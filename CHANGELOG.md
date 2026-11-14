@@ -3,6 +3,30 @@
 All notable changes to `spectre-mcp`. Versioning is semver; the tool surface is
 the public API.
 
+## Unreleased
+
+### Changed — pagination coverage is now explicit
+
+- **Every paginated read reports coverage.** `search` / `search_users` now
+  return `{tweets|users, count, truncated}` at the tool boundary like the
+  timeline and follower tools already did. In Python the scraper methods still
+  return a list (a `SearchResults` subclass) with `.count` / `.truncated`
+  attributes, so existing list-based callers and every single-item field shape
+  are unchanged.
+- **Truncation is never swallowed.** A walk that stops on the time budget, or on
+  a generator failure after collecting data, sets `truncated: true` and keeps
+  the partial results; a clean feed end — including a feed shorter than
+  `limit` — reports `truncated: false`. twscrape's silent rate-limit shape (the
+  generator simply ends with every account locked) is detected via the pool
+  lock table instead of looking like a complete empty list.
+- **Zero-data rate limits raise.** When nothing was collected and the cause is
+  a rate limit (pool locks, `NoAccountError`, or a rate-limit exception), the
+  call now raises `kind: "rate_limit"` with `retry_after_seconds` and a readable
+  retry hint, rather than returning an empty list.
+- Follower/following walks keep their relaxed, limit-scaled budget
+  (`max(default, min(300, limit/4))`); ordinary reads stay on the default
+  budget.
+
 ## 2.0.5 — 2026-11-14
 
 - **Highlights are back.** `create_highlight` and `delete_highlight` were dropped

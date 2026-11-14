@@ -20,7 +20,7 @@ from pydantic import BeforeValidator, WithJsonSchema
 from twscrape.accounts_pool import AccountsPool
 
 from spectre.errors import XError
-from spectre.scraper import Scraper
+from spectre.scraper import Scraper, SearchResults
 from spectre.writer import Writer
 from spectre.xclient import XClient
 
@@ -81,6 +81,8 @@ async def _out(result) -> str:
         value = exc.to_dict()
     except Exception as exc:  # noqa: BLE001 - a tool must never crash the server
         value = {"error": f"{type(exc).__name__}: {exc}", "kind": "internal"}
+    if isinstance(value, SearchResults):
+        value = value.envelope()
     return json.dumps(value, indent=2, default=str, ensure_ascii=False)
 
 
@@ -250,6 +252,8 @@ async def search(query: str, limit: int = 20, mode: str = "latest") -> str:
     min_retweets:, min_faves:, -"term", OR, quoted_tweet_id:. Use mode="latest"
     for recency, "top" for relevance, "media" for visual posts only.
     Costs one request per ~20 results — the expensive call in bulk workflows.
+    Returns `{tweets, count, truncated}`: `truncated: true` means the budget or a
+    rate limit stopped the walk before `limit` posts were collected.
     """
     limit = _clamp(limit, 1, 100)
     return await _out(_get_scraper().search(query, limit=limit, mode=mode))
@@ -260,7 +264,9 @@ async def search_users(query: str, limit: int = 10) -> str:
     """Find accounts by name or keyword.
 
     Cheaper than search() when you only need the handle/id. Follow up with
-    get_user() for the full profile.
+    get_user() for the full profile. Same coverage contract as search():
+    returns `{users, count, truncated}`; a pool-wide rate limit with zero
+    results comes back as `kind: "rate_limit"`, not an empty list.
     """
     limit = _clamp(limit, 1, 50)
     return await _out(_get_scraper().search_users(query, limit=limit))

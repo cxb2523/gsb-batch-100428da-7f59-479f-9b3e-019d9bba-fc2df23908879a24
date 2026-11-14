@@ -250,14 +250,14 @@ async def main() -> int:
     content = render(tools)
     target = os.path.join(REPO, "docs", "tools.md")
     if "--check" in sys.argv:
-        current = open(target).read() if os.path.exists(target) else ""
+        current = open(target, encoding="utf-8").read() if os.path.exists(target) else ""
         if current != content:
             print(f"{target} is stale — run: python tools/gen_docs.py")
             return 1
         print(f"{target} matches the registry ({len(tools)} tools)")
         return 0
     os.makedirs(os.path.dirname(target), exist_ok=True)
-    open(target, "w").write(content)
+    open(target, "w", encoding="utf-8").write(content)
     print(f"wrote {target} ({len(tools)} tools, {len(content)} bytes)")
     return 0
 

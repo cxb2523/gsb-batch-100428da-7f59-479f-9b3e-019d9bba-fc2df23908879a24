@@ -65,13 +65,13 @@ Find posts and people. Search is the most expensive read — one request per ~20
 
 Search X posts with the full operator language.
 
-Supports from:, since:/until:, #tag, filter:media, filter:links, lang:, min_retweets:, min_faves:, -"term", OR, quoted_tweet_id:. Use mode="latest" for recency, "top" for relevance, "media" for visual posts only. Costs one request per ~20 results — the expensive call in bulk workflows.
+Supports from:, since:/until:, #tag, filter:media, filter:links, lang:, min_retweets:, min_faves:, -"term", OR, quoted_tweet_id:. Use mode="latest" for recency, "top" for relevance, "media" for visual posts only. Costs one request per ~20 results — the expensive call in bulk workflows. Returns `{tweets, count, truncated}`: `truncated: true` means the budget or a rate limit stopped the walk before `limit` posts were collected.
 
 ### `search_users(query, limit?)`
 
 Find accounts by name or keyword.
 
-Cheaper than search() when you only need the handle/id. Follow up with get_user() for the full profile.
+Cheaper than search() when you only need the handle/id. Follow up with get_user() for the full profile. Same coverage contract as search(): returns `{users, count, truncated}`; a pool-wide rate limit with zero results comes back as `kind: "rate_limit"`, not an empty list.
 
 ---
 

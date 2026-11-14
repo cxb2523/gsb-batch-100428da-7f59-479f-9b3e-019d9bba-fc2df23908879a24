@@ -143,8 +143,11 @@ between calls.
 
 ## Things that bite
 
-- **Cookies expire ~2 weeks.** First symptom is empty searches, not an error.
-  `spectre doctor` proves it, and refreshes the GraphQL query ids while it runs.
+- **Cookies expire ~2 weeks.** First symptom used to be empty searches; a
+  pool-wide rate limit (or dead cookies) now returns `kind: "rate_limit"` /
+  `kind: "auth"` with a retry hint, and every paginated read reports
+  `truncated` — treat `truncated: true` as partial coverage, never as complete.
+  `spectre doctor` proves the account state and refreshes the GraphQL query ids.
 - **`ct0` must be 160 hex chars.** Partial cookies look fine and fail silently.
 - **Stored handles go stale.** If the account was renamed, `get_me` shows the
   real handle and `get_account_settings` flags `pool_username_stale`; fix with
