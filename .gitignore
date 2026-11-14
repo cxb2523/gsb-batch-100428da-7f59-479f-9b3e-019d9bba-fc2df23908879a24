@@ -1,0 +1,44 @@
+# Claude Code / AI tooling internals
+.agents/
+.claude/
+.claude-plugin/
+.codex-plugin/
+.codex/
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Runtime data
+data/
+!lobbying-overlap/data/
+
+# Local Apify SDK run storage (datasets/key-value stores from `Actor.init()`
+# emulation during local dev/testing) — not source, never shared across runs
+senate/storage/
+house/storage/
+
+# Python (lobbying-overlap)
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+lobbying-overlap/.cache/
+lobbying-overlap/storage/
+
+# Environment
+.env
+.env.local
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

@@ -1,0 +1,257 @@
+{
+  "actorSpecification": 1,
+  "fields": {
+    "type": "object",
+    "required": ["politician", "transaction_date", "filing_date", "asset_name", "asset_type", "type", "amount_min", "owner", "id", "source_id", "filing_id", "content_hash", "parse_status", "fetchedAt", "lastModifiedAt", "revisionCount"],
+    "properties": {
+      "id": {
+        "type": "string",
+        "title": "ID",
+        "description": "SHA-256 of (politician, transaction_date, asset_name, amount_min, amount_max, source_id). Unique per row — changes if source_id changes.",
+        "example": "057cfd6485562a167c140ba950f5835cccf3bbb5fdaf55163f08c37c3cdcd372"
+      },
+      "source_id": {
+        "type": "string",
+        "title": "Source document ID",
+        "description": "The source PTR's document id plus the row's ordinal within it (<doc_id>|<row_index>), or <doc_id>|fetch_failed / <doc_id>|paper / <doc_id>|parse_failed for the three placeholder kinds.",
+        "example": "257795ae-e1b2-411d-b562-8fe4c2a4f2a1|6"
+      },
+      "filing_id": {
+        "type": "string",
+        "title": "Filing ID",
+        "description": "The filing's own document id, shared by every row and placeholder from this one filing — unlike source_id, which is per-row and therefore different for a placeholder (one row per filing) versus real transaction rows (one row per line item). Used to recognize when a later run's real rows supersede a stale placeholder for the same filing.",
+        "example": "257795ae-e1b2-411d-b562-8fe4c2a4f2a1"
+      },
+      "content_hash": {
+        "type": "string",
+        "title": "Content hash",
+        "description": "SHA-256 of (politician, transaction_date, asset_name, type, amount_min, amount_max, owner) — source_id excluded. Rows sharing this within the same document are legitimate separate tranches; rows sharing it across different documents are the same real-world transaction reported twice. Never used to drop or merge rows — see actor README.",
+        "example": "7c2e5b8d4f6a0c9e3b7d1fa3f9c1e2b8d47f60a1c5e93b2d8f7a4c6e0b1d9f3a"
+      },
+      "filing_type": {
+        "type": ["string", "null"],
+        "title": "Filing type",
+        "description": "Read from the PTR's own \"(Amendment N)\" label. Null only when the source page didn't expose a label — never inferred from duplicate documents.",
+        "enum": ["original", "amendment", null],
+        "example": "original"
+      },
+      "amendment_number": {
+        "type": ["integer", "null"],
+        "title": "Amendment number",
+        "description": "The N in \"(Amendment N)\". Null for originals and for anything the source doesn't label.",
+        "example": null
+      },
+      "row_index_in_filing": {
+        "type": ["integer", "null"],
+        "title": "Row index in filing",
+        "description": "0-based position of this row among its filing's parsed data rows, in source order. Tells apart identical rows inside one filing (which share a content_hash). Not part of id or content_hash. 0 on a placeholder row (a filing's only row).",
+        "example": 0
+      },
+      "supersedes_filing_id": {
+        "type": ["string", "null"],
+        "title": "Supersedes filing ID",
+        "description": "On an amendment's rows: the filing_id of the earlier filing by the same filer that this amendment re-lists trades from (shares at least one identical trade with). The Senate source exposes no explicit amends-link, so this is only set where the shared trades make it determinable; otherwise null.",
+        "example": null
+      },
+      "is_superseded": {
+        "type": ["boolean", "null"],
+        "title": "Is superseded",
+        "description": "True on the remaining rows of a filing that a later amendment supersedes by the rule described under supersedes_filing_id.",
+        "example": false
+      },
+      "parse_status": {
+        "type": "string",
+        "title": "Parse status",
+        "description": "'ok' for a normally-parsed row. 'fetch_failed' means the detail-page fetch itself failed after retries — the filing's content was never examined; transient, superseded automatically once a later run's fetch succeeds for the same filing. 'scanned_unparsed' means this filing was submitted on paper — Senate EFD serves it as a scanned image/PDF at /search/view/paper/<id>/, not the structured HTML table electronic PTRs get, and there is no OCR fallback. 'parse_failed' means the /ptr/<uuid>/ page fetched successfully but had zero parseable table rows — a parser bug or a Senate EFD layout change. Every non-'ok' status is a placeholder row: every transaction-detail field (transaction_date, ticker, asset_name, asset_type, asset_subtype, type, amount_min, amount_max, owner) is null, and pdf_url points at the filing's detail page. No filing is ever silently dropped from output.",
+        "enum": ["ok", "fetch_failed", "scanned_unparsed", "parse_failed"],
+        "example": "ok"
+      },
+      "pdf_url": {
+        "type": ["string", "null"],
+        "title": "Source PDF URL",
+        "description": "Populated only on a placeholder row (fetch_failed/scanned_unparsed/parse_failed), pointing at the filing's detail page (no per-row PDF exists on this source). Null on every normally-parsed row — Senate's electronic PTR source is an HTML page, not a per-row PDF.",
+        "example": null
+      },
+      "fetchedAt": {
+        "type": "string",
+        "title": "Fetched at",
+        "description": "ISO 8601 UTC timestamp of when this row was first pulled from source. Immutable once set — a re-fetch of an unchanged row never updates it. If the source later revises this filing row, the new row carries this timestamp forward from the prior version, so 'first seen' survives the revision.",
+        "example": "2026-04-20T14:32:07.000Z"
+      },
+      "lastModifiedAt": {
+        "type": "string",
+        "title": "Last modified at",
+        "description": "ISO 8601 UTC timestamp of when this row's content was last observed to change. Equals fetchedAt for a first-seen row.",
+        "example": "2026-04-20T14:32:07.000Z"
+      },
+      "revisionCount": {
+        "type": "integer",
+        "title": "Revision count",
+        "description": "Number of content revisions detected for this source document/row lineage. 0 for a first-seen row; incremented each time the source republishes this row with different content.",
+        "example": 0
+      },
+      "politician": {
+        "type": "string",
+        "title": "Politician",
+        "description": "Filer name as it appears on the Senate disclosure. Paper filings arrive from the source in ALL CAPS and are re-cased to match electronic ones (see politician_raw).",
+        "example": "Tommy Tuberville"
+      },
+      "politician_raw": {
+        "type": ["string", "null"],
+        "title": "Politician (raw)",
+        "description": "The filer name exactly as the Senate listing printed it, before any casing normalization.",
+        "example": "RICHARD BLUMENTHAL"
+      },
+      "member_bioguide_id": {
+        "type": ["string", "null"],
+        "title": "Member bioguide ID",
+        "description": "Bioguide id from unitedstates/congress-legislators, resolved from the filer name. Null when the filer is not a current senator or the name matches more than one — never guessed.",
+        "example": "T000278"
+      },
+      "transaction_date": {
+        "type": ["string", "null"],
+        "title": "Transaction date",
+        "description": "ISO date (YYYY-MM-DD) when the trade was executed. Null on any placeholder row (fetch_failed/scanned_unparsed/parse_failed) — see parse_status.",
+        "example": "2026-04-15"
+      },
+      "filing_date": {
+        "type": "string",
+        "title": "Filing date",
+        "description": "ISO date (YYYY-MM-DD) when the PTR was filed with the Senate.",
+        "example": "2026-04-20"
+      },
+      "ticker": {
+        "type": ["string", "null"],
+        "title": "Ticker",
+        "description": "Stock ticker as given by the source, cleaned of artifacts. Null when the source omits it (often for bonds, municipal securities, private/LLC holdings, structured notes, and some stocks and ADRs) or gave a company-name abbreviation instead of a ticker. Never guessed or looked up. On an Exchange row this is the GIVEN asset's ticker (the asset asset_name leads with); the received asset's is in received_ticker.",
+        "example": "NVDA"
+      },
+      "asset_name": {
+        "type": ["string", "null"],
+        "title": "Asset name",
+        "description": "Full asset description as reported on the PTR. Null on any placeholder row (fetch_failed/scanned_unparsed/parse_failed).",
+        "example": "NVIDIA Corporation - Common Stock"
+      },
+      "received_ticker": {
+        "type": ["string", "null"],
+        "title": "Received ticker",
+        "description": "Exchange rows only (null otherwise): the ticker of the asset RECEIVED in the exchange, from the source's ticker cell (\"-- AMCR\" = no given ticker, received AMCR) or from a ticker stated in the asset_name text. Null when the source gives none.",
+        "example": "AMCR"
+      },
+      "received_asset_name": {
+        "type": ["string", "null"],
+        "title": "Received asset name",
+        "description": "Exchange rows only (null otherwise): the description of the asset received, parsed from asset_name's \"<given> (Exchanged) <received> (Received)\" form, without its leading \"TICKER - \". Null when the \"(Exchanged)\" marker is missing.",
+        "example": "Amcor plc Ordinary Shares"
+      },
+      "asset_type": {
+        "type": ["string", "null"],
+        "title": "Asset type",
+        "description": "Senate EFD asset classification. Null on any placeholder row (fetch_failed/scanned_unparsed/parse_failed).",
+        "example": "Stock"
+      },
+      "asset_subtype": {
+        "type": ["string", "null"],
+        "title": "Asset subtype",
+        "description": "Derived from asset_name, only when asset_type is 'Stock': Senate's own asset-type checkboxes have no ETF/mutual-fund option, so filers commonly mark those as 'Stock'. 'ETF' when asset_name contains the word 'ETF'; 'Mutual Fund' when it contains 'Fund' (optionally preceded by 'Mutual' or 'Index'). Null for every other asset_type (e.g. 'Other', 'Non-Public Stock') — there, the source's own label is treated as more reliable than a name-text guess. Also null on any placeholder row (fetch_failed/scanned_unparsed/parse_failed).",
+        "enum": ["ETF", "Mutual Fund", null],
+        "example": "ETF"
+      },
+      "type": {
+        "type": ["string", "null"],
+        "title": "Trade type",
+        "description": "Normalized to 'buy' (Purchase), 'sell' (Sale Full / Sale Partial), or 'exchange' (an asset swap, e.g. a called security or merger conversion — reported by the source as its own transaction type, not a buy or sell). Null on any placeholder row (fetch_failed/scanned_unparsed/parse_failed).",
+        "enum": ["buy", "sell", "exchange", null],
+        "example": "buy"
+      },
+      "amount_min": {
+        "type": ["number", "null"],
+        "title": "Amount lower bound",
+        "description": "Lower bound of the reported amount range, in USD. Usually a whole dollar disclosure bracket, but a single exact-amount disclosure can carry cents (e.g. 2722.5). Null on any placeholder row (fetch_failed/scanned_unparsed/parse_failed).",
+        "example": 1001
+      },
+      "amount_max": {
+        "type": ["number", "null"],
+        "title": "Amount upper bound",
+        "description": "Upper bound of the reported amount range, in USD. Usually a whole dollar disclosure bracket, but a single exact-amount disclosure can carry cents (e.g. 2722.5). Null for unbounded 'Over $X' brackets, and on any placeholder row (fetch_failed/scanned_unparsed/parse_failed).",
+        "example": 15000
+      },
+      "owner": {
+        "type": ["string", "null"],
+        "title": "Owner",
+        "description": "Account owner classification per STOCK Act. Null on any placeholder row (fetch_failed/scanned_unparsed/parse_failed).",
+        "enum": ["self", "joint", "spouse", "child", null],
+        "example": "self"
+      }
+    }
+  },
+  "views": {
+    "overview": {
+      "title": "Transaction overview",
+      "description": "Compact view — politician, ticker, type, amounts, dates.",
+      "transformation": {
+        "fields": ["politician", "transaction_date", "filing_date", "ticker", "type", "amount_min", "amount_max", "owner"]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "politician": {
+            "label": "Politician",
+            "format": "text"
+          },
+          "transaction_date": {
+            "label": "Trade date",
+            "format": "date"
+          },
+          "filing_date": {
+            "label": "Filed",
+            "format": "date"
+          },
+          "ticker": {
+            "label": "Ticker",
+            "format": "text"
+          },
+          "type": {
+            "label": "Type",
+            "format": "text"
+          },
+          "amount_min": {
+            "label": "Min $",
+            "format": "number"
+          },
+          "amount_max": {
+            "label": "Max $",
+            "format": "number"
+          },
+          "owner": {
+            "label": "Owner",
+            "format": "text"
+          }
+        }
+      }
+    },
+    "buys_only": {
+      "title": "Purchases only",
+      "description": "Filter to only buy-side transactions.",
+      "transformation": {
+        "fields": ["politician", "transaction_date", "ticker", "asset_name", "amount_min", "amount_max", "owner"],
+        "filter": {
+          "type": "buy"
+        }
+      },
+      "display": {
+        "component": "table"
+      }
+    },
+    "full": {
+      "title": "Full record",
+      "description": "All fields including asset_name, asset_type, id, source_id, content_hash, and filing_type.",
+      "transformation": {
+        "fields": ["id", "politician", "politician_raw", "member_bioguide_id", "transaction_date", "filing_date", "ticker", "asset_name", "received_ticker", "received_asset_name", "asset_type", "asset_subtype", "type", "amount_min", "amount_max", "owner", "source_id", "filing_id", "content_hash", "filing_type", "amendment_number", "row_index_in_filing", "supersedes_filing_id", "is_superseded", "parse_status", "pdf_url", "fetchedAt", "lastModifiedAt", "revisionCount"]
+      },
+      "display": {
+        "component": "table"
+      }
+    }
+  }
+}
