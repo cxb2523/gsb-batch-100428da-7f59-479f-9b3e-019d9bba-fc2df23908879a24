@@ -20,6 +20,9 @@ class TPEnum(enum.Enum):
     URL_FETCH_NOT = "url_fetch_not"
     URL_FETCH_SUCC = "url_fetch_succ"
     URL_FETCH_FAIL = "url_fetch_fail"
+    URL_FETCH_RETRY = "url_fetch_retry"  # times a task was put back to QueueFetch for another try
+    URL_FETCH_RETRY_EXHAUST = "url_fetch_retry_exhaust"  # failed because max_repeat was reached
+    URL_FETCH_PROXY_FAIL = "url_fetch_proxy_fail"  # failed and its proxies were unavailable
 
     HTM_PARSE = "htm_parse"
     HTM_PARSE_RUN = "htm_parse_run"
@@ -90,16 +93,22 @@ def work_monitor(self):
     """
     procedure of MonitorThread, auto running, return False if you need stop thread
     """
-    time.sleep(5)
+    if self._pool.wait_stop_event(timeout=5):
+        # the pool is being stopped, no need to print another line of statistics
+        return False
     info_list = []
 
     fetch_run = self._pool.get_number_dict(TPEnum.URL_FETCH_RUN)
     fetch_not = self._pool.get_number_dict(TPEnum.URL_FETCH_NOT)
     fetch_succ = self._pool.get_number_dict(TPEnum.URL_FETCH_SUCC)
     fetch_fail = self._pool.get_number_dict(TPEnum.URL_FETCH_FAIL)
+    fetch_retry = self._pool.get_number_dict(TPEnum.URL_FETCH_RETRY)
+    fetch_exhaust = self._pool.get_number_dict(TPEnum.URL_FETCH_RETRY_EXHAUST)
+    fetch_proxy_fail = self._pool.get_number_dict(TPEnum.URL_FETCH_PROXY_FAIL)
     fetch_temp = (fetch_succ + fetch_fail) - self._last_fetch_num
     self._last_fetch_num = fetch_succ + fetch_fail
-    info_list.append(f"fetch: [RUN={fetch_run}, NOT={fetch_not}, SUCC={fetch_succ}, FAIL={fetch_fail}, {fetch_temp}/5s];")
+    info_list.append(f"fetch: [RUN={fetch_run}, NOT={fetch_not}, SUCC={fetch_succ}, FAIL={fetch_fail}, "
+                     f"RETRY={fetch_retry}, EXHAUST={fetch_exhaust}, PROXY_FAIL={fetch_proxy_fail}, {fetch_temp}/5s];")
 
     parse_run = self._pool.get_number_dict(TPEnum.HTM_PARSE_RUN)
     parse_not = self._pool.get_number_dict(TPEnum.HTM_PARSE_NOT)

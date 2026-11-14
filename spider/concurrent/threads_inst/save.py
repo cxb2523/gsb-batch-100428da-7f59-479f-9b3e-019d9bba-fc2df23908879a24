@@ -7,7 +7,7 @@ save.py by xianhu
 import logging
 
 from .base import TPEnum, BaseThread
-from ...utilities import TaskSave, ResultSave
+from ...utilities import TaskSave, ResultSave, FailureReason, FailureStage
 
 
 class SaveThread(BaseThread):
@@ -30,6 +30,10 @@ class SaveThread(BaseThread):
             self._pool.update_number_dict(TPEnum.ITEM_SAVE_SUCC, +1)
         else:
             self._pool.update_number_dict(TPEnum.ITEM_SAVE_FAIL, +1)
+            self._pool.record_failure(
+                task.url, FailureStage.SAVE, [FailureReason.SAVE_FAILED], terminal=True,
+                state_code=result.state_code, excep_class=result.excep_class, excep_string=result.excep_string,
+            )
             logging.error("%s error: %s, %s", result.excep_class, result.excep_string, str(task))
 
         # ----4----

@@ -27,15 +27,18 @@ class ResultFetch(Result):
     class of ResultFetch, to define result of fetcher
     """
 
-    def __init__(self, state_code, state_proxies=1, task_parse=None, excep_class=None, excep_string=None):
+    def __init__(self, state_code, state_proxies=1, task_parse=None, excep_class=None, excep_string=None,
+                 retry_exhausted: bool = False):
         """
         constructor
         :param state_code: can be -1(fetch failed), 0(need repeat), 1(fetch success)
         :param state_proxies: can be -1(unavaiable), 0(return to queue), 1(avaiable)
+        :param retry_exhausted: True if this failure happened when max_repeat was already reached
         """
         super().__init__(state_code, excep_class, excep_string)
         self.state_proxies = state_proxies
         self.task_parse = task_parse
+        self.retry_exhausted = bool(retry_exhausted)
         return
 
 

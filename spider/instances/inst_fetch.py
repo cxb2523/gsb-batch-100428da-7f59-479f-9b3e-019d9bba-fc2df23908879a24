@@ -24,6 +24,21 @@ class Fetcher(object):
         self._max_repeat = max_repeat
         return
 
+    @property
+    def max_repeat(self):
+        """
+        maximum repeat count of fetching, a task with repeat >= max_repeat is the last chance
+        """
+        return self._max_repeat
+
+    @max_repeat.setter
+    def max_repeat(self, value):
+        """
+        allow subclasses to set max_repeat directly
+        """
+        self._max_repeat = value
+        return
+
     def working(self, task_fetch: TaskFetch, proxies=None) -> ResultFetch:
         """
         working function, must "try-except" and return ResultFetch()
@@ -33,9 +48,11 @@ class Fetcher(object):
         try:
             result_fetch = self.url_fetch(task_fetch, proxies=proxies)
         except Exception as excep:
-            state_code = -1 if task_fetch.repeat >= self._max_repeat else 0
+            retry_exhausted = task_fetch.repeat >= self._max_repeat
+            state_code = -1 if retry_exhausted else 0
             kwargs = dict(excep_class=self.__class__.__name__, excep_string=str(excep))
-            result_fetch = ResultFetch(state_code=state_code, state_proxies=-1, task_parse=None, **kwargs)
+            result_fetch = ResultFetch(state_code=state_code, state_proxies=-1, task_parse=None,
+                                       retry_exhausted=retry_exhausted, **kwargs)
 
         return result_fetch
 

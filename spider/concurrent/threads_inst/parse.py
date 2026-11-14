@@ -7,7 +7,7 @@ parse.py by xianhu
 import logging
 
 from .base import TPEnum, BaseThread
-from ...utilities import TaskParse, ResultParse
+from ...utilities import TaskParse, ResultParse, FailureReason, FailureStage
 
 
 class ParseThread(BaseThread):
@@ -34,6 +34,10 @@ class ParseThread(BaseThread):
                 self._pool.add_a_task(TPEnum.ITEM_SAVE, result.task_save)
         else:
             self._pool.update_number_dict(TPEnum.HTM_PARSE_FAIL, +1)
+            self._pool.record_failure(
+                task.url, FailureStage.PARSE, [FailureReason.PARSE_FAILED], terminal=True,
+                state_code=result.state_code, excep_class=result.excep_class, excep_string=result.excep_string,
+            )
             logging.error("%s error: %s, %s", result.excep_class, result.excep_string, str(task))
 
         # ----4----

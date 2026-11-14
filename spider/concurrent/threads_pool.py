@@ -11,7 +11,7 @@ import threading
 
 from .threads_inst import *
 from ..instances import Fetcher, Parser, Saver, Proxieser
-from ..utilities import UrlFilter, TaskFetch
+from ..utilities import UrlFilter, TaskFetch, BatchOutcome, BatchResult, FailureRecorder
 
 
 class ThreadPool(object):
@@ -22,9 +22,11 @@ class ThreadPool(object):
     def __init__(
             self, fetcher: Fetcher, parser: Parser = None, saver: Saver = None, proxieser: Proxieser = None,
             url_filter: UrlFilter = None, queue_parse_size=-1, queue_save_size=-1, queue_proxies_size=-1,
+            max_failures=100,
     ):
         """
         constructor, queue_parse_size/queue_save_size/queue_proxies_size are the maximum size of each queue, -1 to no limition
+        max_failures is the maximum number of failure details kept in the result, to avoid unbounded memory usage
         """
         self._inst_fetcher = fetcher  # fetcher instance, subclass of Fetcher
         self._inst_parser = parser  # parser instance, subclass of Parser or None
@@ -45,11 +47,14 @@ class ThreadPool(object):
 
         self._number_dict = {
             TPEnum.URL_FETCH_RUN: 0, TPEnum.URL_FETCH_NOT: 0, TPEnum.URL_FETCH_SUCC: 0, TPEnum.URL_FETCH_FAIL: 0,
+            TPEnum.URL_FETCH_RETRY: 0, TPEnum.URL_FETCH_RETRY_EXHAUST: 0, TPEnum.URL_FETCH_PROXY_FAIL: 0,
             TPEnum.HTM_PARSE_RUN: 0, TPEnum.HTM_PARSE_NOT: 0, TPEnum.HTM_PARSE_SUCC: 0, TPEnum.HTM_PARSE_FAIL: 0,
             TPEnum.ITEM_SAVE_RUN: 0, TPEnum.ITEM_SAVE_NOT: 0, TPEnum.ITEM_SAVE_SUCC: 0, TPEnum.ITEM_SAVE_FAIL: 0,
             TPEnum.PROXIES_LEFT: 0, TPEnum.PROXIES_FAIL: 0,
         }
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()  # set when wait_for_finished() is called
+        self._failures = FailureRecorder(max_failures=max_failures)
 
         self._thread_monitor = MonitorThread("monitor", self)
         self._thread_monitor.setDaemon(True)
@@ -70,6 +75,7 @@ class ThreadPool(object):
         """
         logging.warning("ThreadPool starts working: urls_num=%s, fetchers_num=%s", self.get_number_dict(TPEnum.URL_FETCH_NOT), fetchers_num)
         self._thread_stop_flag = False
+        self._stop_event.clear()
 
         self._thread_fetcher_list = [FetchThread("fetcher-%d" % (i + 1), copy.deepcopy(self._inst_fetcher), self) for i in range(fetchers_num)]
         self._thread_parser = ParseThread("parser", self._inst_parser, self) if self._inst_parser else None
@@ -98,9 +104,20 @@ class ThreadPool(object):
     def wait_for_finished(self):
         """
         wait for finishing this thread pool
+
+        return a BatchResult (dict-like) with all original counters plus:
+          outcome:          one of BatchOutcome values, tells how this run ended
+          converged:        True if all work drained without retry/proxies exhaustion
+          drained:          True if all queues were empty when the pool stopped
+          failures:         bounded list of {"url", "stage", "reason", "reasons", ...}
+          failed_urls:      urls of the retained failures
+          failure_reasons:  reason -> terminal failure count
+          retry_reasons:    reason -> retry count (tasks that were put back to the queue)
+          failure_total / failure_event_total / retry_total
         """
         logging.warning("ThreadPool waits for finishing")
         self._thread_stop_flag = True
+        self._stop_event.set()
 
         for _thread_fetcher in filter(lambda x: x.is_alive(), self._thread_fetcher_list):
             _thread_fetcher.join()
@@ -115,7 +132,84 @@ class ThreadPool(object):
             self._thread_monitor.join()
 
         logging.warning("ThreadPool has finished...")
-        return self._number_dict
+        return self.get_batch_result()
+
+    def get_batch_result(self):
+        """
+        build a BatchResult describing this run, can be called before or after finishing
+        """
+        with self._lock:
+            number_dict = dict(self._number_dict)
+
+        failures, pending_failures, failure_total, terminal_failure_total = self._failures.snapshot()
+        drained = not any(
+            number_dict[key] for key in (
+                TPEnum.URL_FETCH_NOT, TPEnum.URL_FETCH_RUN,
+                TPEnum.HTM_PARSE_NOT, TPEnum.HTM_PARSE_RUN,
+                TPEnum.ITEM_SAVE_NOT, TPEnum.ITEM_SAVE_RUN,
+            )
+        )
+
+        retry_exhausted_count = number_dict[TPEnum.URL_FETCH_RETRY_EXHAUST]
+        proxy_fail_count = number_dict[TPEnum.URL_FETCH_PROXY_FAIL]
+        failed_count = number_dict[TPEnum.URL_FETCH_FAIL] + number_dict[TPEnum.HTM_PARSE_FAIL] + \
+            number_dict[TPEnum.ITEM_SAVE_FAIL]
+
+        if not drained:
+            outcome = BatchOutcome.INCOMPLETE
+        elif retry_exhausted_count and proxy_fail_count:
+            outcome = BatchOutcome.RETRY_AND_PROXIES_EXHAUSTED
+        elif retry_exhausted_count:
+            outcome = BatchOutcome.RETRY_EXHAUSTED
+        elif proxy_fail_count:
+            outcome = BatchOutcome.PROXIES_EXHAUSTED
+        elif failed_count:
+            outcome = BatchOutcome.COMPLETED_WITH_FAILURES
+        else:
+            outcome = BatchOutcome.COMPLETED
+
+        result = BatchResult(
+            number_dict,
+            aliases={member.value: member for member in TPEnum},
+        )
+        result.update({
+            "outcome": outcome,
+            # converged: the pool drained its work without being cut short by retries/proxies
+            "converged": bool(drained and not retry_exhausted_count and not proxy_fail_count),
+            "drained": bool(drained),
+            "success": bool(drained and not failed_count),
+            "failures": failures,
+            "pending_failures": pending_failures,
+            "failed_urls": [item["url"] for item in failures],
+            "failure_reasons": self._failures.reason_counts(terminal=True),
+            "retry_reasons": self._failures.reason_counts(terminal=False),
+            "failure_total": terminal_failure_total,
+            "failure_event_total": failure_total,
+            "retry_total": number_dict[TPEnum.URL_FETCH_RETRY],
+            "retry_exhausted_count": retry_exhausted_count,
+            "proxy_fail_count": proxy_fail_count,
+            "failed_count": failed_count,
+            "max_failures": self._failures.max_failures,
+        })
+        return result
+
+    def record_failure(self, url, stage, reasons, terminal=True, **details):
+        """
+        record a failure of an url, used by threads of this pool
+        """
+        return self._failures.record(url, stage, reasons, terminal=terminal, **details)
+
+    def wait_stop_event(self, timeout=None):
+        """
+        wait until wait_for_finished() is called or timeout elapses, return True if stopping
+        """
+        return self._stop_event.wait(timeout=timeout)
+
+    def resolve_failure(self, url, stage):
+        """
+        drop the pending retry record of an url after it finally succeeded
+        """
+        return self._failures.resolve(url, stage)
 
     def get_proxies_flag(self):
         """

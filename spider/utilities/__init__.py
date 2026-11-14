@@ -8,3 +8,4 @@ from .functions import *
 from .cfilter import UrlFilter
 from .ctask import Task, TaskFetch, TaskParse, TaskSave
 from .cresult import ResultFetch, ResultParse, Result as ResultSave, ResultProxies
+from .cbatch import BatchOutcome, BatchResult, FailureReason, FailureRecorder, FailureStage

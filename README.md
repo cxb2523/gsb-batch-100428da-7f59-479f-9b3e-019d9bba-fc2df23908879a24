@@ -35,6 +35,32 @@ A simple web spider frame written by Python, which needs Python3.8+
 
 **See test.py**
 
+### Batch outcome
+
+`wait_for_finished()` returns a dict-like `BatchResult`. It still contains every
+original counter keyed by `TPEnum` (so existing code keeps working), and adds:
+
+| key | meaning |
+| --- | --- |
+| `outcome` | `completed`, `completed_with_failures`, `retry_exhausted`, `proxies_exhausted`, `retry_and_proxies_exhausted` or `incomplete` (see `BatchOutcome`) |
+| `converged` | all work drained, without any retry/proxies exhaustion |
+| `drained` | every queue was empty when the pool stopped |
+| `success` | drained and no failure at all |
+| `failures` | bounded list of `{"url", "stage", "reason", "reasons", "terminal", "repeat", ...}` |
+| `failed_urls` | urls of the retained failures |
+| `failure_reasons` / `retry_reasons` | reason -> count (`FailureReason`) |
+| `failure_total` / `failure_event_total` / `retry_total` | terminal failures, all failure events, retries |
+| `retry_exhausted_count` / `proxy_fail_count` | failures caused by max_repeat / unavailable proxies |
+
+A task asking for repeat is put back to QueueFetch at most until `Fetcher.max_repeat`;
+after that it is recorded as `retry_exhausted` and counted as a failure, so a url that
+never succeeds can no longer loop forever. Proxy-failure attribution is per url:
+`state_proxies=-1` adds `proxy_invalid`, `state_proxies=0` adds `proxy_returned`.
+Failed details are capped by `max_failures` (default 100, `0` keeps none) while the
+counters keep counting everything, so long running spiders stay bounded in memory.
+
+See `tests/test_batch_outcome.py` for local, network-free examples based on a fake Fetcher.
+
 ### TodoList
 
 1. More Demos
