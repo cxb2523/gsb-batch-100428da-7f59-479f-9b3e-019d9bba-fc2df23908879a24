@@ -3,8 +3,9 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 
-const ROOT = path.join(__dirname, '..');
+const ROOT = process.env.SYNC_ROOT || path.join(__dirname, '..');
 const config = JSON.parse(fs.readFileSync(path.join(__dirname, 'repo.config.json'), 'utf8'));
+const REPORT_PATH = path.join(ROOT, 'catalog', 'sync-report.json');
 
 function fetchText(url) {
   return new Promise((resolve, reject) => {
@@ -29,23 +30,48 @@ function writeIfChanged(filePath, content) {
 }
 
 async function syncOne(url, destination, heading) {
+  const record = { catalog: heading, source: url, destination, outcome: null, error: null };
+  const filePath = path.join(ROOT, destination);
   try {
     const content = await fetchText(url);
     const stamped = `<!-- Synced from ${url} -->\n\n${content.trim()}\n`;
-    const changed = writeIfChanged(path.join(ROOT, destination), stamped);
-    console.log(`${heading}: ${changed ? 'updated' : 'unchanged'}`);
+    const changed = writeIfChanged(filePath, stamped);
+    record.outcome = changed ? 'updated' : 'unchanged';
+    console.log(`${heading}: ${record.outcome}`);
   } catch (error) {
-    if (fs.existsSync(path.join(ROOT, destination))) {
+    record.error = error.message;
+    if (fs.existsSync(filePath)) {
+      record.outcome = 'kept-existing';
       console.warn(`${heading}: ${error.message}; keeping the existing catalog`);
-      return;
+    } else {
+      record.outcome = 'failed';
+      console.error(`${heading}: ${error.message}; no existing catalog to keep`);
     }
-    throw error;
   }
+  return record;
+}
+
+function writeReport(records) {
+  const failed = records.filter((r) => r.outcome === 'failed' || r.outcome === 'kept-existing');
+  const report = {
+    generatedAt: new Date().toISOString(),
+    status: failed.length === 0 ? 'ok' : 'failed',
+    catalogs: records,
+  };
+  fs.mkdirSync(path.dirname(REPORT_PATH), { recursive: true });
+  fs.writeFileSync(REPORT_PATH, `${JSON.stringify(report, null, 2)}\n`, 'utf8');
+  console.log(`Sync report written to ${path.relative(ROOT, REPORT_PATH)} (status: ${report.status})`);
+  return report;
 }
 
 async function main() {
-  await syncOne(config.megaListSource, 'catalog/README.md', 'Apify catalog');
-  await syncOne(config.coreclawSource, 'catalog/coreclaw.md', 'CoreClaw catalog');
+  const records = [];
+  records.push(await syncOne(config.megaListSource, 'catalog/README.md', 'Apify catalog'));
+  records.push(await syncOne(config.coreclawSource, 'catalog/coreclaw.md', 'CoreClaw catalog'));
+  const report = writeReport(records);
+  if (report.status !== 'ok') {
+    process.exitCode = 1;
+  }
 }
 
 main().catch((error) => {
