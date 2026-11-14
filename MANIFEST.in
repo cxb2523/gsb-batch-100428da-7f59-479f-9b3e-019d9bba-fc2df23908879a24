@@ -1,0 +1,9 @@
+# sdist: the package, LICENSE, README, CHANGELOG and the build files only.
+include LICENSE README.md CHANGELOG.md
+include gmaps_extractor/py.typed
+prune tests
+prune docs
+prune .github
+global-exclude *.py[cod] __pycache__
+global-exclude config.py config_*.py *_config.py settings_local.py secrets*.py
+global-exclude .env .env.* *.env

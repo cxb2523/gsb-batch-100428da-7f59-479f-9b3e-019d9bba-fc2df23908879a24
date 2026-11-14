@@ -1,0 +1,50 @@
+site_name: gmaps-extractor
+site_description: Search Google Maps for places in an area and get their opening hours
+site_url: https://promisingcoder.github.io/GoogleMapsCollector/
+repo_url: https://github.com/promisingcoder/GoogleMapsCollector
+repo_name: promisingcoder/GoogleMapsCollector
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: blue grey
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: blue grey
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.sections
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+
+markdown_extensions:
+  - tables
+  - admonition
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.details
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Installation: installation.md
+      - Quick Start: quick-start.md
+  - Usage:
+      - Python API: python-api.md
+      - Command Line: cli-reference.md
+      - Configuration: configuration.md
+      - Output Format: output-format.md
+  - Reference:
+      - Limits and Troubleshooting: known-limitations.md
+      - Migrating from 2.x: migration.md
+      - Changelog: changelog.md

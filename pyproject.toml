@@ -1,0 +1,78 @@
+[build-system]
+requires = ["setuptools>=77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gmaps-extractor"
+version = "3.0.0"
+description = "Search Google Maps for places in an area and get their contact details and opening hours over plain HTTP"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+authors = [
+    { name = "Yossef" },
+]
+keywords = ["google-maps", "places", "local-business", "opening-hours", "scraper"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.25,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+    "build>=1.2",
+    "setuptools>=77.0",
+]
+docs = [
+    "mkdocs-material>=9.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/promisingcoder/GoogleMapsCollector"
+Repository = "https://github.com/promisingcoder/GoogleMapsCollector"
+Changelog = "https://github.com/promisingcoder/GoogleMapsCollector/blob/main/CHANGELOG.md"
+Issues = "https://github.com/promisingcoder/GoogleMapsCollector/issues"
+
+[project.scripts]
+gmaps-collect = "gmaps_extractor.cli:main"
+
+# Packages are listed one by one (no automatic discovery). setup.py also drops
+# any module named config.py / *.env from the build, so a local settings file
+# can never end up in a wheel or sdist.
+[tool.setuptools]
+packages = ["gmaps_extractor", "gmaps_extractor.geo", "gmaps_extractor.parsers"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+gmaps_extractor = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--tb=short"
+markers = [
+    "packaging: builds the sdist and wheel (needs the 'build' and 'setuptools' packages)",
+]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["UP006", "UP007", "UP035"]

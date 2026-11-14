@@ -1,0 +1,2 @@
+)]}'
+[null, null, null, null, null, null, [null, null, null, null, null, null, null, null, null, null, null, "Sample Espresso Bar", null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, [null, [["Closed"], ["9 AM–5 PM"], ["9 AM–5 PM"], ["9 AM–5 PM"], ["9 AM–5 PM"], ["9 AM–3 PM"], [[]]]], null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null], null]

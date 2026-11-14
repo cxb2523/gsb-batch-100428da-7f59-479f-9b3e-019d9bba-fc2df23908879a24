@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.eggs/
+.venv/
+venv/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+site/
+
+# Local settings and secrets: never commit or package these
+.env
+.env.*
+*.env
+gmaps_extractor/config.py
+config_local.py
+
+# Output files
+output/
+*.csv
