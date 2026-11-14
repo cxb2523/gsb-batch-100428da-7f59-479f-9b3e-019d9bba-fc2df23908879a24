@@ -13,22 +13,56 @@ geolocator = Nominatim(user_agent="trouver-une-fresque", timeout=10)
 
 # Disk-backed geocode cache
 _geocode_cache = {}
+# Keys that were loaded from disk and have not been answered by a fresh
+# request during this process. Used only to label the resolution trace.
+_geocode_cache_from_disk = set()
 _geocode_cache_file = os.environ.get("GEOCODE_CACHE_FILE")
+
+# Source of the most recent ``geocode_location_string`` answer:
+# "memory_cache", "disk_cache" or "request". Tracing only.
+_last_geocode_source = None
+# Human-readable trace produced by the most recent ``get_address`` call.
+last_resolution_trace = None
+
+
+def log_resolution_trace(trace):
+    """Logs a resolution trace; separated so it can be observed in tests."""
+    logging.info(trace)
+
+
+def _is_usable_cache_entry(entry):
+    """A cache entry is either a negative result or a raw Nominatim payload."""
+    if entry is None:
+        return True
+    return isinstance(entry, dict) and "lat" in entry and "lon" in entry
 
 
 def _load_geocode_cache():
     """Load the geocode cache from disk if GEOCODE_CACHE_FILE is set."""
-    global _geocode_cache
+    global _geocode_cache, _geocode_cache_from_disk
     if _geocode_cache_file and os.path.exists(_geocode_cache_file):
         try:
             with open(_geocode_cache_file, "r", encoding="utf-8") as f:
-                _geocode_cache = json.load(f)
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                raise ValueError("geocode cache root is not a JSON object")
+            _geocode_cache = {
+                key: entry
+                for key, entry in loaded.items()
+                if _is_usable_cache_entry(entry)
+            }
+            if len(_geocode_cache) != len(loaded):
+                logging.warning(
+                    f"Dropped {len(loaded) - len(_geocode_cache)} malformed geocode cache entries"
+                )
+            _geocode_cache_from_disk = set(_geocode_cache)
             logging.info(
                 f"Loaded {len(_geocode_cache)} geocode cache entries from {_geocode_cache_file}"
             )
-        except (json.JSONDecodeError, OSError) as e:
+        except (json.JSONDecodeError, OSError, ValueError) as e:
             logging.warning(f"Could not load geocode cache: {e}")
             _geocode_cache = {}
+            _geocode_cache_from_disk = set()
 
 
 def _save_geocode_cache():
@@ -160,10 +194,20 @@ def geocode_location_string(location_string):
     Requests Nominatim to geocode an input string. Results are cached in memory
     and persisted to disk (when GEOCODE_CACHE_FILE is set) so they survive
     across scraping attempts.
+
+    Returns the ``geopy.location.Location`` (or ``None``) as before; the source
+    of the result is recorded through ``_last_geocode_source`` for tracing only
+    and does not change the return value.
     """
+    global _last_geocode_source
     location_string = location_string.strip()
     if location_string in _geocode_cache:
         raw = _geocode_cache[location_string]
+        _last_geocode_source = (
+            "disk_cache"
+            if location_string in _geocode_cache_from_disk
+            else "memory_cache"
+        )
         if raw is None:
             return None
         return Location(
@@ -172,35 +216,126 @@ def geocode_location_string(location_string):
             raw=raw,
         )
 
+    _last_geocode_source = "request"
     logging.info(f"Calling geocoder: {location_string}")
     result = geolocator.geocode(location_string, addressdetails=True)
     _geocode_cache[location_string] = result.raw if result else None
+    _geocode_cache_from_disk.discard(location_string)
     return result
 
 
-def get_address(full_location):
+def _candidate_strings(full_location):
+    """
+    Builds the ordered list of strings Nominatim may be queried with, mirroring
+    the historical fallback order exactly: raw string, parenthesis-stripped,
+    substring after the first comma, then everything past the first line.
+
+    Duplicates are kept on purpose: the historical code attempted each step in
+    turn even when it produced the same string again, and such a repeat is
+    answered by the cache instead of Nominatim. ``geocode_location_string``
+    strips each candidate before querying/caching, as it always did.
+    """
+    candidates = [full_location]
+
+    without_parentheses = re.sub(r"\(.*\)", "", full_location)
+    candidates.append(without_parentheses)
+
+    if "," in without_parentheses:
+        candidates.append(without_parentheses.split(",", 1)[1])
+
+    lines = without_parentheses.splitlines(keepends=True)
+    if len(lines) > 1:
+        candidates.append("".join(lines[1:]))
+
+    return candidates
+
+
+def _format_trace(input_str, attempts, outcome, detail=""):
+    """Renders the resolution trace as human-readable log lines."""
+    lines = [f'Address resolution trace for "{input_str}":']
+    for index, attempt in enumerate(attempts, start=1):
+        candidate = attempt["candidate"].replace("\n", "\\n")
+        status = "hit" if attempt["found"] else "miss"
+        lines.append(f"  {index}. {candidate!r} -> {attempt['source']} ({status})")
+    if not attempts:
+        lines.append("  (no candidate was queried)")
+    lines.append(f"  outcome: {outcome}" + (f" ({detail})" if detail else ""))
+    return "\n".join(lines)
+
+
+def _record_trace(input_str, attempts, outcome, detail, matched_candidate, trace):
+    """
+    Publishes the trace without altering the geocoding result: writes it to the
+    log, stores it on the module-level ``last_resolution_trace`` and appends the
+    structured records to the optional ``trace`` list provided by the caller.
+    """
+    global last_resolution_trace
+    rendered = _format_trace(input_str, attempts, outcome, detail)
+    last_resolution_trace = rendered
+    log_resolution_trace(rendered)
+    if trace is not None:
+        trace.extend(attempts)
+        trace.append(
+            {
+                "outcome": outcome,
+                "detail": detail,
+                "matched_candidate": matched_candidate,
+            }
+        )
+
+
+def get_address(full_location, trace=None):
     """
     Gets structured location data from an input string, tries substrings if
     relevant, verifies that the result is sufficiently precise (address or park
     level) and returns a dictionnary with the address properties.
+
+    The returned dictionary and the ``FreskError`` conditions are unchanged.
+    Each call also emits a readable resolution trace: which candidate string was
+    tried (in order), whether it came from the in-memory cache, the disk cache
+    or a real Nominatim request, and the final outcome. The trace is written to
+    the log, kept on the module-level ``last_resolution_trace`` attribute, and
+    (optionally) appended to the ``trace`` list passed by the caller.
     """
+    attempts = []
+    matched_candidate = None
+    outcome = "failure"
+    detail = ""
+    # Matches the historical error-message input: once the raw string fails,
+    # the parenthesis-stripped form becomes the reference string.
+    input_for_errors = full_location
+
     try:
         if not full_location:
+            detail = "empty input"
             raise FreskAddressNotFound("")
 
-        location = geocode_location_string(full_location)
+        normalized_location = re.sub(r"\(.*\)", "", full_location)
+        location = None
+        queried = None
+        for index, candidate in enumerate(_candidate_strings(full_location)):
+            # Record the string as Nominatim/cache actually saw it: the geocoder
+            # helper strips its input.
+            queried = candidate.strip()
+            attempt = {"candidate": queried, "source": None, "found": False}
+            attempts.append(attempt)
+            try:
+                location = geocode_location_string(candidate)
+            except Exception as e:
+                attempt["source"] = _last_geocode_source or "request"
+                attempt["error"] = repr(e)
+                detail = f"geocoder raised on candidate {queried!r}: {e}"
+                raise
+            attempt["source"] = _last_geocode_source
+            attempt["found"] = location is not None
+            if location is not None:
+                matched_candidate = queried
+                break
+            if index == 0:
+                input_for_errors = normalized_location
         if location is None:
-            full_location = re.sub(r"\(.*\)", "", full_location)
-            location = geocode_location_string(full_location)
-        if location is None:
-            if "," in full_location:
-                location = geocode_location_string(full_location.split(",", 1)[1])
-        if location is None:
-            lines = full_location.splitlines(keepends=True)
-            if len(lines) > 1:
-                location = geocode_location_string("".join(lines[1:]))
-        if location is None:
-            raise FreskAddressNotFound(full_location)
+            detail = "no candidate geocoded"
+            raise FreskAddressNotFound(input_for_errors)
 
         address = location.raw["address"]
 
@@ -209,7 +344,8 @@ def get_address(full_location):
             and address["country_code"] != "ch"
             and address["country_code"] != "gb"
         ):
-            raise FreskCountryNotSupported(address, full_location)
+            detail = f"unsupported country; matched candidate {matched_candidate!r}"
+            raise FreskCountryNotSupported(address, input_for_errors)
 
         house_number = ""
         if "house_number" in address.keys():
@@ -223,7 +359,8 @@ def get_address(full_location):
         elif "park" in address.keys():
             road = address["park"]
         else:
-            raise FreskAddressBadFormat(address, full_location, "road")
+            detail = f"missing road; matched candidate {matched_candidate!r}"
+            raise FreskAddressBadFormat(address, input_for_errors, "road")
 
         city = None
         if "city" in address.keys():
@@ -233,7 +370,8 @@ def get_address(full_location):
         elif "village" in address.keys():
             city = address["village"]
         else:
-            raise FreskAddressBadFormat(address, full_location, "city")
+            detail = f"missing city; matched candidate {matched_candidate!r}"
+            raise FreskAddressBadFormat(address, input_for_errors, "city")
 
         # Trying to infer the "department" code
         num_department = None
@@ -248,28 +386,48 @@ def get_address(full_location):
             elif "state" in address.keys():
                 department = address["state"]
             else:
-                raise FreskAddressBadFormat(address, full_location, "department")
+                detail = f"missing department; matched candidate {matched_candidate!r}"
+                raise FreskAddressBadFormat(address, input_for_errors, "department")
             try:
                 num_department = department_to_num(department)
             except FreskError:
+                detail = f"unknown department; matched candidate {matched_candidate!r}"
                 raise
         if address["country_code"] == "ch":
             # Swiss department "numbers" are ISO codes from https://en.wikipedia.org/wiki/ISO_3166-2:CH.
             if "ISO3166-2-lvl4" in address.keys():
                 canton = address["ISO3166-2-lvl4"]
                 if not canton.startswith("CH-"):
-                    raise FreskAddressBadFormat(address, full_location, "department")
+                    detail = f"bad canton; matched candidate {matched_candidate!r}"
+                    raise FreskAddressBadFormat(address, input_for_errors, "department")
                 num_department = canton[3:]
             else:
-                raise FreskAddressBadFormat(address, full_location, "department")
+                detail = f"missing canton; matched candidate {matched_candidate!r}"
+                raise FreskAddressBadFormat(address, input_for_errors, "department")
 
         # Missing fields
         if "postcode" not in address:
-            raise FreskAddressIncomplete(address, full_location, "postcode")
+            detail = f"missing postcode; matched candidate {matched_candidate!r}"
+            raise FreskAddressIncomplete(address, input_for_errors, "postcode")
+
+        outcome = "success"
+        detail = f"matched candidate {matched_candidate!r}"
 
     except FreskError as e:
         logging.error(f"get_address: {e}")
+        if not detail:
+            detail = str(e)
         raise
+    except Exception as e:
+        # Unexpected failures keep propagating unchanged; the trace still
+        # records how far the resolution got.
+        if not detail:
+            detail = f"unexpected error: {e!r}"
+        raise
+    finally:
+        _record_trace(
+            full_location or "", attempts, outcome, detail, matched_candidate, trace
+        )
 
     return {
         "location_name": location.raw["name"],
