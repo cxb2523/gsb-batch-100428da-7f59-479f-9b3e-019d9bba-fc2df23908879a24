@@ -1,0 +1,72 @@
+version: '3.8'
+
+services:
+  crawler:
+    build:
+      context: ./core
+      dockerfile: Dockerfile
+    container_name: google-maps-crawler
+    ports:
+      - "${API_PORT:-6970}:8000"
+    environment:
+      - API_HOST=0.0.0.0
+      - API_PORT=8000
+      - DISPLAY=:99
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # Persist Chrome profile between runs
+      - chrome_profile:/app/core/Chrome_Profile
+      # Persist results
+      - results:/app/core/results
+      # Persist SMTP settings, templates and send history
+      - smtp_data:/app/core/smtp_data
+      # Persist crawl jobs and their results
+      - jobs_data:/app/core/jobs_data
+      # Persist Xvfb logs for debugging
+      - xvfb_logs:/var/log/xvfb
+    restart: unless-stopped
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
+  leadgenui:
+    build:
+      context: ./LeadGenUI
+      args:
+        # Browser-side API URL (inlined at build time, must be reachable from the browser)
+        # Local: http://localhost:${API_PORT:-6970}
+        # Reverse proxy, same domain: /api
+        # Separate domain: https://api.example.com
+        NEXT_PUBLIC_CRAWLER_API_URL: "${NEXT_PUBLIC_CRAWLER_API_URL:-http://localhost:${API_PORT:-6970}}"
+    container_name: google-maps-crawler-ui
+    ports:
+      - "${UI_PORT:-3008}:3000"
+    environment:
+      # Server-side (SSR) API URL, reachable inside the Docker network
+      - CRAWLER_API_URL=http://crawler:8000
+    depends_on:
+      - crawler
+    restart: unless-stopped
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+volumes:
+  chrome_profile:
+    driver: local
+  results:
+    driver: local
+  smtp_data:
+    driver: local
+  jobs_data:
+    driver: local
+  xvfb_logs:
+    driver: local
