@@ -39,12 +39,12 @@ const booksComTwCrawler = require('books-com-tw-crawler');
 
 // Option 1
 booksComTwCrawler('The Clean Coder')
-  .then(results => console.log(results));
+  .then(outcome => console.log(outcome));
 
 // Option 2
 async function run() {
-  const results = await booksComTwCrawler('The Clean Coder')
-  console.log(results);
+  const outcome = await booksComTwCrawler('The Clean Coder')
+  console.log(outcome);
 }
 run();
 ```
@@ -68,6 +68,7 @@ $ yarn start # npm start
 ```shell
 >>> You search data using keyword "快速上手LINUX的九堂課".
 
+status: items, page: 1
 [
   {
     title: 'Linuxの繪本：快速上手LINUX的九堂課',
@@ -85,13 +86,15 @@ $ yarn start # npm start
 ```shell
 >>> You search data using keyword "春夏秋冬".
 
+status: items, page: 1
 [ {...}, {...}, ... ] # Array.prototype.length <= 60
 ```
 
 ```shell
 >>> You search data using keyword "blablablablablablablablablablablabla".
 
-null
+status: empty, page: 1
+[]
 ```
 
 ## Documentation
@@ -101,35 +104,59 @@ null
 ```javascript
 import booksComTwCrawler from 'books-com-tw-crawler';
 
-const result = await booksComTwCrawler(
+const outcome = await booksComTwCrawler(
   keyword, // string. Necessary.
            // If you set it as null, it will get an error.
   page, // number. Positive integer. Default: 1.
         // Every page only shows maximum 60 results.
+        // 0, negative numbers, decimals or non-numbers are rejected
+        // before any request is sent (status: "invalidPage").
 );
 ```
 
 ### Output results
 
-```javascript
-// If you get one or more result(s), it will return an "array".
-result = [
-  {
-    title: string or null,
-    author: string[] or null,
-    publisher: string or null,
-    publicationDate: string or null,
-    imageUrl: string or null,
-    introduction: string or null,
-    price: {
-      discount: number or null,
-      currentPrice: number or null
-    },
-    url: string | null
-  },
-  { ... }, { ... }, ...
-];
+Every call resolves to a page-level outcome object carrying the requested
+`page` and a discriminant `status`, so callers can tell products found, an
+empty page, a failed request and an invalid page argument apart:
 
-// If you have not got any result, it will return a "null".
-result = null;
+```javascript
+// One or more products were parsed from the page.
+outcome = {
+  status: 'items',
+  page: 1,
+  items: [
+    {
+      title: string or null,
+      author: string[] or null,
+      publisher: string or null,
+      publicationDate: string or null,
+      imageUrl: string or null,
+      introduction: string or null,
+      price: {
+        discount: number or null,
+        currentPrice: number or null
+      },
+      url: string | null
+    },
+    { ... }, { ... }, ...
+  ]
+};
+
+// The request succeeded but the page has no product list (including an
+// out-of-range page number).
+outcome = { status: 'empty', page: 1, items: [] };
+
+// The request failed (network error, non-2xx response, or rate-limit
+// (HTTP 429) retries exhausted). `reason` is diagnostics-safe; raw HTML and
+// stack traces are never exposed.
+outcome = { status: 'requestFailed', page: 1, reason: 'HTTP 429' };
+
+// The page argument is not a positive integer; no request was sent. `page`
+// holds the original rejected argument.
+outcome = {
+  status: 'invalidPage',
+  page: 0,
+  reason: 'The page argument must be a positive integer.'
+};
 ```

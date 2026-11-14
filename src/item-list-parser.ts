@@ -4,6 +4,13 @@
 
 import { DetailType, PriceField } from "../index";
 
+export type PageParseStatus = "items" | "empty";
+
+export interface PageParseResult {
+  status: PageParseStatus;
+  items: DetailType[];
+}
+
 const removeAllHtmlTag = (text: string): string => {
   let result: string = text.replace(/<\/?\w+[^>]*>/gi, "");
   // To remove beginning and end of spaces
@@ -173,4 +180,19 @@ export const itemListParser = (htmlCode: string): DetailType[] => {
     (value: string): DetailType => getItem(value),
   );
   return itemList;
+};
+
+/**
+ * To decide, from the fetched HTML alone, whether the page actually contains
+ * products. A 200 response without a product list (including an out-of-range
+ * page) is "empty", not a request failure.
+ */
+export const parseSearchPage = (htmlCode: string): PageParseResult => {
+  const items: DetailType[] = itemListParser(htmlCode);
+
+  if (items.length > 0) {
+    return { status: "items", items };
+  }
+
+  return { status: "empty", items: [] };
 };

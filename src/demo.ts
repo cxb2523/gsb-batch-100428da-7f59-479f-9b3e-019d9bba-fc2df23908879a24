@@ -14,7 +14,12 @@ const demo = async (keywordList: typeof demoKeywordList): Promise<void> => {
   for (const keyword of keywordList) {
     console.log(`>>> You search data using keyword "${keyword}".`);
     const result = await booksComTwCollection(keyword);
-    console.log(result);
+    console.log(`status: ${result.status}, page: ${result.page}`);
+    if (result.status === "items") {
+      console.log(result.items);
+    } else if (result.status === "requestFailed" || result.status === "invalidPage") {
+      console.log(`reason: ${result.reason}`);
+    }
   }
 };
 

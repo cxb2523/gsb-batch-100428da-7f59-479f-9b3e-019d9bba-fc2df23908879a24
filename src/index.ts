@@ -2,29 +2,58 @@
  * Main control for this library.
  */
 
-import { BooksComTwCollectionFunction, DetailType } from "../index";
-import { FetchResult, collectionFetch } from "./books-com-tw-fetch";
-import { itemListParser } from "./item-list-parser";
+import {
+  BooksComTwCollectionFunction,
+  DetailType,
+  SearchOutcome,
+} from "../index";
+import { PageFetchResult, collectionFetch, isPositiveIntegerPage } from "./books-com-tw-fetch";
+import { parseSearchPage } from "./item-list-parser";
 
 const booksComTwCollection: BooksComTwCollectionFunction = async (
   keyword: string,
   page: number = 1,
-): Promise<DetailType[] | null> => {
-  const htmlCodeAfterFetch: FetchResult = await collectionFetch(null, keyword, page);
-
-  // To check whether data is got
-  if (htmlCodeAfterFetch.data === null) {
-    // To do here if html code is empty (no result is got from the HTML code) or status code is not 200
-    return null;
+): Promise<SearchOutcome> => {
+  // Reject invalid page arguments before any request is sent instead of
+  // silently treating them as page 1.
+  if (!isPositiveIntegerPage(page)) {
+    return {
+      status: "invalidPage",
+      page,
+      reason: "The page argument must be a positive integer.",
+    };
   }
 
-  const itemList: DetailType[] = itemListParser(htmlCodeAfterFetch.data);
-  if (itemList.length > 0) {
-    // To do here if the HTML code contains one or more result(s)
-    return itemList;
+  const pageFetchResult: PageFetchResult = await collectionFetch(null, keyword, page);
+
+  if (pageFetchResult.status === "requestFailed") {
+    // Network error, non-2xx response, or rate-limit retries exhausted.
+    return {
+      status: "requestFailed",
+      page,
+      reason: pageFetchResult.reason,
+    };
   }
-  // To do here if no result is got from the HTML code and status code is 200
-  return null;
+
+  // A normal response without a product list (including out-of-range pages)
+  // is an empty page, decided by the parser layer from the HTML.
+  const parsedPage = parseSearchPage(pageFetchResult.html);
+
+  if (parsedPage.status === "empty") {
+    return {
+      status: "empty",
+      page,
+      items: [],
+    };
+  }
+
+  const items: DetailType[] = parsedPage.items;
+
+  return {
+    status: "items",
+    page,
+    items,
+  };
 };
 
 export default booksComTwCollection;
