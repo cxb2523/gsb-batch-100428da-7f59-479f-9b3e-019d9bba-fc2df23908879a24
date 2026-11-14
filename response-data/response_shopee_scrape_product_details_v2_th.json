@@ -1,0 +1,1355 @@
+{
+  "result": {
+    "item": {
+      "flag": 196608,
+      "name": "(ส่งด่วน/ส่งทันที🔥) Umbili Organic Mite Spray สเปรย์กำจัดไรฝุ่น สูตรปลอดภัยต่อคน และสัตว์เลี้ยง",
+      "brand": "Umbili(อัมบิลี่)",
+      "ctime": 1743154500,
+      "image": "th-11134207-81ztd-mt6kcrwny8smca",
+      "liked": false,
+      "price": "14900000",
+      "stock": "5264",
+      "title": "(ส่งด่วน/ส่งทันที🔥) Umbili Organic Mite Spray สเปรย์กำจัดไรฝุ่น สูตรปลอดภัยต่อคน และสัตว์เลี้ยง",
+      "cat_id": 100001,
+      "images": [
+        "th-11134207-81ztd-mt6kcrwny8smca",
+        "th-11134207-7rasm-m7w24aaarn6142",
+        "th-11134207-81ztk-mqyhbgnjhngk03",
+        "th-11134207-7rasl-m7w2e9e79aem96",
+        "th-11134207-7rash-m7w2e7q9ozqma7",
+        "th-11134207-7rasg-m7w2eb5qob1qf9",
+        "th-11134207-7rasc-m7w24vrbcfnz45"
+      ],
+      "itemid": 28631172993,
+      "models": [
+        {
+          "name": "UBLสเปรกำจัดไรฝุ่น 2",
+          "sold": 46,
+          "price": "30000000",
+          "stock": 3099,
+          "itemid": 28631172993,
+          "status": 1,
+          "extinfo": {
+            "sku_image": "",
+            "tier_index": [
+              1
+            ],
+            "is_pre_order": false,
+            "estimated_days": 2
+          },
+          "item_id": 28631172993,
+          "modelid": 288045551866,
+          "name_tr": null,
+          "model_id": "288045551866",
+          "has_stock": true,
+          "is_grayout": false,
+          "promotionid": null,
+          "is_clickable": true,
+          "normal_stock": 3099,
+          "price_stocks": [
+            {
+              "promotion_type": 301,
+              "allocated_stock": null,
+              "stock_breakdown_by_location": null
+            },
+            {
+              "promotion_type": 0,
+              "allocated_stock": null,
+              "stock_breakdown_by_location": null
+            }
+          ],
+          "promotion_id": null,
+          "has_gimmick_tag": false,
+          "key_measurement": null,
+          "price_before_discount": "50000000",
+          "is_lowest_price_at_shopee": null,
+          "current_promotion_reserved_stock": null,
+          "current_promotion_has_reserve_stock": null
+        },
+        {
+          "name": "UBLสเปรกำจัดไรฝุ่น 3",
+          "sold": 23,
+          "price": "42500000",
+          "stock": 2065,
+          "itemid": 28631172993,
+          "status": 1,
+          "extinfo": {
+            "sku_image": "",
+            "tier_index": [
+              2
+            ],
+            "is_pre_order": false,
+            "estimated_days": 2
+          },
+          "item_id": 28631172993,
+          "modelid": 288045551867,
+          "name_tr": null,
+          "model_id": "288045551867",
+          "has_stock": true,
+          "is_grayout": false,
+          "promotionid": null,
+          "is_clickable": true,
+          "normal_stock": 2065,
+          "price_stocks": [
+            {
+              "promotion_type": 301,
+              "allocated_stock": null,
+              "stock_breakdown_by_location": null
+            },
+            {
+              "promotion_type": 0,
+              "allocated_stock": null,
+              "stock_breakdown_by_location": null
+            }
+          ],
+          "promotion_id": null,
+          "has_gimmick_tag": false,
+          "key_measurement": null,
+          "price_before_discount": "75000000",
+          "is_lowest_price_at_shopee": null,
+          "current_promotion_reserved_stock": null,
+          "current_promotion_has_reserve_stock": null
+        },
+        {
+          "name": "UBLสเปรย์กำจัดไรฝุ่น",
+          "sold": 22480,
+          "price": "14900000",
+          "stock": 100,
+          "itemid": 28631172993,
+          "status": 1,
+          "extinfo": {
+            "sku_image": "",
+            "tier_index": [
+              0
+            ],
+            "is_pre_order": false,
+            "estimated_days": 2
+          },
+          "item_id": 28631172993,
+          "modelid": 243014601968,
+          "name_tr": null,
+          "model_id": "243014601968",
+          "has_stock": true,
+          "is_grayout": false,
+          "promotionid": null,
+          "is_clickable": true,
+          "normal_stock": 100,
+          "price_stocks": [
+            {
+              "promotion_type": 502,
+              "allocated_stock": null,
+              "stock_breakdown_by_location": null
+            },
+            {
+              "promotion_type": 0,
+              "allocated_stock": null,
+              "stock_breakdown_by_location": null
+            }
+          ],
+          "promotion_id": null,
+          "has_gimmick_tag": false,
+          "key_measurement": null,
+          "price_before_discount": "25000000",
+          "is_lowest_price_at_shopee": null,
+          "current_promotion_reserved_stock": null,
+          "current_promotion_has_reserve_stock": null
+        }
+      ],
+      "shopid": 106772427,
+      "status": 1,
+      "is_mart": false,
+      "item_id": 28631172993,
+      "shop_id": 106772427,
+      "age_gate": {
+        "kyc": null,
+        "adult_consent": null
+      },
+      "brand_id": 1447400,
+      "cod_flag": null,
+      "currency": "THB",
+      "is_adult": false,
+      "spl_info": null,
+      "title_tr": null,
+      "cb_option": 0,
+      "cmt_count": 6747,
+      "coin_info": {
+        "coin_earn_items": [],
+        "coin_earn_label": null,
+        "spend_cash_unit": 100000
+      },
+      "condition": 1,
+      "is_sexual": false,
+      "item_type": 0,
+      "label_ids": [
+        1001365,
+        1000028,
+        1000110,
+        1009116,
+        1908622,
+        1014045,
+        700640027,
+        1400180080,
+        1400095024,
+        844931064601283,
+        844931086908638,
+        1428713,
+        1718087960,
+        2073655,
+        2058593,
+        298643324,
+        700765086,
+        2098592,
+        2108635,
+        2103586,
+        298938367,
+        822059879271430,
+        822120593886220,
+        822120593887756,
+        299103340,
+        700960097,
+        2218676,
+        1400845277,
+        2298886,
+        843623424279161,
+        298923318,
+        700810080,
+        298923351,
+        1015641,
+        2058612,
+        298893326,
+        998286006,
+        2063618,
+        2063604,
+        2288632,
+        2058592,
+        2063592,
+        2288631
+      ],
+      "price_max": "42500000",
+      "price_min": "14900000",
+      "attributes": [
+        {
+          "id": 100036,
+          "url": null,
+          "name": "รูปแบบผลิตภัณฑ์ความงาม",
+          "type": null,
+          "value": "ของเหลว",
+          "val_id": 708,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100010,
+          "url": null,
+          "name": "อายุการเก็บรักษา",
+          "type": null,
+          "value": "24 เดือน",
+          "val_id": 605,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 101306,
+          "url": null,
+          "name": "Quantity per Pack",
+          "type": null,
+          "value": "1",
+          "val_id": 11855,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100963,
+          "url": null,
+          "name": "หมายเลขใบอนุญาต/อย.",
+          "type": null,
+          "value": "สธ 1007/18204",
+          "val_id": 0,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        }
+      ],
+      "categories": [
+        {
+          "catid": 100001,
+          "no_sub": false,
+          "display_name": "กลุ่มผลิตภัณฑ์เพื่อสุขภาพ",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 100019,
+          "no_sub": false,
+          "display_name": "ของใช้ส่วนตัว",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 100138,
+          "no_sub": true,
+          "display_name": "ผลิตภัณฑ์ป้องกันแมลง",
+          "is_default_subcat": false
+        }
+      ],
+      "disclaimer": null,
+      "is_presale": false,
+      "is_preview": false,
+      "size_chart": null,
+      "title_type": 1,
+      "description": "Umbili Organic Mite Spray - สเปรย์กำจัดไรฝุ่น สูตรออร์แกนิก ปลอดภัยต่อคนและสัตว์เลี้ยง\n\nเลขวินิจฉัย สธ 1007/18204\n\nสเปรย์ป้องกันและกำจัดไรฝุ่น สูตรออร์แกนิกอ่อนโยนจากธรรมชาติ\nมีส่วนผสมของน้ำมันหอมระเหยธรรมชาติ ช่วยทำความสะอาดที่นอน และวัสดุต่างๆ ให้ปราศจากไรฝุ่น\nเพื่อสุขภาพที่ดี และมีความหอมจากน้ำมันหอมระเหยช่วยให้ผ่อนคลาย\nเพิ่มสมดุลของการนอนหลับ สามารถใช้ฉีดบริเวณโซฟา ผ้าม่าน เสื่อ พรม ตุ๊กตา และอื่นๆ\n\nวิธีใช้ ฉีดพ่นลงบนวัสดุต่างๆ ให้ทั่วบริเวณที่ต้องการ ทิ้งให้สเปรย์ทำงานประมาณ 30 นาที\n",
+      "global_sold": 22549,
+      "item_rating": {
+        "rating_star": null,
+        "rating_count": [],
+        "total_rating_count": null
+      },
+      "item_status": "normal",
+      "liked_count": 5683,
+      "long_images": null,
+      "other_stock": null,
+      "drug_details": null,
+      "is_free_gift": false,
+      "is_pre_order": false,
+      "max_quantity": null,
+      "normal_stock": "5264",
+      "preview_info": null,
+      "raw_discount": null,
+      "deep_discount": null,
+      "fe_categories": [
+        {
+          "catid": 11044942,
+          "no_sub": false,
+          "display_name": "กลุ่มผลิตภัณฑ์เพื่อสุขภาพ",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 11045039,
+          "no_sub": false,
+          "display_name": "เครื่องมือและอุปกรณ์ในการดูแลสุขภาพ",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 11045298,
+          "no_sub": true,
+          "display_name": "ผลิตภัณฑ์ป้องกันแมลงกัดต่อย",
+          "is_default_subcat": false
+        }
+      ],
+      "is_hide_stock": null,
+      "shop_detailed": {
+        "name": "เบบี้พาสเท็ล",
+        "ctime": 1542797789,
+        "shopid": 106772427,
+        "status": null,
+        "userid": 106773908,
+        "account": {
+          "fbid": "",
+          "status": 1,
+          "portrait": "e8c5831c91dca268a6ecefa2b1db5e6f",
+          "username": "babypastelshop",
+          "is_seller": true,
+          "hide_likes": 0,
+          "email_verified": true,
+          "phone_verified": true,
+          "total_avg_star": 5,
+          "following_count": 63,
+          "feed_account_info": {
+            "can_post_feed": true
+          }
+        },
+        "vacation": false,
+        "item_count": 491,
+        "rating_bad": null,
+        "rating_good": null,
+        "rating_star": 4.889175,
+        "rating_normal": null,
+        "response_rate": 95,
+        "response_time": 18233,
+        "shop_location": null,
+        "follower_count": 171090,
+        "is_official_shop": null,
+        "last_active_time": 1794655589,
+        "is_shopee_verified": true,
+        "is_preferred_plus_seller": true,
+        "show_official_shop_label": false
+      },
+      "shop_location": "จังหวัดกรุงเทพมหานคร",
+      "show_discount": 99,
+      "stock_display": "5264",
+      "description_tr": null,
+      "discount_stock": null,
+      "estimated_days": 2,
+      "invoice_option": null,
+      "is_super_vitem": null,
+      "is_unavailable": false,
+      "item_has_video": false,
+      "badge_icon_type": 0,
+      "coin_earn_label": null,
+      "historical_sold": 22549,
+      "is_fashion_item": false,
+      "size_chart_info": null,
+      "tier_variations": [
+        {
+          "name": "ตัวเลือก",
+          "type": 0,
+          "images": [
+            "th-11134207-7rasl-m7w2h6mf9mj385",
+            "th-11134207-81zte-mupwycigxz4a6e",
+            "th-11134207-81ztj-mupwyciqyz2if6"
+          ],
+          "name_tr": null,
+          "options": [
+            "UBLสเปรย์กำจัดไรฝุ่น",
+            "UBLสเปรกำจัดไรฝุ่น 2",
+            "UBLสเปรกำจัดไรฝุ่น 3"
+          ],
+          "options_tr": null,
+          "properties": null,
+          "summed_stocks": null,
+          "selling_points": [
+            "",
+            "",
+            ""
+          ],
+          "selling_points_tr": null,
+          "display_indicators": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "video_info_list": [
+        {
+          "vid": "th-11110107-6v6xd-mh61lcfju498c2",
+          "formats": [
+            {
+              "url": "https://down-bs-th.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4",
+              "defn": "V720P",
+              "path": "api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4",
+              "width": 720,
+              "format": 1600008,
+              "height": 1280,
+              "profile": "MP4"
+            }
+          ],
+          "version": 2,
+          "duration": 25,
+          "mms_data": "{\"vid\":\"th-11110107-6v6xd-mh61lcfju498c2\",\"biz\":107,\"duration\":25366,\"create_time\":1763371255,\"update_time\":1763371258,\"serviceID\":6,\"cover\":\"https://down-zl-th.img.susercontent.com/th-11110107-6v6xd-mh61lcfju498c2_cover\",\"cover_list\":[],\"formats\":[{\"format\":1600008,\"defn\":\"V720P\",\"profile\":\"MP4\",\"path\":\"api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4\",\"url\":\"https://down-bs-th.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4\",\"width\":720,\"height\":1280,\"bitrate\":677851,\"abitrate\":64398,\"size\":2374797,\"fps\":25,\"duration\":25360,\"update_time\":1763371271,\"codec\":\"H264\"}],\"default_format\":{\"format\":1600323,\"defn\":\"V540P\",\"profile\":\"MP4\",\"path\":\"\",\"url\":\"https://mms.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.default.mp4\",\"width\":540,\"height\":960,\"bitrate\":401592,\"abitrate\":32483,\"size\":1398290,\"fps\":25,\"duration\":25360,\"update_time\":1763371276,\"codec\":\"H264\"},\"extend_formats\":{\"H265\":[{\"format\":1600309,\"defn\":\"V720P\",\"profile\":\"MP4\",\"path\":\"api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16003091763371273.mp4\",\"url\":\"https://down-bs-th.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16003091763371273.mp4\",\"width\":720,\"height\":1280,\"bitrate\":521766,\"abitrate\":64398,\"size\":1882895,\"fps\":25,\"duration\":25360,\"update_time\":1763371281,\"codec\":\"H265\"}]},\"ab_test\":\"\"}",
+          "video_id": "api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4",
+          "thumb_url": "th-11110107-6v6xd-mh61lcfju498c2_cover",
+          "item_cover": null,
+          "default_format": {
+            "url": "https://mms.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.default.mp4",
+            "defn": "V540P",
+            "path": "",
+            "width": 540,
+            "format": 1600323,
+            "height": 960,
+            "profile": "MP4"
+          }
+        }
+      ],
+      "add_on_deal_info": null,
+      "bundle_deal_info": null,
+      "complaint_policy": null,
+      "is_free_shipping": false,
+      "is_official_shop": false,
+      "can_use_wholesale": false,
+      "is_item_inherited": false,
+      "reference_item_id": "",
+      "is_alcohol_product": false,
+      "is_category_failed": null,
+      "min_purchase_limit": 1,
+      "shipping_icon_type": 0,
+      "social_proof_label": null,
+      "should_show_amp_tag": true,
+      "show_recycling_info": null,
+      "wholesale_tier_list": [],
+      "display_similar_sold": null,
+      "hidden_price_display": null,
+      "is_partial_fulfilled": true,
+      "is_prescription_item": false,
+      "is_service_by_shopee": false,
+      "max_quantity_display": null,
+      "selected_real_models": null,
+      "welcome_package_type": null,
+      "authorized_brand_name": null,
+      "credit_insurance_data": {},
+      "is_low_price_eligible": null,
+      "price_before_discount": "25000000",
+      "rich_text_description": {
+        "paragraph_list": [
+          {
+            "text": "Umbili Organic Mite Spray - สเปรย์กำจัดไรฝุ่น สูตรออร์แกนิก ปลอดภัยต่อคนและสัตว์เลี้ยง",
+            "type": 0,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": null
+          },
+          {
+            "text": null,
+            "type": 10001,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": 1
+          },
+          {
+            "text": "เลขวินิจฉัย สธ 1007/18204",
+            "type": 0,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": null
+          },
+          {
+            "text": null,
+            "type": 10001,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": 1
+          },
+          {
+            "text": "สเปรย์ป้องกันและกำจัดไรฝุ่น สูตรออร์แกนิกอ่อนโยนจากธรรมชาติ",
+            "type": 0,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": null
+          },
+          {
+            "text": "มีส่วนผสมของน้ำมันหอมระเหยธรรมชาติ ช่วยทำความสะอาดที่นอน และวัสดุต่างๆ ให้ปราศจากไรฝุ่น",
+            "type": 0,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": null
+          },
+          {
+            "text": "เพื่อสุขภาพที่ดี และมีความหอมจากน้ำมันหอมระเหยช่วยให้ผ่อนคลาย",
+            "type": 0,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": null
+          },
+          {
+            "text": "เพิ่มสมดุลของการนอนหลับ สามารถใช้ฉีดบริเวณโซฟา ผ้าม่าน เสื่อ พรม ตุ๊กตา และอื่นๆ",
+            "type": 0,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": null
+          },
+          {
+            "text": null,
+            "type": 10001,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": 1
+          },
+          {
+            "text": "วิธีใช้ ฉีดพ่นลงบนวัสดุต่างๆ ให้ทั่วบริเวณที่ต้องการ ทิ้งให้สเปรย์ทำงานประมาณ 30 นาที",
+            "type": 0,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": null
+          },
+          {
+            "text": null,
+            "type": 1,
+            "ratio": 1.014,
+            "img_id": "th-11134208-7rask-m7w2f08vyni40f",
+            "description_type": 1,
+            "empty_paragraph_count": null
+          }
+        ],
+        "source_language": null
+      },
+      "overall_purchase_limit": null,
+      "show_prescription_feed": false,
+      "is_live_streaming_price": null,
+      "is_presale_deposit_item": null,
+      "is_presale_deposit_made": null,
+      "presale_dday_start_time": null,
+      "show_original_guarantee": null,
+      "size_tier_variation_idx": null,
+      "all_models_has_pre_order": false,
+      "has_low_fulfillment_rate": false,
+      "is_preferred_plus_seller": null,
+      "rich_text_description_tr": null,
+      "is_lowest_price_at_shopee": null,
+      "price_max_before_discount": "75000000",
+      "price_min_before_discount": "25000000",
+      "should_move_ratings_above": null,
+      "show_best_price_guarantee": false,
+      "has_lowest_price_guarantee": null,
+      "show_shopee_verified_label": true,
+      "is_infant_milk_formula_product": false,
+      "current_promotion_reserved_stock": null,
+      "show_official_shop_label_in_title": false,
+      "is_cc_installment_payment_eligible": false,
+      "current_promotion_has_reserve_stock": null,
+      "has_model_with_available_shopee_stock": null,
+      "is_non_cc_installment_payment_eligible": false,
+      "display_description_disclosure_rsku_redirection": null
+    },
+    "account": {},
+    "age_gate": {
+      "kyc": null,
+      "adult_consent": null
+    },
+    "trade_in": null,
+    "cmt_count": 6747,
+    "coin_info": {
+      "coin_earn_items": [],
+      "coin_earn_label": null,
+      "spend_cash_unit": 100000
+    },
+    "size_info": null,
+    "event_type": 0,
+    "flash_sale": null,
+    "size_guide": null,
+    "top_banner": {
+      "flash_sale": null,
+      "shopee_vip": null,
+      "live_stream": null,
+      "deep_discount": null,
+      "exclusive_price": {
+        "skin": {
+          "main_color": "#EE4D2D",
+          "secondary_color": "#FF7237",
+          "user_group_icon": "th-11134004-7ra0n-mdk0a9s5mbua0d",
+          "user_group_name": "โปรโมชั่นลูกค้าใหม่"
+        },
+        "promotion_id": 514779291004956
+      },
+      "welcome_package": null,
+      "vip_savings_banner": null,
+      "banner_display_type": null,
+      "recommended_voucher": null,
+      "membership_exclusive": null,
+      "platform_exclusive_sku": null,
+      "recommended_shop_voucher": null
+    },
+    "free_return": null,
+    "live_stream": null,
+    "button_group": {
+      "shop_opt": null,
+      "buy_with_voucher": null,
+      "ineligible_user_platform_exclusive_sku": null
+    },
+    "detail_level": 1,
+    "product_meta": {
+      "hide_sold_count": false,
+      "hide_sharing_button": false,
+      "show_original_guarantee": null,
+      "show_best_price_guarantee": false,
+      "show_shopee_verified_label": true,
+      "show_lowest_price_guarantee": null,
+      "show_lowest_installment_guarantee": null,
+      "show_official_shop_label_in_title": false,
+      "show_description_translation_button": null
+    },
+    "bottom_banner": null,
+    "deep_discount": null,
+    "designer_info": null,
+    "product_price": null,
+    "shipping_info": null,
+    "shipping_meta": {
+      "show_cod": null,
+      "show_mart": false,
+      "show_next_day_delivery": false,
+      "show_fufilled_by_shopee": null
+    },
+    "shop_detailed": {
+      "name": "เบบี้พาสเท็ล",
+      "ctime": 1542797789,
+      "shopid": 106772427,
+      "status": null,
+      "userid": 106773908,
+      "account": {
+        "fbid": "",
+        "status": 1,
+        "portrait": "e8c5831c91dca268a6ecefa2b1db5e6f",
+        "username": "babypastelshop",
+        "is_seller": true,
+        "hide_likes": 0,
+        "email_verified": true,
+        "phone_verified": true,
+        "total_avg_star": 5,
+        "following_count": 63,
+        "feed_account_info": {
+          "can_post_feed": true
+        }
+      },
+      "vacation": false,
+      "item_count": 491,
+      "rating_bad": null,
+      "rating_good": null,
+      "rating_star": 4.889175,
+      "rating_normal": null,
+      "response_rate": 95,
+      "response_time": 18233,
+      "shop_location": null,
+      "follower_count": 171090,
+      "is_official_shop": null,
+      "last_active_time": 1794655589,
+      "is_shopee_verified": true,
+      "is_preferred_plus_seller": true,
+      "show_official_shop_label": false
+    },
+    "shop_vouchers": null,
+    "teaser_banner": null,
+    "abnormal_popup": null,
+    "design_control": {
+      "enable_ksp_config": true,
+      "hide_review_view_all": null,
+      "hide_ftss_tpfs_section": null,
+      "is_support_fbs_enabled": false,
+      "display_direct_delivery": false,
+      "display_fashion_attributes": null,
+      "display_others_also_bought": null,
+      "support_shop_review_preview": null,
+      "use_new_revamp_first_screen": true,
+      "disable_price_with_variation": false,
+      "display_fashion_first_screen": null,
+      "display_fbs_floating_counter": null,
+      "keep_instant_pause_bottom_bar": false,
+      "use_new_featured_video_revamp": null,
+      "display_fashion_review_section": null,
+      "first_screen_revamp_abtest_group": null,
+      "merge_attributes_and_description": null,
+      "display_choice_customised_section": false,
+      "disable_main_page_select_variation": false,
+      "display_on_time_delivery_guarantee": true,
+      "enable_fashion_review_improvements": null,
+      "expand_size_guide_section_by_default": null,
+      "hide_shipping_channel_promotion_text": false,
+      "installment_drawer_updated_spl_display": null,
+      "top_section_featured_video_ab_test_group": null,
+      "enable_fashion_featured_videos_improvements": null,
+      "display_shipping_drawer_new_free_shipping_ui": false,
+      "pdp_revamp_phase1_improvement_ui_review_down": null,
+      "installment_drawer_collapse_cci_by_default_br": null,
+      "display_shipping_drawer_new_free_shipping_text": false,
+      "shift_featured_videos_above_review_ratings_section": null
+    },
+    "ongoing_banner": null,
+    "product_images": {
+      "video": {
+        "vid": "th-11110107-6v6xd-mh61lcfju498c2",
+        "formats": [
+          {
+            "url": "https://down-bs-th.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4",
+            "defn": "V720P",
+            "path": "api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4",
+            "width": 720,
+            "format": 1600008,
+            "height": 1280,
+            "profile": "MP4"
+          }
+        ],
+        "version": 2,
+        "duration": 25,
+        "mms_data": "{\"vid\":\"th-11110107-6v6xd-mh61lcfju498c2\",\"biz\":107,\"duration\":25366,\"create_time\":1763371255,\"update_time\":1763371258,\"serviceID\":6,\"cover\":\"https://down-zl-th.img.susercontent.com/th-11110107-6v6xd-mh61lcfju498c2_cover\",\"cover_list\":[],\"formats\":[{\"format\":1600008,\"defn\":\"V720P\",\"profile\":\"MP4\",\"path\":\"api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4\",\"url\":\"https://down-bs-th.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4\",\"width\":720,\"height\":1280,\"bitrate\":677851,\"abitrate\":64398,\"size\":2374797,\"fps\":25,\"duration\":25360,\"update_time\":1763371271,\"codec\":\"H264\"}],\"default_format\":{\"format\":1600323,\"defn\":\"V540P\",\"profile\":\"MP4\",\"path\":\"\",\"url\":\"https://mms.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.default.mp4\",\"width\":540,\"height\":960,\"bitrate\":401592,\"abitrate\":32483,\"size\":1398290,\"fps\":25,\"duration\":25360,\"update_time\":1763371276,\"codec\":\"H264\"},\"extend_formats\":{\"H265\":[{\"format\":1600309,\"defn\":\"V720P\",\"profile\":\"MP4\",\"path\":\"api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16003091763371273.mp4\",\"url\":\"https://down-bs-th.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16003091763371273.mp4\",\"width\":720,\"height\":1280,\"bitrate\":521766,\"abitrate\":64398,\"size\":1882895,\"fps\":25,\"duration\":25360,\"update_time\":1763371281,\"codec\":\"H265\"}]},\"ab_test\":\"\"}",
+        "video_id": "api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4",
+        "thumb_url": "th-11110107-6v6xd-mh61lcfju498c2_cover",
+        "item_cover": null,
+        "default_format": {
+          "url": "https://mms.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.default.mp4",
+          "defn": "V540P",
+          "path": "",
+          "width": 540,
+          "format": 1600323,
+          "height": 960,
+          "profile": "MP4"
+        }
+      },
+      "images": [
+        "th-11134207-81ztd-mt6kcrwny8smca",
+        "th-11134207-7rasm-m7w24aaarn6142",
+        "th-11134207-81ztk-mqyhbgnjhngk03",
+        "th-11134207-7rasl-m7w2e9e79aem96",
+        "th-11134207-7rash-m7w2e7q9ozqma7",
+        "th-11134207-7rasg-m7w2eb5qob1qf9",
+        "th-11134207-7rasc-m7w24vrbcfnz45"
+      ],
+      "models": [
+        {
+          "tier_index": [
+            1
+          ],
+          "gallery_image": "th-11134207-81zte-mupwycigxz4a6e"
+        },
+        {
+          "tier_index": [
+            2
+          ],
+          "gallery_image": "th-11134207-81ztj-mupwyciqyz2if6"
+        },
+        {
+          "tier_index": [
+            0
+          ],
+          "gallery_image": "th-11134207-7rasl-m7w2h6mf9mj385"
+        }
+      ],
+      "overlay": {
+        "type": 0,
+        "image": "th-11134258-7r98z-lza9f5c8o71l63",
+        "description": "",
+        "is_pre_order": null,
+        "preview_end_time": null
+      },
+      "skincam": null,
+      "beautycam": null,
+      "try_it_on": null,
+      "cover_image": null,
+      "long_images": null,
+      "has_long_image": false,
+      "makeup_preview": null,
+      "abnormal_status": "",
+      "gallery_contents": [
+        {
+          "image": null,
+          "video": {
+            "vid": "th-11110107-6v6xd-mh61lcfju498c2",
+            "formats": [
+              {
+                "url": "https://down-bs-th.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4",
+                "defn": "V720P",
+                "path": "api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4",
+                "width": 720,
+                "format": 1600008,
+                "height": 1280,
+                "profile": "MP4"
+              }
+            ],
+            "version": 2,
+            "duration": 25,
+            "mms_data": "{\"vid\":\"th-11110107-6v6xd-mh61lcfju498c2\",\"biz\":107,\"duration\":25366,\"create_time\":1763371255,\"update_time\":1763371258,\"serviceID\":6,\"cover\":\"https://down-zl-th.img.susercontent.com/th-11110107-6v6xd-mh61lcfju498c2_cover\",\"cover_list\":[],\"formats\":[{\"format\":1600008,\"defn\":\"V720P\",\"profile\":\"MP4\",\"path\":\"api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4\",\"url\":\"https://down-bs-th.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4\",\"width\":720,\"height\":1280,\"bitrate\":677851,\"abitrate\":64398,\"size\":2374797,\"fps\":25,\"duration\":25360,\"update_time\":1763371271,\"codec\":\"H264\"}],\"default_format\":{\"format\":1600323,\"defn\":\"V540P\",\"profile\":\"MP4\",\"path\":\"\",\"url\":\"https://mms.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.default.mp4\",\"width\":540,\"height\":960,\"bitrate\":401592,\"abitrate\":32483,\"size\":1398290,\"fps\":25,\"duration\":25360,\"update_time\":1763371276,\"codec\":\"H264\"},\"extend_formats\":{\"H265\":[{\"format\":1600309,\"defn\":\"V720P\",\"profile\":\"MP4\",\"path\":\"api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16003091763371273.mp4\",\"url\":\"https://down-bs-th.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16003091763371273.mp4\",\"width\":720,\"height\":1280,\"bitrate\":521766,\"abitrate\":64398,\"size\":1882895,\"fps\":25,\"duration\":25360,\"update_time\":1763371281,\"codec\":\"H265\"}]},\"ab_test\":\"\"}",
+            "video_id": "api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.16000081763371257.mp4",
+            "thumb_url": "th-11110107-6v6xd-mh61lcfju498c2_cover",
+            "item_cover": null,
+            "default_format": {
+              "url": "https://mms.vod.susercontent.com/api/v4/11110107/mms/th-11110107-6v6xd-mh61lcfju498c2.default.mp4",
+              "defn": "V540P",
+              "path": "",
+              "width": 540,
+              "format": 1600323,
+              "height": 960,
+              "profile": "MP4"
+            }
+          }
+        },
+        {
+          "image": {
+            "url": "th-11134207-81ztd-mt6kcrwny8smca",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "th-11134207-7rasm-m7w24aaarn6142",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "th-11134207-81ztk-mqyhbgnjhngk03",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "th-11134207-7rasl-m7w2e9e79aem96",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "th-11134207-7rash-m7w2e7q9ozqma7",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "th-11134207-7rasg-m7w2eb5qob1qf9",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "th-11134207-7rasc-m7w24vrbcfnz45",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        }
+      ],
+      "promotion_images": [],
+      "pdp_top_info_list": null,
+      "show_find_similar": null,
+      "shopee_video_req_id": null,
+      "first_tier_variations": [
+        {
+          "name": "UBLสเปรย์กำจัดไรฝุ่น",
+          "image": "th-11134207-7rasl-m7w2h6mf9mj385",
+          "name_tr": null,
+          "summed_stock": null,
+          "gallery_image": "th-11134207-7rasl-m7w2h6mf9mj385",
+          "selling_point": "",
+          "selling_point_tr": null,
+          "display_indicator": 0,
+          "show_find_similar": null
+        },
+        {
+          "name": "UBLสเปรกำจัดไรฝุ่น 2",
+          "image": "th-11134207-81zte-mupwycigxz4a6e",
+          "name_tr": null,
+          "summed_stock": null,
+          "gallery_image": "th-11134207-81zte-mupwycigxz4a6e",
+          "selling_point": "",
+          "selling_point_tr": null,
+          "display_indicator": 0,
+          "show_find_similar": null
+        },
+        {
+          "name": "UBLสเปรกำจัดไรฝุ่น 3",
+          "image": "th-11134207-81ztj-mupwyciqyz2if6",
+          "name_tr": null,
+          "summed_stock": null,
+          "gallery_image": "th-11134207-81ztj-mupwyciqyz2if6",
+          "selling_point": "",
+          "selling_point_tr": null,
+          "display_indicator": 0,
+          "show_find_similar": null
+        }
+      ],
+      "shopee_video_info_list": [],
+      "shopee_video_rcmd_info": null,
+      "show_find_similar_for_selection": false,
+      "unavailable_item_recommendation": null,
+      "sorted_variation_image_index_list": [
+        0,
+        1,
+        2
+      ]
+    },
+    "product_review": {
+      "liked": false,
+      "cmt_count": 6747,
+      "global_sold": 22549,
+      "hide_rating": false,
+      "liked_count": 5683,
+      "rating_star": null,
+      "hide_reviews": false,
+      "rating_count": null,
+      "historical_sold": 22549,
+      "hide_buyer_gallery": false,
+      "sold_count_display": null,
+      "total_rating_count": null,
+      "display_global_sold": false,
+      "global_sold_display": null,
+      "review_rcmd_exp_group": null,
+      "sold_count_disclosure": {
+        "type": 1
+      },
+      "historical_sold_display": null,
+      "should_move_ratings_above": null,
+      "hide_other_product_reviews_in_shop": false
+    },
+    "promotion_info": {
+      "spl": null,
+      "spl_lite": null,
+      "insurance": null,
+      "wholesale": null,
+      "installment": null,
+      "installment_simulation_entry": null,
+      "item_installment_eligibility": {
+        "is_cc_installment_payment_eligible": false,
+        "is_non_cc_installment_payment_eligible": false
+      }
+    },
+    "removed_fields": [
+      "product_price.price",
+      "product_price.price_before_discount",
+      "product_price.discount"
+    ],
+    "return_on_spot": null,
+    "service_drawer": {
+      "services": [
+        {
+          "id": 22,
+          "icon": "th-11134258-7rasi-m16xwc9aebsk37",
+          "type": null,
+          "title": "เก็บเงินปลายทาง",
+          "insurance": null,
+          "description": "ชำระเงินค่าสินค้าเมื่อคำสั่งซื้อจัดส่งถึงคุณ ระบบจะใช้ระยะเวลาในการอนุมัติคำสั่งซื้อเก็บเงินปลายทางภายใน 30 นาที",
+          "free_return": null,
+          "product_type": 0,
+          "redirection_url": "",
+          "insurance_drawer": null
+        },
+        {
+          "id": 23,
+          "icon": "th-11134258-7rasg-m16xwcaecpbo99",
+          "type": null,
+          "title": "ความคุ้มครองการแพ้สินค้า",
+          "insurance": null,
+          "description": "เรียนรู้เพิ่มเติม",
+          "free_return": null,
+          "product_type": 0,
+          "redirection_url": "https://protection.moneeinsurebroker.co.th/ec/ec-pdp.html?from=pdp&locale=TH&product_id=1697224113169684693",
+          "insurance_drawer": {}
+        }
+      ]
+    },
+    "tax_disclaimer": null,
+    "bcrs_disclaimer": null,
+    "exclusive_price": null,
+    "price_breakdown": {
+      "price": {
+        "range_max": -1,
+        "range_min": -1,
+        "price_mask": null,
+        "single_value": "100000"
+      },
+      "price_before_discount": {
+        "range_max": -1,
+        "range_min": -1,
+        "price_mask": null,
+        "single_value": "25000000"
+      }
+    },
+    "tier_variations": [
+      {
+        "name": "ตัวเลือก",
+        "type": 0,
+        "images": [
+          "th-11134207-7rasl-m7w2h6mf9mj385",
+          "th-11134207-81zte-mupwycigxz4a6e",
+          "th-11134207-81ztj-mupwyciqyz2if6"
+        ],
+        "options": [
+          "UBLสเปรย์กำจัดไรฝุ่น",
+          "UBLสเปรกำจัดไรฝุ่น 2",
+          "UBLสเปรกำจัดไรฝุ่น 3"
+        ]
+      }
+    ],
+    "age_gate_control": null,
+    "featured_voucher": null,
+    "product_shipping": null,
+    "promotion_drawer": null,
+    "service_entrance": {
+      "services": [
+        {
+          "id": 22,
+          "text": "เก็บเงินปลายทาง",
+          "type": null
+        },
+        {
+          "id": 23,
+          "text": "ความคุ้มครองการแพ้สินค้า",
+          "type": null
+        }
+      ]
+    },
+    "flash_sale_booked": null,
+    "alcohol_disclaimer": null,
+    "flash_sale_preview": null,
+    "installment_drawer": {
+      "spl": null,
+      "bank": {
+        "channels": null
+      },
+      "priority": [
+        0,
+        1
+      ],
+      "credit_card": null
+    },
+    "product_attributes": {
+      "attrs": [
+        {
+          "id": null,
+          "url": "/search?brands=1447400",
+          "name": "สินค้า",
+          "type": 1,
+          "value": "Umbili(อัมบิลี่)",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": 1447400,
+          "full_url": "https://shopee.co.th/search?brands=1447400",
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100036,
+          "url": null,
+          "name": "รูปแบบผลิตภัณฑ์ความงาม",
+          "type": 5,
+          "value": "ของเหลว",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100010,
+          "url": null,
+          "name": "อายุการเก็บรักษา",
+          "type": 5,
+          "value": "24 เดือน",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 101306,
+          "url": null,
+          "name": "Quantity per Pack",
+          "type": 5,
+          "value": "1",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100963,
+          "url": null,
+          "name": "หมายเลขใบอนุญาต/อย.",
+          "type": 5,
+          "value": "สธ 1007/18204",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": null,
+          "url": null,
+          "name": "ส่งจาก",
+          "type": 6,
+          "value": "จังหวัดกรุงเทพมหานคร",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        }
+      ],
+      "categories": [
+        {
+          "catid": 11044942,
+          "no_sub": false,
+          "display_name": "กลุ่มผลิตภัณฑ์เพื่อสุขภาพ",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 11045039,
+          "no_sub": false,
+          "display_name": "เครื่องมือและอุปกรณ์ในการดูแลสุขภาพ",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 11045298,
+          "no_sub": true,
+          "display_name": "ผลิตภัณฑ์ป้องกันแมลงกัดต่อย",
+          "is_default_subcat": false
+        }
+      ],
+      "related_items": [],
+      "upfront_attrs": null,
+      "fresh_featured_attrs": null
+    },
+    "shop_vouchers_meta": null,
+    "shopee_free_return": null,
+    "translation_status": 0,
+    "exclusive_price_cta": null,
+    "product_description": {
+      "paragraph_list": [
+        {
+          "text": "Umbili Organic Mite Spray - สเปรย์กำจัดไรฝุ่น สูตรออร์แกนิก ปลอดภัยต่อคนและสัตว์เลี้ยง",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": null,
+          "type": 10001,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": 1
+        },
+        {
+          "text": "เลขวินิจฉัย สธ 1007/18204",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": null,
+          "type": 10001,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": 1
+        },
+        {
+          "text": "สเปรย์ป้องกันและกำจัดไรฝุ่น สูตรออร์แกนิกอ่อนโยนจากธรรมชาติ",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "มีส่วนผสมของน้ำมันหอมระเหยธรรมชาติ ช่วยทำความสะอาดที่นอน และวัสดุต่างๆ ให้ปราศจากไรฝุ่น",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "เพื่อสุขภาพที่ดี และมีความหอมจากน้ำมันหอมระเหยช่วยให้ผ่อนคลาย",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "เพิ่มสมดุลของการนอนหลับ สามารถใช้ฉีดบริเวณโซฟา ผ้าม่าน เสื่อ พรม ตุ๊กตา และอื่นๆ",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": null,
+          "type": 10001,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": 1
+        },
+        {
+          "text": "วิธีใช้ ฉีดพ่นลงบนวัสดุต่างๆ ให้ทั่วบริเวณที่ต้องการ ทิ้งให้สเปรย์ทำงานประมาณ 30 นาที",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": null,
+          "type": 1,
+          "ratio": 1.014,
+          "img_id": "th-11134208-7rask-m7w2f08vyni40f",
+          "description_type": 1,
+          "empty_paragraph_count": null
+        }
+      ],
+      "source_language": ""
+    },
+    "size_recommendation": null,
+    "membership_exclusive": null,
+    "product_description_tr": null,
+    "membership_exclusive_teaser": null
+  },
+  "status": "completed",
+  "message": "Product data fetched successfully",
+  "service": {
+    "country": "TH",
+    "credit_cost": 14,
+    "service_name": "scrape_product_details_v2",
+    "service_actor": "shopee"
+  },
+  "timestamp": "2026-11-14T11:29:10.466976+00:00",
+  "created_at": "2026-11-14T11:28:46",
+  "request_id": "10e0ecbd-4654-4024-8859-220c04a9749c",
+  "updated_at": "2026-11-14T11:28:50",
+  "reason_data": "product_found",
+  "status_code": 200,
+  "task_status": "success",
+  "elapsed_time": 4.0,
+  "request_data": {
+    "url": "https://shopee.co.th/product/106772427/28631172993",
+    "is_batch_scraping_shopee": true
+  }
+}

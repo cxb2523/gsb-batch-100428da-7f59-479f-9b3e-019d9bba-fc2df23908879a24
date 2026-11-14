@@ -1,0 +1,1461 @@
+{
+  "result": {
+    "item": {
+      "flag": 269090816,
+      "name": "KitchenAid Pure Power Stand Blender 1.5L Heavy Duty Ice Crusher, Smoothie Maker, Food Processor & Chopper, Mix 5KSM2073",
+      "brand": "KitchenAid",
+      "ctime": 1773116310,
+      "image": "sg-11134207-81zwc-mn3w2djqtq8676",
+      "liked": false,
+      "price": "19900000",
+      "stock": "96",
+      "title": "KitchenAid Pure Power Stand Blender 1.5L Heavy Duty Ice Crusher, Smoothie Maker, Food Processor & Chopper, Mix 5KSM2073",
+      "cat_id": 100010,
+      "images": [
+        "sg-11134207-81zwc-mn3w2djqtq8676",
+        "sg-11134207-82632-mln0mpz7widhb7",
+        "sg-11134207-8260f-mln0mrjjuih4d9",
+        "sg-11134207-8260m-mln0mtk9mtj44e",
+        "sg-11134207-8261y-mln0yc225yit8f",
+        "sg-11134207-82616-mln0ndd8s8w3df",
+        "sg-11134207-8260u-mln0ni7407wg1c",
+        "sg-11134207-82625-mln0ojufsd1ra7",
+        "sg-11134207-8261n-mln0r6m3i5mpdb"
+      ],
+      "itemid": 51106998358,
+      "models": [
+        {
+          "name": "Porcerlaine White",
+          "sold": 35,
+          "price": "19900000",
+          "stock": 39,
+          "itemid": 51106998358,
+          "status": 1,
+          "extinfo": {
+            "sku_image": "",
+            "tier_index": [
+              2
+            ],
+            "is_pre_order": true,
+            "estimated_days": 7
+          },
+          "item_id": 51106998358,
+          "modelid": 267445689264,
+          "name_tr": null,
+          "model_id": "267445689264",
+          "has_stock": true,
+          "is_grayout": false,
+          "promotionid": null,
+          "is_clickable": true,
+          "normal_stock": 39,
+          "price_stocks": [
+            {
+              "promotion_type": 301,
+              "allocated_stock": null,
+              "stock_breakdown_by_location": null
+            },
+            {
+              "promotion_type": 0,
+              "allocated_stock": null,
+              "stock_breakdown_by_location": null
+            }
+          ],
+          "promotion_id": null,
+          "has_gimmick_tag": false,
+          "key_measurement": null,
+          "price_before_discount": "29900000",
+          "is_lowest_price_at_shopee": null,
+          "current_promotion_reserved_stock": null,
+          "current_promotion_has_reserve_stock": null
+        },
+        {
+          "name": "Empire Red",
+          "sold": 65,
+          "price": "19900000",
+          "stock": 37,
+          "itemid": 51106998358,
+          "status": 1,
+          "extinfo": {
+            "sku_image": "",
+            "tier_index": [
+              0
+            ],
+            "is_pre_order": true,
+            "estimated_days": 7
+          },
+          "item_id": 51106998358,
+          "modelid": 267445689262,
+          "name_tr": null,
+          "model_id": "267445689262",
+          "has_stock": true,
+          "is_grayout": false,
+          "promotionid": null,
+          "is_clickable": true,
+          "normal_stock": 37,
+          "price_stocks": [
+            {
+              "promotion_type": 301,
+              "allocated_stock": null,
+              "stock_breakdown_by_location": null
+            },
+            {
+              "promotion_type": 0,
+              "allocated_stock": null,
+              "stock_breakdown_by_location": null
+            }
+          ],
+          "promotion_id": null,
+          "has_gimmick_tag": false,
+          "key_measurement": null,
+          "price_before_discount": "29900000",
+          "is_lowest_price_at_shopee": null,
+          "current_promotion_reserved_stock": null,
+          "current_promotion_has_reserve_stock": null
+        },
+        {
+          "name": "Matte Black",
+          "sold": 45,
+          "price": "19900000",
+          "stock": 20,
+          "itemid": 51106998358,
+          "status": 1,
+          "extinfo": {
+            "sku_image": "",
+            "tier_index": [
+              1
+            ],
+            "is_pre_order": true,
+            "estimated_days": 7
+          },
+          "item_id": 51106998358,
+          "modelid": 267445689263,
+          "name_tr": null,
+          "model_id": "267445689263",
+          "has_stock": true,
+          "is_grayout": false,
+          "promotionid": null,
+          "is_clickable": true,
+          "normal_stock": 20,
+          "price_stocks": [
+            {
+              "promotion_type": 301,
+              "allocated_stock": null,
+              "stock_breakdown_by_location": null
+            },
+            {
+              "promotion_type": 0,
+              "allocated_stock": null,
+              "stock_breakdown_by_location": null
+            }
+          ],
+          "promotion_id": null,
+          "has_gimmick_tag": false,
+          "key_measurement": null,
+          "price_before_discount": "29900000",
+          "is_lowest_price_at_shopee": null,
+          "current_promotion_reserved_stock": null,
+          "current_promotion_has_reserve_stock": null
+        }
+      ],
+      "shopid": 88061045,
+      "status": 1,
+      "is_mart": false,
+      "item_id": 51106998358,
+      "shop_id": 88061045,
+      "age_gate": {
+        "kyc": null,
+        "adult_consent": null
+      },
+      "brand_id": 1801645,
+      "cod_flag": null,
+      "currency": "SGD",
+      "is_adult": false,
+      "spl_info": null,
+      "title_tr": null,
+      "cb_option": 0,
+      "cmt_count": 43,
+      "coin_info": {
+        "coin_earn_items": [
+          {
+            "coin_earn": 0
+          },
+          {
+            "coin_earn": 0
+          },
+          {
+            "coin_earn": 0
+          }
+        ],
+        "coin_earn_label": null,
+        "spend_cash_unit": 1000
+      },
+      "condition": 1,
+      "is_sexual": false,
+      "item_type": 0,
+      "label_ids": [
+        1000107,
+        700025219,
+        298843359,
+        298733330,
+        1007622,
+        1011653,
+        1428754,
+        1114845,
+        1433761,
+        1010074,
+        22,
+        1000021,
+        1000035,
+        844931046478970,
+        844931064601283,
+        822059734999051,
+        843079680351338,
+        1718087960,
+        1428713,
+        2318721,
+        843158296243269,
+        822120593197072,
+        839720755463713,
+        843080294716568,
+        843080294718104,
+        298788312,
+        998031006,
+        814381247146502,
+        298933337,
+        998301212,
+        700630038,
+        1993633,
+        2018639,
+        1988643,
+        298628334,
+        700815075,
+        298888328,
+        2098767
+      ],
+      "price_max": "19900000",
+      "price_min": "19900000",
+      "attributes": [
+        {
+          "id": 100037,
+          "url": null,
+          "name": "Region of Origin",
+          "type": null,
+          "value": "America",
+          "val_id": 110,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100370,
+          "url": null,
+          "name": "Warranty Type",
+          "type": null,
+          "value": "Supplier Warranty",
+          "val_id": 2437,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100275,
+          "url": null,
+          "name": "Blender Type",
+          "type": null,
+          "value": "Countertop Blender",
+          "val_id": 2030,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100274,
+          "url": null,
+          "name": "Blender Features",
+          "type": null,
+          "value": "Detachable Blades, Ice Crushing, Variable speeds",
+          "val_id": 2127,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 101219,
+          "url": null,
+          "name": "Custom Product",
+          "type": null,
+          "value": "No",
+          "val_id": 7222,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100413,
+          "url": null,
+          "name": "Condition",
+          "type": null,
+          "value": "New",
+          "val_id": 2497,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100526,
+          "url": null,
+          "name": "Build-in Battery",
+          "type": null,
+          "value": "No",
+          "val_id": 2930,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100095,
+          "url": null,
+          "name": "Weight",
+          "type": null,
+          "value": "10kg",
+          "val_id": 0,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100134,
+          "url": null,
+          "name": "Material",
+          "type": null,
+          "value": "bpa-free jar",
+          "val_id": 0,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100942,
+          "url": null,
+          "name": "Dimension (L x W x H)",
+          "type": null,
+          "value": "12.13 x 10.47 x 16.89",
+          "val_id": 0,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100961,
+          "url": null,
+          "name": "Safety Mark",
+          "type": null,
+          "value": "200275-24",
+          "val_id": 0,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        }
+      ],
+      "categories": [
+        {
+          "catid": 100010,
+          "no_sub": false,
+          "display_name": "Home Appliances",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 100041,
+          "no_sub": false,
+          "display_name": "Kitchen Appliances",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 100193,
+          "no_sub": true,
+          "display_name": "Juicers, Blenders & Soya Bean Machines",
+          "is_default_subcat": false
+        }
+      ],
+      "disclaimer": null,
+      "is_presale": false,
+      "is_preview": false,
+      "size_chart": null,
+      "title_type": 1,
+      "description": "Pure Power. Pure Control\n- Go ahead and blend the rules with the K200 Pure Power Blender. A precision control knob, powerful asymmetrical blades, and a vented lid means the confidence and control in making your favorite recipes just the way you like them.\n\n- From chunky salsa to smooth tomato soup, the precision speed control knob helps you achieve the blends you want. Choose your exact setting between 1 and 10 or smoothly glide between the speeds to create your desired texture.\n\n- Whether it's roasted tomatoes fresh from the oven or frozen whole foods straight from the freezer, blend foods into a whole range of textures for your hot or cold recipes.\n",
+      "global_sold": 145,
+      "item_rating": {
+        "rating_star": null,
+        "rating_count": [],
+        "total_rating_count": null
+      },
+      "item_status": "normal",
+      "liked_count": 191,
+      "long_images": null,
+      "other_stock": null,
+      "drug_details": null,
+      "is_free_gift": false,
+      "is_pre_order": true,
+      "max_quantity": null,
+      "normal_stock": "96",
+      "preview_info": null,
+      "raw_discount": null,
+      "deep_discount": null,
+      "fe_categories": [
+        {
+          "catid": 11027421,
+          "no_sub": false,
+          "display_name": "Home Appliances",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 11027457,
+          "no_sub": false,
+          "display_name": "Small Kitchen Appliances",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 11027469,
+          "no_sub": true,
+          "display_name": "Juicers & Blenders",
+          "is_default_subcat": false
+        }
+      ],
+      "is_hide_stock": null,
+      "shop_detailed": {
+        "name": "KitchenAid Official Store ",
+        "ctime": 1536052697,
+        "shopid": 88061045,
+        "status": null,
+        "userid": 88062523,
+        "account": {
+          "fbid": "",
+          "status": 1,
+          "portrait": "028f4b3a07ff067660f09cf29d61a1bc",
+          "username": "kitchenaidsingapore",
+          "is_seller": true,
+          "hide_likes": 0,
+          "email_verified": true,
+          "phone_verified": true,
+          "total_avg_star": 0,
+          "following_count": 4,
+          "feed_account_info": {
+            "can_post_feed": true
+          }
+        },
+        "vacation": false,
+        "item_count": 37,
+        "rating_bad": null,
+        "rating_good": null,
+        "rating_star": 4.84944,
+        "rating_normal": null,
+        "response_rate": 93,
+        "response_time": 7310,
+        "shop_location": null,
+        "follower_count": 20917,
+        "is_official_shop": null,
+        "last_active_time": 1794651889,
+        "is_shopee_verified": false,
+        "is_preferred_plus_seller": false,
+        "show_official_shop_label": true
+      },
+      "shop_location": "SG",
+      "show_discount": 33,
+      "stock_display": "96",
+      "description_tr": null,
+      "discount_stock": null,
+      "estimated_days": 7,
+      "invoice_option": null,
+      "is_super_vitem": null,
+      "is_unavailable": false,
+      "item_has_video": false,
+      "badge_icon_type": 11,
+      "coin_earn_label": null,
+      "historical_sold": 145,
+      "is_fashion_item": false,
+      "size_chart_info": null,
+      "tier_variations": [
+        {
+          "name": "Color",
+          "type": 0,
+          "images": [
+            "sg-11134207-81zwc-mn3w2djqtq8676",
+            "sg-11134207-81zuo-mn3w2gj34u0x1e",
+            "sg-11134207-81zux-mn3w2lhv2j2e45"
+          ],
+          "name_tr": null,
+          "options": [
+            "Empire Red",
+            "Matte Black",
+            "Porcerlaine White"
+          ],
+          "options_tr": null,
+          "properties": null,
+          "summed_stocks": null,
+          "selling_points": [
+            "",
+            "",
+            ""
+          ],
+          "selling_points_tr": null,
+          "display_indicators": [
+            0,
+            0,
+            0
+          ]
+        }
+      ],
+      "video_info_list": [],
+      "add_on_deal_info": null,
+      "bundle_deal_info": null,
+      "complaint_policy": null,
+      "is_free_shipping": false,
+      "is_official_shop": true,
+      "can_use_wholesale": false,
+      "is_item_inherited": false,
+      "reference_item_id": "",
+      "is_alcohol_product": false,
+      "is_category_failed": null,
+      "min_purchase_limit": 1,
+      "shipping_icon_type": 0,
+      "social_proof_label": null,
+      "should_show_amp_tag": true,
+      "show_recycling_info": null,
+      "wholesale_tier_list": [],
+      "display_similar_sold": null,
+      "hidden_price_display": null,
+      "is_partial_fulfilled": true,
+      "is_prescription_item": false,
+      "is_service_by_shopee": true,
+      "max_quantity_display": null,
+      "selected_real_models": null,
+      "welcome_package_type": null,
+      "authorized_brand_name": null,
+      "credit_insurance_data": {},
+      "is_low_price_eligible": null,
+      "price_before_discount": "29900000",
+      "rich_text_description": {
+        "paragraph_list": [
+          {
+            "text": "Pure Power. Pure Control",
+            "type": 0,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": null
+          },
+          {
+            "text": "- Go ahead and blend the rules with the K200 Pure Power Blender. A precision control knob, powerful asymmetrical blades, and a vented lid means the confidence and control in making your favorite recipes just the way you like them.",
+            "type": 0,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": null
+          },
+          {
+            "text": null,
+            "type": 10001,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": 1
+          },
+          {
+            "text": "- From chunky salsa to smooth tomato soup, the precision speed control knob helps you achieve the blends you want. Choose your exact setting between 1 and 10 or smoothly glide between the speeds to create your desired texture.",
+            "type": 0,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": null
+          },
+          {
+            "text": null,
+            "type": 10001,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": 1
+          },
+          {
+            "text": "- Whether it's roasted tomatoes fresh from the oven or frozen whole foods straight from the freezer, blend foods into a whole range of textures for your hot or cold recipes.",
+            "type": 0,
+            "ratio": null,
+            "img_id": null,
+            "description_type": 1,
+            "empty_paragraph_count": null
+          }
+        ],
+        "source_language": null
+      },
+      "overall_purchase_limit": null,
+      "show_prescription_feed": false,
+      "is_live_streaming_price": null,
+      "is_presale_deposit_item": null,
+      "is_presale_deposit_made": null,
+      "presale_dday_start_time": null,
+      "show_original_guarantee": null,
+      "size_tier_variation_idx": null,
+      "all_models_has_pre_order": true,
+      "has_low_fulfillment_rate": false,
+      "is_preferred_plus_seller": null,
+      "rich_text_description_tr": null,
+      "is_lowest_price_at_shopee": null,
+      "price_max_before_discount": "29900000",
+      "price_min_before_discount": "29900000",
+      "should_move_ratings_above": null,
+      "show_best_price_guarantee": false,
+      "has_lowest_price_guarantee": null,
+      "show_shopee_verified_label": false,
+      "is_infant_milk_formula_product": false,
+      "current_promotion_reserved_stock": null,
+      "show_official_shop_label_in_title": true,
+      "is_cc_installment_payment_eligible": false,
+      "current_promotion_has_reserve_stock": null,
+      "has_model_with_available_shopee_stock": null,
+      "is_non_cc_installment_payment_eligible": false,
+      "display_description_disclosure_rsku_redirection": null
+    },
+    "account": {},
+    "age_gate": {
+      "kyc": null,
+      "adult_consent": null
+    },
+    "trade_in": null,
+    "cmt_count": 43,
+    "coin_info": {
+      "coin_earn_items": [
+        {
+          "coin_earn": 0
+        },
+        {
+          "coin_earn": 0
+        },
+        {
+          "coin_earn": 0
+        }
+      ],
+      "coin_earn_label": null,
+      "spend_cash_unit": 1000
+    },
+    "size_info": null,
+    "event_type": 0,
+    "flash_sale": null,
+    "size_guide": null,
+    "top_banner": null,
+    "free_return": null,
+    "live_stream": null,
+    "button_group": {
+      "shop_opt": null,
+      "buy_with_voucher": {
+        "price": null
+      },
+      "ineligible_user_platform_exclusive_sku": null
+    },
+    "detail_level": 1,
+    "product_meta": {
+      "hide_sold_count": false,
+      "hide_sharing_button": false,
+      "show_original_guarantee": null,
+      "show_best_price_guarantee": false,
+      "show_shopee_verified_label": false,
+      "show_lowest_price_guarantee": null,
+      "show_lowest_installment_guarantee": null,
+      "show_official_shop_label_in_title": true,
+      "show_description_translation_button": null
+    },
+    "bottom_banner": null,
+    "deep_discount": null,
+    "designer_info": null,
+    "product_price": null,
+    "shipping_info": null,
+    "shipping_meta": {
+      "show_cod": null,
+      "show_mart": false,
+      "show_next_day_delivery": false,
+      "show_fufilled_by_shopee": null
+    },
+    "shop_detailed": {
+      "name": "KitchenAid Official Store ",
+      "ctime": 1536052697,
+      "shopid": 88061045,
+      "status": null,
+      "userid": 88062523,
+      "account": {
+        "fbid": "",
+        "status": 1,
+        "portrait": "028f4b3a07ff067660f09cf29d61a1bc",
+        "username": "kitchenaidsingapore",
+        "is_seller": true,
+        "hide_likes": 0,
+        "email_verified": true,
+        "phone_verified": true,
+        "total_avg_star": 0,
+        "following_count": 4,
+        "feed_account_info": {
+          "can_post_feed": true
+        }
+      },
+      "vacation": false,
+      "item_count": 37,
+      "rating_bad": null,
+      "rating_good": null,
+      "rating_star": 4.84944,
+      "rating_normal": null,
+      "response_rate": 93,
+      "response_time": 7310,
+      "shop_location": null,
+      "follower_count": 20917,
+      "is_official_shop": null,
+      "last_active_time": 1794651889,
+      "is_shopee_verified": false,
+      "is_preferred_plus_seller": false,
+      "show_official_shop_label": true
+    },
+    "shop_vouchers": null,
+    "teaser_banner": null,
+    "abnormal_popup": null,
+    "design_control": {
+      "enable_ksp_config": true,
+      "hide_review_view_all": null,
+      "hide_ftss_tpfs_section": null,
+      "is_support_fbs_enabled": false,
+      "display_direct_delivery": false,
+      "display_fashion_attributes": null,
+      "display_others_also_bought": null,
+      "support_shop_review_preview": null,
+      "use_new_revamp_first_screen": true,
+      "disable_price_with_variation": false,
+      "display_fashion_first_screen": null,
+      "display_fbs_floating_counter": null,
+      "keep_instant_pause_bottom_bar": false,
+      "use_new_featured_video_revamp": null,
+      "display_fashion_review_section": null,
+      "first_screen_revamp_abtest_group": null,
+      "merge_attributes_and_description": null,
+      "display_choice_customised_section": false,
+      "disable_main_page_select_variation": false,
+      "display_on_time_delivery_guarantee": true,
+      "enable_fashion_review_improvements": null,
+      "expand_size_guide_section_by_default": null,
+      "hide_shipping_channel_promotion_text": false,
+      "installment_drawer_updated_spl_display": null,
+      "top_section_featured_video_ab_test_group": null,
+      "enable_fashion_featured_videos_improvements": null,
+      "display_shipping_drawer_new_free_shipping_ui": false,
+      "pdp_revamp_phase1_improvement_ui_review_down": null,
+      "installment_drawer_collapse_cci_by_default_br": null,
+      "display_shipping_drawer_new_free_shipping_text": false,
+      "shift_featured_videos_above_review_ratings_section": null
+    },
+    "ongoing_banner": null,
+    "product_images": {
+      "video": null,
+      "images": [
+        "sg-11134207-81zwc-mn3w2djqtq8676",
+        "sg-11134207-82632-mln0mpz7widhb7",
+        "sg-11134207-8260f-mln0mrjjuih4d9",
+        "sg-11134207-8260m-mln0mtk9mtj44e",
+        "sg-11134207-8261y-mln0yc225yit8f",
+        "sg-11134207-82616-mln0ndd8s8w3df",
+        "sg-11134207-8260u-mln0ni7407wg1c",
+        "sg-11134207-82625-mln0ojufsd1ra7",
+        "sg-11134207-8261n-mln0r6m3i5mpdb"
+      ],
+      "models": [
+        {
+          "tier_index": [
+            2
+          ],
+          "gallery_image": "sg-11134207-81zux-mn3w2lhv2j2e45"
+        },
+        {
+          "tier_index": [
+            0
+          ],
+          "gallery_image": "sg-11134207-81zwc-mn3w2djqtq8676"
+        },
+        {
+          "tier_index": [
+            1
+          ],
+          "gallery_image": "sg-11134207-81zuo-mn3w2gj34u0x1e"
+        }
+      ],
+      "overlay": {
+        "type": 0,
+        "image": "sg-11134258-8259r-mutc9i2d7awx76",
+        "description": "",
+        "is_pre_order": null,
+        "preview_end_time": null
+      },
+      "skincam": null,
+      "beautycam": null,
+      "try_it_on": null,
+      "cover_image": null,
+      "long_images": null,
+      "has_long_image": false,
+      "makeup_preview": null,
+      "abnormal_status": "",
+      "gallery_contents": [
+        {
+          "image": {
+            "url": "sg-11134207-81zwc-mn3w2djqtq8676",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "sg-11134207-82632-mln0mpz7widhb7",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "sg-11134207-8260f-mln0mrjjuih4d9",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "sg-11134207-8260m-mln0mtk9mtj44e",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "sg-11134207-8261y-mln0yc225yit8f",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "sg-11134207-82616-mln0ndd8s8w3df",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "sg-11134207-8260u-mln0ni7407wg1c",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "sg-11134207-82625-mln0ojufsd1ra7",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "sg-11134207-8261n-mln0r6m3i5mpdb",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        }
+      ],
+      "promotion_images": [],
+      "pdp_top_info_list": null,
+      "show_find_similar": null,
+      "shopee_video_req_id": null,
+      "first_tier_variations": [
+        {
+          "name": "Empire Red",
+          "image": "sg-11134207-81zwc-mn3w2djqtq8676",
+          "name_tr": null,
+          "summed_stock": null,
+          "gallery_image": "sg-11134207-81zwc-mn3w2djqtq8676",
+          "selling_point": "",
+          "selling_point_tr": null,
+          "display_indicator": 0,
+          "show_find_similar": null
+        },
+        {
+          "name": "Matte Black",
+          "image": "sg-11134207-81zuo-mn3w2gj34u0x1e",
+          "name_tr": null,
+          "summed_stock": null,
+          "gallery_image": "sg-11134207-81zuo-mn3w2gj34u0x1e",
+          "selling_point": "",
+          "selling_point_tr": null,
+          "display_indicator": 0,
+          "show_find_similar": null
+        },
+        {
+          "name": "Porcerlaine White",
+          "image": "sg-11134207-81zux-mn3w2lhv2j2e45",
+          "name_tr": null,
+          "summed_stock": null,
+          "gallery_image": "sg-11134207-81zux-mn3w2lhv2j2e45",
+          "selling_point": "",
+          "selling_point_tr": null,
+          "display_indicator": 0,
+          "show_find_similar": null
+        }
+      ],
+      "shopee_video_info_list": [],
+      "shopee_video_rcmd_info": null,
+      "show_find_similar_for_selection": false,
+      "unavailable_item_recommendation": null,
+      "sorted_variation_image_index_list": [
+        0,
+        1,
+        2
+      ]
+    },
+    "product_review": {
+      "liked": false,
+      "cmt_count": 43,
+      "global_sold": 145,
+      "hide_rating": false,
+      "liked_count": 191,
+      "rating_star": null,
+      "hide_reviews": false,
+      "rating_count": null,
+      "historical_sold": 145,
+      "hide_buyer_gallery": false,
+      "sold_count_display": null,
+      "total_rating_count": null,
+      "display_global_sold": false,
+      "global_sold_display": null,
+      "review_rcmd_exp_group": null,
+      "sold_count_disclosure": null,
+      "historical_sold_display": null,
+      "should_move_ratings_above": null,
+      "hide_other_product_reviews_in_shop": false
+    },
+    "promotion_info": {
+      "spl": null,
+      "spl_lite": null,
+      "insurance": null,
+      "wholesale": null,
+      "installment": null,
+      "installment_simulation_entry": null,
+      "item_installment_eligibility": {
+        "is_cc_installment_payment_eligible": false,
+        "is_non_cc_installment_payment_eligible": false
+      }
+    },
+    "removed_fields": [
+      "product_price.price",
+      "product_price.price_before_discount"
+    ],
+    "return_on_spot": null,
+    "service_drawer": {
+      "services": [
+        {
+          "id": 40,
+          "icon": "tw-11134258-7rasc-m16w5grsqh2080",
+          "type": null,
+          "title": "100% Authentic",
+          "insurance": null,
+          "description": "Shopee Mall products are guaranteed 100% authentic, and are sourced directly from brands and authorised distributors. If you receive an inauthentic product, you may request for a 2x refund.",
+          "free_return": null,
+          "product_type": 0,
+          "redirection_url": "https://shopee.sg/m/shopee-mall-100-authentic",
+          "insurance_drawer": null
+        },
+        {
+          "id": 41,
+          "icon": "sg-11134258-825al-mscf49rkyjnoa9",
+          "type": null,
+          "title": "Fulfilled by Shopee",
+          "insurance": null,
+          "description": "Fulfilled by Shopee is an exclusive service where you can enjoy fast delivery and reliable quality.",
+          "free_return": null,
+          "product_type": 0,
+          "redirection_url": "https://shopee.sg/m/fulfilledbyshopee",
+          "insurance_drawer": null
+        },
+        {
+          "id": 39,
+          "icon": "tw-11134258-7rasj-m16w5gpau4m017",
+          "type": null,
+          "title": "15-Day Free Returns",
+          "insurance": null,
+          "description": "Request a free return within 15 days from the date of delivery if the item received is incorrect or damaged. Applicable to selected items. Refund requests are subject to our return policy. T&Cs apply.",
+          "free_return": null,
+          "product_type": 0,
+          "redirection_url": "https://shopee.sg/pdp-free-return",
+          "insurance_drawer": null
+        },
+        {
+          "id": 42,
+          "icon": "tw-11134258-7rase-m16w5gqesi5416",
+          "type": null,
+          "title": "Electronics Protection",
+          "insurance": null,
+          "description": "Protect your Electronics from accidental damage and liquid damage.",
+          "free_return": null,
+          "product_type": 0,
+          "redirection_url": "https://protection.shopee.sg/ec/ec-pdp.html?from=pdp&locale=EN&product_id=2036651368646733337",
+          "insurance_drawer": {}
+        },
+        {
+          "id": 42,
+          "icon": "tw-11134258-7rase-m16w5gqesi5416",
+          "type": null,
+          "title": "Extended Warranty",
+          "insurance": null,
+          "description": "Extend existing warranty by 12 months",
+          "free_return": null,
+          "product_type": 0,
+          "redirection_url": "https://protection.shopee.sg/ec/ec-pdp.html?from=pdp&locale=EN&product_id=2036663916238499345",
+          "insurance_drawer": {}
+        }
+      ]
+    },
+    "tax_disclaimer": null,
+    "bcrs_disclaimer": null,
+    "exclusive_price": null,
+    "price_breakdown": {
+      "price": {
+        "range_max": -1,
+        "range_min": -1,
+        "price_mask": null,
+        "single_value": "19900000"
+      },
+      "price_before_discount": {
+        "range_max": -1,
+        "range_min": -1,
+        "price_mask": null,
+        "single_value": "29900000"
+      }
+    },
+    "tier_variations": [
+      {
+        "name": "Color",
+        "type": 0,
+        "images": [
+          "sg-11134207-81zwc-mn3w2djqtq8676",
+          "sg-11134207-81zuo-mn3w2gj34u0x1e",
+          "sg-11134207-81zux-mn3w2lhv2j2e45"
+        ],
+        "options": [
+          "Empire Red",
+          "Matte Black",
+          "Porcerlaine White"
+        ]
+      }
+    ],
+    "age_gate_control": null,
+    "featured_voucher": null,
+    "product_shipping": null,
+    "promotion_drawer": null,
+    "service_entrance": {
+      "services": [
+        {
+          "id": 40,
+          "text": "100% Authentic",
+          "type": null
+        },
+        {
+          "id": 41,
+          "text": "Fulfilled by Shopee",
+          "type": null
+        },
+        {
+          "id": 39,
+          "text": "15-Day Free Returns",
+          "type": null
+        },
+        {
+          "id": 42,
+          "text": "Electronics Protection",
+          "type": null
+        },
+        {
+          "id": 42,
+          "text": "Extended Warranty",
+          "type": null
+        }
+      ]
+    },
+    "flash_sale_booked": null,
+    "alcohol_disclaimer": null,
+    "flash_sale_preview": null,
+    "installment_drawer": {
+      "spl": null,
+      "bank": {
+        "channels": null
+      },
+      "priority": [
+        0,
+        1
+      ],
+      "credit_card": null
+    },
+    "product_attributes": {
+      "attrs": [
+        {
+          "id": null,
+          "url": "/search?brands=1801645",
+          "name": "Brand",
+          "type": 1,
+          "value": "KitchenAid",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": 1801645,
+          "full_url": "https://shopee.sg/search?brands=1801645",
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100037,
+          "url": null,
+          "name": "Region of Origin",
+          "type": 5,
+          "value": "America",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100370,
+          "url": null,
+          "name": "Warranty Type",
+          "type": 5,
+          "value": "Supplier Warranty",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100275,
+          "url": null,
+          "name": "Blender Type",
+          "type": 5,
+          "value": "Countertop Blender",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100274,
+          "url": null,
+          "name": "Blender Features",
+          "type": 5,
+          "value": "Detachable Blades, Ice Crushing, Variable speeds",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 101219,
+          "url": null,
+          "name": "Custom Product",
+          "type": 5,
+          "value": "No",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100413,
+          "url": null,
+          "name": "Condition",
+          "type": 5,
+          "value": "New",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100526,
+          "url": null,
+          "name": "Build-in Battery",
+          "type": 5,
+          "value": "No",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100095,
+          "url": null,
+          "name": "Weight",
+          "type": 5,
+          "value": "10kg",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100134,
+          "url": null,
+          "name": "Material",
+          "type": 5,
+          "value": "bpa-free jar",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100942,
+          "url": null,
+          "name": "Dimension (L x W x H)",
+          "type": 5,
+          "value": "12.13 x 10.47 x 16.89",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100961,
+          "url": null,
+          "name": "Safety Mark",
+          "type": 5,
+          "value": "200275-24",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": null,
+          "url": null,
+          "name": "Ships From",
+          "type": 6,
+          "value": "SG",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        }
+      ],
+      "categories": [
+        {
+          "catid": 11027421,
+          "no_sub": false,
+          "display_name": "Home Appliances",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 11027457,
+          "no_sub": false,
+          "display_name": "Small Kitchen Appliances",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 11027469,
+          "no_sub": true,
+          "display_name": "Juicers & Blenders",
+          "is_default_subcat": false
+        }
+      ],
+      "related_items": [],
+      "upfront_attrs": null,
+      "fresh_featured_attrs": null
+    },
+    "shop_vouchers_meta": null,
+    "shopee_free_return": null,
+    "translation_status": 0,
+    "exclusive_price_cta": null,
+    "product_description": {
+      "paragraph_list": [
+        {
+          "text": "Pure Power. Pure Control",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "- Go ahead and blend the rules with the K200 Pure Power Blender. A precision control knob, powerful asymmetrical blades, and a vented lid means the confidence and control in making your favorite recipes just the way you like them.",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": null,
+          "type": 10001,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": 1
+        },
+        {
+          "text": "- From chunky salsa to smooth tomato soup, the precision speed control knob helps you achieve the blends you want. Choose your exact setting between 1 and 10 or smoothly glide between the speeds to create your desired texture.",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": null,
+          "type": 10001,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": 1
+        },
+        {
+          "text": "- Whether it's roasted tomatoes fresh from the oven or frozen whole foods straight from the freezer, blend foods into a whole range of textures for your hot or cold recipes.",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        }
+      ],
+      "source_language": ""
+    },
+    "size_recommendation": null,
+    "membership_exclusive": null,
+    "product_description_tr": null,
+    "membership_exclusive_teaser": null
+  },
+  "status": "completed",
+  "message": "Product data fetched successfully",
+  "service": {
+    "country": "SG",
+    "credit_cost": 19,
+    "service_name": "scrape_product_details_v2",
+    "service_actor": "shopee"
+  },
+  "timestamp": "2026-11-14T11:36:26.358471+00:00",
+  "created_at": "2026-11-14T11:35:43",
+  "request_id": "641f606f-14c3-4450-8e1c-fe96fe4bcce0",
+  "updated_at": "2026-11-14T11:35:51",
+  "reason_data": "product_found",
+  "status_code": 200,
+  "task_status": "success",
+  "elapsed_time": 8.0,
+  "request_data": {
+    "url": "https://shopee.sg/product/88061045/51106998358",
+    "is_batch_scraping_shopee": true
+  }
+}

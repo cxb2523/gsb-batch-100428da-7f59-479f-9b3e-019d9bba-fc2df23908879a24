@@ -1,0 +1,1033 @@
+{
+  "result": {
+    "item": {
+      "flag": 131072,
+      "name": "Colchão Queen D45 Alfa + Base 158X198X62",
+      "brand": "Bom Pastor",
+      "ctime": 1757688239,
+      "image": "br-11134207-820m0-mpzc2jc5bxmq07",
+      "liked": false,
+      "price": "149900000",
+      "stock": "884",
+      "title": "Colchão Queen D45 Alfa + Base 158X198X62",
+      "cat_id": 100636,
+      "images": [
+        "br-11134207-820m0-mpzc2jc5bxmq07",
+        "br-11134207-820lj-mpzc2jc5eqrm94",
+        "br-11134207-820lc-mpzc2jc5n66a1b",
+        "br-11134207-820ld-mpzc2jc5dc765b",
+        "br-11134207-820m2-mpzc2jc5lrlu72",
+        "br-11134207-820lr-mpzc2jc5aj2a8e",
+        "br-11134207-820me-mpzc2jc5kd1ee2",
+        "br-11134207-820m8-mpzc2jc5g5c253",
+        "br-11134207-820l7-mpzc2jc5hjwi54"
+      ],
+      "itemid": 22998900568,
+      "models": [
+        {
+          "name": "",
+          "sold": 89,
+          "price": "149900000",
+          "stock": 884,
+          "itemid": 22998900568,
+          "status": 1,
+          "extinfo": {
+            "sku_image": "",
+            "tier_index": [
+              0
+            ],
+            "is_pre_order": false,
+            "estimated_days": 2
+          },
+          "item_id": 22998900568,
+          "modelid": 209611778782,
+          "name_tr": null,
+          "model_id": "209611778782",
+          "has_stock": true,
+          "is_grayout": false,
+          "promotionid": null,
+          "is_clickable": true,
+          "normal_stock": 884,
+          "price_stocks": [
+            {
+              "promotion_type": 0,
+              "allocated_stock": null,
+              "stock_breakdown_by_location": null
+            }
+          ],
+          "promotion_id": null,
+          "has_gimmick_tag": false,
+          "key_measurement": null,
+          "price_before_discount": "149900000",
+          "is_lowest_price_at_shopee": null,
+          "current_promotion_reserved_stock": null,
+          "current_promotion_has_reserve_stock": null
+        }
+      ],
+      "shopid": 1563516628,
+      "status": 1,
+      "is_mart": false,
+      "item_id": 22998900568,
+      "shop_id": 1563516628,
+      "age_gate": {
+        "kyc": null,
+        "adult_consent": null
+      },
+      "brand_id": 5445160,
+      "currency": "BRL",
+      "is_adult": false,
+      "spl_info": null,
+      "title_tr": null,
+      "cb_option": 0,
+      "cmt_count": 52,
+      "coin_info": {
+        "coin_earn_items": [
+          {
+            "coin_earn": 500
+          }
+        ],
+        "coin_earn_label": null,
+        "spend_cash_unit": 1000
+      },
+      "condition": 1,
+      "is_sexual": false,
+      "item_type": 0,
+      "label_ids": [
+        1000022,
+        844931064601283,
+        700065057,
+        1119017,
+        822062091122182,
+        595433038,
+        299033489,
+        2203642,
+        299048468,
+        1718387984,
+        997961055,
+        298818315,
+        1823810,
+        1823833,
+        700605236,
+        298643352,
+        1400620050,
+        1718388139,
+        298738374,
+        299138681,
+        998301327,
+        299253360,
+        299213331
+      ],
+      "price_max": "149900000",
+      "price_min": "149900000",
+      "attributes": [
+        {
+          "id": 100121,
+          "url": null,
+          "name": "Duração da Garantia",
+          "type": null,
+          "value": "12 Meses",
+          "val_id": 822,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100370,
+          "url": null,
+          "name": "Tipo de Garantia",
+          "type": null,
+          "value": "Garantia do Fabricante",
+          "val_id": 2419,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100730,
+          "url": null,
+          "name": "Necessita montagem",
+          "type": null,
+          "value": "Sim",
+          "val_id": 3823,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100735,
+          "url": null,
+          "name": "Tamanho da Cama",
+          "type": null,
+          "value": "Queen",
+          "val_id": 3954,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100942,
+          "url": null,
+          "name": "Dimensões do Produto (A x L x C), sem a caixa de embalagem",
+          "type": null,
+          "value": "158x198x62",
+          "val_id": 0,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": false,
+          "item_attribute_type": null
+        }
+      ],
+      "categories": [
+        {
+          "catid": 100636,
+          "no_sub": false,
+          "display_name": "Casa e Decoração",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 100713,
+          "no_sub": false,
+          "display_name": "Móveis",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 101168,
+          "no_sub": true,
+          "display_name": "Estruturas de Cama, Cabeceiras e Colchões",
+          "is_default_subcat": false
+        }
+      ],
+      "disclaimer": null,
+      "is_presale": false,
+      "is_preview": false,
+      "size_chart": null,
+      "title_type": 1,
+      "description": "Colchão Bom Pastor Alfa D45\n  O Colchão Alfa é a proposta ideal para quem busca um colchão com um design inovador e de extrema qualidade. O Alfa Possui uma camada de Pillow interno, espuma de altíssima qualidade, que 'abraça' seu corpo ao deitar, além disso, contém tecido de multifilamentos de poliéster que proporciona resistência. Um tecido de última geração e alta tecnologia.\n\n  O Colchão Alfa é produzido de espuma 100% poliuretano D45 e EPS. O EPS é uma estrutura Ortopédica em forma de uma placa rígida como a madeira, porém muito mais leve em comparação aos colchões tradicionais ortopédicos de madeira, além de ser bem mais durável. Este produto oferece firmeza com o conforto adequado. Com duas camadas de conforto compostas de Espuma D45 e Espuma Hipersoft, proporciona maior durabilidade e estabilidade ao seu colchão.\n\nEspecificações:\n• Tecido 100% Poliéster com multifilamentos de alta resistência aumentando a durabilidade do seu colchão.\n• Espuma 100% Poliuretano D45 e Espuma Hipersoft. Espuma de Alta performance apresentando excelente desempenho e sensação de aconchego.\n• Camada de EPS\n• Bordado em Matelassê. Proporcionando maior maciez e mais volume ao colchão.\n• Altura: 62 cm (Base + Colchão: 50cm, Pés: 12cm)\n\nObservações importantes:\nProdutos podem apresentar diferenças de tonalidades entre a foto na tela e o produto real, devido a calibração de cor da tela.\nO aspecto ou proporção do colchão vai variar de acordo com o tamanho escolhido (Solteiro, Casal, Queen, King). A foto serve apenas de referência para visualização de acabamento e detalhes estéticos do produto.\nO serviço de transporte não se responsabiliza por produtos que precisem subir escadas, ou ser içados a algum andar superior.Este serviço fica a cargo do cliente. Verifique as dimensões do produto antes de finalizar a compra.\nCertifique-se que o produto passa por escadas, vãos, portas ou janelas antes de finalizar a compra.\nA Loja Bom Pastor não faz montagem de produtos. Não nos responsabilizamos por erros de montagem. Manuais e peças para a montagem são fornecidos com o produto.",
+      "global_sold": 89,
+      "item_rating": {
+        "rating_star": null,
+        "rating_count": [],
+        "total_rating_count": null
+      },
+      "item_status": "normal",
+      "liked_count": 1001,
+      "long_images": null,
+      "other_stock": null,
+      "drug_details": null,
+      "is_free_gift": false,
+      "is_pre_order": false,
+      "max_quantity": null,
+      "normal_stock": "884",
+      "preview_info": null,
+      "raw_discount": null,
+      "deep_discount": null,
+      "fe_categories": [
+        {
+          "catid": 11059983,
+          "no_sub": false,
+          "display_name": "Casa e Construção",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 11060110,
+          "no_sub": false,
+          "display_name": "Móveis",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 11061710,
+          "no_sub": true,
+          "display_name": "Estruturas de Cama, Cabeceiras e Colchões",
+          "is_default_subcat": false
+        }
+      ],
+      "is_hide_stock": null,
+      "shop_detailed": {
+        "name": "Móveis Bom Pastor",
+        "ctime": 1749742170,
+        "shopid": 1563516628,
+        "status": null,
+        "userid": 1564385121,
+        "account": {
+          "fbid": "",
+          "status": 1,
+          "portrait": "br-11134004-7r98o-mbzmsek4nmu15b",
+          "username": "lojabompastor",
+          "is_seller": true,
+          "email_verified": true,
+          "phone_verified": true,
+          "total_avg_star": 0,
+          "following_count": 1
+        },
+        "vacation": false,
+        "item_count": 328,
+        "rating_bad": null,
+        "rating_good": null,
+        "rating_star": 4.854104,
+        "rating_normal": null,
+        "response_rate": 97,
+        "response_time": 207,
+        "shop_location": null,
+        "follower_count": 81808,
+        "is_official_shop": null,
+        "last_active_time": 1794655588,
+        "is_shopee_verified": false,
+        "is_preferred_plus_seller": false,
+        "show_official_shop_label": true
+      },
+      "shop_location": "Minas Gerais",
+      "show_discount": 0,
+      "stock_display": "884",
+      "description_tr": null,
+      "discount_stock": null,
+      "estimated_days": 2,
+      "invoice_option": null,
+      "is_super_vitem": null,
+      "is_unavailable": false,
+      "item_has_video": false,
+      "badge_icon_type": 0,
+      "coin_earn_label": null,
+      "historical_sold": 89,
+      "is_fashion_item": false,
+      "size_chart_info": null,
+      "tier_variations": [
+        {
+          "name": "",
+          "type": 0,
+          "images": null,
+          "name_tr": null,
+          "options": [
+            ""
+          ],
+          "options_tr": null,
+          "properties": null,
+          "summed_stocks": null,
+          "selling_points": [
+            ""
+          ],
+          "selling_points_tr": null,
+          "display_indicators": [
+            0
+          ]
+        }
+      ],
+      "video_info_list": [],
+      "add_on_deal_info": null,
+      "bundle_deal_info": null,
+      "complaint_policy": null,
+      "is_free_shipping": false,
+      "is_official_shop": true,
+      "can_use_wholesale": false,
+      "is_item_inherited": false,
+      "reference_item_id": "",
+      "is_alcohol_product": false,
+      "is_category_failed": null,
+      "min_purchase_limit": 0,
+      "shipping_icon_type": 0,
+      "social_proof_label": null,
+      "should_show_amp_tag": true,
+      "show_recycling_info": null,
+      "wholesale_tier_list": [],
+      "display_similar_sold": null,
+      "hidden_price_display": null,
+      "is_partial_fulfilled": false,
+      "is_prescription_item": false,
+      "is_service_by_shopee": false,
+      "max_quantity_display": null,
+      "selected_real_models": null,
+      "welcome_package_type": null,
+      "authorized_brand_name": null,
+      "credit_insurance_data": {},
+      "is_low_price_eligible": null,
+      "price_before_discount": "149900000",
+      "rich_text_description": null,
+      "overall_purchase_limit": null,
+      "show_prescription_feed": false,
+      "is_live_streaming_price": null,
+      "is_presale_deposit_item": null,
+      "is_presale_deposit_made": null,
+      "presale_dday_start_time": null,
+      "show_original_guarantee": null,
+      "size_tier_variation_idx": null,
+      "all_models_has_pre_order": false,
+      "has_low_fulfillment_rate": false,
+      "is_preferred_plus_seller": null,
+      "rich_text_description_tr": null,
+      "is_lowest_price_at_shopee": null,
+      "price_max_before_discount": "149900000",
+      "price_min_before_discount": "149900000",
+      "should_move_ratings_above": null,
+      "show_best_price_guarantee": false,
+      "has_lowest_price_guarantee": null,
+      "show_shopee_verified_label": false,
+      "is_infant_milk_formula_product": false,
+      "current_promotion_reserved_stock": null,
+      "show_official_shop_label_in_title": true,
+      "is_cc_installment_payment_eligible": false,
+      "current_promotion_has_reserve_stock": null,
+      "has_model_with_available_shopee_stock": null,
+      "is_non_cc_installment_payment_eligible": false,
+      "display_description_disclosure_rsku_redirection": null
+    },
+    "account": {},
+    "age_gate": {
+      "kyc": null,
+      "adult_consent": null
+    },
+    "trade_in": null,
+    "cmt_count": 52,
+    "coin_info": {
+      "coin_earn_items": [
+        {
+          "coin_earn": 500
+        }
+      ],
+      "coin_earn_label": null,
+      "spend_cash_unit": 1000
+    },
+    "size_info": null,
+    "event_type": 0,
+    "flash_sale": null,
+    "size_guide": null,
+    "top_banner": null,
+    "free_return": null,
+    "live_stream": null,
+    "button_group": {
+      "shop_opt": null,
+      "buy_with_voucher": {
+        "price": null
+      },
+      "ineligible_user_platform_exclusive_sku": null
+    },
+    "detail_level": 1,
+    "product_meta": {
+      "hide_sold_count": false,
+      "hide_sharing_button": false,
+      "show_original_guarantee": null,
+      "show_best_price_guarantee": false,
+      "show_shopee_verified_label": false,
+      "show_lowest_price_guarantee": null,
+      "show_lowest_installment_guarantee": null,
+      "show_official_shop_label_in_title": true,
+      "show_description_translation_button": null
+    },
+    "bottom_banner": null,
+    "deep_discount": null,
+    "designer_info": null,
+    "product_price": null,
+    "shipping_info": null,
+    "shipping_meta": null,
+    "shop_detailed": {
+      "name": "Móveis Bom Pastor",
+      "ctime": 1749742170,
+      "shopid": 1563516628,
+      "status": null,
+      "userid": 1564385121,
+      "account": {
+        "fbid": "",
+        "status": 1,
+        "portrait": "br-11134004-7r98o-mbzmsek4nmu15b",
+        "username": "lojabompastor",
+        "is_seller": true,
+        "email_verified": true,
+        "phone_verified": true,
+        "total_avg_star": 0,
+        "following_count": 1
+      },
+      "vacation": false,
+      "item_count": 328,
+      "rating_bad": null,
+      "rating_good": null,
+      "rating_star": 4.854104,
+      "rating_normal": null,
+      "response_rate": 97,
+      "response_time": 207,
+      "shop_location": null,
+      "follower_count": 81808,
+      "is_official_shop": null,
+      "last_active_time": 1794655588,
+      "is_shopee_verified": false,
+      "is_preferred_plus_seller": false,
+      "show_official_shop_label": true
+    },
+    "shop_vouchers": null,
+    "teaser_banner": null,
+    "abnormal_popup": null,
+    "design_control": {
+      "enable_ksp_config": true,
+      "hide_review_view_all": null,
+      "hide_ftss_tpfs_section": null,
+      "is_support_fbs_enabled": true,
+      "display_direct_delivery": true,
+      "display_fashion_attributes": null,
+      "display_others_also_bought": null,
+      "support_shop_review_preview": null,
+      "use_new_revamp_first_screen": true,
+      "disable_price_with_variation": false,
+      "display_fashion_first_screen": null,
+      "display_fbs_floating_counter": null,
+      "keep_instant_pause_bottom_bar": false,
+      "use_new_featured_video_revamp": null,
+      "display_fashion_review_section": null,
+      "first_screen_revamp_abtest_group": null,
+      "merge_attributes_and_description": null,
+      "display_choice_customised_section": false,
+      "disable_main_page_select_variation": false,
+      "display_on_time_delivery_guarantee": false,
+      "enable_fashion_review_improvements": null,
+      "expand_size_guide_section_by_default": null,
+      "hide_shipping_channel_promotion_text": false,
+      "installment_drawer_updated_spl_display": null,
+      "top_section_featured_video_ab_test_group": null,
+      "enable_fashion_featured_videos_improvements": null,
+      "display_shipping_drawer_new_free_shipping_ui": false,
+      "pdp_revamp_phase1_improvement_ui_review_down": null,
+      "installment_drawer_collapse_cci_by_default_br": null,
+      "display_shipping_drawer_new_free_shipping_text": false,
+      "shift_featured_videos_above_review_ratings_section": null
+    },
+    "ongoing_banner": null,
+    "product_images": {
+      "video": null,
+      "images": [
+        "br-11134207-820m0-mpzc2jc5bxmq07",
+        "br-11134207-820lj-mpzc2jc5eqrm94",
+        "br-11134207-820lc-mpzc2jc5n66a1b",
+        "br-11134207-820ld-mpzc2jc5dc765b",
+        "br-11134207-820m2-mpzc2jc5lrlu72",
+        "br-11134207-820lr-mpzc2jc5aj2a8e",
+        "br-11134207-820me-mpzc2jc5kd1ee2",
+        "br-11134207-820m8-mpzc2jc5g5c253",
+        "br-11134207-820l7-mpzc2jc5hjwi54"
+      ],
+      "models": null,
+      "overlay": null,
+      "skincam": null,
+      "beautycam": null,
+      "try_it_on": null,
+      "cover_image": null,
+      "long_images": null,
+      "has_long_image": false,
+      "makeup_preview": null,
+      "abnormal_status": "",
+      "gallery_contents": [
+        {
+          "image": {
+            "url": "br-11134207-820m0-mpzc2jc5bxmq07",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "br-11134207-820lj-mpzc2jc5eqrm94",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "br-11134207-820lc-mpzc2jc5n66a1b",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "br-11134207-820ld-mpzc2jc5dc765b",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "br-11134207-820m2-mpzc2jc5lrlu72",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "br-11134207-820lr-mpzc2jc5aj2a8e",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "br-11134207-820me-mpzc2jc5kd1ee2",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "br-11134207-820m8-mpzc2jc5g5c253",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        },
+        {
+          "image": {
+            "url": "br-11134207-820l7-mpzc2jc5hjwi54",
+            "cmt_id": null,
+            "label_content": null,
+            "promotion_image_type": null
+          },
+          "video": null
+        }
+      ],
+      "promotion_images": [],
+      "pdp_top_info_list": null,
+      "show_find_similar": null,
+      "shopee_video_req_id": null,
+      "first_tier_variations": null,
+      "shopee_video_info_list": [],
+      "shopee_video_rcmd_info": null,
+      "show_find_similar_for_selection": false,
+      "unavailable_item_recommendation": null,
+      "sorted_variation_image_index_list": []
+    },
+    "product_review": {
+      "liked": false,
+      "cmt_count": 52,
+      "global_sold": 89,
+      "hide_rating": false,
+      "liked_count": 1001,
+      "rating_star": null,
+      "hide_reviews": false,
+      "rating_count": null,
+      "historical_sold": 89,
+      "hide_buyer_gallery": false,
+      "sold_count_display": null,
+      "total_rating_count": null,
+      "display_global_sold": false,
+      "global_sold_display": null,
+      "review_rcmd_exp_group": null,
+      "sold_count_disclosure": null,
+      "historical_sold_display": null,
+      "should_move_ratings_above": null,
+      "hide_other_product_reviews_in_shop": false
+    },
+    "promotion_info": {
+      "spl": null,
+      "spl_lite": null,
+      "insurance": null,
+      "wholesale": null,
+      "installment": null,
+      "installment_simulation_entry": null,
+      "item_installment_eligibility": {
+        "is_cc_installment_payment_eligible": false,
+        "is_non_cc_installment_payment_eligible": false
+      }
+    },
+    "removed_fields": [
+      "product_price.price",
+      "product_price.price_before_discount"
+    ],
+    "return_on_spot": null,
+    "service_drawer": {
+      "services": []
+    },
+    "tax_disclaimer": null,
+    "bcrs_disclaimer": null,
+    "exclusive_price": null,
+    "price_breakdown": {
+      "price": {
+        "range_max": -1,
+        "range_min": -1,
+        "price_mask": null,
+        "single_value": "130413000"
+      },
+      "price_before_discount": {
+        "range_max": -1,
+        "range_min": -1,
+        "price_mask": null,
+        "single_value": "149900000"
+      }
+    },
+    "tier_variations": [
+      {
+        "name": "",
+        "type": 0,
+        "options": [
+          ""
+        ]
+      }
+    ],
+    "age_gate_control": null,
+    "featured_voucher": null,
+    "product_shipping": null,
+    "promotion_drawer": {
+      "shop_vouchers": null,
+      "package_promotion": {
+        "add_on_deal": null,
+        "bundle_deal": null
+      },
+      "platform_vouchers": null,
+      "spl_zero_interest": null,
+      "lowest_price_indicator": null
+    },
+    "service_entrance": {
+      "services": []
+    },
+    "flash_sale_booked": null,
+    "alcohol_disclaimer": null,
+    "flash_sale_preview": null,
+    "installment_drawer": {
+      "spl": null,
+      "bank": {
+        "channels": null
+      },
+      "priority": [
+        1,
+        0
+      ],
+      "credit_card": null
+    },
+    "product_attributes": {
+      "attrs": [
+        {
+          "id": null,
+          "url": "/search?brands=5445160",
+          "name": "Marca",
+          "type": 1,
+          "value": "Bom Pastor",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": 5445160,
+          "full_url": "https://shopee.com.br/search?brands=5445160",
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100121,
+          "url": null,
+          "name": "Duração da Garantia",
+          "type": 5,
+          "value": "12 Meses",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100370,
+          "url": null,
+          "name": "Tipo de Garantia",
+          "type": 5,
+          "value": "Garantia do Fabricante",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100730,
+          "url": null,
+          "name": "Necessita montagem",
+          "type": 5,
+          "value": "Sim",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100735,
+          "url": null,
+          "name": "Tamanho da Cama",
+          "type": 5,
+          "value": "Queen",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": 100942,
+          "url": null,
+          "name": "Dimensões do Produto (A x L x C), sem a caixa de embalagem",
+          "type": 5,
+          "value": "158x198x62",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        },
+        {
+          "id": null,
+          "url": null,
+          "name": "Envio de",
+          "type": 6,
+          "value": "Minas Gerais",
+          "val_id": null,
+          "name_tr": null,
+          "brand_id": null,
+          "full_url": null,
+          "value_tr": null,
+          "brand_option": null,
+          "is_timestamp": null,
+          "item_attribute_type": null
+        }
+      ],
+      "categories": [
+        {
+          "catid": 11059983,
+          "no_sub": false,
+          "display_name": "Casa e Construção",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 11060110,
+          "no_sub": false,
+          "display_name": "Móveis",
+          "is_default_subcat": false
+        },
+        {
+          "catid": 11061710,
+          "no_sub": true,
+          "display_name": "Estruturas de Cama, Cabeceiras e Colchões",
+          "is_default_subcat": false
+        }
+      ],
+      "related_items": [],
+      "upfront_attrs": null,
+      "fresh_featured_attrs": null
+    },
+    "shop_vouchers_meta": null,
+    "shopee_free_return": null,
+    "translation_status": 0,
+    "exclusive_price_cta": null,
+    "product_description": {
+      "paragraph_list": [
+        {
+          "text": "Colchão Bom Pastor Alfa D45",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "  O Colchão Alfa é a proposta ideal para quem busca um colchão com um design inovador e de extrema qualidade. O Alfa Possui uma camada de Pillow interno, espuma de altíssima qualidade, que 'abraça' seu corpo ao deitar, além disso, contém tecido de multifilamentos de poliéster que proporciona resistência. Um tecido de última geração e alta tecnologia.",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": null,
+          "type": 10001,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": 1
+        },
+        {
+          "text": "  O Colchão Alfa é produzido de espuma 100% poliuretano D45 e EPS. O EPS é uma estrutura Ortopédica em forma de uma placa rígida como a madeira, porém muito mais leve em comparação aos colchões tradicionais ortopédicos de madeira, além de ser bem mais durável. Este produto oferece firmeza com o conforto adequado. Com duas camadas de conforto compostas de Espuma D45 e Espuma Hipersoft, proporciona maior durabilidade e estabilidade ao seu colchão.",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": null,
+          "type": 10001,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": 1
+        },
+        {
+          "text": "Especificações:",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "• Tecido 100% Poliéster com multifilamentos de alta resistência aumentando a durabilidade do seu colchão.",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "• Espuma 100% Poliuretano D45 e Espuma Hipersoft. Espuma de Alta performance apresentando excelente desempenho e sensação de aconchego.",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "• Camada de EPS",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "• Bordado em Matelassê. Proporcionando maior maciez e mais volume ao colchão.",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "• Altura: 62 cm (Base + Colchão: 50cm, Pés: 12cm)",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": null,
+          "type": 10001,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": 1
+        },
+        {
+          "text": "Observações importantes:",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "Produtos podem apresentar diferenças de tonalidades entre a foto na tela e o produto real, devido a calibração de cor da tela.",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "O aspecto ou proporção do colchão vai variar de acordo com o tamanho escolhido (Solteiro, Casal, Queen, King). A foto serve apenas de referência para visualização de acabamento e detalhes estéticos do produto.",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "O serviço de transporte não se responsabiliza por produtos que precisem subir escadas, ou ser içados a algum andar superior.Este serviço fica a cargo do cliente. Verifique as dimensões do produto antes de finalizar a compra.",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "Certifique-se que o produto passa por escadas, vãos, portas ou janelas antes de finalizar a compra.",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        },
+        {
+          "text": "A Loja Bom Pastor não faz montagem de produtos. Não nos responsabilizamos por erros de montagem. Manuais e peças para a montagem são fornecidos com o produto.",
+          "type": 0,
+          "ratio": null,
+          "img_id": null,
+          "description_type": 1,
+          "empty_paragraph_count": null
+        }
+      ],
+      "source_language": ""
+    },
+    "size_recommendation": null,
+    "membership_exclusive": null,
+    "product_description_tr": null,
+    "membership_exclusive_teaser": null
+  },
+  "status": "completed",
+  "message": "Product data fetched successfully",
+  "service": {
+    "country": "BR",
+    "credit_cost": 20,
+    "service_name": "scrape_product_details_v2",
+    "service_actor": "shopee"
+  },
+  "timestamp": "2026-11-14T11:33:21.399353+00:00",
+  "created_at": "2026-11-14T11:32:20",
+  "request_id": "87da053e-b58e-457b-9b49-6f9fc0d67b80",
+  "updated_at": "2026-11-14T11:32:23",
+  "reason_data": "product_found",
+  "status_code": 200,
+  "task_status": "success",
+  "elapsed_time": 3.0,
+  "request_data": {
+    "url": "https://shopee.com.br/product/1563516628/22998900568",
+    "is_batch_scraping_shopee": true
+  }
+}
