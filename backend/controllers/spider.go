@@ -66,14 +66,10 @@ func CreateSpider(c *gin.Context) {
 		return
 	}
 
-	if res, err := services.AddSpider(form); err != nil {
+	if res, err := services.AddSpiderWithVersion(form); err != nil {
 		HandleError(http.StatusBadRequest, c, err)
 		return
 	} else {
-		if _, err2 := services.AddSpiderVersion(res.Id, form.SpiderUploadForm); err2 != nil {
-			HandleError(http.StatusBadRequest, c, err2)
-			return
-		}
 		HandleSuccess(c, res)
 	}
 }

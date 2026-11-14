@@ -8,13 +8,23 @@ import (
 	"crawlab-lite/results"
 	"crawlab-lite/utils"
 	"errors"
+	"fmt"
 	. "github.com/ahmetb/go-linq/v3"
+	"github.com/apex/log"
 	"github.com/jinzhu/copier"
 	uuid "github.com/satori/go.uuid"
 	"github.com/spf13/viper"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+)
+
+// 上传版本时的业务错误，调用方据此区分失败类型
+var (
+	// ErrSpiderVersionDuplicated 重复版本：上传的压缩包与已有版本 MD5 相同
+	ErrSpiderVersionDuplicated = errors.New("spider version already exists (duplicate package md5)")
+	// ErrSpiderVersionUnzipFailed 解压失败：压缩包损坏或无法正常解压
+	ErrSpiderVersionUnzipFailed = errors.New("spider version unzip failed")
 )
 
 func QuerySpiderPage(page forms.PageForm) (total int, resultList []*results.Spider, err error) {
@@ -118,6 +128,26 @@ func AddSpider(form forms.SpiderForm) (result *results.Spider, err error) {
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+
+	return result, nil
+}
+
+// AddSpiderWithVersion 创建爬虫并同时上传首个版本。
+// 若首个版本上传失败，回滚已写入的爬虫记录，保证不会留下没有任何版本的爬虫。
+func AddSpiderWithVersion(form forms.SpiderForm) (result *results.Spider, err error) {
+	result, err = AddSpider(form)
+	if err != nil {
+		return nil, err
+	}
+
+	// 随附的版本上传失败时，删除刚刚创建的爬虫记录及相关数据
+	if _, versionErr := AddSpiderVersion(result.Id, form.SpiderUploadForm); versionErr != nil {
+		if _, removeErr := RemoveSpider(result.Id); removeErr != nil {
+			log.Errorf("rollback spider %s after version upload failed, remove error: %s (original error: %s)",
+				result.Id.String(), removeErr.Error(), versionErr.Error())
+		}
+		return nil, versionErr
 	}
 
 	return result, nil
@@ -240,8 +270,31 @@ func AddSpiderVersion(spiderId uuid.UUID, form forms.SpiderUploadForm) (result *
 		}
 
 		uid := uuid.NewV4()
-		tmpPath := filepath.Join(viper.GetString("other.tmppath"), spiderId.String())
+
+		// 本次上传独占的临时目录，避免多个上传共用同一目录时互相清理
+		baseTmpPath := filepath.Join(viper.GetString("other.tmppath"), spiderId.String())
+		tmpPath := filepath.Join(baseTmpPath, uid.String())
 		zipPath := filepath.Join(tmpPath, uid.String()+".zip")
+
+		// 解压目标路径（版本路径规则保持不变）
+		version := &models.SpiderVersion{
+			Id:       uid,
+			SpiderId: spiderId,
+			Path:     filepath.Join(spiderId.String(), uid.String()),
+		}
+		unzipPath := filepath.Join(viper.GetString("spider.path"), version.Path)
+
+		// 无论成功失败，都清理本次产生的临时文件；
+		// 失败时同时清理已创建的解压目录，成功时保留解压目录。
+		success := false
+		defer func() {
+			_ = os.RemoveAll(tmpPath)
+			// 临时父目录若已为空则一并删除，删除失败（如其他上传正在写入）可忽略
+			_ = os.Remove(baseTmpPath)
+			if !success {
+				_ = os.RemoveAll(unzipPath)
+			}
+		}()
 
 		formFile, err := form.File.Open()
 		if err != nil {
@@ -249,11 +302,9 @@ func AddSpiderVersion(spiderId uuid.UUID, form forms.SpiderUploadForm) (result *
 		}
 		defer formFile.Close()
 
-		// 检查创建临时目录
-		if utils.PathExist(tmpPath) == false {
-			if err := os.MkdirAll(tmpPath, os.ModePerm); err != nil {
-				return err
-			}
+		// 创建本次上传的临时目录
+		if err := os.MkdirAll(tmpPath, os.ModePerm); err != nil {
+			return err
 		}
 
 		// 保存压缩文件到临时目录
@@ -266,33 +317,20 @@ func AddSpiderVersion(spiderId uuid.UUID, form forms.SpiderUploadForm) (result *
 		if err != nil {
 			return err
 		}
+		defer zipFile.Close()
 
-		defer func() {
-			// 关闭压缩文件
-			_ = zipFile.Close()
-			// 删除解压临时文件夹
-			_ = os.RemoveAll(tmpPath)
-		}()
+		version.MD5 = utils.GetFileMD5(zipFile)
 
-		version := &models.SpiderVersion{
-			Id:       uid,
-			MD5:      utils.GetFileMD5(zipFile),
-			SpiderId: spiderId,
-			Path:     filepath.Join(spiderId.String(), uid.String()),
-		}
-
-		// 通过文件 MD5 判断是否为重复的版本
+		// 通过文件 MD5 判断是否为重复的版本（去重规则保持不变）
 		if _version, err := tx.SelectSpiderVersionWhereMD5(spiderId, version.MD5); err != nil {
 			return err
 		} else if _version != nil {
-			return errors.New("spider version already exists")
+			return ErrSpiderVersionDuplicated
 		}
 
-		// 解压文件
-		unzipPath := filepath.Join(viper.GetString("spider.path"), version.Path)
+		// 解压文件，失败时返回可识别的解压错误，临时文件与解压目录由 defer 清理
 		if err := utils.Unzip(zipFile, unzipPath); err != nil {
-			_ = os.RemoveAll(unzipPath)
-			return err
+			return fmt.Errorf("%w: %s", ErrSpiderVersionUnzipFailed, err.Error())
 		}
 
 		// 修改权限
@@ -315,6 +353,8 @@ func AddSpiderVersion(spiderId uuid.UUID, form forms.SpiderUploadForm) (result *
 		if err := copier.Copy(&result, version); err != nil {
 			return err
 		}
+
+		success = true
 		return nil
 	}); err != nil {
 		return nil, err
