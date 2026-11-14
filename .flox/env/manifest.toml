@@ -1,0 +1,117 @@
+# Note: package descriptors intentionally have no `outputs` setting.
+# With `outputs = "all"` flox installs every output of a package and the
+# environment fails to build on overlapping files (e.g. nodejs out/dev
+# both provide include/node/common.gypi). Omitted, flox installs the
+# default outputs recorded in manifest.lock.
+schema-version = "1.19.0"
+
+[install]
+python.pkg-path = "python3"
+python.version = "3.13"
+uv.pkg-path = "uv"
+zlib.pkg-path = "zlib"
+gcc-unwrapped.pkg-path = "gcc-unwrapped"
+postgresql.pkg-path = "postgresql"
+jq.pkg-path = "jq"
+
+geckodriver.pkg-path = "geckodriver"
+firefox-esr.pkg-path = "firefox-esr"
+
+# Playwright from flake - provides playwright-driver  
+playwright_driver.flake = "github:pietdevries94/playwright-web-flake#playwright-driver"
+nodejs.pkg-path = "nodejs"
+
+# Chromium for Playwright (Linux only, properly patched for NixOS)
+chromium.pkg-path = "chromium"
+chromium.systems = ["aarch64-linux", "x86_64-linux"]
+
+# Tools
+ffmpeg.pkg-path = "ffmpeg"
+
+# helper tools
+coreutils.pkg-path = "coreutils"
+
+
+[hook]
+on-activate = '''
+export WEBDRIVER_PATH="$(command -v geckodriver)"
+export BROWSER_PATH="$(command -v firefox-esr)"
+
+# Playwright: browsers live in a writable cache dir (the nix store is read-only).
+export PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true
+export PLAYWRIGHT_BROWSERS_PATH="$FLOX_ENV_CACHE/playwright-browsers"
+mkdir -p "$PLAYWRIGHT_BROWSERS_PATH"
+
+# The venv is owned by uv: it creates it when missing and recreates it when the
+# pinned interpreter changes (a nix store path, so it moves on env rebuilds).
+unset VIRTUAL_ENV
+export UV_PROJECT_ENVIRONMENT="$FLOX_ENV_CACHE/python-uv/venv"
+
+# A venv whose interpreter was garbage-collected from the nix store is
+# unusable, and uv refuses to reuse it; drop it so the sync recreates it.
+if [ -d "$UV_PROJECT_ENVIRONMENT" ] && ! "$UV_PROJECT_ENVIRONMENT/bin/python" -c "" >/dev/null 2>&1; then
+  rm -rf "$UV_PROJECT_ENVIRONMENT"
+fi
+
+if [ -f pyproject.toml ]; then
+  if uv sync --quiet --python "$(realpath "$(command -v python3)")"; then
+    echo "✅ venv ready: $UV_PROJECT_ENVIRONMENT"
+  else
+    echo "❌ uv sync failed — the venv may be incomplete, run 'uv sync' to retry" >&2
+  fi
+fi
+
+# The node binary bundled with the playwright package doesn't run on NixOS:
+# point its driver at the nix-provided one, and link system chromium/ffmpeg
+# where playwright expects browser builds.
+PLAYWRIGHT_DRIVER_PATH="$(find /nix/store -maxdepth 1 -name "*playwright-driver*" -type d | head -1)"
+PYTHON_DRIVER="$(ls -d "$UV_PROJECT_ENVIRONMENT"/lib/python*/site-packages/playwright/driver 2>/dev/null | head -1)"
+if [ -n "$PLAYWRIGHT_DRIVER_PATH" ] && [ -n "$PYTHON_DRIVER" ] && [ -f "$PLAYWRIGHT_DRIVER_PATH/package/browsers.json" ]; then
+  cat > "$PYTHON_DRIVER/node" << WRAPPER
+#!/bin/sh
+# Playwright calls: node cli.js <args>; cli.js is hardcoded to the nix driver.
+shift
+exec "$(readlink -f "$(command -v node)")" "$PLAYWRIGHT_DRIVER_PATH/package/cli.js" "\$@"
+WRAPPER
+  chmod +x "$PYTHON_DRIVER/node"
+  rm -rf "$PYTHON_DRIVER/package"
+  ln -sf "$PLAYWRIGHT_DRIVER_PATH/package" "$PYTHON_DRIVER/package"
+
+  BROWSERS_JSON="$PLAYWRIGHT_DRIVER_PATH/package/browsers.json"
+  CHROMIUM_REV="$(jq -r '.browsers[] | select(.name == "chromium").revision' "$BROWSERS_JSON")"
+  HEADLESS_REV="$(jq -r '.browsers[] | select(.name == "chromium-headless-shell").revision' "$BROWSERS_JSON")"
+  FFMPEG_REV="$(jq -r '.browsers[] | select(.name == "ffmpeg").revision' "$BROWSERS_JSON")"
+  CHROME_DIR="chrome-linux64"
+  [ "$(uname -m)" = "aarch64" ] && CHROME_DIR="chrome-linux"
+
+  mkdir -p "$PLAYWRIGHT_BROWSERS_PATH/chromium-$CHROMIUM_REV/$CHROME_DIR"
+  ln -sf "$(command -v chromium)" "$PLAYWRIGHT_BROWSERS_PATH/chromium-$CHROMIUM_REV/$CHROME_DIR/chrome"
+  # Headless shell (playwright uses underscores in the path, not hyphens)
+  mkdir -p "$PLAYWRIGHT_BROWSERS_PATH/chromium_headless_shell-$HEADLESS_REV/$CHROME_DIR"
+  ln -sf "$(command -v chromium)" "$PLAYWRIGHT_BROWSERS_PATH/chromium_headless_shell-$HEADLESS_REV/$CHROME_DIR/headless_shell"
+  mkdir -p "$PLAYWRIGHT_BROWSERS_PATH/ffmpeg-$FFMPEG_REV"
+  ln -sf "$(command -v ffmpeg)" "$PLAYWRIGHT_BROWSERS_PATH/ffmpeg-$FFMPEG_REV/ffmpeg-linux"
+fi
+'''
+
+[profile]
+bash = '''
+source "$UV_PROJECT_ENVIRONMENT/bin/activate"
+'''
+fish = '''
+source "$UV_PROJECT_ENVIRONMENT/bin/activate.fish"
+'''
+tcsh = '''
+source "$UV_PROJECT_ENVIRONMENT/bin/activate.csh"
+'''
+zsh = '''
+source "$UV_PROJECT_ENVIRONMENT/bin/activate"
+'''
+
+[options]
+systems = [
+  "aarch64-darwin",
+  "aarch64-linux",
+  "x86_64-darwin",
+  "x86_64-linux",
+]
