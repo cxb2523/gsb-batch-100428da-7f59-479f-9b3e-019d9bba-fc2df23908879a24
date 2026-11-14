@@ -270,7 +270,7 @@ For this page and query, Trafilatura followed by BM25 produced the smallest focu
 | `tool.ts` | Tool definition, validation, and execution logic |
 | `args.ts` | Maps friendly params to CLI flags |
 | `resolve.ts` | Binary discovery, env vars, output path helpers |
-| `runner.ts` | Spawns `crwl` with timeout, abort, and streaming |
+| `runner.ts` | Spawns `crwl` with timeout, abort, and streaming; resolves with partial output on interruption |
 | `trafilatura.ts` | Parses Crawl4AI raw HTML and runs Trafilatura via stdin |
 | `render.ts` | Custom TUI rendering |
 | `commands.ts` | Slash commands (`/crawl4ai-*`) |
@@ -288,7 +288,7 @@ The extension runs inside pi’s extension loader. After modifying source, reloa
 - **"No default LLM provider configured"** → configure a provider in Crawl4AI before using `json_extract`
 - **"the JSON object must be str, bytes or bytearray, not NoneType"** → usually missing `extraction_config` when using `schema_path`, or the page has no matching content
 - **Stale cache** → run `/crawl4ai-clear-cache`
-- **Timeouts** → increase `timeout` param for slow sites
+- **Timeouts** → increase `timeout` param for slow sites; on timeout or cancellation, whatever was already downloaded is saved as a partial result (the response says which happened and where the file is) — nothing is saved if no output was received at all
 
 ## Links
 

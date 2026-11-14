@@ -17,7 +17,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CrawlParams, type CrawlDetails, type CrawlParamsType } from "./types.js";
 import { validateCrawlRequest } from "./validate.js";
 import { buildArgs } from "./args.js";
-import { runCrawl } from "./runner.js";
+import { runCrawl, type CrawlResult } from "./runner.js";
 import {
 	ensureUniqueCrawl4AiOutputPath,
 	ensureUniqueTrafilaturaOutputPaths,
@@ -152,7 +152,7 @@ export async function executeCrawl(
 	});
 
 	// ── Execute crawl via subprocess ──
-	let result: { stdout: string; stderr: string; exitCode: number | null };
+	let result: CrawlResult;
 	try {
 		result = await runCrawl(crwlPath, args, timeoutSec, signal, onUpdate, _ctx.cwd);
 	} catch (err: any) {
@@ -163,25 +163,48 @@ export async function executeCrawl(
 		};
 	}
 
+	// ── Interruption (timeout / user abort) ──
+	// runCrawl resolves with partial output instead of rejecting, so an
+	// interrupted crawl can still be salvaged. The first reason to arrive wins.
+	const interrupted = result.interrupted;
+	const interruptReason = interrupted === "timeout"
+		? `timed out after ${timeoutSec}s`
+		: "was cancelled by the user";
+
 	// ── Build metadata ──
 	const details: CrawlDetails = {
 		url: params.url,
 		command: crwlPath,
 		args,
 		exitCode: result.exitCode,
+		interrupted,
 		stderr: result.stderr || undefined,
 		stdoutPreview: result.stdout?.slice(0, 500) || undefined,
 	};
 
-	// Non-zero exit code
-	if (result.exitCode !== 0) {
+	// Non-zero exit code (an interrupted run has no meaningful exit code —
+	// it was killed by us, so partial output takes precedence over this check)
+	if (!interrupted && result.exitCode !== 0) {
 		const msg = formatErrorOutput(result);
 		return { content: [{ type: "text", text: msg }], details, isError: true };
 	}
 
+	// Interrupted before anything was received — report failure, write nothing.
+	if (interrupted && !result.stdout.trim()) {
+		return {
+			content: [{
+				type: "text",
+				text: `[crawl4ai] Crawl ${interruptReason} before any output was received. Nothing was saved.`,
+			}],
+			details: { ...details, error: `Crawl ${interruptReason}` },
+			isError: true,
+		};
+	}
+
 	// For regular non-question output_file requests, Crawl4AI wrote the artifact
-	// directly and intentionally left stdout empty.
-	if (params.output_file && params.extractor !== "trafilatura" && !params.question && !params.bm25_query) {
+	// directly and intentionally left stdout empty. (Skipped when interrupted:
+	// partial stdout, if any, goes through the normal save path below instead.)
+	if (!interrupted && params.output_file && params.extractor !== "trafilatura" && !params.question && !params.bm25_query) {
 		details.fullOutputPath = params.output_file;
 		return {
 			content: [{
@@ -333,7 +356,9 @@ export async function executeCrawl(
 			content: [{
 				type: "text",
 				text:
-					`[crawl4ai] Crawl + Trafilatura extraction complete — ${extractedOutput ? extractedOutput.split("\n").length : 0} lines.${bm25Summary}\n\n` +
+					(interrupted
+						? `[crawl4ai] Partial result — crawl ${interruptReason}. Trafilatura extracted ${extractedOutput ? extractedOutput.split("\n").length : 0} lines.${bm25Summary}\n\n`
+						: `[crawl4ai] Crawl + Trafilatura extraction complete — ${extractedOutput ? extractedOutput.split("\n").length : 0} lines.${bm25Summary}\n\n`) +
 					`[crawl4ai] Extracted output: ${extractedPath}\n` +
 					`[crawl4ai] Raw HTML: ${rawHtmlPath}\n` +
 					"[crawl4ai] Use the read tool only if you need to inspect a file.",
@@ -359,10 +384,13 @@ export async function executeCrawl(
 	);
 	details.fullOutputPath = path;
 
-	const contentText =
-		`[crawl4ai] Crawl complete — ${output ? output.split("\n").length : 0} lines.${bm25Summary}\n\n` +
-		`[crawl4ai] Full output saved to: ${path}\n` +
-		`[crawl4ai] Use the read tool if you want to inspect the file.`;
+	const contentText = interrupted
+		? `[crawl4ai] Partial result — crawl ${interruptReason} — ${output ? output.split("\n").length : 0} lines saved.${bm25Summary}\n\n` +
+			`[crawl4ai] Partial output saved to: ${path}\n` +
+			"[crawl4ai] Use the read tool if you want to inspect the file."
+		: `[crawl4ai] Crawl complete — ${output ? output.split("\n").length : 0} lines.${bm25Summary}\n\n` +
+			`[crawl4ai] Full output saved to: ${path}\n` +
+			`[crawl4ai] Use the read tool if you want to inspect the file.`;
 
 	return {
 		content: [{ type: "text", text: contentText }],

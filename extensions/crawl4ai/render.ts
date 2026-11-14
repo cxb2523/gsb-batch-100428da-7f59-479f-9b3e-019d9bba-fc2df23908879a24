@@ -34,14 +34,17 @@ export function renderCrawlResult(
 		return new Text(theme.fg("dim", "[crawl4ai] No details"), 0, 0);
 	}
 
-	// Crawl or post-processing error
-	if (result.isError || details.exitCode !== 0 || details.error) {
-		const suffix = details.exitCode !== 0 ? ` (exit ${details.exitCode})` : "";
+	// Crawl or post-processing error (an interrupted run has exitCode null —
+	// that alone is not a failure when partial output was saved)
+	if (result.isError || details.error || (!details.interrupted && details.exitCode !== 0)) {
+		const suffix = details.exitCode !== 0 && details.exitCode !== null ? ` (exit ${details.exitCode})` : "";
 		return new Text(theme.fg("error", `[crawl4ai] Failed${suffix}`), 0, 0);
 	}
 
 	// Compact preview — always show only the header + path
-	let text = theme.fg("success", "[crawl4ai] Crawl complete");
+	let text = details.interrupted
+		? theme.fg("warning", `[crawl4ai] Partial result (${details.interrupted === "timeout" ? "timeout" : "cancelled"})`)
+		: theme.fg("success", "[crawl4ai] Crawl complete");
 
 	const targetPath = details.outputFile ?? details.fullOutputPath;
 	if (targetPath) {

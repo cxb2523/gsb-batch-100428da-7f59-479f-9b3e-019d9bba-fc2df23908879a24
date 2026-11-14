@@ -107,6 +107,8 @@ export interface CrawlDetails {
 	command: string;
 	args: string[];
 	exitCode: number | null;
+	/** Set when the crawl was cut short — partial output may have been saved. */
+	interrupted?: "timeout" | "aborted";
 	truncated?: boolean;
 	fullOutputPath?: string;
 	rawHtmlPath?: string;
