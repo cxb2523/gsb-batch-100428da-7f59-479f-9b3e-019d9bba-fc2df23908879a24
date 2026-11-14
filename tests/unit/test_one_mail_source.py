@@ -73,9 +73,14 @@ class TestOneMailSource(unittest.TestCase):
         mb = src.allocate()
         rows = [{"from_addr": "s@a.com", "code": "42", "subject": "x"}]
         with mock.patch.object(src, "_fetch_codes", return_value=rows):
-            with self.assertRaises(MailMissError):
-                src.poll_otp(mb, timeout_s=5, poll_interval_s=0.01,
+            with self.assertRaises(MailMissError) as ctx:
+                # A used code is not a hit, but the window still runs: a resend
+                # with a fresh code may arrive. It ends as stale_code.
+                src.poll_otp(mb, timeout_s=0.3, poll_interval_s=0.01,
                              used_codes={"42"})
+        diag = ctx.exception.diagnostics
+        self.assertEqual(diag.failure_class, "stale_code")
+        self.assertGreaterEqual(diag.used_code_count, 1)
 
     def test_login_failure_is_provider_error(self) -> None:
         src = OneMailSource(base_url="https://m.example.com", emails="a@x.tech:pw")
@@ -144,13 +149,29 @@ class TestOneMailAdminMode(unittest.TestCase):
         fa.assert_called_once()
         self.assertEqual(fa.call_args.kwargs["fresh_ms"], 600_000)
 
-    def test_admin_401_is_provider_error(self) -> None:
+    def test_admin_401_is_imap_error_outcome(self) -> None:
+        """A failed transfer/auth on the list request is a classified ending.
+
+        The four poll outcomes are shared with cf_temp/cloudflare, so an auth
+        failure on the mail list ends as ``imap_error`` (not an untyped
+        ProviderError) — and the admin key must not leak into diagnostics.
+        """
         src = self._src()
         mb = src.allocate()
         with mock.patch("register_core.email.sources.one_mail.requests.get",
                         return_value=_Resp(401, {})):
-            with self.assertRaises(ProviderError):
+            with self.assertRaises(MailMissError) as ctx:
                 src.poll_otp(mb, timeout_s=1, poll_interval_s=0.01)
+        exc = ctx.exception
+        diag = exc.diagnostics
+        self.assertIsNotNone(diag)
+        self.assertEqual(diag.failure_class, "imap_error")
+        self.assertIn("auth_fail", diag.notes)
+        # Neither the mailbox JWT nor the admin key may reach the error or the
+        # diagnostics that get persisted as an artifact.
+        self.assertNotIn("synthetic-jwt", str(exc))
+        self.assertNotIn("synthetic-jwt", repr(diag))
+        self.assertNotIn(src.admin_key, repr(diag))
 
 
 if __name__ == "__main__":

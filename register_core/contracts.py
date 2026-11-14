@@ -154,7 +154,12 @@ class OtpCode:
 
 @dataclass(slots=True)
 class OtpWaitDiagnostics:
-    """Observability for one OTP poll window (no raw MIME/token)."""
+    """Observability for one OTP poll window (no raw MIME/token).
+
+    ``failure_class`` uses the canonical vocabulary in
+    :mod:`register_core.email.outcome` (``no_mail`` / ``parse_fail`` /
+    ``stale_code`` / ``imap_error`` / ``aborted``; ``""`` means success).
+    """
 
     poll_count: int = 0
     message_scan_count: int = 0
@@ -166,10 +171,17 @@ class OtpWaitDiagnostics:
     first_seen_after_seconds: float | None = None
     matched_after_seconds: float | None = None
     abort_reason: str = ""
-    failure_class: str = ""  # no_mail | parse_fail | stale_code | imap_error | aborted | ""
+    # Canonical poll outcome (see register_core.email.outcome):
+    # no_mail | parse_fail | stale_code | imap_error | aborted | "" (success)
+    failure_class: str = ""
     provider: str = ""
     sender_hint: str = ""
     notes: str = ""
+    # Counters backing the failure_class decision (see email/outcome.py):
+    list_error_count: int = 0  # mail-list requests that failed outright
+    stale_message_count: int = 0  # messages older than newer_than_epoch
+    stale_code_count: int = 0  # codes parsed from pre-watermark messages
+    used_code_count: int = 0  # parsed codes already present in used_codes
 
 
 @dataclass(slots=True)

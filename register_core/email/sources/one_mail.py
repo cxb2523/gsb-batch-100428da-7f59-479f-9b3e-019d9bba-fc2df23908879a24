@@ -40,7 +40,13 @@ from typing import Any
 import requests
 
 from register_core.contracts import Mailbox, OtpCode, OtpWaitDiagnostics
-from register_core.errors import FailFastError, MailMissError, ProviderError
+from register_core.email.outcome import (
+    MailListError,
+    list_error_notes,
+    poll_until_code,
+    status_notes,
+)
+from register_core.errors import FailFastError, ProviderError
 
 
 class OneMailSource:
@@ -151,6 +157,11 @@ class OneMailSource:
         return jwt
 
     def _fetch_codes(self, jwt: str, *, fresh_ms: int, limit: int) -> list[dict[str, Any]]:
+        """GET /api/verifcodes; failures surface as :class:`MailListError`.
+
+        The bearer JWT, URL, and body never travel on the error — only a short
+        status/type note, so ``MailMissError.diagnostics`` stays secret-free.
+        """
         try:
             resp = requests.get(
                 f"{self.base_url}/api/verifcodes",
@@ -159,10 +170,21 @@ class OneMailSource:
                 timeout=15,
             )
         except requests.RequestException as exc:
-            raise ProviderError(f"one_mail verifcodes transport: {exc}") from exc
+            raise MailListError(
+                f"one_mail verifcodes transport: {type(exc).__name__}",
+                notes=list_error_notes(exc),
+            ) from exc
         if resp.status_code != 200:
-            raise ProviderError(f"one_mail verifcodes: http {resp.status_code}")
-        body = resp.json() if isinstance(resp.json(), dict) else {}
+            raise MailListError(
+                f"one_mail verifcodes: http {resp.status_code}",
+                notes=status_notes(resp.status_code),
+            )
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise MailListError("one_mail verifcodes: non-JSON", notes="bad_payload") from exc
+        if not isinstance(body, dict):
+            raise MailListError("one_mail verifcodes: payload not an object", notes="bad_payload")
         results = body.get("results")
         return [r for r in results if isinstance(r, dict)] if isinstance(results, list) else []
 
@@ -178,14 +200,28 @@ class OneMailSource:
                 timeout=15,
             )
         except requests.RequestException as exc:
-            raise ProviderError(f"one_mail admin verifcodes transport: {exc}") from exc
-        if resp.status_code == 401:
-            raise ProviderError(
-                "one_mail admin verifcodes: http 401 (check ONEMAIL_ADMIN_KEY)"
-            )
+            raise MailListError(
+                f"one_mail admin verifcodes transport: {type(exc).__name__}",
+                notes=list_error_notes(exc),
+            ) from exc
         if resp.status_code != 200:
-            raise ProviderError(f"one_mail admin verifcodes: http {resp.status_code}")
-        body = resp.json() if isinstance(resp.json(), dict) else {}
+            # 401/403 keep their auth marker so ops can tell a bad
+            # ONEMAIL_ADMIN_KEY apart from a server outage, without the key
+            # itself ever entering diagnostics.
+            raise MailListError(
+                f"one_mail admin verifcodes: http {resp.status_code}",
+                notes=status_notes(resp.status_code),
+            )
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise MailListError(
+                "one_mail admin verifcodes: non-JSON", notes="bad_payload"
+            ) from exc
+        if not isinstance(body, dict):
+            raise MailListError(
+                "one_mail admin verifcodes: payload not an object", notes="bad_payload"
+            )
         results = body.get("results")
         return [r for r in results if isinstance(r, dict)] if isinstance(results, list) else []
 
@@ -249,7 +285,17 @@ class OneMailSource:
         newer_than_epoch: float | None = None,
         sender_hint: str | None = None,
     ) -> OtpCode:
-        started = _time.time()
+        """Poll one-mail's server-extracted codes with the shared outcome set.
+
+        Endings are ``no_mail`` / ``parse_fail`` / ``stale_code`` / ``imap_error``
+        exactly as cf_temp and cloudflare report them (see
+        :mod:`register_core.email.outcome`).  ``newer_than_epoch`` is enforced
+        twice: the server-side ``fresh`` window narrows the list, and the
+        client-side watermark keeps rows at/below it from ever becoming a new
+        code — while still counting them as delivered mail, so a mailbox that
+        only holds an old code ends as ``stale_code``/``parse_fail`` instead of
+        falsely as ``no_mail``.
+        """
         diag = OtpWaitDiagnostics(
             timeout_s=float(timeout_s),
             provider=self.name,
@@ -269,42 +315,26 @@ class OneMailSource:
             jwt = mailbox.token or self._login(mailbox.address, mailbox.password)
             return self._fetch_codes(jwt, fresh_ms=fresh_ms, limit=5)
 
-        deadline = started + timeout_s
-        while _time.time() < deadline:
-            rows = _fetch()
-            diag.poll_count += 1
-            diag.message_scan_count += len(rows)
-            for row in rows:
-                code = str(row.get("code") or "")
-                if not code:
-                    continue
-                sender = str(row.get("from_addr") or "")
-                if sender_hint and sender_hint.lower() not in sender.lower():
-                    continue
-                if used_codes and code in used_codes:
-                    diag.failure_class = "stale_code"
-                    self.last_wait_diagnostics = diag
-                    raise MailMissError(
-                        f"one_mail OTP already used for {mailbox.address}",
-                        diagnostics=diag,
-                    )
-                diag.matched_at = _time.time()
-                diag.matched_after_seconds = diag.matched_at - started
-                diag.failure_class = ""
-                self.last_wait_diagnostics = diag
-                return OtpCode(
-                    code=code,
-                    source=self.name,
-                    raw_subject=str(row.get("subject") or ""),
-                )
-            _time.sleep(poll_interval_s)
-
-        diag.elapsed_seconds = _time.time() - started
-        diag.failure_class = diag.failure_class or "no_mail"
-        self.last_wait_diagnostics = diag
-        raise MailMissError(
-            f"one_mail OTP timeout for {mailbox.address} after {timeout_s:.0f}s",
-            diagnostics=diag,
+        return poll_until_code(
+            provider=self.name,
+            address=mailbox.address,
+            diag=diag,
+            fetch=_fetch,
+            extract_code=lambda row: str(row.get("code") or "").strip(),
+            sender_key=lambda row: str(row.get("from_addr") or ""),
+            timeout_s=float(timeout_s),
+            poll_interval_s=float(poll_interval_s),
+            used_codes=used_codes,
+            newer_than_epoch=newer_than_epoch,
+            sender_hint=sender_hint,
+            # This mailbox pool can hold codes for several products, so a
+            # sender hint still acts as a filter (historical behaviour) — but
+            # filtered-out mail is already counted as delivered, so it ends as
+            # parse_fail rather than a false no_mail.
+            sender_must_match=True,
+            note_prefix="one_mail verifcodes",
+            clock=_time.monotonic,
+            sleep=lambda seconds: _time.sleep(seconds),
         )
 
     def release(self, mailbox: Mailbox, *, success: bool) -> None:

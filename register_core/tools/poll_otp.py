@@ -106,7 +106,15 @@ def main(argv: list[str] | None = None) -> int:
             sender_hint=sender_hint,
         )
     except MailMissError as exc:
+        # Shell adapters branch on the class, not on free-form text:
+        #   no_mail     → widen the wait / try another mailbox
+        #   parse_fail  → the decoder or the template is wrong
+        #   stale_code  → the code was already consumed (or is pre-watermark)
+        #   imap_error  → the list request itself failed
+        diag = getattr(exc, "diagnostics", None)
+        failure_class = str(getattr(diag, "failure_class", "") or "") or "unknown"
         print(f"otp_poll miss: {exc}", file=sys.stderr)
+        print(f"otp_poll class: {failure_class}", file=sys.stderr)
         return 2
     except Exception as exc:
         print(f"otp_poll error: {exc}", file=sys.stderr)

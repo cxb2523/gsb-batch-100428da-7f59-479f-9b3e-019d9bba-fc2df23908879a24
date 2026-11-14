@@ -6,6 +6,12 @@ import time as _time
 from typing import Any
 
 from register_core.contracts import Mailbox, OtpCode, OtpWaitDiagnostics
+from register_core.email.outcome import (
+    NO_MAIL,
+    STALE_CODE,
+    classify_legacy_failure,
+    normalize_failure_class,
+)
 from register_core.errors import FailFastError, MailMissError, ProviderError
 
 
@@ -69,30 +75,32 @@ class GmailImapSource:
                 poll_interval=int(poll_interval_s),
             )
         except Exception as exc:
-            msg = str(exc)
-            low = msg.lower()
-            diag.failure_class = "imap_error"
-            if "auth" in low or "credential" in low or "authenticationfailed" in low:
-                diag.notes = ((diag.notes or "") + " auth_fail").strip()
-            else:
-                # transport / protocol / timeout from underlying helper
-                diag.notes = ((diag.notes or "") + f" transport:{msg[:80]}").strip()
+            # The helper only exposes a free-form message; classify it into the
+            # same four outcomes every source uses (register_core.email.outcome)
+            # instead of a gmail-private spelling.
+            failure, note = classify_legacy_failure(str(exc))
+            diag.failure_class = normalize_failure_class(failure)
+            diag.list_error_count = 1
+            if note:
+                diag.notes = ((diag.notes or "") + f" {note}").strip()
             diag.elapsed_seconds = _time.time() - started
             self.last_wait_diagnostics = diag
-            raise MailMissError(f"gmail OTP failed: {exc}", diagnostics=diag) from exc
+            raise MailMissError(
+                f"gmail OTP failed ({diag.failure_class})", diagnostics=diag
+            ) from exc
         finally:
             if prev is not None:
                 reg.config["email_provider"] = prev
         diag.elapsed_seconds = _time.time() - started
         if not code:
-            diag.failure_class = "no_mail"
+            diag.failure_class = NO_MAIL
             self.last_wait_diagnostics = diag
             raise MailMissError(
                 f"gmail empty OTP for {mailbox.address}",
                 diagnostics=diag,
             )
         if used_codes and code in used_codes:
-            diag.failure_class = "stale_code"
+            diag.failure_class = STALE_CODE
             self.last_wait_diagnostics = diag
             # Do not put the raw OTP into the error string (log/sink surface).
             raise MailMissError(

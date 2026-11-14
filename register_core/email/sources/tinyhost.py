@@ -150,6 +150,13 @@ class TinyhostSource:
         sender_hint: str | None = None,
     ) -> OtpCode:
         from register_core.contracts import OtpWaitDiagnostics
+        from register_core.email.outcome import (
+            IMAP_ERROR,
+            NO_MAIL,
+            PARSE_FAIL,
+            STALE_CODE,
+            normalize_failure_class,
+        )
 
         used = used_codes or set()
         local = mailbox.meta.get("local") or mailbox.address.split("@", 1)[0]
@@ -165,13 +172,22 @@ class TinyhostSource:
             sender_hint=(sender_hint or ""),
         )
         self.last_wait_diagnostics = diag
+        list_errors = 0
+        used_code_hits = 0
+        stale_code_hits = 0
+        fresh_messages = 0
 
         while time.time() < deadline:
             diag.poll_count += 1
             try:
                 data = self._get_json(url, timeout=20)
             except MailMissError:
-                diag.empty_rounds += 1
+                # A failed list request is tracked separately from "no mail":
+                # reporting an unreadable list as an empty mailbox is exactly
+                # the confusion this shared taxonomy removes.
+                list_errors += 1
+                diag.list_error_count = list_errors
+                diag.notes = ((diag.notes or "") + " transport").strip()
                 time.sleep(poll_interval_s)
                 continue
             emails = data.get("emails") if isinstance(data, dict) else None
@@ -186,16 +202,11 @@ class TinyhostSource:
                 if not isinstance(mail, dict):
                     continue
                 diag.message_scan_count += 1
-                ts = _parse_mail_ts(mail.get("date"))
-                if ts and ts < since:
-                    continue
                 subject = str(mail.get("subject") or "")
                 blob = " ".join(
                     str(mail.get(k) or "")
                     for k in ("from", "sender", "subject", "body", "html_body", "text")
                 )
-                if hint and hint not in blob.lower():
-                    continue
                 # typesafe.ai mail contains both a Stytch URL and short tokens
                 # that look like an xAI OTP. When the caller asked for typesafe,
                 # the magic link is the code; a hex/alnum hit must not win.
@@ -210,7 +221,28 @@ class TinyhostSource:
                     parsed = extract_typesafe_magic_link(blob, subject=subject)
                     if parsed:
                         code = parsed["magic_link"]
-                if not code or code in used:
+                ts = _parse_mail_ts(mail.get("date"))
+                if ts and ts < since:
+                    # Pre-watermark mail is never a new code, but its presence
+                    # still proves delivery: with a code it is stale_code, not
+                    # no_mail.
+                    diag.stale_message_count += 1
+                    if code and code not in used:
+                        stale_code_hits += 1
+                        diag.stale_code_count = stale_code_hits
+                        diag.notes = ((diag.notes or "") + " watermark").strip()
+                    continue
+                # The message is fresh and delivered even when the sender hint
+                # does not match, so it counts as "mail arrived" for the
+                # no_mail/parse_fail distinction.
+                fresh_messages += 1
+                if hint and hint not in blob.lower():
+                    continue
+                if not code:
+                    continue
+                if code in used:
+                    used_code_hits += 1
+                    diag.used_code_count = used_code_hits
                     continue
                 diag.matched_at = time.time()
                 diag.matched_after_seconds = diag.matched_at - started
@@ -223,10 +255,20 @@ class TinyhostSource:
                 )
             time.sleep(poll_interval_s)
         diag.elapsed_seconds = time.time() - started
-        diag.failure_class = "no_mail" if diag.message_scan_count == 0 else "parse_fail"
+        # Same precedence as register_core.email.outcome.PollEvidence:
+        # used code > fresh mail without a code > pre-watermark mail > list errors.
+        if used_code_hits or stale_code_hits:
+            failure = STALE_CODE
+        elif fresh_messages:
+            failure = PARSE_FAIL
+        elif diag.message_scan_count == 0 and list_errors:
+            failure = IMAP_ERROR
+        else:
+            failure = NO_MAIL
+        diag.failure_class = normalize_failure_class(failure)
         self.last_wait_diagnostics = diag
         raise MailMissError(
-            f"tinyhost OTP timeout for {mailbox.address}",
+            f"tinyhost OTP miss for {mailbox.address} ({diag.failure_class})",
             diagnostics=diag,
         )
 

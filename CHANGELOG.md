@@ -9,6 +9,22 @@ project versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Unified OTP poll outcomes** (`register_core/email/outcome.py`): every
+  `EmailSource` now ends a poll window with one of four canonical
+  `OtpWaitDiagnostics.failure_class` values — `no_mail` / `parse_fail` /
+  `stale_code` / `imap_error` (plus `aborted`) — instead of per-source strings.
+  `one_mail`, `cf_temp` (`temp_mail`) and `cloudflare` share one poll loop
+  (`poll_until_code`), so the same mailbox state yields the same diagnosis;
+  `gmail_imap` and `tinyhost` map onto the same vocabulary.
+  `newer_than_epoch` is still enforced (old mail is never a new code) but mail
+  below the watermark now ends as `stale_code`/`parse_fail`, never as
+  `no_mail`. A mail-list failure no longer masquerades as an empty mailbox and
+  no longer aborts the window early. Diagnostics gain
+  `list_error_count` / `stale_message_count` / `stale_code_count` /
+  `used_code_count`, carry only counters and short notes tokens (no mailbox
+  JWT, admin key, or mail body), and `register_core/tools/poll_otp.py` prints
+  the class on stderr (`otp_poll class: …`). Offline tests:
+  `tests/unit/test_otp_outcome.py`.
 - **typesafe.ai / jev console provider** (in-process): Stytch magic-link →
   `/api/auth/callback` → `/api/api-keys`. Hub `./register.sh typesafe [count]`,
   aliases `jev` / `typesafe-ai`. Default mailbox is tinyhost (full body).

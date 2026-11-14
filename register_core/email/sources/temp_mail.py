@@ -17,42 +17,29 @@ from __future__ import annotations
 import os
 import re
 import time
-from datetime import datetime
 from typing import Any
 
 import httpx
 
 from register_core.contracts import Mailbox, OtpCode, OtpWaitDiagnostics
-from register_core.errors import MailMissError, ProviderError
+from register_core.email.outcome import (
+    MailListError,
+    list_error_notes,
+    mail_epoch,
+    poll_until_code,
+)
+from register_core.errors import ProviderError
 
 _CODE_PATTERNS = (
     re.compile(r"(?i)(?:code|验证码|security code)[^0-9]{0,20}(\d{6})"),
     re.compile(r"\b(\d{6})\b"),
 )
 
-_MAIL_TIME_KEYS = ("timestamp", "created_at", "createdAt", "date", "received_at")
-
-
-def _mail_epoch(mail: dict[str, Any]) -> float | None:
-    """Best-effort epoch seconds for one mail row; None when undeterminable."""
-    for key in _MAIL_TIME_KEYS:
-        raw = mail.get(key)
-        if raw in (None, ""):
-            continue
-        if isinstance(raw, (int, float)):
-            value = float(raw)
-            # CF Temp Mail sometimes reports milliseconds.
-            return value / 1000.0 if value > 1e11 else value
-        text = str(raw).strip()
-        try:
-            return float(text)
-        except ValueError:
-            pass
-        try:
-            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            continue
-    return None
+# Re-exported for callers that referenced the helper while it lived here; the
+# implementation now lives in register_core.email.outcome so every source uses
+# one date normalization.
+__all__ = ["TempMailClient", "TempMailSource", "_mail_epoch", "mail_epoch"]
+_mail_epoch = mail_epoch
 
 
 class TempMailClient:
@@ -124,16 +111,31 @@ class TempMailClient:
         return self.mailbox_from_payload(payload)
 
     def list_mails(self, mailbox: Mailbox) -> list[dict[str, Any]]:
-        response = httpx.get(
-            f"{self.base_url}/api/mails",
-            headers={"Authorization": f"Bearer {mailbox.token}"},
-            timeout=self.timeout,
-        )
-        response.raise_for_status()
-        payload = response.json()
+        """GET one mailbox's message list.
+
+        Failures become :class:`MailListError` carrying only a short notes
+        token — the JWT header, URL, and response body never travel with it.
+        """
+        try:
+            response = httpx.get(
+                f"{self.base_url}/api/mails",
+                headers={"Authorization": f"Bearer {mailbox.token}"},
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            raise MailListError(
+                f"cf_temp list failed: {type(exc).__name__}",
+                notes=list_error_notes(exc),
+            ) from exc
         if isinstance(payload, list):
             return [row for row in payload if isinstance(row, dict)]
+        if not isinstance(payload, dict):
+            raise MailListError("cf_temp list payload not a list/object", notes="bad_payload")
         rows = payload.get("mails") or payload.get("results") or []
+        if not isinstance(rows, list):
+            raise MailListError("cf_temp list rows not a list", notes="bad_payload")
         return [row for row in rows if isinstance(row, dict)]
 
     def wait_for_code(
@@ -146,7 +148,15 @@ class TempMailClient:
         used_codes: set[str] | None = None,
         sender_hint: str | None = None,
     ) -> OtpCode:
-        """Poll until a fresh 6-digit code arrives, else raise MailMissError."""
+        """Poll until a fresh code arrives, else raise a classified MailMissError.
+
+        Outcome classes come from :mod:`register_core.email.outcome`, so this
+        source, ``one_mail`` and ``cloudflare`` answer the same way to the same
+        situation.  A list request that fails does not end the window early;
+        the ending is ``imap_error`` only when the list itself is what ended it,
+        and "no mail" is never reported for a mailbox that the list kept failing
+        to read.
+        """
         diag = OtpWaitDiagnostics(
             timeout_s=float(timeout_sec),
             provider="cf_temp",
@@ -154,70 +164,25 @@ class TempMailClient:
             notes="cf_temp wait_for_code",
         )
         self.last_wait_diagnostics = diag
-        seen = used_codes or set()
-        started = time.monotonic()
-        deadline = started + float(timeout_sec)
-
-        while True:
-            diag.poll_count += 1
-            try:
-                mails = self.list_mails(mailbox)
-            except Exception as exc:
-                diag.failure_class = "imap_error"
-                diag.elapsed_seconds = time.monotonic() - started
-                raise MailMissError(
-                    f"cf_temp mail list failed for {mailbox.address}: {type(exc).__name__}",
-                    diagnostics=diag,
-                ) from exc
-
-            if after_ts is not None:
-                mails = [
-                    mail
-                    for mail in mails
-                    if (_mail_epoch(mail) or 0.0) == 0.0 or (_mail_epoch(mail) or 0.0) > after_ts
-                ]
-            if mails:
-                diag.message_scan_count += len(mails)
-                if diag.first_message_seen_at is None:
-                    diag.first_message_seen_at = time.monotonic()
-                    diag.first_seen_after_seconds = diag.first_message_seen_at - started
-            else:
-                diag.empty_rounds += 1
-
-            if sender_hint:
-                hint = sender_hint.lower()
-                preferred = [
-                    mail
-                    for mail in mails
-                    if hint in f"{mail.get('source', '')}{mail.get('from', '')}".lower()
-                ]
-                mails = preferred + [mail for mail in mails if mail not in preferred]
-
-            for mail in mails:
-                haystack = " ".join(
-                    str(mail.get(key, "") or "") for key in ("subject", "text", "body")
+        return poll_until_code(
+            provider="cf_temp",
+            address=mailbox.address,
+            diag=diag,
+            fetch=lambda: self.list_mails(mailbox),
+            extract_code=lambda mail: self.extract_code_from_text(
+                " ".join(
+                    str(mail.get(key, "") or "")
+                    for key in ("subject", "text", "body")
                 )
-                code = self.extract_code_from_text(haystack)
-                if not code:
-                    continue
-                if code in seen:
-                    diag.failure_class = diag.failure_class or "stale_code"
-                    continue
-                diag.failure_class = ""
-                diag.matched_at = time.monotonic()
-                diag.matched_after_seconds = diag.matched_at - started
-                diag.elapsed_seconds = diag.matched_at - started
-                return OtpCode(code=code, source="cf_temp")
-
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(max(0.1, float(poll_sec)))
-
-        diag.failure_class = diag.failure_class or ("parse_fail" if diag.message_scan_count else "no_mail")
-        diag.elapsed_seconds = time.monotonic() - started
-        raise MailMissError(
-            f"cf_temp no OTP for {mailbox.address} before deadline",
-            diagnostics=diag,
+            ),
+            sender_key=lambda mail: f"{mail.get('source', '')}{mail.get('from', '')}",
+            timeout_s=float(timeout_sec),
+            poll_interval_s=float(poll_sec),
+            used_codes=used_codes,
+            newer_than_epoch=after_ts,
+            sender_hint=sender_hint,
+            clock=time.monotonic,
+            sleep=lambda seconds: time.sleep(seconds),
         )
 
     def release(self, mailbox: Mailbox, *, success: bool) -> None:
