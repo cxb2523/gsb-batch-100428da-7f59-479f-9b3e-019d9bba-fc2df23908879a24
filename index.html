@@ -17,6 +17,7 @@
 					<ul class="breadcrumb">
 						<li >100%-Discount list:</li>
 					</ul>
+					<div id="failed-warning" class="alert alert-warning" role="alert" style="display: none;"></div>
 					<table class="table table-striped">
 						<thead>
 							<tr>
@@ -52,6 +53,10 @@
 					success: function(data){
 						$('#totalcount').text(data["total_count"]);
 						$('#uptime').text(data["update_time"]);
+						if (data["failed_pages"] && data["failed_pages"].length > 0) {
+							var pages = data["failed_pages"].map(function(p){ return "第 " + p.page + " 页 (" + p.reason + ")"; });
+							$('#failed-warning').text("⚠️ 部分页面抓取失败，数据可能不完整：" + pages.join("、")).show();
+						}
 						if (data["free_list"].length === 0) {
 							$('#listcontent').append("<tr><td colspan='2' style='text-align: center;'>暂无免费游戏数据</td></tr>");
 						} else {
