@@ -3,17 +3,30 @@ import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import fs from 'fs';
 import { scrapeAllIndividualArticles } from './scrape/scrapeAllIndividualArticles';
-import { scrapeSitemap } from './scrape/scrapeSitemap';
+import {
+  scrapeSitemap,
+  sitemapSweepFromError,
+  type SitemapSweepSummary,
+} from './scrape/scrapeSitemap';
 import { closeSession } from './fetch/fetchURL';
 import { failureStopReason } from './scrape/scrapeAllIndividualArticles';
 import {
   createScrapeOutcome,
   finalizeOutcome,
   publishOutcome,
+  type SitemapRoundReport,
   type StopReason,
 } from './helpers/scrapeOutcome';
 
 export const prisma = new PrismaClient();
+
+function toSitemapRoundReport(sweep: SitemapSweepSummary): SitemapRoundReport {
+  return {
+    total: sweep.total,
+    completed: sweep.completed.map((part) => ({ ...part })),
+    failed: sweep.failed.map((part) => ({ ...part })),
+  };
+}
 
 export async function main() {
   const outcome = createScrapeOutcome();
@@ -61,7 +74,17 @@ export async function main() {
     outcome.database.before = await prisma.pixivArticle.count();
     outcome.phase = 'sitemap';
     publish();
-    await scrapeSitemap(controller.signal);
+    try {
+      outcome.sitemap = toSitemapRoundReport(
+        await scrapeSitemap(controller.signal),
+      );
+    } catch (error) {
+      // A partially failed sitemap round still reports which parts finished and
+      // which did not, then keeps the existing stop/error semantics.
+      const sweep = sitemapSweepFromError(error);
+      if (sweep) outcome.sitemap = toSitemapRoundReport(sweep);
+      throw error;
+    }
     controller.signal.throwIfAborted();
     outcome.phase = 'articles';
     publish();

@@ -9,13 +9,24 @@ async function scrapeScenario(scenario: string) {
     const scenario = ${JSON.stringify(scenario)};
     const controller = new AbortController();
     const events = [];
-    mock.module(root + '/src/index.ts', () => ({ prisma: {
-      pixivArticle: { deleteMany: async () => ({ count: 0 }) },
-      $executeRawUnsafe: async () => {
-        events.push('batch');
-        if (scenario === 'abort-after-batch') controller.abort();
-      },
-    }}));
+    mock.module(root + '/src/index.ts', () => {
+      const client = {
+        pixivArticle: { deleteMany: async () => ({ count: 0 }) },
+        $executeRawUnsafe: async () => {
+          events.push('batch');
+          if (scenario === 'abort-after-batch') controller.abort();
+        },
+        sitemapPartProgress: {
+          findMany: async () => [],
+          upsert: async () => {
+            events.push('part-progress');
+            if (scenario === 'part-progress-failed') throw new Error('db down');
+          },
+        },
+      };
+      client.$transaction = async (fn) => fn(client);
+      return { prisma: client };
+    });
     mock.module(root + '/src/helpers/lastScrapedHandler.ts', () => ({
       getCategoryScraped: async () => '2000-01-01T00:00:00Z',
       updateCategoryScraped: async () => events.push('watermark'),
@@ -61,11 +72,18 @@ for (const scenario of [
     expect(
       result.events.filter((event: string) => event === 'batch'),
     ).toHaveLength(scenario === 'abort-after-batch' ? 1 : 0);
+    if (scenario !== 'abort-after-batch')
+      expect(result.events).not.toContain('part-progress');
   });
 }
 
 test('a valid empty sitemap part can advance its watermark', async () => {
   const result = await scrapeScenario('empty-part');
   expect(result.failed).toBe(false);
-  expect(result.events).toEqual(['index', 'part', 'watermark']);
+  expect(result.events).toEqual([
+    'index',
+    'part',
+    'part-progress',
+    'watermark',
+  ]);
 });

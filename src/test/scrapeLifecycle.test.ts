@@ -42,14 +42,38 @@ async function runScenario(scenario: string) {
     mock.module(root + '/src/fetch/fetchURL.ts', () => ({
       closeSession: async () => { event('close'); if (scenario === 'cleanup-failed') throw new Error('private-close-detail'); },
     }));
-    mock.module(root + '/src/scrape/scrapeSitemap.ts', () => ({ scrapeSitemap: async () => {
-      event('sitemap');
-      if (scenario === 'timeout-sitemap-failed') {
-        await new Promise(resolve => setTimeout(resolve, 50));
-        throw new SyntaxError('private-late-sitemap-detail');
-      }
-      if (scenario === 'sitemap-failed') throw new SyntaxError('private-html-detail');
-    }}));
+    mock.module(root + '/src/scrape/scrapeSitemap.ts', () => ({
+      sitemapSweepFromError: (error) => error?.sitemapSweep,
+      scrapeSitemap: async () => {
+        event('sitemap');
+        if (scenario === 'timeout-sitemap-failed') {
+          await new Promise(resolve => setTimeout(resolve, 50));
+          throw new SyntaxError('private-late-sitemap-detail');
+        }
+        if (scenario === 'sitemap-failed') throw new SyntaxError('private-html-detail');
+        if (scenario === 'sitemap-part-failed') {
+          const error = new SyntaxError('private-part-detail');
+          error.sitemapSweep = {
+            total: 2,
+            completed: [
+              { loc: 'https://dic.pixiv.net/sitemap/part/a', lastmod: '2026-01-01T00:00:00Z', upserted: 1 },
+            ],
+            failed: [
+              { loc: 'https://dic.pixiv.net/sitemap/part/b', lastmod: '2026-01-01T00:00:00Z', reason: 'parse-failed (Expected a complete urlset XML document)' },
+            ],
+          };
+          throw error;
+        }
+        return {
+          total: 2,
+          completed: [
+            { loc: 'https://dic.pixiv.net/sitemap/part/a', lastmod: '2026-01-01T00:00:00Z', upserted: 1 },
+            { loc: 'https://dic.pixiv.net/sitemap/part/b', lastmod: '2026-01-01T00:00:00Z', upserted: 1 },
+          ],
+          failed: [],
+        };
+      },
+    }));
     class ArticleNotFoundError extends Error {}
     mock.module(root + '/src/scrape/scrapeSingleArticleInfo.ts', () => ({
       ArticleNotFoundError,
@@ -126,6 +150,48 @@ test('entrypoint reports actual writes, 404 deletion, ignored tags and completio
     'close',
   ]);
   expect(result.marker).toBe(true);
+  expect(result.report.sitemap).toEqual({
+    total: 2,
+    completed: [
+      {
+        loc: 'https://dic.pixiv.net/sitemap/part/a',
+        lastmod: '2026-01-01T00:00:00Z',
+        upserted: 1,
+      },
+      {
+        loc: 'https://dic.pixiv.net/sitemap/part/b',
+        lastmod: '2026-01-01T00:00:00Z',
+        upserted: 1,
+      },
+    ],
+    failed: [],
+  });
+});
+
+test('entrypoint reports the per-part sitemap summary from a failed round', async () => {
+  const result = await runScenario('sitemap-part-failed');
+  expect(result.code).toBe(1);
+  expect(result.report.status).toBe('partial');
+  expect(result.report.stopReason).toBe('fatal-error');
+  expect(result.report.stoppedPhase).toBe('sitemap');
+  expect(result.report.sitemap).toEqual({
+    total: 2,
+    completed: [
+      {
+        loc: 'https://dic.pixiv.net/sitemap/part/a',
+        lastmod: '2026-01-01T00:00:00Z',
+        upserted: 1,
+      },
+    ],
+    failed: [
+      {
+        loc: 'https://dic.pixiv.net/sitemap/part/b',
+        lastmod: '2026-01-01T00:00:00Z',
+        reason: 'parse-failed (Expected a complete urlset XML document)',
+      },
+    ],
+  });
+  expect(result.marker).toBe(false);
 });
 
 for (const scenario of [

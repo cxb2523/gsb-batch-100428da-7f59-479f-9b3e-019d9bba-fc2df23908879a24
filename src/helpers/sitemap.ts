@@ -3,6 +3,28 @@ export type SitemapEntry = {
   lastmod: string;
 };
 
+/** A sitemap part fully applied and recorded as complete this round. */
+export type SitemapPartCompletion = {
+  loc: string;
+  lastmod: string;
+  upserted: number;
+};
+
+/** A sitemap part that failed this round, with a bounded reason category. */
+export type SitemapPartFailure = {
+  loc: string;
+  lastmod: string;
+  reason: string;
+};
+
+/** The outcome of one sitemap round, listing what finished and what did not. */
+export type SitemapSweepSummary = {
+  /** Parts selected for this round, i.e. not already complete at this lastmod. */
+  total: number;
+  completed: SitemapPartCompletion[];
+  failed: SitemapPartFailure[];
+};
+
 const ARTICLE_URL_PREFIX = 'https://dic.pixiv.net/a/';
 const JA_SITEMAP_PART_PREFIX = 'https://dic.pixiv.net/sitemap/part/';
 

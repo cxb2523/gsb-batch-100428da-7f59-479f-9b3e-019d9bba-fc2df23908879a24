@@ -16,6 +16,16 @@ model scrapeProgress {
   oldestScraped String @default("9999-12-31 23:59:59")
 }
 
+// Per-part completion ledger for the sitemap resume chain. A part is selected
+// again only when its index lastmod is newer than the lastmod recorded here.
+// Unlike the single `sitemap` watermark, this can represent a partly successful
+// round without skipping the parts that failed.
+model sitemapPartProgress {
+  loc         String @id
+  lastmod     String
+  completedAt String
+}
+
 model PixivArticle {
   tag_name           String  @id
   summary            String

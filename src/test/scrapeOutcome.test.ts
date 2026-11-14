@@ -323,6 +323,58 @@ for (const invalid of [
   });
 }
 
+test('workflow summary lists failed sitemap parts with their reasons', async () => {
+  const report = completeOutcome();
+  report.sitemap = {
+    total: 3,
+    completed: [
+      {
+        loc: 'https://dic.pixiv.net/sitemap/part/a',
+        lastmod: '2026-01-01T00:00:00Z',
+        upserted: 4,
+      },
+    ],
+    failed: [
+      {
+        loc: 'https://dic.pixiv.net/sitemap/part/b',
+        lastmod: '2026-01-01T00:00:00Z',
+        reason: 'parse-failed (Expected a complete urlset XML document)',
+      },
+    ],
+  };
+  report.sitemap.total = 2;
+  const result = await workflowReport(report, { BUDGET_ENOUGH: 'false' });
+  expect(result.report.workflow.reportValid).toBe(true);
+  expect(result.report.workflow.releaseEligible).toBe(false);
+  expect(result.summary).toContain('Sitemap parts: 1/2 completed; 1 failed.');
+  expect(result.summary).toContain('https://dic.pixiv.net/sitemap/part/b');
+  expect(result.summary).toContain('parse-failed');
+});
+
+test('a sitemap summary whose part counts disagree is not trusted', async () => {
+  const report = completeOutcome();
+  report.sitemap = {
+    total: 3,
+    completed: [
+      {
+        loc: 'https://dic.pixiv.net/sitemap/part/a',
+        lastmod: '2026-01-01T00:00:00Z',
+        upserted: 1,
+      },
+    ],
+    failed: [
+      {
+        loc: 'https://dic.pixiv.net/sitemap/part/b',
+        lastmod: '2026-01-01T00:00:00Z',
+        reason: 'x',
+      },
+    ],
+  };
+  const result = await workflowReport(report);
+  expect(result.report.workflow.reportValid).toBe(false);
+  expect(result.outputs).toContain('release_eligible=false');
+});
+
 test('a late timeout cannot hide a previously recorded fatal error', () => {
   const outcome = completeOutcome();
   outcome.error = 'fatal-error';

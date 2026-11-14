@@ -5,6 +5,39 @@ from pathlib import Path
 
 
 COUNT_KEYS = ('total', 'processed', 'successful', 'failed', 'notFound', 'skipped')
+SITEMAP_KEYS = ('total', 'completed', 'failed')
+
+
+def valid_sitemap(sitemap):
+    """Optional sitemap round summary; absent reports are still valid."""
+    if sitemap is None:
+        return True
+    if not isinstance(sitemap, dict):
+        return False
+    counts = sitemap.get('total')
+    completed = sitemap.get('completed')
+    failed = sitemap.get('failed')
+    if type(counts) is not int or counts < 0:
+        return False
+    if not isinstance(completed, list) or not isinstance(failed, list):
+        return False
+    if len(completed) + len(failed) != counts:
+        return False
+    for part in completed:
+        if not isinstance(part, dict) or not isinstance(part.get('loc'), str):
+            return False
+        if not isinstance(part.get('lastmod'), str):
+            return False
+        if type(part.get('upserted')) is not int or part['upserted'] < 0:
+            return False
+    for part in failed:
+        if not isinstance(part, dict) or not isinstance(part.get('loc'), str):
+            return False
+        if not isinstance(part.get('lastmod'), str):
+            return False
+        if not isinstance(part.get('reason'), str):
+            return False
+    return True
 REASONS = {
     'running', 'completed', 'cloudflare', 'rate-limit', 'network-error',
     'fatal-error', 'timeout', 'sigint', 'sigterm', 'cleanup-failed',
@@ -23,6 +56,7 @@ def valid_report(report):
         and report['stopReason'] in REASONS
         and type(report.get('finalized')) is bool
         and isinstance(report.get('cleanupErrors'), list)
+        and valid_sitemap(report.get('sitemap'))
         and isinstance(counts, dict)
         and all(type(counts.get(key)) is int and counts[key] >= 0 for key in COUNT_KEYS)
         and counts['processed'] == sum(counts[key] for key in COUNT_KEYS[2:])
@@ -62,6 +96,7 @@ def evaluate(report, scrape, checkpoint, previous, budget):
             report['stopReason'] = 'process-failed'
 
     counts = report['counts']
+    sitemap = report.get('sitemap')
     complete = (
         report['status'] == 'complete'
         and report['stopReason'] == 'completed'
@@ -73,6 +108,7 @@ def evaluate(report, scrape, checkpoint, previous, budget):
         and checkpoint == 'success' and report['finalized']
         and 'error' not in report and not report['cleanupErrors']
         and counts['failed'] == 0
+        and (sitemap is None or not sitemap['failed'])
         and (report['database']['before'] or 0) > 0
         and (report['database']['after'] or 0) > 0
     )
@@ -102,12 +138,25 @@ def main():
     path.write_text(json.dumps(report, indent=2) + '\n')
     eligible = str(report['workflow']['releaseEligible']).lower()
     counts = report['counts']
+    sitemap = report.get('sitemap')
+    sitemap_summary = ''
+    if sitemap is not None:
+        sitemap_summary = (
+            f"\nSitemap parts: {len(sitemap['completed'])}/{sitemap['total']} "
+            f"completed; {len(sitemap['failed'])} failed.\n"
+        )
+        for part in sitemap['failed']:
+            sitemap_summary += (
+                f"- Failed `{part['loc']}` "
+                f"(lastmod {part['lastmod']}): {part['reason']}\n"
+            )
     summary = (
         f"## Scrape outcome: {report['status']}\n\n"
         f"Stop reason: {report['stopReason']}\n\n"
         f"Processed: {counts['processed']}/{counts['total']}; "
         f"successful: {counts['successful']}; failed: {counts['failed']}; "
-        f"not found: {counts['notFound']}; skipped: {counts['skipped']}.\n\n"
+        f"not found: {counts['notFound']}; skipped: {counts['skipped']}.\n"
+        f"{sitemap_summary}\n"
         f"Finalized: {report['finalized']}; "
         f"SQLite backup/integrity check: {report['workflow']['checkpoint']}.\n\n"
         f"Release eligible: **{eligible}**. Valid database snapshots are retained "

@@ -38,15 +38,48 @@ never satisfy the release guard. There are no extra article-level retries on top
 of the fetch layer's shared budget. Reports contain sanitized failure categories
 and cleanup operation names, not response bodies, URLs or credentials.
 
+## Sitemap parts and resume progress
+
+Each round fetches the sitemap index, filters Japanese parts, and selects the
+parts that are not yet complete at their current index `lastmod`. Completion is
+tracked per part in the `sitemapPartProgress` table (`loc`, `lastmod`,
+`completedAt`) rather than as one global date.
+
+- A part failure (fetch, parse, or database) no longer aborts the round. The
+  remaining due parts are still processed, then the round reports a `sitemap`
+  object in `scrape-outcome.json`: `total` (due parts), `completed[]` (`loc`,
+  `lastmod`, `upserted`), and `failed[]` (`loc`, `lastmod`, `reason`). `reason`
+  is a bounded category such as `parse-failed`, `fetch-failed (HTTP 503)`,
+  `fetch-blocked (cloudflare challenge)`, or `fetch-timeout`, with URLs and
+  response bodies sanitized out.
+- After the summary, the first underlying error is rethrown so existing
+  classification and exit behavior are unchanged; `SitemapSchemaError` from a
+  malformed part is still the thrown type.
+- A part's articles and its completion row commit in a single transaction, so a
+  failed or cancelled part leaves neither half-batch rows nor a progress entry.
+- The coarse `sitemap` category watermark remains as informational state and
+  advances only after a round where every due part succeeded. Resume selection
+  never reads it, so a stale value cannot skip failed parts. On first use with
+  an existing database, the ledger is seeded from that watermark (parts at or
+  older than it are treated as complete), avoiding a full refetch.
+- A rerun therefore selects exactly the parts that did not finish, plus any part
+  whose index `lastmod` advanced. A failed part is never skipped.
+- Known WAF tags are still ignored, and the successful-part upsert/dedup
+  condition (`lastScrapedArticle` newer than the sitemap `lastScraped`) is
+  unchanged.
+- A sitemap round with any failed part is not release eligible, and the workflow
+  summary lists each failed part location and reason.
+
 ## Timeout, interruption and finalization
 
 The configured timeout requests cooperative shutdown. SIGINT/SIGTERM do the same
 and exit 130/143. The article scraper checks cancellation before every write,
-and sitemap discovery checks between fetches/batches and before advancing its
-progress watermark. An already-issued DB operation may finish; successful
-article writes are counted when it resolves. A single finalizer then attempts DB
-count, WAL checkpoint, Prisma disconnect and fetch-session close, even when an
-earlier cleanup fails. Cleanup or report-publication failure exits nonzero.
+and sitemap discovery checks between fetches/batches, inside a part's
+transaction, and before advancing its progress watermark. An already-issued DB
+operation may finish; successful article writes are counted when it resolves. A
+single finalizer then attempts DB count, WAL checkpoint, Prisma disconnect and
+fetch-session close, even when an earlier cleanup fails. Cleanup or
+report-publication failure exits nonzero.
 
 A 30-second grace bounds shutdown and finalization. If a fetch/driver is still
 stuck, the process exits nonzero with `finalized: false`; the workflow performs

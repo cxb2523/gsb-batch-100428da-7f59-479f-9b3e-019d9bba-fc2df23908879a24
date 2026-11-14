@@ -12,6 +12,12 @@ export type StopReason =
   | 'sigterm'
   | 'cleanup-failed';
 
+export type SitemapRoundReport = {
+  total: number;
+  completed: { loc: string; lastmod: string; upserted: number }[];
+  failed: { loc: string; lastmod: string; reason: string }[];
+};
+
 export type ScrapeOutcome = {
   schemaVersion: 1;
   status: 'complete' | 'partial' | 'blocked';
@@ -30,6 +36,8 @@ export type ScrapeOutcome = {
     skipped: number;
   };
   database: { before: number | null; after: number | null };
+  /** Per-part sitemap round result, including failed part locations/reasons. */
+  sitemap?: SitemapRoundReport;
   error?: string;
   cleanupErrors: string[];
 };
