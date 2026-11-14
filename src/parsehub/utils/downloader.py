@@ -40,7 +40,14 @@ class RangePart:
 
 
 class FallbackToSingle(Exception):
-    """服务端忽略 Range 时回退到普通单连接下载。"""
+    """服务端忽略 Range 或无法校验分片一致性时回退到普通单连接下载。"""
+
+
+class RemoteFileChanged(Exception):
+    """远端文件在下载过程中发生变化（版本标识或总大小不一致）。
+
+    该异常不会被分片级重试吞掉，必须整体回退为单连接重新下载。
+    """
 
 
 class SegmentDownloader:
@@ -79,11 +86,22 @@ class SegmentDownloader:
         self._progress_lock = asyncio.Lock()
         self._downloaded = 0
         self._part_downloaded: dict[int, int] = {}
+        # 已向回调上报过的最大字节数；回退/重试时不允许回调倒退。
+        self._reported_progress = 0
+        # 本次探测/分片观察到的远端版本标识，用于分片与合并前的一致性校验。
+        self._remote_etag: str | None = None
+        self._remote_last_modified: str | None = None
+        # 是否因远端文件变化（版本标识或总大小）而回退过单连接下载。
+        self._remote_changed = False
 
     async def run(self) -> str:
         last_error: Exception | None = None
+        # 进度基线在整次 run 内累计，保证回退与重试不会让回调倒退或重复累计。
+        self._reported_progress = 0
         for attempt in range(self.max_retries + 1):
             self._reset_progress()
+            # 每轮尝试重新判断是否观察到了远端变化，避免影响后续轮次的错误归类。
+            self._remote_changed = False
             try:
                 async with self._client() as client:
                     self.resolved_path = await self._resolve_path(client)
@@ -92,21 +110,23 @@ class SegmentDownloader:
             except DownloadError as e:
                 last_error = e
                 if attempt == self.max_retries:
-                    raise
+                    raise self._finalize_error(e) from e
             except httpx.HTTPStatusError as e:
                 last_error = e
                 if attempt == self.max_retries or not _is_retryable_status(e.response.status_code):
-                    raise DownloadError(
-                        f"HTTP错误: {e.response.status_code}", status_code=e.response.status_code
+                    raise self._finalize_error(
+                        DownloadError(f"HTTP错误: {e.response.status_code}", status_code=e.response.status_code)
                     ) from e
             except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError, httpx.ReadError) as e:
                 last_error = e
                 if attempt == self.max_retries:
-                    raise DownloadError(f"网络连接错误: {e}") from e
+                    raise self._finalize_error(DownloadError(f"网络连接错误: {e}")) from e
             except Exception as e:
                 last_error = e
                 if attempt == self.max_retries:
-                    raise DownloadError(f"{type(e).__name__}: {e}" if str(e) else type(e).__name__) from e
+                    raise self._finalize_error(
+                        DownloadError(f"{type(e).__name__}: {e}" if str(e) else type(e).__name__)
+                    ) from e
 
             await asyncio.sleep(2**attempt)
 
@@ -144,8 +164,17 @@ class SegmentDownloader:
             probe = await self._probe(client)
             if self._should_use_multipart(probe):
                 try:
-                    await self._download_multipart(client, probe.total_size or 0)
+                    await self._download_multipart(client, probe)
                 except FallbackToSingle:
+                    # 服务端忽略 Range：丢弃分片，整体回退为单连接重新下载。
+                    self._cleanup_temp_dir()
+                    self._reset_progress()
+                    self._prepare_temp_dir(resolved_path)
+                    await self._download_single(client, probe.total_size)
+                except RemoteFileChanged:
+                    # 远端内容可能在分片期间被替换/改动：不在分片层面重试掩盖，
+                    # 而是丢弃全部分片，整体回退为单连接重新下载当前内容。
+                    self._remote_changed = True
                     self._cleanup_temp_dir()
                     self._reset_progress()
                     self._prepare_temp_dir(resolved_path)
@@ -181,9 +210,9 @@ class SegmentDownloader:
             pass
 
         if self.connections <= 1 or (total_size is not None and total_size < self.min_split_size):
-            return RangeProbe(False, total_size, etag, last_modified, content_encoding)
+            return self._remember_version(RangeProbe(False, total_size, etag, last_modified, content_encoding))
         if _has_non_identity_encoding(content_encoding):
-            return RangeProbe(False, total_size, etag, last_modified, content_encoding)
+            return self._remember_version(RangeProbe(False, total_size, etag, last_modified, content_encoding))
 
         try:
             response = await client.get(
@@ -192,27 +221,61 @@ class SegmentDownloader:
                 follow_redirects=True,
             )
         except httpx.HTTPError:
-            return RangeProbe(False, total_size, etag, last_modified, content_encoding)
+            return self._remember_version(RangeProbe(False, total_size, etag, last_modified, content_encoding))
 
         response_encoding = response.headers.get("Content-Encoding")
         if _has_non_identity_encoding(response_encoding):
-            return RangeProbe(False, total_size, etag, last_modified, response_encoding)
+            return self._remember_version(
+                RangeProbe(False, total_size, etag, last_modified, response_encoding)
+            )
 
         if response.status_code == 206:
             parsed_range = _parse_content_range(response.headers.get("Content-Range", ""))
             if parsed_range:
                 start, end, range_total = parsed_range
                 if start == 0 and end == 0 and range_total and range_total > 0:
-                    return RangeProbe(True, range_total, etag, last_modified, response_encoding)
+                    return self._remember_version(
+                        RangeProbe(
+                            True,
+                            range_total,
+                            _first_header(response.headers, "ETag", etag),
+                            _first_header(response.headers, "Last-Modified", last_modified),
+                            response_encoding,
+                        )
+                    )
         if response.status_code == 200:
             probed_size = _parse_int(response.headers.get("Content-Length"))
-            return RangeProbe(False, probed_size or total_size, etag, last_modified, response_encoding)
+            return self._remember_version(
+                RangeProbe(
+                    False,
+                    probed_size or total_size,
+                    _first_header(response.headers, "ETag", etag),
+                    _first_header(response.headers, "Last-Modified", last_modified),
+                    response_encoding,
+                )
+            )
         if response.status_code == 416:
             parsed_range = _parse_content_range(response.headers.get("Content-Range", ""))
             range_total = parsed_range[2] if parsed_range else total_size
-            return RangeProbe(False, range_total, etag, last_modified, response_encoding)
+            return self._remember_version(
+                RangeProbe(
+                    False,
+                    range_total,
+                    _first_header(response.headers, "ETag", etag),
+                    _first_header(response.headers, "Last-Modified", last_modified),
+                    response_encoding,
+                )
+            )
 
-        return RangeProbe(False, total_size, etag, last_modified, response_encoding or content_encoding)
+        return self._remember_version(
+            RangeProbe(False, total_size, etag, last_modified, response_encoding or content_encoding)
+        )
+
+    def _remember_version(self, probe: RangeProbe) -> RangeProbe:
+        """记录探测阶段观察到的远端版本标识，供分片与合并前校验。"""
+        self._remote_etag = probe.etag
+        self._remote_last_modified = probe.last_modified
+        return probe
 
     async def _download_single(self, client: httpx.AsyncClient, total_size: int | None) -> None:
         complete_path = self._require_complete_path()
@@ -241,7 +304,8 @@ class SegmentDownloader:
             raise DownloadError(f"下载不完整: 期望 {expected_size} 字节, 实际 {current} 字节")
         await self._report_finish(total)
 
-    async def _download_multipart(self, client: httpx.AsyncClient, total_size: int) -> None:
+    async def _download_multipart(self, client: httpx.AsyncClient, probe: RangeProbe) -> None:
+        total_size = probe.total_size or 0
         temp_dir = self._require_temp_dir()
         parts_dir = temp_dir.joinpath("parts")
         parts_dir.mkdir(parents=True, exist_ok=True)
@@ -256,6 +320,9 @@ class SegmentDownloader:
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
 
+        # 合并前的整体一致性兜底：所有分片都下载完成后，再确认远端版本与大小未变，
+        # 避免“各分片单独校验通过、拼起来却来自不同版本”的错位文件。
+        await self._verify_remote_version(client, total_size)
         await self._merge_parts(parts, total_size)
         await self._report_finish(total_size)
 
@@ -293,7 +360,8 @@ class SegmentDownloader:
                 if received != part.size:
                     raise DownloadError(f"分片大小不匹配: 期望 {part.size} 字节, 实际 {received} 字节")
                 return
-            except FallbackToSingle:
+            except (FallbackToSingle, RemoteFileChanged):
+                # 远端版本变化不能靠重试掩盖：立即向上抛出，由整体回退单连接处理。
                 raise
             except httpx.HTTPStatusError as e:
                 if attempt == self.max_retries or not _is_retryable_status(e.response.status_code):
@@ -339,10 +407,77 @@ class SegmentDownloader:
         if not parsed_range:
             raise DownloadError("分片响应缺少 Content-Range")
         start, end, response_total = parsed_range
+        if response_total != total_size:
+            # 总大小变化优先判定为远端变化，避免被“范围不匹配”的重试路径掩盖。
+            raise RemoteFileChanged(f"远端文件大小变化: 探测时 {total_size} 字节, 当前分片响应 {response_total} 字节")
         if start != part.start or end != part.end:
             raise DownloadError(f"分片范围不匹配: 期望 {part.start}-{part.end}, 实际 {start}-{end}")
-        if response_total != total_size:
-            raise DownloadError(f"远端文件大小变化: 期望 {total_size}, 实际 {response_total}")
+        if self._version_mismatch(headers.get("ETag"), headers.get("Last-Modified")):
+            raise RemoteFileChanged("远端文件版本已变化: 分片响应中的 ETag/Last-Modified 与探测阶段不一致")
+
+    def _version_mismatch(self, etag: str | None, last_modified: str | None) -> bool:
+        """比对探测阶段记录的版本标识；响应未提供该头时无法比较，视为一致。"""
+        if self._remote_etag is not None and etag is not None and etag != self._remote_etag:
+            return True
+        if (
+            self._remote_last_modified is not None
+            and last_modified is not None
+            and last_modified != self._remote_last_modified
+        ):
+            return True
+        return False
+
+    async def _verify_remote_version(self, client: httpx.AsyncClient, total_size: int) -> None:
+        """合并前再次确认远端版本与总大小未变，作为整体一致性兜底。
+
+        优先使用 HEAD（不需要下载响应体）；服务端不支持 HEAD 时再用一个字节的 Range 请求。
+        校验请求自身失败（网络错误、405 等）不视为内容变化，交由合并后的大小校验与整轮重试处理。
+        """
+        try:
+            response = await client.head(
+                self.url,
+                headers=self._headers({"Accept-Encoding": "identity"}),
+                follow_redirects=True,
+            )
+        except httpx.HTTPError:
+            response = None
+
+        if response is not None and response.status_code < 400:
+            response_total = _parse_int(response.headers.get("Content-Length"))
+            if response_total is not None and response_total != total_size:
+                raise RemoteFileChanged(
+                    f"远端文件大小变化: 探测时 {total_size} 字节, 合并前 {response_total} 字节"
+                )
+            if self._version_mismatch(response.headers.get("ETag"), response.headers.get("Last-Modified")):
+                raise RemoteFileChanged("远端文件版本已变化: 合并前的 ETag/Last-Modified 与探测阶段不一致")
+            return
+
+        try:
+            response = await client.get(
+                self.url,
+                headers=self._headers({"Accept-Encoding": "identity", "Range": "bytes=0-0"}),
+                follow_redirects=True,
+            )
+        except httpx.HTTPError:
+            return
+
+        headers = response.headers
+        if _has_non_identity_encoding(headers.get("Content-Encoding")):
+            return
+        if response.status_code == 206:
+            parsed_range = _parse_content_range(headers.get("Content-Range", ""))
+            response_total = parsed_range[2] if parsed_range else None
+        elif response.status_code < 400:
+            response_total = _parse_int(headers.get("Content-Length"))
+        else:
+            return
+
+        if response_total is not None and response_total != total_size:
+            raise RemoteFileChanged(
+                f"远端文件大小变化: 探测时 {total_size} 字节, 合并前 {response_total} 字节"
+            )
+        if self._version_mismatch(headers.get("ETag"), headers.get("Last-Modified")):
+            raise RemoteFileChanged("远端文件版本已变化: 合并前的 ETag/Last-Modified 与探测阶段不一致")
 
     def _should_use_multipart(self, probe: RangeProbe) -> bool:
         return (
@@ -374,7 +509,7 @@ class SegmentDownloader:
                 return
             self._part_downloaded[index] = downloaded
             self._downloaded += downloaded - previous
-            await self.progress(self._downloaded, total, *self.progress_args, **self.progress_kwargs)
+            await self._emit_progress(self._downloaded, total)
 
     async def _report_single(self, downloaded: int, total: int) -> None:
         if not self.progress:
@@ -383,16 +518,24 @@ class SegmentDownloader:
             if downloaded <= self._downloaded:
                 return
             self._downloaded = downloaded
-            await self.progress(downloaded, total, *self.progress_args, **self.progress_kwargs)
+            await self._emit_progress(downloaded, total)
 
     async def _report_finish(self, total: int) -> None:
         if not self.progress or total <= 0:
             return
         async with self._progress_lock:
-            if self._downloaded >= total:
-                return
-            self._downloaded = total
-            await self.progress(total, total, *self.progress_args, **self.progress_kwargs)
+            if self._downloaded < total:
+                self._downloaded = total
+            await self._emit_progress(self._downloaded, total)
+
+    async def _emit_progress(self, current: int, total: int) -> None:
+        """在持有进度锁时上报；全局单调递增，回退单连接后旧进度不会被倒退或重复累计。"""
+        if self.progress is None:
+            return
+        if current <= self._reported_progress:
+            return
+        self._reported_progress = current
+        await self.progress(current, total, *self.progress_args, **self.progress_kwargs)
 
     def _headers(self, extra: Mapping[str, str]) -> dict[str, str]:
         merged = dict(self.headers)
@@ -402,6 +545,15 @@ class SegmentDownloader:
     def _reset_progress(self) -> None:
         self._downloaded = 0
         self._part_downloaded.clear()
+
+    def _finalize_error(self, error: DownloadError) -> DownloadError:
+        """若本次下载期间检测到远端文件变化，则在最终错误中显式标注，便于与普通网络失败区分。"""
+        if not self._remote_changed:
+            return error
+        message = error.message
+        if "远端文件已变化" in message:
+            return error
+        return DownloadError(f"远端文件已变化，回退单连接下载后仍失败: {message}", status_code=error.status_code)
 
     def _require_resolved_path(self) -> Path:
         if self.resolved_path is None:
@@ -508,6 +660,11 @@ def _parse_int(value: str | None) -> int | None:
     except ValueError:
         return None
     return parsed if parsed >= 0 else None
+
+
+def _first_header(headers: httpx.Headers, name: str, fallback: str | None) -> str | None:
+    """优先使用响应自身的版本头，缺失时回退到探测请求（HEAD）记录的值。"""
+    return headers.get(name) or fallback
 
 
 def _parse_content_range(header: str) -> tuple[int | None, int | None, int | None] | None:
