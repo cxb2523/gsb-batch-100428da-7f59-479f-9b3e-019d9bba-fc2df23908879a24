@@ -197,6 +197,13 @@ def base_path(subpath = None, filename = None):
 
 
 def get_filename_for_read(filename):
+    # Каталог результатов можно переопределить (например, в автотестах,
+    # чтобы не трогать рабочий results/).
+    results_dir = os.environ.get('OZON_RESULTS_DIR')
+    if results_dir:
+        check_make_path(results_dir)
+        return os.path.join(results_dir, filename)
+
     return base_path('results', filename)
 
 

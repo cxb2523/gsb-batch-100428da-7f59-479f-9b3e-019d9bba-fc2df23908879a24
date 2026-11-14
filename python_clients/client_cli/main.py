@@ -22,6 +22,18 @@ def final_error(dest_file, msg):
     sys.exit(1)
 
 
+def request_from_params(params):
+    """Копия параметров без клиентских настроек, которые серверу не нужны."""
+
+    request = dict(params)
+
+    for k in ('dest_filename', 'poll_timeout', 'poll_interval',
+              'poll_timeout_sec', 'poll_interval_sec'):
+        request.pop(k, None)
+
+    return request
+
+
 async def async_main() -> None:
 
     if sys.platform == 'win32':
@@ -29,15 +41,19 @@ async def async_main() -> None:
 
     params = client_cli.params.read_params_from_file()
 
-    dest_file = params.get('dest_filename')
+    dest_file = params.get('dest_filename') if params else None
 
     if not params:
-        final_error(dest_file, 'входные параметры не определены')
+        final_error(dest_file or coms.coms.get_filename_for_store('result.json'),
+                    'входные параметры не определены')
         sys.exit(1)
         return
 
     try:
-        answer = await client_tools.api.make_request(params)
+        answer = await client_tools.api.make_request_checked(
+            request_from_params(params),
+            poll_timeout=params.get('poll_timeout'),
+            poll_interval=params.get('poll_interval'))
     except Exception as e:
         final_error(dest_file, coms.coms.format_error(e))
         sys.exit(1)

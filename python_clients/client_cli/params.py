@@ -55,7 +55,12 @@ def read_params_from_file(file_parameters = None):
         'min_price',
         'max_price',
         'sorting',
-        'expected_count_items'
+        'expected_count_items',
+        'asynchronously',
+        'poll_timeout',
+        'poll_timeout_sec',
+        'poll_interval',
+        'poll_interval_sec'
         ]
 
     for k,v in parameters.items():
@@ -64,6 +69,24 @@ def read_params_from_file(file_parameters = None):
             coms.coms.logmsg(f'WRONG PARAMETER: {k}')
 
     #*******************************************************************
+
+    # Настройки ожидания результата при асинхронном режиме.
+    # Можно задать в параметрах, иначе используются значения по умолчанию
+    # из client_tools/api.py (лимит 10 минут, опрос раз в 10 секунд).
+    def positive_number(value):
+        if value is None:
+            return None
+        try:
+            number = float(coms.coms.only_numbers(value))
+        except (TypeError, ValueError):
+            return None
+        return number if number > 0 else None
+
+    parameters['poll_timeout'] = positive_number(
+        parameters.get('poll_timeout_sec', parameters.get('poll_timeout', None)))
+
+    parameters['poll_interval'] = positive_number(
+        parameters.get('poll_interval_sec', parameters.get('poll_interval', None)))
 
     return parameters
 

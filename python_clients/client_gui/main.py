@@ -45,13 +45,43 @@ class MyWindow(QWidget):
     async def make_request(self):
 
         query = self.make_parameters()
+
+        poll_timeout = self.poll_timeout_value()
+
+        def on_progress(polls, elapsed):
+            self.progress_bar.setFormat(f"Ожидание результата: {elapsed:.0f} с")
+            self.progress_bar.setTextVisible(True)
+
         try:
-            return await client_tools.api.make_request(query)
+            answer = await client_tools.api.make_request_checked(
+                query,
+                poll_timeout=poll_timeout,
+                on_progress=on_progress)
+            return 'success', answer
+        except client_tools.api.PollTimeoutError as e:
+            return 'timeout', coms.coms.format_error(e)
+        except client_tools.api.ApiError as e:
+            return 'error', coms.coms.format_error(e)
         except Exception as e:
-            return coms.coms.format_error(e)
+            return 'error', coms.coms.format_error(e)
 
 
-    def append_result(self, msg):
+    def poll_timeout_value(self):
+        """Пустое поле - использовать значение по умолчанию из api.py."""
+
+        text = self.e_poll_timeout.text().strip()
+        if not text:
+            return None
+
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+
+        return value if value > 0 else None
+
+
+    def append_result(self, msg, success='success'):
 
         num = self.result_count + 1
         self.result_count = num
@@ -60,10 +90,25 @@ class MyWindow(QWidget):
         result_text_edit.setReadOnly(True)
         result_text_edit.setText(msg)
 
+        if success == 'success':
+            caption = f"Результат {num}"
+            status = "Данные получены успешно."
+        elif success == 'timeout':
+            # Явно отделяем таймаут ожидания от успешного результата.
+            caption = f"Таймаут {num}"
+            status = "Не удалось получить данные: превышено время ожидания результата."
+        else:
+            caption = f"Ошибка {num}"
+            status = "Не удалось получить данные: ошибка обращения к сервису."
+
+        status_label = QLabel(status)
+        status_label.setWordWrap(True)
+
         tab_result = QWidget()
-        self.tab_widget.addTab(tab_result, f"Результат {num}")
+        self.tab_widget.addTab(tab_result, caption)
 
         result_layout = QVBoxLayout(tab_result)
+        result_layout.addWidget(status_label)
         result_layout.addLayout(self.make_result_buttons(result_text_edit, tab_result))
         result_layout.addWidget(result_text_edit)
 
@@ -252,6 +297,14 @@ class MyWindow(QWidget):
         #************************
         self.checkbox_csv = QCheckBox("Получить как CSV")
         form_layout.addRow('', self.checkbox_csv)
+
+        #************************
+        # Общий лимит ожидания результата при асинхронном опросе.
+        # Пусто - значение по умолчанию (10 минут).
+        line = self.make_input(form_layout, 'e_poll_timeout',
+                               "Лимит ожидания, сек")
+        line.setValidator(QIntValidator(0, 86400, self))
+        line.setPlaceholderText("по умолчанию 600")
         #************************
 
         self.form_group = QGroupBox()
@@ -299,11 +352,24 @@ class MyWindow(QWidget):
             self.button_ok.setEnabled(f)
             self.button_default.setEnabled(f)
             self.progress_bar.setVisible(not f)
+            if f:
+                self.progress_bar.setTextVisible(False)
+                self.progress_bar.setFormat("")
+            else:
+                # Прогресс виден всё время ожидания, включая опрос poll_token.
+                self.progress_bar.setTextVisible(True)
+                self.progress_bar.setFormat("Ожидание результата...")
+
+        if not self.button_ok.isEnabled():
+            return
 
         set_enabled(False)
-        res = await self.make_request()
-        self.append_result(res)
-        set_enabled(True)
+
+        try:
+            success, res = await self.make_request()
+            self.append_result(res, success)
+        finally:
+            set_enabled(True)
 
 
     def closeEvent(self, event):
@@ -339,6 +405,9 @@ class MyWindow(QWidget):
         self.combo_sorting.setCurrentIndex(
             self.settings.value("combo_sorting", 0, type=int))
 
+        self.e_poll_timeout.setText(
+            self.settings.value("e_poll_timeout", ""))
+
 
     def save_settings(self):
 
@@ -352,6 +421,8 @@ class MyWindow(QWidget):
         self.settings.setValue("checkbox_csv", self.checkbox_csv.isChecked())
 
         self.settings.setValue("combo_sorting", self.combo_sorting.currentIndex())
+
+        self.settings.setValue("e_poll_timeout", self.e_poll_timeout.text())
 
 
 

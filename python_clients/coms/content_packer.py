@@ -67,7 +67,7 @@ def __try_decompress(data: bytes):
             pass
 
     # 3. В самую последнюю очередь ZLIB или кастомный метод
-    if iz_zlib(data):
+    if is_zlib(data):
         try:
             return 'zlib', zlib.decompress(data)
         except:
