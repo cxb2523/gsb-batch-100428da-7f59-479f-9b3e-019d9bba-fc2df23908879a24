@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% set title = 'Hacker News Summary'|translate(lang) ~ (' - ' ~ date if date else '') -%}
+{% set site = 'hackernews' -%}
+{% set description = 'Hacker News Summary leverages AI technology to extract summaries and illustrations from Hacker News posts, providing a seamless news scanning experience.' -%}
+
+{% block head %}
+    <meta name="description" content="{{ description }}">
+    <link rel="canonical" href="{{ path }}"/>
+    {% if not date %}
+    <link rel="alternate" hreflang="en" href="{{ config.site }}/"/>
+    <link rel="alternate" hreflang="zh" href="{{ config.site }}/zh"/>
+    {% endif %}
+    <meta name="twitter:card" content="summary"/>
+    <meta name="twitter:title" content="{{ title }}"/>
+    <meta name="twitter:description" content="{{ description }}"/>
+    {{ super() }}
+{% endblock %}
+
+{% block nav_brand %}
+    <a class="navbar-brand" href="{{ config.site }}/">Hacker News Summary</a>
+{% endblock %}
+
+{% block nav_links %}
+    <li>
+        <a href="https://news.ycombinator.com/news" target="_blank" title="Hacker News front page">Front</a>
+    </li>
+    <li>
+        <a href="https://news.ycombinator.com/front" target="_blank" title="Hacker News front page before">Past</a>
+    </li>
+{% endblock %}
