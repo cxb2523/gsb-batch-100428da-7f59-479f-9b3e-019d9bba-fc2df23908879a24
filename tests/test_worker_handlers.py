@@ -15,6 +15,7 @@ from conftest import (
     make_thread,
     make_threads_response,
 )
+from tiebameow.client.tieba_client import UnretriableApiError
 from tiebameow.models.orm import Post as PostModel
 from tiebameow.models.orm import Thread as ThreadModel
 
@@ -563,6 +564,207 @@ async def test_incremental_scan_comments_handler():
     datastore.push_object_event.assert_awaited_with("comment", new_comment)
     # 增量扫描只应清理 incremental 标记，避免误删 full 标记
     datastore.remove_pending_comment_scan.assert_awaited_once_with(1, 100, task_kind="incremental")
+
+
+def _make_incremental_comments_handler(get_comments_dto, filter_new_ids) -> IncrementalScanCommentsTaskHandler:
+    """构造带 mock 客户端与 datastore 的增量楼中楼处理器。"""
+    tb_client = SimpleNamespace(get_comments_dto=AsyncMock(side_effect=get_comments_dto))
+    datastore = SimpleNamespace(
+        filter_new_ids=AsyncMock(side_effect=filter_new_ids),
+        save_items=AsyncMock(),
+        push_object_event=AsyncMock(),
+        remove_pending_comment_scan=AsyncMock(),
+    )
+    return IncrementalScanCommentsTaskHandler(
+        worker_id=0,
+        container=create_mock_container(tb_client=tb_client),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+
+
+def _requested_comment_pages(tb_client) -> list[int]:
+    """提取 get_comments_dto 调用中的页码参数。"""
+    return [call.args[2] for call in tb_client.get_comments_dto.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_incremental_scan_comments_mixed_page_continues_to_earlier_page():
+    """一页同时含新旧楼中楼时，应继续向更早页面翻页而不是提前停止。"""
+    page3_new = make_comment(cid=3001, pid=100, tid=1)
+    page3_old = make_comment(cid=1001, pid=100, tid=1)
+    page2_new = make_comment(cid=2002, pid=100, tid=1)
+    page2_old = make_comment(cid=1002, pid=100, tid=1)
+    page1_old = make_comment(cid=1003, pid=100, tid=1)
+
+    page3 = make_comments_response([page3_new, page3_old], current_page=3, total_page=3)
+    page2 = make_comments_response([page2_new, page2_old], current_page=2, total_page=3)
+    page1 = make_comments_response([page1_old], current_page=1, total_page=3)
+
+    def get_comments_dto(tid, pid, pn):
+        return {3: page3, 2: page2, 1: page1}[pn]
+
+    def filter_new_ids(kind, ids):
+        if kind != "comment":
+            return set(ids)
+        return {cid for cid in ids if cid in {3001, 2002}}
+
+    handler = _make_incremental_comments_handler(get_comments_dto, filter_new_ids)
+    tb_client = handler.container.tb_client
+
+    await handler.handle(IncrementalScanCommentsTask(tid=1, pid=100))
+
+    # 初始 pn=1 取总页数；倒序依次请求 pn=3、pn=2；pn=1 复用初始页数据不再发请求。
+    # 第 3、2 页都混有新楼中楼，必须继续推进，直到第 1 页全为旧记录才停止。
+    assert _requested_comment_pages(tb_client) == [1, 3, 2]
+    # 第 1 页（全旧）同样经过去重检查，证明扫描确实推进到了更早页面
+    comment_filter_calls = [
+        call.args[1] for call in handler.datastore.filter_new_ids.await_args_list if call.args[0] == "comment"
+    ]
+    assert comment_filter_calls == [[3001, 1001], [2002, 1002], [1003]]
+    # 混合页中的新楼中楼都应推送，不能因为同页存在旧记录而漏抓
+    pushed_cids = {
+        call.args[1].cid for call in handler.datastore.push_object_event.await_args_list if call.args[0] == "comment"
+    }
+    assert pushed_cids == {3001, 2002}
+    handler.datastore.remove_pending_comment_scan.assert_awaited_once_with(1, 100, task_kind="incremental")
+
+
+@pytest.mark.asyncio
+async def test_incremental_scan_comments_stops_after_consecutive_all_old_pages():
+    """连续页面全部为已存在楼中楼时应停止，不再请求更早的页面。"""
+    page3_old_a = make_comment(cid=1001, pid=100, tid=1)
+    page3_old_b = make_comment(cid=1002, pid=100, tid=1)
+    page2_old_a = make_comment(cid=1003, pid=100, tid=1)
+    page2_old_b = make_comment(cid=1004, pid=100, tid=1)
+    page1_untouched = make_comments_response([make_comment(cid=9999, pid=100, tid=1)], current_page=1, total_page=3)
+
+    page3 = make_comments_response([page3_old_a, page3_old_b], current_page=3, total_page=3)
+    page2 = make_comments_response([page2_old_a, page2_old_b], current_page=2, total_page=3)
+
+    def get_comments_dto(tid, pid, pn):
+        return {3: page3, 2: page2, 1: page1_untouched}[pn]
+
+    handler = _make_incremental_comments_handler(get_comments_dto, lambda kind, ids: set())
+    tb_client = handler.container.tb_client
+
+    await handler.handle(IncrementalScanCommentsTask(tid=1, pid=100))
+
+    # 初始 pn=1 取总页数，倒序从 pn=3 开始；pn=3 全旧即停止，pn=2、pn=1 均不应再被处理
+    assert _requested_comment_pages(tb_client) == [1, 3]
+    handler.datastore.push_object_event.assert_not_called()
+    handler.datastore.remove_pending_comment_scan.assert_awaited_once_with(1, 100, task_kind="incremental")
+
+
+@pytest.mark.asyncio
+async def test_incremental_completion_keeps_pending_full_marker():
+    """增量任务完成后只清理 incremental 标记，同一 (tid, pid) 的 full 标记必须保留。"""
+    new_comment = make_comment(cid=2000, pid=100, tid=1)
+    old_comment = make_comment(cid=1000, pid=100, tid=1)
+    comments_response = make_comments_response([new_comment, old_comment], current_page=1, total_page=1)
+
+    tb_client = SimpleNamespace(get_comments_dto=AsyncMock(return_value=comments_response))
+    datastore = SimpleNamespace(
+        filter_new_ids=AsyncMock(return_value={new_comment.cid}),
+        save_items=AsyncMock(),
+        push_object_event=AsyncMock(),
+        remove_pending_comment_scan=AsyncMock(),
+    )
+    handler = IncrementalScanCommentsTaskHandler(
+        worker_id=0,
+        container=create_mock_container(tb_client=tb_client),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+
+    await handler.handle(IncrementalScanCommentsTask(tid=1, pid=100))
+
+    # 必须带 task_kind="incremental" 过滤，不能无条件删除整行（full 标记仍在）
+    datastore.remove_pending_comment_scan.assert_awaited_once_with(1, 100, task_kind="incremental")
+    remove_kwargs = datastore.remove_pending_comment_scan.await_args.kwargs
+    assert remove_kwargs.get("task_kind") == "incremental"
+
+
+@pytest.mark.asyncio
+async def test_full_scan_comments_completion_clears_marker_unconditionally():
+    """全量任务完成后按原逻辑无条件清除该 (tid, pid) 的 pending 标记。"""
+    comment = make_comment(cid=1000, pid=100, tid=1)
+    comments_response = make_comments_response([comment])
+
+    tb_client = SimpleNamespace(get_comments_dto=AsyncMock(return_value=comments_response))
+    datastore = SimpleNamespace(
+        filter_new_ids=AsyncMock(return_value={comment.cid}),
+        save_items=AsyncMock(),
+        push_object_event=AsyncMock(),
+        remove_pending_comment_scan=AsyncMock(),
+    )
+    handler = FullScanCommentsTaskHandler(
+        worker_id=0,
+        container=create_mock_container(tb_client=tb_client),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+
+    await handler.handle(FullScanCommentsTask(tid=1, pid=100))
+
+    # 全量清理不带 task_kind 过滤，整行 pending 标记被移除
+    datastore.remove_pending_comment_scan.assert_awaited_once_with(1, 100)
+    assert not datastore.remove_pending_comment_scan.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_incremental_scan_comments_deleted_clears_only_incremental_marker():
+    """回复或主题贴被删除（err_code=4）时，增量任务仍走 incremental 清理路径。"""
+    tb_client = SimpleNamespace(
+        get_comments_dto=AsyncMock(side_effect=UnretriableApiError(4, "thread or post deleted"))
+    )
+    datastore = SimpleNamespace(remove_pending_comment_scan=AsyncMock())
+    handler = IncrementalScanCommentsTaskHandler(
+        worker_id=0,
+        container=create_mock_container(tb_client=tb_client),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+
+    # err_code=4 在处理器内部被捕获，不应向上抛出，且不能留下永久 pending
+    await handler.handle(IncrementalScanCommentsTask(tid=1, pid=100))
+
+    datastore.remove_pending_comment_scan.assert_awaited_once_with(1, 100, task_kind="incremental")
+
+
+@pytest.mark.asyncio
+async def test_incremental_scan_comments_unexpected_error_still_clears_marker():
+    """增量任务抛出非删除类异常时，也要清理 incremental 标记，避免永久 pending。"""
+    tb_client = SimpleNamespace(get_comments_dto=AsyncMock(side_effect=RuntimeError("boom")))
+    datastore = SimpleNamespace(remove_pending_comment_scan=AsyncMock())
+    handler = IncrementalScanCommentsTaskHandler(
+        worker_id=0,
+        container=create_mock_container(tb_client=tb_client),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+
+    # 异常在处理器内部被捕获并记录，不应向上抛出
+    await handler.handle(IncrementalScanCommentsTask(tid=1, pid=100))
+
+    datastore.remove_pending_comment_scan.assert_awaited_once_with(1, 100, task_kind="incremental")
+
+
+@pytest.mark.asyncio
+async def test_full_scan_comments_unexpected_error_still_clears_marker():
+    """全量任务抛出异常时也要按原逻辑清理标记，避免永久 pending。"""
+    tb_client = SimpleNamespace(get_comments_dto=AsyncMock(side_effect=RuntimeError("boom")))
+    datastore = SimpleNamespace(remove_pending_comment_scan=AsyncMock())
+    handler = FullScanCommentsTaskHandler(
+        worker_id=0,
+        container=create_mock_container(tb_client=tb_client),
+        datastore=cast("Any", datastore),
+        router=QueueRouter(),
+    )
+
+    await handler.handle(FullScanCommentsTask(tid=1, pid=100))
+
+    datastore.remove_pending_comment_scan.assert_awaited_once_with(1, 100)
 
 
 @pytest.mark.asyncio

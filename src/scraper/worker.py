@@ -945,6 +945,10 @@ class FullScanCommentsTaskHandler(TaskHandler):
         1. 获取楼中楼的第一页数据以确定总页数
         2. 逐页扫描直至所有楼中楼都被处理完毕
 
+        无论任务正常结束、回复被删除（err_code=4）还是抛出其他异常，
+        都会按原逻辑无条件移除该 (tid, pid) 的 pending_comment_scan 标记，
+        避免留下永久 pending。
+
         Args:
             task_content: ScanPostCommentsTask实例，包含帖子ID和回复ID。
         """
@@ -956,8 +960,6 @@ class FullScanCommentsTaskHandler(TaskHandler):
             initial_page_data = await self.get_comments(tid, pid, pn=1)
 
             if not initial_page_data or not initial_page_data.objs:
-                await self._finalize_comment_scan(tid, pid)
-
                 self.log.debug("Post pid={} in tid={} has no comments or has been deleted. Task finished.", pid, tid)
                 return
 
@@ -966,9 +968,6 @@ class FullScanCommentsTaskHandler(TaskHandler):
             )
 
             await self._scan_comment_pages(tid, pid, initial_page_data, backfill)
-
-            await self._finalize_comment_scan(tid, pid)
-            self.log.debug("Finished comment scan for pid={} in tid={}.", pid, tid)
         except UnretriableApiError as e:
             if e.code == 4:
                 self.log.warning(
@@ -976,11 +975,13 @@ class FullScanCommentsTaskHandler(TaskHandler):
                     pid,
                     tid,
                 )
-                await self._finalize_comment_scan(tid, pid)
             else:
                 self.log.exception("Failed to process ScanPostCommentsTask for pid={}, tid={}: {}", pid, tid, e)
         except Exception as e:
             self.log.exception("Failed to process ScanPostCommentsTask for pid={}, tid={}: {}", pid, tid, e)
+        finally:
+            await self._finalize_comment_scan(tid, pid)
+            self.log.debug("Finished comment scan for pid={} in tid={}.", pid, tid)
 
     async def _finalize_comment_scan(self, tid: int, pid: int) -> None:
         """移除 pending_comment_scan 标记，表示该评论扫描任务已完成。"""
@@ -1070,6 +1071,10 @@ class IncrementalScanCommentsTaskHandler(TaskHandler):
         1. 获取指定回复的最新一页数据以确定总页数
         2. 从最新一页的总页数开始，逐页倒序扫描回复下的所有楼中楼
 
+        无论任务正常结束、回复被删除（err_code=4）还是抛出其他异常，
+        都会清理本任务写入的 incremental 标记；清理带 task_kind 过滤，
+        不会误删仍待执行的 full 标记。
+
         Args:
             task_content: IncrementalScanCommentsTask实例，包含主题贴tid和回复pid。
         """
@@ -1082,13 +1087,11 @@ class IncrementalScanCommentsTaskHandler(TaskHandler):
 
             if not comments_page or not comments_page.objs:
                 self.log.debug("No comments found for pid={} in tid={}. Task finished.", pid, tid)
-                await self._finalize_comment_scan(tid, pid)
                 return
 
             total_pages = comments_page.page.total_page
 
             await self._scan_comment_pages(tid, pid, total_pages, comments_page, backfill)
-            await self._finalize_comment_scan(tid, pid)
         except UnretriableApiError as e:
             if e.code == 4:
                 self.log.warning(
@@ -1096,14 +1099,20 @@ class IncrementalScanCommentsTaskHandler(TaskHandler):
                     pid,
                     tid,
                 )
-                await self._finalize_comment_scan(tid, pid)
             else:
                 self.log.exception("Failed to process IncrementalScanCommentsTask for pid={}, tid={}: {}", pid, tid, e)
         except Exception as e:
             self.log.exception("Failed to process IncrementalScanCommentsTask for pid={}, tid={}: {}", pid, tid, e)
+        finally:
+            # 仅清理 incremental 标记，full 标记仍由全量任务自行清理。
+            await self._finalize_comment_scan(tid, pid)
 
     async def _finalize_comment_scan(self, tid: int, pid: int) -> None:
-        """移除 pending_comment_scan 标记，表示该评论扫描任务已完成。"""
+        """移除 incremental pending_comment_scan 标记，表示增量评论扫描任务已结束。
+
+        带 ``task_kind="incremental"`` 过滤：若同一 (tid, pid) 上仍挂着
+        full 标记（全量任务尚未完成），该标记会被保留，避免被增量任务误删。
+        """
         await self.datastore.remove_pending_comment_scan(tid, pid, task_kind="incremental")
         self.log.debug("Removed incremental pending_comment_scan marker for tid={}, pid={}", tid, pid)
 
@@ -1115,15 +1124,18 @@ class IncrementalScanCommentsTaskHandler(TaskHandler):
         initial_page_data: CommentsDTO,
         backfill: bool,
     ):
-        """扫描楼中楼的所有页面。
+        """倒序扫描楼中楼的所有页面。
 
         从最后一页开始，逐页倒序扫描指定回复下的所有楼中楼。
+        仅当某一页全部为已存在的楼中楼（没有任何新记录）时才停止；
+        若某页仍混有新楼中楼，则继续向更早的页面推进。
 
         Args:
             tid: 主题贴tid
             pid: 回复pid
             total_pages: 楼中楼总页数
             initial_page_data: 第一页的楼中楼数据
+            backfill: 是否为回溯任务
         """
         for pn in range(total_pages, 0, -1):
             self.log.debug("Scanning comments for pid={}, page {}/{}.", pid, pn, total_pages)
@@ -1154,10 +1166,16 @@ class IncrementalScanCommentsTaskHandler(TaskHandler):
             pid: 回复ID。
             pn: 页码。
             comments_page: 该页面的评论数据。
+            backfill: 是否为回溯任务。
+
+        Returns:
+            bool: 是否仍需继续向更早的页面倒序推进。
+                仅当本页没有任何新楼中楼（全部为已存在记录）时才返回 False；
+                只要本页仍混有新记录，就返回 True 继续扫描更早页面，
+                避免漏掉更早页面中的新楼中楼。
         """
         all_cids_on_page = [c.cid for c in comments_page.objs]
         new_cids = await self.datastore.filter_new_ids("comment", all_cids_on_page)
-        old_cids = set(all_cids_on_page) - new_cids
 
         if not new_cids:
             self.log.debug("No new comments on pid={}, pn={}.", pid, pn)
@@ -1178,9 +1196,7 @@ class IncrementalScanCommentsTaskHandler(TaskHandler):
                 await self.datastore.push_object_event("comment", comment)
                 self.log.debug("Pushed comment cid={} to object stream.", comment.cid)
 
-        if old_cids:
-            return False
-
+        # 本页仍含新楼中楼（即使同时混有已存在记录），继续向更早页面推进。
         return True
 
 
