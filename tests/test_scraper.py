@@ -20,7 +20,10 @@ from custom_components.multiscrape.scraper import Scraper
 from custom_components.multiscrape.selector import Selector
 
 from .fixtures.html_samples import (SAMPLE_HTML_EMPTY, SAMPLE_HTML_FULL,
-                                    SAMPLE_HTML_LIST, SAMPLE_HTML_MALFORMED,
+                                    SAMPLE_HTML_LIST,
+                                    SAMPLE_HTML_LIST_MISSING_ATTRIBUTE,
+                                    SAMPLE_HTML_MALFORMED,
+                                    SAMPLE_HTML_SINGLE_MISSING_ATTRIBUTE,
                                     SAMPLE_HTML_SPECIAL_TAGS)
 from .fixtures.json_samples import (SAMPLE_JSON_INVALID, SAMPLE_JSON_NESTED,
                                     SAMPLE_JSON_SIMPLE)
@@ -520,6 +523,142 @@ async def test_scraper_registered_selector_errors_are_raised_by_scrape(
         scraper_instance.scrape(missing_list, "missing_list")
     with pytest.raises(TemplateError):
         scraper_instance.scrape(broken, "broken")
+
+
+# ============================================================================
+# Missing attribute error tests
+# ============================================================================
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_empty_list_selector_raises_value_error(
+    hass: HomeAssistant, scraper_instance
+):
+    """A select_list matching nothing is still an error, never an empty string."""
+    await scraper_instance.set_content(SAMPLE_HTML_LIST)
+
+    selector = Selector(
+        hass,
+        {"name": "missing_list", "select_list": Template(".nonexistent", hass)},
+    )
+
+    with pytest.raises(
+        ValueError, match="Could not find any tags for given selector"
+    ):
+        scraper_instance.scrape(selector, "missing_list")
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_list_attribute_missing_on_element_raises_value_error(
+    hass: HomeAssistant, scraper_instance
+):
+    """An element without the configured attribute fails with its index in the list."""
+    await scraper_instance.set_content(SAMPLE_HTML_LIST_MISSING_ATTRIBUTE)
+
+    selector = Selector(
+        hass,
+        {
+            "name": "links",
+            "select_list": Template(".link", hass),
+            "attribute": "href",
+        },
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        scraper_instance.scrape(selector, "links")
+
+    message = str(exc_info.value)
+    assert "href" in message
+    assert "index 1" in message
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_single_attribute_missing_raises_value_error(
+    hass: HomeAssistant, scraper_instance
+):
+    """A single element without the configured attribute is a ValueError, not KeyError."""
+    await scraper_instance.set_content(SAMPLE_HTML_SINGLE_MISSING_ATTRIBUTE)
+
+    selector = Selector(
+        hass,
+        {
+            "name": "link",
+            "select": Template(".link", hass),
+            "attribute": "href",
+        },
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        scraper_instance.scrape(selector, "link")
+
+    assert "href" in str(exc_info.value)
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_empty_list_selector_raises_value_error_when_registered(
+    hass: HomeAssistant, scraper_instance
+):
+    """Zero matches in a pre-registered select_list still reaches on_error."""
+    selector = Selector(
+        hass,
+        {"name": "missing_list", "select_list": Template(".nonexistent", hass)},
+    )
+    scraper_instance.register_selectors([selector])
+    await scraper_instance.set_content(SAMPLE_HTML_LIST)
+
+    with pytest.raises(
+        ValueError, match="Could not find any tags for given selector"
+    ):
+        scraper_instance.scrape(selector, "missing_list")
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_registered_missing_attribute_errors_are_raised_by_scrape(
+    hass: HomeAssistant, scraper_instance
+):
+    """Executor-extracted attribute errors surface unchanged from scrape()."""
+    missing_list = Selector(
+        hass,
+        {
+            "name": "missing_list",
+            "select_list": Template(".link", hass),
+            "attribute": "href",
+        },
+    )
+    missing_single = Selector(
+        hass,
+        {
+            "name": "missing_single",
+            "select": Template(".link", hass),
+            "attribute": "href",
+        },
+    )
+    scraper_instance.register_selectors([missing_list, missing_single])
+
+    await scraper_instance.set_content(SAMPLE_HTML_LIST_MISSING_ATTRIBUTE)
+
+    with pytest.raises(ValueError) as list_exc:
+        scraper_instance.scrape(missing_list, "missing_list")
+    assert "href" in str(list_exc.value)
+    assert "index 1" in str(list_exc.value)
+
+    # Swapping in a page where the only `.link` lacks the attribute proves the
+    # error survives the executor for the single-element path too.
+    await scraper_instance.set_content(SAMPLE_HTML_SINGLE_MISSING_ATTRIBUTE)
+
+    with pytest.raises(ValueError) as single_exc:
+        scraper_instance.scrape(missing_single, "missing_single")
+    assert "href" in str(single_exc.value)
 
 
 @pytest.mark.integration

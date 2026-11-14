@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock
 
 from bs4 import BeautifulSoup
+import pytest
 
 from custom_components.multiscrape.extractors import ValueExtractor
 
@@ -128,3 +129,54 @@ class TestExtractList:
         extractor = ValueExtractor(",")
         selector = _make_selector(extract="text")
         assert extractor.extract_list([], selector) == ""
+
+    def test_extract_list_missing_attribute_raises_value_error(self):
+        """A list element without the configured attribute is a ValueError.
+
+        The message must name the missing attribute and the element's position
+        (0-based) so the broken item can be located.
+        """
+        extractor = ValueExtractor(",")
+        soup = _make_soup(
+            '<div><a href="/a" class="link">A</a><span class="link">B</span></div>'
+        )
+        tags = soup.select(".link")
+        selector = _make_selector(attribute="href")
+
+        with pytest.raises(ValueError) as exc_info:
+            extractor.extract_list(tags, selector)
+
+        message = str(exc_info.value)
+        assert "href" in message
+        assert "index 1" in message
+
+    def test_extract_list_missing_attribute_on_first_element_reports_index_zero(self):
+        """The reported position is the 0-based index of the broken element."""
+        extractor = ValueExtractor(",")
+        soup = _make_soup(
+            '<div><span class="link">A</span><a href="/b" class="link">B</a></div>'
+        )
+        tags = soup.select(".link")
+        selector = _make_selector(attribute="href")
+
+        with pytest.raises(ValueError) as exc_info:
+            extractor.extract_list(tags, selector)
+
+        assert "href" in str(exc_info.value)
+        assert "index 0" in str(exc_info.value)
+
+
+class TestExtractSingleAttributeErrors:
+    """Tests for missing attributes during single element extraction."""
+
+    def test_extract_single_missing_attribute_raises_value_error(self):
+        """A single element without the configured attribute is a ValueError."""
+        extractor = ValueExtractor(",")
+        soup = _make_soup('<a class="test">No link</a>')
+        tag = soup.select_one(".test")
+        selector = _make_selector(attribute="href")
+
+        with pytest.raises(ValueError) as exc_info:
+            extractor.extract_single(tag, selector)
+
+        assert "href" in str(exc_info.value)

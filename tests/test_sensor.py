@@ -286,6 +286,49 @@ async def test_sensor_empty_select_list_uses_on_error_and_requests_reauth(
 @pytest.mark.integration
 @pytest.mark.async_test
 @pytest.mark.timeout(10)
+async def test_sensor_missing_list_attribute_uses_on_error_and_requests_reauth(
+    hass: HomeAssistant, coordinator, scraper
+):
+    """A list element missing its attribute is scrapeable through on_error."""
+    from custom_components.multiscrape.const import CONF_ATTR, CONF_SELECT_LIST
+
+    from .fixtures.html_samples import SAMPLE_HTML_LIST_MISSING_ATTRIBUTE
+
+    config = {
+        CONF_NAME: "link",
+        CONF_SELECT_LIST: Template(".link", hass),
+        CONF_ATTR: "href",
+        CONF_ON_ERROR: {CONF_ON_ERROR_VALUE: CONF_ON_ERROR_VALUE_LAST},
+    }
+    sensor = MultiscrapeSensor(
+        hass=hass,
+        coordinator=coordinator,
+        scraper=scraper,
+        unique_id="link",
+        name="link",
+        unit_of_measurement=None,
+        device_class=None,
+        state_class=None,
+        force_update=False,
+        icon_template=None,
+        picture=None,
+        sensor_selector=Selector(hass, config),
+        attribute_selectors={},
+    )
+    sensor._attr_native_value = "/previous"
+    await scraper.set_content(SAMPLE_HTML_LIST_MISSING_ATTRIBUTE)
+
+    with patch.object(coordinator, "request_reauth") as request_reauth:
+        sensor._update_sensor()
+
+    assert sensor._attr_native_value == "/previous"
+    assert sensor._scrape_error is False
+    request_reauth.assert_called_once()
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(10)
 async def test_sensor_on_error_value_last_with_none_value(hass: HomeAssistant, coordinator, scraper):
     """Test sensor with on_error value 'last' but no previous value."""
     from custom_components.multiscrape.selector import Selector

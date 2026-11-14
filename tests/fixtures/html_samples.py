@@ -41,6 +41,23 @@ SAMPLE_HTML_LIST = """
 </ul>
 """
 
+# HTML where the second list element lost the attribute the config reads,
+# as happens when the page structure changes.
+SAMPLE_HTML_LIST_MISSING_ATTRIBUTE = """
+<ul class="links">
+    <li><a href="/one" class="link">One</a></li>
+    <li><a class="link">Two</a></li>
+    <li><a href="/three" class="link">Three</a></li>
+</ul>
+"""
+
+# HTML where the selected single element lost its attribute.
+SAMPLE_HTML_SINGLE_MISSING_ATTRIBUTE = """
+<div class="links">
+    <a class="link">Release notes</a>
+</div>
+"""
+
 # HTML with script and style tags (special extraction)
 SAMPLE_HTML_SPECIAL_TAGS = """
 <html>
