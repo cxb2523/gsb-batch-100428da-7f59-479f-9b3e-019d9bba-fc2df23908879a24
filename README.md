@@ -192,6 +192,54 @@ with WebDesktop() as web:
     web.button("Search").click()
 ```
 
+Every action and read first verifies that the element still belongs to the
+browser's currently active tab, so multi-tab workflows cannot silently act on a
+stale page:
+
+```python
+from tarsier import WebDesktop, PageClosedError, PageNotActiveError, WebElementTimeoutError
+
+with WebDesktop() as web:
+    first = web.goto("https://example.org")
+    button = first.wait_for_element(role="button", name="Submit")
+
+    second = web.new_page("https://example.org/other")
+    try:
+        button.click()                 # button belongs to tab 0, which is no longer active
+    except PageNotActiveError as e:
+        print(e)                       # ... call WebDesktop.switch_to_page(0) ...
+        web.switch_to_page(0)
+        button.click()                 # works again once tab 0 is active
+
+    second.page.close()
+    try:
+        second.find(selector="h1").read()
+    except PageClosedError:
+        second = web.new_page("https://example.org/other")  # re-locate from an open tab
+```
+
+`wait_for_element` waits for the first *visible* role/name match (hidden
+duplicates never satisfy the wait) and reports the role/name or selector plus
+the actual elapsed time on timeout. When a role/name lookup matches several
+elements, Tarsier adopts the first visible one and emits a
+`WebElementAmbiguityWarning` so callers can detect and disambiguate the lookup.
+
+| Error / warning | Meaning |
+| --- | --- |
+| `PageClosedError` | The tab owning the element was closed; the element is stale. |
+| `PageNotActiveError` | The tab owning the element is open but is not the active tab. |
+| `WebElementTimeoutError` | Waiting exceeded its timeout (subclass of `TimeoutError`, so existing handlers keep working). |
+| `WebElementAmbiguityWarning` | Several elements matched role/name; the first visible one was used. |
+
+These behaviours are covered by network-free tests that render a local HTML
+fixture (`tests/fixtures/web_fixture.html`) in Chromium:
+
+```bash
+pip install pytest
+python -m playwright install chromium   # one-time browser download
+python -m pytest tests/ -q
+```
+
 ### 4. Window Management
 Modify workspace coordinates using native OS Window Transform patterns:
 

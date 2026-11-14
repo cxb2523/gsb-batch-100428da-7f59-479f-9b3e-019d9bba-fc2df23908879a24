@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Tarsier Local Web Fixture</title>
+</head>
+<body>
+  <h1>Tarsier Web Fixture</h1>
+
+  <!-- Normal semantic controls used by the happy-path test. -->
+  <input id="query" type="text" aria-label="Search query" placeholder="Search query">
+  <button id="search" type="button"
+          onclick="document.querySelector('#result').textContent = 'Result: ' + document.querySelector('#query').value">
+    Search
+  </button>
+
+  <p id="result">No result yet.</p>
+
+  <!-- A container the tests remove at runtime to simulate re-rendering. -->
+  <div id="removable">
+    <button id="temporary" type="button">Temporary</button>
+  </div>
+
+  <!-- Two matches for role=button, name=Duplicate; the first has a zero-size box. -->
+  <div id="ambiguity-mixed">
+    <button id="duplicate-hidden" type="button"
+            style="width:0;height:0;padding:0;border:0;overflow:hidden;font-size:0;line-height:0">
+      Duplicate
+    </button>
+    <button id="duplicate-visible" type="button"
+            onclick="document.querySelector('#duplicate-hit').textContent = 'duplicate-visible'">
+      Duplicate
+    </button>
+  </div>
+  <p id="duplicate-hit">none</p>
+
+  <!-- Two matches for role=link, name=Same; both hidden, to exercise "all invisible" waiting. -->
+  <div id="ambiguity-all-hidden">
+    <a href="#never" id="same-hidden-a" style="display:none">Same</a>
+    <a href="#never" id="same-hidden-b" style="visibility:hidden">Same</a>
+  </div>
+
+  <!-- Second tab content (same document, different title via hash). -->
+  <div id="tab-marker">This area is shared by the second tab.</div>
+</body>
+</html>
