@@ -8,8 +8,17 @@ import config
 
 log = logging.getLogger("wxbot")
 
+# 临时性故障（限流/超时/服务端错误）：按退避重试，重试耗尽后抛 retryable=True 的 SearchError
+RETRYABLE_STATUS = (408, 429, 500, 502, 503, 504)
+
 
 class SearchError(RuntimeError):
+    """搜索失败。
+
+    retryable=True：临时性故障（408/429/5xx、超时、连接错误），稍后可重试；
+    retryable=False：请求本身有问题（4xx 等），重试无意义。
+    """
+
     def __init__(self, message, retryable=False):
         super().__init__(message)
         self.retryable = retryable
@@ -44,36 +53,64 @@ class DeepSeekSearch:
             "Authorization": "Bearer " + self.api_key,
             "Content-Type": "application/json",
         }
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         last_error = None
         for attempt in range(retries + 1):
             try:
                 resp = self.session.post(
                     url,
                     headers=headers,
-                    data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                    data=body,
                     timeout=self.timeout,
                 )
-                if resp.status_code in (408, 429, 500, 502, 503, 504):
-                    raise SearchError("HTTP %s" % resp.status_code, retryable=True)
-                if resp.status_code != 200:
+            except (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+            ) as exc:
+                # 超时/连接错误：临时性故障，走退避重试
+                last_error = SearchError("网络错误：%s" % exc, retryable=True)
+            except Exception as exc:  # noqa: BLE001
+                raise SearchError("搜索请求异常：%s" % exc, retryable=False) from exc
+            else:
+                if resp.status_code in RETRYABLE_STATUS:
+                    last_error = SearchError(
+                        "HTTP %s（临时故障，可重试）" % resp.status_code,
+                        retryable=True,
+                    )
+                elif resp.status_code != 200:
+                    # 4xx 等不可重试错误：立即抛出，不重试
                     raise SearchError(
-                        "HTTP %s: %s" % (resp.status_code, resp.text[:200]),
+                        "HTTP %s：%s" % (resp.status_code, resp.text[:200]),
                         retryable=False,
                     )
-                return resp.json()
-            except SearchError as exc:
-                last_error = exc
-                if not exc.retryable:
-                    break
-                if attempt < retries:
-                    time.sleep(1.0 * (attempt + 1))
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                if attempt < retries:
-                    time.sleep(1.0 * (attempt + 1))
-        raise SearchError("搜索请求失败：%s" % last_error)
+                else:
+                    try:
+                        return resp.json()
+                    except ValueError as exc:
+                        raise SearchError(
+                            "响应不是合法 JSON：%s" % exc, retryable=False
+                        ) from exc
+            if attempt < retries:
+                wait = 1.0 * (attempt + 1)
+                log.warning(
+                    "搜索请求失败（%s），%.1f 秒后重试（第 %d/%d 次）",
+                    last_error,
+                    wait,
+                    attempt + 1,
+                    retries,
+                )
+                time.sleep(wait)
+        raise SearchError(
+            "搜索请求失败（已重试 %d 次）：%s" % (retries, last_error),
+            retryable=last_error.retryable,
+        )
 
     def search(self, query, count=6, ori_question="", need_content=False):
+        """联网搜索，返回结果列表。
+
+        空列表表示“搜过但没有结果”，不是异常，调用方用 `results == []` 区分；
+        搜索失败抛 SearchError（retryable 标记是否值得稍后重试）。
+        """
         query = (query or "").strip()
         if not query:
             raise SearchError("搜索词为空")
@@ -84,6 +121,7 @@ class DeepSeekSearch:
         if cached and self.cache_seconds > 0:
             age = time.time() - cached[0]
             if age <= self.cache_seconds:
+                log.info("联网搜索（缓存命中）：%s -> %d 条", query[:60], len(cached[1]))
                 return [dict(item) for item in cached[1]]
 
         payload = {"query": query, "count": count, "need_content": bool(need_content)}
@@ -106,7 +144,10 @@ class DeepSeekSearch:
             )
         if self.cache_seconds > 0:
             self._cache[key] = (time.time(), [dict(item) for item in results])
-        log.info("联网搜索：%s -> %d 条", query[:60], len(results))
+        if results:
+            log.info("联网搜索（实时请求）：%s -> %d 条", query[:60], len(results))
+        else:
+            log.info("联网搜索（实时请求）：%s -> 0 条（搜过但没有结果）", query[:60])
         return results
 
     def fetch(self, url):

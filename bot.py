@@ -209,6 +209,17 @@ SEARCH_OFF_RULES = """
 【联网搜索】
 当前没有可用的联网搜索。需要实时/最新资料时，直接说明查不了，不要假装查过，也不要让群友提供公开资料。
 """
+# 检索结局：让最终回复能看出本次是“有来源 / 无结果 / 搜索失败”
+SEARCH_STATUS_LABELS = {
+    "ok": "有来源",
+    "empty": "无结果",
+    "failed": "搜索失败",
+}
+# 无结果/搜索失败时加在回复开头的标记（有来源时靠“来源：URL”附注区分）
+SEARCH_STATUS_TAGS = {
+    "empty": "（没搜到相关资料，下面是没有资料核对的回答）\n",
+    "failed": "（联网搜索失败，下面是没有资料核对的回答）\n",
+}
 SEARCH_FORCE_PREFIXES = (
     "查一下", "查查", "搜一下", "搜索", "帮我查", "帮我搜",
     "网上查", "联网查", "查资料", "找一下",
@@ -760,6 +771,8 @@ class Bot:
 
         can_search = self.search is not None and self.search.available
         used_search = False
+        # 检索结局："" 未检索 / "ok" 有来源 / "empty" 无结果 / "failed" 搜索失败
+        search_status = ""
         sources = []
         allowed_urls = set()
         for url in re.findall(r"https?://[^\s<>'\"）)]+", question):
@@ -781,6 +794,7 @@ class Bot:
                 used_search = True
                 search_calls += 1
                 if results:
+                    search_status = "ok"
                     self.add_sources(sources, results)
                     allowed_urls.update(
                         item.get("url") for item in results if item.get("url")
@@ -802,23 +816,33 @@ class Bot:
                         }
                     )
                 else:
+                    search_status = "empty"
                     messages.append(
                         {
                             "role": "system",
                             "content": (
-                                "【自动检索结果】没有搜到结果。不要编，直接说明没查到；"
+                                "【自动检索结果】本次没有可用资料：已经联网搜索，但没有搜到结果。"
+                                "不要编造链接、版本号、价格或日期；明确说明本次没有可用资料，"
+                                "只能按已有知识谨慎回答，并提醒信息可能过时、未经核实；"
                                 "如果问题需要公开资料，不要改问用户要资料。"
                             ),
                         }
                     )
             except SearchError as exc:
                 used_search = True
-                log.warning("自动搜索失败：%s", exc)
+                search_status = "failed"
+                log.warning(
+                    "自动搜索失败（%s）：%s",
+                    "可重试" if exc.retryable else "不可重试",
+                    exc,
+                )
                 messages.append(
                     {
                         "role": "system",
                         "content": (
-                            "【自动检索失败】%s。不要编造事实或链接，直接说明搜索失败。"
+                            "【自动检索失败】%s。本次没有可用资料："
+                            "不要编造链接、版本号、价格或日期；明确说明搜索失败，"
+                            "只能按已有知识谨慎回答，并提醒信息可能过时、未经核实。"
                             % str(exc)[:160]
                         ),
                     }
@@ -872,6 +896,10 @@ class Bot:
                                 )
                                 used_search = True
                                 search_calls += 1
+                                if results:
+                                    search_status = "ok"
+                                elif search_status != "ok":
+                                    search_status = "empty"
                                 self.add_sources(sources, results)
                                 allowed_urls.update(
                                     item.get("url")
@@ -881,6 +909,8 @@ class Bot:
                                 content = self.tool_search_result(query, results)
                             except SearchError as exc:
                                 used_search = True
+                                if search_status != "ok":
+                                    search_status = "failed"
                                 content = json.dumps(
                                     {"error": "搜索失败：%s" % str(exc)[:160]},
                                     ensure_ascii=False,
@@ -969,7 +999,7 @@ class Bot:
                 + [{"role": "user", "content": f"{sender}：{question}"}]
             )
 
-        return answer, used_search, sources
+        return answer, used_search, sources, search_status
 
     def start_meme_refresh(self):
         if self.meme_corpus is None:
@@ -1946,7 +1976,7 @@ class Bot:
 
                 log.info("[%s] %s: %s", name, sender, question)
                 try:
-                    raw_answer, used_search, sources = self.answer_question(
+                    raw_answer, used_search, sources, search_status = self.answer_question(
                         state, question, sender
                     )
                 except LLMError as exc:
@@ -1956,6 +1986,11 @@ class Bot:
                 raw_answer = (raw_answer or "").strip()
                 if not raw_answer:
                     continue
+                if search_status:
+                    log.info(
+                        "检索结局：%s",
+                        SEARCH_STATUS_LABELS.get(search_status, search_status),
+                    )
                 answer = self.finalize_answer(raw_answer, sources, used_search)
                 tag, answer = self.extract_sticker(answer)
                 if not answer:
@@ -1964,6 +1999,9 @@ class Bot:
                         state.history.append((self.bot_name, "[表情]" + tag))
                     continue
 
+                status_tag = SEARCH_STATUS_TAGS.get(search_status, "")
+                if status_tag:
+                    answer = status_tag + answer
                 state.history.append((self.bot_name, answer))
                 sent = self.say(
                     target,
