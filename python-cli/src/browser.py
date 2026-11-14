@@ -1,0 +1,244 @@
+import os
+import time
+import json
+import urllib.request
+
+try:
+    import requests
+except Exception:
+    requests = None
+
+try:
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.common.by import By
+    HAS_SELENIUM = True
+except ImportError:
+    HAS_SELENIUM = False
+    webdriver = None
+
+try:
+    import undetected_chromedriver as uc
+    HAS_UC = True
+except Exception:
+    HAS_UC = False
+    uc = None
+
+def parse_cookie_string(cookie_str: str) -> dict:
+    """Parse raw set-cookie headers or Cookie string into clean dict."""
+    cookies = {}
+    if not cookie_str:
+        return cookies
+        
+    lines = cookie_str.strip().splitlines()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if line.lower().startswith("set-cookie:"):
+            line = line[11:].strip()
+        elif line.lower().startswith("set-cookie"):
+            line = line[10:].strip()
+            
+        parts = line.split(";")
+        for part in parts:
+            part = part.strip()
+            if "=" in part:
+                k, v = part.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if k.lower() not in ["path", "domain", "max-age", "httponly", "secure", "expires", "samesite"]:
+                    cookies[k] = v
+    return cookies
+
+
+class ShopeeBrowserManager:
+    def __init__(self, profile_dir="./shopee_profile", headless=False):
+        self.profile_dir = os.path.abspath(profile_dir)
+        os.makedirs(self.profile_dir, exist_ok=True)
+        self.driver = None
+        
+        if HAS_SELENIUM or HAS_UC:
+            self._init_driver(headless=headless)
+
+    def _init_driver(self, headless=False):
+        chrome_binary = "/usr/bin/google-chrome"
+        
+        # 1. First try connecting to existing Chrome on remote-debugging-port=9222 (100% bypass anti-bot)
+        if HAS_SELENIUM and webdriver:
+            try:
+                options = Options()
+                options.add_experimental_option("debuggerAddress", "127.0.0.1:9222")
+                self.driver = webdriver.Chrome(options=options)
+                print("[Info] Berhasil terhubung ke Chrome yang sedang berjalan di port 9222!")
+                return
+            except Exception:
+                pass
+
+        # 2. Fallback to Undetected ChromeDriver
+        if HAS_UC and uc:
+            try:
+                options = uc.ChromeOptions()
+                options.add_argument(f"--user-data-dir={self.profile_dir}")
+                options.add_argument("--no-sandbox")
+                options.add_argument("--disable-dev-shm-usage")
+                options.add_argument("--window-size=1280,800")
+                options.add_argument("--disable-blink-features=AutomationControlled")
+                options.add_argument("--disable-popup-blocking")
+                if headless:
+                    options.add_argument("--headless=new")
+                    
+                self.driver = uc.Chrome(
+                    options=options,
+                    browser_executable_path=chrome_binary if os.path.exists(chrome_binary) else None,
+                    use_subprocess=True
+                )
+                self._apply_stealth_scripts()
+                return
+            except Exception as e:
+                print(f"[Warning] Failed to start undetected_chromedriver ({e}), falling back to standard Selenium Chrome...")
+
+        if HAS_SELENIUM and webdriver:
+            try:
+                options = Options()
+                options.add_argument(f"--user-data-dir={self.profile_dir}")
+                options.add_argument("--no-sandbox")
+                options.add_argument("--disable-dev-shm-usage")
+                options.add_argument("--window-size=1280,800")
+                options.add_argument("--disable-blink-features=AutomationControlled")
+                options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+                options.add_experimental_option('useAutomationExtension', False)
+                if os.path.exists(chrome_binary):
+                    options.binary_location = chrome_binary
+                if headless:
+                    options.add_argument("--headless=new")
+                self.driver = webdriver.Chrome(options=options)
+                self._apply_stealth_scripts()
+            except Exception as e:
+                print(f"[Warning] Failed to start standard Chrome driver: {e}")
+
+    def _apply_stealth_scripts(self):
+        if self.driver:
+            try:
+                self.driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+                    "source": """
+                    Object.defineProperty(navigator, 'webdriver', {
+                        get: () => undefined
+                    });
+                    """
+                })
+            except Exception:
+                try:
+                    self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                except Exception:
+                    pass
+
+    def get_driver(self):
+        return self.driver
+
+    def check_logged_in(self) -> bool:
+        """Check if user is currently logged into Shopee by scanning active cookies and URL."""
+        cookies = self.get_session_cookies()
+        has_cookie = any(name in cookies for name in ["SPC_EC", "SPC_U", "SPC_ST", "SPC_SI", "shopee_token"])
+        
+        if self.driver:
+            try:
+                current_url = self.driver.current_url or ""
+                if "buyer/login" not in current_url and "verify/" not in current_url:
+                    if has_cookie or current_url.rstrip("/") == "https://shopee.co.id":
+                        return True
+            except Exception:
+                pass
+        return has_cookie
+
+    def ensure_login(self, prompt_callback=None, timeout_seconds=600) -> bool:
+        """Ensure user is logged in. Opens Chrome and allows user to solve CAPTCHA / QR Code login manually."""
+        if self.check_logged_in():
+            return True
+            
+        if not self.driver:
+            return self.check_logged_in()
+            
+        try:
+            current_url = self.driver.current_url or ""
+            if "shopee.co.id" not in current_url:
+                self.driver.get("https://shopee.co.id/")
+                time.sleep(2)
+                
+            if self.check_logged_in():
+                return True
+                
+            current_url = self.driver.current_url or ""
+            if "buyer/login" not in current_url and "verify/" not in current_url:
+                self.driver.get("https://shopee.co.id/buyer/login")
+                time.sleep(2)
+                
+            if prompt_callback:
+                prompt_callback("Silakan selesaikan CAPTCHA (klik 'Coba Lagi') / Scan QR Code di browser Chrome Anda...")
+                
+            start_time = time.time()
+            prompted_captcha = False
+            
+            while time.time() - start_time < timeout_seconds:
+                current_url = self.driver.current_url or ""
+                if "verify/captcha" in current_url or "verify/traffic" in current_url:
+                    if not prompted_captcha and prompt_callback:
+                        prompt_callback("⚠️ Silakan selesaikan CAPTCHA atau klik 'Coba Lagi' di browser Chrome...")
+                        prompted_captcha = True
+                else:
+                    prompted_captcha = False
+                    
+                if self.check_logged_in():
+                    return True
+                time.sleep(2)
+                
+            return False
+        except Exception as e:
+            print(f"[Error] Exception during login check: {e}")
+            return False
+
+    def get_session_cookies(self) -> dict:
+        """Extract cookies from env, cookies.txt/.env file, or Selenium driver."""
+        cookies = {}
+        
+        # 1. Read from cookies.txt or .env if file exists in project directory
+        for fname in ["cookies.txt", ".env"]:
+            if os.path.exists(fname):
+                try:
+                    with open(fname, "r", encoding="utf-8") as f:
+                        content = f.read()
+                        if "COOKIE_STRING=" in content:
+                            for line in content.splitlines():
+                                if line.strip().startswith("COOKIE_STRING="):
+                                    c_str = line.split("COOKIE_STRING=", 1)[1].strip().strip('"').strip("'")
+                                    cookies.update(parse_cookie_string(c_str))
+                        else:
+                            cookies.update(parse_cookie_string(content))
+                except Exception:
+                    pass
+
+        # 2. Try env variables
+        for env_key in ["SHOPEE_COOKIE", "COOKIE_STRING"]:
+            env_val = os.getenv(env_key, "").strip()
+            if env_val:
+                cookies.update(parse_cookie_string(env_val))
+
+        # 3. Add/override cookies from active Selenium driver if available
+        if self.driver:
+            try:
+                for c in self.driver.get_cookies():
+                    cookies[c['name']] = c['value']
+            except Exception:
+                pass
+                
+        return cookies
+
+    def close(self):
+        if self.driver:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+            self.driver = None
+None
+
