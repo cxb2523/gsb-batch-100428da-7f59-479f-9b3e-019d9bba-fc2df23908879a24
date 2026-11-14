@@ -237,6 +237,24 @@ _last_recovery = 0.0
 # Berapa kali lesson URL ini sudah di-recovery (guard anti loop level rusak)
 _recovery_counts = {}
 
+# Recovery berulang yang ternyata BUKAN level rusak (halaman sudah keluar
+# dari level: logout / redirect login / halaman utama) menyerahkan kendali
+# ke patroli login. Level sesi ini disimpan di sini supaya patroli bisa
+# mengembalikan bot ke level yang sedang dikerjakan - bukan level terdepan
+# akun. Kosong = tidak ada yang menunggu.
+_recovery_pending_lesson = ""
+
+# Jangkar level sesi ini: URL level TERAKHIR yang benar-benar dikerjakan
+# bot. state.last_url bisa sudah tertimpa URL login/home saat redirect,
+# jadi recovery memakai jangkar ini untuk tetap mengenali level yang
+# sedang dikerjakan (hitung recovery berulang & kembali setelah login).
+_lesson_anchor = ""
+
+_recovery_resume_try = 0.0   # throttle percobaan kembali ke level sesi
+
+_recovery_resume_fail = 0    # percobaan kembali gagal; menyerah setelah 3
+                             # supaya loop tidak diam menunggu selamanya
+
 
 
 _hijack_counts = {}

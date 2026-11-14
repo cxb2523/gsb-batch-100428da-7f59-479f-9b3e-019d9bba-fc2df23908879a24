@@ -871,6 +871,8 @@ def _skip_to_next_lesson(alasan):
                 state._recovery_counts.pop(base, None)
                 state._hijack_counts.pop(base, None)
                 state.last_url = url
+                state._lesson_anchor = url
+                state._recovery_pending_lesson = ""
                 state.last_action_time = time.time()
                 state._last_recovery = time.time()
                 print(f"[SKIP] {alasan} - lanjut ke {url.split('/')[-1]} "
@@ -905,6 +907,9 @@ def _skip_to_next_lesson(alasan):
     state._recovery_counts.pop(base, None)
     state._hijack_counts.pop(base, None)
     state.last_url = state.PAGE.url
+    if ".play" in (state.last_url or ""):
+        state._lesson_anchor = state.last_url
+    state._recovery_pending_lesson = ""
     state.last_action_time = time.time()
     state._last_recovery = time.time()
     print(f"[SKIP] {alasan} - lanjut ke {url.split('/')[-1]} "

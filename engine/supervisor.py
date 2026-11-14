@@ -267,6 +267,17 @@ def main_loop():
             # validasi level start terkunci (non-blokir, hanya setelah
             # status login pasti; selama menunggu jawaban GUI, loop berhenti
             # di sini dan tidak menyentuh halaman)
+            # Handoff recovery -> patroli login: bukan level rusak, bot
+            # harus kembali ke level yang sedang dikerjakan sesi ini.
+            # Patroli login biasanya sudah mengurusnya (profil 'in'),
+            # cabang ini menangkap kasus penanda login tak terbaca / patroli
+            # tertahan throttle - selama sesi TIDAK butuh login dan user
+            # tidak sedang memakai browser (cek di dalam fungsinya).
+            if (getattr(state, "_recovery_pending_lesson", "")
+                    and not state.NEEDS_LOGIN and state.LOGIN_DICEK
+                    and not state.AWAIT_RANGE):
+                if session._resume_pending_lesson(url):
+                    continue
             if not levels._range_validate_step():
                 state.STOP = True
                 return
@@ -302,6 +313,13 @@ def main_loop():
                 except Exception:
                     state.STATUS_LABEL = ""
                 state.last_url = url
+                # jangkar level sesi: dipakai recovery/patroli login untuk
+                # kembali ke level yang SEDANG dikerjakan walau halaman
+                # sempat ke-redirect ke login/home (state.last_url sudah
+                # tertimpa URL non-level saat itu).
+                if browser._di_lesson(url):
+                    state._lesson_anchor = browser._lesson_play_url(url)
+                    state._recovery_pending_lesson = ""
                 # level terakhir yang dikerjakan -> kartu 'Lanjut'
                 try:
                     levels.catat_posisi(levels.url_to_level(url) or 0)

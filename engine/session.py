@@ -301,6 +301,112 @@ def _probe_tab_login(timeout_s=15.0):
     return hasil
 
 
+def _lesson_id_dari_url(u):
+    """ID lesson dari URL bentuk .play (dipakai untuk cek level rusak)."""
+    m = re.search(r"/program-(\d+)/(\d+)\.play", u or "")
+    return int(m.group(2)) if m else None
+
+
+def _url_halaman_aman(timeout_ms=2500):
+    """location.href halaman aktif, dibaca dengan GERBANG TIMEOUT dulu
+    (evaluate di renderer yang di-suspend Windows bisa menghang tanpa
+    batas - pernah mematikan loop). Return '' bila belum terbaca."""
+    pg = state.PAGE
+    if pg is None:
+        return ""
+    try:
+        pg.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+    except Exception:
+        return ""
+    try:
+        u = pg.evaluate("() => location.href")
+    except Exception:
+        return ""
+    return u.strip() if isinstance(u, str) else ""
+
+
+def _resume_pending_lesson(url=None):
+    """Recovery berulang yang ternyata BUKAN level rusak (halaman sudah
+    keluar dari level: logout / redirect login / halaman utama) menyerahkan
+    kendali ke patroli login. Setelah sesi dipastikan hidup lagi, di sini
+    bot dikembalikan ke level yang SEDANG DIKERJAKAN sesi ini - bukan level
+    terdepan akun, dan tanpa melompati level apa pun.
+    Return True = navigasi kembali dilakukan."""
+    target = getattr(state, "_recovery_pending_lesson", "") or ""
+    if not target or state.NEEDS_LOGIN or state.STOP:
+        return False
+    if getattr(state, "AWAIT_RANGE", False):
+        # GUI sedang menanyakan rentang / user memilih sendiri - jangan
+        # rebut halaman.
+        return False
+    if _lesson_id_dari_url(target) in state._broken_lessons:
+        # level itu belakangan memang ditandai rusak oleh jalur lain ->
+        # jangan dihidupkan lagi
+        state._recovery_pending_lesson = ""
+        return False
+    try:
+        real = _url_halaman_aman()
+    except Exception:
+        real = url or ""
+    if browser._di_lesson(real):
+        # sudah kembali ke level (user / reload) - tidak perlu navigasi
+        state._recovery_pending_lesson = ""
+        return False
+    now = time.time()
+    if now - state._recovery_resume_try < 15.0:
+        return False
+    try:
+        from . import typing_core
+        if typing_core._user_active(25.0):
+            return False       # user sedang memakai browser bot
+    except Exception:
+        pass
+    state._recovery_resume_try = now
+    tujuan = browser._lesson_route_url(target)
+    try:
+        state.PAGE.goto(tujuan, timeout=25000)
+    except Exception as e:
+        state._recovery_resume_fail += 1
+        print(f"[LOGIN] gagal kembali ke level sesi "
+              f"({target.split('/')[-1]}): {str(e)[:60]}")
+        if state._recovery_resume_fail >= 3:
+            # menyerah: biarkan jalur normal (recovery/daftar) mengambil
+            # alih, jangan biarkan bot diam menunggu level yang tak bisa
+            # dibuka, dan jangan lompati level apa pun diam-diam.
+            state._recovery_pending_lesson = ""
+            state._recovery_resume_fail = 0
+            print("[LOGIN] 3x gagal kembali ke level sesi - serahkan ke "
+                  "pemulihan biasa (tanpa melompati level).")
+        return False
+    # goto tidak melempar error belum tentu mendarat di level: sesi bisa
+    # logout lagi dan server me-redirect ke /signin / halaman utama.
+    mendarat = _url_halaman_aman()
+    if not browser._di_lesson(mendarat):
+        state._recovery_resume_fail += 1
+        print(f"[LOGIN] kembali ke level sesi belum berhasil "
+              f"(mendarat di {mendarat[-40:] or '?'}) - tetap menunggu "
+              f"patroli login, level sesi tidak dilompati")
+        if state._recovery_resume_fail >= 3:
+            state._recovery_pending_lesson = ""
+            state._recovery_resume_fail = 0
+            print("[LOGIN] 3x kembali ke level sesi tidak mendarat di "
+                  "lesson - kendali ke pemulihan biasa (tanpa melompati).")
+        return False
+    state._recovery_pending_lesson = ""
+    state._recovery_resume_fail = 0
+    state._recovery_counts.pop(target, None)
+    state._lesson_anchor = target
+    state.last_url = target
+    state.last_typed_text = ""
+    state._std_last_rem = None
+    state._std_attempts = 0
+    state._last_recovery = time.time()
+    state.last_action_time = time.time()
+    print(f"[LOGIN] sesi pulih - kembali ke level sesi ini: "
+          f"{target.split('/')[-1]}")
+    return True
+
+
 def _login_patrol(url):
     """Cek berkala dari main loop: set/bersihkan NEEDS_LOGIN. Interval 8 dtk
     biasa, 3 dtk saat sedang menunggu user login (popup harus tertutup
@@ -408,6 +514,13 @@ def _login_patrol(url):
         state._login_sentinel["ok"] = True
         state._login_sentinel["alasan"] = ""
         print("[LOGIN] Sesi edclub aktif kembali - lanjut.")
+    # handoff recovery -> login patroli: begitu sesi hidup lagi (atau
+    # ternyata masih hidup - halaman cuma ke-redirect ke home/login), bot
+    # harus kembali ke level yang sedang dikerjakan sesi ini, bukan lanjut
+    # dari halaman tempat ia mendarat.
+    if (not state.NEEDS_LOGIN and profil == "in"
+            and getattr(state, "_recovery_pending_lesson", "")):
+        _resume_pending_lesson(url)
     if state.NEEDS_LOGIN and state.ASK_LOGIN_NAV:
         state.ASK_LOGIN_NAV = False
         # URL login yang benar (live: /login = 404). Individu = /signin

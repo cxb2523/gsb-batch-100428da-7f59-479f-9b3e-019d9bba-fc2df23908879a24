@@ -1383,6 +1383,11 @@ def disconnect():
     state.LOGIN_DICEK = False
     state.BROWSER_CLOSED = False
     state.RANGE_READY = False
+    # handoff recovery->patroli login tidak boleh menyeberang sesi
+    state._recovery_pending_lesson = ""
+    state._lesson_anchor = ""
+    state._recovery_resume_fail = 0
+    state._recovery_resume_try = 0.0
     state._login_sentinel["ok"] = True
     state._login_sentinel["alasan"] = ""
     state._login_sentinel["pernah_in"] = False
