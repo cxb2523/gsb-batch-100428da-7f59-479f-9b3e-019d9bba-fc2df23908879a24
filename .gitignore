@@ -1,0 +1,11 @@
+__pycache__/
+.vscode/
+venv/
+testing/
+dist/
+.idea/
+.ipynb_checkpoints/
+.DS_Store
+.env
+*.egg-info
+*.ipynb
