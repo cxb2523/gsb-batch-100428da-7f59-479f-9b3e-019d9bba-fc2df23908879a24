@@ -491,7 +491,8 @@ async def list_tools() -> list[Tool]:
                 "扫描发现所有 AirScript 设备。\n"
                 "同时执行：1) 局域网扫描（WiFi 连接的 Android/iOS 设备）"
                 "2) ADB 扫描（USB 连接的 Android 设备）。\n"
-                "返回所有发现的设备列表。"
+                "返回发现的设备列表，并明确标注局域网扫描是否完整完成："
+                "完整无设备 ≠ 扫描超时/探测失败（后者可能仍有未发现的设备，建议重试）。"
             ),
             inputSchema={
                 "type": "object",
@@ -1080,12 +1081,55 @@ def _dispatch(name: str, args: dict) -> str | dict:
 
     if name == "scan_devices":
         port = args.get("port", 9096)
-        lan_devices = dev.scan_devices(port=port)
+        lan_result = dev.scan_devices(port=port)
+        lan_devices = lan_result["devices"]
+        scan = lan_result["scan"]
         adb_devices = dev.scan_adb_devices()
         all_devices = lan_devices + adb_devices
+
+        lines: list[str] = []
+
+        def _lan_summary() -> str:
+            if scan["status"] == "not_scanned":
+                return "局域网扫描：未执行（本机未发现任何局域网网段），不能据此判断没有设备。"
+            if scan["status"] == "complete":
+                return f"局域网扫描：完整完成（用时 {scan['elapsed_s']}s），结果可信。"
+            parts = [f"局域网扫描：未完整完成（用时 {scan['elapsed_s']}s / 上限 {scan['total_timeout_s']}s）。"]
+            if scan["timed_out"]:
+                parts.append("总超时提前结束。")
+            for item in scan["unscanned_prefixes"]:
+                parts.append(
+                    f"网段 {item['prefix']} 未扫完（已扫 {item['scanned_ips']}/{item['total_ips']}）。"
+                )
+            failed = scan["platform_probe_failed_count"]
+            timedout = scan["platform_probe_timeout_count"]
+            if failed or timedout:
+                parts.append(
+                    f"端口开放但平台探测未完成：失败 {failed} 个，超时 {timedout} 个"
+                    f"（这些 IP 未计入设备列表）。"
+                )
+            parts.append("以下仅为已确认设备，可能还有遗漏；可重试扫描。")
+            return "".join(parts)
+
+        lines.append(_lan_summary())
+
         if not all_devices:
-            return "未发现 AirScript 设备。请确认：\n- 局域网设备：已开启 AirScript 服务且在同一网络\n- USB 设备：已通过 USB 连接且 adb 可用"
-        lines = [f"发现 {len(all_devices)} 台设备：\n"]
+            if scan["status"] == "not_scanned":
+                lines.append(
+                    "ADB 扫描也未发现设备。请确认：\n"
+                    "- 局域网设备：已开启 AirScript 服务且在同一网络\n"
+                    "- USB 设备：已通过 USB 连接且 adb 可用"
+                )
+            elif scan["status"] == "complete":
+                lines.append("未发现 AirScript 设备。请确认：\n"
+                             "- 局域网设备：已开启 AirScript 服务且在同一网络\n"
+                             "- USB 设备：已通过 USB 连接且 adb 可用")
+            else:
+                lines.append("当前未确认到任何设备，但扫描未完成，不能断定网络中没有设备。"
+                             "请重试，或直接使用 connect_device 手动连接已知 IP。")
+            return "\n".join(lines)
+
+        lines.append(f"\n发现 {len(all_devices)} 台设备：\n")
         for d in all_devices:
             mode = d.get("connection_mode", "LocalIP")
             if mode == "ADB":

@@ -11,11 +11,12 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -289,13 +290,17 @@ def _is_port_open(ip: str, port: int, timeout_s: float = 0.8) -> bool:
         return False
 
 
-def _probe_platform(ip: str, port: int, password: str = "") -> Optional[str]:
+def _probe_platform(
+    ip: str, port: int, password: str = "", timeout: float = 5.0
+) -> Optional[str]:
     """
     探测设备平台，对齐插件 probeDevicePlatform。
     POST /api/model/pip:
       - code===1          → android
       - 其他有效响应/空体  → ios（iOS 该接口返回空 body 或 code!=1）
       - 网络/超时错误      → None（非 AScript 设备）
+
+    timeout 允许调用方收窄单次等待（扫描时用于贴合总超时预算）。
     """
     url = f"http://{ip}:{port}/api/model/pip"
     headers: dict[str, str] = {"Content-Type": "application/json"}
@@ -303,7 +308,7 @@ def _probe_platform(ip: str, port: int, password: str = "") -> Optional[str]:
         headers["Cookie"] = f"airscript={password}"
     try:
         req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=max(0.1, timeout)) as resp:
             body = resp.read().decode("utf-8").strip()
             if not body:
                 return "ios"  # iOS 返回空 body
@@ -313,65 +318,233 @@ def _probe_platform(ip: str, port: int, password: str = "") -> Optional[str]:
         return None
 
 
-def scan_devices(port: int = 9096) -> list[dict[str, Any]]:
-    """
-    局域网扫描，1:1 对齐插件 scanLocalDevices。
+# 局域网扫描基线（与插件一致，不得随意改动）
+LAN_SCAN_TOTAL_TIMEOUT_S = 25.0   # 25s 总超时
+LAN_SCAN_CONCURRENCY = 80         # 端口探测 80 并发
+LAN_SCAN_PORT_TIMEOUT_S = 0.8     # 800ms 单 IP 端口超时
+LAN_SCAN_PROBE_CONCURRENCY = 20   # 平台探测并发
 
-    流程：
+
+def _summarize_scan(
+    *,
+    elapsed_s: float,
+    scanned: bool,
+    port_scan_timed_out: bool,
+    unscanned_prefixes: list[dict[str, Any]],
+    open_port_count: int,
+    device_count: int,
+    probe_failed_count: int,
+    probe_timeout_count: int,
+    probe_failures: list[dict[str, Any]],
+    total_timeout_s: float,
+    scanned_prefixes: list[str],
+    prefixes: list[str],
+) -> dict[str, Any]:
+    """汇总本次局域网扫描的完成情况，供调用方判断结果是否完整。
+
+    status 语义：
+      - "not_scanned"：本机没有局域网网段，扫描根本没执行（≠ 扫描完成且无设备）
+      - "complete"   ：所有 IP 的端口探测都已完成，且所有端口开放的平台探测都有结论
+      - "partial"    ：超时提前结束、有网段没扫完，或存在端口开放但平台探测失败/超时
+
+    complete 仅在 status == "complete" 时为 True。只要 complete 为 False，
+    devices 就只能当作"已经确认的设备"，不能当作完整的设备清单。
+    """
+    probe_incomplete_count = probe_failed_count + probe_timeout_count
+    timed_out = port_scan_timed_out or probe_timeout_count > 0
+    complete = scanned and not timed_out and not unscanned_prefixes and probe_incomplete_count == 0
+
+    if not scanned:
+        status = "not_scanned"
+    elif complete:
+        status = "complete"
+    else:
+        status = "partial"
+
+    return {
+        "scanned": scanned,
+        "complete": complete,
+        "status": status,
+        "timed_out": timed_out,
+        "total_timeout_s": total_timeout_s,
+        "elapsed_s": round(elapsed_s, 3),
+        "prefixes": sorted(prefixes),
+        "scanned_prefixes": sorted(scanned_prefixes),
+        "unscanned_prefixes": unscanned_prefixes,
+        "open_port_count": open_port_count,
+        "confirmed_device_count": device_count,
+        "platform_probe_failed_count": probe_failed_count,
+        "platform_probe_timeout_count": probe_timeout_count,
+        # 端口开放但平台探测未得出结论（失败 + 超时）的总数
+        "platform_probe_incomplete_count": probe_incomplete_count,
+        "probe_failures": probe_failures,
+    }
+
+
+def scan_devices(
+    port: int = 9096,
+    *,
+    total_timeout_s: float = LAN_SCAN_TOTAL_TIMEOUT_S,
+    concurrency: int = LAN_SCAN_CONCURRENCY,
+    port_timeout_s: float = LAN_SCAN_PORT_TIMEOUT_S,
+    probe_concurrency: int = LAN_SCAN_PROBE_CONCURRENCY,
+) -> dict[str, Any]:
+    """局域网扫描，返回已确认设备 + 本次扫描完成情况。
+
+    流程保持不变：
     1. 合并所有子网 IP 列表（去重）
     2. 分批 80 并发端口扫描，每批等完才下一批
     3. 端口开放时立即异步提交平台探测（不阻塞当前批）
-    4. 25s 总超时控制端口扫描批次
-    5. 端口扫描全部完成后，统一等待所有平台探测结果
+    4. 25s 总超时同时约束端口扫描与平台探测的等待
+    5. 端口扫描结束后，在剩余总超时内统一收敛平台探测结果
+
+    与旧版的区别：不再在超时/探测失败时静默丢弃结果。返回 dict：
+
+      {
+        "devices": [{"name", "ip", "port", "platform"}, ...],  # 仅已确认设备，字段不变
+        "complete": bool,     # 仅当扫描完整且有结论时为 True
+        "status": "complete" | "partial" | "not_scanned",
+        "scan": {
+            "scanned": bool,
+            "complete": bool,
+            "status": ...,
+            "timed_out": bool,
+            "total_timeout_s": 25.0,
+            "elapsed_s": float,
+            "prefixes": [...],            # 本机所有局域网前缀
+            "scanned_prefixes": [...],    # 全部 IP 都完成端口扫描的前缀
+            "unscanned_prefixes": [       # 没扫完的前缀（因总超时提前结束）
+                {"prefix": "...", "scanned_ips": n, "total_ips": 254},
+                ...
+            ],
+            "open_port_count": int,       # 端口开放的 IP 数
+            "confirmed_device_count": int,
+            "platform_probe_failed_count": int,     # 平台探测失败（无平台/异常）
+            "platform_probe_timeout_count": int,    # 到总超时仍未返回的探测
+            "platform_probe_incomplete_count": int, # 上两者之和
+            "probe_failures": [{"ip", "port", "reason"}, ...],
+        },
+      }
+
+    平台探测失败/超时的 IP 不会出现在 devices 中，但会出现在 scan 统计里。
+    没有任何本机局域网前缀时，返回空 devices + status="not_scanned"，明确表示未扫描。
     """
-    import time
+    start = time.monotonic()
+    total_timeout_s = max(0.0, total_timeout_s)
+    deadline = start + total_timeout_s
 
     prefixes = _get_local_prefixes()
     if not prefixes:
-        return []
-
-    CONCURRENT = 80     # 与插件一致
-    PROBE_MS = 0.8      # 800ms 单 IP 超时（与插件一致）
-    TOTAL_S = 25.0      # 25s 总超时（与插件一致）
+        return {
+            "devices": [],
+            "complete": False,
+            "status": "not_scanned",
+            "scan": _summarize_scan(
+                elapsed_s=time.monotonic() - start,
+                scanned=False,
+                port_scan_timed_out=False,
+                unscanned_prefixes=[],
+                open_port_count=0,
+                device_count=0,
+                probe_failed_count=0,
+                probe_timeout_count=0,
+                probe_failures=[],
+                total_timeout_s=total_timeout_s,
+                scanned_prefixes=[],
+                prefixes=[],
+            ),
+        }
 
     # 合并所有子网的 IP 列表（去重），与插件完全一致
-    ip_set: set[str] = set()
+    prefix_ips: dict[str, list[str]] = {
+        prefix: [prefix + str(i) for i in range(1, 255)]
+        for prefix in prefixes
+    }
+    ips: list[str] = []
+    seen_ips: set[str] = set()
     for prefix in prefixes:
-        for i in range(1, 255):
-            ip_set.add(prefix + str(i))
-    ips = list(ip_set)
+        for ip in prefix_ips[prefix]:
+            if ip not in seen_ips:
+                seen_ips.add(ip)
+                ips.append(ip)
 
-    deadline = time.monotonic() + TOTAL_S
+    scanned_ips: set[str] = set()
+    open_ips: list[str] = []
+    probe_futures: list[tuple[Any, str]] = []  # (future, ip)
+    port_scan_timed_out = False
 
-    # 端口开放时异步提交的平台探测 futures
-    probe_pool = ThreadPoolExecutor(max_workers=20)
-    probe_futures: list[tuple] = []  # (future, ip)
+    scan_pool = ThreadPoolExecutor(max_workers=max(1, concurrency))
+    probe_pool = ThreadPoolExecutor(max_workers=max(1, probe_concurrency))
 
     try:
-        # 分批端口扫描
-        for batch_start in range(0, len(ips), CONCURRENT):
-            if time.monotonic() > deadline:
+        # 分批端口扫描；每批最多 80 并发
+        for batch_start in range(0, len(ips), max(1, concurrency)):
+            if time.monotonic() >= deadline:
+                port_scan_timed_out = True
                 break
 
-            batch = ips[batch_start: batch_start + CONCURRENT]
+            batch = ips[batch_start: batch_start + max(1, concurrency)]
+            futures = {
+                scan_pool.submit(_is_port_open, ip, port, port_timeout_s): ip
+                for ip in batch
+            }
 
-            # 当前批 80 并发端口扫描，等待全部完成
-            with ThreadPoolExecutor(max_workers=CONCURRENT) as scan_pool:
-                futures = {scan_pool.submit(_is_port_open, ip, port, PROBE_MS): ip for ip in batch}
-                for future in as_completed(futures):
-                    if future.result():
-                        ip = futures[future]
-                        # 端口开放 → 异步探测平台（不阻塞当前批）
-                        pf = probe_pool.submit(_probe_platform, ip, port)
-                        probe_futures.append((pf, ip))
+            # 当前批的等待同样受总超时约束，避免某批卡死拖垮整体
+            remaining = max(0.0, deadline - time.monotonic())
+            done, not_done = wait(list(futures.keys()), timeout=remaining)
 
-        # 端口扫描完毕，统一等待所有平台探测完成（与插件 await Promise.all 一致）
+            for future in done:
+                ip = futures[future]
+                try:
+                    is_open = future.result()
+                except Exception:
+                    # 端口探测本身异常：无法确认该 IP，按未扫描处理（保守）
+                    continue
+                scanned_ips.add(ip)
+                if is_open:
+                    open_ips.append(ip)
+                    # 端口开放 → 立即异步探测平台，不阻塞当前批。
+                    # 单次探测等待也贴合剩余总超时预算（默认仍为 5s）。
+                    probe_budget = max(0.5, min(5.0, deadline - time.monotonic()))
+                    pf = probe_pool.submit(_probe_platform, ip, port, "", probe_budget)
+                    probe_futures.append((pf, ip))
+
+            if not_done:
+                # 本批未在总超时内完成：这些 IP 视为未扫描，不再启动下一批
+                port_scan_timed_out = True
+                for future in not_done:
+                    future.cancel()
+                break
+
+        # 端口扫描结束，在剩余总超时内统一收敛平台探测结果。
+        # 注意：单个探测的等待不会超过总 deadline；未完成的按超时计入统计，
+        # 绝不因为等待探测而让整体远超 25s。
+        if probe_futures:
+            pending = [pf for pf, _ in probe_futures if not pf.done()]
+            if pending:
+                remaining = max(0.0, deadline - time.monotonic())
+                wait(pending, timeout=remaining)
+
         devices: list[dict[str, Any]] = []
+        probe_failures: list[dict[str, Any]] = []
+        probe_failed_count = 0
+        probe_timeout_count = 0
+
         for pf, ip in probe_futures:
+            if not pf.done():
+                # 到总超时仍未返回：不当作设备，但计入未完成统计
+                pf.cancel()
+                probe_timeout_count += 1
+                probe_failures.append({"ip": ip, "port": port, "reason": "timeout"})
+                continue
+
             try:
-                platform = pf.result(timeout=10)
+                platform = pf.result()
             except Exception:
-                platform = None
+                probe_failed_count += 1
+                probe_failures.append({"ip": ip, "port": port, "reason": "error"})
+                continue
+
             if platform:
                 last_octet = ip.split(".")[-1]
                 name = f"{'Android' if platform == 'android' else 'iOS'}-{last_octet}"
@@ -381,10 +554,54 @@ def scan_devices(port: int = 9096) -> list[dict[str, Any]]:
                     "port": port,
                     "platform": platform,
                 })
+            else:
+                # 端口开放但未能确认平台（非 AScript 服务、网络错误等）
+                probe_failed_count += 1
+                probe_failures.append({"ip": ip, "port": port, "reason": "no_platform"})
     finally:
-        probe_pool.shutdown(wait=False)
+        # 不等待仍在跑的探测线程；结果已按 deadline 收敛，避免拖长整体耗时
+        probe_pool.shutdown(wait=False, cancel_futures=True)
+        scan_pool.shutdown(wait=False, cancel_futures=True)
 
-    return devices
+    # 统计每个网段的扫描完成情况
+    devices.sort(key=lambda d: d["ip"])
+    probe_failures.sort(key=lambda f: f["ip"])
+
+    scanned_prefixes: list[str] = []
+    unscanned_prefixes: list[dict[str, Any]] = []
+    for prefix in prefixes:
+        prefix_ip_list = prefix_ips[prefix]
+        scanned_count = sum(1 for ip in prefix_ip_list if ip in scanned_ips)
+        if scanned_count == len(prefix_ip_list):
+            scanned_prefixes.append(prefix)
+        else:
+            unscanned_prefixes.append({
+                "prefix": prefix,
+                "scanned_ips": scanned_count,
+                "total_ips": len(prefix_ip_list),
+            })
+
+    scan = _summarize_scan(
+        elapsed_s=time.monotonic() - start,
+        scanned=True,
+        port_scan_timed_out=port_scan_timed_out,
+        unscanned_prefixes=unscanned_prefixes,
+        open_port_count=len(open_ips),
+        device_count=len(devices),
+        probe_failed_count=probe_failed_count,
+        probe_timeout_count=probe_timeout_count,
+        probe_failures=probe_failures,
+        total_timeout_s=total_timeout_s,
+        scanned_prefixes=scanned_prefixes,
+        prefixes=prefixes,
+    )
+
+    return {
+        "devices": devices,
+        "complete": scan["complete"],
+        "status": scan["status"],
+        "scan": scan,
+    }
 
 
 # ------------------------------------------------------------------

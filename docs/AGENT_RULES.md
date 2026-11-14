@@ -207,7 +207,7 @@ _result = json.dumps(safe_action())
 | 工具 | 用途 | 何时用 / 陷阱 |
 |---|---|---|
 | `auto_connect()` | 从工程配置自动连接 | 接到任务先跑一次,失败再走下面手动 |
-| `scan_devices()` | 局域网 + ADB 扫描 | auto_connect 失败 / 多设备选择时 |
+| `scan_devices()` | 局域网 + ADB 扫描 | auto_connect 失败 / 多设备选择时。**看返回里的扫描完成状态**：`完整完成` 才算"确实没设备"，`未完整完成`（超时/探测失败）要重试 |
 | `connect_device(...)` | 手动连接 | scan_devices 拿到 IP 后用 |
 | `get_device_status()` | 完整运行状态(run_mode / permissions / screen / battery / 当前脚本…) | **③ UI 任务必须**;①② 任务可省。仅 Android |
 | `list_python_packages()` | 设备 AScript 已装 Python 库 | 写 import 之前查一次。Android + iOS |
