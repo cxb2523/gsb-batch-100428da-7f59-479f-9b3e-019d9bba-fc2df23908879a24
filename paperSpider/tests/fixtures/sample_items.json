@@ -1,0 +1,46 @@
+[
+  {
+    "paper_title": "Deep Residual Learning for Image Recognition",
+    "paper_writer": ["Kaiming He", "Xiangyu Zhang", "Shaoqing Ren", "Jian Sun"],
+    "paper_time": "2016",
+    "paper_cite_count": "被引 189521 次",
+    "paper_source": "http://openaccess.thecvf.com/content_cvpr_2016/papers/He_Deep_Residual_Learning_CVPR_2016_paper.pdf",
+    "paper_abstract": "Deeper neural networks are more difficult to train.",
+    "paper_keywords": ["deep learning", "residual network", "image recognition"],
+    "paper_DOI": "doi:10.1109/CVPR.2016.90",
+    "paper_download_link": ["http://openaccess.thecvf.com/content_cvpr_2016/papers/He_Deep_Residual_Learning_CVPR_2016_paper.pdf"]
+  },
+  {
+    "paper_title": "Attention Is All You Need",
+    "paper_writer": ["Ashish Vaswani", "Noam Shazeer"],
+    "paper_time": "2017",
+    "paper_cite_count": "暂无",
+    "paper_source": "",
+    "paper_abstract": "The dominant sequence transduction models are based on complex recurrent or convolutional neural networks.",
+    "paper_keywords": ["transformer", "attention", "machine translation"],
+    "paper_DOI": "",
+    "paper_download_link": []
+  },
+  {
+    "paper_title": "Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift",
+    "paper_writer": ["Sergey Ioffe", "Christian Szegedy"],
+    "paper_time": "暂无",
+    "paper_cite_count": "",
+    "paper_source": "https://arxiv.org/abs/1502.03167",
+    "paper_abstract": "",
+    "paper_keywords": [],
+    "paper_DOI": "https://doi.org/10.48550/arXiv.1502.03167",
+    "paper_download_link": []
+  },
+  {
+    "paper_title": "",
+    "paper_writer": [],
+    "paper_time": "",
+    "paper_cite_count": "abc",
+    "paper_source": "",
+    "paper_abstract": "完全没有身份字段的坏数据",
+    "paper_keywords": [],
+    "paper_DOI": "",
+    "paper_download_link": []
+  }
+]

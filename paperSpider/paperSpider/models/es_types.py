@@ -4,7 +4,7 @@
 
 from datetime import datetime
 from elasticsearch_dsl import DocType, Date, Nested, Boolean, \
-    analyzer, Completion, Keyword, Text, Integer
+    analyzer, Completion, Keyword, Text, Integer, Index
 from elasticsearch_dsl.analysis import CustomAnalyzer as _CustomAnalyzer
 from elasticsearch_dsl.connections import connections
 
@@ -17,6 +17,10 @@ class CustomAnalyzer(_CustomAnalyzer):
 
 
 ik_analyzer = CustomAnalyzer("ik_max_word", filter=["lowercase"])
+
+# 索引名集中定义，兼容不同版本 elasticsearch-dsl 的取值方式
+PAPER_INDEX = "baidu"
+PAPER_DOC_TYPE = "paper"
 
 
 class PaperType(DocType):
@@ -32,9 +36,14 @@ class PaperType(DocType):
     paper_DOI = Text()
     paper_download_link = Text()
 
+    # elasticsearch-dsl 6.x 使用 Index 内部类声明索引
+    class Index:
+        name = PAPER_INDEX
+
+    # 兼容 elasticsearch-dsl 5.x 的声明方式
     class Meta:
-        index = "baidu"
-        doc_type = "paper"
+        index = PAPER_INDEX
+        doc_type = PAPER_DOC_TYPE
 
 
 if __name__ == "__main__":
