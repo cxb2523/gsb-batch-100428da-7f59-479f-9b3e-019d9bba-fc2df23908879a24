@@ -1,0 +1,22 @@
+{
+  "items": [
+    {
+      "id": "alpha-001",
+      "title": "示例：晨光速写合集更新",
+      "url": "https://example.com/alpha/001",
+      "published": "2026-11-14T08:00:00Z"
+    },
+    {
+      "id": "alpha-002",
+      "title": "示例：本周社区精选回顾",
+      "url": "https://example.com/alpha/002",
+      "published": "2026-11-13T20:00:00Z"
+    },
+    {
+      "id": "shared-100",
+      "title": "示例：跨源转载条目（旧版本）",
+      "url": "https://example.com/alpha/shared-100",
+      "published": "2026-11-12T10:00:00Z"
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+{
+  "max_items": 50,
+  "timeout_seconds": 10,
+  "retries": 2,
+  "sources": [
+    {
+      "name": "alpha",
+      "url": "../sample_data/source_alpha.json",
+      "weight": 1.0,
+      "enabled": true
+    },
+    {
+      "name": "beta",
+      "url": "../sample_data/source_beta.json",
+      "weight": 2.0,
+      "enabled": true
+    },
+    {
+      "name": "gamma",
+      "url": "../sample_data/source_gamma_dirty.json",
+      "weight": 0.5,
+      "enabled": true
+    }
+  ]
+}

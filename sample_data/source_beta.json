@@ -1,0 +1,16 @@
+{
+  "items": [
+    {
+      "id": "beta-001",
+      "title": "示例：新作速递第 42 期",
+      "url": "https://example.com/beta/001",
+      "published": "2026-11-14T09:30:00Z"
+    },
+    {
+      "id": "shared-100",
+      "title": "示例：跨源转载条目（新版本）",
+      "url": "https://example.com/beta/shared-100",
+      "published": "2026-11-14T07:00:00Z"
+    }
+  ]
+}
