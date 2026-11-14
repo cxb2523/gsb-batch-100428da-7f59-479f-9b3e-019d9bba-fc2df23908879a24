@@ -188,6 +188,16 @@ stores them in `sponsorscan.db`.
 Use `--replace` when you want the jobs table to represent the latest full fetch.
 Run the same command again whenever you want refreshed postings.
 
+Each board's outcome is printed as it finishes and stored in the
+`fetch_outcomes` table (one row per board, replaced on every run): whether the
+fetch succeeded, partially succeeded or failed, how many pages it read, how
+many postings came back before and after dedup, how many Workday postings were
+skipped as too old, and why paging stopped (last page, empty page, a repeated
+page from an API ignoring `offset`, the page cap, a rate limit, or an error).
+A board that answered with zero postings is a success with zero kept. Boards
+that failed outright are also in `fetch_failures`, which the notification
+email reads.
+
 ### Workday boards
 
 A Workday slug is `tenant/wdN/site`, read from the careers page URL:

@@ -151,10 +151,10 @@ def test_fetch_records_boards_that_answered(monkeypatch, tmp_path):
     import argparse
     import sqlite3
 
-    def empty_board(slug):
+    def empty_board(slug, stats=None):
         return []
 
-    def dead_board(slug):
+    def dead_board(slug, stats=None):
         raise requests.ConnectionError("down")
 
     monkeypatch.setattr(ss, "DB_PATH", str(tmp_path / "t.db"))
@@ -184,7 +184,7 @@ def test_leftover_feeds_section_is_ignored_with_a_note(monkeypatch, tmp_path, ca
     import argparse
     import sqlite3
 
-    def board(slug):
+    def board(slug, stats=None):
         return [{"job_key": "greenhouse:stripe:9", "source": "greenhouse",
                  "title": "Backend Engineer", "location": "Seattle, WA",
                  "url": "https://job-boards.greenhouse.io/stripe/jobs/9",
@@ -308,7 +308,7 @@ def test_fetch_passes_the_workday_window(monkeypatch, tmp_path):
     import argparse
     seen = {}
 
-    def fake_workday(slug, max_age_days):
+    def fake_workday(slug, max_age_days, stats=None):
         seen[slug] = max_age_days
         return []
 
@@ -396,7 +396,7 @@ def test_fetch_records_failed_boards(monkeypatch, tmp_path):
     import argparse
     import sqlite3
 
-    def dead_board(slug):
+    def dead_board(slug, stats=None):
         raise requests.ConnectionError("connection refused")
 
     monkeypatch.setattr(ss, "DB_PATH", str(tmp_path / "t.db"))
@@ -540,7 +540,7 @@ def test_fetch_stores_the_lca_name_beside_the_display_name(monkeypatch, tmp_path
     import argparse
     import sqlite3
 
-    def board(slug):
+    def board(slug, stats=None):
         return [{"job_key": "greenhouse:instacart:1", "source": "greenhouse",
                  "title": "Software Engineer", "location": "San Francisco, CA",
                  "url": "https://instacart.careers/job/?gh_jid=1",
@@ -1029,3 +1029,151 @@ def test_workday_slug_can_narrow_a_big_board_by_category(monkeypatch):
     assert sent[0] == ("https://walmart.wd504.myworkdayjobs.com/wday/cxs/walmart/WalmartExternal/jobs",
                        {"jobFamilyGroup": ["tech", "data"]})
     assert sent[1][1] == {}
+
+
+# ---------------------------------------------------------- fetch outcomes
+#
+# fetch-jobs records one row per board in fetch_outcomes: how the fetch ended,
+# how much it read, and why it stopped paging. These run the real fetchers
+# against fake HTTP responses and read the outcome back from the database.
+
+def _run_fetch(monkeypatch, tmp_path, companies_yaml, replace=True):
+    import argparse
+    monkeypatch.setattr(ss, "DB_PATH", str(tmp_path / "t.db"))
+    companies = tmp_path / "companies.yaml"
+    companies.write_text(companies_yaml, encoding="utf-8")
+    ss.cmd_fetch_jobs(argparse.Namespace(companies=str(companies), replace=replace,
+                                         delay=0, workday_days=3))
+
+
+def _outcome(tmp_path, board):
+    import sqlite3
+    con = sqlite3.connect(tmp_path / "t.db")
+    row = con.execute(
+        "SELECT source, slug, status, pages, raw_count, kept_count, skipped_old, "
+        "detail_failed, stop_reason FROM fetch_outcomes WHERE board = ?",
+        (board,)).fetchone()
+    con.close()
+    return row
+
+
+def _outcome_count(tmp_path, board):
+    import sqlite3
+    con = sqlite3.connect(tmp_path / "t.db")
+    n = con.execute("SELECT COUNT(*) FROM fetch_outcomes WHERE board = ?",
+                    (board,)).fetchone()[0]
+    con.close()
+    return n
+
+
+def test_outcome_records_a_normal_multi_page_fetch(monkeypatch, tmp_path, no_sleep):
+    jobs = [_amazon_job(n) for n in range(ss.AMAZON_PAGE + 5)]
+    monkeypatch.setattr(requests, "get", _AmazonAPI(jobs))
+    _run_fetch(monkeypatch, tmp_path,
+               "companies:\n  amazon:\n    - {slug: all, name: Amazon}\n")
+    assert _outcome(tmp_path, "amazon/all") == (
+        "amazon", "all", "success", 2, len(jobs), len(jobs), 0, 0, "last_page")
+
+
+def test_outcome_marks_a_repeated_page_as_duplicate_not_last(monkeypatch, tmp_path,
+                                                             no_sleep):
+    # An API that ignores `offset` serves the same page forever; the outcome
+    # must say so, or the fetch looks like it ended cleanly.
+    api = _AmazonAPI([], page=[_amazon_job(n) for n in range(ss.AMAZON_PAGE)])
+    monkeypatch.setattr(requests, "get", api)
+    _run_fetch(monkeypatch, tmp_path,
+               "companies:\n  amazon:\n    - {slug: all, name: Amazon}\n")
+    assert _outcome(tmp_path, "amazon/all") == (
+        "amazon", "all", "success", 2, 2 * ss.AMAZON_PAGE, ss.AMAZON_PAGE, 0, 0,
+        "duplicate_page")
+
+
+def test_outcome_partial_when_eightfold_is_rate_limited(monkeypatch, tmp_path, no_sleep):
+    api = _EightfoldAPI([_position(1), _position(2)])
+    original = api.__call__
+
+    def refuse_second_detail(url, params=None, **kwargs):
+        if url.endswith("position_details") and params["position_id"] == 2:
+            api.refuse["position_details"] = 99
+        return original(url, params=params, **kwargs)
+
+    monkeypatch.setattr(requests, "get", refuse_second_detail)
+    slug = "careers.example.com/careers?domain=example.com"
+    _run_fetch(monkeypatch, tmp_path,
+               f"companies:\n  eightfold:\n    - {{slug: '{slug}', name: Example}}\n")
+    # The posting read before the refusal is stored; the outcome says partial.
+    assert _outcome(tmp_path, f"eightfold/{slug}") == (
+        "eightfold", slug, "partial", 1, 2, 2, 0, 0, "rate_limited")
+    import sqlite3
+    con = sqlite3.connect(tmp_path / "t.db")
+    stored = [r[0] for r in con.execute("SELECT job_key FROM jobs")]
+    con.close()
+    assert stored == ["eightfold:careers.example.com:1"]
+
+
+def test_outcome_failed_when_every_workday_detail_fails(monkeypatch, tmp_path):
+    fake = _FakeWorkday(["Posted Today"] * 2, broken={0, 1})
+    _install(monkeypatch, fake)
+    _run_fetch(monkeypatch, tmp_path,
+               "companies:\n  workday:\n    - {slug: acme/wd5/Ext, name: Acme}\n")
+    assert _outcome(tmp_path, "workday/acme/wd5/Ext") == (
+        "workday", "acme/wd5/Ext", "failed", 1, 2, 2, 0, 2, "error")
+    import sqlite3
+    con = sqlite3.connect(tmp_path / "t.db")
+    failures = [r[0] for r in con.execute("SELECT board FROM fetch_failures")]
+    con.close()
+    assert failures == ["workday/acme/wd5/Ext"]
+
+
+def test_outcome_counts_age_skips_and_partial_workday_details(monkeypatch, tmp_path):
+    ages = ["Posted Today"] * 3 + ["Posted 10 Days Ago"] * 20 + ["Posted Yesterday"] * 2
+    fake = _FakeWorkday(ages, broken={1})
+    _install(monkeypatch, fake)
+    _run_fetch(monkeypatch, tmp_path,
+               "companies:\n  workday:\n    - {slug: acme/wd5/Ext, name: Acme}\n")
+    assert _outcome(tmp_path, "workday/acme/wd5/Ext") == (
+        "workday", "acme/wd5/Ext", "partial", 2, 25, 5, 20, 1, "last_page")
+    import sqlite3
+    con = sqlite3.connect(tmp_path / "t.db")
+    stored = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+    con.close()
+    assert stored == 4  # the five recent postings minus the failed detail
+
+
+def _json_response(payload):
+    r = requests.Response()
+    r.status_code = 200
+    r._content = json.dumps(payload).encode()
+    return r
+
+
+def test_outcome_records_a_zero_job_success(monkeypatch, tmp_path):
+    monkeypatch.setattr(requests, "get",
+                        lambda *a, **k: _json_response({"jobs": []}))
+    _run_fetch(monkeypatch, tmp_path,
+               "companies:\n  greenhouse:\n    - {slug: acme, name: Acme}\n")
+    assert _outcome(tmp_path, "greenhouse/acme") == (
+        "greenhouse", "acme", "success", 1, 0, 0, 0, 0, "last_page")
+    import sqlite3
+    con = sqlite3.connect(tmp_path / "t.db")
+    failures = con.execute("SELECT COUNT(*) FROM fetch_failures").fetchone()[0]
+    con.close()
+    assert failures == 0
+
+
+def test_outcome_rerun_replaces_the_previous_record(monkeypatch, tmp_path):
+    yaml_text = "companies:\n  greenhouse:\n    - {slug: acme, name: Acme}\n"
+
+    def boom(*a, **k):
+        raise requests.ConnectionError("down")
+
+    monkeypatch.setattr(requests, "get", boom)
+    _run_fetch(monkeypatch, tmp_path, yaml_text, replace=False)
+    assert _outcome(tmp_path, "greenhouse/acme")[2] == "failed"
+
+    payload = {"jobs": [{"id": n, "title": f"Engineer {n}"} for n in (1, 2)]}
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _json_response(payload))
+    _run_fetch(monkeypatch, tmp_path, yaml_text, replace=False)
+    assert _outcome_count(tmp_path, "greenhouse/acme") == 1
+    assert _outcome(tmp_path, "greenhouse/acme") == (
+        "greenhouse", "acme", "success", 1, 2, 2, 0, 0, "last_page")

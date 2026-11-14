@@ -168,6 +168,25 @@ CREATE TABLE IF NOT EXISTS fetch_failures (
     error     TEXT,
     failed_at TEXT
 );
+-- One row per board per fetch-jobs run, overwritten on re-run: how the board's
+-- fetch ended and what it read along the way. A whole board silently failing,
+-- or one board inflating the count with duplicate pages, is visible here
+-- rather than only in a missing or swollen total.
+CREATE TABLE IF NOT EXISTS fetch_outcomes (
+    board         TEXT PRIMARY KEY,
+    source        TEXT,
+    slug          TEXT,
+    status        TEXT,   -- success | partial | failed
+    pages         INTEGER,
+    raw_count     INTEGER,  -- entries the API returned, before dedup
+    kept_count    INTEGER,  -- entries left after dedup
+    skipped_old   INTEGER,  -- Workday postings outside the age window
+    detail_failed INTEGER,  -- Workday detail requests that failed
+    stop_reason   TEXT,     -- last_page | empty_page | duplicate_page |
+                            -- page_cap | rate_limited | error
+    error         TEXT,
+    fetched_at    TEXT
+);
 CREATE TABLE IF NOT EXISTS probe_cache (
     provider   TEXT,
     slug       TEXT,
@@ -750,9 +769,22 @@ def _get_json(url, timeout=25):
     return r.json()
 
 
-def fetch_greenhouse(slug):
+# Every fetcher fills one of these dicts (passed in as `stats`) while it runs,
+# so cmd_fetch_jobs can record a per-board outcome in fetch_outcomes even when
+# the fetcher raises partway through. `partial` marks a fetch that kept going
+# past a failure (a rate limit, a failed detail request) and stored only some
+# of what the board offered.
+def _fetch_stats():
+    return {"pages": 0, "raw": 0, "kept": 0, "skipped_old": 0,
+            "detail_failed": 0, "stop_reason": "", "partial": False}
+
+
+def fetch_greenhouse(slug, stats=None):
+    stats = _fetch_stats() if stats is None else stats
     url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
     data = _get_json(url)
+    stats["pages"] = 1
+    stats["raw"] = len(data.get("jobs", []))
     out = []
     for j in data.get("jobs", []):
         loc = (j.get("location") or {}).get("name", "")
@@ -765,12 +797,17 @@ def fetch_greenhouse(slug):
             "posted": (j.get("first_published") or j.get("updated_at") or "")[:10],
             "description": html_to_text(j.get("content", "")),
         })
+    stats["kept"] = len(out)
+    stats["stop_reason"] = "last_page"  # one request returns the whole board
     return out
 
 
-def fetch_lever(slug):
+def fetch_lever(slug, stats=None):
+    stats = _fetch_stats() if stats is None else stats
     url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
     data = _get_json(url)
+    stats["pages"] = 1
+    stats["raw"] = len(data)
     out = []
     for j in data:
         cats = j.get("categories") or {}
@@ -786,12 +823,17 @@ def fetch_lever(slug):
                 " ".join(str(d.get("text", "")) + " " + str(d.get("content", ""))
                          for d in (j.get("lists") or []))),
         })
+    stats["kept"] = len(out)
+    stats["stop_reason"] = "last_page"
     return out
 
 
-def fetch_ashby(slug):
+def fetch_ashby(slug, stats=None):
+    stats = _fetch_stats() if stats is None else stats
     url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true"
     data = _get_json(url)
+    stats["pages"] = 1
+    stats["raw"] = len(data.get("jobs", []))
     out = []
     for j in data.get("jobs", []):
         out.append({
@@ -802,6 +844,8 @@ def fetch_ashby(slug):
             "posted": (j.get("publishedAt") or "")[:10],
             "description": html_to_text(j.get("descriptionPlain", "")),
         })
+    stats["kept"] = len(out)
+    stats["stop_reason"] = "last_page"
     return out
 
 
@@ -823,8 +867,9 @@ def _amazon_date(text):
         return ""
 
 
-def fetch_amazon(slug):
+def fetch_amazon(slug, stats=None):
     """US postings from amazon.jobs in the slug's categories ("all" for every one)."""
+    stats = _fetch_stats() if stats is None else stats
     categories = [c.strip() for c in str(slug or "").split(",") if c.strip()]
     if categories == ["all"]:
         categories = []
@@ -837,6 +882,8 @@ def fetch_amazon(slug):
                          headers=UA, timeout=25)
         r.raise_for_status()
         jobs = r.json().get("jobs") or []
+        stats["pages"] += 1
+        stats["raw"] += len(jobs)
         fresh = 0
         for j in jobs:
             key = str(j.get("id_icims") or j.get("id") or "")
@@ -856,9 +903,21 @@ def fetch_amazon(slug):
                 "posted": _amazon_date(j.get("posted_date")),
                 "description": "\n\n".join(sections),
             })
-        if len(jobs) < AMAZON_PAGE or not fresh:  # the last page, or an API ignoring offset
+        if not jobs:
+            stats["stop_reason"] = "empty_page"
+            break
+        if not fresh:
+            # The API ignored `offset` and served a page already seen. Stopping
+            # here is not the last page; saying so would hide a broken fetch.
+            stats["stop_reason"] = "duplicate_page"
+            break
+        if len(jobs) < AMAZON_PAGE:
+            stats["stop_reason"] = "last_page"
             break
         time.sleep(AMAZON_DELAY)
+    else:
+        stats["stop_reason"] = "page_cap"
+    stats["kept"] = len(out)
     return out
 
 
@@ -894,8 +953,9 @@ def _eightfold_get(host, method, params):
     raise EightfoldRefused(f"{host} kept asking to slow down (HTTP 429)")
 
 
-def fetch_eightfold(slug):
+def fetch_eightfold(slug, stats=None):
     """US postings from an Eightfold career site, such as Microsoft's."""
+    stats = _fetch_stats() if stats is None else stats
     parts = urlsplit(slug if "://" in slug else "https://" + slug)
     host = (parts.hostname or "").lower()
     if not _HOSTNAME.match(host):
@@ -911,16 +971,25 @@ def fetch_eightfold(slug):
                 rows = _eightfold_get(host, "search", {
                     "domain": domain, "start": page * EIGHTFOLD_PAGE, "query": query,
                     "location": "United States", "sort_by": "timestamp"}).get("positions") or []
+                stats["pages"] += 1
+                stats["raw"] += len(rows)
                 for p in rows:
                     if p.get("id") not in seen:
                         seen.add(p.get("id"))
                         positions.append(p)
                 if len(rows) < EIGHTFOLD_PAGE:
+                    stats["stop_reason"] = "empty_page" if not rows else "last_page"
                     break
                 time.sleep(EIGHTFOLD_DELAY)
+            else:
+                stats["stop_reason"] = "page_cap"
     except EightfoldRefused:
+        stats["stop_reason"] = "rate_limited"
         if not positions:
             raise
+        # Keep what was read; the next fetch picks up the rest.
+        stats["partial"] = True
+    stats["kept"] = len(positions)
     out = []
     for p in positions:
         title = p.get("name") or ""
@@ -932,6 +1001,8 @@ def fetch_eightfold(slug):
                 "position_id": p["id"], "domain": domain, "hl": "en"})
         except EightfoldRefused:
             if out:
+                stats["stop_reason"] = "rate_limited"
+                stats["partial"] = True
                 break  # keep what was read; the next fetch picks up the rest
             raise
         public = str(details.get("publicUrl") or "")
@@ -977,13 +1048,14 @@ def workday_age_days(posted_on):
     return int(m.group(2))
 
 
-def fetch_workday(slug, max_age_days=WORKDAY_MAX_AGE_DAYS):
+def fetch_workday(slug, max_age_days=WORKDAY_MAX_AGE_DAYS, stats=None):
     """slug is 'tenant/wdN/site', e.g. 'adobe/wd5/external_experienced'.
 
     A big board can be narrowed to the board's own categories by adding them
     as a query: 'walmart/wd504/WalmartExternal?jobFamilyGroup=<id>', with the
     ids the board's filters use. Repeat a name for several values.
     """
+    stats = _fetch_stats() if stats is None else stats
     base, _, query = slug.partition("?")
     parts = base.split("/")
     if len(parts) != 3:
@@ -1013,9 +1085,14 @@ def fetch_workday(slug, max_age_days=WORKDAY_MAX_AGE_DAYS):
     # gives the total; the rest go through a small pool, since a big employer
     # lists thousands of jobs at 20 a page.
     first = list_page(0)
+    stats["pages"] += 1
+    stats["raw"] += len(first.get("jobPostings") or [])
     total = first.get("total") or 0
     with ThreadPoolExecutor(WORKDAY_WORKERS) as pool:
-        pages = [first] + list(pool.map(list_page, range(WORKDAY_PAGE, total, WORKDAY_PAGE)))
+        rest = list(pool.map(list_page, range(WORKDAY_PAGE, total, WORKDAY_PAGE)))
+        stats["pages"] += len(rest)
+        stats["raw"] += sum(len(p.get("jobPostings") or []) for p in rest)
+        pages = [first] + rest
 
         # Ordering is unstable between requests, so a job can appear twice.
         recent = {}
@@ -1023,14 +1100,18 @@ def fetch_workday(slug, max_age_days=WORKDAY_MAX_AGE_DAYS):
             for j in page.get("jobPostings") or []:
                 age = workday_age_days(j.get("postedOn"))
                 if age is not None and age > max_age_days:
+                    stats["skipped_old"] += 1
                     continue
                 recent.setdefault(j.get("externalPath", ""), j)
         details = list(pool.map(detail, recent))
 
+    stats["kept"] = len(recent)
+    stats["stop_reason"] = "last_page"  # every page the total called for was read
     out, last_error = [], None
     for (path, j), info in zip(recent.items(), details):
         if isinstance(info, Exception):
             last_error = info
+            stats["detail_failed"] += 1
             continue
         places = [info.get("location") or ""] + list(info.get("additionalLocations") or [])
         location = "; ".join(p for p in places if p)
@@ -1048,13 +1129,42 @@ def fetch_workday(slug, max_age_days=WORKDAY_MAX_AGE_DAYS):
     # One bad detail is skipped; all of them failing means the board is down,
     # and fetch-jobs must record that rather than an empty board.
     if recent and not out:
+        stats["stop_reason"] = "error"
         raise last_error
+    if stats["detail_failed"]:
+        stats["partial"] = True
     return out
 
 
 FETCHERS = {"greenhouse": fetch_greenhouse, "lever": fetch_lever, "ashby": fetch_ashby,
             "amazon": fetch_amazon, "eightfold": fetch_eightfold,
             "workday": fetch_workday}
+
+
+def _record_outcome(con, provider, slug, status, stats, error=""):
+    """Write the board's fetch outcome, replacing the previous run's row."""
+    con.execute(
+        "INSERT OR REPLACE INTO fetch_outcomes (board, source, slug, status, pages, "
+        "raw_count, kept_count, skipped_old, detail_failed, stop_reason, error, "
+        "fetched_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (f"{provider}/{slug}", provider, str(slug), status,
+         stats["pages"], stats["raw"], stats["kept"], stats["skipped_old"],
+         stats["detail_failed"],
+         stats["stop_reason"] or ("error" if status == "failed" else ""),
+         str(error)[:200], time.strftime("%Y-%m-%d %H:%M")))
+
+
+def _outcome_summary(stats):
+    """The outcome as one line for the fetch-jobs output."""
+    parts = [f"{stats['pages']} page(s)", f"{stats['raw']} raw",
+             f"{stats['kept']} kept"]
+    if stats["skipped_old"]:
+        parts.append(f"{stats['skipped_old']} skipped (age window)")
+    if stats["detail_failed"]:
+        parts.append(f"{stats['detail_failed']} detail(s) failed")
+    if stats["stop_reason"]:
+        parts.append(f"stop: {stats['stop_reason']}")
+    return ", ".join(parts)
 
 
 def cmd_fetch_jobs(args):
@@ -1066,6 +1176,7 @@ def cmd_fetch_jobs(args):
         con.execute("DELETE FROM jobs")
         con.execute("DELETE FROM fetched_companies")
         con.execute("DELETE FROM fetch_failures")
+        con.execute("DELETE FROM fetch_outcomes")
     # SpeedyApply feeds were removed: their rows had no posting text, so the
     # citizenship, clearance, degree and experience checks could not run on
     # them. Rows a feed stored before go now, even without --replace.
@@ -1090,17 +1201,19 @@ def cmd_fetch_jobs(args):
                 lca_name = entry.get("lca_name")
             else:
                 slug, display = entry, entry
+            stats = _fetch_stats()
             try:
                 if provider == "workday":
-                    jobs = fetcher(slug, max_age_days=args.workday_days)
+                    jobs = fetcher(slug, max_age_days=args.workday_days, stats=stats)
                 else:
-                    jobs = fetcher(slug)
+                    jobs = fetcher(slug, stats=stats)
             except Exception as exc:
                 failed.append(f"{provider}/{slug}: {exc}")
                 # Read by the notification email, so a dead board is noticed.
                 con.execute("INSERT OR REPLACE INTO fetch_failures VALUES (?, ?, ?)",
                             (f"{provider}/{slug}", str(exc)[:200],
                              time.strftime("%Y-%m-%d %H:%M")))
+                _record_outcome(con, provider, slug, "failed", stats, error=exc)
                 con.commit()
                 continue
             rows = [(
@@ -1120,9 +1233,14 @@ def cmd_fetch_jobs(args):
             con.execute(
                 "INSERT OR REPLACE INTO fetched_companies VALUES (?, ?)",
                 (norm_employer(display), time.strftime("%Y-%m-%d %H:%M")))
+            # A board that answered with no postings is a success with zero
+            # kept; its outcome is recorded either way.
+            status = "partial" if stats["partial"] else "success"
+            _record_outcome(con, provider, slug, status, stats)
             con.commit()
             total += len(rows)
-            print(f"  {display:<28} {provider:<11} {len(rows):>4} postings")
+            print(f"  {display:<28} {provider:<11} {len(rows):>4} postings  "
+                  f"[{status}: {_outcome_summary(stats)}]")
             time.sleep(args.delay)
 
     con.close()
