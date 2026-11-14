@@ -9,11 +9,27 @@ _node_outputs: dict[str, object] = {}
 _node_logs: dict[str, list] = {}
 _sse_queues: list[asyncio.Queue] = []
 
+# Optional listener notified when the generated workflow reports a terminal
+# status on the synthetic "__workflow__" node. The backend uses it to tell a
+# logically-finished run (which then holds the browser session open) apart from
+# one that is still executing, so queued triggers can start right away.
+_workflow_listener = None
+
+
+def set_workflow_listener(fn) -> None:
+    global _workflow_listener
+    _workflow_listener = fn
+
 
 def report_node(node_id: str, status: str) -> None:
     _node_statuses[node_id] = status
     for q in _sse_queues:
         q.put_nowait({"node_id": node_id, "status": status})
+    if node_id == "__workflow__" and _workflow_listener is not None:
+        try:
+            _workflow_listener(status)
+        except Exception:
+            pass  # a listener hiccup must never break the workflow
 
 
 def report_node_output(node_id: str, output: object) -> None:

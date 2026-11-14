@@ -223,7 +223,14 @@ function fmtSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
-const STATUS_DOT = { success: '#22c55e', error: '#ef4444', stopped: '#f59e0b', running: '#3b82f6' };
+const STATUS_DOT = {
+  success: '#22c55e',
+  error: '#ef4444',
+  stopped: '#f59e0b',
+  running: '#3b82f6',
+  queued: '#a855f7',
+  cancelled: '#8b949e',
+};
 
 export default function WorkspacePanel({ onStart, onWorkflowEnd }) {
   const [graph, setGraph] = useState(DEFAULT_GRAPH);

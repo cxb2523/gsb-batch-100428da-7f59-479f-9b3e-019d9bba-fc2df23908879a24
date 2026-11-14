@@ -12,6 +12,7 @@ export default function App() {
   const [paused, setPaused] = useState(false); // true = user in control
   const [pausePending, setPausePending] = useState(false); // pause requested, waiting for step to finish
   const [stopping, setStopping] = useState(false); // stop requested, waiting for task to die
+  const [pendingCount, setPendingCount] = useState(0); // triggers waiting for the run slot
   const [rightWidth, setRightWidth] = useState(460);
   const isDragging = useRef(false);
   const startX = useRef(0);
@@ -81,6 +82,7 @@ export default function App() {
       try {
         const res = await fetch(`${API}/status`);
         const data = await res.json();
+        setPendingCount(data.pending || 0);
         if (data.state === 'running') {
           setTaskStatus('running');
           setPaused(false);
@@ -340,6 +342,7 @@ const handleWorkflowEnd = useCallback((status) => {
                   </div>
                   <span className="task-sublabel">
                     {stopping ? 'Waiting for current step to cancel' : pausePending ? 'Will pause after current step completes' : paused ? (taskStatus === 'finished' ? 'Workflow complete' : 'Agent paused') : taskStatus === 'pending' ? 'No workflow started' : 'Autonomous mode'}
+                    {pendingCount > 0 ? ` · ${pendingCount} queued` : ''}
                   </span>
                 </div>
               <div style={{ display: 'flex', gap: 6 }}>

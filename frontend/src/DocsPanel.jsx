@@ -452,7 +452,8 @@ X-Orbit-Secret: your_secret   # optional
 */30 * * * *    every 30 minutes
 0 0 * * *       daily at midnight
 * * * * *       every minute (testing)`}</pre>
-          <p style={s.p}>The backend scheduler checks every 60 seconds. If a workflow is already running when a trigger fires, that firing is skipped.</p>
+          <p style={s.p}>The backend scheduler checks every 60 seconds. If a workflow is already running when a trigger fires, the firing is <strong>queued</strong> instead of skipped — it starts automatically as soon as the current run finishes. Only one firing per workflow can be queued at a time: a newer firing supersedes the older one, which is recorded as <C>cancelled</C> in run history.</p>
+          <p style={s.p}>Triggers that arrive while execution is paused are also queued, and are released in order when you resume. The current queue length is shown by <C>GET /status</C> (the <C>pending</C> field) and in the status bar next to the pause control.</p>
 
           <div style={s.warn}>
             Cron triggers require <C>croniter</C> to be installed in the Docker container. Run <C>docker compose up --build</C> to pick up the dependency.
@@ -587,7 +588,7 @@ resp = httpx.get("https://api.example.com/data", headers={"Authorization": "Bear
           </p>
 
           <ul style={s.ul}>
-            <li style={s.li}>Each run shows its <strong>status</strong> (success / error / running), <strong>start time</strong>, and <strong>duration</strong></li>
+            <li style={s.li}>Each run shows its <strong>status</strong> (<C>success</C> / <C>error</C> / <C>stopped</C> / <C>running</C> / <C>queued</C> / <C>cancelled</C>), <strong>start time</strong>, and <strong>duration</strong></li>
             <li style={s.li}>Click a run to open the <strong>log viewer</strong> — streams the full output, auto-scrolling to the bottom as new lines arrive</li>
             <li style={s.li}>Logs are persisted in <C>/workspace/logs/</C> and survive container restarts</li>
           </ul>
@@ -762,6 +763,7 @@ POST   /stop                       stop running workflow
 POST   /interrupt                  pause
 POST   /resume                     resume after pause
 GET    /events                     SSE stream — live node statuses
+GET    /status                     run state + queued trigger count
 GET    /runs?workflow_id={id}      run history
 GET    /runs/{run_id}/log          stream log file
 POST   /webhook/{workflow_id}      external trigger with inputs
