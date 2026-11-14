@@ -1,0 +1,1006 @@
+import pdfplumber
+import re
+import logging
+import os
+import pandas as pd
+import fitz  # pymupdf，图片型PDF的备用提取方案
+
+logger = logging.getLogger(__name__)
+
+
+class PDFParser:
+    """年报PDF财务报表解析器"""
+
+    # 单张报表最多扫这么多页，避免现金流量表一直吃到「财务报表附注」
+    MAX_STATEMENT_PAGES = {
+        'balance_sheet': 8,
+        'income_statement': 6,
+        'cash_flow': 8,
+    }
+
+    # 附注编号：注释31 / 五、32 / 附注 6
+    _NOTE_VALUE_RE = re.compile(
+        r'^(注释|附注|注)\s*\d+$'
+        r'|^[一二三四五六七八九十]+[、.．]\s*\d+$'
+    )
+
+    _TABLE_KEYWORDS = {
+        'balance_sheet': {
+            'positive': [
+                '货币资金', '流动资产', '资产总计', '流动负债', '合同负债',
+                '所有者权益', '应付账款', '应收账款', '固定资产', '负债合计',
+            ],
+            'negative': [
+                '营业收入', '营业总收入', '经营活动产生的现金流量',
+                '折旧方法', '使用年限', '残值率',
+            ],
+        },
+        'income_statement': {
+            'positive': [
+                '营业收入', '营业总收入', '营业成本', '营业总成本',
+                '营业利润', '利润总额', '净利润',
+            ],
+            'negative': [
+                '合同负债', '持有待售负债', '货币资金', '资产总计',
+                '经营活动产生的现金流量', '折旧方法',
+            ],
+        },
+        'cash_flow': {
+            'positive': [
+                '经营活动', '投资活动', '筹资活动', '销售商品',
+                '购买商品', '现金及现金等价物',
+            ],
+            'negative': [
+                '营业收入', '营业总收入', '资产总计', '合同负债',
+                '折旧方法',
+            ],
+        },
+    }
+    
+    # 三大报表的识别特征
+    STATEMENT_MARKERS = {
+        'balance_sheet': {
+            'title': ['合并资产负债表', '资产负债表'],
+            'headers': [
+                '期末余额', '期初余额', '期末数', '期初数',
+                '年12月31日', '年末余额', '年初余额',
+            ],
+        },
+        'income_statement': {
+            'title': ['合并利润表', '利润表'],
+            'headers': ['本期金额', '上期金额', '营业收入', '营业总收入', '营业成本', '净利润'],
+        },
+        'cash_flow': {
+            'title': ['合并现金流量表', '现金流量表'],
+            'headers': ['本期金额', '上期金额', '经营活动', '投资活动', '筹资活动'],
+        },
+    }
+    
+    def parse_pdf(self, pdf_path):
+        """
+        解析PDF，提取三大报表
+        先用 pdfplumber (lines策略)，数据不足时回退到 pymupdf 文本解析
+        :param pdf_path: PDF文件路径
+        :return: 字典，包含三大报表的pandas DataFrame
+        """
+        result = {
+            'balance_sheet': None,
+            'income_statement': None,
+            'cash_flow': None
+        }
+        
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                total_pages = len(pdf.pages)
+                
+                statement_ranges = self._find_statement_pages(pdf, total_pages)
+                
+                # 如果 pdfplumber 找不到报表范围，用 pymupdf 找
+                if len(statement_ranges) < 2:
+                    logger.info(f'pdfplumber只找到{len(statement_ranges)}张报表，尝试pymupdf定位')
+                    pymupdf_ranges = self._find_statement_pages_pymupdf(pdf_path, total_pages)
+                    if len(pymupdf_ranges) > len(statement_ranges):
+                        statement_ranges = pymupdf_ranges
+                
+                logger.info(f'报表页码范围: {statement_ranges}')
+                
+                for stmt_type, (start_page, end_page) in statement_ranges.items():
+                    all_rows = []
+                    columns = None
+                    
+                    for pn in range(start_page, end_page + 1):
+                        if pn > total_pages:
+                            break
+                        
+                        tables = self._extract_tables_from_page(pdf.pages[pn - 1])
+                        
+                        for table in tables:
+                            if self._is_main_financial_table(table, stmt_type):
+                                rows = self._clean_table_rows(table, stmt_type, columns is None)
+                                rows = self._normalize_table_shape(rows)
+                                
+                                if not rows:
+                                    continue
+                                
+                                if columns is None:
+                                    if self._is_valid_header(rows[0]):
+                                        columns = self._normalize_columns(rows[0], stmt_type)
+                                        rows = rows[1:]
+                                    else:
+                                        columns = self._generate_default_columns(stmt_type, 3)
+                                
+                                filtered_rows = []
+                                for row in rows:
+                                    if not self._is_header_row(row, columns):
+                                        filtered_rows.append(row)
+                                
+                                all_rows.extend(filtered_rows)
+                    
+                    if columns:
+                        df = self._rows_to_dataframe(all_rows, columns)
+                        df = self._clean_dataframe(df)
+                    else:
+                        df = None
+                    
+                    # pymupdf 回退：如果 pdfplumber 提取不到足够数据，用 pymupdf
+                    if df is None or len(df) < 5 or not self._is_quality_data(df, stmt_type):
+                        logger.info(f'{stmt_type} pdfplumber数据质量不足，尝试pymupdf回退')
+                        pymupdf_end = min(start_page + 12, end_page)
+                        df_pymupdf = self._parse_with_pymupdf(pdf_path, stmt_type, start_page, pymupdf_end)
+                        if df_pymupdf is not None and len(df_pymupdf) >= 5 and self._is_quality_data(df_pymupdf, stmt_type):
+                            df = df_pymupdf
+                            logger.info(f'{stmt_type} pymupdf回退成功: {len(df)}行数据')
+                        else:
+                            logger.info(f'{stmt_type} pymupdf也无法提取有效数据，尝试OCR回退 / OCR fallback')
+                            ocr_end = min(start_page + 12, end_page)
+                            df_ocr = self._parse_with_ocr(pdf_path, stmt_type, start_page, ocr_end)
+                            if df_ocr is not None and len(df_ocr) >= 5 and self._is_quality_data(df_ocr, stmt_type):
+                                df = df_ocr
+                                logger.info(f'{stmt_type} OCR回退成功: {len(df)}行数据 / OCR fallback success')
+                            else:
+                                # 三级解析全部失败：必须显式置空，否则低质量数据会被当作
+                                # 有效结果导出，污染下游分析（宁可缺数据，不可存假数据）
+                                logger.warning(f'{stmt_type} OCR也无法提取有效数据，舍弃该表 / All methods failed')
+                                df = None
+                    
+                    result[stmt_type] = df
+                    if df is not None:
+                        logger.info(f'{stmt_type} 解析成功: {len(df)}行数据')
+                    else:
+                        logger.warning(f'{stmt_type} 未找到有效数据')
+                            
+        except Exception as e:
+            logger.error(f'PDF解析失败: {pdf_path}, 错误: {e}', exc_info=True)
+        
+        return result
+
+    def _extract_tables_from_page(self, page):
+        """
+        使用 lines 策略从单页提取所有表格
+        """
+        try:
+            tables = page.extract_tables({
+                'vertical_strategy': 'lines',
+                'horizontal_strategy': 'lines',
+            })
+            return tables or []
+        except Exception:
+            return []
+
+    def _find_statement_pages(self, pdf, total_pages):
+        """
+        扫描全部页面，定位每张报表的起始页。
+        按报表类型记页码（同一页可同时是资产负债表尾 + 利润表头）。
+        """
+        starts = {}  # {报表类型: 起始页}
+
+        for pn in range(1, total_pages + 1):
+            text = pdf.pages[pn - 1].extract_text() or ''
+            if self._is_notes_heading_page(text):
+                if starts:
+                    break
+                continue
+
+            for stmt_type in self.STATEMENT_MARKERS:
+                if stmt_type in starts:
+                    continue
+                if self._page_starts_statement(text, stmt_type):
+                    starts[stmt_type] = pn
+                    logger.info(f'找到{stmt_type}起始页: 第{pn}页')
+
+            if len(starts) == 3:
+                break
+
+        # 利润表备用：标题在资产负债表最后一页、营业收入在下一页时
+        if 'income_statement' not in starts and starts:
+            ordered = sorted(starts.values())
+            search_start = ordered[0]
+            search_end = min((ordered[-1] + 8), total_pages)
+            for pn in range(search_start, search_end + 1):
+                text = pdf.pages[pn - 1].extract_text() or ''
+                if self._page_starts_statement(text, 'income_statement'):
+                    starts['income_statement'] = pn
+                    logger.info(f'找到income_statement起始页: 第{pn}页 (备用)')
+                    break
+
+        # 资产负债表备用：无「合并」字样、但紧挨利润表之前出现货币资金
+        if 'balance_sheet' not in starts and 'income_statement' in starts:
+            is_start = starts['income_statement']
+            for pn in range(max(1, is_start - 8), is_start):
+                text = pdf.pages[pn - 1].extract_text() or ''
+                if (
+                    '货币资金' in text
+                    and '流动资产' in text
+                    and '资产负债表' in text
+                    and not self._is_audit_or_toc_page(text)
+                ):
+                    starts['balance_sheet'] = pn
+                    logger.info(f'找到balance_sheet起始页: 第{pn}页 (备用)')
+                    break
+
+        return self._ranges_from_starts(starts, total_pages)
+
+    def _find_statement_pages_pymupdf(self, pdf_path, total_pages):
+        """
+        使用 pymupdf 定位报表起始页（图片型PDF回退方案）
+        """
+        ranges = {}
+        try:
+            doc = fitz.open(pdf_path)
+            total = min(total_pages, doc.page_count)
+            
+            found = {'balance_sheet': None, 'income_statement': None, 'cash_flow': None}
+
+            for pn in range(total):
+                text = doc[pn].get_text()
+                if self._is_notes_heading_page(text):
+                    if any(v is not None for v in found.values()):
+                        break
+                    continue
+
+                for stmt_type in ('balance_sheet', 'income_statement', 'cash_flow'):
+                    if found[stmt_type] is not None:
+                        continue
+                    if self._page_starts_statement(text, stmt_type):
+                        found[stmt_type] = pn + 1
+                        logger.info(f'[pymupdf] 找到{stmt_type}起始页: 第{pn+1}页')
+            
+            doc.close()
+            
+            starts = {k: v for k, v in found.items() if v is not None}
+            ranges = self._ranges_from_starts(starts, total)
+                
+        except Exception as e:
+            logger.warning(f'pymupdf locate pages failed: {e}')
+        
+        return ranges
+
+    def _is_quality_data(self, df, stmt_type):
+        """
+        检查提取的数据是否像是真正的财务报表（而非附注杂表）
+        """
+        if df is None or len(df) < 3:
+            return False
+        
+        # 取"项目"列的前20个值
+        items = [str(v).strip() for v in df.iloc[:20, 0].tolist() if v and str(v).strip()]
+        
+        # 资产负债表特征项
+        bs_items = ['货币资金', '流动资产', '应收账款', '存货', '固定资产',
+                     '资产总计', '短期借款', '应付账款', '负债合计', '所有者权益']
+        # 利润表特征项
+        is_items = ['营业收入', '营业成本', '利润总额', '净利润', '营业利润', '营业总收入', '研发费用']
+        # 现金流量表特征项
+        cf_items = ['经营活动', '投资活动', '筹资活动', '销售商品', '现金及现金等价物']
+        
+        check_map = {
+            'balance_sheet': bs_items,
+            'income_statement': is_items,
+            'cash_flow': cf_items,
+        }
+        
+        check_items = check_map.get(stmt_type, [])
+        items_text = ' '.join(items)
+        match_count = sum(1 for item in check_items if item in items_text)
+        
+        if match_count < 2:
+            return False
+        
+        # 利润表额外校验：营业收入（或营业总收入）行必须带有效数值。
+        # 仅靠关键词计数会放过两类脏数据：
+        #   1. 数值与科目行错位（如金额被粘在"五、32"这类附注编号行上），营业收入行金额为空
+        #   2. 抽到的是附注明细表，却被归一化成利润表列名，产生"看起来有效"的假数据
+        if stmt_type == 'income_statement' and not self._has_valid_revenue(df):
+            logger.info('income_statement 营业收入行无有效数值，判定为低质量数据')
+            return False
+        
+        return True
+
+    def _has_valid_revenue(self, df):
+        """
+        检查利润表中"营业收入/营业总收入"行是否带有至少一个有效数值
+        :param df: 已清洗（金额列已解析为数字）的利润表DataFrame
+        :return: bool
+        """
+        revenue_keywords = ('营业总收入', '营业收入')
+        
+        for _, row in df.iterrows():
+            item = str(row.iloc[0]) if row.iloc[0] is not None else ''
+            if not any(k in item for k in revenue_keywords):
+                continue
+            for value in row.iloc[1:]:
+                if isinstance(value, (int, float)) and not pd.isna(value):
+                    return True
+        
+        return False
+
+    def _cap_statement_end(self, stmt_type, start_page, end_page):
+        """Limit how far a statement may run so notes are not ingested."""
+        span = self.MAX_STATEMENT_PAGES.get(stmt_type, 8)
+        return min(end_page, start_page + span - 1)
+
+    def _ranges_from_starts(self, starts, total_pages):
+        """Build inclusive page ranges. Same-page types each keep at least that page."""
+        ranges = {}
+        ordered = sorted(starts.items(), key=lambda item: (item[1], item[0]))
+        for i, (stmt_type, start_page) in enumerate(ordered):
+            if i + 1 < len(ordered):
+                next_start = ordered[i + 1][1]
+                end_page = next_start - 1 if next_start > start_page else start_page
+            else:
+                end_page = total_pages
+            ranges[stmt_type] = (
+                start_page,
+                self._cap_statement_end(stmt_type, start_page, end_page),
+            )
+        return ranges
+
+    _NOTES_COVER_RE = re.compile(r'(?:19|20)\d{2}\s*年度财务报表附注')
+
+    @classmethod
+    def _is_notes_heading_page(cls, text):
+        """True only on the accounting-policy cover, not MD&A or TOC."""
+        raw = text or ''
+        compact = re.sub(r'\s+', '', raw[:800])
+        if not re.search(r'(?:19|20)\d{2}年度财务报表附注', compact):
+            return False
+        head = raw[:900]
+        return (
+            '公司基本情况' in head
+            or '除特别说明外' in head
+            or '企业注册地' in head
+        )
+
+    @staticmethod
+    def _is_audit_or_toc_page(text):
+        """Audit opinion / section cover, not the statement itself."""
+        if '是否审计' in text and '无保留意见' in text and '货币资金' not in text:
+            return True
+        if '关键审计事项' in text and '单位：元' not in text:
+            return True
+        head = (text or '')[:120]
+        if '目 录' in head or head.strip().startswith('目录'):
+            return True
+        return False
+
+    def _page_starts_statement(self, text, stmt_type):
+        """
+        Text-layer start-page detector.
+
+        Rejects MD&A (期末余额较上年)、审计报告封面、目录。
+        利润表/现金流量表允许本页只有标题、数字在下一页。
+        """
+        if not text or self._is_audit_or_toc_page(text):
+            return False
+
+        if stmt_type == 'balance_sheet':
+            if '较上年期末' in text and '合并资产负债表' not in text:
+                return False
+            has_title = (
+                '合并资产负债表' in text
+                or ('(一)' in text and '资产负债表' in text)
+            )
+            has_body = '货币资金' in text and (
+                '流动资产' in text or '年12月31日' in text
+            )
+            return has_title and has_body
+
+        if stmt_type == 'income_statement':
+            if '合并利润表' in text:
+                if '关键审计事项' in text:
+                    return '一、营业总收入' in text or '一、营业收入' in text
+                return True
+            if '一、营业总收入' in text or '一、营业收入' in text:
+                return '合并现金流量表' not in text
+            return False
+
+        if stmt_type == 'cash_flow':
+            if '合并现金流量表' in text:
+                if '关键审计事项' in text:
+                    return '销售商品、提供劳务收到的现金' in text
+                return True
+            if (
+                '现金流量表' in text
+                and '销售商品、提供劳务收到的现金' in text
+                and '关键审计事项' not in text
+            ):
+                return True
+            return False
+
+        return False
+
+    def _is_main_financial_table(self, table, stmt_type):
+        """
+        判断是否为本报表的主表（排除上一张表的尾巴、附注小表）
+        """
+        # 利润表常在资产负债表同一页以 3～4 行表头表开头，过严会丢掉首页
+        if not table or len(table) < 3:
+            return False
+
+        keywords = self._TABLE_KEYWORDS.get(stmt_type)
+        if not keywords:
+            return False
+
+        sample = ' '.join(
+            ' '.join(self._clean_cell(c) for c in row)
+            for row in table[:15]
+        )
+        pos = sum(1 for kw in keywords['positive'] if kw in sample)
+        neg = sum(1 for kw in keywords['negative'] if kw in sample)
+        if pos < 1 or pos <= neg:
+            return False
+
+        has_numbers = False
+        for row in table[:10]:
+            for cell in row:
+                if cell and re.search(r'[\d,]+\.?\d*', str(cell)):
+                    has_numbers = True
+                    break
+            if has_numbers:
+                break
+        return has_numbers
+
+    def _compact_columns(self, rows):
+        """Drop columns that are empty in every row (pdfplumber line artifacts)."""
+        if not rows:
+            return rows
+        width = max(len(row) for row in rows)
+        padded = [row + [''] * (width - len(row)) for row in rows]
+        keep = [
+            i for i in range(width)
+            if any(row[i].strip() for row in padded)
+        ]
+        if not keep:
+            return []
+        return [[row[i] for i in keep] for row in padded]
+
+    def _column_kind(self, values):
+        """Classify a column as empty / note / amount / text."""
+        non_empty = [v.strip() for v in values if v and str(v).strip()]
+        if not non_empty:
+            return 'empty'
+
+        numeric = 0
+        notes = 0
+        for raw in non_empty:
+            compact = re.sub(r'\s+', '', raw)
+            if compact in ('附注', '注释', '注'):
+                notes += 1
+                continue
+            if self._NOTE_VALUE_RE.match(compact):
+                notes += 1
+                continue
+            parsed = self._parse_number(raw)
+            if isinstance(parsed, (int, float)):
+                numeric += 1
+
+        if notes and numeric == 0 and notes >= max(1, len(non_empty) * 0.4):
+            return 'note'
+        if numeric >= max(1, len(non_empty) * 0.25):
+            return 'amount'
+        return 'text'
+
+    def _normalize_table_shape(self, rows):
+        """
+        Collapse sparse pdfplumber columns, drop 附注, keep 项目 + two amounts.
+
+        Typical raw row: ['', '其中：营业成本', '', '五、32', '95,404,953.93', '132,273,384.81']
+        After this:      ['其中：营业成本', '95,404,953.93', '132,273,384.81']
+        """
+        rows = self._compact_columns(rows)
+        if not rows:
+            return []
+
+        width = len(rows[0])
+        kinds = [
+            self._column_kind([row[i] for row in rows])
+            for i in range(width)
+        ]
+        keep = [i for i, kind in enumerate(kinds) if kind != 'note']
+        if keep:
+            rows = [[row[i] for i in keep] for row in rows]
+            kinds = [kinds[i] for i in keep]
+
+        text_idxs = [i for i, kind in enumerate(kinds) if kind == 'text']
+        amount_idxs = [i for i, kind in enumerate(kinds) if kind == 'amount']
+        item_idx = text_idxs[0] if text_idxs else 0
+        leftover = [i for i in range(len(kinds)) if i != item_idx]
+        if len(amount_idxs) >= 2:
+            amt_idxs = amount_idxs[:2]
+        elif len(amount_idxs) == 1:
+            extra = [i for i in leftover if i not in amount_idxs]
+            amt_idxs = amount_idxs + extra[:1]
+        else:
+            amt_idxs = leftover[:2]
+        while len(amt_idxs) < 2:
+            amt_idxs.append(None)
+
+        shaped = []
+        for row in rows:
+            item = row[item_idx] if item_idx < len(row) else ''
+            amounts = [
+                row[i] if i is not None and i < len(row) else ''
+                for i in amt_idxs
+            ]
+            if not item and not any(amounts):
+                continue
+            shaped.append([item, amounts[0], amounts[1]])
+        return shaped
+
+    def _is_header_row(self, row, columns):
+        """
+        判断是否为重复的表头行（跨页表格常见）
+        """
+        if not columns:
+            return False
+        
+        # 如果行内容和columns高度相似，就是表头
+        row_clean = [self._clean_cell(c) for c in row]
+        cols_clean = [self._clean_cell(c) for c in columns]
+        
+        match_count = sum(1 for rc, cc in zip(row_clean, cols_clean) if rc and cc and rc[:6] == cc[:6])
+        return match_count >= min(2, len(columns))
+
+    def _is_valid_header(self, row):
+        """
+        判断一行是否为有效的表头（非数据行）
+        表头如：项目|期末余额|期初余额  或  项目|本期金额|上期金额
+        数据行如：货币资金|734587608.57|628833804.17
+        """
+        if not row:
+            return False
+        
+        cleaned = [self._clean_cell(c) for c in row]
+        first_cell = cleaned[0] if cleaned else ''
+        
+        # 第一列必须是"项目"或类似的表头标记
+        if first_cell not in ['项目', '项 目', '项目名称', '科目']:
+            return False
+        
+        # 其余列不能全是空
+        other_cells = [c for c in cleaned[1:] if c]
+        if not other_cells:
+            return False
+        
+        # 其余列应该包含中文（如"期末余额"、"本期金额"）
+        has_chinese = any(re.search(r'[\u4e00-\u9fff]', c) for c in other_cells)
+        return has_chinese
+
+    def _normalize_columns(self, row, stmt_type):
+        """
+        标准化列名：始终使用统一的标准列名，不受原始PDF表头影响
+        """
+        defaults = {
+            'balance_sheet': ['项目', '期末余额', '期初余额'],
+            'income_statement': ['项目', '本期金额', '上期金额'],
+            'cash_flow': ['项目', '本期金额', '上期金额'],
+        }
+        # 始终返回标准列名，避免数据值被误当列名
+        return defaults.get(stmt_type, ['项目', '列1', '列2'])
+
+    def _generate_default_columns(self, stmt_type, num_cols):
+        """
+        生成默认列名
+        """
+        defaults = {
+            'balance_sheet': ['项目', '期末余额', '期初余额'],
+            'income_statement': ['项目', '本期金额', '上期金额'],
+            'cash_flow': ['项目', '本期金额', '上期金额'],
+        }
+        cols = defaults.get(stmt_type, [f'列{i}' for i in range(num_cols)])
+        while len(cols) < num_cols:
+            cols.append(f'列{len(cols)}')
+        return cols[:num_cols]
+
+    def _clean_table_rows(self, table, stmt_type, is_first_table):
+        """
+        清理表格行数据
+        """
+        cleaned = []
+        for row in table:
+            # 跳过全空行
+            if not row or all(c is None or str(c).strip() == '' for c in row):
+                continue
+            
+            # 清理每个单元格
+            clean_row = [self._clean_cell(c) for c in row]
+            
+            # 跳过完全无意义的行
+            if all(c == '' for c in clean_row):
+                continue
+            
+            cleaned.append(clean_row)
+        
+        return cleaned
+
+    def _clean_cell(self, cell):
+        """
+        清理单个单元格内容
+        """
+        if cell is None:
+            return ''
+        
+        text = str(cell).strip()
+        # 合并换行符
+        text = text.replace('\n', '')
+        return text
+
+    def _rows_to_dataframe(self, rows, columns):
+        """
+        将行数据转为DataFrame，最多保留3列（项目+2个金额列）
+        """
+        # 对于财务报表，只需要3列：项目 + 2期金额
+        max_cols = len(columns)
+        padded_rows = []
+        for row in rows:
+            if len(row) < max_cols:
+                row = row + [''] * (max_cols - len(row))
+            elif len(row) > max_cols:
+                row = row[:max_cols]
+            # 截断到最多3列（财务报表标准格式）
+            if len(row) > 3:
+                row = row[:3]
+            padded_rows.append(row)
+        
+        # 确保columns也截断到3列
+        if len(columns) > 3:
+            columns = columns[:3]
+        
+        df = pd.DataFrame(padded_rows, columns=columns)
+        return df
+
+    def _clean_dataframe(self, df):
+        """
+        清理DataFrame数据：解析金额、删除空列空行
+        """
+        # 确保第一列命名为"项目"
+        if df.columns[0] != '项目':
+            df = df.rename(columns={df.columns[0]: '项目'})
+        
+        # 删除完全为空的列（phantom columns from PDF lines）
+        valid_cols = ['项目']
+        for col in df.columns[1:]:
+            non_empty = df[col].dropna()
+            non_empty = non_empty[non_empty != '']
+            if len(non_empty) > 0:
+                valid_cols.append(col)
+        df = df[valid_cols]
+        
+        # 处理金额列：去除逗号、空格、换行符
+        for col in df.columns[1:]:
+            df[col] = df[col].map(self._parse_number)
+        
+        # 删除全空行
+        df = df[df['项目'].str.strip() != '']
+        df = df.dropna(how='all')
+        df = df.reset_index(drop=True)
+        
+        return df
+
+    def _parse_number(self, value):
+        """
+        解析金额字符串为数字
+        """
+        if value is None or value == '':
+            return None
+        
+        text = str(value).strip()
+        # 处理括号负数：(123.45) -> -123.45
+        is_negative = False
+        if text.startswith('(') and text.endswith(')'):
+            text = text[1:-1].strip()
+            is_negative = True
+        # 去除逗号、空格
+        text = re.sub(r'[,，\s]', '', text)
+        
+        if not text:
+            return None
+        
+        try:
+            result = float(text)
+            return -result if is_negative else result
+        except ValueError:
+            return text
+
+    def _parse_with_pymupdf(self, pdf_path, stmt_type, start_page, end_page):
+        """
+        使用 pymupdf (MuPDF) 作为备用提取方案
+        适用于 pdfplumber 无法解析的图片型表格PDF
+        """
+        column_names = {
+            'balance_sheet': ['项目', '期末余额', '期初余额'],
+            'income_statement': ['项目', '本期金额', '上期金额'],
+            'cash_flow': ['项目', '本期金额', '上期金额'],
+        }
+        
+        try:
+            doc = fitz.open(pdf_path)
+            all_items = []
+            current_item = None  # (item_name, val1, val2)
+            found_header = False
+            collected_header = []
+            header_detected = False
+            
+            for pn in range(start_page, end_page + 1):
+                idx = pn - 1
+                if idx >= doc.page_count:
+                    break
+                
+                page = doc[idx]
+                text = page.get_text()
+                lines = [l.strip() for l in text.split('\n') if l.strip()]
+                
+                for line in lines:
+                    # 跳过页面头和页码
+                    if re.match(r'^[\d]+$', line):
+                        continue
+                    if re.match(r'^.+年年度报告全文$', line):
+                        continue
+                    
+                    # 检测是否进入报表正文（表头行）
+                    if not header_detected:
+                        if line in ['项目', '项 目']:
+                            collected_header = [line]
+                        elif collected_header and line in ['期末余额', '期初余额', '本期金额', '上期金额']:
+                            collected_header.append(line)
+                            if len(collected_header) >= 2:
+                                header_detected = True
+                        elif collected_header and re.match(r'^[\d]{4}\s*年度?$', line):
+                            collected_header.append(line)
+                            if len(collected_header) >= 2:
+                                header_detected = True
+                        # 无"项目"列的情况：直接碰到两个年度列
+                        elif re.match(r'^[\d]{4}\s*年度?$', line) and not collected_header:
+                            collected_header = [line]
+                        elif collected_header and re.match(r'^[\d]{4}\s*年度?$', line):
+                            collected_header.append(line)
+                            header_detected = True
+                        continue
+                    
+                    # 判断行类型：纯数字行（含负数、括号负数、千分位）
+                    is_pure_number = bool(re.match(r'^[(\d,\-.\s)]+$', line) and re.search(r'\d', line))
+                    
+                    if is_pure_number:
+                        if current_item is not None:
+                            num_val = self._parse_number(line)
+                            if current_item[1] is None:
+                                current_item = (current_item[0], num_val, None)
+                            elif current_item[2] is None:
+                                current_item = (current_item[0], current_item[1], num_val)
+                                # 两个值都收集完毕，保存
+                                all_items.append(current_item)
+                                current_item = None
+                    else:
+                        # 文本行 = 新项目
+                        # 先保存上一个未完成的项目
+                        if current_item is not None:
+                            all_items.append(current_item)
+                        
+                        # 跳过非数据行
+                        if len(line) > 3 and not re.search(r'[\u4e00-\u9fff]', line[:10]):
+                            continue
+                        
+                        # 检查是否为其他报表开始标记（不是本报表的结束标记）
+                        if any(kw in line for kw in ['法定代表人', '主管会计', '会计机构']):
+                            break
+                        # 遇到其他报表类型时退出
+                        if stmt_type == 'income_statement':
+                            if any(kw in line for kw in ['合并资产负债表', '合并现金流量表']):
+                                break
+                        elif stmt_type == 'cash_flow':
+                            if any(kw in line for kw in ['合并资产负债表', '合并利润表']):
+                                break
+                        elif stmt_type == 'balance_sheet':
+                            if any(kw in line for kw in ['合并利润表', '合并现金流量表']):
+                                break
+                        
+                        current_item = (line, None, None)
+                
+                # 跨页时保存最后一个未完成项目
+                if current_item is not None and stmt_type in ('balance_sheet', 'income_statement'):
+                    pass  # 保留到下页继续
+            
+            # 最后一页的残留项目
+            if current_item is not None:
+                all_items.append(current_item)
+            
+            doc.close()
+            
+            if len(all_items) < 3:
+                return None
+            
+            cols = column_names.get(stmt_type, ['项目', '列1', '列2'])
+            df = pd.DataFrame(all_items, columns=cols)
+            df = self._clean_dataframe(df)
+            
+            return df
+            
+        except Exception as e:
+            logger.warning(f'pymupdf解析失败: {e}')
+            return None
+
+    def _parse_with_ocr(self, pdf_path, stmt_type, start_page, end_page):
+        """
+        OCR 第三级回退方案 / OCR third-level fallback
+        适用于 pdfplumber 和 pymupdf 都无法提取的图片型/复杂排版PDF
+        Renders PDF pages to images, uses RapidOCR (ONNX-based PP-OCR) for text recognition.
+        """
+        os.environ.pop('HTTP_PROXY', None)
+        os.environ.pop('HTTPS_PROXY', None)
+
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+        except ImportError:
+            logger.warning('rapidocr_onnxruntime 未安装，跳过OCR回退 / RapidOCR not installed')
+            return None
+
+        if not hasattr(self, '_ocr_engine'):
+            logger.info('初始化RapidOCR引擎 / Initializing RapidOCR engine...')
+            self._ocr_engine = RapidOCR()
+
+        import tempfile
+
+        column_names = {
+            'balance_sheet': ['项目', '期末余额', '期初余额'],
+            'income_statement': ['项目', '本期金额', '上期金额'],
+            'cash_flow': ['项目', '本期金额', '上期金额'],
+        }
+
+        try:
+            doc = fitz.open(pdf_path)
+            all_items = []
+
+            for pn in range(start_page, end_page + 1):
+                idx = pn - 1
+                if idx >= doc.page_count:
+                    break
+
+                page = doc[idx]
+                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                temp_img = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+                temp_img.close()
+                pix.save(temp_img.name)
+
+                try:
+                    result, elapse = self._ocr_engine(temp_img.name)
+                finally:
+                    os.unlink(temp_img.name)
+
+                if not result:
+                    continue
+
+                items = self._parse_ocr_result(result, stmt_type)
+                for item_name, current_val, prior_val in items:
+                    if item_name:
+                        all_items.append((item_name, current_val, prior_val))
+
+            doc.close()
+
+            if len(all_items) < 3:
+                return None
+
+            cols = column_names.get(stmt_type, ['项目', '列1', '列2'])
+            df = pd.DataFrame(all_items, columns=cols)
+            df = self._clean_dataframe(df)
+            return df
+
+        except Exception as e:
+            logger.warning(f'OCR解析失败 / OCR parse failed: {e}')
+            return None
+
+    def _parse_ocr_result(self, ocr_result, stmt_type):
+        """
+        将RapidOCR结果解析为结构化行 / Parse RapidOCR results into structured rows
+        RapidOCR returns: [[box, text, score], ...]
+        Groups text boxes by y-coordinate (rows), then separates item names from numbers.
+        """
+        if not ocr_result:
+            return []
+
+        boxes = []
+        for item in ocr_result:
+            if not item or len(item) < 3:
+                continue
+            box_coords = item[0]
+            text = str(item[1])
+            conf = float(item[2])
+
+            if conf < 0.5:
+                continue
+
+            y_center = sum(p[1] for p in box_coords) / 4
+            x_center = sum(p[0] for p in box_coords) / 4
+
+            boxes.append({
+                'text': text.strip(),
+                'y_center': y_center,
+                'x_center': x_center,
+            })
+
+        if not boxes:
+            return []
+
+        boxes.sort(key=lambda b: b['y_center'])
+
+        ROW_THRESHOLD = 15
+        rows = []
+        current_row = [boxes[0]]
+
+        for i in range(1, len(boxes)):
+            if abs(boxes[i]['y_center'] - current_row[-1]['y_center']) < ROW_THRESHOLD:
+                current_row.append(boxes[i])
+            else:
+                rows.append(current_row)
+                current_row = [boxes[i]]
+        if current_row:
+            rows.append(current_row)
+
+        items = []
+        header_detected = False
+
+        for row in rows:
+            row.sort(key=lambda b: b['x_center'])
+
+            text_parts = []
+            number_parts = []
+            for box in row:
+                t = box['text'].replace(',', '').replace('，', '').strip()
+                try:
+                    cleaned = t.replace('(', '-').replace(')', '').replace(' ', '')
+                    float(cleaned)
+                    number_parts.append(box['text'].strip())
+                except ValueError:
+                    if t:
+                        text_parts.append(box['text'].strip())
+
+            if not text_parts and not number_parts:
+                continue
+
+            joined = ' '.join(text_parts)
+            if not header_detected:
+                if '项目' in joined or '本期金额' in joined or '期末余额' in joined:
+                    header_detected = True
+                    continue
+
+            if not header_detected:
+                continue
+
+            item_name = ''.join(text_parts) if text_parts else None
+            current_val = number_parts[0] if number_parts else None
+            prior_val = number_parts[1] if len(number_parts) > 1 else None
+
+            if item_name:
+                if any(kw in item_name for kw in ['法定代表人', '主管会计', '会计机构']):
+                    break
+                if stmt_type == 'income_statement':
+                    if any(kw in item_name for kw in ['合并资产负债表', '合并现金流量表']):
+                        break
+                elif stmt_type == 'cash_flow':
+                    if any(kw in item_name for kw in ['合并资产负债表', '合并利润表']):
+                        break
+                elif stmt_type == 'balance_sheet':
+                    if any(kw in item_name for kw in ['合并利润表', '合并现金流量表']):
+                        break
+                items.append((item_name, current_val, prior_val))
+
+        return items
