@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Comment collection failures are no longer swallowed: a post that declares comments but yields none after an expansion, container, navigation, or parsing error stays in the result with `comments_complete` set to false and is recorded in the new `diagnostics.comment_failures` count and `diagnostics.comment_failed_posts` list; verbose mode reports the failing stage and reason. A clean flow reading zero comments still marks `comments_complete` true, and `--skip-comments` retains its previous semantics without reporting failures.
+
 ## [2.3.0] - 2026-11-03
 
 ### Added

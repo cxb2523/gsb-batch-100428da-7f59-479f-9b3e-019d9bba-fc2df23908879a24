@@ -117,6 +117,25 @@ class ScrapeOptions:
 
 
 @dataclass
+class CommentFetchResult:
+    """Outcome of one comment-collection attempt.
+
+    ``error``/``error_stage`` are set when an expansion, container, navigation,
+    or parsing failure prevented reading comments. A flow that completed
+    normally but legitimately found no comments has an empty comment list and
+    no error, so callers can distinguish "no comments" from "could not read".
+    """
+
+    comments: list[Comment]
+    error: Optional[str] = None
+    error_stage: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+@dataclass
 class MarketplaceOptions:
     """Options for a Facebook Marketplace search."""
 
@@ -406,10 +425,16 @@ def scrape_post_comments(
     options: ScrapeOptions,
     *,
     post_id: str = "",
-) -> list[Comment]:
-    """Expand visible feed comments, then parse their article hierarchy."""
+) -> CommentFetchResult:
+    """Expand visible feed comments, then parse their article hierarchy.
+
+    Returns a :class:`CommentFetchResult` so a selector/page failure is never
+    confused with a post that genuinely has no comments.
+    """
     if options.skip_comments:
-        return []
+        return CommentFetchResult(comments=[])
+
+    expand_error: Optional[Exception] = None
 
     for selector in (
         'span:has-text("View more comments")',
@@ -422,7 +447,10 @@ def scrape_post_comments(
                 view_more.click(timeout=2000)
                 human_delay(page, options.delay, options.delay * 0.3)
                 break
-        except Exception:
+        except Exception as error:
+            # Keep trying the remaining selectors; remember the failure in case
+            # comment collection itself cannot recover.
+            expand_error = error
             continue
 
     try:
@@ -431,17 +459,26 @@ def scrape_post_comments(
             if re.fullmatch(
                 r"View (?:\d+|more) repl(?:y|ies)", control.inner_text().strip()
             ):
-                control.click(timeout=2000)
-                human_delay(page, options.delay, options.delay * 0.3)
-                container = _find_post_container(page, post_id) or container
+                try:
+                    control.click(timeout=2000)
+                    human_delay(page, options.delay, options.delay * 0.3)
+                    container = _find_post_container(page, post_id) or container
+                except Exception as error:
+                    expand_error = error
                 break
-        return _collect_comments(container, options, post_id)
+        comments = _collect_comments(container, options, post_id)
+        return CommentFetchResult(comments=comments)
     except Exception as error:
-        if options.verbose:
-            console.print(
-                f"[yellow]Warning: cannot read feed comments: {error}[/yellow]"
-            )
-        return []
+        stage = "comment-container"
+        if isinstance(expand_error, PlaywrightTimeoutError) or (
+            expand_error is not None and "timeout" in str(expand_error).lower()
+        ):
+            stage = "comment-expand"
+        return CommentFetchResult(
+            comments=[],
+            error=f"{type(error).__name__}: {error}",
+            error_stage=stage,
+        )
     finally:
         if page.query_selector('[role="dialog"]'):
             page.keyboard.press("Escape")
@@ -453,26 +490,35 @@ def scrape_comments_from_post_page(
     options: ScrapeOptions,
     *,
     post_id: str = "",
-) -> list[Comment]:
+) -> CommentFetchResult:
     """
     Navigate to a post's dedicated page and scrape all comments.
 
-    This is more reliable than scraping from the feed.
+    This is more reliable than scraping from the feed. Returns a
+    :class:`CommentFetchResult` so navigation/selector/parsing failures are
+    reported rather than silently producing an empty comment list.
     """
     if options.skip_comments:
-        return []
+        return CommentFetchResult(comments=[])
 
     comments: list[Comment] = []
     comment_page = page.context.new_page()
+    error_stage: Optional[str] = None
+    error_message: Optional[str] = None
 
     try:
         # Navigate to the post page with retry
-        navigate_with_retry(
-            comment_page,
-            post_url,
-            max_retries=2,
-            verbose=options.verbose,
-        )
+        try:
+            navigate_with_retry(
+                comment_page,
+                post_url,
+                max_retries=2,
+                verbose=options.verbose,
+            )
+        except Exception as error:
+            error_stage = "comment-page-navigation"
+            error_message = f"{type(error).__name__}: {error}"
+            raise
         human_delay(comment_page, options.delay, options.delay * 0.3)
 
         # Wait for comments to load
@@ -496,21 +542,39 @@ def scrape_comments_from_post_page(
                     )
                 else:
                     break
-            except Exception:
+            except Exception as error:
+                if error_stage is None:
+                    error_stage = "comment-expand"
+                    error_message = f"{type(error).__name__}: {error}"
                 break
 
         # A permalink may show a feed with unrelated posts beside the target.
         target_id = post_id or extract_post_id(post_url)
         if target_id:
-            container = _find_post_container(comment_page, target_id)
+            try:
+                container = _find_post_container(comment_page, target_id)
+            except Exception as error:
+                error_stage = "comment-container"
+                error_message = f"{type(error).__name__}: {error}"
+                container = None
             if container:
-                comments = _collect_comments(container, options, target_id)
+                try:
+                    comments = _collect_comments(container, options, target_id)
+                except Exception as error:
+                    error_stage = "comment-parse"
+                    error_message = f"{type(error).__name__}: {error}"
+                    comments = []
+            elif error_stage is None:
+                error_stage = "comment-container"
+                error_message = (
+                    "target post container not found on the post page; "
+                    "page layout or selectors may have changed"
+                )
 
-    except Exception as e:
-        if options.verbose:
-            console.print(
-                f"[yellow]Warning: Error scraping post comments: {e}[/yellow]"
-            )
+    except Exception as error:
+        if error_stage is None:
+            error_stage = "comment-page"
+            error_message = f"{type(error).__name__}: {error}"
 
     finally:
         try:
@@ -518,7 +582,13 @@ def scrape_comments_from_post_page(
         except Exception:
             pass
 
-    return comments
+    if error_stage is not None:
+        return CommentFetchResult(
+            comments=comments,
+            error=error_message or "unknown comment page error",
+            error_stage=error_stage,
+        )
+    return CommentFetchResult(comments=comments)
 
 
 def scrape_group(group: str, options: ScrapeOptions) -> ScrapeResult:
@@ -716,15 +786,54 @@ def scrape_group(group: str, options: ScrapeOptions) -> ScrapeResult:
                         )
 
                         # Try to scrape comments from the article element first
-                        post.comments = scrape_post_comments(
+                        feed_result = scrape_post_comments(
                             page, article, options, post_id=post.id
                         )
+                        post.comments = feed_result.comments
+                        post.comments_complete = feed_result.ok
 
-                        # If no comments found and we have a post URL, try navigating to it
+                        # If the feed attempt failed (or found nothing), try the
+                        # post's dedicated page before deciding coverage.
                         if not post.comments and post.url:
-                            post.comments = scrape_comments_from_post_page(
+                            page_result = scrape_comments_from_post_page(
                                 page, post.url, options, post_id=post.id
                             )
+                            if page_result.comments:
+                                post.comments = page_result.comments
+                                post.comments_complete = True
+                            elif page_result.ok:
+                                # Navigation/parsing completed cleanly; the post
+                                # simply has no readable comments right now.
+                                post.comments_complete = True
+                            else:
+                                # Both attempts failed to recover any comments.
+                                post.comments_complete = False
+                                failure = page_result
+                                if feed_result.error and not page_result.error:
+                                    failure = feed_result
+                                diagnostics.comment_failures += 1
+                                diagnostics.comment_failed_posts.append(post.id)
+                                if options.verbose:
+                                    console.print(
+                                        "[yellow]Warning: could not collect "
+                                        f"comments for post {post.id} "
+                                        f"(declared {post.comments_count}); "
+                                        f"stage={failure.error_stage} "
+                                        f"reason={failure.error}[/yellow]"
+                                    )
+                        elif feed_result.error and not post.comments:
+                            # No post URL to fall back to; the feed failure stands.
+                            post.comments_complete = False
+                            diagnostics.comment_failures += 1
+                            diagnostics.comment_failed_posts.append(post.id)
+                            if options.verbose:
+                                console.print(
+                                    "[yellow]Warning: could not collect "
+                                    f"comments for post {post.id} "
+                                    f"(declared {post.comments_count}); "
+                                    f"stage={feed_result.error_stage} "
+                                    f"reason={feed_result.error}[/yellow]"
+                                )
 
                         human_delay(page, options.delay * 0.5, options.delay * 0.2)
 

@@ -178,7 +178,7 @@ uv run playwright install chromium
 
 JSON and LLM JSON include collection diagnostics: stop reason, candidate count, rejected count, parse failures, and unknown timestamps.
 `partial: true` means the scraper cannot prove exhaustive coverage. A verified empty-page message produces `stop_reason: "empty"`.
-`content_truncated` identifies an unexpanded post. `comments_complete: false` means comment coverage is unverified.
+`content_truncated` identifies an unexpanded post. `comments_complete: false` means comment coverage is unverified; when a post declares comments but an expansion, container, navigation, or parsing error yields none, diagnostics count it in `comment_failures` and list its ID in `comment_failed_posts` (run with `-v` for the stage and reason). `--skip-comments` never reports a failure.
 Keep the original JSON if you need these diagnostics beside CSV or SQLite output.
 
 Dates use the local system and browser timezone. `--until` includes the entire selected day. Reversed dates fail before login.

@@ -17,9 +17,10 @@ Updated: 2026-11-03. This file describes observed application behavior, not exha
 
 `diagnostics.stop_reason` states why collection stops. Reasons include `limit`, `candidate_limit`, `date_boundary`, `no_new_posts`, `no_new_listings`, and `empty`.
 Candidate and rejection counts explain filters. Parse failures and unknown timestamps expose uncertain data.
+`comment_failures` and `comment_failed_posts` identify posts that declared comments (`comments_count > 0`) yet yielded none after an expansion, container, navigation, or parsing failure; verbose mode prints the failing stage and reason. A clean flow that reads zero comments is not a failure, and `--skip-comments` never increments these fields.
 `partial` remains true unless the page explicitly reports an empty result. This flag does not certify Facebook's search completeness.
 
-The parser marks visible unexpanded content with `content_truncated`. It leaves `comments_complete` false because current expansion cannot prove full coverage.
+The parser marks visible unexpanded content with `content_truncated`. It leaves `comments_complete` false because current expansion cannot prove full coverage; a comment read that completes without error sets it true, while an unrecovered comment failure keeps it false so missing comments are never presented as fact.
 The LLM pain score is a keyword heuristic. It does not measure customer demand.
 
 ## API scope and evidence

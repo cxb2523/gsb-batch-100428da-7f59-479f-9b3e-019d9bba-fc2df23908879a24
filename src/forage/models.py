@@ -61,6 +61,10 @@ class CollectionDiagnostics(BaseModel):
     rejected_count: int = 0
     parse_failures: int = 0
     unknown_timestamps: int = 0
+    # Posts whose declared comments could not be collected. Both fields are
+    # additive: older JSON without them still validates with the defaults.
+    comment_failures: int = 0
+    comment_failed_posts: list[str] = Field(default_factory=list)
     partial: bool = True
 
 
