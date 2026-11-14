@@ -6,7 +6,7 @@ import { mergeSamePoles } from "@/lib/kmb-pole"
 import { KMB_LIST_BUDGET_MS, withinBudget } from "@/lib/list-wait"
 import { kmbReachMetres, STOP_CAP } from "@/lib/kmb-reach"
 import { nextBus } from "@/lib/next-bus"
-import { readEtaJson } from "@/lib/eta-read"
+import { readEtaFeed, type PoleRead } from "@/lib/eta-read"
 import { loadPoleBoard } from "@/lib/pole-board"
 import type { KmbCall, KmbPlacesResponse, KmbResponse, KmbStopBoard } from "@/lib/types"
 
@@ -65,6 +65,8 @@ export async function loadKmbNear(lng: number, lat: number, now = Date.now(), zo
     observedAt: null,
     stops: places.stops.map((stop) => ({ ...stop, calls: [], clock: "waiting" as const })),
     cacheable: true,
+    source: "live" as const,
+    fetchedAt: null,
   }
 }
 
@@ -129,8 +131,12 @@ function text(value: unknown): string {
   return typeof value === "string" ? value.trim() : ""
 }
 
-async function fetchStop(stopId: string): Promise<EtaRow[] | null> {
-  const body = await readEtaJson<{ data?: EtaRow[] }>(`${ETA_ROOT}/${encodeURIComponent(stopId)}`)
-  if (!body) return null
-  return Array.isArray(body.data) ? body.data : []
+async function fetchStop(stopId: string): Promise<PoleRead<EtaRow>> {
+  const read = await readEtaFeed<{ data?: EtaRow[] }>(`${ETA_ROOT}/${encodeURIComponent(stopId)}`)
+  if (!read.data) return { rows: null, source: read.source, fetchedAt: read.fetchedAt }
+  return {
+    rows: Array.isArray(read.data.data) ? read.data.data : [],
+    source: read.source,
+    fetchedAt: read.fetchedAt,
+  }
 }

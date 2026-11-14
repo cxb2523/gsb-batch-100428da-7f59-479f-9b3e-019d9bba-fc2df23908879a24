@@ -600,6 +600,16 @@ html[data-locale="zh-CN"] .city-card {
   margin: 8px 0 0;
 }
 
+.city-card-source {
+  width: 0;
+  min-width: 100%;
+  margin: 6px 0 0;
+  color: #0b7a45;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+}
+
 .city-card-aside {
   margin: 8px 0 0;
   color: #526170;

@@ -2,7 +2,7 @@ import { gmbDestination } from "@/lib/gmb-destinations"
 import { mergeSamePoles } from "@/lib/kmb-pole"
 import { gmbPoleIds, gmbStop, gmbStopsSpread, gmbStopsWithin } from "@/lib/gmb-reach"
 import { kmbReachMetres } from "@/lib/kmb-reach"
-import { readEtaJson } from "@/lib/eta-read"
+import { readEtaFeed, type PoleRead } from "@/lib/eta-read"
 import { loadPoleBoard } from "@/lib/pole-board"
 import type { GmbCall, GmbPlacesResponse, GmbResponse, GmbStopBoard } from "@/lib/types"
 
@@ -52,6 +52,8 @@ export async function loadGmbNear(lng: number, lat: number, now = Date.now(), zo
     observedAt: null,
     stops: places.stops.map((stop) => ({ ...stop, calls: [], clock: "waiting" as const })),
     cacheable: true,
+    source: "live" as const,
+    fetchedAt: null,
   }
 }
 
@@ -106,8 +108,12 @@ function text(value: unknown): string {
   return typeof value === "string" ? value.trim() : ""
 }
 
-async function fetchStop(stopId: string): Promise<EtaRoute[] | null> {
-  const body = await readEtaJson<{ data?: EtaRoute[] }>(`${ETA_ROOT}/${encodeURIComponent(stopId)}`)
-  if (!body) return null
-  return Array.isArray(body.data) ? body.data : []
+async function fetchStop(stopId: string): Promise<PoleRead<EtaRoute>> {
+  const read = await readEtaFeed<{ data?: EtaRoute[] }>(`${ETA_ROOT}/${encodeURIComponent(stopId)}`)
+  if (!read.data) return { rows: null, source: read.source, fetchedAt: read.fetchedAt }
+  return {
+    rows: Array.isArray(read.data.data) ? read.data.data : [],
+    source: read.source,
+    fetchedAt: read.fetchedAt,
+  }
 }

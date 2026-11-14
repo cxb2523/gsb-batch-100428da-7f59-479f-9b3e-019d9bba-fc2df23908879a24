@@ -4,7 +4,7 @@ import type { CitybusResponse } from "@/lib/types"
 
 export const dynamic = "force-dynamic"
 
-const empty = (error: string): CitybusResponse => ({ ok: false, error, observedAt: null, stops: [] })
+const empty = (error: string): CitybusResponse => ({ ok: false, error, observedAt: null, stops: [], source: "missing", fetchedAt: null })
 
 export const GET = viewCachedGet({
   freshMs: 60_000,

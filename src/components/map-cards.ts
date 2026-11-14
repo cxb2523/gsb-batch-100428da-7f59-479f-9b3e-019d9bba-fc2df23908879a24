@@ -25,7 +25,7 @@ import type { StopOperator } from "@/lib/stop-board"
 import type { ParkingKind, ParkingSpace } from "@/lib/parking-parks"
 import { shownChargerFree } from "@/lib/charger-free"
 import { meterClock, type MeterKind, type MeterSpace } from "@/lib/meter-poles"
-import type { ApproachPoint, HarbourJourney, LrtResponse, MtrCalling, MtrResponse, SpeedBand } from "@/lib/types"
+import type { ApproachPoint, FeedSource, HarbourJourney, LrtResponse, MtrCalling, MtrResponse, SpeedBand } from "@/lib/types"
 
 const TUNNEL_TC: Record<string, string> = {
   "Western Harbour Crossing": "西區海底隧道",
@@ -228,7 +228,7 @@ export function lrtTrainPopup(properties: GeoJSON.GeoJsonProperties, snapshot: L
 }
 
 const BOARD_MS = 60_000
-const seenBoards = new Map<string, { at: number; calls: KmbBoardCall[]; routes: string[] }>()
+const seenBoards = new Map<string, { at: number; calls: KmbBoardCall[]; routes: string[]; source: FeedSource; fetchedAt: string | null }>()
 
 function busStopPopup(properties: GeoJSON.GeoJsonProperties, m: Messages, title: string, empty: string, operator: StopOperator): HTMLElement {
   const heading = readablePlace(displayText(m.locale, textProp(properties, "nameTc"), textProp(properties, "nameEn"))) || title
@@ -247,7 +247,7 @@ function mountStopBoard(body: HTMLElement, operator: StopOperator, id: string, n
   const key = `${operator}:${id}`
   const hit = seenBoards.get(key)
   if (hit && Date.now() - hit.at < BOARD_MS) {
-    paintBoard(body, hit.calls, hit.routes, m, empty)
+    paintBoard(body, hit.calls, hit.routes, m, empty, hit.source, hit.fetchedAt)
     return
   }
   body.replaceChildren(paragraph("city-card-copy", m.boardLoading))
@@ -258,23 +258,46 @@ function mountStopBoard(body: HTMLElement, operator: StopOperator, id: string, n
       const stop = readStopBoard(payload)
       if (!stop) {
         markBoardFault({ operator, id, name })
-        paintBoard(body, [], routes, m, boardFailedCopy(operator, m))
+        paintBoard(body, [], routes, m, boardFailedCopy(operator, m), "missing", null)
         return
       }
       clearBoardFault(operator, id)
       const nextRoutes = stop.routes.length > 0 ? stop.routes : routes
-      seenBoards.set(key, { at: Date.now(), calls: stop.calls, routes: nextRoutes })
-      paintBoard(body, stop.calls, nextRoutes, m, empty)
+      seenBoards.set(key, {
+        at: Date.now(),
+        calls: stop.calls,
+        routes: nextRoutes,
+        source: stop.source,
+        fetchedAt: stop.fetchedAt,
+      })
+      paintBoard(body, stop.calls, nextRoutes, m, empty, stop.source, stop.fetchedAt)
     })
     .catch(() => {
       if (!body.isConnected) return
       markBoardFault({ operator, id, name })
-      paintBoard(body, [], routes, m, boardFailedCopy(operator, m))
+      paintBoard(body, [], routes, m, boardFailedCopy(operator, m), "missing", null)
     })
 }
 
-function paintBoard(body: HTMLElement, calls: KmbBoardCall[], routes: string[], m: Messages, empty: string) {
+// Pure mapping from the API provenance fields to the visible badge text, so the three
+// states ("live" / "stale" / "missing") can be checked without a DOM or fetch.
+export function feedSourceCopy(source: FeedSource | undefined, fetchedAt: string | null, m: Messages): string {
+  if (source === "stale") return m.feedStale(fetchedAt ? clock(fetchedAt, m.locale) : "")
+  if (source === "missing") return m.feedMissing
+  return m.feedLive
+}
+
+function paintBoard(
+  body: HTMLElement,
+  calls: KmbBoardCall[],
+  routes: string[],
+  m: Messages,
+  empty: string,
+  source: FeedSource = "live",
+  fetchedAt: string | null = null,
+) {
   body.replaceChildren()
+  body.append(paragraph("city-card-source", feedSourceCopy(source, fetchedAt, m)))
   const quiet = routesWithoutArrival(routes, calls.map((call) => call.route))
   if (calls.length === 0 && quiet.length === 0) {
     body.append(paragraph("city-card-copy", empty))
@@ -288,9 +311,17 @@ function paintBoard(body: HTMLElement, calls: KmbBoardCall[], routes: string[], 
   if (calls.length === 0) body.append(paragraph("city-card-copy", empty))
 }
 
-function readStopBoard(payload: unknown): { calls: KmbBoardCall[]; routes: string[] } | null {
+function readStopBoard(payload: unknown): {
+  calls: KmbBoardCall[]
+  routes: string[]
+  source: FeedSource
+  fetchedAt: string | null
+} | null {
   if (typeof payload !== "object" || payload === null || !("ok" in payload) || payload.ok !== true) return null
   if (!("stop" in payload) || typeof payload.stop !== "object" || payload.stop === null) return null
+  const envelope = payload as { source?: unknown; fetchedAt?: unknown }
+  const source: FeedSource = envelope.source === "stale" ? "stale" : envelope.source === "missing" ? "missing" : "live"
+  const fetchedAt = typeof envelope.fetchedAt === "string" ? envelope.fetchedAt : null
   const stop = payload.stop as { routes?: unknown; calls?: unknown }
   const routes = Array.isArray(stop.routes) ? stop.routes.filter((item): item is string => typeof item === "string") : []
   const calls = Array.isArray(stop.calls) ? stop.calls.flatMap((item) => {
@@ -313,7 +344,7 @@ function readStopBoard(payload: unknown): { calls: KmbBoardCall[]; routes: strin
       company: row.company === "LWB" ? "LWB" as const : "KMB" as const,
     }]
   }) : []
-  return { calls, routes }
+  return { calls, routes, source, fetchedAt }
 }
 
 function routeOnly(route: string, m: Messages): HTMLElement {

@@ -1,6 +1,6 @@
 import { citybusPoleIds, citybusStop, citybusStopsSpread, citybusStopsWithin } from "@/lib/citybus-network"
 import { kmbReachMetres, STOP_CAP } from "@/lib/kmb-reach"
-import { readEtaJson } from "@/lib/eta-read"
+import { readEtaFeed, type PoleRead } from "@/lib/eta-read"
 import { nextBus } from "@/lib/next-bus"
 import { loadPoleBoard } from "@/lib/pole-board"
 import type { CitybusCall, CitybusPlacesResponse, CitybusResponse, CitybusStopBoard } from "@/lib/types"
@@ -44,6 +44,8 @@ export async function loadCitybusNear(lng: number, lat: number): Promise<Citybus
     observedAt: null,
     stops: places.stops.map((stop) => ({ ...stop, calls: [], clock: "waiting" as const })),
     cacheable: true,
+    source: "live" as const,
+    fetchedAt: null,
   }
 }
 
@@ -104,8 +106,14 @@ function text(value: unknown): string {
   return typeof value === "string" ? value.trim() : ""
 }
 
-async function fetchEta(stopId: string, route: string): Promise<EtaRow[] | null> {
-  const body = await readEtaJson<{ data?: EtaRow[] }>(`${ETA_ROOT}/${encodeURIComponent(stopId)}/${encodeURIComponent(route)}`)
-  if (!body) return null
-  return Array.isArray(body.data) ? body.data : []
+async function fetchEta(stopId: string, route: string): Promise<PoleRead<EtaRow>> {
+  const read = await readEtaFeed<{ data?: EtaRow[] }>(
+    `${ETA_ROOT}/${encodeURIComponent(stopId)}/${encodeURIComponent(route)}`,
+  )
+  if (!read.data) return { rows: null, source: read.source, fetchedAt: read.fetchedAt }
+  return {
+    rows: Array.isArray(read.data.data) ? read.data.data : [],
+    source: read.source,
+    fetchedAt: read.fetchedAt,
+  }
 }

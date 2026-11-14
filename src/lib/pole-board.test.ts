@@ -1,8 +1,13 @@
 import assert from "node:assert/strict"
-import { loadPoleBoard } from "./pole-board.ts"
+import type { PoleRead } from "./eta-read.ts"
+import { combineSources, loadPoleBoard } from "./pole-board.ts"
 
 const now = 1_700_000_000_000
 const here = { tc: "中港城", en: "City", lng: 114.168095, lat: 22.300341, routes: ["12", "HK1"] }
+
+function read<Row>(rows: Row[] | null, source: PoleRead<Row>["source"] = "live", fetchedAt: string | null = "2026-11-14T08:00:00.000Z"): PoleRead<Row> {
+  return { rows, source, fetchedAt }
+}
 
 let fetches = 0
 const first = await loadPoleBoard("pole:published", now, {
@@ -11,7 +16,7 @@ const first = await loadPoleBoard("pole:published", now, {
   jobs: (_id, pole) => pole.routes,
   rows: async (_id, route) => {
     fetches += 1
-    return [{ route, minutes: route === "HK1" ? 4 : 11 }]
+    return read([{ route, minutes: route === "HK1" ? 4 : 11 }])
   },
   calls: (_id, _route, rows) => rows.map((row) => ({
     route: row.route,
@@ -25,6 +30,8 @@ if (first.ok) {
   assert.equal(first.stop.id, "a")
   assert.deepEqual(first.stop.calls.map((call) => [call.route, call.minutes]), [["HK1", 4], ["12", 11]])
   assert.deepEqual(first.stop.routes, ["12", "HK1"])
+  assert.equal(first.stop.source, "live")
+  assert.equal(first.stop.fetchedAt, "2026-11-14T08:00:00.000Z")
 }
 const second = await loadPoleBoard("pole:published", now, {
   poleIds: () => ["a"],
@@ -32,7 +39,7 @@ const second = await loadPoleBoard("pole:published", now, {
   jobs: () => ["again"],
   rows: async () => {
     fetches += 1
-    return []
+    return read([])
   },
   calls: () => [],
 })
@@ -47,7 +54,7 @@ const missed = await loadPoleBoard("pole:miss", now, {
   jobs: () => ["12"],
   rows: async () => {
     tries += 1
-    return null
+    return read(null, "missing", null)
   },
   calls: () => [],
 })
@@ -57,7 +64,7 @@ const partial = await loadPoleBoard("pole:partial", now, {
   poleIds: () => ["near", "here"],
   pole: (id) => ({ ...here, routes: id === "here" ? ["12"] : ["99"] }),
   jobs: (_id, pole) => pole.routes,
-  rows: async (_id, route) => (route === "99" ? null : [{ route, minutes: 6 }]),
+  rows: async (_id, route) => (route === "99" ? read(null, "missing", null) : read([{ route, minutes: 6 }])),
   calls: (_id, _route, rows) => rows.map((row) => ({
     route: row.route,
     destTc: "中環",
@@ -76,7 +83,7 @@ const recovered = await loadPoleBoard<{ route: string }, { route: string; minute
   jobs: () => ["12"],
   rows: async () => {
     tries += 1
-    return [{ route: "12", minutes: 3 }]
+    return read([{ route: "12", minutes: 3 }])
   },
   calls: (_id, _route, rows) => rows.map((row) => ({
     route: row.route,
@@ -93,7 +100,7 @@ const absent = await loadPoleBoard("pole:absent", now, {
   poleIds: () => [],
   pole: () => null,
   jobs: () => [],
-  rows: async () => [],
+  rows: async () => read([]),
   calls: () => [],
 })
 assert.equal(absent.ok, false)
@@ -102,7 +109,7 @@ const quiet = await loadPoleBoard("pole:quiet", now, {
   poleIds: () => ["003227"],
   pole: () => ({ tc: "新興花園", en: "Sun Hing", lng: 114.17256, lat: 22.4529, routes: ["307A"] }),
   jobs: (_id, pole) => pole.routes,
-  rows: async () => [],
+  rows: async () => read([]),
   calls: () => [],
 })
 assert.equal(quiet.ok, true)
@@ -110,5 +117,45 @@ if (quiet.ok) {
   assert.deepEqual(quiet.stop.calls, [])
   assert.deepEqual(quiet.stop.routes, ["307A"])
 }
+
+// A stale upstream fallback is surfaced on the board, even alongside a live reading.
+const stale = await loadPoleBoard("pole:stale", now, {
+  poleIds: () => ["a"],
+  pole: () => here,
+  jobs: () => ["12", "HK1"],
+  rows: async (_id, route) => read(
+    [{ route, minutes: 5 }],
+    route === "12" ? "stale" : "live",
+    "2026-11-14T07:55:00.000Z",
+  ),
+  calls: (_id, _route, rows) => rows.map((row) => ({
+    route: row.route,
+    destTc: "中環",
+    destEn: "Central",
+    minutes: row.minutes,
+  })),
+})
+assert.equal(stale.ok, true)
+if (stale.ok) {
+  assert.equal(stale.stop.source, "stale")
+  assert.equal(stale.stop.fetchedAt, "2026-11-14T07:55:00.000Z")
+}
+
+// Every failed reading with no success at all yields a "missing" board source.
+const allMissing = await loadPoleBoard("pole:all-missing", now, {
+  poleIds: () => ["a"],
+  pole: () => here,
+  jobs: () => ["12"],
+  rows: async () => read(null, "missing", null),
+  calls: () => [],
+})
+assert.equal(allMissing.ok, false)
+
+assert.equal(combineSources([]), "missing")
+assert.equal(combineSources(["live", "live"]), "live")
+assert.equal(combineSources(["live", "stale"]), "stale")
+assert.equal(combineSources(["missing", "live"]), "live")
+assert.equal(combineSources(["missing", "stale"]), "stale")
+assert.equal(combineSources(["missing", "missing"]), "missing")
 
 console.log("pole-board-ok")

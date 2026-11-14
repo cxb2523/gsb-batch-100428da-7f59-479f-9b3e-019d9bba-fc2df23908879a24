@@ -2,7 +2,7 @@ import { mergeSamePoles } from "@/lib/kmb-pole"
 import { nlbArrivalMs } from "@/lib/nlb-clock"
 import { nlbPoleIds, nlbStop, nlbStopsSpread, nlbStopsWithin } from "@/lib/nlb-network"
 import { kmbReachMetres, STOP_CAP } from "@/lib/kmb-reach"
-import { readEtaJson } from "@/lib/eta-read"
+import { readEtaFeed, type PoleRead } from "@/lib/eta-read"
 import { loadPoleBoard } from "@/lib/pole-board"
 import type { NlbCall, NlbPlacesResponse, NlbResponse, NlbStopBoard } from "@/lib/types"
 
@@ -72,9 +72,13 @@ function callAt(route: string, rows: Arrival[], now: number): NlbCall | null {
   return { route, destTc: "", destEn: "", eta: "", minutes: null, scheduled: false, remarkTc: "", remarkEn: "" }
 }
 
-async function fetchEta(routeId: string, stopId: string): Promise<Arrival[] | null> {
+async function fetchEta(routeId: string, stopId: string): Promise<PoleRead<Arrival>> {
   const url = `${ETA_ROOT}&routeId=${encodeURIComponent(routeId)}&stopId=${encodeURIComponent(stopId)}&lang=en`
-  const body = await readEtaJson<{ estimatedArrivals?: Arrival[] }>(url, {})
-  if (!body) return null
-  return Array.isArray(body.estimatedArrivals) ? body.estimatedArrivals : []
+  const read = await readEtaFeed<{ estimatedArrivals?: Arrival[] }>(url, {})
+  if (!read.data) return { rows: null, source: read.source, fetchedAt: read.fetchedAt }
+  return {
+    rows: Array.isArray(read.data.estimatedArrivals) ? read.data.estimatedArrivals : [],
+    source: read.source,
+    fetchedAt: read.fetchedAt,
+  }
 }

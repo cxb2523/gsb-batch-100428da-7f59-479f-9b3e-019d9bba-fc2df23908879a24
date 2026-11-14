@@ -210,6 +210,9 @@ export type Messages = {
   kmbScheduled: string
   kmbNone: string
   boardLoading: string
+  feedLive: string
+  feedStale: (when: string) => string
+  feedMissing: string
   lrt: string
   lrtFailed: string
   lrtNone: string
@@ -451,6 +454,9 @@ const en: Messages = {
   kmbScheduled: "Scheduled",
   kmbNone: "No arrival on the board",
   boardLoading: "Reading the published times.",
+  feedLive: "Live times",
+  feedStale: (when) => `Cached times from ${when}; the live feed is unavailable.`,
+  feedMissing: "No arrival data",
   lrt: "Light Rail",
   lrtFailed: "Light Rail arrivals did not load.",
   lrtNone: "No arrival on the board",
@@ -692,6 +698,9 @@ const zhHK: Messages = {
   kmbScheduled: "原定班次",
   kmbNone: "沒有到站時間",
   boardLoading: "正在讀取已公布的到站時間。",
+  feedLive: "實時到站時間",
+  feedStale: (when) => `快取到站時間（${when}），實時資料源暫時無法連接。`,
+  feedMissing: "暫無到站資料",
   lrt: "輕鐵",
   lrtFailed: "未能取得輕鐵到站時間。",
   lrtNone: "沒有到站時間",
@@ -921,6 +930,9 @@ const zhCN: Messages = {
   kmbScheduled: "原定班次",
   kmbNone: "没有到站时间",
   boardLoading: "正在读取已公布的到站时间。",
+  feedLive: "实时到站时间",
+  feedStale: (when) => `缓存到站时间（${when}），实时数据源暂时无法连接。`,
+  feedMissing: "暂无到站数据",
   kmbLwb: "九巴／龙运",
   lwb: "龙运",
   lrt: "轻铁",

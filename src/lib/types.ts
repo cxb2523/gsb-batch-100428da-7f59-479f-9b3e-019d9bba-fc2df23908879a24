@@ -1,3 +1,7 @@
+// Where an arrival reading came from. "live" is a fresh upstream response, "stale" is an
+// out-of-TTL but still-acceptable fallback, and "missing" means no usable reading exists.
+export type FeedSource = "live" | "stale" | "missing"
+
 export type SpeedBand = "free" | "slow" | "congested" | "unknown"
 
 export type Corridor = {
@@ -203,6 +207,13 @@ export type KmbCall = {
 
 export type ArrivalClock = "ready" | "waiting"
 
+// Provenance of the times shown on a stop board. fetchedAt is the original upstream
+// fetch time (ISO) and is only present for "live" and "stale" readings.
+export type ArrivalSource = {
+  source?: FeedSource
+  fetchedAt?: string | null
+}
+
 export type KmbStopBoard = {
   id: string
   nameTc: string
@@ -213,7 +224,7 @@ export type KmbStopBoard = {
   headings?: KmbHeading[]
   calls: KmbCall[]
   clock: ArrivalClock
-}
+} & ArrivalSource
 
 export type KmbPlacesResponse = {
   ok: boolean
@@ -229,7 +240,7 @@ export type KmbResponse = {
   observedAt: string | null
   stops: KmbStopBoard[]
   cacheable?: boolean
-}
+} & ArrivalSource
 
 export type LrtCalling = {
   route: string
@@ -274,7 +285,7 @@ export type CitybusStopBoard = {
   routes: string[]
   calls: CitybusCall[]
   clock: ArrivalClock
-}
+} & ArrivalSource
 
 export type CitybusPlacesResponse = {
   ok: boolean
@@ -290,7 +301,7 @@ export type CitybusResponse = {
   observedAt: string | null
   stops: CitybusStopBoard[]
   cacheable?: boolean
-}
+} & ArrivalSource
 
 export type GmbCall = CitybusCall
 export type GmbStopBoard = CitybusStopBoard
