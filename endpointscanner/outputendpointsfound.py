@@ -2,6 +2,7 @@
 Output all the sorted endpoints, or output the raw results into the terminal and into a text file (if applicable)
 '''
 from .filtersort import filter_endpoints
+from .scrapefiles import render_sitemap_summary_text
 def display_and_save_results(
     args, show_dead, target,
     results_200, results_services, results_ext, results_subd,
@@ -10,8 +11,11 @@ def display_and_save_results(
     assets_suffix, dead_suffix, invalidated_suffix,
     all_scanned_sources,
     unsorted_paths, invalidated_count,
-    invalidated_endpoints
+    invalidated_endpoints, sitemap_outcomes=None
 ):
+    if sitemap_outcomes is None:
+        sitemap_outcomes = []
+    sitemap_summary_text = render_sitemap_summary_text(sitemap_outcomes, pipeable=args.pipeable)
     what_to_output = filter_endpoints(
         args, target, results_ext, results_subd, results_200, results_services, 
         results_assets, results_frameworks, results_30x, results_protected, 
@@ -36,6 +40,8 @@ def display_and_save_results(
             print(f"Total {stuff_to_output}: {len(what_to_output)}")
         print()
         print("\n".join(f" {p}" for p in what_to_output))
+        if sitemap_summary_text:
+            print(sitemap_summary_text)
         if args.output_file:
             try:
                 with open(args.output_file, 'w', encoding='utf-8') as fi:
@@ -43,6 +49,8 @@ def display_and_save_results(
                         fi.write('----Raw Results----\n\n')
                     if what_to_output:
                         fi.write("\n".join(what_to_output) + "\n")
+                    if sitemap_summary_text:
+                        fi.write(sitemap_summary_text + "\n")
                     if args.still_show_invalid:
                         if not args.pipeable: fi.write('----Invalidated (-ssi passed)----\n\n')
                         fi.write("\n".join(f"  {p}" for p in invalidated_endpoints) + "\n")
@@ -150,10 +158,13 @@ def display_and_save_results(
                 f"Invalidated Endpoints: {invalidated_count}{invalidated_suffix}\n"
             )
             print(summary_report)
-            
+
             if unsorted:
-                print(f"Total Unsorted: {len(unsorted)}") 
-                
+                print(f"Total Unsorted: {len(unsorted)}")
+
+            if sitemap_summary_text:
+                print(sitemap_summary_text)
+
             if args.show_source:
                 print("\n----Files Scanned----")
                 if all_scanned_sources: print("\n".join(f" - {f}" for f in sorted(set(all_scanned_sources))))
@@ -235,7 +246,10 @@ def display_and_save_results(
                         f.write(summary_report)
                         if unsorted:
                             f.write(f"Total Unsorted: {len(unsorted)}")
-                            
+
+                        if sitemap_summary_text:
+                            f.write("\n" + sitemap_summary_text + "\n")
+
                         if args.show_source:
                             f.write(f"\n\n----Files Scanned----\n")
                             if all_scanned_sources: f.write("\n".join(f" - {f}" for f in sorted(set(all_scanned_sources))) + "\n")
@@ -254,7 +268,10 @@ def display_and_save_results(
             if args.still_show_invalid:
                 if not args.pipeable: print('----Invalidated (-ssi passed)----\n')
                 print("\n".join(f"  {p}" for p in invalidated_endpoints))
-                
+
+            if sitemap_summary_text:
+                print(sitemap_summary_text)
+
             if args.show_source:
                 print(f"\n\n----Files Scanned----")
                 if all_scanned_sources: print("\n".join(f" - {f}" for f in sorted(set(all_scanned_sources))))
@@ -269,6 +286,8 @@ def display_and_save_results(
                             fi.write('----Raw Results----\n\n')
                         if clean_found_paths:
                             fi.write("\n".join(clean_found_paths) + "\n")
+                        if sitemap_summary_text:
+                            fi.write(sitemap_summary_text + "\n")
                         if args.still_show_invalid:
                             if not args.pipeable: fi.write('----Invalidated (-ssi passed)----\n\n')
                             fi.write("\n".join(f"  {p}" for p in invalidated_endpoints) + "\n")

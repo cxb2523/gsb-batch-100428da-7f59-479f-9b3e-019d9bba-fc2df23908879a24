@@ -2,6 +2,10 @@
 where = ["."]
 include = ["endpointscanner*"]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
 [build-system]
 requires = ["setuptools"]
 build-backend = "setuptools.build_meta"

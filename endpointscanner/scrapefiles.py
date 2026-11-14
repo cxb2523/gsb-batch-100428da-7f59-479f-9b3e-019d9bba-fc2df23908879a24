@@ -9,6 +9,85 @@ from curl_cffi import requests
 from .miscfuncs import checktime
 from .identifyjs import identify_javascript_type, identify_javascript_type_two
 
+# possible outcomes for a sitemap subgraph processed by recursive_xml_crawler
+SITEMAP_PARSED_WITH_LINKS = "parsed_with_links"
+SITEMAP_PARSED_NO_LINKS = "parsed_no_links"
+SITEMAP_DECOMPRESSION_FAILED = "decompression_failed"
+SITEMAP_DEPTH_SKIPPED = "depth_skipped"
+SITEMAP_FETCH_FAILED = "fetch_failed"
+
+# stable ordering + human readable labels used when the scan summary is rendered
+SITEMAP_OUTCOME_ORDER = (
+    SITEMAP_PARSED_WITH_LINKS,
+    SITEMAP_PARSED_NO_LINKS,
+    SITEMAP_DECOMPRESSION_FAILED,
+    SITEMAP_DEPTH_SKIPPED,
+    SITEMAP_FETCH_FAILED,
+)
+SITEMAP_OUTCOME_LABELS = {
+    SITEMAP_PARSED_WITH_LINKS: "Parsed, links extracted",
+    SITEMAP_PARSED_NO_LINKS: "Parsed, no links found",
+    SITEMAP_DECOMPRESSION_FAILED: "Decompression failed (.gz/.zip corrupt or undecodable)",
+    SITEMAP_DEPTH_SKIPPED: "Not expanded (depth limit)",
+    SITEMAP_FETCH_FAILED: "Fetch failed (non-200 or request error)",
+}
+
+
+def record_sitemap_outcome(sitemap_outcomes, sitemap_file, outcome, depth=None, detail=""):
+    '''append a verifiable outcome for a single processed sitemap subgraph'''
+    sitemap_outcomes.append({
+        "file": sitemap_file,
+        "outcome": outcome,
+        "depth": depth,
+        "detail": detail or "",
+    })
+
+
+def build_sitemap_summary(sitemap_outcomes):
+    '''aggregate per-subgraph outcomes into counts keyed by outcome type'''
+    counts = {outcome: 0 for outcome in SITEMAP_OUTCOME_ORDER}
+    for entry in sitemap_outcomes:
+        outcome = entry.get("outcome")
+        if outcome in counts:
+            counts[outcome] += 1
+    counts["total"] = len(sitemap_outcomes)
+    return counts
+
+
+def render_sitemap_summary_text(sitemap_outcomes, pipeable=False):
+    '''
+    render the sitemap subgraph summary for terminal/file output.
+    pipeable mode emits machine-friendly '# sitemap:' lines so the summary
+    survives pipes instead of being mistaken for endpoint paths.
+    '''
+    if not sitemap_outcomes:
+        return ""
+
+    counts = build_sitemap_summary(sitemap_outcomes)
+    lines = []
+    if pipeable:
+        lines.append(f"# sitemap-subgraphs-processed: {counts['total']}")
+        for outcome in SITEMAP_OUTCOME_ORDER:
+            lines.append(f"# sitemap-{outcome}: {counts[outcome]}")
+        for entry in sitemap_outcomes:
+            detail = f" ({entry['detail']})" if entry.get("detail") else ""
+            depth = entry.get("depth")
+            depth_text = f" depth={depth}" if depth is not None else ""
+            lines.append(f"# sitemap-outcome: {entry['file']}{depth_text} -> {entry['outcome']}{detail}")
+    else:
+        lines.append("")
+        lines.append("---- SITEMAP SUBGRAPHS ----")
+        lines.append(f"Total subgraphs processed: {counts['total']}")
+        for outcome in SITEMAP_OUTCOME_ORDER:
+            lines.append(f"  {SITEMAP_OUTCOME_LABELS[outcome]}: {counts[outcome]}")
+        for entry in sitemap_outcomes:
+            detail = f" [{entry['detail']}]" if entry.get("detail") else ""
+            depth = entry.get("depth")
+            depth_text = f" (depth {depth})" if depth is not None else ""
+            lines.append(f"  - {entry['file']}{depth_text}: {SITEMAP_OUTCOME_LABELS.get(entry['outcome'], entry['outcome'])}{detail}")
+    return "\n".join(lines)
+
+
 def tag_soup_scrape(
     args, main_html, target, found_paths, scanned_html, 
     verified_esl_domains, verified_esl_scripts, unique_progress_paths, nd
@@ -424,8 +503,10 @@ def recursive_xml_crawler(
         target_netloc = urlparse(target if "://" in target else f"https://{target}").netloc.lower()
         target_apex = '.'.join(target_netloc.split('.')[-2:]) if len(target_netloc.split('.')) >= 2 else target_netloc
         SITEMAP_EXTENSIONS = ('.xml', '.txt', '.rss', '.atom', '.gz', '.zip')
-        
+
         allowed_xml_netlocs = {urlparse(d).netloc.lower() for d in verified_esl_domains if d}
+        # one verifiable outcome entry per processed sitemap subgraph
+        sitemap_outcomes = []
 
         for f in list(found_paths):
             if f.lower().endswith(SITEMAP_EXTENSIONS):
@@ -469,6 +550,11 @@ def recursive_xml_crawler(
             x_res = None
 
             if args.depth is not None and current_xml_depth > args.depth:
+                record_sitemap_outcome(
+                    sitemap_outcomes, xmlfile, SITEMAP_DEPTH_SKIPPED,
+                    depth=current_xml_depth,
+                    detail=f"depth limit {args.depth} reached"
+                )
                 xml_index += 1
                 continue
             
@@ -496,6 +582,8 @@ def recursive_xml_crawler(
                     all_sitemap_locs_recursive = []
                     smap_ct = x_res.headers.get('Content-Type', '').lower()
                     is_scraped_successfully = False
+                    decompression_failed = False
+                    decompression_detail = ""
                     
                     if xmlfile.lower().endswith('.txt'):
                         if 'html' not in smap_ct:
@@ -528,7 +616,7 @@ def recursive_xml_crawler(
                                         if archive_contents:
                                             with z_file.open(archive_contents[0]) as internal_file:
                                                 decompressed_text = internal_file.read().decode('utf-8', errors='ignore')
-                                                
+
                                 if decompressed_text:
                                     is_scraped_successfully = True
                                     if xmlfile.lower().endswith(('.txt.gz', '.txt.zip')):
@@ -540,9 +628,16 @@ def recursive_xml_crawler(
                                         raw_locs_recursive = re.findall(r'<loc>\s*([^<]+)\s*</loc>', decompressed_text, re.IGNORECASE | re.DOTALL)
                                         xhtml_locs_recursive = re.findall(r'<xhtml:link[^>]*href=["\']([^"\']+)["\']', decompressed_text, re.IGNORECASE)
                                         rss_links_recursive = re.findall(r'<link>\s*([^<]+)\s*</link>', decompressed_text, re.IGNORECASE)
-                                        all_sitemap_locs_recursive = raw_locs_recursive + xhtml_locs_recursive + rss_links_recursive                                   
-                            except Exception:
-                                pass
+                                        all_sitemap_locs_recursive = raw_locs_recursive + xhtml_locs_recursive + rss_links_recursive
+                                # decompressed_text == "" is NOT a decompression failure:
+                                # the archive was readable but held no content, so it is
+                                # recorded later as "parsed, no links" instead.
+                            except Exception as decomp_error:
+                                # corrupt .gz/.zip bytes or undecodable archive structure
+                                decompression_failed = True
+                                decompression_detail = f"{type(decomp_error).__name__}: {decomp_error}"
+                        else:
+                            decompression_detail = "parse-zip (-pz) disabled, archive not expanded"
                     else:
                         if "<loc" in x_res.text.lower() or "<link" in x_res.text.lower():
                             raw_locs_recursive = re.findall(r'<loc>\s*([^<]+)\s*</loc>', x_res.text, re.IGNORECASE | re.DOTALL)
@@ -586,12 +681,21 @@ def recursive_xml_crawler(
                                         xml_files.append(check_map_token)
                                         scanned_or_queued_xml.add(check_map_token)
                                         xml_depths[check_map_token] = current_xml_depth + 1
-                                        
+
                                         if args.show_prog and (not nd or check_map_token not in unique_progress_paths):
                                             print(f"New path/file: {clean_path}")
                                             if args.show_source:
                                                 print(f"  └─ Source File: {xmlfile}")
                                             unique_progress_paths.add(check_map_token)
+                                    else:
+                                        # the nested subgraph is never queued because the
+                                        # depth limit was reached; leave a verifiable ending
+                                        scanned_or_queued_xml.add(check_map_token)
+                                        record_sitemap_outcome(
+                                            sitemap_outcomes, check_map_token, SITEMAP_DEPTH_SKIPPED,
+                                            depth=current_xml_depth + 1,
+                                            detail=f"nested in {xmlfile}, depth limit {args.depth} reached"
+                                        )
                                 continue
 
                                 
@@ -603,14 +707,48 @@ def recursive_xml_crawler(
                                         print(f"  └─ Source File: {xmlfile}")
                                     unique_progress_paths.add(clean_path)
 
+                    # every fetched subgraph gets exactly one verifiable ending
+                    if decompression_failed:
+                        record_sitemap_outcome(
+                            sitemap_outcomes, xmlfile, SITEMAP_DECOMPRESSION_FAILED,
+                            depth=current_xml_depth, detail=decompression_detail
+                        )
+                    elif is_scraped_successfully and all_sitemap_locs_recursive:
+                        record_sitemap_outcome(
+                            sitemap_outcomes, xmlfile, SITEMAP_PARSED_WITH_LINKS,
+                            depth=current_xml_depth,
+                            detail=f"{len(all_sitemap_locs_recursive)} link(s) extracted"
+                        )
+                    else:
+                        no_link_detail = ""
+                        if xmlfile.lower().endswith(('.gz', '.zip')) and not args.parse_zip:
+                            no_link_detail = decompression_detail
+                        record_sitemap_outcome(
+                            sitemap_outcomes, xmlfile, SITEMAP_PARSED_NO_LINKS,
+                            depth=current_xml_depth, detail=no_link_detail
+                        )
+                else:
+                    record_sitemap_outcome(
+                        sitemap_outcomes, xmlfile, SITEMAP_FETCH_FAILED,
+                        depth=current_xml_depth,
+                        detail=f"HTTP status {x_res.status_code}"
+                    )
+
             except (KeyboardInterrupt, SystemExit):
                 print("Scan cancelled by user.")
                 sys.exit(0)
-            except: 
+            except Exception as fetch_error:
+                record_sitemap_outcome(
+                    sitemap_outcomes, xmlfile, SITEMAP_FETCH_FAILED,
+                    depth=current_xml_depth,
+                    detail=f"{type(fetch_error).__name__}: {fetch_error}"
+                )
                 xml_index += 1
                 continue
             xml_index += 1
-    return start_test_time, checktimestatusalready
+    else:
+        sitemap_outcomes = []
+    return start_test_time, checktimestatusalready, sitemap_outcomes
 
 
 

@@ -166,6 +166,7 @@ def main():
         scanned_html = set()
 
         e_files, xml_files, xml_depths = scrape_structure_files(args, target, HEADER, impersonate_settings, found_paths, unique_progress_paths, nd, USELESSSTUFF)
+        sitemap_outcomes = []
         main_html = ""
         base_res = requests.get(
             target, 
@@ -260,7 +261,7 @@ def main():
                                         start_test_time, checktimestatusalready, autoinput_timeout
                                     )
             #scrape xml
-            start_test_time, checktimestatusalready = recursive_xml_crawler(
+            start_test_time, checktimestatusalready, sitemap_outcomes = recursive_xml_crawler(
                 args, target, HEADER, session_cookies, impersonate_settings,
                 verified_esl_domains, verified_esl_scripts, USELESSSTUFF, nd,
                 found_paths, xml_files, xml_depths, unique_progress_paths,
@@ -369,7 +370,7 @@ def main():
                 assets_suffix, dead_suffix, invalidated_suffix,
                 all_scanned_sources,
                 unsorted_paths, invalidated_count,
-                invalidated_endpoints
+                invalidated_endpoints, sitemap_outcomes
             )
 
             if args.ratelimit is not None:
