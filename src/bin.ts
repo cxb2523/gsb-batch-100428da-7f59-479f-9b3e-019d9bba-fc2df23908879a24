@@ -6,11 +6,23 @@ import { HttpsProxyAgent } from "https-proxy-agent";
 import path from "node:path";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 
-import { CrawlOptions, Page, crawlWebsite } from "./index.js";
+import {
+  CrawlOptions,
+  CrawlResult,
+  Page,
+  crawlWebsite,
+} from "./index.js";
 import PRESET_LIST, { Preset } from "./preset.js";
 
 async function main() {
-  const { preset, maxConnections, exclude = [], extract, log } = program.opts();
+  const {
+    preset,
+    maxConnections,
+    exclude = [],
+    extract,
+    log,
+    breakOnError,
+  } = program.opts();
   const [startUrl, outPath] = program.args;
   const fetchOptions: RequestInit = {
     headers: {
@@ -26,6 +38,7 @@ async function main() {
     maxConnections,
     exclude,
     extract,
+    breakOnError,
     logEnabled: !!log,
     fetchOptions,
   };
@@ -46,8 +59,15 @@ async function main() {
     );
   }
   const pages: Page[] = [];
-  for await (const page of crawlWebsite(startUrl, options)) {
-    pages.push(page);
+  const crawler = crawlWebsite(startUrl, options);
+  let crawlResult: CrawlResult | undefined;
+  while (true) {
+    const next = await crawler.next();
+    if (next.done === true) {
+      crawlResult = next.value;
+      break;
+    }
+    pages.push(next.value);
   }
   const data = JSON.stringify(pages, null, 2);
   if (outPath) {
@@ -64,6 +84,24 @@ async function main() {
     }
   } else {
     console.log(data);
+  }
+  reportFailures(crawlResult);
+}
+
+function reportFailures(crawlResult?: CrawlResult) {
+  const failures = crawlResult?.failures ?? [];
+  if (failures.length === 0) {
+    return;
+  }
+  // This report is independent of the --log switch so that missing pages
+  // are always visible in the final output.
+  console.error(
+    `⚠️  Crawl finished with ${failures.length} failed page${
+      failures.length === 1 ? "" : "s"
+    }:`,
+  );
+  for (const failure of failures) {
+    console.error(`  - ${failure.path}: ${failure.error}`);
   }
 }
 
@@ -159,6 +197,10 @@ Examples:
     "Extract specific content using a CSS selector, If omitted, extract all content",
   )
   .option("--no-log", "Disable logging")
+  .option(
+    "--no-break-on-error",
+    "Keep crawling when a page fails; failed pages are listed on stderr at the end",
+  )
   .version("1.6.0");
 
 program.parse();

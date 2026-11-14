@@ -47,10 +47,55 @@ export interface CrawlOptions {
 const IS_GITHUB_REPO =
   /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/tree\/([^/]+)/;
 
+/**
+ * A page whose fetch failed while breakOnError was disabled.
+ */
+export interface FailedPage {
+  /**
+   * Full address of the page that could not be fetched.
+   */
+  path: string;
+  /**
+   * Error message taken from the original error's message or string form.
+   */
+  error: string;
+}
+
+/**
+ * Summary returned after the crawl generator finishes.
+ */
+export interface CrawlResult {
+  /**
+   * Every page that failed to fetch when breakOnError was false.
+   */
+  failures: FailedPage[];
+}
+
+/**
+ * Normalize a URL to the canonical key used for queue de-duplication.
+ *
+ * Links that point at the same document collapse to the same key:
+ * the hash and query string are ignored, the trailing slash is removed
+ * and a trailing index.html / index.htm segment is stripped. Accepts both
+ * path names (ordinary sites) and full URLs (GitHub repository entries).
+ */
+export function canonicalizeUrl(link: string, base?: string): string {
+  const parsedUrl = new URL(link, base);
+  parsedUrl.hash = "";
+  parsedUrl.search = "";
+  let pathname = parsedUrl.pathname;
+  pathname = pathname.replace(/\/index\.(html|htm)$/i, "/");
+  pathname = pathname.replace(/\/+$/, "");
+  if (pathname === "") {
+    pathname = "/";
+  }
+  return `${parsedUrl.origin}${pathname}`;
+}
+
 export async function* crawlWebsite(
   startUrl: string,
   options_?: Partial<CrawlOptions>,
-): AsyncGenerator<Page, any, Page> {
+): AsyncGenerator<Page, CrawlResult, unknown> {
   const options: CrawlOptions = {
     maxConnections: 6,
     exclude: [],
@@ -61,12 +106,28 @@ export async function* crawlWebsite(
   };
 
   const startUrlObj = new URL(startUrl);
-  let paths: string[] = [startUrlObj.pathname];
   startUrl = normalizeStartUrl(startUrl);
 
+  const paths: string[] = [];
+  const enqueued = new Set<string>();
+  const enqueue = (link: string) => {
+    const key = canonicalizeUrl(link, startUrl);
+    if (!enqueued.has(key)) {
+      enqueued.add(key);
+      paths.push(link);
+    }
+  };
+
   if (IS_GITHUB_REPO.test(startUrl)) {
-    paths = await crawlGHTree(startUrlObj, options.exclude);
+    const ghPaths = await crawlGHTree(startUrlObj, options.exclude);
+    for (const ghPath of ghPaths) {
+      enqueue(ghPath);
+    }
+  } else {
+    enqueue(startUrlObj.pathname);
   }
+
+  const failures: FailedPage[] = [];
 
   let index = 0;
   while (index < paths.length) {
@@ -76,7 +137,17 @@ export async function* crawlWebsite(
 
     const results = await Promise.all(promises);
 
-    for (const { links, text, path } of results) {
+    for (const result of results) {
+      if (result.ok === false) {
+        failures.push({
+          path: new URL(result.path, startUrlObj).toString(),
+          error: result.error,
+        });
+        continue;
+      }
+
+      const { links, text, path } = result;
+      // A failed fetch never yields a Page; an empty body is skipped too.
       if (text !== "") {
         yield {
           path: new URL(path, startUrlObj).toString(),
@@ -84,9 +155,7 @@ export async function* crawlWebsite(
         };
       }
       for (let link of links) {
-        if (!paths.some((path) => matchLink(path, link))) {
-          paths.push(link);
-        }
+        enqueue(link);
       }
     }
 
@@ -95,6 +164,8 @@ export async function* crawlWebsite(
   if (options.logEnabled) {
     console.log("✨ Crawl completed");
   }
+
+  return { failures };
 }
 
 async function crawlGHTree(startUrl: URL, exclude: string[]) {
@@ -139,11 +210,15 @@ export interface Page {
   text: string;
 }
 
+type CrawlPageResult =
+  | { ok: true; path: string; text: string; links: string[] }
+  | { ok: false; path: string; error: string };
+
 async function crawlPage(
   startUrl: string,
   path: string,
   options: CrawlOptions,
-) {
+): Promise<CrawlPageResult> {
   const location = new URL(path, startUrl).toString();
 
   let html = "";
@@ -157,15 +232,20 @@ async function crawlPage(
   } catch (err) {
     if (options.breakOnError) {
       throw err;
-    } else if (options.logEnabled) {
-      console.error(err);
     }
+    const message = err instanceof Error ? err.message : String(err);
+    if (options.logEnabled) {
+      console.error(message);
+    }
+    // No Page is produced for a failed fetch; the caller records it.
+    return { ok: false, path, error: message };
   }
 
   let links: string[] = [];
 
   if (IS_GITHUB_REPO.test(startUrl)) {
     return {
+      ok: true,
       path,
       text: html,
       links,
@@ -197,6 +277,7 @@ async function crawlPage(
   text = turndownService.turndown(text);
 
   return {
+    ok: true,
     path,
     text,
     links: [...new Set(links)],
@@ -235,10 +316,6 @@ function normalizeStartUrl(startUrl: string) {
     parsedUrl.pathname = parsedUrl.pathname.substring(0, lastSlashIndex + 1);
   }
   return parsedUrl.toString();
-}
-
-function matchLink(path: string, link: string) {
-  return path === link || path === link.replace(/\/index\.(html|htm)$/, "/");
 }
 // fix tweak
 // fix note
