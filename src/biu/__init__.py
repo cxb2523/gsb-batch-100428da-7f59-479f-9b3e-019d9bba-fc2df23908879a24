@@ -4,6 +4,8 @@ monkey.patch_all()
 
 from collections.abc import Iterable
 
+import threading
+
 import gevent
 from gevent.lock import BoundedSemaphore
 from gevent import pool
@@ -19,7 +21,7 @@ from parsel import Selector as _ParselSelector
 
 from typing import Callable, Dict, TypeVar
 
-IntOrFloat = TypeVar([int, float])
+IntOrFloat = TypeVar("IntOrFloat", int, float)
 
 import logging
 
@@ -155,6 +157,18 @@ class Project:
     def result_handler(self, rv):
         return rv
 
+    def errorback(self, request: "Request", exception: BaseException, retried: int):
+        """Called when a request has exhausted all retries.
+
+        :param request: the failed biu.Request
+        :param exception: the last exception (or timeout) raised while fetching
+        :param retried: how many times the request was retried
+
+        The default implementation does nothing and never raises.
+        Override it to get notified about failed requests.
+        """
+        pass
+
     def before(self):
         pass
 
@@ -195,10 +209,16 @@ class BiuCore:
         self._session.verify = False
         self._retry_delay = project.retry_delay
 
+        # Failed-task bookkeeping. threading.Lock is monkey-patched by gevent,
+        # so this is safe across greenlets (and threads).
+        self._failed_lock = threading.Lock()
+        self._failed_requests = []
+
     def send_request(self, req: Request):
         raw_req = req._raw_req_obj.prepare()
         retried = 0
         resp = None
+        last_exc = None
         for i in range(50):
             retried = i
             try:
@@ -207,25 +227,27 @@ class BiuCore:
 
                 send_args = req.send_args
                 raw_resp = self.rate_limit_send_request(raw_req, send_args)
+                resp = Response(req, raw_resp)
                 if raw_resp.status_code in req.allow_codes:
                     return self._pool.spawn(self.callback_handler, req, resp)
                 raw_resp.raise_for_status()
-                resp = Response(req, raw_resp)
                 return self._pool.spawn(self.callback_handler, req, resp)
             except requests.Timeout as e:
+                last_exc = e
                 logger.error("Fetch timeout!")
                 if retried < self._max_retry:
                     gevent.sleep(self._retry_delay)
                     continue
                 break
             except Exception as e:
+                last_exc = e
                 logger.error(e)
                 if retried < self._max_retry:
                     gevent.sleep(self._retry_delay)
                     continue
                 break
         logger.error("Retry failed! {} {}".format(raw_req.url, retried))
-        self.errorback_handler(resp)
+        self.errorback_handler(req, last_exc, retried)
 
     def rate_limit_send_request(
         self,
@@ -264,8 +286,49 @@ class BiuCore:
             logger.error("Exception %s", e)
             raise
 
-    def errorback_handler(self, resp: Response):
-        return
+    def errorback_handler(self, req: Request, exception: BaseException, retried: int):
+        """Record a request that exhausted its retries and notify the project."""
+        self._record_failed(req, exception, retried)
+        try:
+            self.project.errorback(req, exception, retried)
+        except Exception as e:
+            logger.error("project.errorback raised: %s", e)
+
+    def _record_failed(self, req: Request, exception: BaseException, retried: int):
+        with self._failed_lock:
+            self._failed_requests.append(
+                {"request": req, "exception": exception, "retried": retried}
+            )
+
+    def get_failed_requests(self):
+        """Return a snapshot of the failed-task records (thread/greenlet safe).
+
+        Each record is a dict: {"request": Request, "exception": exc, "retried": int}.
+        """
+        with self._failed_lock:
+            return list(self._failed_requests)
+
+    def pop_failed_requests(self):
+        """Return all failed-task records and clear the failure list."""
+        with self._failed_lock:
+            failed = self._failed_requests
+            self._failed_requests = []
+            return failed
+
+    def resend_failed(self, failed=None):
+        """Re-deliver failed tasks to send_request.
+
+        :param failed: records as returned by get_failed_requests()/pop_failed_requests(),
+            or plain Request objects. If None, all currently recorded failures are
+            popped and re-sent. The original Request objects (with their callback,
+            save and request arguments) are reused, and tasks that fail again are
+            recorded again.
+        """
+        if failed is None:
+            failed = self.pop_failed_requests()
+        for item in failed:
+            req = item["request"] if isinstance(item, dict) else item
+            self.send_request(req)
 
     def result_handler(self, result):
         return
