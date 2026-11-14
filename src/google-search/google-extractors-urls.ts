@@ -14,6 +14,61 @@ const GOOGLE_ORIGIN = `https://${GOOGLE_HOSTNAME}`;
 
 const MAX_RESOLVE_ATTEMPTS = 3;
 
+/** Why one attempt or one redirect entry failed to resolve. */
+export type RedirectFailureReason =
+    /** The response was not a 3xx redirect, so it carries no destination. */
+    | 'no-redirect-status'
+    /** The redirect had no usable Location header. */
+    | 'missing-location'
+    /** The Location was unparseable, not an http(s) result page, or another Google interstitial. */
+    | 'invalid-location'
+    /** The request itself failed (network, timeout, proxy, ...). */
+    | 'request-failed'
+    /** The attempts failed for different reasons, so no single reason describes the entry. */
+    | 'all-attempts-failed';
+
+export type RedirectAttemptFailure = {
+    reason: RedirectFailureReason;
+    message: string;
+};
+
+/** One result dropped because its Google redirect link could not be resolved to a real destination. */
+export type DroppedRedirect = {
+    /** The link as extracted from the SERP, before any resolution. */
+    originalUrl: string;
+    reason: RedirectFailureReason;
+    message: string;
+    /** One entry per attempt, so a partial failure is still visible. */
+    attempts: RedirectAttemptFailure[];
+};
+
+/**
+ * What happened while resolving Google redirect links on one page of results.
+ * Counts make a page's losses checkable instead of just showing fewer results.
+ */
+export type RedirectResolutionSummary = {
+    /** Results handed to the resolver. */
+    totalResults: number;
+    /** Results that were not Google redirect links; kept as-is without a request. */
+    untouched: number;
+    /** Google redirect links that entered resolution. */
+    enteredResolution: number;
+    /** Entries replaced by their real destination (local parameter hits plus resolved requests). */
+    resolved: number;
+    /** Destinations read from the /url q or url parameter without asking Google. */
+    localParamHits: number;
+    /** Destinations obtained by reading a redirect Location header from Google. */
+    resolvedByRequest: number;
+    /** Entries dropped because no destination could be found. */
+    dropped: number;
+    droppedRedirects: DroppedRedirect[];
+};
+
+export type RedirectResolution = {
+    results: OrganicResult[];
+    summary: RedirectResolutionSummary;
+};
+
 function isGoogleRedirectPath(href: string): boolean {
     return GOOGLE_REDIRECT_PATHNAMES.has(href.split(/[?#]/)[0]);
 }
@@ -157,54 +212,157 @@ const readUrlDestination = (parsedUrl: URL): string | null => {
     return isValidUrl(destination.href) && !isGoogleInterstitial(destination) ? destination.href : null;
 };
 
+/** A failed attempt, carrying the reason so the caller can report it instead of just "failed". */
+class RedirectAttemptError extends Error {
+    readonly reason: RedirectFailureReason;
+
+    constructor(reason: RedirectFailureReason, message: string) {
+        super(message);
+        this.name = 'RedirectAttemptError';
+        this.reason = reason;
+    }
+}
+
 const resolveGoogleRedirectUrl = async (parsedUrl: URL, proxyConfig: ProxyConfiguration | undefined): Promise<string> => {
-    const response = await gotScraping({
-        url: parsedUrl.toString(),
-        followRedirect: false,
-        proxyUrl: await proxyConfig?.newUrl(),
-        timeout: { request: 5_000 },
-    });
+    let response;
+    try {
+        response = await gotScraping({
+            url: parsedUrl.toString(),
+            followRedirect: false,
+            proxyUrl: await proxyConfig?.newUrl(),
+            timeout: { request: 5_000 },
+        });
+    } catch (error) {
+        throw new RedirectAttemptError('request-failed', `${error instanceof Error ? error.message : String(error)}`);
+    }
     const statusCode = response?.statusCode;
     const location: unknown = response?.headers?.location;
-    if (statusCode < 300 || statusCode >= 400 || typeof location !== 'string') {
-        throw new Error(`response is not a redirect (status ${statusCode})`);
+    if (statusCode < 300 || statusCode >= 400) {
+        throw new RedirectAttemptError('no-redirect-status', `response is not a redirect (status ${statusCode})`);
+    }
+    if (typeof location !== 'string' || !location) {
+        throw new RedirectAttemptError('missing-location', `redirect has no Location header (status ${statusCode})`);
     }
     // Google's own pages (captcha, consent) also come as redirects; failing here keeps them from winning the race
-    const destination = new URL(location, parsedUrl);
+    let destination: URL;
+    try {
+        destination = new URL(location, parsedUrl);
+    } catch {
+        throw new RedirectAttemptError('invalid-location', `Location is not a url: ${location}`);
+    }
     if (!isValidUrl(destination.href) || isGoogleInterstitial(destination)) {
-        throw new Error(`redirect does not lead to a result page: ${destination.href}`);
+        throw new RedirectAttemptError('invalid-location', `redirect does not lead to a result page: ${destination.href}`);
     }
     return destination.href;
 };
 
+/** Describes why resolving one redirect entry failed, preferring a single attempt's reason when they agree. */
+function describeFailedAttempts(attempts: RedirectAttemptFailure[], fallbackMessage: string): Pick<DroppedRedirect, 'reason' | 'message'> {
+    const reasons = new Set(attempts.map((attempt) => attempt.reason));
+    if (reasons.size === 1) {
+        return { reason: attempts[0].reason, message: attempts[0].message };
+    }
+    const details = attempts.map((attempt) => `${attempt.reason}: ${attempt.message}`).join('; ');
+    return { reason: 'all-attempts-failed', message: details || fallbackMessage };
+}
+
+type ResolvedEntry = {
+    result: OrganicResult;
+    /** How the entry was resolved, or undefined when it was not a redirect link. */
+    outcome: 'untouched' | 'local' | 'request' | 'dropped';
+    dropped?: DroppedRedirect;
+};
+
+async function resolveEntry(result: OrganicResult, proxyConfig: ProxyConfiguration | undefined): Promise<ResolvedEntry> {
+    const parsedUrl = result.url && parseGoogleRedirectUrl(result.url);
+    if (!parsedUrl) {
+        return { result, outcome: 'untouched' };
+    }
+
+    const urlDestination = readUrlDestination(parsedUrl);
+    if (urlDestination) {
+        return { result: { ...result, url: urlDestination }, outcome: 'local' };
+    }
+
+    // Attempts run in parallel, each through a different proxy IP, and the first to resolve wins
+    const attempts = Array.from({ length: MAX_RESOLVE_ATTEMPTS }, async () => resolveGoogleRedirectUrl(parsedUrl, proxyConfig));
+    try {
+        const destination = await Promise.any(attempts);
+        return { result: { ...result, url: destination }, outcome: 'request' };
+    } catch (error) {
+        // Promise.any rejects with an AggregateError once every attempt has failed
+        const attemptFailures: RedirectAttemptFailure[] = (error as AggregateError).errors.map((attemptError) => ({
+            reason: attemptError instanceof RedirectAttemptError ? attemptError.reason : 'request-failed',
+            message: attemptError instanceof RedirectAttemptError ? attemptError.message : `${attemptError}`,
+        }));
+        const failure = describeFailedAttempts(attemptFailures, `${error}`);
+        return {
+            result,
+            outcome: 'dropped',
+            dropped: { originalUrl: result.url!, ...failure, attempts: attemptFailures },
+        };
+    }
+}
+
 /**
  * Replaces Google's redirect urls (/goto and /url) with their destination.
  * /url links are read locally; /goto links (and /url without a usable destination) from Google's redirect response.
+ * Anything that cannot be resolved is dropped, and reported in the returned summary.
+ */
+export const resolveGoogleRedirectUrlsWithSummary = async (results: OrganicResult[]): Promise<RedirectResolution> => {
+    // Not needed when nothing has to go through Google, so a page without /goto links stays request-free
+    const needsProxy = results.some((result) => {
+        const parsedUrl = result.url && parseGoogleRedirectUrl(result.url);
+        return Boolean(parsedUrl && !readUrlDestination(parsedUrl));
+    });
+    const proxyConfig = needsProxy ? await Actor.createProxyConfiguration({ checkAccess: false }) : undefined;
+
+    const entries = await Promise.all(results.map(async (result) => resolveEntry(result, proxyConfig)));
+
+    const summary: RedirectResolutionSummary = {
+        totalResults: results.length,
+        untouched: 0,
+        enteredResolution: 0,
+        resolved: 0,
+        localParamHits: 0,
+        resolvedByRequest: 0,
+        dropped: 0,
+        droppedRedirects: [],
+    };
+    const resolvedResults: OrganicResult[] = [];
+    for (const entry of entries) {
+        if (entry.outcome === 'untouched') {
+            summary.untouched += 1;
+            resolvedResults.push(entry.result);
+            continue;
+        }
+        summary.enteredResolution += 1;
+        if (entry.outcome === 'dropped') {
+            summary.dropped += 1;
+            summary.droppedRedirects.push(entry.dropped!);
+            continue;
+        }
+        summary.resolved += 1;
+        if (entry.outcome === 'local') summary.localParamHits += 1;
+        else summary.resolvedByRequest += 1;
+        resolvedResults.push(entry.result);
+    }
+
+    if (summary.dropped > 0) {
+        log.warning('Dropped search results whose Google redirect url could not be resolved', {
+            dropped: summary.dropped,
+            droppedRedirects: summary.droppedRedirects.map(({ originalUrl, reason, message }) => ({ originalUrl, reason, message })),
+        });
+    }
+
+    return { results: resolvedResults, summary };
+};
+
+/**
+ * Replaces Google's redirect urls (/goto and /url) with their destination.
+ * Thin wrapper over {@link resolveGoogleRedirectUrlsWithSummary} for callers that only need the results.
  */
 export const resolveGoogleRedirectUrls = async (results: OrganicResult[]): Promise<OrganicResult[]> => {
-    const proxyConfig = await Actor.createProxyConfiguration({ checkAccess: false });
-
-    const resolvedResults = await Promise.all(
-        results.map(async (result) => {
-            const parsedUrl = result.url && parseGoogleRedirectUrl(result.url);
-            if (!parsedUrl) {
-                return result;
-            }
-            const urlDestination = readUrlDestination(parsedUrl);
-            if (urlDestination) {
-                return { ...result, url: urlDestination };
-            }
-
-            // Attempts run in parallel, each through a different proxy IP, and the first to resolve wins
-            try {
-                const attempts = Array.from({ length: MAX_RESOLVE_ATTEMPTS }, async () => resolveGoogleRedirectUrl(parsedUrl, proxyConfig));
-                return { ...result, url: await Promise.any(attempts) };
-            } catch (error) {
-                const errors = (error as AggregateError).errors.map((attemptError) => `${attemptError}`);
-                log.warning('Failed to resolve Google redirect url', { errors, url: result.url });
-                return null;
-            }
-        }),
-    );
-    return resolvedResults.filter((result) => result !== null);
+    const { results: resolvedResults } = await resolveGoogleRedirectUrlsWithSummary(results);
+    return resolvedResults;
 };

@@ -21,7 +21,11 @@ import {
 import { canAfford, chargeFetch, chargeSearch } from './charging.js';
 import type { CrawlerKind } from './const.js';
 import { ContentCrawlerTypes, GOOGLE_STANDARD_RESULTS_PER_PAGE } from './const.js';
-import { deduplicateResults, resolveGoogleRedirectUrls, scrapeOrganicResults } from './google-search/google-extractors-urls.js';
+import {
+    deduplicateResults,
+    resolveGoogleRedirectUrlsWithSummary,
+    scrapeOrganicResults,
+} from './google-search/google-extractors-urls.js';
 import { getMiniActor } from './mini-actors.js';
 import {
     checkTimeoutAndCancelRequest,
@@ -161,7 +165,14 @@ export async function createAndStartSearchCrawler(
                 await Actor.setValue(`google-serp-${request.id}-${request.retryCount}`, body, { contentType: 'text/html; charset=utf-8' });
             }
             const organicResults = scrapeOrganicResults($);
-            const resolvedResults = await resolveGoogleRedirectUrls(organicResults);
+            const { results: resolvedResults, summary: redirectSummary } = await resolveGoogleRedirectUrlsWithSummary(organicResults);
+
+            // Logged here, after the page is handled, so every result it lost to a failed redirect can be checked
+            // against the page that produced it, not just inferred from a smaller result count.
+            log.info(`Page ${(request.userData.currentPage ?? 0) + 1}: Google redirect resolution summary`, {
+                ...redirectSummary,
+                pageUrl: request.url,
+            });
 
             // Destructure userData for easier access (pagination fields are initialized in createSearchRequest)
             const { collectedResults, currentPage, totalPages, maxResults, actorRequestId } = request.userData;
