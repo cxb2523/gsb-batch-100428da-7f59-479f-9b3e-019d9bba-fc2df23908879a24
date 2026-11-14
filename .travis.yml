@@ -1,0 +1,27 @@
+language: python
+
+notifications:
+  email: false
+
+dist: xenial
+sudo: required
+
+python:
+- "3.6"
+- "3.7"
+- "3.8"
+- "3.9"
+- "3.10"
+
+install:
+- pip install codecov
+- pip install ./
+
+script: coverage run --source=ruia -m pytest && coverage report
+
+after_success:
+- codecov
+
+branches:
+  only:
+  - master

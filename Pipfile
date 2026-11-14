@@ -1,0 +1,21 @@
+[[source]]
+name = "pypi"
+verify_ssl = true
+url = "https://pypi.python.org/simple"
+
+[dev-packages]
+pytest = "*"
+mkdocs = "*"
+mkdocs-material = "*"
+codecov = "*"
+pylint = "*"
+yapf = "*"
+black = "*"
+
+[packages]
+aiohttp = ">=3.5.4"
+cssselect = "*"
+lxml = "*"
+
+[pipenv]
+allow_prereleases = true
