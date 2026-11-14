@@ -36,7 +36,10 @@ from feedsearch_crawler.crawler.lib import (
 from feedsearch_crawler.crawler.middleware.cookie import CookieMiddleware
 from feedsearch_crawler.crawler.middleware.monitoring import MonitoringMiddleware
 from feedsearch_crawler.crawler.middleware.retry import RetryMiddleware
-from feedsearch_crawler.crawler.middleware.robots import RobotsMiddleware
+from feedsearch_crawler.crawler.middleware.robots import (
+    DEFAULT_ROBOTS_TIMEOUT,
+    RobotsMiddleware,
+)
 from feedsearch_crawler.crawler.middleware.throttle import ThrottleMiddleware
 from feedsearch_crawler.crawler.queueable import CallbackResult, Queueable
 from feedsearch_crawler.crawler.request import Request
@@ -47,6 +50,7 @@ from feedsearch_crawler.crawler.statistics import (
     StatsCollector,
 )
 from feedsearch_crawler.crawler.trace import add_trace_config
+from feedsearch_crawler.exceptions import ErrorType, RobotsBlockedError
 
 
 logger = logging.getLogger(__name__)
@@ -110,6 +114,7 @@ class Crawler(ABC):
         ssl: bool = False,
         trace: bool = False,
         respect_robots: bool = True,
+        robots_timeout: float = DEFAULT_ROBOTS_TIMEOUT,
         requests_per_host_per_sec: float = 5.0,
         stats_level: StatisticsLevel = StatisticsLevel.STANDARD,
         stats_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -136,6 +141,8 @@ class Crawler(ABC):
         :param ssl: Enables strict SSL checking.
         :param trace: Enables aiohttp trace debugging.
         :param respect_robots: If True, fetch robots.txt first and respect disallow rules. Default True.
+        :param robots_timeout: Max seconds an ordinary request waits for its host's robots.txt
+            result before being allowed through. Default 5.
         :param requests_per_host_per_sec: Max request rate per host. 0 disables throttling. Default 5.
         :param stats_level: Statistics collection level (MINIMAL/STANDARD/DETAILED).
         :param stats_callback: Optional callback for real-time statistics updates.
@@ -174,6 +181,7 @@ class Crawler(ABC):
         self._ssl = ssl
         self._trace = trace
         self.respect_robots = respect_robots
+        self.robots_timeout = robots_timeout
 
         # Default set for parsed items.
         self.items: set[Item] = set()
@@ -231,7 +239,10 @@ class Crawler(ABC):
         # Build middleware list - conditionally add RobotsMiddleware
         self.middlewares = []
         if self.respect_robots:
-            self._robots_middleware = RobotsMiddleware(user_agent=self.user_agent)
+            self._robots_middleware = RobotsMiddleware(
+                user_agent=self.user_agent,
+                timeout=self.robots_timeout,
+            )
             self.middlewares.append(self._robots_middleware)
 
         self.middlewares.extend(
@@ -257,9 +268,45 @@ class Crawler(ABC):
 
             start = time.perf_counter()
 
+            # Enforce robots.txt before taking a download slot: a request whose
+            # host's rules are still being fetched waits here (bounded), and a
+            # disallowed request is dropped without ever consuming concurrency
+            # or reaching the network. The downloader repeats the check, which
+            # is a cache hit once the rules are registered.
+            robots_response = None
+            if self._robots_middleware:
+                try:
+                    await self._robots_middleware.pre_request(request)
+                except RobotsBlockedError as e:
+                    logger.debug("%s", e)
+                    robots_response = Downloader.blocked_response(
+                        request, list(request.history)
+                    )
+
             # Fetch the request using the downloader
-            async with self._download_semaphore:
-                response = await self._downloader.fetch(request)
+            if robots_response is not None:
+                response = robots_response
+            else:
+                async with self._download_semaphore:
+                    response = await self._downloader.fetch(request)
+
+            # Count a robots-blocked request exactly once, whichever layer
+            # stopped it (the pre-check above or the downloader's own check).
+            if response.error_type == ErrorType.ROBOTS_BLOCKED:
+                await self.stats_collector.record_robots_block()
+
+            # A failed robots.txt fetch (404, timeout, connection error, ...)
+            # never reaches parse_robots_txt, so register "no rules" here to
+            # release the requests waiting on this origin. A failed attempt
+            # that will be retried is skipped: the next attempt may still
+            # deliver real rules.
+            if (
+                self._robots_middleware
+                and self._robots_middleware.is_robots_request(request.url)
+                and not response.ok
+                and not request.will_retry
+            ):
+                self._robots_middleware.register_robots_txt(request.url, None)
 
             # Run the callback if available (parsing can be done with separate concurrency limit)
             callback_result = None
@@ -296,7 +343,9 @@ class Crawler(ABC):
             else:
                 # Categorize error based on status code
                 error_category = ErrorCategory.OTHER
-                if response.status_code >= 500:
+                if response.error_type == ErrorType.ROBOTS_BLOCKED:
+                    error_category = ErrorCategory.ROBOTS
+                elif response.status_code >= 500:
                     error_category = ErrorCategory.HTTP_SERVER
                 elif response.status_code >= 400:
                     error_category = ErrorCategory.HTTP_CLIENT
@@ -607,7 +656,8 @@ class Crawler(ABC):
         """
         # Register the result with the robots middleware so disallow rules are
         # enforced without any blocking fetches. A missing/failed robots.txt is
-        # registered as None (permissive).
+        # registered as None (permissive). This also releases any requests that
+        # are waiting for this origin's rules.
         if self._robots_middleware:
             self._robots_middleware.register_robots_txt(
                 request.url, response.text if response.ok else None
@@ -961,6 +1011,11 @@ class Crawler(ABC):
                     allow_domain=True,
                 )
                 if robots_req:
+                    # Announce the pending fetch so ordinary requests for this
+                    # origin wait for its rules instead of being let through.
+                    # Without respect_robots there is no middleware and no wait.
+                    if self._robots_middleware:
+                        self._robots_middleware.expect_robots_txt(robots_url)
                     self._process_request(robots_req)
                     robots_urls_added.add(robots_url)
                     logger.debug(f"Queued robots.txt: {robots_url}")

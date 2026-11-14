@@ -14,6 +14,7 @@ class ErrorType(Enum):
     HTTP_ERROR = "http_error"
     TIMEOUT = "timeout"
     INVALID_URL = "invalid_url"
+    ROBOTS_BLOCKED = "robots_blocked"
     OTHER = "other"
 
 

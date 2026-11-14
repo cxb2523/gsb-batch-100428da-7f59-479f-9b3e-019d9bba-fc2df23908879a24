@@ -51,7 +51,7 @@ class Downloader:
                 await middleware.pre_request(request)
         except RobotsBlockedError as e:
             logger.debug("%s", e)
-            return self._failed_response(request, 403, history)
+            return self.blocked_response(request, history)
 
         error_type_hint: Optional[ErrorType] = None
         try:
@@ -248,6 +248,25 @@ class Downloader:
             raise ValueError(
                 f"HTTP method {request.method} is not valid. Must be GET, POST, PUT, or DELETE"
             )
+
+    @staticmethod
+    def blocked_response(request: Request, history: List[URL]) -> Response:
+        """Build the Response for a request stopped by robots.txt.
+
+        The request never reached the network, so it carries a distinct error
+        type (and no successful status) and is never retried: it is a final
+        outcome, not a transient failure.
+        """
+        return Response(
+            url=request.url,
+            method=request.method,
+            encoding=request.encoding,
+            headers={},
+            history=history or [],
+            status_code=403,
+            request=request,
+            error_type=ErrorType.ROBOTS_BLOCKED,
+        )
 
     def _failed_response(
         self,

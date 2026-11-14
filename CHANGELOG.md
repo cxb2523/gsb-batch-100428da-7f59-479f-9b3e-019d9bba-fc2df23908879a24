@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A page request no longer races its host's robots.txt fetch. Page requests
+  for an origin with a robots.txt fetch in flight now wait (up to
+  `robots_timeout`, default 5s) for the result to be registered, instead of
+  being allowed while the rules are still unknown. robots.txt requests
+  themselves never wait and are never blocked by their own rules, so the
+  wait cannot deadlock behind them.
+- A robots.txt fetch that fails (404, timeout, connection error, ...) or
+  returns empty/unparseable content is registered as "no rules", releasing
+  waiting requests and marking the origin permissive for the rest of the
+  crawl. Previously a failed fetch was only noticed when its callback ran,
+  which never happened for non-2xx responses.
+- robots.txt cache keys are canonicalised by URL origin (scheme + host +
+  port), so a registration from a retried or redirected fetch (query string,
+  fragment, explicit default port, host case) matches later lookups.
+- Requests blocked by robots.txt are stopped before they take a download
+  slot, are reported as a `robots_blocked` error (not a successful 2xx
+  response), counted in `robots_blocked` statistics, and are not retried.
+
+### Added
+
+- `robots_timeout` crawler option bounding how long a request waits for its
+  host's robots.txt result.
+
 ## [2.1.8] - 2026-10-29
 
 ### Fixed

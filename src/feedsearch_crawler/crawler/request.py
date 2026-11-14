@@ -122,5 +122,15 @@ class Request(Queueable):
             self._num_retries += 1
             self.delay = self._num_retries * 1
 
+    @property
+    def will_retry(self) -> bool:
+        """Whether another attempt is still pending within the retry budget.
+
+        ``should_retry`` is sticky: once a retryable status has been seen it
+        stays true even after the budget is exhausted, so it cannot be used on
+        its own to tell whether the request is finished.
+        """
+        return self.should_retry and self._num_retries < self._max_retries
+
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({str(self.url)})"
