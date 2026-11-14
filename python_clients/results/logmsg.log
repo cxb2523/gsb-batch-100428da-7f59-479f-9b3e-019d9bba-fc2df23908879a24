@@ -1,0 +1,7 @@
+2026-06-01--00-48-03: parameter dest_filename: C:\ozy_mp\results\result.json
+2026-06-01--00-48-03: parameter search_string: самолет
+2026-06-01--00-48-03: parameter url_and_category: 
+2026-06-01--00-48-03: WRONG PARAMETER: url_and_category
+2026-06-01--00-48-03: parameter expected_count_items: 5
+2026-06-01--00-48-03: подключение к https://curly-loops-think.loca.lt
+2026-06-01--00-48-48: Размеры, запрос: 148/150, ответ: 3828/15134, время: 45.254
