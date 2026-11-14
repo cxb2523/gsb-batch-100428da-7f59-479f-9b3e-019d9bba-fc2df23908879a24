@@ -1,0 +1,64 @@
+name: Node.js CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch: ~
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    timeout-minutes: 10
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version:
+          - 20
+          - 22
+          - 24
+          - 26
+          - current
+        os:
+          - ubuntu-latest
+          - windows-latest
+        include:
+          - node-version: 24
+            os: macos-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node-version }}
+      - name: Update npm to latest
+        # npm@latest (v12+) dropped support for Node 20, so only upgrade on
+        # newer Node versions; Node 20 keeps its bundled npm.
+        if: ${{ matrix.node-version != 20 }}
+        run: npm install -g npm@latest
+      - run: npm i
+      - name: Install Chrome for Puppeteer
+        # npm v12 disables install scripts by default, so Puppeteer's
+        # postinstall no longer downloads Chrome automatically.
+        run: npx puppeteer browsers install chrome
+      - name: Disable AppArmor
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+        run: echo 0 | sudo tee /proc/sys/kernel/apparmor_restrict_unprivileged_userns
+      - run: npm test
+      - run: npm run eslint
+        if: ${{ matrix.node-version == '24' && matrix.os == 'ubuntu-latest' }}
+      - name: Publish Qlty code coverage
+        if: ${{ matrix.node-version == '24' && matrix.os == 'ubuntu-latest' }}
+        uses: qltysh/qlty-action/coverage@v2
+        with:
+          token: ${{ secrets.QLTY_COVERAGE_TOKEN }}
+          files: coverage/lcov.info
