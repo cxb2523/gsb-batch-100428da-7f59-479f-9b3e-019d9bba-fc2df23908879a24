@@ -19,7 +19,10 @@ def _sample_timings(
     rng: np.random.Generator,
 ) -> list[int]:
     total_time = max(1, round(timings[-1] - timings[0]))
-    interval_count = max(1, round(total_time * frequency / 1000))
+    # Timings are whole milliseconds, so at most total_time + 1 distinct sample
+    # points fit into the duration. Requesting more would force duplicate time
+    # points with no positive waiting time; reduce the sample count instead.
+    interval_count = min(max(1, round(total_time * frequency / 1000)), total_time)
 
     recorded_intervals = np.diff(timings)
     recorded_intervals = recorded_intervals[recorded_intervals > 0]
@@ -38,11 +41,24 @@ def _sample_timings(
         sampled_intervals = np.maximum(sampled_intervals, np.finfo(float).eps)
         sampled_intervals *= total_time / sampled_intervals.sum()
 
-    sampled_timings = [
-        int(timing) for timing in np.rint(np.concatenate(([0.0], np.cumsum(sampled_intervals)))).astype(int)
-    ]
-    sampled_timings[-1] = total_time
-    return sampled_timings
+    # Distribute the integer millisecond budget over the intervals proportionally
+    # to the sampled weights (largest remainder method). Every interval gets at
+    # least 1 ms, so the resulting timings are strictly increasing, start at 0
+    # and end exactly at total_time.
+    durations = np.ones(interval_count, dtype=int)
+    remaining = total_time - interval_count
+    if remaining:
+        weights = sampled_intervals / sampled_intervals.sum()
+        extra = weights * remaining
+        whole = np.floor(extra).astype(int)
+        durations += whole
+        leftover = int(remaining - whole.sum())
+        if leftover:
+            fractions = extra - whole
+            order = np.argsort(-fractions, kind="stable")
+            durations[order[:leftover]] += 1
+
+    return [0, *np.cumsum(durations).tolist()]
 
 
 def generate_trajectory(

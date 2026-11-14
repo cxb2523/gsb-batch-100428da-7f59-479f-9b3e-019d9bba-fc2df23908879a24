@@ -1,5 +1,4 @@
 import math
-from itertools import pairwise
 
 import cursory.cursory as cursory_module
 import numpy as np
@@ -28,17 +27,24 @@ def _patch_trajectory(monkeypatch):
 
 
 @pytest.mark.usefixtures("_patch_trajectory")
-def test_high_frequency_still_generates_samples():
+def test_high_frequency_reduces_samples_to_available_time_resolution():
     points, timings = generate_trajectory((0.0, 0.0), (10.0, 10.0), frequency=2000, seed=1)
 
-    assert len(points) == len(timings) == 401
-    assert timings == sorted(timings)
-    assert any(first == second for first, second in pairwise(points))
+    total_time = BASE_TIMINGS[-1] - BASE_TIMINGS[0]
+    # 2000 Hz over 200 ms would request 401 samples, but whole-millisecond
+    # timings only offer 201 distinct time points; the count must be reduced.
+    assert len(points) == len(timings) == total_time + 1
+    assert timings[0] == 0
+    assert timings[-1] == total_time
+    # Every point gets its own strictly positive waiting time.
+    assert all(step >= 1 for step in np.diff(timings))
+    assert points[0] == (0.0, 0.0)
+    assert points[-1] == (10.0, 10.0)
 
 
 @pytest.mark.usefixtures("_patch_trajectory")
 def test_timings_never_go_backwards_under_large_jitter():
-    _points, timings = generate_trajectory(
+    points, timings = generate_trajectory(
         (0.0, 0.0),
         (10.0, 10.0),
         frequency=1000,
@@ -46,9 +52,13 @@ def test_timings_never_go_backwards_under_large_jitter():
         seed=1,
     )
 
+    assert len(points) == len(timings)
     assert timings[0] == 0
     assert timings[-1] == BASE_TIMINGS[-1]
-    assert timings == sorted(timings)
+    # Strictly increasing: no duplicate time points even with heavy jitter.
+    assert all(step >= 1 for step in np.diff(timings))
+    assert points[0] == (0.0, 0.0)
+    assert points[-1] == (10.0, 10.0)
 
 
 @pytest.mark.usefixtures("_patch_trajectory")
@@ -88,6 +98,19 @@ def test_zero_distance_returns_one_stationary_point(monkeypatch):
     monkeypatch.setattr(cursory_module, "find_trajectory", fail_selection)
 
     assert generate_trajectory((100.0, 100.0), (100.0, 100.0)) == ([(100.0, 100.0)], [0])
+
+
+def test_zero_distance_with_high_frequency_and_jitter_stays_stationary():
+    points, timings = generate_trajectory(
+        (5.0, 5.0),
+        (5.0, 5.0),
+        frequency=2000,
+        frequency_randomizer=50,
+        seed=7,
+    )
+
+    assert points == [(5.0, 5.0)]
+    assert timings == [0]
 
 
 def test_duplicate_samples_keep_their_timing(monkeypatch):

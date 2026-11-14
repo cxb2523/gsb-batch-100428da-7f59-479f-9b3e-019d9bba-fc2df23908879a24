@@ -42,22 +42,30 @@ def run(playwright: Playwright) -> None:
         end_point = (random.randint(0, 1080), random.randint(0, 720))
         trajectory_points, timings = generate_trajectory(start_point, end_point, frequency_randomizer=0, frequency=60)
         # Print Frequency
-        avg_freq = 1000 / (timings[-1] - timings[0]) * len(timings)
-        print(f"Average Frequency: {avg_freq:.2f} Hz")
+        duration = timings[-1] - timings[0]
+        if duration > 0:
+            avg_freq = 1000 / duration * len(timings)
+            print(f"Average Frequency: {avg_freq:.2f} Hz")
 
         # Simulate drawing the trajectory on the page
-        for i, (point, timing) in enumerate(zip(trajectory_points, timings, strict=False)):
+        previous_timing = 0
+        for point, timing in zip(trajectory_points, timings, strict=True):
             # Move mouse to the point and measure delay
             start = time.time()
             page.mouse.move(point[0], point[1])
             delay_time = (time.time() - start) * 1000
 
-            # Wait for the remaining time in the timing interval
-            pause_time = timing - (timings[i - 1] if i > 0 else 0)
+            # Wait based on the gap to the previous point, never on absolute time
+            pause_time = timing - previous_timing
+            previous_timing = timing
+            total_points += 1
+            if pause_time <= 0:
+                # No positive waiting time for this point; skip waiting.
+                continue
+
             if delay_time > pause_time:
                 print(f"[WARNING]: Delay ({delay_time:.2f} ms) is greater than timing pause ({pause_time} ms)")
                 timeout_points += 1
-            total_points += 1
 
             sleep_delay = max(((pause_time - delay_time) / 1000), 0)
             # page.wait_for_timeout(pause_time - delay_time)
