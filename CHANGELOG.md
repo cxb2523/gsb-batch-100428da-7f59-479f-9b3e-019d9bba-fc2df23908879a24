@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `partial=True` on `download_google_trends_rss_batch` and
+  `download_google_trends_rss_batch_async` settles each region independently:
+  successes keep their data, failures are recorded per geo as
+  `{"ok": False, "error": "<ExceptionClassName>", "message": "<text>"}` and
+  successes as `{"ok": True, "data": ...}` (the `NormalizedEnvelope` when
+  `normalize=True`). One region failing no longer loses the rest; an invalid
+  geo code is recorded as a failed item. The default is unchanged — the first
+  error still raises the original exception. The async batch still honors
+  `max_concurrent`, does not cancel in-flight regions on one failure, and keeps
+  already-completed successes.
+
 ## [1.9.0] - 2026-10-02
 
 pytrends code runs on trendspyg after changing its imports.

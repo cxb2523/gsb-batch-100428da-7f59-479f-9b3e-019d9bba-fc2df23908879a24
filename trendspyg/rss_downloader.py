@@ -63,6 +63,20 @@ def _rss_result(
     return _format_output(trends, output_format, include_images, include_articles)
 
 
+def _batch_success(data: Any) -> Dict[str, Any]:
+    """Wrap one batch item's data for partial=True settlement."""
+    return {"ok": True, "data": data}
+
+
+def _batch_failure(error: BaseException) -> Dict[str, Any]:
+    """Record one batch item's failure without hiding it.
+
+    ``error`` is the exception class name (e.g. ``DownloadError``), ``message``
+    its text — JSON-safe, so a partial batch can be logged or returned as-is.
+    """
+    return {"ok": False, "error": type(error).__name__, "message": str(error)}
+
+
 def _handle_http_error(status_code: int, geo: str, url: str) -> None:
     """
     Raise appropriate exception based on HTTP status code.
@@ -881,6 +895,7 @@ def download_google_trends_rss_batch(
     db_path: Optional[str] = None,
     *,
     cache: Union[bool, str] = True,
+    partial: bool = False,
 ) -> Dict[str, Union[List[Dict], Dict[str, Any]]]:
     """
     Download RSS trends for multiple countries/regions with progress tracking.
@@ -904,14 +919,22 @@ def download_google_trends_rss_batch(
                persistent caching across processes (same as a single-region call).
         db_path: Archive file (default: TRENDSPYG_DB env var, else the
                  platform data directory)
+        partial: If True, settle each geo independently instead of failing the
+                 whole batch. Every geo maps to either
+                 ``{"ok": True, "data": ...}`` or
+                 ``{"ok": False, "error": "<ExceptionClassName>", "message": "..."}``.
+                 A bad geo code is recorded as a failed item too. Default False
+                 keeps the fail-fast behaviour: the first error is raised.
 
     Returns:
         Dict mapping geo code to list of trends: {'US': [...], 'GB': [...]}
-        (or geo -> NormalizedEnvelope dict when normalize=True)
+        (or geo -> NormalizedEnvelope dict when normalize=True).
+        With ``partial=True`` each value is the ``{"ok": ...}`` settlement dict
+        described above.
 
     Raises:
-        InvalidParameterError: If any geo code is invalid
-        DownloadError: If any RSS fetch fails
+        InvalidParameterError: If any geo code is invalid (``partial=False``)
+        DownloadError: If any RSS fetch fails (``partial=False``)
 
     Examples:
         >>> # Fetch 5 countries with progress bar
@@ -926,6 +949,13 @@ def download_google_trends_rss_batch(
         ...     delay=0.5  # 0.5s between requests
         ... )
         Fetching trends: 100%|██████████| 125/125 [01:05<00:00, 1.9 geo/s]
+
+        >>> # Keep the successes even when one region fails
+        >>> results = download_google_trends_rss_batch(
+        ...     ['US', 'INVALID', 'GB'], partial=True
+        ... )
+        >>> results['US']['ok'], results['INVALID']['error']
+        (True, 'InvalidParameterError')
 
     Warning:
         Fetching many countries (>50) without delay may trigger Google rate limits.
@@ -956,18 +986,27 @@ def download_google_trends_rss_batch(
         iterator = tqdm(geos, desc="Fetching trends", unit="geo")
 
     for geo in iterator:
-        trends = download_google_trends_rss(
-            geo=geo,
-            output_format="dict",
-            include_images=include_images,
-            include_articles=include_articles,
-            max_articles_per_trend=max_articles_per_trend,
-            normalize=normalize,
-            cache=cache,
-            archive=archive,
-            db_path=db_path,
-        )
-        results[geo] = cast(Union[List[Dict], Dict[str, Any]], trends)
+        try:
+            trends = download_google_trends_rss(
+                geo=geo,
+                output_format="dict",
+                include_images=include_images,
+                include_articles=include_articles,
+                max_articles_per_trend=max_articles_per_trend,
+                normalize=normalize,
+                cache=cache,
+                archive=archive,
+                db_path=db_path,
+            )
+        except Exception as exc:
+            # partial=False keeps the original fail-fast contract: the first
+            # failing geo aborts the batch with its own exception type.
+            if not partial:
+                raise
+            results[geo] = _batch_failure(exc)
+        else:
+            settled = _batch_success(trends) if partial else trends
+            results[geo] = cast(Union[List[Dict], Dict[str, Any]], settled)
 
         # Optional delay between requests
         if delay > 0:
@@ -990,6 +1029,7 @@ async def download_google_trends_rss_batch_async(
     db_path: Optional[str] = None,
     *,
     cache: Union[bool, str] = True,
+    partial: bool = False,
 ) -> Dict[str, Union[List[Dict], Dict[str, Any]]]:
     """
     Download RSS trends for multiple countries/regions in parallel with progress.
@@ -1013,14 +1053,23 @@ async def download_google_trends_rss_batch_async(
                persistent caching across processes (same as a single-region call).
         db_path: Archive file (default: TRENDSPYG_DB env var, else the
                  platform data directory)
+        partial: If True, settle each geo independently instead of failing the
+                 whole batch. Every geo maps to either
+                 ``{"ok": True, "data": ...}`` or
+                 ``{"ok": False, "error": "<ExceptionClassName>", "message": "..."}``.
+                 A bad geo code is recorded as a failed item too. One region
+                 failing never cancels the others. Default False keeps the
+                 fail-fast behaviour: the first error is raised.
 
     Returns:
         Dict mapping geo code to list of trends: {'US': [...], 'GB': [...]}
-        (or geo -> NormalizedEnvelope dict when normalize=True)
+        (or geo -> NormalizedEnvelope dict when normalize=True).
+        With ``partial=True`` each value is the ``{"ok": ...}`` settlement dict
+        described above.
 
     Raises:
-        InvalidParameterError: If any geo code is invalid
-        DownloadError: If any RSS fetch fails
+        InvalidParameterError: If any geo code is invalid (``partial=False``)
+        DownloadError: If any RSS fetch fails (``partial=False``)
         ImportError: If aiohttp is not installed
 
     Examples:
@@ -1040,6 +1089,15 @@ async def download_google_trends_rss_batch_async(
         ...     )
         ... )
         Fetching trends: 100%|██████████| 125/125 [00:03<00:00, 38.5 geo/s]
+
+        >>> # Keep the successes even when one region fails
+        >>> results = asyncio.run(
+        ...     download_google_trends_rss_batch_async(
+        ...         ['US', 'GB', 'INVALID'], partial=True
+        ...     )
+        ... )
+        >>> sorted(geo for geo, r in results.items() if not r['ok'])
+        ['INVALID']
 
     Performance:
         - 5 countries: ~0.3 seconds (vs ~1s sync)
@@ -1081,19 +1139,27 @@ async def download_google_trends_rss_batch_async(
 
     async def fetch_one(session: "aiohttp.ClientSession", geo: str) -> tuple:
         async with semaphore:
-            trends = await download_google_trends_rss_async(
-                geo=geo,
-                output_format="dict",
-                include_images=include_images,
-                include_articles=include_articles,
-                max_articles_per_trend=max_articles_per_trend,
-                session=session,
-                normalize=normalize,
-                cache=cache,
-                archive=archive,
-                db_path=db_path,
-            )
-            return geo, trends
+            try:
+                trends = await download_google_trends_rss_async(
+                    geo=geo,
+                    output_format="dict",
+                    include_images=include_images,
+                    include_articles=include_articles,
+                    max_articles_per_trend=max_articles_per_trend,
+                    session=session,
+                    normalize=normalize,
+                    cache=cache,
+                    archive=archive,
+                    db_path=db_path,
+                )
+            except Exception as exc:
+                # partial=False re-raises inside the task, exactly as before.
+                # partial=True settles this geo as a failure and lets the other
+                # tasks keep running — the semaphore is released either way.
+                if not partial:
+                    raise
+                return geo, _batch_failure(exc)
+            return geo, _batch_success(trends) if partial else trends
 
     async with aiohttp.ClientSession() as session:
         tasks = [fetch_one(session, geo) for geo in geos]

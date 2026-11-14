@@ -205,7 +205,8 @@ def download_google_trends_rss_batch(
     archive: bool = False,
     db_path: Optional[str] = None,
     *,
-    cache: Union[bool, str] = True
+    cache: Union[bool, str] = True,
+    partial: bool = False
 ) -> Dict[str, Union[List[Dict], Dict]]
 ```
 
@@ -217,10 +218,11 @@ def download_google_trends_rss_batch(
 | `show_progress` | `bool` | `True` | Show tqdm progress bar |
 | `delay` | `float` | `0.0` | Delay between requests (seconds) |
 | `normalize` | `bool` | `False` | Each geo maps to a `NormalizedEnvelope` instead of a trend list |
+| `partial` | `bool` | `False` | Settle each geo independently: every geo maps to `{"ok": True, "data": ...}` or `{"ok": False, "error": ..., "message": ...}` |
 
 **Caching/archive:** `cache=True` uses memory; `False` fetches fresh; `"disk"` persists across processes. `archive=True` records fresh observations in `db_path` (or `TRENDSPYG_DB`). Cached reads retain their original timestamps and do not add history.
 
-**Returns:** `Dict[str, List[Dict]]` - Dictionary mapping geo codes to trends (or geo to `NormalizedEnvelope` when `normalize=True`)
+**Returns:** `Dict[str, List[Dict]]` - Dictionary mapping geo codes to trends (or geo to `NormalizedEnvelope` when `normalize=True`). With `partial=True`, each value is the settlement dict described above; `error` is the exception class name and `message` its text. An invalid geo code is recorded as a failed item too.
 
 **Example:**
 
@@ -236,6 +238,14 @@ results = download_google_trends_rss_batch(
 
 for country, trends in results.items():
     print(f"{country}: {len(trends)} trends")
+
+# Keep the regions that answered when one fails
+results = download_google_trends_rss_batch(['US', 'GB', 'INVALID'], partial=True)
+for geo, outcome in results.items():
+    if outcome["ok"]:
+        print(geo, len(outcome["data"]))
+    else:
+        print(geo, outcome["error"], outcome["message"])
 ```
 
 ---
@@ -256,7 +266,8 @@ async def download_google_trends_rss_batch_async(
     archive: bool = False,
     db_path: Optional[str] = None,
     *,
-    cache: Union[bool, str] = True
+    cache: Union[bool, str] = True,
+    partial: bool = False
 ) -> Dict[str, Union[List[Dict], Dict]]
 ```
 
@@ -268,6 +279,11 @@ async def download_google_trends_rss_batch_async(
 | `show_progress` | `bool` | `True` | Show tqdm progress bar |
 | `max_concurrent` | `int` | `10` | Maximum concurrent requests |
 | `normalize` | `bool` | `False` | Each geo maps to a `NormalizedEnvelope` instead of a trend list |
+| `partial` | `bool` | `False` | Settle each geo independently: every geo maps to `{"ok": True, "data": ...}` or `{"ok": False, "error": ..., "message": ...}` |
+
+With `partial=True`, one region failing never cancels the requests already in
+flight and `max_concurrent` still caps concurrency; completed successes are
+kept. An invalid geo code is recorded as a failed item too.
 
 **Example:**
 
@@ -283,6 +299,11 @@ async def main():
     return results
 
 all_trends = asyncio.run(main())
+
+# Or keep partial results and the per-region failure reasons
+results = await download_google_trends_rss_batch_async(
+    ['US', 'GB', 'INVALID'], partial=True
+)
 ```
 
 ---

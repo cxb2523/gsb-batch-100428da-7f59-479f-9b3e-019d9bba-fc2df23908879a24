@@ -192,6 +192,17 @@ async def main():
 asyncio.run(main())
 ```
 
+Pass `partial=True` to keep the regions that succeeded when one request fails:
+
+```python
+results = asyncio.run(
+    download_google_trends_rss_batch_async(['US', 'GB', 'INVALID'], partial=True)
+)
+# {'US': {'ok': True, 'data': [...]},
+#  'GB': {'ok': True, 'data': [...]},
+#  'INVALID': {'ok': False, 'error': 'InvalidParameterError', 'message': '...'}}
+```
+
 ### CLI
 
 ```bash

@@ -202,6 +202,11 @@ results = asyncio.run(
 # drop normalize=True to get dict[str, list[Trend]] instead
 ```
 
+Pass `partial=True` (sync or async batch) to settle each region independently:
+`{'US': {'ok': True, 'data': ...}, 'GB': {'ok': False, 'error': 'DownloadError',
+'message': ...}}`. An invalid geo code becomes a failed item too; the default
+still raises on the first error.
+
 ### Sort by volume
 
 ```python
