@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import calendar
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -114,6 +115,33 @@ CREATE TABLE IF NOT EXISTS ricequant_history_chunks (
 """
 
 
+# Per-day outcome values recorded by RiceQuantHistoryRunner.
+OUTCOME_SKIPPED = "skipped"
+OUTCOME_SUCCESS = "success"
+OUTCOME_EMPTY = "empty"
+OUTCOME_FAILED = "failed"
+
+
+@dataclass
+class DayOutcome:
+    """Auditable per-trading-day outcome of a history backfill run.
+
+    Emitted by RiceQuantHistoryRunner when an outcome_recorder is supplied.
+    `outcome` is one of OUTCOME_SKIPPED / OUTCOME_SUCCESS / OUTCOME_EMPTY /
+    OUTCOME_FAILED. `error` carries the exception message on failure;
+    `reason` explains skips. rows/symbols/parquet_size describe the written
+    partition for successful days.
+    """
+
+    trade_date: str
+    outcome: str
+    rows: int = 0
+    symbols: int = 0
+    parquet_size: int = 0
+    error: str | None = None
+    reason: str | None = None
+
+
 class RiceQuantHistoryManifest:
     """Tracks historical sync state in a DuckDB database."""
 
@@ -217,6 +245,25 @@ class RiceQuantHistoryManifest:
             return False
         return row[0] in ("success", "skipped")
 
+    def list_days(self, start_date: str, end_date: str) -> list[dict]:
+        """Return recorded day outcomes in [start_date, end_date], ordered by date.
+
+        Each entry is a dict of the ricequant_history_days columns (trade_date,
+        status, rows, symbols, parquet_size, error, reason, ...). Days with no
+        record are simply absent, so callers can spot the first day without a
+        terminal record and resume the backfill from there.
+        """
+        rows = self._conn.execute(
+            """
+            SELECT * FROM ricequant_history_days
+            WHERE trade_date BETWEEN ? AND ?
+            ORDER BY trade_date
+            """,
+            [start_date, end_date],
+        ).fetchall()
+        cols = [desc[0] for desc in self._conn.description]
+        return [dict(zip(cols, row)) for row in rows]
+
     def close(self) -> None:
         self._conn.close()
 
@@ -245,6 +292,7 @@ class RiceQuantHistoryRunner:
         data_dir: Path,
         notifier,
         get_quota=None,
+        outcome_recorder=None,
     ) -> None:
         self._pipeline = pipeline
         self._manifest = manifest
@@ -252,6 +300,7 @@ class RiceQuantHistoryRunner:
         self._data_dir = Path(data_dir)
         self._notifier = notifier
         self._get_quota = get_quota
+        self._outcome_recorder = outcome_recorder
         self._store = DailyPartitionStore(
             self._data_dir / "ricequant" / "stock_minute"
         )
@@ -313,6 +362,22 @@ class RiceQuantHistoryRunner:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _emit_outcome(self, outcome: DayOutcome) -> None:
+        """Forward a per-day outcome to the optional recorder.
+
+        No-op when no recorder was supplied, keeping the default behavior
+        identical to before. The recorder may be a callable taking the
+        DayOutcome, or an object exposing a `record(outcome)` method.
+        """
+        recorder = self._outcome_recorder
+        if recorder is None:
+            return
+        record = getattr(recorder, "record", None)
+        if callable(record):
+            record(outcome)
+        else:
+            recorder(outcome)
+
     def _run_pipeline_silently(self, trade_date: str) -> None:
         runtime = getattr(self._pipeline, "_runtime", None)
         if runtime is None or not hasattr(runtime, "notifier"):
@@ -336,6 +401,11 @@ class RiceQuantHistoryRunner:
         """Sync a single trading day.  Returns True if the caller should stop."""
         # Skip if already recorded in manifest
         if self._manifest.is_day_done(trade_date):
+            self._emit_outcome(DayOutcome(
+                trade_date=trade_date,
+                outcome=OUTCOME_SKIPPED,
+                reason="already recorded in manifest",
+            ))
             return False
 
         # Skip if parquet partition exists and has rows
@@ -344,6 +414,11 @@ class RiceQuantHistoryRunner:
             if len(df) > 0:
                 logger.info(f"跳过 {trade_date}: existing partition")
                 self._manifest.record_day_skipped(trade_date, "existing partition")
+                self._emit_outcome(DayOutcome(
+                    trade_date=trade_date,
+                    outcome=OUTCOME_SKIPPED,
+                    reason="existing partition",
+                ))
                 return False
 
         logger.info(f"开始同步 {trade_date}")
@@ -376,6 +451,11 @@ class RiceQuantHistoryRunner:
             logger.error(f"放弃 {trade_date}: {last_error}")
             self._manifest.record_day_failure(trade_date, str(last_error))
             self._notifier.notify_error("ricequant_history", f"{trade_date}: {last_error}")
+            self._emit_outcome(DayOutcome(
+                trade_date=trade_date,
+                outcome=OUTCOME_FAILED,
+                error=str(last_error),
+            ))
             return False
 
         # Collect parquet stats
@@ -392,6 +472,9 @@ class RiceQuantHistoryRunner:
 
         # Log quota after and check stop conditions
         bytes_used_after = bytes_used_before
+        # A day the pipeline completed without producing rows is "empty";
+        # the manifest still records it as success per existing rules.
+        day_outcome = OUTCOME_SUCCESS if rows > 0 else OUTCOME_EMPTY
         if self._get_quota is not None:
             used, remaining = self._get_quota()
             bytes_used_after = used
@@ -403,6 +486,10 @@ class RiceQuantHistoryRunner:
                     trade_date, rows, symbols, parquet_size,
                     bytes_used_before, bytes_used_after, elapsed,
                 )
+                self._emit_outcome(DayOutcome(
+                    trade_date=trade_date, outcome=day_outcome,
+                    rows=rows, symbols=symbols, parquet_size=parquet_size,
+                ))
                 logger.info(f"完成 {trade_date}")
                 return True
 
@@ -412,6 +499,10 @@ class RiceQuantHistoryRunner:
                     trade_date, rows, symbols, parquet_size,
                     bytes_used_before, bytes_used_after, elapsed,
                 )
+                self._emit_outcome(DayOutcome(
+                    trade_date=trade_date, outcome=day_outcome,
+                    rows=rows, symbols=symbols, parquet_size=parquet_size,
+                ))
                 logger.info(f"完成 {trade_date}")
                 return True
 
@@ -419,5 +510,9 @@ class RiceQuantHistoryRunner:
             trade_date, rows, symbols, parquet_size,
             bytes_used_before, bytes_used_after, elapsed,
         )
+        self._emit_outcome(DayOutcome(
+            trade_date=trade_date, outcome=day_outcome,
+            rows=rows, symbols=symbols, parquet_size=parquet_size,
+        ))
         logger.info(f"完成 {trade_date}")
         return False

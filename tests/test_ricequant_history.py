@@ -8,7 +8,12 @@ import pyarrow.parquet as pq
 import pytest
 from loguru import logger
 
+from zer0share.storage import DailyPartitionStore
 from zer0share.sync.ricequant_history import (
+    OUTCOME_EMPTY,
+    OUTCOME_FAILED,
+    OUTCOME_SKIPPED,
+    OUTCOME_SUCCESS,
     RiceQuantHistoryManifest,
     RiceQuantHistoryRunner,
     month_chunks,
@@ -229,3 +234,181 @@ def test_runner_stops_when_quota_exceeded(tmp_path):
     # After day 2 remaining=1G < stop_remaining_below=2G → runner stops
     # Both days were processed (pipeline called twice before stop check triggered after day 2)
     assert call_count["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Per-day outcome recording
+# ---------------------------------------------------------------------------
+
+class _SequencePipeline:
+    """Fake pipeline whose per-day behavior is scripted by `behaviors`.
+
+    behaviors maps trade_date -> ("write", df) | ("empty",) | ("raise", msg).
+    """
+
+    def __init__(self, data_dir: Path, behaviors: dict):
+        self._store = DailyPartitionStore(
+            Path(data_dir) / "ricequant" / "stock_minute"
+        )
+        self._behaviors = behaviors
+        self.calls: list[str] = []
+
+    def run(self, table_name, start_date, end_date):
+        self.calls.append(start_date)
+        behavior = self._behaviors[start_date]
+        if behavior[0] == "write":
+            self._store.write(start_date, behavior[1])
+        elif behavior[0] == "raise":
+            raise RuntimeError(behavior[1])
+        # "empty": fetch succeeds but produces nothing to persist
+
+
+def _two_symbol_df(trade_date: str) -> pd.DataFrame:
+    return pd.DataFrame({
+        "order_book_id": ["000001.XSHG", "600000.XSHG"],
+        "trade_date": [trade_date, trade_date],
+    })
+
+
+def test_runner_records_per_day_outcomes_across_mixed_sequence(tmp_path):
+    """skip / success / empty / failure / success-after-failure, all auditable."""
+    days = ["20260504", "20260505", "20260506", "20260507", "20260508"]
+
+    # Day 1: partition already exists on disk → skipped
+    _write_parquet_partition(tmp_path, days[0], rows=1)
+
+    pipeline = _SequencePipeline(tmp_path, {
+        days[1]: ("write", _two_symbol_df(days[1])),   # success
+        days[2]: ("empty",),                            # empty result
+        days[3]: ("raise", "boom"),                     # keeps failing
+        days[4]: ("write", _two_symbol_df(days[4])),    # success after failure
+    })
+
+    manifest = RiceQuantHistoryManifest(tmp_path / "meta.duckdb")
+    calendar = MagicMock()
+    calendar.get_trading_days.return_value = days
+    notifier = MagicMock()
+
+    outcomes = []
+    runner = RiceQuantHistoryRunner(
+        pipeline=pipeline,
+        manifest=manifest,
+        calendar=calendar,
+        data_dir=tmp_path,
+        notifier=notifier,
+        outcome_recorder=outcomes.append,
+    )
+    runner.run(days[0], days[-1], retries=2)
+
+    # Every trading day produced exactly one outcome, in calendar order —
+    # including the days after the failed one.
+    assert [o.trade_date for o in outcomes] == days
+    assert [o.outcome for o in outcomes] == [
+        OUTCOME_SKIPPED, OUTCOME_SUCCESS, OUTCOME_EMPTY,
+        OUTCOME_FAILED, OUTCOME_SUCCESS,
+    ]
+
+    skipped, success, empty, failed, after = outcomes
+    assert skipped.reason == "existing partition"
+
+    assert success.rows == 2
+    assert success.symbols == 2
+    assert success.parquet_size > 0
+
+    assert empty.rows == 0
+
+    assert "boom" in failed.error
+
+    assert after.rows == 2
+
+    # The failing day was retried per the configured retry count.
+    assert pipeline.calls.count(days[3]) == 2
+    # The original failure notification is still sent.
+    notifier.notify_error.assert_called_once()
+    assert notifier.notify_error.call_args[0][0] == "ricequant_history"
+    assert days[3] in notifier.notify_error.call_args[0][1]
+
+    # Manifest records agree with the emitted outcomes.
+    assert manifest.get_day(days[0])["status"] == "skipped"
+    row = manifest.get_day(days[1])
+    assert row["status"] == "success"
+    assert row["rows"] == 2
+    assert row["symbols"] == 2
+    row = manifest.get_day(days[2])
+    assert row["status"] == "success"  # empty days keep existing manifest rules
+    assert row["rows"] == 0
+    row = manifest.get_day(days[3])
+    assert row["status"] == "failed"
+    assert "boom" in row["error"]
+    assert manifest.get_day(days[4])["status"] == "success"
+
+    # Range query returns every recorded day in order...
+    recorded = manifest.list_days(days[0], days[-1])
+    assert [r["trade_date"] for r in recorded] == days
+    # ...and can be narrowed to a sub-range.
+    assert [r["trade_date"] for r in manifest.list_days(days[3], days[4])] == days[3:]
+
+    # The failed day is locatable as the first day without a terminal record,
+    # i.e. where a rerun should resume.
+    resume_from = next(
+        r["trade_date"] for r in recorded
+        if r["status"] not in ("success", "skipped")
+    )
+    assert resume_from == days[3]
+
+
+def test_runner_without_outcome_recorder_behaves_as_before(tmp_path):
+    """Omitting outcome_recorder: same manifest writes, no extra side effects."""
+    pipeline = _SequencePipeline(tmp_path, {
+        "20260506": ("write", _two_symbol_df("20260506")),
+        "20260507": ("raise", "boom"),
+    })
+
+    manifest = RiceQuantHistoryManifest(tmp_path / "meta.duckdb")
+    calendar = MagicMock()
+    calendar.get_trading_days.return_value = ["20260506", "20260507"]
+    notifier = MagicMock()
+
+    runner = RiceQuantHistoryRunner(
+        pipeline=pipeline,
+        manifest=manifest,
+        calendar=calendar,
+        data_dir=tmp_path,
+        notifier=notifier,
+    )
+    runner.run("20260506", "20260507", retries=1)
+
+    assert manifest.get_day("20260506")["status"] == "success"
+    assert manifest.get_day("20260507")["status"] == "failed"
+    notifier.notify_error.assert_called_once()
+
+
+def test_runner_accepts_recorder_object_with_record_method(tmp_path):
+    """The recorder may also be an object exposing record(outcome)."""
+
+    class CollectingRecorder:
+        def __init__(self):
+            self.outcomes = []
+
+        def record(self, outcome):
+            self.outcomes.append(outcome)
+
+    recorder = CollectingRecorder()
+    pipeline = _SequencePipeline(tmp_path, {
+        "20260506": ("write", _two_symbol_df("20260506")),
+    })
+    manifest = RiceQuantHistoryManifest(tmp_path / "meta.duckdb")
+    calendar = MagicMock()
+    calendar.get_trading_days.return_value = ["20260506"]
+
+    runner = RiceQuantHistoryRunner(
+        pipeline=pipeline,
+        manifest=manifest,
+        calendar=calendar,
+        data_dir=tmp_path,
+        notifier=MagicMock(),
+        outcome_recorder=recorder,
+    )
+    runner.run("20260506", "20260506")
+
+    assert [o.outcome for o in recorder.outcomes] == [OUTCOME_SUCCESS]
