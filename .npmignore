@@ -1,0 +1,17 @@
+# directories
+.github/
+.vscode/
+coverage/
+src/
+test/
+
+# hidden configs
+.editorconfig
+.gitignore
+
+# configs
+babel.config.js
+biome.json
+jest.config.js
+tsconfig.json
+yarn-error.log
