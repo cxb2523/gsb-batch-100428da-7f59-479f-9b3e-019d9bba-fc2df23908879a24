@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+server.out.log
+server.err.log
+.venv/
+venv/
+.venv-win/
+dist/
+build/
+
+# 工具链
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# 本地 issue tracker（个人工作区，不入库）
+.scratch/
+
+# 本地配置实例（只允许 examples/ 下的占位符样例入库）
+config.toml
+*.local.toml
+.env
+!examples/config.toml
+!examples/*.local.toml
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
