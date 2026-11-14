@@ -604,6 +604,15 @@ seletores = tracktab.seletores("data/input/tracktab_exemplo.json", "relativo")
 # {"nome": "//div[@id='...']", ...}
 ```
 
+Nomes repetidos no export mantêm o **primeiro** elemento; para inspecionar os
+ignorados use `tracktab.carregar_detalhado(...)` / `tracktab.combinar_detalhado(...)`
+(propriedades `conflitos`, `duplicados` e `lidos`). `seletores()` e `buscar()`
+omitem elementos sem o seletor pedido (nome em `resultado.ausentes`) e marcam
+os repetidos (`resultado.duplicados`); `obter()` levanta `ErroElementoAusente`,
+`ErroNomeDuplicado` ou `ErroSeletorIndisponivel` conforme a causa — nunca
+devolvem `""` para o Navegador. Com `estrito=True`, os problemas viram
+`ErroSeletores`.
+
 Enquanto não estiver na Chrome Web Store, carregue a pasta `tracktab/` em
 `chrome://extensions` (**Modo do desenvolvedor** → *Carregar sem compactação*).
 Para publicar (instalação de **1 clique**):

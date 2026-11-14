@@ -472,7 +472,7 @@ notificacoes.enviar_telegram(BOT_TOKEN, CHAT_ID, "Job concluído ✅")
 | `dados` (`core/rpa/dados.py`) | `renomear_colunas`, `remover_duplicados`, `preencher_vazios`, `substituir_valores`, `ordenar_df`, `selecionar_colunas`, `dividir_df`, `amostrar_df`, `resumo_estatistico`, `dataframe_para_markdown`, `tratar_datas`, `calcular_percentual`, `pivotar`, `derreter` |
 | `api` (`core/rpa/api.py`) | `ClienteAPI.api_patch/api_head/api_upload/api_download` + `api_put`, `api_delete`, `api_patch`, `api_upload`, `api_download` |
 | `email` (`core/rpa/email.py`) | `enviar_email(..., html=True, cc=, bcc=, responder_para=)`, `enviar_email_html`, `testar_smtp` |
-| `tracktab` (`core/rpa/tracktab.py`) | `obter`, `buscar`, `listar_nomes`, `para_lista`, `exportar_csv`, `resumo`, `combinar` |
+| `tracktab` (`core/rpa/tracktab.py`) | `obter`, `buscar`, `listar_nomes`, `para_lista`, `exportar_csv`, `resumo`, `combinar`, `carregar_detalhado`, `combinar_detalhado` |
 
 ### Navegador (novas ações em `core/rpa/browser.py`)
 

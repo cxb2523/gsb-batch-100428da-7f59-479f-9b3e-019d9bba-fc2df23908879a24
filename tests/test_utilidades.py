@@ -423,3 +423,204 @@ def test_tracktab(tmp_path):
         tracktab.obter(export, "Inexistente")
     with pytest.raises(ErroRPA):
         tracktab.combinar()
+
+
+def _escrever_export_tracktab(caminho, elementos):
+    caminho.write_text(
+        json.dumps(_export_tracktab(caminho.stem, elementos)),
+        encoding="utf-8",
+    )
+    return caminho
+
+
+def _elemento_tracktab(nome, relativo="", custom="", completo=""):
+    return {
+        "name": nome,
+        "tag": "input",
+        "text": "",
+        "fullXpath": completo,
+        "relativeXpath": relativo,
+        "customPath": custom,
+    }
+
+
+def test_tracktab_nome_repetido_mantem_primeiro_e_registra(tmp_path):
+    export = _escrever_export_tracktab(
+        tmp_path / "repetido.json",
+        [
+            _elemento_tracktab("Campo Busca", relativo="//input[@id='primeiro']"),
+            _elemento_tracktab("Campo Busca", relativo="//input[@id='segundo']"),
+            _elemento_tracktab("Campo Busca", relativo="//input[@id='terceiro']"),
+            _elemento_tracktab("Campo Senha", relativo="//input[@id='senha']"),
+        ],
+    )
+
+    # carregar continua sendo {nome: Elemento}, com o primeiro elemento.
+    elementos = tracktab.carregar(export)
+    assert list(elementos) == ["Campo Busca", "Campo Senha"]
+    assert elementos["Campo Busca"].relativo == "//input[@id='primeiro']"
+
+    # O rastro fica disponível de forma programática.
+    detalhado = tracktab.carregar_detalhado(export)
+    assert detalhado.elementos == elementos
+    assert detalhado.total_lido == 4
+    assert len(detalhado.lidos) == 4
+    assert detalhado.duplicados == {"Campo Busca": 2}
+    [conflito] = detalhado.conflitos
+    assert conflito.nome == "Campo Busca"
+    assert conflito.quantidade == 2
+    assert [item.relativo for item in conflito.ignorados] == [
+        "//input[@id='segundo']",
+        "//input[@id='terceiro']",
+    ]
+    assert detalhado.conflito_de("Campo Senha") is None
+
+    # listar_nomes/para_lista/resumo seguem olhando só os elementos mantidos,
+    # mas incluir_repetidos=True expõe uma entrada por ocorrência.
+    assert tracktab.listar_nomes(export) == ["Campo Busca", "Campo Senha"]
+    assert tracktab.listar_nomes(export, incluir_repetidos=True) == [
+        "Campo Busca",
+        "Campo Busca",
+        "Campo Busca",
+        "Campo Senha",
+    ]
+    assert len(tracktab.para_lista(export)) == 2
+    assert tracktab.resumo(export)["total"] == 2
+
+    # seletores entrega o primeiro e marca o conflito em vez de sobrescrever.
+    seletores = tracktab.seletores(export)
+    assert seletores == {
+        "Campo Busca": "//input[@id='primeiro']",
+        "Campo Senha": "//input[@id='senha']",
+    }
+    assert seletores.duplicados == ("Campo Busca",)
+    assert seletores.ausentes == ()
+    assert seletores.conflitos[0].ignorados[0].relativo == "//input[@id='segundo']"
+    with pytest.raises(tracktab.ErroSeletores):
+        tracktab.seletores(export, estrito=True)
+
+    # buscar também expõe o conflito.
+    resultado_busca = tracktab.buscar(export, "campo")
+    assert resultado_busca["Campo Busca"] == "//input[@id='primeiro']"
+    assert resultado_busca.duplicados == ("Campo Busca",)
+
+    # obter não devolve silenciosamente um seletor ambíguo.
+    with pytest.raises(tracktab.ErroNomeDuplicado) as erro:
+        tracktab.obter(export, "Campo Busca")
+    assert erro.value.nome == "Campo Busca"
+    assert erro.value.quantidade == 2
+    assert tracktab.obter(export, "Campo Busca", permitir_duplicado=True) == (
+        "//input[@id='primeiro']"
+    )
+    assert tracktab.obter(export, "Campo Senha") == "//input[@id='senha']"
+
+
+def test_tracktab_seletor_vazio_nao_vira_string_vazia(tmp_path):
+    export = _escrever_export_tracktab(
+        tmp_path / "sem-seletor.json",
+        [
+            _elemento_tracktab(
+                "Só Completo",
+                completo="/html/body/input",
+            ),
+            _elemento_tracktab(
+                "Só Custom",
+                custom="#custom",
+            ),
+            _elemento_tracktab("Sem Nada"),
+            _elemento_tracktab(
+                "Completo",
+                relativo="//input[@id='ok']",
+                completo="/html/body/input-ok",
+            ),
+        ],
+    )
+
+    # O elemento existe: não é "ausente", é "sem seletor do tipo".
+    with pytest.raises(tracktab.ErroSeletorIndisponivel) as erro:
+        tracktab.obter(export, "Só Completo")
+    assert erro.value.nome == "Só Completo"
+    assert erro.value.tipo == "relativo"
+    assert tracktab.obter(export, "Só Completo", "completo") == "/html/body/input"
+    assert tracktab.obter(export, "Só Custom", "custom") == "#custom"
+
+    with pytest.raises(tracktab.ErroSeletorIndisponivel):
+        tracktab.obter(export, "Sem Nada", "completo")
+
+    seletores = tracktab.seletores(export)
+    assert seletores == {"Completo": "//input[@id='ok']"}
+    assert seletores.ausentes == ("Só Completo", "Só Custom", "Sem Nada")
+    assert seletores.duplicados == ()
+    assert "" not in seletores.values()
+    with pytest.raises(tracktab.ErroSeletores) as erro:
+        tracktab.seletores(export, estrito=True)
+    assert set(erro.value.ausentes) == {"Só Completo", "Só Custom", "Sem Nada"}
+
+    # Para o tipo "completo", entram "Só Completo" e "Completo".
+    assert tracktab.seletores(export, "completo") == {
+        "Só Completo": "/html/body/input",
+        "Completo": "/html/body/input-ok",
+    }
+    assert tracktab.seletores(export, "completo").ausentes == ("Só Custom", "Sem Nada")
+    with pytest.raises(tracktab.ErroSeletorIndisponivel):
+        tracktab.obter(export, "Só Custom", "completo")
+
+    busca = tracktab.buscar(export, "só")
+    assert busca == {}
+    assert busca.ausentes == ("Só Completo", "Só Custom")
+    with pytest.raises(tracktab.ErroSeletores):
+        tracktab.buscar(export, "só", estrito=True)
+
+    # Nome realmente inexistente tem erro próprio, distinto dos demais.
+    with pytest.raises(tracktab.ErroElementoAusente):
+        tracktab.obter(export, "Não Existe")
+
+
+def test_tracktab_combinar_registra_conflito_entre_arquivos(tmp_path):
+    primeiro = _escrever_export_tracktab(
+        tmp_path / "pagina1.json",
+        [
+            _elemento_tracktab("Campo Login", relativo="//input[@id='login-1']"),
+            _elemento_tracktab("Campo Login", relativo="//input[@id='login-repetido']"),
+            _elemento_tracktab("Botão OK", relativo="//button[@id='ok']"),
+        ],
+    )
+    segundo = _escrever_export_tracktab(
+        tmp_path / "pagina2.json",
+        [
+            _elemento_tracktab("Campo Login", relativo="//input[@id='login-2']"),
+            _elemento_tracktab("Campo Busca", relativo="//input[@id='busca']"),
+        ],
+    )
+
+    combinado = tracktab.combinar(primeiro, segundo)
+    assert list(combinado) == ["Campo Login", "Botão OK", "Campo Busca"]
+    assert combinado["Campo Login"].relativo == "//input[@id='login-1']"
+    assert combinado["Botão OK"].relativo == "//button[@id='ok']"
+    assert combinado["Campo Busca"].relativo == "//input[@id='busca']"
+
+    detalhado = tracktab.combinar_detalhado(primeiro, segundo)
+    assert detalhado.elementos == combinado
+    assert detalhado.arquivos == (str(primeiro), str(segundo))
+    assert detalhado.duplicados == {"Campo Login": 2}
+
+    # Conflito interno (mesmo arquivo) e conflito entre arquivos são distinguíveis.
+    internos = [c for c in detalhado.conflitos if c.arquivo == c.mantido_em]
+    externos = [c for c in detalhado.conflitos if c.arquivo != c.mantido_em]
+    assert [(c.nome, c.arquivo_nome) for c in internos] == [("Campo Login", "pagina1.json")]
+    assert [(c.nome, c.arquivo_nome, c.mantido_em_nome) for c in externos] == [
+        ("Campo Login", "pagina2.json", "pagina1.json")
+    ]
+    assert externos[0].ignorados[0].relativo == "//input[@id='login-2']"
+    assert detalhado.total_lido == 5
+
+    # conflito_de devolve o primeiro registro; os dois conflitos de "Campo Login"
+    # continuam visíveis em conflitos para quem precisa decidir o que fazer.
+    assert detalhado.conflito_de("Campo Login") == internos[0]
+    assert [c.arquivo_nome for c in detalhado.conflitos if c.nome == "Campo Login"] == [
+        "pagina1.json",
+        "pagina2.json",
+    ]
+
+    with pytest.raises(ErroRPA):
+        tracktab.combinar_detalhado()
