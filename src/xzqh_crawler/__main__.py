@@ -19,6 +19,7 @@ DEFAULT_RETRY_ATTEMPTS = 5
 DEFAULT_RETRY_BASE_DELAY = 2.0
 DEFAULT_RETRY_MAX_DELAY = 60.0
 DEFAULT_REQUEST_INTERVAL = 0.2
+DEFAULT_LEASE_SECONDS = 600.0
 
 @dataclass(slots=True)
 class CliOptions:
@@ -30,6 +31,7 @@ class CliOptions:
     retry_base_delay: float = DEFAULT_RETRY_BASE_DELAY
     retry_max_delay: float = DEFAULT_RETRY_MAX_DELAY
     request_interval: float = DEFAULT_REQUEST_INTERVAL
+    lease_seconds: float = DEFAULT_LEASE_SECONDS
     log_level: str = "INFO"
     log_file: str | None = None
     output_format: str = "text"
@@ -47,7 +49,7 @@ def main() -> int:
     return 0 if success else 1
 
 async def _run(options: CliOptions, *, resume: bool) -> bool:
-    crawler = XzqhCrawler(db_path=options.db_path, base_url=options.base_url, request_timeout=options.request_timeout, max_concurrency=options.max_concurrency, retry_attempts=options.retry_attempts, retry_base_delay=options.retry_base_delay, retry_max_delay=options.retry_max_delay, request_interval=options.request_interval)
+    crawler = XzqhCrawler(db_path=options.db_path, base_url=options.base_url, request_timeout=options.request_timeout, max_concurrency=options.max_concurrency, retry_attempts=options.retry_attempts, retry_base_delay=options.retry_base_delay, retry_max_delay=options.retry_max_delay, request_interval=options.request_interval, lease_seconds=options.lease_seconds)
     success = await (crawler.retry_failed_jobs() if resume else crawler.crawl())
     if not success and options.output_format == "text":
         print("提示：可降低并发或使用 xzqh resume --database PATH 重试失败任务。", file=sys.stderr)
@@ -75,6 +77,7 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--retry-base-delay", type=float, default=DEFAULT_RETRY_BASE_DELAY, metavar="SECONDS")
     parser.add_argument("--retry-max-delay", type=float, default=DEFAULT_RETRY_MAX_DELAY, metavar="SECONDS")
     parser.add_argument("--request-interval", type=float, default=DEFAULT_REQUEST_INTERVAL, metavar="SECONDS")
+    parser.add_argument("--lease-seconds", type=float, default=DEFAULT_LEASE_SECONDS, metavar="SECONDS")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, metavar="URL")
     parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"), default="INFO")
     parser.add_argument("--log-file", metavar="PATH")
@@ -86,12 +89,12 @@ def _resolve_options(args: argparse.Namespace) -> CliOptions:
     for name in ("max_concurrency", "retry_attempts"):
         if getattr(args, name) < 1:
             raise SystemExit(f"xzqh: error: --{name.replace('_', '-')} must be greater than zero")
-    for name in ("request_timeout", "retry_base_delay", "retry_max_delay", "request_interval"):
+    for name in ("request_timeout", "retry_base_delay", "retry_max_delay", "request_interval", "lease_seconds"):
         if getattr(args, name) < 0:
             raise SystemExit(f"xzqh: error: --{name.replace('_', '-')} must not be negative")
     if args.retry_max_delay < args.retry_base_delay:
         raise SystemExit("xzqh: error: --retry-max-delay must be greater than or equal to --retry-base-delay")
-    return CliOptions(db_path=args.database, base_url=args.base_url, request_timeout=args.request_timeout, max_concurrency=args.max_concurrency, retry_attempts=args.retry_attempts, retry_base_delay=args.retry_base_delay, retry_max_delay=args.retry_max_delay, request_interval=args.request_interval, log_level="DEBUG" if args.verbose else args.log_level, log_file=args.log_file, output_format=args.output_format, quiet=args.quiet)
+    return CliOptions(db_path=args.database, base_url=args.base_url, request_timeout=args.request_timeout, max_concurrency=args.max_concurrency, retry_attempts=args.retry_attempts, retry_base_delay=args.retry_base_delay, retry_max_delay=args.retry_max_delay, request_interval=args.request_interval, lease_seconds=args.lease_seconds, log_level="DEBUG" if args.verbose else args.log_level, log_file=args.log_file, output_format=args.output_format, quiet=args.quiet)
 
 async def _print_status(db_path: str, output_format: str, *, heading: str | None = None) -> None:
     async with Database(db_path) as db:

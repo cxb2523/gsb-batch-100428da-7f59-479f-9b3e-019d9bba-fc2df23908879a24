@@ -21,6 +21,14 @@ logger = logging.getLogger(__name__)
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
 
+def _as_int(value: object) -> int:
+    """把接口返回的状态码宽松地转成整数；无法转换时视为正常。"""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 200
+
+
 @dataclass(slots=True)
 class BackoffController:
     """控制请求节奏并在远端错误高发时短暂冷却。"""
@@ -59,6 +67,14 @@ class BackoffController:
 
 class XzqhClientError(RuntimeError):
     """接口访问异常。"""
+
+
+class XzqhEmptyDataError(XzqhClientError):
+    """接口请求成功，但 `data` 为空。
+
+    上游对部分父节点会返回 200 且 `data` 为空，这表示该父节点下确实没有
+    下级数据，而不是请求失败，调用方应据此区分两种结果。
+    """
 
 
 class XzqhClient:
@@ -144,6 +160,7 @@ class XzqhClient:
 
         Raises:
             ValueError: 参数不合法。
+            XzqhEmptyDataError: 请求成功但 `data` 为空。
             XzqhClientError: 请求失败或响应格式错误。
         """
         if not code or not str(code).isdigit():
@@ -160,8 +177,19 @@ class XzqhClient:
             },
         )
         tree_data = payload.get("data")
-        if not isinstance(tree_data, dict) or not tree_data:
-            raise XzqhClientError("接口返回缺少 data 字段或 data 为空")
+        if tree_data is None or (isinstance(tree_data, dict) and not tree_data):
+            # 上游可能用 200 + `data: null` 表示“该节点下没有数据”，也可能
+            # 在 2xx HTTP 里用逻辑状态码表达错误。只有前者算空结果。
+            status = payload.get("status")
+            if status is not None and _as_int(status) >= 400:
+                raise XzqhClientError(
+                    f"接口返回逻辑错误状态: {status} {str(payload.get('message') or '')[:200]}"
+                )
+            raise XzqhEmptyDataError("接口返回缺少 data 字段或 data 为空")
+        if not isinstance(tree_data, dict):
+            raise XzqhClientError(
+                f"接口 data 字段不是对象: {type(tree_data).__name__}",
+            )
         return ApiDivisionNode.from_api_data(tree_data)
 
     async def fetch_township_tree(self, parent_code: str) -> ApiDivisionNode | None:
@@ -171,10 +199,12 @@ class XzqhClient:
             parent_code: 可作为 `maxLevel=4` 请求参数的父节点代码。
 
         Returns:
-            ApiDivisionNode | None: 请求成功时返回树节点；请求失败时返回 `None`。
+            ApiDivisionNode | None: 请求成功时返回树节点；若上游返回 200 但
+            `data` 为空（该父节点下确实没有乡级数据），返回 `None`。
 
         Raises:
             ValueError: 父节点代码格式不合法。
+            XzqhClientError: 请求失败（超时、重试耗尽的 5xx、非法 JSON 等）。
         """
         normalized = str(parent_code).strip()
         if not normalized.isdigit() or len(normalized) < 4:
@@ -182,19 +212,18 @@ class XzqhClient:
 
         try:
             return await self.fetch_tree(code=normalized, max_level=4)
-        except XzqhClientError as exc:
-            error_message = str(exc)
-            if error_message == "接口返回缺少 data 字段或 data 为空":
-                logger.debug("乡级数据为空: parent_code=%s", normalized)
-            else:
-                log_event(
-                    logger,
-                    logging.DEBUG,
-                    "task_request_failed",
-                    parent_code=normalized,
-                    error=error_message.split(":", 1)[0],
-                )
+        except XzqhEmptyDataError:
+            logger.debug("乡级数据为空: parent_code=%s", normalized)
             return None
+        except XzqhClientError as exc:
+            log_event(
+                logger,
+                logging.DEBUG,
+                "task_request_failed",
+                parent_code=normalized,
+                error=str(exc).split(":", 1)[0],
+            )
+            raise
 
     async def _request_json(
         self,

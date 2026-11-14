@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 import pytest
 from aiohttp import web
 
-from xzqh_crawler.client import XzqhClient, XzqhClientError
+from xzqh_crawler.client import XzqhClient, XzqhClientError, XzqhEmptyDataError
 
 
 @asynccontextmanager
@@ -99,8 +99,11 @@ async def test_client_retries_invalid_json(unused_tcp_port_factory):
 
 
 @pytest.mark.asyncio
-async def test_fetch_township_tree_returns_none_after_retries(unused_tcp_port_factory):
+async def test_fetch_township_tree_raises_after_retries_exhausted(unused_tcp_port_factory):
+    state = {"calls": 0}
+
     async def handler(_: web.Request) -> web.Response:
+        state["calls"] += 1
         return web.json_response({"status": 503, "message": "busy"}, status=503)
 
     app = web.Application()
@@ -112,10 +115,34 @@ async def test_fetch_township_tree_returns_none_after_retries(unused_tcp_port_fa
             request_timeout=3,
             retry_attempts=2,
             retry_base_delay=0.01,
+            retry_max_delay=0.01,
         ) as client:
-            tree = await client.fetch_township_tree("6202")
+            with pytest.raises(XzqhClientError, match="HTTP 503"):
+                await client.fetch_township_tree("6202")
 
-    assert tree is None
+    assert state["calls"] == 2
+
+
+@pytest.mark.asyncio
+async def test_fetch_township_tree_raises_for_invalid_json_after_retries(
+    unused_tcp_port_factory,
+):
+    async def handler(_: web.Request) -> web.Response:
+        return web.Response(text="{broken json", content_type="application/json")
+
+    app = web.Application()
+    app.router.add_get("/xzqh/getList", handler)
+
+    async with run_test_server(app, unused_tcp_port_factory()) as base_url:
+        async with XzqhClient(
+            base_url=base_url,
+            request_timeout=3,
+            retry_attempts=2,
+            retry_base_delay=0.01,
+            retry_max_delay=0.01,
+        ) as client:
+            with pytest.raises(XzqhClientError, match="响应不是合法 JSON"):
+                await client.fetch_township_tree("6202")
 
 
 @pytest.mark.asyncio
@@ -143,6 +170,48 @@ async def test_fetch_township_tree_logs_debug_without_traceback_for_empty_data(
     assert tree is None
     assert any("乡级数据为空" in record.message for record in caplog.records)
     assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_fetch_tree_raises_empty_data_error_for_empty_payload(
+    unused_tcp_port_factory,
+):
+    async def handler(_: web.Request) -> web.Response:
+        return web.json_response({"status": 200, "data": None})
+
+    app = web.Application()
+    app.router.add_get("/xzqh/getList", handler)
+
+    async with run_test_server(app, unused_tcp_port_factory()) as base_url:
+        async with XzqhClient(
+            base_url=base_url,
+            request_timeout=3,
+            retry_attempts=1,
+        ) as client:
+            with pytest.raises(XzqhEmptyDataError):
+                await client.fetch_tree(code="120104", max_level=4)
+
+
+@pytest.mark.asyncio
+async def test_fetch_township_tree_treats_logical_error_status_as_failure(
+    unused_tcp_port_factory,
+):
+    """HTTP 200 但 JSON 里 status>=400 且无 data，是失败而不是空结果。"""
+
+    async def handler(_: web.Request) -> web.Response:
+        return web.json_response({"status": 500, "message": "internal error"})
+
+    app = web.Application()
+    app.router.add_get("/xzqh/getList", handler)
+
+    async with run_test_server(app, unused_tcp_port_factory()) as base_url:
+        async with XzqhClient(
+            base_url=base_url,
+            request_timeout=3,
+            retry_attempts=1,
+        ) as client:
+            with pytest.raises(XzqhClientError, match="逻辑错误状态"):
+                await client.fetch_township_tree("110101")
 
 
 @pytest.mark.asyncio

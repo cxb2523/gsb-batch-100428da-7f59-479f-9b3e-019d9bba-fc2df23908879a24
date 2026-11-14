@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -26,12 +27,20 @@ class TaskWrite:
     last_error: str | None = None
 
 
+def _format_timestamp(moment: datetime) -> str:
+    """把 UTC 时间格式化为可直接按字符串比较的 ISO 时间串。"""
+    return moment.astimezone(UTC).isoformat()
+
+
 class Database:
     def __init__(self, db_path: str = "./data/xzqh.db") -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: aiosqlite.Connection | None = None
         self.run_id: str | None = None
+        # workers 会在抓取前把任务标记为 running，writer 同时用显式事务提交
+        # 结果；aiosqlite 共用一条连接，必须用锁避免语句交错进同一个事务。
+        self._write_lock = asyncio.Lock()
 
     async def __aenter__(self) -> Database:
         await self.open()
@@ -117,19 +126,42 @@ class Database:
                 row = await cursor.fetchone()
             previous_run_id = str(row["id"]) if row else None
         self.run_id = uuid.uuid4().hex
+        now = _format_timestamp(datetime.now(UTC))
         await conn.execute(
             "INSERT INTO crawl_runs(id, mode, source_version, status, started_at) VALUES (?, ?, ?, 'running', ?)",
-            (self.run_id, mode, source_version, datetime.now(UTC).isoformat()),
+            (self.run_id, mode, source_version, now),
         )
         if mode == "resume" and previous_run_id:
+            # 继承上一次运行的全部任务，使新运行的任务表是完整快照：
+            # - succeeded 原样继承，resume 不会再次请求它（包括成功的空结果）；
+            # - pending / failed 原样继承，继续待办；
+            # - running 且租约已过期（或未写租约）视为中断遗留，改回 pending；
+            # - running 且租约仍有效，保留 running 与租约，交给持有者处理，
+            #   resume 不会重复请求它。
             await conn.execute(
                 """
-                INSERT INTO crawl_tasks(run_id, parent_code, target_level, state, attempts, last_error)
-                SELECT ?, parent_code, target_level, state, attempts, last_error
+                INSERT INTO crawl_tasks(
+                    run_id, parent_code, target_level, state, attempts,
+                    last_error, started_at, lease_until
+                )
+                SELECT ?, parent_code, target_level,
+                       CASE
+                           WHEN state = 'running'
+                                AND (lease_until IS NULL OR lease_until <= ?)
+                           THEN 'pending'
+                           ELSE state
+                       END,
+                       attempts, last_error, started_at,
+                       CASE
+                           WHEN state = 'running'
+                                AND (lease_until IS NULL OR lease_until <= ?)
+                           THEN NULL
+                           ELSE lease_until
+                       END
                 FROM crawl_tasks
-                WHERE run_id = ? AND state IN ('pending', 'failed')
+                WHERE run_id = ? AND state IN ('pending', 'failed', 'running', 'succeeded')
                 """,
-                (self.run_id, previous_run_id),
+                (self.run_id, now, now, previous_run_id),
             )
         await conn.commit()
         return self.run_id
@@ -147,14 +179,15 @@ class Database:
 
     async def save_divisions(self, divisions: Sequence[Division]) -> int:
         conn = self._require_connection()
-        await conn.execute("BEGIN")
-        try:
-            saved = await self._upsert_divisions(divisions)
-            await conn.commit()
-            return saved
-        except Exception:
-            await conn.rollback()
-            raise
+        async with self._write_lock:
+            await conn.execute("BEGIN")
+            try:
+                saved = await self._upsert_divisions(divisions)
+                await conn.commit()
+                return saved
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def _upsert_divisions(self, divisions: Sequence[Division]) -> int:
         conn = self._require_connection()
@@ -225,23 +258,120 @@ class Database:
             rows = await cursor.fetchall()
         return [str(row["parent_code"]) for row in rows]
 
+    async def list_runnable_tasks(
+        self,
+        *,
+        states: Sequence[TaskState] = (TaskState.PENDING, TaskState.FAILED),
+    ) -> list[str]:
+        """列出当前可抓取的任务。
+
+        只返回处于待办状态、或已处于 running 但租约过期的任务。租约未过期的
+        running 任务说明另一个进程仍在处理，不应重复请求。
+
+        Args:
+            states: 视为待办的终态集合。
+
+        Returns:
+            list[str]: 按 `parent_code` 排序的父节点代码。
+        """
+        if self.run_id is None:
+            return []
+        conn = self._require_connection()
+        now = _format_timestamp(datetime.now(UTC))
+        placeholders = ",".join("?" for _ in states)
+        async with conn.execute(
+            f"""
+            SELECT parent_code FROM crawl_tasks
+            WHERE run_id = ?
+              AND (
+                  state IN ({placeholders})
+                  OR (state = 'running' AND (lease_until IS NULL OR lease_until <= ?))
+              )
+            ORDER BY parent_code
+            """,
+            [self.run_id, *(str(state) for state in states), now],
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [str(row["parent_code"]) for row in rows]
+
+    async def claim_task(
+        self,
+        parent_code: str,
+        target_level: DivisionLevel,
+        *,
+        lease_seconds: float,
+    ) -> bool:
+        """把任务从 pending/failed/过期 running 置为 running 并写入租约。
+
+        Args:
+            parent_code: 父节点代码。
+            target_level: 目标任务层级。
+            lease_seconds: 本次租约时长。
+
+        Returns:
+            bool: 是否成功认领。已被其他执行者持有有效租约时返回 `False`。
+        """
+        if self.run_id is None:
+            return False
+        conn = self._require_connection()
+        now = datetime.now(UTC)
+        lease_until = _format_timestamp(now + timedelta(seconds=lease_seconds))
+        async with self._write_lock:
+            cursor = await conn.execute(
+                """
+                UPDATE crawl_tasks
+                SET state = 'running',
+                    started_at = ?,
+                    lease_until = ?,
+                    updated_at = ?
+                WHERE run_id = ? AND parent_code = ? AND target_level = ?
+                  AND (
+                      state IN ('pending', 'failed')
+                      OR (state = 'running' AND (lease_until IS NULL OR lease_until <= ?))
+                  )
+                """,
+                (
+                    _format_timestamp(now),
+                    lease_until,
+                    _format_timestamp(now),
+                    self.run_id,
+                    parent_code,
+                    int(target_level),
+                    _format_timestamp(now),
+                ),
+            )
+            await conn.commit()
+            return cursor.rowcount > 0
+
     async def apply_task_write(self, write: TaskWrite) -> int:
         """在一个独立事务中写入一个任务结果。"""
         conn = self._require_connection()
-        await conn.execute("BEGIN")
-        try:
-            saved = 0
-            if write.state is TaskState.SUCCEEDED:
-                saved += await self._upsert_divisions(write.divisions)
-            await conn.execute(
-                "UPDATE crawl_tasks SET state = ?, attempts = attempts + 1, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE run_id = ? AND parent_code = ? AND target_level = ?",
-                (str(write.state), write.last_error, self.run_id, write.parent_code, int(write.target_level)),
-            )
-            await conn.commit()
-            return saved
-        except Exception:
-            await conn.rollback()
-            raise
+        async with self._write_lock:
+            await conn.execute("BEGIN")
+            try:
+                saved = 0
+                if write.state is TaskState.SUCCEEDED:
+                    saved += await self._upsert_divisions(write.divisions)
+                await conn.execute(
+                    """
+                    UPDATE crawl_tasks
+                    SET state = ?, attempts = attempts + 1, last_error = ?,
+                        lease_until = NULL, updated_at = CURRENT_TIMESTAMP
+                    WHERE run_id = ? AND parent_code = ? AND target_level = ?
+                    """,
+                    (
+                        str(write.state),
+                        write.last_error,
+                        self.run_id,
+                        write.parent_code,
+                        int(write.target_level),
+                    ),
+                )
+                await conn.commit()
+                return saved
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def apply_task_writes(self, writes: Sequence[TaskWrite]) -> int:
         """逐任务提交结果；每个任务使用独立事务。"""

@@ -70,6 +70,7 @@ uv run xzqh --help
 - `--retry-base-delay SECONDS`：指数退避基础延迟，默认 2
 - `--retry-max-delay SECONDS`：最大退避延迟，默认 60
 - `--request-interval SECONDS`：请求之间的最小间隔，默认 0.2
+- `--lease-seconds SECONDS`：任务租约时长，默认 600（用于中断续跑，见下）
 - `--log-level LEVEL`：`DEBUG/INFO/WARNING/ERROR`
 - `--log-file PATH`：写入日志文件
 - `--format text|json`：选择最终结果格式
@@ -90,6 +91,23 @@ uv run xzqh --help
   - `run_id, raw_code, raw_payload, reason, created_at`
 
 抓取运行、任务状态和被拒绝的脏数据分别记录，支持断点续跑、失败补抓和问题审计。
+
+## 任务状态与断点续跑
+
+`crawl_tasks.state` 的语义：
+
+- `pending`：等待抓取
+- `running`：已被某个执行者认领，`lease_until` 记录租约到期时间
+- `succeeded`：请求成功。**上游返回 200 但 `data` 为空也记为成功**——这表示该父节点下确实没有乡级数据，不会写入任何乡级记录，也不会写入 `division_rejections`
+- `failed`：请求真的失败（超时、重试耗尽的 5xx、非法 JSON 等），错误信息保留在 `last_error`
+
+`resume` 只重试 `pending` / `failed` 任务；`succeeded` 任务（包括空结果）不会再被请求。任务开始抓取时从 `pending` 置为 `running` 并写入 `lease_until`。进程中途退出后，再次 `resume` 时：
+
+- `running` 且租约已过期的任务会被重新纳入抓取；
+- `running` 且租约仍有效的任务视为仍被其他执行者持有，不会被重复请求；
+- 上一次运行的 `succeeded` 任务会继承到新运行中，便于计数。
+
+运行结束时若仍有 `pending` / `running` 任务，该次运行记为失败，需再次 `resume` 收尾。租约时长用 `--lease-seconds` 调整。
 
 ## 数据快照与结构兼容性
 
