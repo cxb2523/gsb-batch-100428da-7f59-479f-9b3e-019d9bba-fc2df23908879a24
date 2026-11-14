@@ -299,6 +299,7 @@ The following commands are available in the project:
 - `npm run link`: Test link extraction from a specific URL.
 - `npm run cases`: Run comprehensive validation test cases.
 - `npm run sand`: Use the testing sandbox.
+- `npm run sources`: Print the page fetch outcomes of the development mode sample sources, without any real request.
 
 ## Extending the Application
 
@@ -355,8 +356,8 @@ When running, you'll see a real-time status line with:
 ===[SETTINGS] Mode: PRODUCTION | Plan: STANDARD | Database: crawl | Drop: false | Long: true | Active Methods: LINKS,CRAWL===
 ===[GENERAL] Time: 00.00:00:12 [\] | Goal: MINUTES | Progress: 0/700 (00.00%) | Status: CRAWL | Restarts: 0===
 ===[PROCESS] Process: 1/10,000 | Page: 1/1 | Engine: Bing | Key: search term===
-===[LINK] Crawl: ✅  13 | Total: 40 | Filter: 27 | Error: 0 | Error In A Row: 0 | Current: 2/13===
-===[EMAIL ADDRESS] Save: ✅  0 | Total: 2 | Database: 15,915 | Exists: 1 | Invalid: ❌  0 | Valid Fix: 0 | Invalid Fix: 0 | Unsave: 0 | Filter: 0 | Skip: 0 | Gibberish: 0===
+===[LINK] Crawl: ✅  13 | Total: 40 | Filter: 27 | Error: 0 | Error In A Row: 0 | Current: 2/13 | Src OK: 4 | Src Timeout: 1 | Src Invalid: 0 | Src Empty: 0 | Src Last: success===
+===[EMAIL ADDRESS] Save: ✅  0 | Total: 2 | Database: 15,915 | Exists: 1 | Invalid: ❌  0 | Valid Fix: 0 | Invalid Fix: 0 | Unsave: 0 | Filter: 0 | Skip: 0 | Gibberish: 0 | Src OK: 6 | Src Timeout: 2 | Src Invalid: 1 | Src Empty: 0 | Src Last: timeout===
 ```
 
 - **SETTINGS**: Current mode and configuration
@@ -364,6 +365,50 @@ When running, you'll see a real-time status line with:
 - **PROCESS**: Process number, page number, search engine, search key
 - **LINK**: Link crawling statistics
 - **EMAIL ADDRESS**: Email collection statistics
+- **Src OK / Src Timeout / Src Invalid / Src Empty**: How many search engine pages (in LINK) and target pages (in EMAIL ADDRESS) ended with each fetch outcome. **Src Last** is the outcome of the most recent fetch.
+
+### Page Fetch Outcomes
+
+Every page fetch leaves an explicit outcome, so you can tell why a page did not produce data and whether it is worth retrying:
+
+| Outcome | Meaning |
+| --- | --- |
+| `success` | The page was fetched and its source is not empty. |
+| `timeout` | The request exceeded `MILLISECONDS_TIMEOUT_SOURCE_REQUEST_COUNT`. |
+| `invalidPage` | The page was reached but is not a valid page (blocked, captcha, error page). |
+| `emptySource` | The page was reached successfully but its source is empty. |
+
+`sourceService.getPageSource()` returns `{ isValidPage, pageSource, outcome }`. The original `isValidPage` and `pageSource` fields keep their original semantics. The two crawl services add each outcome to `applicationDataModel.crawlLinkDataModel` (search engine pages) and `applicationDataModel.crawlEmailAddressDataModel` (target pages) as `sourceSuccessCount`, `sourceTimeoutCount`, `sourceInvalidPageCount` and `sourceEmptySourceCount`, plus `sourceLastOutcome`. The same counters are visible in the console status line.
+
+A link that fails with a timeout is written to the error links file only once, even if it times out again.
+
+### Development Mode Sample Sources
+
+Development mode (`IS_PRODUCTION_MODE: false`) reads local TXT files instead of making real requests. Place them under `sources/`:
+
+```
+sources/
+├── engine/
+│   └── <engine name>/   # For example: bing
+│       ├── 01-success.txt
+│       ├── 02-timeout.txt
+│       ├── 03-invalid-page.txt
+│       └── 04-empty-source.txt
+└── page/
+    ├── 01-success.txt
+    ├── 02-timeout.txt
+    ├── 03-invalid-page.txt
+    └── 04-empty-source.txt
+```
+
+The outcome is derived from the file name, without any random value:
+
+- A file name that contains `timeout` produces a `timeout` outcome.
+- A file name that contains `invalid` produces an `invalidPage` outcome.
+- An empty file produces an `emptySource` outcome.
+- Any other non-empty file produces a `success` outcome.
+
+The files are read in sorted order and used in a round-robin order per source list, so each call gets a predictable file and every sample is exercised. Use this to verify the timeout / invalid / empty source statistics without touching the network.
 
 ## Troubleshooting
 

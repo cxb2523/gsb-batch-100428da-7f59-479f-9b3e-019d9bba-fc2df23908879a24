@@ -1,6 +1,6 @@
 const puppeteerExtra = require('puppeteer-extra');
 const pluginStealth = require('puppeteer-extra-plugin-stealth');
-const { ColorEnum, StatusEnum } = require('../../core/enums');
+const { ColorEnum, SourceOutcomeEnum, StatusEnum } = require('../../core/enums');
 const { crawlUtils, systemUtils } = require('../../utils');
 
 class PuppeteerService {
@@ -82,6 +82,7 @@ class PuppeteerService {
       const crawlResults = {
         isValidPage: true,
         pageSource: null,
+        outcome: SourceOutcomeEnum.SUCCESS,
       };
       try {
         await this.page.setUserAgent(userAgent);
@@ -90,10 +91,17 @@ class PuppeteerService {
           timeout: this.timeout,
         });
         crawlResults.pageSource = await this.page.content();
+        if (!crawlResults.pageSource || !crawlResults.pageSource.trim()) {
+          crawlResults.outcome = SourceOutcomeEnum.EMPTY_SOURCE;
+        }
         this.errorInARowCounter = 0;
       } catch (error) {
         this.errorInARowCounter += 1;
         crawlResults.isValidPage = false;
+        crawlResults.outcome =
+          error && error.name === 'TimeoutError'
+            ? SourceOutcomeEnum.TIMEOUT
+            : SourceOutcomeEnum.INVALID_PAGE;
       }
       if (this.isLinkCrawlTest) {
         await this.close();

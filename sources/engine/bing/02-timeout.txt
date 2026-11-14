@@ -1,0 +1,5 @@
+<html>
+  <body>
+    <p>This sample simulates a search engine page that never answered in time.</p>
+  </body>
+</html>

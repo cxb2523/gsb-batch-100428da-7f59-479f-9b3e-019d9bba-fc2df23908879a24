@@ -81,6 +81,7 @@
     "preload": "npm run pre_load && npm i & npm run delay & npm i",
     "sand": "node src/tests/sandBox.test.js",
     "session": "node src/tests/linksSession.test.js",
+    "sources": "node src/tests/sourceOutcomes.test.js",
     "start": "node src/monitor/monitor.js",
     "stop": "taskkill -f -im node.exe",
     "typos": "node src/tests/emailAddressTypos.test.js",

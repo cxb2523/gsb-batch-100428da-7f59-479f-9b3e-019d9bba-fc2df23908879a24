@@ -23,6 +23,7 @@ const SearchEngineModel = require('./files/SearchEngine.model');
 const SearchEngineStatusModel = require('./files/SearchEngineStatus.model');
 const SearchKeyModel = require('./files/SearchKey.model');
 const SearchProcessDataModel = require('./files/SearchProcessData.model');
+const SourceResultModel = require('./files/SourceResult.model');
 const TestDataModel = require('./files/TestData.model');
 const ValidationResultModel = require('./files/ValidationResult.model');
 const ValidEmailAddressModel = require('./files/ValidEmailAddress.model');
@@ -53,6 +54,7 @@ module.exports = {
   SearchEngineStatusModel,
   SearchKeyModel,
   SearchProcessDataModel,
+  SourceResultModel,
   TestDataModel,
   ValidationResultModel,
   ValidEmailAddressModel,

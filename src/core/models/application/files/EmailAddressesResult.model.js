@@ -13,6 +13,12 @@ class EmailAddressesResultModel {
     this.gibberishCount = 0;
     this.trendingSaveList = [];
     this.isValidPage = true;
+    // The fetch outcome of the target page of this crawl
+    // (success / timeout / invalidPage / emptySource).
+    this.sourceOutcome = null;
+    // Prevents counting the same outcome twice when the statistics are updated
+    // from more than one place.
+    this.isSourceOutcomeCounted = false;
   }
 }
 

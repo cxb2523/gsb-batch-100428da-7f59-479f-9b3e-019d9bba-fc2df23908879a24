@@ -1,0 +1,5 @@
+<html>
+  <body>
+    <p>This sample simulates a search engine that blocked the request or returned a captcha / error page.</p>
+  </body>
+</html>

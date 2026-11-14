@@ -20,6 +20,11 @@ Crawl - Count of: A link that was scanned to crawl from its email addresses.
 Total - Count of: A link that was found in the search engine source page.
 Filter - Count of: A link that was filtered by the list of filter domains, to NOT search on their source page.
 Current - Count of: current link from amount of total links to crawl during the specific page of the search engine source.
+Src OK - Count of: A search engine page that was fetched successfully (outcome: success).
+Src Timeout - Count of: A search engine page fetch that exceeded the request timeout (outcome: timeout).
+Src Invalid - Count of: A search engine page that was reached but is not a valid page, for example a blocked / captcha / error page (outcome: invalidPage).
+Src Empty - Count of: A search engine page that was reached successfully but its source is empty (outcome: emptySource).
+Src Last - The outcome of the most recent search engine page fetch.
 
 [EMAIL ADDRESS]
 Total - Count of: All the email addresses fetched from the page source, before any logic happens (duplicates included here) - Only from current session.
@@ -31,6 +36,7 @@ Valid Fix: - Count of: Valid email address that was invalid before and fixed suc
 Invalid Fix - Count of: Valid email address that was invalid and still invalid after a failure attempt to fix. Will not be saved to the database. Will be logged to a TXT file.
 Unsave - Count of: An email that failed to be saved to the database. Will be logged to a TXT file.
 Filter - Count of: An email address that was filtered from a domains list. Will not be saved to the database.
+Src OK / Src Timeout / Src Invalid / Src Empty / Src Last - The same fetch outcomes as in [LINK], for the target pages that are crawled from email addresses.
 
 [TRENDING]
 The trending list is a random email address that was saved to the database, to show the user and give indication that the application is active.

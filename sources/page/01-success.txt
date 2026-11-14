@@ -1,0 +1,9 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <h1>Contact page</h1>
+    <p>Office: office@example-alpha.co.il</p>
+    <p>Sales: sales@example-beta.co.il</p>
+    <p>Duplicate entry: office@example-alpha.co.il</p>
+  </body>
+</html>

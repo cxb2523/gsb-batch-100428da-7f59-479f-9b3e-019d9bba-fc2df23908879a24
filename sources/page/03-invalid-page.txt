@@ -1,0 +1,5 @@
+<html>
+  <body>
+    <p>This sample simulates a target page that was blocked or returned an error page.</p>
+  </body>
+</html>

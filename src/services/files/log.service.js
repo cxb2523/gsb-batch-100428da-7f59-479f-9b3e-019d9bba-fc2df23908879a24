@@ -3,6 +3,7 @@ const {
   LogStatusEnum,
   MethodEnum,
   PlaceholderEnum,
+  SourceOutcomeEnum,
   StatusIconEnum,
 } = require('../../core/enums');
 const { invalidEmailAddresses } = require('../../configurations');
@@ -37,6 +38,8 @@ class LogService {
     this.gibberishEmailAddressesPath = null;
     this.crawlLinksPath = null;
     this.crawlErrorLinksPath = null;
+    // Links that already failed with a timeout, so they are never written twice.
+    this.timeoutErrorLinksSet = new Set();
     this.frames = ['-', '\\', '|', '/'];
     this.i = 0;
     this.y = 0;
@@ -56,6 +59,8 @@ class LogService {
     this.mongoDatabaseDataModel = mongoDatabaseDataModel;
     this.countLimitDataModel = countLimitDataModel;
     this.pathDataModel = pathDataModel;
+    // Reset the timeout links cache, so a new session starts with a clean state.
+    this.timeoutErrorLinksSet = new Set();
     this.isLogs =
       this.logDataModel.isLogValidEmailAddresses ||
       this.logDataModel.isLogFixEmailAddresses ||
@@ -293,6 +298,16 @@ class LogService {
           Error: this.applicationDataModel.crawlLinkDataModel.errorCount,
           'Error In A Row': puppeteerService.errorInARowCounter,
           Current: link,
+          'Src OK':
+            this.applicationDataModel.crawlLinkDataModel.sourceSuccessCount,
+          'Src Timeout':
+            this.applicationDataModel.crawlLinkDataModel.sourceTimeoutCount,
+          'Src Invalid':
+            this.applicationDataModel.crawlLinkDataModel.sourceInvalidPageCount,
+          'Src Empty':
+            this.applicationDataModel.crawlLinkDataModel.sourceEmptySourceCount,
+          'Src Last':
+            this.applicationDataModel.crawlLinkDataModel.sourceLastOutcome,
         },
         {
           Save: saveEmailAddress,
@@ -315,6 +330,21 @@ class LogService {
           Skip: this.applicationDataModel.crawlEmailAddressDataModel.skipCount,
           Gibberish:
             this.applicationDataModel.crawlEmailAddressDataModel.gibberishCount,
+          'Src OK':
+            this.applicationDataModel.crawlEmailAddressDataModel
+              .sourceSuccessCount,
+          'Src Timeout':
+            this.applicationDataModel.crawlEmailAddressDataModel
+              .sourceTimeoutCount,
+          'Src Invalid':
+            this.applicationDataModel.crawlEmailAddressDataModel
+              .sourceInvalidPageCount,
+          'Src Empty':
+            this.applicationDataModel.crawlEmailAddressDataModel
+              .sourceEmptySourceCount,
+          'Src Last':
+            this.applicationDataModel.crawlEmailAddressDataModel
+              .sourceLastOutcome,
         },
         {
           '#': page,
@@ -356,6 +386,11 @@ class LogService {
           ColorEnum.RED,
           ColorEnum.RED,
           ColorEnum.CYAN,
+          ColorEnum.GREEN,
+          ColorEnum.YELLOW,
+          ColorEnum.RED,
+          ColorEnum.YELLOW,
+          ColorEnum.CYAN,
         ],
         [
           ColorEnum.GREEN,
@@ -369,6 +404,11 @@ class LogService {
           ColorEnum.MAGENTA,
           ColorEnum.YELLOW,
           ColorEnum.YELLOW,
+          ColorEnum.GREEN,
+          ColorEnum.YELLOW,
+          ColorEnum.RED,
+          ColorEnum.YELLOW,
+          ColorEnum.CYAN,
         ],
       ],
       nonNumericKeys: {},
@@ -495,7 +535,7 @@ class LogService {
   }
 
   async logLinks(links) {
-    if (links && this.logDataModel.isLogCrawlLinks) {
+    if (links && this.logDataModel && this.logDataModel.isLogCrawlLinks) {
       await fileUtils.appendFile({
         targetPath: this.crawlLinksPath,
         message: links,
@@ -503,13 +543,26 @@ class LogService {
     }
   }
 
-  async logErrorLink(link) {
-    if (link && this.logDataModel.isLogCrawlErrorLinks) {
-      await fileUtils.appendFile({
-        targetPath: this.crawlErrorLinksPath,
-        message: textUtils.addBreakLine(link),
-      });
+  async logErrorLink(link, outcome) {
+    if (
+      !link ||
+      !this.logDataModel ||
+      !this.logDataModel.isLogCrawlErrorLinks
+    ) {
+      return;
     }
+    // A link that failed with a timeout might be retried and time out again, but it
+    // should appear in the error links file only once.
+    if (outcome === SourceOutcomeEnum.TIMEOUT) {
+      if (this.timeoutErrorLinksSet.has(link)) {
+        return;
+      }
+      this.timeoutErrorLinksSet.add(link);
+    }
+    await fileUtils.appendFile({
+      targetPath: this.crawlErrorLinksPath,
+      message: textUtils.addBreakLine(link),
+    });
   }
 
   createFixResultTemplate(validationResultModel, icon) {

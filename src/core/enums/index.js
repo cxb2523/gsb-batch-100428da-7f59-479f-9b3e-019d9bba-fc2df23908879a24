@@ -12,6 +12,7 @@ const {
   SearchKeyGenderEnum,
   SearchKeyTypeEnum,
   SearchPlaceHolderEnum,
+  SourceOutcomeEnum,
   SourceTypeEnum,
 } = require('./files/search.enum');
 const {
@@ -46,6 +47,7 @@ module.exports = {
   SearchKeyGenderEnum,
   SearchKeyTypeEnum,
   SearchPlaceHolderEnum,
+  SourceOutcomeEnum,
   SourceTypeEnum,
   StatusEnum,
   StatusIconEnum,

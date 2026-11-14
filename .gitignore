@@ -48,10 +48,16 @@ coverage
 /.pnp
 .pnp.js
 
-# Sources.
-sources/
-/sources
-sources
+# Sources. Everything under it is ignored, except the small development mode sample
+# sources, so the timeout / invalid page / empty source outcomes can be reproduced
+# locally without any real request.
+sources/**
+/sources/**
+!sources/page/
+!sources/engine/
+!sources/page/*.txt
+!sources/engine/*/
+!sources/engine/*/*.txt
 
 # Misc.
 **/misc/backups/

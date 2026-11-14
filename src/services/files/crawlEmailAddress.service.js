@@ -7,6 +7,7 @@ const {
   GoalTypeEnum,
   LogStatusEnum,
   SaveStatusEnum,
+  SourceOutcomeEnum,
   SourceTypeEnum,
 } = require('../../core/enums');
 const {
@@ -31,6 +32,7 @@ class CrawlEmailAddressService {
     this.goalValue = 0;
     this.isSkipLogic = null;
     this.countLimitDataModel = null;
+    this.crawlEmailAddressDataModel = null;
   }
 
   initiate(data) {
@@ -41,6 +43,9 @@ class CrawlEmailAddressService {
         : null;
     this.isSkipLogic = applicationDataModel.isSkipLogic;
     this.countLimitDataModel = countLimitDataModel;
+    this.crawlEmailAddressDataModel = applicationDataModel
+      ? applicationDataModel.crawlEmailAddressDataModel
+      : null;
     // Initiate the common email address domains lists.
     this.initiateCommonEmailAddressDomains();
   }
@@ -72,6 +77,16 @@ class CrawlEmailAddressService {
     return this.goalValue ? this.goalValue === this.totalSaveCount : false;
   }
 
+  // Adds the target page fetch outcome to this crawl statistics. The result model is
+  // marked as counted, so a later statistics update won't count it twice.
+  updateSourceOutcome(emailAddressesResultModel) {
+    if (this.crawlEmailAddressDataModel) {
+      this.crawlEmailAddressDataModel.updateSourceOutcomeFromResult(
+        emailAddressesResultModel
+      );
+    }
+  }
+
   getEmailAddressesFromPage(data) {
     return new Promise(async (resolve, reject) => {
       if (reject) {
@@ -96,15 +111,24 @@ class CrawlEmailAddressService {
         linkData: linkData,
       });
       if (!pageResults) {
+        emailAddressesResultModel.isValidPage = false;
+        emailAddressesResultModel.sourceOutcome = SourceOutcomeEnum.TIMEOUT;
+        this.updateSourceOutcome(emailAddressesResultModel);
+        await logService.logErrorLink(
+          linkData.link,
+          SourceOutcomeEnum.TIMEOUT
+        );
         clearTimeout(abortTimeout);
         resolve(emailAddressesResultModel);
         return;
       }
-      const { isValidPage, pageSource } = pageResults;
-      if (!isValidPage) {
-        await logService.logErrorLink(linkData.link);
-      }
+      const { isValidPage, pageSource, outcome } = pageResults;
       emailAddressesResultModel.isValidPage = isValidPage;
+      emailAddressesResultModel.sourceOutcome = outcome;
+      this.updateSourceOutcome(emailAddressesResultModel);
+      if (!isValidPage) {
+        await logService.logErrorLink(linkData.link, outcome);
+      }
       // Get all the email addresses from the page source.
       let emailAddressesList = emailAddressUtils.getEmailAddresses(pageSource);
       if (!validationUtils.isExists(emailAddressesList)) {

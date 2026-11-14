@@ -1,0 +1,11 @@
+<!DOCTYPE html>
+<html>
+  <body>
+    <ul>
+      <li><a href="https://www.example-alpha.co.il/contact">Contact Alpha</a></li>
+      <li><a href="https://www.example-beta.co.il/about">About Beta</a></li>
+      <li><a href="https://www.example-alpha.co.il/contact">Duplicate Alpha</a></li>
+      <li><a href="https://www.example-beta.co.il/files/price-list.txt">Filtered TXT file</a></li>
+    </ul>
+  </body>
+</html>

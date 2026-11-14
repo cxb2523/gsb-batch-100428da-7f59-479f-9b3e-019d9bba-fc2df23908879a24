@@ -1,7 +1,11 @@
 const url = require('url');
 const axios = require('axios');
 const { LinksResultModel } = require('../../core/models/application');
-const { GoalTypeEnum, SourceTypeEnum } = require('../../core/enums');
+const {
+  GoalTypeEnum,
+  SourceOutcomeEnum,
+  SourceTypeEnum,
+} = require('../../core/enums');
 const {
   filterLinkDomains,
   filterLinkFileExtensions,
@@ -26,11 +30,15 @@ class CrawlLinkService {
     this.timeout = null;
     this.maximumURLValidationCount = null;
     this.millisecondsTimeoutURLValidation = null;
+    this.crawlLinkDataModel = null;
   }
 
   async initiate(data) {
     const { applicationDataModel, countLimitDataModel } = data;
     this.timeout = countLimitDataModel.millisecondsTimeoutSourceRequestCount;
+    this.crawlLinkDataModel = applicationDataModel
+      ? applicationDataModel.crawlLinkDataModel
+      : null;
     this.goalValue =
       applicationDataModel.goalType === GoalTypeEnum.LINKS
         ? applicationDataModel.goalValue
@@ -232,6 +240,20 @@ class CrawlLinkService {
     await logService.logLinks(logLinks);
   }
 
+  // Logs a failed link to the error links file. The log service itself makes sure a
+  // timeout link is never written more than once.
+  async logErrorLink(link, outcome) {
+    await logService.logErrorLink(link, outcome);
+  }
+
+  // Adds the search engine page fetch outcome to this crawl statistics. The result
+  // model is marked as counted, so a later statistics update won't count it twice.
+  updateSourceOutcome(linksResultModel) {
+    if (this.crawlLinkDataModel) {
+      this.crawlLinkDataModel.updateSourceOutcomeFromResult(linksResultModel);
+    }
+  }
+
   checkGoalComplete() {
     return this.goalValue ? this.goalValue === this.totalCrawlCount : false;
   }
@@ -278,17 +300,23 @@ class CrawlLinkService {
         },
       });
       if (!pageResults) {
+        linksResultModel.sourceOutcome = SourceOutcomeEnum.TIMEOUT;
+        linksResultModel.isValidPage = false;
+        this.updateSourceOutcome(linksResultModel);
         clearTimeout(abortTimeout);
         resolve(linksResultModel);
         return;
       }
-      const { isValidPage, pageSource } = pageResults;
+      const { isValidPage, pageSource, outcome } = pageResults;
+      linksResultModel.isValidPage = isValidPage;
+      linksResultModel.sourceOutcome = outcome;
+      this.updateSourceOutcome(linksResultModel);
       if (!isValidPage) {
-        await logService.logErrorLink(
-          searchProcessDataModel.searchEngineLinkTemplate
+        await this.logErrorLink(
+          searchProcessDataModel.searchEngineLinkTemplate,
+          outcome
         );
       }
-      linksResultModel.isValidPage = isValidPage;
       // Get all the links from the search engine source.
       let linksList = this.getLinks(pageSource);
       if (!validationUtils.isExists(linksList)) {

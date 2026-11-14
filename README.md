@@ -159,6 +159,7 @@ npm run session        # Test session with predefined links
 npm run generator      # Test email address generation
 npm run cases          # Run email validation test cases
 npm run sand           # General testing sandbox
+npm run sources        # Page fetch outcomes from the local sample sources
 ```
 
 ## Project Structure
@@ -196,6 +197,8 @@ crawler/
 │   ├── production/           # Production mode outputs
 │   └── development/          # Development mode outputs
 ├── sources/                  # Test sources for development mode
+│   ├── engine/               # Search engine page samples, one folder per engine
+│   └── page/                 # Target page samples
 ├── INSTRUCTIONS.md           # Detailed setup and usage guide
 ├── CONTRIBUTING.md           # Contribution guidelines
 └── package.json
@@ -370,6 +373,15 @@ Set `IS_PRODUCTION_MODE: false` in settings to:
 - Test without Puppeteer
 - Avoid rate limiting from search engines
 - Debug faster without network delays
+
+Development mode reads TXT files from `sources/engine/<engine name>/` (search engine pages) and `sources/page/` (target pages). The fetch outcome is derived from the file name, not from a random value:
+
+- `*timeout*.txt` → `timeout`
+- `*invalid*.txt` → `invalidPage`
+- an empty file → `emptySource`
+- any other file → `success`
+
+The sample set under `sources/` already contains one file per outcome, including an empty file, so the timeout / invalid page / empty source statistics can be verified without any network request. See [INSTRUCTIONS.md](INSTRUCTIONS.md#page-fetch-outcomes) for the outcome meanings and the console status line fields.
 
 ## Best Practices
 
