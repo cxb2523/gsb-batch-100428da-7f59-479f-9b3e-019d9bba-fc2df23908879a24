@@ -388,6 +388,8 @@ const result = await extract({
 });
 ```
 
+Lazy-loaded images are supported: when an image's `src` is missing or empty, the URL falls back to `data-src`, then `data-original`, then the first `srcset` candidate. Relative URLs are resolved against `sourceUrl` as usual, and the image is only dropped when no candidate holds a URL.
+
 ### URL Cleaning
 
 The library can clean URLs to remove tracking parameters and unnecessary components, producing cleaner and more readable links. This is particularly useful for e-commerce sites that add extensive tracking parameters:
@@ -439,7 +441,7 @@ Main function to extract structured data from content.
 | Option | Type | Description | Default |
 |--------|------|-------------|---------|
 | `extractMainHtml` | `boolean` | When enabled for HTML content, attempts to extract the main content area, removing navigation bars, headers, footers, sidebars etc. using heuristics. Should be kept off when extracting details about a single item. | `false` |
-| `includeImages` | `boolean` | When enabled, images in the HTML will be included in the markdown output. Enable this when you need to extract image URLs or related content. | `false` |
+| `includeImages` | `boolean` | When enabled, images in the HTML will be included in the markdown output. Enable this when you need to extract image URLs or related content. Lazy-loaded images are supported: when `src` is missing or empty, the URL falls back to `data-src`, then `data-original`, then the first `srcset` candidate. | `false` |
 | `cleanUrls` | `boolean` | When enabled, removes tracking parameters and unnecessary URL components to produce cleaner links. Currently supports cleaning Amazon product URLs by removing `/ref=` parameters and everything after. This helps produce more readable URLs in the markdown output. | `false` |
 | `annotateNumberClasses` | `boolean` | When enabled, appends the CSS class name of number-bearing elements next to the number in the markdown (e.g. `22,99 {price-box__price__amount}`). Plain markdown discards the semantic meaning encoded in class names; this preserves whether a number is a price, rating, review count, etc. Only the outermost element whose text is purely a number is annotated, so nested integer/decimal parts don't add noise. | `false` |
 

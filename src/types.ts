@@ -30,6 +30,10 @@ export interface HTMLExtractionOptions {
    * By default, images are excluded to simplify the extraction process.
    *
    * Enable this option when you need to extract image information or URLs.
+   *
+   * Lazy-loaded images are supported: when `src` is missing or empty, the URL
+   * falls back to `data-src`, then `data-original`, then the first `srcset`
+   * candidate. The image is only dropped when all of them are missing.
    */
   includeImages?: boolean;
 

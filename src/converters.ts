@@ -91,6 +91,34 @@ function normalizeNumberText(text: string | null | undefined): string {
 }
 
 /**
+ * Returns the URL of the first candidate in a srcset attribute
+ * (e.g. "a-480.jpg 480w, a-800.jpg 800w" → "a-480.jpg"), or an empty
+ * string when the srcset is missing or malformed.
+ */
+function firstSrcsetCandidate(srcset: string | null | undefined): string {
+  if (!srcset) return "";
+  const firstCandidate = srcset.split(",")[0]?.trim() ?? "";
+  if (!firstCandidate) return "";
+  return firstCandidate.split(/\s+/)[0] ?? "";
+}
+
+/**
+ * Resolves the image URL for an <img> element, falling back to the common
+ * lazy-loading attributes when src is missing or empty:
+ * data-src → data-original → first srcset candidate. Returns an empty
+ * string when no candidate holds a URL.
+ */
+function resolveImageSrc(node: any): string {
+  const src = (node.getAttribute("src") || "").trim();
+  if (src) return src;
+  const dataSrc = (node.getAttribute("data-src") || "").trim();
+  if (dataSrc) return dataSrc;
+  const dataOriginal = (node.getAttribute("data-original") || "").trim();
+  if (dataOriginal) return dataOriginal;
+  return firstSrcsetCandidate(node.getAttribute("srcset"));
+}
+
+/**
  * Convert HTML to Markdown
  */
 export function htmlToMarkdown(
@@ -260,7 +288,10 @@ export function htmlToMarkdown(
     filter: "img",
 
     replacement: function (content: string, node: any) {
-      let src = node.getAttribute("src");
+      // Lazy-loaded images often leave src empty and keep the real URL in
+      // data-src / data-original / srcset — fall back through them before
+      // giving up on the image.
+      let src = resolveImageSrc(node);
       if (src) {
         // Convert relative URLs to absolute if sourceUrl is provided
         if (sourceUrl && !src.startsWith("http") && !src.startsWith("data:")) {
@@ -281,7 +312,7 @@ export function htmlToMarkdown(
 
         src = src.replace(/([()])/g, "\\$1");
       } else {
-        return ""; // No source, no image
+        return ""; // No source in any of the candidate attributes, no image
       }
 
       let alt = cleanAttribute(node.getAttribute("alt") || "");

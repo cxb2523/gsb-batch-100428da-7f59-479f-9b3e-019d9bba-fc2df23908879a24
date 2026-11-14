@@ -226,6 +226,147 @@ describe("HTML to Markdown converter", () => {
       // Numeric but no class → no annotation.
       expect(markdown).not.toContain("{");
     });
+
+    test("annotates the semantic class, not the layout wrapper, for split prices", () => {
+      // The composed number sits in a semantic span inside a grid column;
+      // the layout class must not be mistaken for the price semantics.
+      const html = `
+        <div class="col-xs-6">
+          <span class="price-box__price__amount">
+            <span class="price-box__price__amount__integer">22</span>
+            <span class="price-box__price__amount__decSep">,</span>
+            <sup class="price-box__price__amount__decimal">99</sup>
+          </span>
+        </div>`;
+      const markdown = htmlToMarkdown(html, { annotateNumberClasses: true });
+
+      expect(markdown).toContain("22,99 {price-box__price__amount}");
+      expect(markdown).not.toContain("{col-xs-6}");
+      expect(markdown).not.toContain("__integer}");
+      expect(markdown).not.toContain("__decSep}");
+      expect(markdown).not.toContain("__decimal}");
+    });
+
+    test("does not annotate split-price fragments when the option is off", () => {
+      const html = `
+        <span class="price-box__price__amount">
+          <span class="price-box__price__amount__integer">22</span>
+          <span class="price-box__price__amount__decSep">,</span>
+          <sup class="price-box__price__amount__decimal">99</sup>
+        </span>`;
+      const markdown = htmlToMarkdown(html, { annotateNumberClasses: false });
+
+      expect(markdown).not.toContain("{");
+      expect(markdown.replace(/\s+/g, "")).toContain("22,99");
+    });
+  });
+
+  describe("lazy-loaded images", () => {
+    test("falls back to data-src when src is missing", () => {
+      const html = '<img data-src="https://cdn.example.com/lazy.jpg" alt="Lazy">';
+      const markdown = htmlToMarkdown(html, { includeImages: true });
+      expect(markdown).toBe("![Lazy](https://cdn.example.com/lazy.jpg)");
+    });
+
+    test("falls back to data-src when src is empty", () => {
+      const html = '<img src="" data-src="https://cdn.example.com/lazy.jpg" alt="Lazy">';
+      const markdown = htmlToMarkdown(html, { includeImages: true });
+      expect(markdown).toBe("![Lazy](https://cdn.example.com/lazy.jpg)");
+    });
+
+    test("falls back to data-original when src and data-src are missing", () => {
+      const html =
+        '<img data-original="https://cdn.example.com/full.jpg" alt="Original">';
+      const markdown = htmlToMarkdown(html, { includeImages: true });
+      expect(markdown).toBe("![Original](https://cdn.example.com/full.jpg)");
+    });
+
+    test("falls back to the first srcset candidate", () => {
+      const html =
+        '<img srcset="https://cdn.example.com/a-480.jpg 480w, https://cdn.example.com/a-800.jpg 800w" alt="Responsive">';
+      const markdown = htmlToMarkdown(html, { includeImages: true });
+      expect(markdown).toBe("![Responsive](https://cdn.example.com/a-480.jpg)");
+    });
+
+    test("prefers src over the lazy-load attributes", () => {
+      const html =
+        '<img src="https://cdn.example.com/real.jpg" data-src="https://cdn.example.com/lazy.jpg" srcset="https://cdn.example.com/srcset.jpg 1x" alt="Real">';
+      const markdown = htmlToMarkdown(html, { includeImages: true });
+      expect(markdown).toBe("![Real](https://cdn.example.com/real.jpg)");
+    });
+
+    test("resolves relative fallback URLs against sourceUrl", () => {
+      const html = '<img data-src="/images/main.jpg" alt="Main">';
+      const markdown = htmlToMarkdown(
+        html,
+        { includeImages: true },
+        "https://shop.example.com/products/"
+      );
+      expect(markdown).toBe("![Main](https://shop.example.com/images/main.jpg)");
+    });
+
+    test("keeps data: URLs unchanged", () => {
+      const dataUri = "data:image/gif;base64,R0lGODlhAQABAAAAACw=";
+      const html = `<img src="${dataUri}" alt="Pixel">`;
+      const markdown = htmlToMarkdown(
+        html,
+        { includeImages: true },
+        "https://shop.example.com/"
+      );
+      expect(markdown).toBe(`![Pixel](${dataUri})`);
+    });
+
+    test("drops the image when all source candidates are missing", () => {
+      const html = '<p>Before <img alt="No source"> after</p>';
+      const markdown = htmlToMarkdown(html, { includeImages: true });
+      expect(markdown).not.toContain("![");
+      expect(markdown).toContain("Before");
+      expect(markdown).toContain("after");
+    });
+
+    test("removes lazy-loaded images when includeImages is false", () => {
+      const html = '<img data-src="https://cdn.example.com/lazy.jpg" alt="Lazy">';
+      expect(htmlToMarkdown(html)).toBe("");
+      expect(htmlToMarkdown(html, { includeImages: false })).toBe("");
+    });
+  });
+
+  describe("extractMainHtml with prices and lazy images", () => {
+    test("keeps merged prices and fallback images in the main content", () => {
+      const html = `
+        <html>
+          <body>
+            <header>Site header</header>
+            <article>
+              <h1>Product</h1>
+              <span class="price-box__price__amount">
+                <span class="price-box__price__amount__integer">22</span>
+                <span class="price-box__price__amount__decSep">,</span>
+                <sup class="price-box__price__amount__decimal">99</sup>
+              </span>
+              <img data-src="/images/main.jpg" alt="Product photo">
+            </article>
+            <footer>Footer content</footer>
+          </body>
+        </html>`;
+      const markdown = htmlToMarkdown(
+        html,
+        {
+          extractMainHtml: true,
+          annotateNumberClasses: true,
+          includeImages: true,
+        },
+        "https://shop.example.com/products/item"
+      );
+
+      expect(markdown).toContain("22,99 {price-box__price__amount}");
+      expect(markdown).not.toContain("__integer}");
+      expect(markdown).toContain(
+        "![Product photo](https://shop.example.com/images/main.jpg)"
+      );
+      expect(markdown).not.toContain("Site header");
+      expect(markdown).not.toContain("Footer content");
+    });
   });
 
   describe("URL handling", () => {
