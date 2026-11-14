@@ -181,6 +181,63 @@ async def _seed_from_sitemap(seed_url: str, follow_pattern: str) -> list[str]:
         return []
 
 
+class _CrawlStats:
+    """Bookkeeping shared by the sync and async crawl paths so both report
+    identical counters in ``CrawlMeta``.
+
+    - ``pages_skipped``: robots.txt (and similar policy) refusals only.
+    - ``pages_skipped_duplicate``: links whose normalized URL was already
+      discovered earlier in the same crawl.
+    - ``links_dropped_max_pages``: in-pattern links refused at enqueue time
+      because the ``max_pages`` ceiling was already reached.
+    - ``sitemap_*``: coverage of the sitemap candidate set, populated only
+      when ``use_sitemap`` is enabled.
+    """
+
+    def __init__(self) -> None:
+        self.pages_skipped = 0
+        self.pages_failed = 0
+        self.links_dropped_max_pages = 0
+        self.pages_skipped_duplicate = 0
+        self.sitemap_candidates_total = 0
+        self.sitemap_candidates_enqueued = 0
+        self.sitemap_candidates_truncated = 0
+
+    async def enqueue(
+        self,
+        queue: "asyncio.Queue[tuple[str, int]]",
+        visited: set[str],
+        url: str,
+        depth: int,
+        max_pages: int,
+        follow_pattern: str,
+        from_sitemap: bool = False,
+    ) -> bool:
+        """Add one discovered link to the queue with full accounting.
+
+        Check order mirrors the original crawl loop: duplicate →
+        ``follow_pattern`` → ``max_pages`` cap. Returns True when the URL
+        was actually enqueued. Every candidate is inspected, so links past
+        the cap are counted individually instead of silently abandoned.
+        """
+        norm = normalize_url(url)
+        if norm in visited:
+            self.pages_skipped_duplicate += 1
+            return False
+        if not fnmatch.fnmatch(norm, follow_pattern):
+            return False
+        if len(visited) >= max_pages:
+            self.links_dropped_max_pages += 1
+            if from_sitemap:
+                self.sitemap_candidates_truncated += 1
+            return False
+        visited.add(norm)
+        await queue.put((norm, depth))
+        if from_sitemap:
+            self.sitemap_candidates_enqueued += 1
+        return True
+
+
 async def _sync_crawl(
     seed_url: str,
     follow_pattern: str,
@@ -196,22 +253,25 @@ async def _sync_crawl(
 ) -> CrawlResult:
     visited: set[str] = set()
     results: list[ExtractResult] = []
-    pages_skipped = 0
-    pages_failed = 0
     cancelled = False
+    stats = _CrawlStats()
     policy = HostPolicy()
 
     queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
-    await queue.put((normalize_url(seed_url), 0))
-    visited.add(normalize_url(seed_url))
+    seed_norm = normalize_url(seed_url)
+    await queue.put((seed_norm, 0))
+    visited.add(seed_norm)
 
-    # Optional sitemap seeding: append matching URLs at depth 1.
+    # Optional sitemap seeding: append matching URLs at depth 1. A failed
+    # sitemap fetch yields an empty candidate list, so the counters stay 0.
     if crawl_cfg.use_sitemap:
-        for u in await _seed_from_sitemap(seed_url, follow_pattern):
-            if u in visited:
-                continue
-            visited.add(u)
-            await queue.put((u, 1))
+        sitemap_urls = await _seed_from_sitemap(seed_url, follow_pattern)
+        stats.sitemap_candidates_total = len(sitemap_urls)
+        for u in sitemap_urls:
+            await stats.enqueue(
+                queue, visited, u, 1, max_pages, follow_pattern,
+                from_sitemap=True,
+            )
 
     while not queue.empty() and len(results) < max_pages:
         if cancel_event is not None and cancel_event.is_set():
@@ -220,7 +280,7 @@ async def _sync_crawl(
         url, depth = await queue.get()
 
         if not crawl_cfg.ignore_robots and not await policy.robots_allows(url):
-            pages_skipped += 1
+            stats.pages_skipped += 1
             continue
 
         await policy.pace(url)
@@ -233,7 +293,7 @@ async def _sync_crawl(
             policy.record_outcome(url, fetch_result.status_code)
         except Exception:
             policy.record_outcome(url, None)
-            pages_failed += 1
+            stats.pages_failed += 1
             continue
 
         result = await run_single_extract(
@@ -245,28 +305,27 @@ async def _sync_crawl(
         if on_progress is not None:
             on_progress(len(results))
         if result.status == "error":
-            pages_failed += 1
+            stats.pages_failed += 1
 
         if depth < max_depth:
             for link in extract_links(fetch_result.html, url):
-                norm_link = normalize_url(link)
-                if norm_link in visited:
-                    pages_skipped += 1
-                    continue
-                if not fnmatch.fnmatch(norm_link, follow_pattern):
-                    continue
-                if len(visited) >= max_pages:
-                    break
-                visited.add(norm_link)
-                await queue.put((norm_link, depth + 1))
+                await stats.enqueue(
+                    queue, visited, link, depth + 1,
+                    max_pages, follow_pattern,
+                )
 
     return CrawlResult(
         results=results,
         crawl_meta=CrawlMeta(
             pages_visited=len(results),
-            pages_skipped=pages_skipped,
-            pages_failed=pages_failed,
+            pages_skipped=stats.pages_skipped,
+            pages_failed=stats.pages_failed,
             cancelled=cancelled,
+            links_dropped_max_pages=stats.links_dropped_max_pages,
+            pages_skipped_duplicate=stats.pages_skipped_duplicate,
+            sitemap_candidates_total=stats.sitemap_candidates_total,
+            sitemap_candidates_enqueued=stats.sitemap_candidates_enqueued,
+            sitemap_candidates_truncated=stats.sitemap_candidates_truncated,
         ),
     )
 
@@ -286,25 +345,27 @@ async def _async_batch_crawl(
 ) -> CrawlResult:
     """Two-pass crawl: (1) discover + fetch pages, (2) batch-LLM the remainder."""
     visited: set[str] = set()
-    pages_skipped = 0
-    pages_failed = 0
     cancelled = False
     use_cache = not options.no_cache
     policy = HostPolicy()
+    stats = _CrawlStats()
 
     # Ordered list of (url, early_result_or_None, (clean_text, render_mode) or None)
     discovered: list[tuple[str, ExtractResult | None, tuple[str, str] | None]] = []
 
     queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
-    await queue.put((normalize_url(seed_url), 0))
-    visited.add(normalize_url(seed_url))
+    seed_norm = normalize_url(seed_url)
+    await queue.put((seed_norm, 0))
+    visited.add(seed_norm)
 
     if crawl_cfg.use_sitemap:
-        for u in await _seed_from_sitemap(seed_url, follow_pattern):
-            if u in visited:
-                continue
-            visited.add(u)
-            await queue.put((u, 1))
+        sitemap_urls = await _seed_from_sitemap(seed_url, follow_pattern)
+        stats.sitemap_candidates_total = len(sitemap_urls)
+        for u in sitemap_urls:
+            await stats.enqueue(
+                queue, visited, u, 1, max_pages, follow_pattern,
+                from_sitemap=True,
+            )
 
     while not queue.empty() and len(discovered) < max_pages:
         if cancel_event is not None and cancel_event.is_set():
@@ -313,7 +374,7 @@ async def _async_batch_crawl(
         url, depth = await queue.get()
 
         if not crawl_cfg.ignore_robots and not await policy.robots_allows(url):
-            pages_skipped += 1
+            stats.pages_skipped += 1
             continue
 
         await policy.pace(url)
@@ -341,11 +402,11 @@ async def _async_batch_crawl(
                 url=url, status="error",
                 error=ErrorDetail(code=e.code, message=e.message, retryable=e.retryable),
             ), None))
-            pages_failed += 1
+            stats.pages_failed += 1
             policy.record_outcome(url, None)
             continue
         except Exception:
-            pages_failed += 1
+            stats.pages_failed += 1
             policy.record_outcome(url, None)
             continue
 
@@ -377,16 +438,10 @@ async def _async_batch_crawl(
 
         if depth < max_depth:
             for link in extract_links(fetch_result.html, url):
-                norm_link = normalize_url(link)
-                if norm_link in visited:
-                    pages_skipped += 1
-                    continue
-                if not fnmatch.fnmatch(norm_link, follow_pattern):
-                    continue
-                if len(visited) >= max_pages:
-                    break
-                visited.add(norm_link)
-                await queue.put((norm_link, depth + 1))
+                await stats.enqueue(
+                    queue, visited, link, depth + 1,
+                    max_pages, follow_pattern,
+                )
 
     # Batch-extract the pages that need the LLM.
     llm_jobs = [(u, ct, schema_fields) for (u, done, pending) in discovered
@@ -427,16 +482,23 @@ async def _async_batch_crawl(
             url=u2, status="success", render_mode=rm, data=extraction.data,
         ))
 
-    pages_failed = sum(1 for r in results if r.status == "error")
+    # Recompute from the final result list: LLM-batch failures only surface
+    # here, so the in-loop counter alone is not authoritative on this path.
+    stats.pages_failed = sum(1 for r in results if r.status == "error")
     if on_progress is not None:
         on_progress(len(results))
     return CrawlResult(
         results=results,
         crawl_meta=CrawlMeta(
             pages_visited=len(results),
-            pages_skipped=pages_skipped,
-            pages_failed=pages_failed,
+            pages_skipped=stats.pages_skipped,
+            pages_failed=stats.pages_failed,
             cancelled=cancelled,
+            links_dropped_max_pages=stats.links_dropped_max_pages,
+            pages_skipped_duplicate=stats.pages_skipped_duplicate,
+            sitemap_candidates_total=stats.sitemap_candidates_total,
+            sitemap_candidates_enqueued=stats.sitemap_candidates_enqueued,
+            sitemap_candidates_truncated=stats.sitemap_candidates_truncated,
         ),
     )
 

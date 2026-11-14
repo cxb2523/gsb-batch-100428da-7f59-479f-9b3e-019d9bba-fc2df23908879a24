@@ -40,6 +40,28 @@ class CrawlMeta(BaseModel):
     # True when the crawl exited early because the caller cancelled it via
     # DELETE /v1/jobs/{id}. Unused reservation has already been refunded.
     cancelled: bool = False
+    # Links that matched ``follow_pattern`` but were never enqueued because
+    # the ``max_pages`` ceiling had already been reached. This includes
+    # sitemap candidates truncated by the same ceiling (also broken out in
+    # the sitemap_* counters below when use_sitemap is enabled).
+    links_dropped_max_pages: int = 0
+    # Links skipped because the normalized URL had already been discovered
+    # or visited earlier in the same crawl. Reported separately from
+    # ``pages_skipped``, which remains the robots.txt/other-policy bucket.
+    pages_skipped_duplicate: int = 0
+    # Sitemap coverage. Populated only when ``crawl.use_sitemap`` is enabled;
+    # the counters stay at zero otherwise — and also when the sitemap cannot
+    # be fetched or parsed, since a failed sitemap fetch reports zero
+    # candidates rather than raising.
+    #   candidates_total:      pattern-matching URLs the sitemap exposed
+    #   candidates_enqueued:   of those, actually added to the crawl queue
+    #   candidates_truncated:  of those, refused because max_pages was hit
+    # Invariant: candidates_total = candidates_enqueued + candidates_truncated
+    #            (+ sitemap duplicates, which are counted in
+    #            pages_skipped_duplicate rather than any sitemap_* field).
+    sitemap_candidates_total: int = 0
+    sitemap_candidates_enqueued: int = 0
+    sitemap_candidates_truncated: int = 0
 
 
 class CrawlResult(BaseModel):
