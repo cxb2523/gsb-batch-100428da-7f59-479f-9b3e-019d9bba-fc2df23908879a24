@@ -217,6 +217,7 @@ def _process_neeq_announcements(
 
         record = repository.get_announcement('neeq', pdf_url)
         recorded_path = record.get('file_path') if record else None
+        recorded_status = record.get('status') if record else None
         active_pdf_path = None
 
         for candidate in (recorded_path, pdf_path):
@@ -232,6 +233,18 @@ def _process_neeq_announcements(
                 file_size=os.path.getsize(active_pdf_path),
             )
             stats['existing'] += 1
+        elif recorded_status == 'downloaded':
+            # 已 downloaded 的记录不得被失败路径覆盖：
+            # 本地文件缺失时保留原状态，等待人工核查
+            logger.warning(
+                '记录已标记为 downloaded，但本地文件缺失，保留原记录: %s',
+                pdf_url,
+            )
+            stats['existing'] += 1
+            if _consume_stop_request(logger):
+                stats['interrupted'] = True
+                break
+            continue
         else:
             backup_path = backup_pdfs.pop(stock_code, None)
             if backup_path and is_valid_pdf(backup_path):
@@ -247,11 +260,17 @@ def _process_neeq_announcements(
                 logger.info(f'从备份目录恢复PDF: {os.path.basename(pdf_path)}')
             else:
                 repository.mark_downloading('neeq', pdf_url)
-                if not download_pdf(pdf_url, pdf_path):
+                error_info = {}
+                if not download_pdf(pdf_url, pdf_path, error_info=error_info):
+                    category = error_info.get('category', 'unknown')
+                    message = (
+                        error_info.get('message')
+                        or 'PDF download failed after retries'
+                    )
                     repository.mark_failed(
                         'neeq',
                         pdf_url,
-                        'PDF download failed after retries',
+                        f'[{category}] {message}',
                     )
                     stats['failed'] += 1
                     if _consume_stop_request(logger):
@@ -465,13 +484,19 @@ def process_announcements(announcements, args, api, parser, exporter, logger, so
         
         report_year = infer_report_year(title) or args.year
         pdf_path = exporter.get_pdf_save_path(stock_code, stock_name, report_year, title)
+        error_info = {}
         if source == 'neeq':
             from neeq_crawler import download_pdf
-            if not download_pdf(adjunct_url, pdf_path):
-                continue
+            downloaded = download_pdf(adjunct_url, pdf_path, error_info=error_info)
         else:
-            if not api.download_pdf(adjunct_url, pdf_path):
-                continue
+            downloaded = api.download_pdf(adjunct_url, pdf_path, error_info=error_info)
+        if not downloaded:
+            logger.warning(
+                'PDF下载失败[%s]: %s',
+                error_info.get('category', 'unknown'),
+                error_info.get('message', ''),
+            )
+            continue
         
         logger.info('开始解析PDF...')
         reports = parser.parse_pdf(pdf_path)

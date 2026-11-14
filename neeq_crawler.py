@@ -240,12 +240,36 @@ def is_valid_pdf(path):
         return False
 
 
-def download_pdf(url, save_path):
+# 下载失败类别：便于调用方区分“可重试的临时失败”和“确定性失败”
+ERROR_CATEGORY_NETWORK = "network"    # 网络异常（连接/超时等，可重试）
+ERROR_CATEGORY_HTTP = "http"          # HTTP 错误状态码（可重试）
+ERROR_CATEGORY_NOT_PDF = "not_pdf"    # 响应内容不是 PDF（确定性失败，重试无意义）
+ERROR_CATEGORY_LOCAL_IO = "local_io"  # 本地写入失败
+ERROR_CATEGORY_UNKNOWN = "unknown"    # 未预期的其他异常
+
+
+def classify_download_error(exc):
+    """把下载过程中捕获的异常归类为失败类别。"""
+    if isinstance(exc, requests.HTTPError):
+        return ERROR_CATEGORY_HTTP
+    if isinstance(exc, requests.RequestException):
+        return ERROR_CATEGORY_NETWORK
+    if isinstance(exc, ValueError):
+        return ERROR_CATEGORY_NOT_PDF
+    if isinstance(exc, OSError):
+        return ERROR_CATEGORY_LOCAL_IO
+    return ERROR_CATEGORY_UNKNOWN
+
+
+def download_pdf(url, save_path, error_info=None):
     """
     下载新三板公告 PDF
-    
+
     :param url: PDF 下载地址
     :param save_path: 保存路径
+    :param error_info: 可选 dict；下载失败时写入
+        {'category': 失败类别, 'message': 最后一次错误描述}，
+        成功时不修改
     :return: 是否成功
     """
     if not url:
@@ -267,6 +291,7 @@ def download_pdf(url, save_path):
         "Referer": f"{NEEQ_BASE}/",
     }
     
+    last_error = None
     for retry in range(3):
         try:
             with requests.get(
@@ -288,6 +313,7 @@ def download_pdf(url, save_path):
             logger.info("PDF下载成功: %s", path.name)
             return True
         except (requests.RequestException, OSError, ValueError) as exc:
+            last_error = exc
             logger.warning(
                 "PDF下载异常（重试%s/3）: %s",
                 retry + 1,
@@ -300,5 +326,8 @@ def download_pdf(url, save_path):
 
         if retry < 2:
             time.sleep((retry + 1) * 2)
-    
+
+    if error_info is not None and last_error is not None:
+        error_info["category"] = classify_download_error(last_error)
+        error_info["message"] = str(last_error)
     return False

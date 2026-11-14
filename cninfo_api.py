@@ -7,7 +7,7 @@ from urllib.parse import urljoin
 import requests
 
 from config import CNINFO_API, MAX_RETRIES, PLATE_COLUMN, REQUEST_INTERVAL
-from neeq_crawler import is_valid_pdf
+from neeq_crawler import classify_download_error, is_valid_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -96,9 +96,12 @@ class CNInfoAPI:
         
         return all_announcements
 
-    def download_pdf(self, adjunct_url, save_path):
+    def download_pdf(self, adjunct_url, save_path, error_info=None):
         """
         下载PDF文件：跳过已有有效文件，.part 原子写入，校验 %PDF- 头。
+
+        :param error_info: 可选 dict；失败时写入
+            {'category': 失败类别, 'message': 最后一次错误描述}，成功时不修改
         """
         if not adjunct_url:
             return False
@@ -115,6 +118,7 @@ class CNInfoAPI:
             return True
 
         part_path = path.with_suffix(path.suffix + '.part')
+        last_error = None
         for attempt in range(MAX_RETRIES):
             try:
                 response = self.session.get(pdf_url, timeout=(10, 120), stream=True)
@@ -129,6 +133,7 @@ class CNInfoAPI:
                 logger.info('PDF下载成功: %s', path.name)
                 return True
             except Exception as exc:
+                last_error = exc
                 logger.warning(
                     'PDF下载失败(第%s次): %s, 错误: %s',
                     attempt + 1,
@@ -140,6 +145,9 @@ class CNInfoAPI:
                 if attempt < MAX_RETRIES - 1:
                     time.sleep(REQUEST_INTERVAL * (attempt + 1))
 
+        if error_info is not None and last_error is not None:
+            error_info['category'] = classify_download_error(last_error)
+            error_info['message'] = str(last_error)
         logger.error('PDF下载失败，已重试%s次: %s', MAX_RETRIES, pdf_url)
         return False
 

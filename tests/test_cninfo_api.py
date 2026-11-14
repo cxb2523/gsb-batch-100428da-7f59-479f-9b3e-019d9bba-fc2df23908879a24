@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import requests
+
 from cninfo_api import CNInfoAPI
 
 
@@ -14,7 +16,7 @@ class _FakeResponse:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise RuntimeError(f'status {self.status_code}')
+            raise requests.HTTPError(f'{self.status_code} Client Error')
 
     def iter_content(self, chunk_size=64 * 1024):
         yield self.content
@@ -24,6 +26,22 @@ class _FakeResponse:
 
     def __exit__(self, exc_type, exc, tb):
         return False
+
+
+class _FakeSession:
+    """伪造的 session：依次返回预设响应或抛出预设异常，记录调用次数。"""
+
+    def __init__(self, responses=None, exc=None):
+        self.responses = list(responses or [])
+        self.exc = exc
+        self.calls = 0
+
+    def get(self, *args, **kwargs):
+        self.calls += 1
+        if self.exc is not None:
+            raise self.exc
+        index = min(self.calls - 1, len(self.responses) - 1)
+        return self.responses[index]
 
 
 class CNInfoDownloadTest(unittest.TestCase):
@@ -39,6 +57,64 @@ class CNInfoDownloadTest(unittest.TestCase):
             self.assertFalse(save_path.exists())
             self.assertFalse(list(Path(temp_dir).glob('*.part')))
 
+    def test_html_error_page_is_classified_as_not_pdf(self):
+        api = CNInfoAPI()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            save_path = Path(temp_dir) / 'report.pdf'
+            session = _FakeSession(responses=[_FakeResponse(b'<html>error</html>')])
+            error_info = {}
+            with patch('cninfo_api.REQUEST_INTERVAL', 0):
+                with patch.object(api.session, 'get', new=session.get):
+                    ok = api.download_pdf(
+                        'finalpage/2025/x.PDF',
+                        str(save_path),
+                        error_info=error_info,
+                    )
+            self.assertFalse(ok)
+            self.assertEqual(error_info['category'], 'not_pdf')
+            self.assertIn('PDF', error_info['message'])
+            self.assertFalse(save_path.exists())
+            self.assertFalse(list(Path(temp_dir).glob('*.part')))
+
+    def test_network_failure_reports_category_and_leaves_no_files(self):
+        api = CNInfoAPI()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            save_path = Path(temp_dir) / 'report.pdf'
+            session = _FakeSession(exc=requests.ConnectionError('连接被拒绝'))
+            error_info = {}
+            with patch('cninfo_api.REQUEST_INTERVAL', 0):
+                with patch.object(api.session, 'get', new=session.get):
+                    ok = api.download_pdf(
+                        'finalpage/2025/x.PDF',
+                        str(save_path),
+                        error_info=error_info,
+                    )
+            self.assertFalse(ok)
+            self.assertEqual(error_info['category'], 'network')
+            self.assertIn('连接被拒绝', error_info['message'])
+            self.assertGreater(session.calls, 1)
+            self.assertFalse(save_path.exists())
+            self.assertFalse(list(Path(temp_dir).glob('*.part')))
+
+    def test_http_error_is_classified_as_http(self):
+        api = CNInfoAPI()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            save_path = Path(temp_dir) / 'report.pdf'
+            session = _FakeSession(
+                responses=[_FakeResponse(b'', status_code=500)],
+            )
+            error_info = {}
+            with patch('cninfo_api.REQUEST_INTERVAL', 0):
+                with patch.object(api.session, 'get', new=session.get):
+                    ok = api.download_pdf(
+                        'finalpage/2025/x.PDF',
+                        str(save_path),
+                        error_info=error_info,
+                    )
+            self.assertFalse(ok)
+            self.assertEqual(error_info['category'], 'http')
+            self.assertIn('500', error_info['message'])
+
     def test_writes_valid_pdf_atomically_and_skips_second_download(self):
         api = CNInfoAPI()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -49,6 +125,22 @@ class CNInfoDownloadTest(unittest.TestCase):
                 self.assertTrue(save_path.read_bytes().startswith(b'%PDF-'))
                 self.assertTrue(api.download_pdf('finalpage/2025/x.PDF', str(save_path)))
                 self.assertEqual(mocked.call_count, 1)
+
+    def test_success_does_not_touch_error_info(self):
+        api = CNInfoAPI()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            save_path = Path(temp_dir) / 'report.pdf'
+            fake = _FakeResponse(b'%PDF-1.7\ncontent')
+            error_info = {}
+            with patch.object(api.session, 'get', return_value=fake):
+                self.assertTrue(
+                    api.download_pdf(
+                        'finalpage/2025/x.PDF',
+                        str(save_path),
+                        error_info=error_info,
+                    )
+                )
+            self.assertEqual(error_info, {})
 
 
 class DefaultSourceTest(unittest.TestCase):
@@ -76,7 +168,7 @@ class CNInfoReportYearTest(unittest.TestCase):
         args = SimpleNamespace(year=2025)
         captured = {}
 
-        def fake_download(_url, save_path):
+        def fake_download(_url, save_path, error_info=None):
             captured['pdf'] = save_path
             Path(save_path).parent.mkdir(parents=True, exist_ok=True)
             Path(save_path).write_bytes(b'%PDF-1.7\n')
