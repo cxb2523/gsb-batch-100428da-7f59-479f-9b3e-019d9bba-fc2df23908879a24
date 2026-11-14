@@ -1,0 +1,198 @@
+# 🛰️ GeMSentry
+
+![GeMSentry Banner](assets/gemsentry_banner.png)
+
+<div align="center">
+
+**Smart RFP Acquisition & Scraper Dashboard for India's Government e-Marketplace (GeM)**
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg?style=for-the-badge)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg?style=for-the-badge&logo=python)](https://www.python.org/)
+[![Playwright](https://img.shields.io/badge/Playwright-1.40%2B-green.svg?style=for-the-badge&logo=playwright)](https://playwright.dev/python/)
+[![Flask](https://img.shields.io/badge/Flask-3.0%2B-black.svg?style=for-the-badge&logo=flask)](https://flask.palletsprojects.com/)
+
+</div>
+
+---
+
+## 📌 Project Overview
+**GeMSentry** is an automated pipeline and visual intelligence tool that monitors, extracts, parses, and scores RFP (Request for Proposal) documents from the India Government e-Marketplace (GeM) portal (`bidplus.gem.gov.in/all-bids`).
+
+By leveraging headful/headless browser automation, PDF text analysis, and metadata scoring, GeMSentry takes the manual overhead out of bid hunting. It presents opportunities in a gorgeous, glassmorphic review dashboard with automated scoring and exemption analysis.
+
+---
+
+## 🛠️ Architecture Workflow
+
+The following diagram illustrates how GeMSentry operates from keyword search to local dashboard rendering:
+
+```mermaid
+graph TD
+    A[Start Scraper / API Trigger] --> B[Playwright harvests GeM search cookies]
+    B --> C[Search GeM Portal using Keywords]
+    C --> D[Parse Search Result Cards]
+    D --> E{Inside closing window?}
+    E -- No --> F[Auto-reject expired or closing too soon]
+    E -- Yes --> G[Check Download Cache]
+    G -- Not Cached --> H[Download RFP PDF Document]
+    G -- Cached --> I[Skip Download]
+    H --> J[PyPDF reads up to the configured page cap]
+    I --> J
+    J --> K[Regex Scoring Engine processes exemptions]
+    K --> L[Save to SQLite; export JSON and CSV]
+    L --> M[Serve local Flask Backend server]
+    M --> N[Load Interactive Dashboard on localhost:5000]
+    F --> L
+```
+
+---
+
+## ✨ Features
+
+- **GeM search session:** Playwright opens the listing page with a desktop user agent and `en-IN` locale to harvest GeM search cookies. It is not designed to defeat bot-protection or WAFs. A blocked session (HTTP 403 or a non-JSON captcha page) stops further GeM keywords, keeps tenders already collected, logs `GeM session blocked, results incomplete`, and finishes as a partial run. The dashboard job outcome is `partial`; `python -m gemsentry.cli` exits 2. External portals are still queried.
+- **Keyword scouting:** Queries the keywords in `config/keywords.csv`.
+- **Closing-window gate:** Auto-rejects bids that have already closed, and bids closing sooner than `date_window.min_days_to_bid` (default 5 days); those PDFs are not downloaded. Remaining time scores on a ramp that reaches full credit at `full_credit_days` (default 14). An age penalty for a start date older than `dates.stale_start_days` (default 30) applies only when `dates.stale_start_penalty` is true (default false).
+- **RFP analyzer:** Reads each downloaded PDF up to `analysis.max_pdf_pages` (default 40). When the file is longer, the record includes `Analysed N of M pages; later terms not checked.` and a Pursue verdict is downgraded to Review.
+  - **EMD amount:** Detects whether earnest money is required. Amounts at or below `emd.free_threshold_inr` (default ₹2 lakh) score full credit; the penalty reaches zero at `emd.max_penalty_threshold_inr` (default ₹20 lakh).
+  - **Startup Exemption:** Identifies turnover/experience exemptions for startups.
+  - **MSE Exemption:** Identifies micro & small enterprise exemptions.
+  - **Pre-Bid Details:** Detects pre-bid meeting necessity and pulls scheduling dates.
+  - **ePBG Details:** Identifies performance bank guarantee requirement percentages.
+- **🖥️ Glassmorphic Triage Dashboard:** Sleek, responsive, local web interface featuring:
+  - Global searching and keyword filtering.
+  - Live console stream of scraping activities.
+  - Quick buttons to override and toggle status (Shortlisted, Pending, Rejected).
+  - One-click viewing of downloaded RFP documents.
+
+---
+
+## 🚀 Getting Started
+
+### Quick Start (Windows)
+We provide a PowerShell script that configures your virtual environment, updates dependencies, downloads Playwright chromium binaries, and starts the system:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_search.ps1
+```
+
+### Manual Installation (Any OS)
+
+1. **Clone the Repository:**
+   ```bash
+   git clone https://github.com/<your-username>/GeMSentry.git
+   cd GeMSentry
+   ```
+
+2. **Install Dependencies:**
+   ```bash
+   uv sync            # or: pip install -e .
+   ```
+
+3. **Install Browser Binaries:**
+   ```bash
+   playwright install chromium
+   ```
+
+4. **Run the Application:**
+   ```bash
+   python run.py
+   ```
+   *The local server will spin up, and your default web browser will automatically open to `http://localhost:5000`.*
+
+---
+
+## 📁 Project layout
+
+| Path | Purpose |
+|------|---------|
+| `config/` | Tunable knobs: `keywords.csv`, `scoring_config.json`, ignored `company_profile.local.json` (generic example: `company_profile.json`) |
+| `data/` | Runtime / imported state (`history.json`, optional `source/` inputs) |
+| `logs/` | App log (`gemsentry.log`) + per-scrape session files under `logs/scrapes/` |
+| `tenders/` | Tender metadata + downloaded RFP PDFs (`tenders/downloads/`) |
+| `static/` | Dashboard CSS + JS, served separately so the browser caches them |
+| `gemsentry/web/` | Flask blueprints (`auth`, `tenders`, `settings`, `live_excel`, `master_sheet`) + shared `context.py` |
+| `gemsentry/db.py` | SQLite tender store (store of record) |
+| `paths.py` | Single path map used by app, scraper, and tools |
+| `app.py` | Composition root: builds the Flask app, registers blueprints |
+| `run.py` | Primary entrypoint |
+
+### Data storage
+
+`tenders/<workspace>/metadata.db` (SQLite) is the store of record. `metadata.json`
+and `metadata.csv` are **exports** kept beside it for `tools/` and for reading by
+hand; they are refreshed on every bulk save and, after a single-record change, by
+a debounced background writer. An existing `metadata.json` is migrated into the
+database automatically on first run.
+
+## Security
+
+See [Security setup and migration](SECURITY_SETUP.md) for the required Apps Script secret/redeployment, private local configuration, and tunnel preflight.
+
+The server binds `127.0.0.1` by default. Binding any other interface requires an
+auth token, and startup refuses otherwise:
+
+```powershell
+$env:GEMSENTRY_AUTH_TOKEN = "<a long secret>"
+$env:GEMSENTRY_HOST = "0.0.0.0"
+```
+
+API calls authenticate with `Authorization: Bearer <token>`. The `HttpOnly`
+cookie issued by `/api/auth/verify` covers browser navigations (opening a PDF)
+and is deliberately **not** accepted for POST/PUT/PATCH/DELETE, so another site
+cannot forge a state change.
+
+Google Sheets sync settings live in `config/google_sync_config.json`, which is
+gitignored. Copy `config/google_sync_config.example.json`, or set
+`GEMSENTRY_APPS_SCRIPT_URL` / `GEMSENTRY_SHEET_ID` / `GEMSENTRY_MASTER_XLSX`.
+
+## Development
+
+```bash
+uv sync --group dev
+uv run pytest                 # test suite
+uv run pytest --cov=gemsentry # with coverage
+uv run ruff check .           # lint
+```
+
+---
+
+## ⚙️ Configuration
+
+### 🔍 Keywords Setup
+Modify `config/keywords.csv` to add or remove search terms. GeMSentry will automatically pick these up on the next scrape.
+
+Searches default to **Auto** pagination, following GeM's result count instead of stopping after two pages. A search has a five-minute budget and a 1,000-page safety ceiling; the console reports incomplete searches, repeated pages, and date/relevance exclusions. Select a fixed page limit for a quick scan. The API accepts up to 1,000 keywords and `max_pages: null` for Auto.
+
+Capacity-specific discovery terms are broadened automatically (`250 KW SOLAR` → `SOLAR`, `12V 100AH BATTERY` → `BATTERY`). Profile phrases also use broader word queries, with relevance checked against listing content. Drone/UAV aliases share a search plan. Rediscovered bids refresh their closing dates and listing facts before scoring.
+
+INR values preserve decimal places. To repair previously stored values from local PDFs, run `python tools/repair_bid_values.py` to preview corrections, then add `--apply`. Original records are backed up before updates; missing amounts are never repaired by guessing where a decimal belongs.
+```csv
+POWER SUPPLY
+RADAR
+SOFTWARE
+MILITARY GRADE
+```
+
+### Date window
+Date scoring is in `gemsentry/scoring/dates.py`, configured under `date_window` and `dates` in `config/scoring_config.json`:
+* **Hard reject:** the bid has already closed, or it closes in fewer than `min_days_to_bid` days (default 5). Those PDFs are not downloaded.
+* **Closing ramp:** remaining time scores from 0 at the deadline up to full credit at `full_credit_days` (default 14).
+* **Short duration:** a window shorter than `min_days` (default 7) halves the date subscore.
+* **Stale start (opt-in):** with `dates.stale_start_penalty` set to true, a start date older than `stale_start_days` (default 30) halves the date subscore. The flag is false by default.
+
+---
+
+## 📚 References & Third-Party Libraries
+
+GeMSentry uses several open-source libraries to deliver automation:
+* **[Playwright Python API](https://playwright.dev/python/):** Drives headless browser operations and manages secure PDF downloading.
+* **[Flask](https://flask.palletsprojects.com/):** Powers the local API server and serves the dashboard interface.
+* **[BeautifulSoup 4](https://www.crummy.com/software/BeautifulSoup/):** Parses bid card structures from GeM search page results.
+* **[PyPDF](https://pypdf.readthedocs.io/):** Handles local PDF text extraction to scan for exemptions and penalties.
+* **[Government e-Marketplace (GeM)](https://gem.gov.in/):** The public procurement portal of India from which bids are aggregated.
+
+---
+
+## 📄 License
+
+Distributed under the MIT License. See [LICENSE](LICENSE) for details.

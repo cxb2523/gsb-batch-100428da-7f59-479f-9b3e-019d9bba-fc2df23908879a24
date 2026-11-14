@@ -1,0 +1,85 @@
+"""Filename, date and free-text normalisation helpers."""
+
+import datetime
+import math
+import re
+
+from gemsentry.constants import _INDIAN_STATES
+
+_STATE_BY_NAME = {state.casefold(): state for state in _INDIAN_STATES}
+_STATE_PATTERN = re.compile(
+    r"\b(?:" + "|".join(
+        re.escape(state).replace(r"\ ", r"\s+")
+        for state in sorted(_INDIAN_STATES, key=len, reverse=True)
+    ) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def sanitize_filename(name):
+    return re.sub(r'[\\/*?:"<>|]', '_', name).strip().replace(" ", "_")
+
+
+def sanitize_folder_name(name):
+    sanitized = re.sub(r'[^a-zA-Z0-9_\-\s]', '_', name)
+    sanitized = re.sub(r'\s+', '_', sanitized)
+    sanitized = re.sub(r'_+', '_', sanitized)
+    return sanitized.strip('_').lower()
+
+
+def today_iso():
+    """Discovery date stamp (YYYY-MM-DD) — sorts lexicographically."""
+    return datetime.datetime.now().strftime("%Y-%m-%d")
+
+
+def get_date_folder_name():
+    now = datetime.datetime.now()
+    return f"{now.strftime('%d')} {now.strftime('%b').lower()}{now.strftime('%y')}"
+
+
+def _parse_inr_amount(raw):
+    """Parse an INR amount string that may contain commas/rupees markers."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return raw if math.isfinite(raw) and raw >= 0 else None
+    s = str(raw).strip()
+    # Currency markers are whole tokens; a character class also ate decimal dots.
+    s = re.sub(r'^(?:(?:INR|Rs\.?|₹)\s*)+', '', s, flags=re.IGNORECASE)
+    s = s.replace(",", "")
+    # take leading number
+    m = re.match(r'([\d]+(?:\.\d+)?)', s)
+    if not m:
+        return None
+    try:
+        amount = float(m.group(1))
+        if not math.isfinite(amount):
+            return None
+        return int(amount) if amount.is_integer() else amount
+    except ValueError:
+        return None
+
+
+def _clean_english_phrase(s, max_len=120):
+    if not s:
+        return None
+    s = re.sub(r'\s+', ' ', s).strip(" \t\n\r/,-")
+    # Drop leading non-ASCII
+    s = re.sub(r'^[^\x00-\x7F]+', '', s).strip()
+    if not s:
+        return None
+    return s[:max_len]
+
+
+def _match_indian_state(text):
+    if not text:
+        return None
+    match = _STATE_PATTERN.search(text)
+    return _STATE_BY_NAME[re.sub(r"\s+", " ", match.group()).casefold()] if match else None
+
+# ---------------------------------------------------------------------------
+# BE-15 helpers: bilingual GeM layout — English label then value, no colon.
+# Patterns use bounded .{0,N} windows only (no nested quantifiers / backtracking).
+# ---------------------------------------------------------------------------

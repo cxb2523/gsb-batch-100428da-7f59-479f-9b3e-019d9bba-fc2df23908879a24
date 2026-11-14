@@ -1,0 +1,379 @@
+"""Recommendation, priority, status and verdict application."""
+
+import hashlib
+import json
+
+from gemsentry.constants import TOTAL_ANALYSIS_FIELDS, TOTAL_SIGNAL_FIELDS
+from gemsentry.defaults import DEFAULT_SCORING_CONFIG
+
+
+def get_failed_analysis(reason):
+    """Analysis payload for parse exception or missing PDF (BE-04)."""
+    return {
+        "emd_amount": None,
+        "emd_status": "Not Analyzed",
+        "startup_exemption": "Unknown",
+        "mse_exemption": "Unknown",
+        "pre_bid_required": "Unknown",
+        "pre_bid_date": None,
+        "epbg_required": "Unknown",
+        "epbg_percentage": None,
+        "score": None,
+        "terms_score": None,
+        "score_scale": 100,
+        "analysis_status": "failed",
+        "pages_total": None,
+        "pages_read": None,
+        "pages_truncated": False,
+        "parsed_fields": 0,
+        "na_fields": 0,
+        "total_fields": TOTAL_ANALYSIS_FIELDS,
+        "confidence": 0.0,
+        "breakdown": [],
+        "reasons": [reason],
+        # Phase-2 keys (null / empty so FE can render gracefully)
+        "est_value_inr": None,
+        "est_value_estimated": False,
+        "est_value_source": None,
+        "primary_item": None,
+        "item_category": None,
+        "buyer_org": None,
+        "buyer_dept": None,
+        "consignee_state": None,
+        "mii_required": "unknown",
+        "mse_pref": "unknown",
+        "signal_parsed": 0,
+        "signal_fields": TOTAL_SIGNAL_FIELDS,
+        "eligibility": {
+            "verdict": "unknown",
+            "flags": ["analysis_failed"],
+            "detail": reason
+        },
+        "fit_score": None,
+        "fit_breakdown": [],
+        "business_line": None,
+        "recommendation": None,
+        "priority_score": None
+    }
+
+
+def build_score_breakdown(criteria, weights):
+    """
+    criteria: list of (name, subscore, detail)
+    returns (final_score int 0-100, breakdown list)
+    """
+    weight_sum = sum(float(weights.get(name, 0)) for name, _, _ in criteria)
+    if weight_sum <= 0:
+        weight_sum = 1.0
+
+    breakdown = []
+    points_sum = 0.0
+    weighted = 0.0
+    for name, subscore, detail in criteria:
+        w = float(weights.get(name, 0))
+        sub = max(0.0, min(1.0, float(subscore)))
+        points = round(100.0 * w * sub / weight_sum, 1)
+        points_sum += points
+        weighted += w * sub
+        breakdown.append({
+            "criterion": name,
+            "weight": w,
+            "subscore": round(sub, 4),
+            "points": points,
+            "detail": detail
+        })
+
+    final_score = int(round(100.0 * weighted / weight_sum))
+    final_score = max(0, min(100, final_score))
+
+    # Keep points sum aligned with score within ±1 of rounding noise
+    # (points are already per-criterion rounded; final uses unrounded weighted sum)
+    return final_score, breakdown
+
+
+def status_from_score(score, cfg, current_status=None):
+    """
+    Map 0-100 score to status using config thresholds.
+    Never clobber manual Shortlisted/Rejected. score None → Pending Review.
+    """
+    if current_status in ("Shortlisted", "Rejected"):
+        return current_status
+    if score is None:
+        return "Pending Review"
+    thresholds = cfg.get("status_thresholds", DEFAULT_SCORING_CONFIG["status_thresholds"])
+    shortlist_min = float(thresholds.get("shortlist_min", 70))
+    reject_max = float(thresholds.get("reject_max", 40))
+    if score >= shortlist_min:
+        return "Shortlisted"
+    if score <= reject_max:
+        return "Rejected"
+    return "Pending Review"
+
+# BE-25: single source of truth for status. Status derives from the fit-gated
+# recommendation — never from the Risk score alone (which used to Shortlist
+# irrelevant-but-clean bids). Manual pins (status_source == "manual") always win.
+
+
+# Eligibility flags that mean "the document said something about the turnover
+# bar that we could not resolve". A bid carrying one of these must not be
+# presented as a confident Pursue -- a human has to read the requirement.
+UNRESOLVED_ELIGIBILITY_FLAGS = {
+    "turnover_req_unreadable",
+    "turnover_req_conflicting",
+}
+
+
+RECOMMENDATION_TO_STATUS = {
+    "Pursue": "Shortlisted",
+    "Review": "Pending Review",
+    "Drop": "Rejected",
+}
+
+
+def status_from_recommendation(recommendation, current_status=None, status_source=None):
+    """Map recommendation → workflow status; keep manually pinned statuses."""
+    if status_source == "manual" and current_status:
+        return current_status
+    return RECOMMENDATION_TO_STATUS.get(recommendation, "Pending Review")
+
+
+def apply_verdict(tender, analysis):
+    """
+    Attach analysis and derive status in one place (scrape / manual / rescore).
+    Mutates and returns the tender record.
+    """
+    tender["analysis"] = analysis
+    tender["status"] = status_from_recommendation(
+        (analysis or {}).get("recommendation"),
+        current_status=tender.get("status"),
+        status_source=tender.get("status_source"),
+    )
+    return tender
+
+
+def finalize_auto_reject(analysis, date_info=None):
+    """
+    Stamp an analysis as date-window auto-rejected (expired / closing sooner
+    than min_days_to_bid): score 0, Drop, priority 0, normalized reasons.
+    """
+    info = date_info or {}
+    expired = bool(analysis.get("is_expired") or info.get("is_expired"))
+    analysis["auto_reject"] = True
+    analysis["is_expired"] = expired
+    analysis["score"] = 0
+    analysis["recommendation"] = "Drop"
+    analysis["priority_score"] = 0
+    reasons = analysis.setdefault("reasons", [])
+    if not any(str(r).startswith("Auto-Rejected") for r in reasons):
+        msg = ("Auto-Rejected: bid expired" if expired
+               else "Auto-Rejected: closing too soon to bid")
+        reasons.insert(0, msg)
+    for r in info.get("reasons", []):
+        if r not in reasons:
+            reasons.append(r)
+    return analysis
+
+
+def scoring_fingerprint(cfg, profile):
+    """Short hash of scoring config + company profile to detect stale analyses."""
+    try:
+        blob = json.dumps({"cfg": cfg, "profile": profile}, sort_keys=True, default=str)
+        return hashlib.sha1(blob.encode("utf-8")).hexdigest()[:12]
+    except Exception:
+        return None
+
+
+def compute_recommendation(fit_score, terms_score, eligibility, is_expired, cfg,
+                           relevance_matched=False, truncated=False):
+    """
+    Fit-gated recommendation (BE-11): Pursue / Review / Drop.
+    Fit gates first — low-fit bids Drop regardless of terms. Among relevant bids,
+    terms split Pursue (friendly) vs Review (has friction). Watch is retired.
+    Never overwrites manual status — advisory only.
+
+    relevance_matched: a business line matched the bid content. Bids inside
+    fit.review_band points below fit_min with a real match go to Review instead
+    of Drop (BE-28) — a false Drop loses a tender forever; a false Review costs
+    a human ten seconds.
+    """
+    if terms_score is None and fit_score is None:
+        return None
+
+    fit_cfg = cfg.get("fit") or DEFAULT_SCORING_CONFIG.get("fit", {})
+    fit_min = float(fit_cfg.get("fit_min", 60))
+    review_band = float(fit_cfg.get("review_band", 8))
+    thresholds = cfg.get("status_thresholds") or DEFAULT_SCORING_CONFIG["status_thresholds"]
+    shortlist_min = float(thresholds.get("shortlist_min", 70))
+
+    fs = fit_score if fit_score is not None else 0
+    ts = terms_score if terms_score is not None else 0
+
+    high_fit = fs >= fit_min
+    friendly_terms = ts >= shortlist_min
+
+    # Fit is the gate: a bid that doesn't match our business lines is Dropped
+    # regardless of how friendly its terms are. Among relevant (high-fit)
+    # bids, the terms score separates Pursue (friendly) from Review (has friction).
+    if not high_fit:
+        if relevance_matched and fs >= fit_min - review_band:
+            rec = "Review"  # borderline near the gate: surface, don't silently drop
+        else:
+            rec = "Drop"
+    elif friendly_terms:
+        rec = "Pursue"
+    else:
+        rec = "Review"
+
+    # Downgrades
+    if is_expired:
+        rec = "Drop"
+    else:
+        verdict = (eligibility or {}).get("verdict")
+        if verdict == "turnover_gap" and rec == "Pursue":
+            rec = "Review"
+        # An eligibility requirement we could not read is not a clean bill of
+        # health. Narrower than "verdict != eligible" on purpose: card-only
+        # bids are unknown for want of a PDF, which is a different situation.
+        elig_flags = set((eligibility or {}).get("flags") or ())
+        if rec == "Pursue" and elig_flags & UNRESOLVED_ELIGIBILITY_FLAGS:
+            rec = "Review"
+        if terms_score is None and rec == "Pursue":
+            rec = "Review"
+        if truncated and rec == "Pursue":
+            rec = "Review"
+
+    return rec
+
+
+HIGH_EMD_REASON_PREFIX = "High EMD:"
+
+
+def _terms_score_without_emd(analysis, cfg):
+    """Terms score recomputed from the stored breakdown with EMD left out."""
+    weights = cfg.get("weights", DEFAULT_SCORING_CONFIG["weights"])
+    criteria = [
+        (b.get("criterion"), b.get("subscore", 0), b.get("detail", ""))
+        for b in analysis.get("breakdown") or []
+        if b.get("criterion") != "emd"
+    ]
+    if not criteria:
+        return None
+    score, _ = build_score_breakdown(criteria, weights)
+    return score
+
+
+def _passes_non_emd_checks(analysis, terms_ex_emd, cfg):
+    """True when the bid would be a clean candidate if the EMD were waived."""
+    if analysis.get("auto_reject") or terms_ex_emd is None:
+        return False
+    fit_cfg = cfg.get("fit") or DEFAULT_SCORING_CONFIG.get("fit", {})
+    fit_score = analysis.get("fit_score")
+    if fit_score is None or fit_score < float(fit_cfg.get("fit_min", 60)):
+        return False
+    eligibility = analysis.get("eligibility") or {}
+    if eligibility.get("verdict") != "eligible":
+        return False
+    if set(eligibility.get("flags") or ()) & UNRESOLVED_ELIGIBILITY_FLAGS:
+        return False
+    thresholds = cfg.get("status_thresholds") or DEFAULT_SCORING_CONFIG["status_thresholds"]
+    return terms_ex_emd >= float(thresholds.get("shortlist_min", 70))
+
+
+def apply_high_emd_hold(analysis, cfg):
+    """
+    Keep high-EMD bids that pass everything else, tagged for an exemption check.
+
+    EMD up to the cap (emd.max_penalty_threshold_inr, ₹20 lakh by default) is
+    scored on the normal curve. Above it the EMD sub-score is zero, which sinks
+    the bid even when fit, eligibility and terms are all fine -- yet as a Udyam
+    MSE / DPIIT startup we are often exempt from EMD. So when every other check
+    passes, the bid is kept (Review, never Drop), ranked as if the EMD were
+    waived, and flagged high_emd_hold so the dashboard lists it separately.
+    Mutates and returns the analysis.
+    """
+    emd_cfg = cfg.get("emd") or DEFAULT_SCORING_CONFIG["emd"]
+    cap = float(emd_cfg.get("max_penalty_threshold_inr", 2000000))
+    emd_amount = analysis.get("emd_amount")
+    reasons = [r for r in analysis.get("reasons") or []
+               if not str(r).startswith(HIGH_EMD_REASON_PREFIX)]
+    analysis["reasons"] = reasons
+
+    high_emd = emd_amount is not None and emd_amount > cap
+    analysis["high_emd"] = high_emd
+    analysis["high_emd_hold"] = False
+    if not high_emd:
+        return analysis
+
+    terms_ex_emd = _terms_score_without_emd(analysis, cfg)
+    if not _passes_non_emd_checks(analysis, terms_ex_emd, cfg):
+        reasons.append(
+            f"{HIGH_EMD_REASON_PREFIX} ₹{emd_amount:,} is above the ₹{int(cap):,} cap "
+            "and other checks do not all pass."
+        )
+        return analysis
+
+    analysis["high_emd_hold"] = True
+    analysis["recommendation"] = "Review"
+    analysis["priority_score"] = compute_priority_score(
+        analysis.get("fit_score"), terms_ex_emd, analysis.get("eligibility"),
+        False, cfg,
+        exemptions_favorable=bool(analysis.get("exemptions_favorable")),
+    )
+    reasons.append(
+        f"{HIGH_EMD_REASON_PREFIX} ₹{emd_amount:,} is above the ₹{int(cap):,} cap, "
+        "but every other check passes — kept under exemptions. Confirm the "
+        "MSE/Startup EMD exemption applies before bidding."
+    )
+    return analysis
+
+
+def compute_priority_score(fit_score, terms_score, eligibility, is_expired, cfg,
+                           exemptions_favorable=False):
+    """
+    Single blended 0-100 Priority score for best-first ranking (Feature B).
+    Combines Fit (company match) and terms (tender friendliness). Advisory only —
+    never overwrites manual status. Expired bids are forced to 0.
+
+    exemptions_favorable: when the tender explicitly grants Startup/MSE
+    experience or turnover relaxations, apply a priority boost (config
+    priority.exemption_boost) since such tenders are easier for us to win.
+    """
+    if fit_score is None and terms_score is None:
+        return None
+    if is_expired:
+        return 0
+
+    pr_cfg = cfg.get("priority") or DEFAULT_SCORING_CONFIG.get("priority", {})
+    fw = float(pr_cfg.get("fit_weight", 0.6))
+    rw = float(pr_cfg.get("risk_weight", 0.4))
+
+    parts = []
+    if fit_score is not None:
+        parts.append((fw, float(fit_score)))
+    if terms_score is not None:
+        parts.append((rw, float(terms_score)))
+    total_w = sum(w for w, _ in parts)
+    if total_w <= 0:
+        return None
+
+    priority = sum(w * v for w, v in parts) / total_w
+
+    # Soft nudge down when eligibility is uncertain (mirrors recommendation rules).
+    verdict = (eligibility or {}).get("verdict")
+    if verdict == "turnover_gap":
+        priority *= 0.85
+
+    # Boost tenders that explicitly relax Startup/MSE eligibility criteria.
+    if exemptions_favorable:
+        boost = float(pr_cfg.get("exemption_boost", 1.1))
+        priority *= boost
+
+    # Fit gate (BE-25): a low-fit bid must never outrank relevant bids purely on
+    # tender friendliness (clean terms → Risk 90+ used to float manpower/banner
+    # bids to the top). Below fit_min, priority is capped at the Fit score itself.
+    fit_cfg = cfg.get("fit") or DEFAULT_SCORING_CONFIG.get("fit", {})
+    fit_min = float(fit_cfg.get("fit_min", 60))
+    if fit_score is not None and float(fit_score) < fit_min:
+        priority = min(priority, float(fit_score))
+
+    return round(max(0.0, min(100.0, priority)), 1)

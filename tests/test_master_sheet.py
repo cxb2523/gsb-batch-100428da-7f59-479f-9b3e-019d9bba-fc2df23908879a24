@@ -1,0 +1,491 @@
+import os
+import sys
+import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+import openpyxl
+from gemsentry.master_sheet import MasterSheetManager
+
+@pytest.fixture
+def temp_manager(tmp_path, monkeypatch):
+    # Tests must not consume private config or write into the operator's data.
+    import gemsentry.master_sheet as module
+    import paths
+    monkeypatch.setattr(module, "CONFIG_PATH", str(tmp_path / "sync.json"))
+    monkeypatch.setattr(module, "FINALIZED_STORE_PATH", str(tmp_path / "records.json"))
+    monkeypatch.setattr(paths, "TECH_SPECS_DIR", str(tmp_path / "specs"))
+    mgr = MasterSheetManager()
+    test_wb_path = str(tmp_path / "test_master.xlsx")
+
+    # Create clean test workbook with the required sheets
+    wb = openpyxl.Workbook()
+    ws_master = wb.active
+    ws_master.title = "MASTER"
+    ws_study = wb.create_sheet("UNDER DETAILED STUDY")
+    ws_part = wb.create_sheet("(TENDER DETAILS (PARTICIPATED)")
+
+    # Add dummy header rows (row 4 for Master/Study, row 2 for Participated)
+    for _ in range(3):
+        ws_master.append([])
+        ws_study.append([])
+    ws_master.append(["SL. NO", "DOWNLOAD FROM", "WORK CATEGORY", "DOWNLOAD DATE", "MONTH", "ORGANISATION", "LOCATION/SITE", "TENDER ID"])
+    ws_study.append(["SL. NO", "DOWNLOAD FROM", "WORK CATEGORY", "DOWNLOAD DATE", "MONTH", "ORGANISATION", "LOCATION/SITE", "TENDER ID"])
+
+    ws_part.append([])
+    ws_part.append(["SL. NO", "STATUS", "DOWNLOAD FROM", "WORK CATEGORY", "DOWNLOAD DATE", "MONTH", "ORGANISATION", "LOCATIOIN/SITE", "TENDER ID"])
+
+    wb.save(test_wb_path)
+    wb.close()
+
+    mgr._get_active_master_paths = lambda: [test_wb_path]
+    mgr.finalized_records = []
+    mgr.highest_serial_no = 1016
+    mgr._save_store = lambda: None
+    mgr._sync_to_google_sheet = lambda payload: {"status": "ok", "mocked": True}
+    return mgr
+
+
+def test_serial_number_increment(temp_manager):
+    sample_tender_1 = {
+        "bid_no": "TEST/GEM/2026/001",
+        "title": "Rugged Drone Detection System",
+        "department": "Indian Air Force",
+        "end_date": "15-06-2026 15:00:00",
+        "analysis": {
+            "buyer_org": "IAF 7 BRD",
+            "est_value_inr": 4500000.0,
+            "startup_exemption": "Yes (Full)",
+            "mse_exemption": "Yes (Full)",
+            "emd_status": "No EMD Required (OK)",
+            "business_line": {"label": "DRONES"}
+        }
+    }
+
+    sample_tender_2 = {
+        "bid_no": "TEST/GEM/2026/002",
+        "title": "AC-DC Linear Power Supply Units",
+        "department": "Indian Navy",
+        "end_date": "20-07-2026 11:00:00",
+        "analysis": {
+            "buyer_org": "Naval Dockyard",
+            "est_value_inr": 1200000.0,
+            "startup_exemption": "No",
+            "mse_exemption": "Yes",
+            "emd_amount": 25000.0,
+            "business_line": {"label": "POWER SUPPLY"}
+        }
+    }
+
+    # 1. Finalize tender 1
+    res1 = temp_manager.finalize_tender(sample_tender_1, target_sheet="UNDER DETAILED STUDY")
+    assert res1["status"] == "ok"
+    assert res1["sl_no"] == 1017
+    assert res1["record"]["bid_no"] == "TEST/GEM/2026/001"
+    assert res1["record"]["organisation"] == "IAF 7 BRD"
+    assert res1["record"]["experience_exemption"] == "YES"
+    assert res1["record"]["work_category"] == "DRONES"
+
+    # 2. Finalize tender 2
+    res2 = temp_manager.finalize_tender(sample_tender_2, target_sheet="MASTER")
+    assert res2["status"] == "ok"
+    assert res2["sl_no"] == 1018
+    assert res2["record"]["bid_no"] == "TEST/GEM/2026/002"
+    assert res2["record"]["experience_exemption"] == "NO"
+    assert res2["record"]["turnover_exemption"] == "YES"
+
+    # 3. Check highest serial number
+    assert temp_manager.get_highest_serial_number() == 1018
+
+
+def test_move_to_participated(temp_manager):
+    tender = {
+        "bid_no": "TEST/GEM/2026/PART1",
+        "title": "Specialized FPGA Boards",
+        "department": "HAL Korwa",
+        "analysis": {"est_value_inr": 850000.0}
+    }
+    temp_manager.finalize_tender(tender, target_sheet="UNDER DETAILED STUDY")
+
+    # Move to participated with WON status
+    res = temp_manager.move_to_participated(
+        bid_no="TEST/GEM/2026/PART1",
+        won_lost_result="WON L - 1",
+        tender_value=850000.0,
+        so_link="https://drive.google.com/file/d/test_so/view",
+        final_remarks="Order placed successfully"
+    )
+
+    assert res["status"] == "ok"
+    rec = temp_manager.get_record("TEST/GEM/2026/PART1")
+    assert rec is not None
+    assert rec["target_sheet"] == "(TENDER DETAILS (PARTICIPATED)"
+    assert rec["won_lost_result"] == "WON L - 1"
+    assert rec["so_status"] == "SO RECEIVED"
+    assert rec["so_link"] == "https://drive.google.com/file/d/test_so/view"
+
+
+def test_delete_tender(temp_manager):
+    tender = {
+        "bid_no": "TEST/GEM/2026/DEL",
+        "title": "Accidental Tender",
+        "department": "Test Dept"
+    }
+    temp_manager.finalize_tender(tender)
+    assert temp_manager.is_tender_finalized("TEST/GEM/2026/DEL") is True
+
+    # Delete
+    del_res = temp_manager.delete_tender("TEST/GEM/2026/DEL")
+    assert del_res["status"] == "ok"
+    assert del_res["deleted_bid"] == "TEST/GEM/2026/DEL"
+    assert temp_manager.is_tender_finalized("TEST/GEM/2026/DEL") is False
+
+
+def test_api_finalized_endpoints(monkeypatch):
+    from app import app
+    from gemsentry.master_sheet import master_sheet_manager
+    monkeypatch.setattr(master_sheet_manager, "_sync_to_local_excel", lambda *args, **kwargs: True)
+    monkeypatch.setattr(master_sheet_manager, "_delete_from_local_excel", lambda *args, **kwargs: 1)
+    monkeypatch.setattr(master_sheet_manager, "_sync_to_google_sheet", lambda *args, **kwargs: {"status": "ok", "mocked": True})
+
+    client = app.test_client()
+
+    # 1. GET /api/finalized
+    res = client.get("/api/finalized")
+    assert res.status_code == 200
+    data = res.get_json()
+    assert "highest_serial_no" in data
+    assert "records" in data
+
+    # 2. POST /api/finalized/finalize
+    res_fin = client.post("/api/finalized/finalize", json={
+        "bid_no": "API/TEST/GEM/001",
+        "title": "API Test Tender",
+        "target_sheet": "UNDER DETAILED STUDY"
+    })
+    assert res_fin.status_code == 200
+    fin_data = res_fin.get_json()
+    assert fin_data["status"] == "ok"
+    assert fin_data["sl_no"] >= 1017
+
+    # 3. POST /api/finalized/move-to-participated
+    res_part = client.post("/api/finalized/move-to-participated", json={
+        "bid_no": "API/TEST/GEM/001",
+        "won_lost_result": "WON L - 1",
+        "tender_value": 500000,
+        "so_link": "https://drive.google.com/file/d/sample"
+    })
+    assert res_part.status_code == 200
+    part_data = res_part.get_json()
+    assert part_data["status"] == "ok"
+    assert part_data["result"] == "WON L - 1"
+
+    # 4. POST /api/finalized/delete
+    res_del = client.post("/api/finalized/delete", json={
+        "bid_no": "API/TEST/GEM/001"
+    })
+    assert res_del.status_code == 200
+    del_data = res_del.get_json()
+    assert del_data["status"] == "ok"
+
+    # 5. GET /api/finalized/config
+    res_cfg = client.get("/api/finalized/config")
+    assert res_cfg.status_code == 200
+    cfg_data = res_cfg.get_json()
+    assert "spreadsheet_id" in cfg_data
+
+    # 6. GET /api/finalized/script
+    res_scr = client.get("/api/finalized/script")
+    assert res_scr.status_code == 200
+    scr_data = res_scr.get_json()
+    assert "GeMSentry" in scr_data.get("script", "")
+
+    # 7. POST /api/finalized/sync-all
+    monkeypatch.setattr(master_sheet_manager, "config", {"apps_script_url": "https://script.google.com/macros/s/mock/exec"})
+    res_sync = client.post("/api/finalized/sync-all")
+    assert res_sync.status_code == 200
+    sync_data = res_sync.get_json()
+    assert sync_data["status"] == "ok"
+
+
+def test_vendor_detection_and_coloring(temp_manager):
+    # 1. Drone tender -> Drone vendor (Red: FEE2E2)
+    drone_tender = {
+        "bid_no": "TEST/DRONE/001",
+        "title": "Quadrotor UAV Surveillance Drone System",
+        "department": "BSF",
+        "analysis": {"business_line": {"id": "drone", "label": "Drone / UAV"}}
+    }
+    res_drone = temp_manager.finalize_tender(drone_tender)
+    assert res_drone["status"] == "ok"
+    rec_drone = res_drone["record"]
+    assert rec_drone["vendor_id"] == "drone"
+    assert rec_drone["vendor_name"] == "Drone vendor"
+    assert rec_drone["vendor_color"] == "FEE2E2"
+
+    # 2. Power Supply tender -> Power supply vendor (Yellow: FEF08A)
+    power_tender = {
+        "bid_no": "TEST/POWER/002",
+        "title": "High Voltage Static Convertor and Rectifier Unit",
+        "department": "DRDO",
+        "analysis": {"business_line": {"id": "power_supply", "label": "Power Supply / Electrical"}}
+    }
+    res_power = temp_manager.finalize_tender(power_tender)
+    assert res_power["status"] == "ok"
+    rec_power = res_power["record"]
+    assert rec_power["vendor_id"] == "power_supply"
+    assert rec_power["vendor_name"] == "Power supply vendor"
+    assert rec_power["vendor_color"] == "FEF08A"
+
+    # 3. Biometrics tender -> Biometrics vendor (Blue: BFDBFE)
+    bio_tender = {
+        "bid_no": "TEST/BIO/003",
+        "title": "Aadhaar Facial Recognition and Biometric Attendance Terminal",
+        "department": "CRPF",
+        "analysis": {"business_line": {"id": "biometrics", "label": "Biometrics & Facial Recognition"}}
+    }
+    res_bio = temp_manager.finalize_tender(bio_tender)
+    assert res_bio["status"] == "ok"
+    rec_bio = res_bio["record"]
+    assert rec_bio["vendor_id"] == "biometrics"
+    assert rec_bio["vendor_name"] == "Biometrics vendor"
+    assert rec_bio["vendor_color"] == "BFDBFE"
+
+    # 4. Manual Vendor Override
+    override_tender = {
+        "bid_no": "TEST/OVERRIDE/004",
+        "title": "Generic Rugged IT Workstation",
+        "department": "Army"
+    }
+    res_over = temp_manager.finalize_tender(
+        override_tender,
+        custom_fields={"assigned_vendor": "drone"}
+    )
+    rec_over = res_over["record"]
+    assert rec_over["vendor_id"] == "drone"
+    assert rec_over["vendor_name"] == "Drone vendor"
+    assert rec_over["vendor_color"] == "FEE2E2"
+
+    # 5. Check Excel workbook cell fill colors
+    active_path = temp_manager._get_active_master_paths()[0]
+    wb = openpyxl.load_workbook(active_path, data_only=False)
+    ws = wb["MASTER"]
+    # Header is row 4, rows 5-8 are the 4 tenders
+    # Check cell fill for Drone row (row 5)
+    drone_cell = ws.cell(row=5, column=1)
+    assert drone_cell.fill is not None
+    assert drone_cell.fill.start_color.rgb == "00FEE2E2" or drone_cell.fill.start_color.rgb == "FEE2E2"
+
+    # Check cell fill for Power Supply row (row 6)
+    power_cell = ws.cell(row=6, column=1)
+    assert power_cell.fill is not None
+    assert power_cell.fill.start_color.rgb == "00FEF08A" or power_cell.fill.start_color.rgb == "FEF08A"
+
+    # Check cell fill for Biometrics row (row 7)
+    bio_cell = ws.cell(row=7, column=1)
+    assert bio_cell.fill is not None
+    assert bio_cell.fill.start_color.rgb == "00BFDBFE" or bio_cell.fill.start_color.rgb == "BFDBFE"
+
+    wb.close()
+
+    # 6. Check payload structure
+    payload = temp_manager._build_gsheet_payload(rec_drone, target_sheet="MASTER")
+    assert payload["vendor_id"] == "drone"
+    assert payload["vendor_name"] == "Drone vendor"
+    assert payload["vendor_color"] == "FEE2E2"
+    assert "vendor_sheets" in payload
+    assert "tech_spec_url" in payload
+
+
+def test_tech_spec_attachment_and_sync(temp_manager):
+    # 1. Finalize tender without spec sheet
+    tender = {
+        "bid_no": "TEST/SPEC/001",
+        "title": "Tactical UAV System",
+        "department": "BSF",
+        "analysis": {"business_line": {"label": "DRONES"}}
+    }
+    fin = temp_manager.finalize_tender(tender)
+    assert fin["status"] == "ok"
+    assert fin["record"]["tech_spec_url"] == ""
+
+    # 2. Attach Google Doc URL
+    doc_url = "https://docs.google.com/document/d/1ABCXYZ_Drone_Spec/edit?usp=sharing"
+    res = temp_manager.update_tech_spec(
+        bid_no="TEST/SPEC/001",
+        tech_spec_url=doc_url,
+        filename="drone_spec_doc"
+    )
+    assert res["status"] == "ok"
+    assert res["tech_spec_url"] == doc_url
+    assert res["vendor_id"] == "drone"
+    assert res["vendor_name"] == "Drone vendor"
+
+    # Verify record in manager
+    rec = temp_manager.get_record("TEST/SPEC/001")
+    assert rec["tech_spec_url"] == doc_url
+    assert rec["tech_spec_filename"] == "drone_spec_doc"
+    assert rec["tech_spec_updated_at"] != ""
+
+    # Verify payload reflects tech_spec_url
+    payload = temp_manager._build_gsheet_payload(rec, target_sheet="MASTER")
+    assert payload["tech_spec_url"] == doc_url
+
+    # 3. Test uploading file bytes locally
+    file_content = b"%PDF-1.4 Mock PDF Technical Specification for Drone"
+    res_file = temp_manager.update_tech_spec(
+        bid_no="TEST/SPEC/001",
+        filename="uav_tech_specs.pdf",
+        file_bytes=file_content
+    )
+    assert res_file["status"] == "ok"
+    assert res_file["tech_spec_filename"] == "uav_tech_specs.pdf"
+    assert "spec-sheet" in res_file["tech_spec_url"] or "drive.google.com" in res_file["tech_spec_url"]
+
+    # Verify saved on disk
+    import paths
+    spec_file = os.path.join(paths.TECH_SPECS_DIR, "TEST_SPEC_001", "uav_tech_specs.pdf")
+    assert os.path.exists(spec_file)
+    with open(spec_file, "rb") as f:
+        assert f.read() == file_content
+
+
+def test_web_endpoints_spec_sheet(temp_manager, monkeypatch):
+    import app as flask_app
+    from io import BytesIO
+    client = flask_app.app.test_client()
+
+    # Pre-finalize a tender
+    temp_manager.finalize_tender({"bid_no": "TEST/ENDPOINT/001", "title": "CCTV and Biometric Access Control"})
+    monkeypatch.setattr("gemsentry.web.master_sheet.master_sheet_manager", temp_manager)
+
+    # 1. Update spec sheet with Google Doc URL
+    res = client.post("/api/finalized/update-spec-sheet", json={
+        "bid_no": "TEST/ENDPOINT/001",
+        "tech_spec_url": "https://docs.google.com/document/d/my_spec_doc"
+    })
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["status"] == "ok"
+    assert data["tech_spec_url"] == "https://docs.google.com/document/d/my_spec_doc"
+
+    # 2. Upload a spec sheet file
+    file_data = (BytesIO(b"%PDF-1.4 Biometric Specifications"), "biometric_spec.pdf")
+    res_up = client.post("/api/finalized/upload-spec-sheet", data={
+        "bid_no": "TEST/ENDPOINT/001",
+        "file": file_data
+    }, content_type="multipart/form-data")
+    assert res_up.status_code == 200
+    up_data = res_up.get_json()
+    assert up_data["status"] == "ok"
+    assert up_data["tech_spec_filename"] == "biometric_spec.pdf"
+
+    # 3. Serve spec sheet file
+    res_serve = client.get("/api/finalized/spec-sheet/TEST_ENDPOINT_001")
+    assert res_serve.status_code == 200
+    assert b"Biometric Specifications" in res_serve.data
+
+def test_finalize_with_custom_sl_no(temp_manager):
+    tender = {
+        "bid_no": "TEST/GEM/CUSTOM_SL_1",
+        "title": "Custom Serial Tender",
+        "department": "Custom Dept"
+    }
+    # User manually specifies SL 1035
+    res = temp_manager.finalize_tender(tender, sl_no=1035)
+    assert res["status"] == "ok"
+    assert res["sl_no"] == 1035
+    assert res["record"]["sl_no"] == 1035
+    assert temp_manager.get_highest_serial_number() == 1035
+
+    # Another tender using custom_fields["sl_no"]
+    tender2 = {
+        "bid_no": "TEST/GEM/CUSTOM_SL_2",
+        "title": "Custom Serial Tender 2",
+        "department": "Custom Dept 2"
+    }
+    res2 = temp_manager.finalize_tender(tender2, custom_fields={"sl_no": 1040})
+    assert res2["status"] == "ok"
+    assert res2["sl_no"] == 1040
+    assert temp_manager.get_highest_serial_number() == 1040
+
+
+def test_prevent_overwriting_occupied_row_in_excel(temp_manager):
+    # In temp_manager's Excel sheet, create a row with SL 1029 that already has another tender's data
+    excel_path = temp_manager._get_active_master_paths()[0]
+    wb = openpyxl.load_workbook(excel_path)
+    ws = wb["MASTER"]
+    occupied_row = 10
+    ws.cell(row=occupied_row, column=1, value=1029)
+    ws.cell(row=occupied_row, column=8, value="EXISTING/MANUAL/1029")
+    ws.cell(row=occupied_row, column=10, value="Original Tender in 1029")
+    wb.save(excel_path)
+    wb.close()
+
+    # Now finalize a new tender via GeMSentry with sl_no=1029
+    new_tender = {
+        "bid_no": "NEW/GEMSENTRY/1029",
+        "title": "New Pushed Tender",
+        "department": "Some Dept"
+    }
+    res = temp_manager.finalize_tender(new_tender, target_sheet="MASTER", sl_no=1029)
+    assert res["status"] == "ok"
+    assert res["sl_no"] == 1029
+
+    # Verify that row 10 in Excel was NOT overwritten!
+    wb = openpyxl.load_workbook(excel_path)
+    ws = wb["MASTER"]
+    cell_id_at_10 = ws.cell(row=occupied_row, column=8).value
+    assert cell_id_at_10 == "EXISTING/MANUAL/1029", "Occupied row was overwritten!"
+    assert ws.cell(row=occupied_row, column=10).value == "Original Tender in 1029"
+
+    # Verify that the new tender was written to a different row
+    found_new = False
+    for r in range(5, ws.max_row + 1):
+        if r != occupied_row and ws.cell(row=r, column=8).value == "NEW/GEMSENTRY/1029":
+            found_new = True
+            break
+    assert found_new, "New tender was not saved to an empty row"
+    wb.close()
+
+
+def test_dynamic_excel_baseline_detection(temp_manager):
+    # Add a row to Excel manually with SL 1055 and some data
+    excel_path = temp_manager._get_active_master_paths()[0]
+    wb = openpyxl.load_workbook(excel_path)
+    ws = wb["MASTER"]
+    ws.cell(row=15, column=1, value=1055)
+    ws.cell(row=15, column=6, value="Manual Org")
+    ws.cell(row=15, column=10, value="Manual Drone Project")
+    wb.save(excel_path)
+    wb.close()
+
+    # Query highest serial number with refresh
+    highest = temp_manager.get_highest_serial_number(refresh=True)
+    assert highest == 1055
+
+    # Auto-increment should now pick 1056
+    next_tender = {"bid_no": "TEST/AUTO/NEXT", "title": "Next Auto Tender"}
+    res = temp_manager.finalize_tender(next_tender)
+    assert res["sl_no"] == 1056
+
+
+def test_api_finalize_with_custom_sl_no(monkeypatch):
+    from app import app
+    from gemsentry.master_sheet import master_sheet_manager
+    monkeypatch.setattr(master_sheet_manager, "_sync_to_local_excel", lambda *args, **kwargs: True)
+    monkeypatch.setattr(master_sheet_manager, "_sync_to_google_sheet", lambda *args, **kwargs: {"status": "ok", "mocked": True})
+
+    client = app.test_client()
+    res = client.post("/api/finalized/finalize", json={
+        "bid_no": "API/TEST/CUSTOM_SL_99",
+        "title": "API Custom SL Tender",
+        "sl_no": 1099
+    })
+    assert res.status_code == 200
+    data = res.get_json()
+    assert data["status"] == "ok"
+    assert data["sl_no"] == 1099
+
