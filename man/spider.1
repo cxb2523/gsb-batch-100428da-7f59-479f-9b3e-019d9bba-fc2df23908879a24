@@ -201,6 +201,12 @@ open after only ever seeing individual
 .IR /js/*.min.js " hits)," and crawls whatever that turns up \(em
 listed directories, in particular, often expose files the forward
 crawl never had a link to.
+Every ancestor candidate and its outcome \(em requested (with status),
+skipped (with reason), or failed (with reason) \(em is recorded in the
+report under the top-level
+.I backtracking
+key, so a directory that is absent from the endpoint list can be
+distinguished from one that was never probed or whose probe failed.
 .SS "Piping"
 .TP
 .BR \-Q ", " \-\-pipe
