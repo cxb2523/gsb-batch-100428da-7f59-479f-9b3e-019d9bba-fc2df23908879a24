@@ -15,6 +15,14 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from bs4 import BeautifulSoup
 
+from crawler_common import (
+    CrawlStats,
+    load_visited_urls,
+    append_visited_url,
+    save_visited_urls,
+    print_summary,
+)
+
 # 全局控制变量
 cancel_crawl = False
 BING_URL = "https://www.bing.com/search"
@@ -36,71 +44,62 @@ def signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 
-# Chrome浏览器配置
-options = Options()
-options.add_argument('--headless')
-options.add_argument('--disable-gpu')
-options.add_argument('--no-sandbox')
-options.add_argument('--window-size=1920,1080')
-options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+def init_driver():
+    """初始化真实 Chrome 驱动（仅在未注入 driver 时由 main 调用）。"""
+    # Chrome浏览器配置
+    options = Options()
+    options.add_argument('--headless')
+    options.add_argument('--disable-gpu')
+    options.add_argument('--no-sandbox')
+    options.add_argument('--window-size=1920,1080')
+    options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
-# 初始化浏览器驱动
-try:
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=options)
-except Exception as e:
-    print(f"浏览器驱动初始化失败: {str(e)}")
-    exit(1)
+    try:
+        service = Service(ChromeDriverManager().install())
+        return webdriver.Chrome(service=service, options=options)
+    except Exception as e:
+        print(f"浏览器驱动初始化失败: {str(e)}")
+        exit(1)
 
-def load_visited_urls():
-    if os.path.exists(visited_urls_file):
-        with open(visited_urls_file, 'r', encoding='utf-8') as f:
-            return set(f.read().splitlines())
-    return set()
-
-def save_visited_urls(urls):
-    with open(visited_urls_file, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(urls))
-
-def search_bing(query, region='US'):
+def search_bing(query, driver, region='US'):
     search_results = set()
-    
+
     for page in range(0, MAX_PAGES):
         if cancel_crawl:
             break
-            
+
         # 构造Bing搜索参数
         params = {
             'q': query,
             'first': page*10 + 1,  # Bing分页参数
             'cc': region
         }
-        
+
         try:
             driver.get(f"{BING_URL}?{requests.compat.urlencode(params)}")
             WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, 'ol#b_results'))
             )
-            
+
             soup = BeautifulSoup(driver.page_source, 'html.parser')
             results = soup.select('li.b_algo h2 a')
-            
+
             for link in results:
                 url = link.get('href')
                 if url and url.startswith('http'):
                     search_results.add(url)
-            
+
             print(f"地区 {region} 第 {page+1} 页找到 {len(results)} 个结果")
-            
+
             # 检查是否有下一页
             next_page = soup.select_one('a.sb_pagN')
             if not next_page:
                 break
-                
+
         except Exception as e:
             print(f"搜索失败: {str(e)}")
             break
-            
+
     return list(search_results)
 
 def clean_content(html_content):
@@ -111,25 +110,33 @@ def clean_content(html_content):
     text = re.sub(r'\s+', ' ', text)
     return text[:10000]  # 限制内容长度
 
-def crawl_page(url, visited, depth=1, max_depth=2):
-    if cancel_crawl or url in visited or depth > max_depth:
+def crawl_page(url, visited, stats, driver, depth=1, max_depth=2):
+    if cancel_crawl or depth > max_depth:
         return
-        
+    if url in visited:
+        stats.skipped_count += 1
+        print(f"跳过(已访问): {url}")
+        return
+
     print(f"正在爬取 [{depth}级]: {url}")
-    visited.add(url)
-    
+
     try:
         driver.get(url)
         WebDriverWait(driver, 20).until(
             EC.presence_of_element_located((By.TAG_NAME, 'body')))
-        
+
         title = driver.title
         content = clean_content(driver.page_source)
-        
+
         with open(csv_file_path, 'a', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow([title, url, content])
-            
+
+        # 成功写入 CSV 后立即持久化该 URL，中断也不丢进度
+        visited.add(url)
+        append_visited_url(visited_urls_file, url)
+        stats.new_count += 1
+
         # 提取子链接
         if depth < max_depth:
             links = driver.find_elements(By.TAG_NAME, 'a')
@@ -138,35 +145,60 @@ def crawl_page(url, visited, depth=1, max_depth=2):
                 if href and href.startswith('http'):
                     absolute_url = urljoin(url, href)
                     if absolute_url not in visited:
-                        crawl_page(absolute_url, visited, depth+1, max_depth)
-                        
+                        crawl_page(absolute_url, visited, stats, driver, depth+1, max_depth)
+
     except Exception as e:
         print(f"爬取失败: {str(e)}")
 
-def main():
+def main(search_fn=None, driver=None):
+    """主流程。
+
+    search_fn: 可注入的搜索入口，签名 search_fn(query, driver, region) -> [url,...]，
+               默认使用真实 Bing 搜索 search_bing。
+    driver:    可注入的抓取驱动（如本地假页面驱动），默认启动真实 Chrome。
+    注入二者后无需真实浏览器与在线搜索即可驱动同一套收尾与持久化逻辑。
+    """
+    global cancel_crawl
+    cancel_crawl = False
+
     # 初始化文件
     if not os.path.exists(csv_file_path):
         with open(csv_file_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(['标题', 'URL', '内容'])
-            
-    visited = load_visited_urls()
-    
-    # 多地区搜索
+
+    visited = load_visited_urls(visited_urls_file)
+    stats = CrawlStats()
+
+    own_driver = driver is None
+    if own_driver:
+        driver = init_driver()
+    if search_fn is None:
+        search_fn = search_bing
+
     total_results = 0
-    for region_code in GEOLOCATIONS.values():
-        print(f"\n正在搜索地区: {region_code}")
-        urls = search_bing(QUERY, region_code)
-        total_results += len(urls)
-        
-        for url in urls:
+    try:
+        # 多地区搜索
+        for region_code in GEOLOCATIONS.values():
             if cancel_crawl:
                 break
-            crawl_page(url, visited)
-            
-    driver.quit()
-    save_visited_urls(visited)
-    print(f"\n完成! 共爬取 {total_results} 个结果")
+            print(f"\n正在搜索地区: {region_code}")
+            urls = search_fn(QUERY, driver, region_code)
+            total_results += len(urls)
+
+            for url in urls:
+                if cancel_crawl:
+                    break
+                crawl_page(url, visited, stats, driver)
+    finally:
+        if own_driver and driver is not None:
+            driver.quit()
+        # 无论正常结束还是用户中断，都保存当前已访问集合并交代进度
+        save_visited_urls(visited_urls_file, visited)
+        if cancel_crawl:
+            stats.mark_interrupted()
+        print_summary(stats)
+        print(f"本次搜索共获得 {total_results} 个结果")
 
 if __name__ == '__main__':
     main()
