@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "test": "node test.js",
+    "test:offline": "node --test test/offline-failure.test.js",
     "tsc": "rm -f index.d.ts && rm -f src/*.d.ts && tsc --allowJs -d --emitDeclarationOnly index.js",
     "prepare": "husky install"
   },

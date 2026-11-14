@@ -53,6 +53,15 @@ class BaseAPI {
 
   /**
    * Makes a request to Crawlbase API.
+   *
+   * The returned promise never resolves with an incomplete or undecoded body.
+   * When it rejects, the error is tagged so callers can tell failures apart:
+   * - `error.type === 'compression'` the response body could not be decompressed.
+   *   The error also carries `error.statusCode` and `error.headers` from the response.
+   * - `error.type === 'timeout'` the request took longer than the configured timeout
+   *   and was destroyed. The error also carries `error.timeout` with the configured
+   *   timeout in milliseconds.
+   * - Any other rejection is the original network error, untagged.
    * @param {string} path Path from the API to load.
    * @param {object} [options={}] Additional options for the request.
    * @returns {Promise}
@@ -78,7 +87,12 @@ class BaseAPI {
       const request = https.request(requestOptions, (response) =>
         this.processResponse(response).then(resolve).catch(reject),
       );
-      request.setTimeout(this.options.timeout, () => request.destroy('Request timeout'));
+      request.setTimeout(this.options.timeout, () => {
+        const error = new Error('Request timeout');
+        error.type = 'timeout';
+        error.timeout = this.options.timeout;
+        request.destroy(error);
+      });
       request.on('error', reject);
       if (('POST' === options.method || 'PUT' === options.method) && '' !== options.postData) {
         request.write(options.postData);
@@ -113,6 +127,9 @@ class BaseAPI {
           return resolve(response);
         });
         pipe.on('error', (error) => {
+          error.type = 'compression';
+          error.statusCode = response.statusCode;
+          error.headers = response.headers;
           response.statusCode = 400;
           response.body = 'Error unzipping response';
           return reject(error);
