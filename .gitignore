@@ -1,0 +1,52 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.wrangler/
+
+# File cấu hình cục bộ (chứa KV ID thật, KHÔNG push lên GitHub)
+wrangler.local.toml
+
+# Runtime cache (generated at startup)
+cache.json
+**/cache.json
+
+# Log files
+*.log
+logs/
+**/logs/
+
+# Debug artifacts
+backend/tools/debug/
+backend/tools/debug/*.html
+backend/tools/debug/*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Demo Website (không commit lên main repo)
+websites/
+
+# Các file trả lời/note cá nhân
+answer.md
+
+# Scripts và tools nội bộ (không commit)
+scripts/
+backend/tools/
+
+# File test tạm
+backend/test_fetch.js
+backend/tests/*.snap
+
+# Package lock (tuỳ chọn — comment ra nếu muốn lock version)
+# package-lock.json
+
+# Local SQLite databases and temp brain directories
+backend/data/
+brain/
