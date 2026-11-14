@@ -1,4 +1,4 @@
-import fcntl
+import contextlib
 import os
 import shutil
 import socket
@@ -11,6 +11,11 @@ from subprocess import DEVNULL, PIPE, Popen
 from urllib.parse import urljoin
 
 import port_for
+
+with contextlib.suppress(ImportError):
+    # fcntl is only available on POSIX systems; on Windows the non-blocking
+    # read below falls back to a plain read.
+    import fcntl
 
 from . import TESTS_PATH
 from .utils import generate_project, get_testenv
@@ -36,7 +41,14 @@ class BaseTestServer:
         self.stdout = stdout
         self.stderr = stderr
 
-        self.arguments = ["flask", "run", "-p", str(self.port)]
+        self.arguments = [
+            sys.executable,
+            "-m",
+            "flask",
+            "run",
+            "-p",
+            str(self.port),
+        ]
 
     def start(self):
         self.proc = Popen(
@@ -98,6 +110,9 @@ class BaseTestServer:
     @staticmethod
     def _non_block_read(output):
         if output is None:
+            return ""
+        if "fcntl" not in globals():
+            # No fcntl on Windows; stderr is typically empty after startup.
             return ""
         fd = output.fileno()
         fl = fcntl.fcntl(fd, fcntl.F_GETFL)

@@ -359,6 +359,133 @@ class TestCrawlResourceIntegration:
         assert msg in res_json["message"]
 
     @pytest.mark.parametrize("method", (perform_get, perform_post))
+    def test_invalid_callback(self, server, method):
+        url = server.url("crawl.json")
+        res = method(
+            url,
+            {"spider_name": "test"},
+            {"url": server.site.url("page1.html"), "callback": "not_a_callback"},
+        )
+        assert res.status_code == 400
+        res_json = res.json()
+        assert res_json["status"] == "error"
+        assert res_json["code"] == 400
+        assert res_json.get("items") is None
+        assert "callback" in res_json["message"]
+        assert "not_a_callback" in res_json["message"]
+
+    @pytest.mark.parametrize("method", (perform_get, perform_post))
+    def test_invalid_errback(self, server, method):
+        url = server.url("crawl.json")
+        res = method(
+            url,
+            {"spider_name": "test"},
+            {"url": server.site.url("err/503"), "errback": "not_an_errback"},
+        )
+        assert res.status_code == 400
+        res_json = res.json()
+        assert res_json["status"] == "error"
+        assert res_json["code"] == 400
+        assert res_json.get("items") is None
+        assert "errback" in res_json["message"]
+        assert "not_an_errback" in res_json["message"]
+
+    @pytest.mark.parametrize("method", (perform_get, perform_post))
+    def test_invalid_callback_and_errback_reports_callback(self, server, method):
+        # Both names are invalid; the callback is checked first so the
+        # reported error deterministically points at the callback.
+        url = server.url("crawl.json")
+        res = method(
+            url,
+            {"spider_name": "test"},
+            {
+                "url": server.site.url("page1.html"),
+                "callback": "bad_callback",
+                "errback": "bad_errback",
+            },
+        )
+        assert res.status_code == 400
+        res_json = res.json()
+        assert res_json["status"] == "error"
+        assert res_json["code"] == 400
+        assert "callback" in res_json["message"]
+        assert "bad_callback" in res_json["message"]
+        assert "bad_errback" not in res_json["message"]
+
+    @pytest.mark.parametrize("method", (perform_get, perform_post))
+    def test_valid_callback(self, server, method):
+        url = server.url("crawl.json")
+        res = method(
+            url,
+            {"spider_name": "test"},
+            {"url": server.site.url("page1.html"), "callback": "return_bytes"},
+        )
+        assert res.status_code == 200
+        res_json = res.json()
+        assert res_json["status"] == "ok"
+        assert res_json["items"] == [{"name": "Some bytes here"}]
+        assert res_json["items_dropped"] == []
+        assert res_json["stats"] is not None
+
+    @pytest.mark.parametrize("method", (perform_get, perform_post))
+    def test_valid_errback(self, server, method):
+        url = server.url("crawl.json")
+        res = method(
+            url,
+            {"spider_name": "test"},
+            {"url": server.site.url("err/503"), "errback": "some_errback"},
+        )
+        assert res.status_code == 200
+        res_json = res.json()
+        assert res_json["status"] == "ok"
+        assert res_json["stats"] is not None
+        assert res_json.get("items", []) == []
+
+    @pytest.mark.parametrize("method", (perform_get, perform_post))
+    def test_default_parse_callback_unchanged(self, server, method):
+        # No callback given: the default 'parse' must still be used.
+        url = server.url("crawl.json")
+        res = method(
+            url,
+            {"spider_name": "test"},
+            {"url": server.site.url("page1.html")},
+        )
+        assert res.status_code == 200
+        res_json = res.json()
+        assert res_json["status"] == "ok"
+        assert res_json["items"] == [{"name": ["Page 1"]}]
+        assert res_json["items_dropped"] == []
+        assert res_json["stats"] is not None
+
+    @pytest.mark.parametrize("method", (perform_get, perform_post))
+    def test_invalid_callback_then_retry_succeeds(self, server, method):
+        # An invalid callback must not pollute the service process: a later
+        # valid request against the same server still returns items.
+        url = server.url("crawl.json")
+        failed = method(
+            url,
+            {"spider_name": "test"},
+            {"url": server.site.url("page1.html"), "callback": "not_a_callback"},
+        )
+        assert failed.status_code == 400
+        failed_json = failed.json()
+        assert failed_json["status"] == "error"
+        assert failed_json["code"] == 400
+        assert "not_a_callback" in failed_json["message"]
+
+        retried = method(
+            url,
+            {"spider_name": "test"},
+            {"url": server.site.url("page1.html")},
+        )
+        assert retried.status_code == 200
+        retried_json = retried.json()
+        assert retried_json["status"] == "ok"
+        assert retried_json["items"] == [{"name": ["Page 1"]}]
+        assert retried_json["items_dropped"] == []
+        assert retried_json["stats"] is not None
+
+    @pytest.mark.parametrize("method", (perform_get, perform_post))
     def test_passing_errback(self, server, method):
         url = server.url("crawl.json")
         res = method(

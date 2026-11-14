@@ -3,13 +3,14 @@ import datetime as dt
 import re
 from pathlib import Path
 from time import sleep
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from scrapy import Item
 from scrapy.exceptions import DontCloseSpider
 from scrapy.http import Response
 from scrapy.settings import Settings
+from twisted.internet.defer import Deferred
 from twisted.python.failure import Failure
 from twisted.trial import unittest
 from twisted.web.error import Error
@@ -119,6 +120,123 @@ class TestSpiderIdle(TestCrawlManager):
 
         assert callable(mng.request.errback)
         assert mng.request.errback("something") == "something"
+
+
+class TestValidateSpiderCallback(TestCrawlManager):
+    def test_valid_callback(self):
+        # 'parse' is defined on the spider and is callable
+        self.crawl_manager.callback_name = "parse"
+        assert self.crawl_manager.validate_spider_callback(MetaSpider) is None
+
+    def test_invalid_callback_raises_400(self):
+        self.crawl_manager.callback_name = "not_a_real_callback"
+        with pytest.raises(Error) as exception:
+            self.crawl_manager.validate_spider_callback(MetaSpider)
+        assert exception.value.status == b"400"
+        msg = exception.value.message
+        assert b"Invalid spider callback not_a_real_callback" in msg
+        assert self.spider.name.encode() in msg
+
+    def test_callback_that_is_not_callable_raises_400(self):
+        MetaSpider.not_callable_attribute = "I am not a method"  # type: ignore[attr-defined]
+        try:
+            self.crawl_manager.callback_name = "not_callable_attribute"
+            with pytest.raises(Error) as exception:
+                self.crawl_manager.validate_spider_callback(MetaSpider)
+            assert exception.value.status == b"400"
+            assert b"Invalid spider callback not_callable_attribute" in (
+                exception.value.message
+            )
+        finally:
+            del MetaSpider.not_callable_attribute
+
+    def test_invalid_errback_raises_400(self):
+        self.crawl_manager.errback_name = "not_a_real_errback"
+        with pytest.raises(Error) as exception:
+            self.crawl_manager.validate_spider_callback(MetaSpider)
+        assert exception.value.status == b"400"
+        msg = exception.value.message
+        assert b"Invalid spider errback not_a_real_errback" in msg
+        assert self.spider.name.encode() in msg
+
+    def test_valid_errback(self):
+        MetaSpider.handle_error = lambda self, failure: None  # type: ignore[attr-defined]
+        try:
+            self.crawl_manager.errback_name = "handle_error"
+            assert self.crawl_manager.validate_spider_callback(MetaSpider) is None
+        finally:
+            del MetaSpider.handle_error
+
+    def test_no_errback_skips_errback_check(self):
+        # DEFAULT_ERRBACK_NAME is None by default
+        self.crawl_manager.errback_name = None
+        assert self.crawl_manager.validate_spider_callback(MetaSpider) is None
+
+    def test_callback_checked_first_when_both_invalid(self):
+        # When both names are invalid the callback error must win so the
+        # behaviour stays deterministic.
+        self.crawl_manager.callback_name = "bad_callback"
+        self.crawl_manager.errback_name = "bad_errback"
+        with pytest.raises(Error) as exception:
+            self.crawl_manager.validate_spider_callback(MetaSpider)
+        assert exception.value.status == b"400"
+        assert b"Invalid spider callback bad_callback" in exception.value.message
+        assert b"errback" not in exception.value.message
+
+    def test_crawl_rejects_invalid_callback_before_scheduling(self):
+        manager = self.create_crawl_manager(
+            {"url": self.url, "callback": "not_a_real_callback"},
+        )
+        runner = MagicMock()
+        runner.spider_loader.load.return_value = MetaSpider
+        runner.crawl = MagicMock()
+        with (
+            patch("scrapyrt.core.ScrapyrtCrawlerRunner", return_value=runner),
+            pytest.raises(Error) as exception,
+        ):
+            manager.crawl()
+        assert exception.value.status == b"400"
+        assert b"Invalid spider callback not_a_real_callback" in (
+            exception.value.message
+        )
+        # The crawler must not be started and nothing gets scheduled
+        assert runner.crawl.called is False
+        assert manager._request_scheduled is False
+        assert manager.items == []
+        assert runner.create_crawler.called is False
+
+    def test_crawl_rejects_invalid_errback_before_scheduling(self):
+        manager = self.create_crawl_manager(
+            {"url": self.url, "errback": "not_a_real_errback"},
+        )
+        runner = MagicMock()
+        runner.spider_loader.load.return_value = MetaSpider
+        runner.crawl = MagicMock()
+        with (
+            patch("scrapyrt.core.ScrapyrtCrawlerRunner", return_value=runner),
+            pytest.raises(Error) as exception,
+        ):
+            manager.crawl()
+        assert exception.value.status == b"400"
+        assert b"Invalid spider errback not_a_real_errback" in (
+            exception.value.message
+        )
+        assert runner.crawl.called is False
+        assert manager._request_scheduled is False
+        assert manager.items == []
+        assert runner.create_crawler.called is False
+
+    def test_crawl_starts_when_callback_is_valid(self):
+        manager = self.create_crawl_manager(
+            {"url": self.url, "callback": "parse"},
+        )
+        runner = MagicMock()
+        runner.spider_loader.load.return_value = MetaSpider
+        runner.crawl.return_value = Deferred()
+        with patch("scrapyrt.core.ScrapyrtCrawlerRunner", return_value=runner):
+            manager.crawl()
+        assert runner.crawl.called is True
+        assert manager._request_scheduled is False
 
 
 class TestHandleScheduling(TestCrawlManager):

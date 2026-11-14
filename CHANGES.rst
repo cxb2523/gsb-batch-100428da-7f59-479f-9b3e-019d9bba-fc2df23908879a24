@@ -7,6 +7,11 @@ ScrapyRT 0.19.0 (unreleased)
 -   Added a ``max_items`` API parameter to stop the crawl once a given number
     of items has been scraped.
 
+-   Invalid ``callback`` and ``errback`` values are now rejected with an HTTP
+    400 error before the crawl starts, instead of failing later in the crawl.
+    The error message names the offending ``callback`` or ``errback`` and its
+    value, and no request is scheduled or partial result returned.
+
 ScrapyRT 0.18.1 (2026-06-29)
 ----------------------------
 

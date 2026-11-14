@@ -141,6 +141,10 @@ class CrawlManager:  # pylint: disable=too-many-instance-attributes
                     400,
                     message=msg.format(kw, getattr(spidercls, kw)).encode(),
                 )
+        # Validate callback and errback before scheduling anything so that an
+        # invalid name fails fast with a 400 response and leaves no scheduled
+        # requests or partially collected results behind.
+        self.validate_spider_callback(spidercls)
         if not self.spider_start:
             self.set_dummy_start_methods(spidercls)
         dfd = self.crawler_runner.crawl(spidercls, *args, **kwargs)
@@ -180,6 +184,32 @@ class CrawlManager:  # pylint: disable=too-many-instance-attributes
             setattr(self.crawler.spider.__class__, method_name, original_method)
         return result
 
+    def validate_spider_callback(self, spidercls):
+        """Check that the request callback and errback name spider methods.
+
+        The check runs before the crawler is started so that an invalid
+        callback or errback results in a 400 error without scheduling the
+        request or producing partial crawl results.
+
+        :raises twisted.web.error.Error: with HTTP status 400 when the
+            callback or errback is not a callable method of the spider.
+        """
+        callback = getattr(spidercls, self.callback_name, None)
+        if not callable(callback):
+            msg = (
+                f"Invalid spider callback {self.callback_name}, callback not "
+                f"callable or not a method of a spider {self.spider_name}"
+            )
+            raise Error(400, message=msg.encode())
+        if self.errback_name:
+            errback = getattr(spidercls, self.errback_name, None)
+            if not callable(errback):
+                msg = (
+                    f"Invalid spider errback {self.errback_name}, errback not "
+                    f"callable or not a method of a spider {self.spider_name}"
+                )
+                raise Error(400, message=msg.encode())
+
     def read_spider(self, spider):
         self._cleanup_handler = setup_spider_logging(spider, spider.settings)
 
@@ -215,6 +245,9 @@ class CrawlManager:  # pylint: disable=too-many-instance-attributes
             and self.request
             and not self._request_scheduled
         ):
+            # validate_spider_callback() already rejects invalid callbacks
+            # with a 400 error before the crawl starts; this mirrors the check
+            # against the actual spider instance as a safety net.
             try:
                 callback = getattr(self.crawler.spider, self.callback_name)
                 assert callable(callback), "Invalid callback"
