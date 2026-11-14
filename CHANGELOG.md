@@ -5,6 +5,14 @@ All notable changes to ClawBridge will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Per-page capture records (browser-use)**: Whole-task runs now return `TaskResult.page_records` — one record per unique page, in first-visit order, with `url`, `title`, extracted `snippet`, `captured` flag, and a `reason` when no content was obtained. Repeated hits on an already-recorded URL add no record; they increment `duplicate_skips` on the original instead. An empty final result or a history with no usable URL is recorded as not captured with an explicit reason — never as a fake success. Records appear in the dashboard chat reply, history detail, and markdown export.
+- **Page record tests**: Unit tests use fake agent histories (no browser) to cover normal extraction, empty final result, and duplicate URLs, asserting record count, order, and per-record status.
+
+---
+
 ## [0.6.1] - 2026-03-12
 
 ### Added

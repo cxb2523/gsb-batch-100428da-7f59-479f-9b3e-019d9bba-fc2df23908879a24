@@ -17,6 +17,7 @@ from clawbridge.shared.schemas import (
     EngineInfo,
     EngineName,
     EngineStatus,
+    PageRecord,
     PolicyDecision,
     PolicyMode,
     StepResult,
@@ -208,6 +209,7 @@ class TestTaskResult:
         result = TaskResult(summary="AI agents are useful for automation")
         assert result.summary == "AI agents are useful for automation"
         assert result.citations == []
+        assert result.page_records == []
         assert result.total_steps == 0
         assert result.total_duration_ms == 0
         assert result.engine_used == EngineName.AUTO
@@ -232,6 +234,47 @@ class TestTaskResult:
         )
         assert result.tokens_used.input_tokens == 100
         assert result.tokens_used.estimated_cost_usd == 0.002
+
+    def test_with_page_records(self):
+        result = TaskResult(
+            summary="test",
+            page_records=[
+                PageRecord(url="https://example.com", title="Example", snippet="Body", captured=True),
+                PageRecord(url="https://empty.test", captured=False, reason="Final result was empty"),
+            ],
+        )
+        assert len(result.page_records) == 2
+        assert result.page_records[0].captured is True
+        assert result.page_records[0].duplicate_skips == 0
+        assert result.page_records[1].captured is False
+        assert result.page_records[1].reason == "Final result was empty"
+        dumped = result.model_dump(mode="json")
+        assert dumped["page_records"][0]["url"] == "https://example.com"
+
+
+# ── PageRecord Model ────────────────────────────────────────────────────────
+
+
+class TestPageRecord:
+    def test_defaults(self):
+        record = PageRecord()
+        assert record.url == ""
+        assert record.title == ""
+        assert record.snippet == ""
+        assert record.captured is False
+        assert record.reason == ""
+        assert record.step == 0
+        assert record.duplicate_skips == 0
+
+    def test_captured_record_roundtrips_json(self):
+        record = PageRecord(
+            url="https://example.com/a",
+            title="A",
+            snippet="content",
+            captured=True,
+            step=2,
+        )
+        assert PageRecord(**record.model_dump()) == record
 
 
 # ── Citation Model ───────────────────────────────────────────────────────────

@@ -2160,9 +2160,26 @@ class Citation(BaseModel):
     title: str = ""
     snippet: str = ""
 
+class PageRecord(BaseModel):
+    """Per-page capture record from an engine's task run.
+
+    One record per unique page URL, ordered by first appearance in the agent
+    history. ``captured`` is True only when content was really obtained for
+    that page; otherwise ``reason`` states why. Later hits on an already
+    recorded URL add no record -- they bump ``duplicate_skips`` instead.
+    """
+    url: str = ""
+    title: str = ""
+    snippet: str = ""
+    captured: bool = False
+    reason: str = ""
+    step: int = 0
+    duplicate_skips: int = 0
+
 class TaskResult(BaseModel):
     summary: str = ""
     citations: list[Citation] = Field(default_factory=list)
+    page_records: list[PageRecord] = Field(default_factory=list)
     total_steps: int = 0
     total_duration_ms: int = 0
     engine_used: str = "auto"
@@ -2564,6 +2581,16 @@ def _find_chrome_exe() -> str | None:
             return found
     return None
 
+# ---------------------------------------------------------------------------
+# Per-page capture records (browser-use)
+# ---------------------------------------------------------------------------
+# The implementation lives in the clawbridge package so the monolith and the
+# modular engine cannot drift. It is stdlib-only and duck-typed on history.
+from clawbridge.shared.page_records import (
+    build_page_records as _build_page_records,
+)
+
+
 class BrowserUseEngine(EngineBase):
     name = EngineName.BROWSER_USE
     display_name = "browser-use"
@@ -2906,8 +2933,20 @@ class BrowserUseEngine(EngineBase):
             _bu_model = getattr(self, '_llm', None)
             _bu_model_name = getattr(_bu_model, 'model_name', '') or getattr(_bu_model, 'model', '') or get_settings().default_model
             cost = _estimate_cost(str(_bu_model_name), total_in, total_out)
+            # Verifiable per-page capture records, in first-visit order.
+            # Only the agent's genuine final answer counts as page content --
+            # never the synthesized summary_text fallback below.
+            try:
+                _page_records = [
+                    PageRecord(**_pr)
+                    for _pr in _build_page_records(history, final_text=final)
+                ]
+            except Exception as _pr_err:
+                logging.warning("browser-use: page record build failed: %s", _pr_err)
+                _page_records = []
             task.result = TaskResult(
                 summary=summary_text[:5000],
+                page_records=_page_records,
                 total_steps=n_steps,
                 total_duration_ms=duration_ms,
                 tokens_in=total_in,
@@ -9032,6 +9071,27 @@ function renderMarkdown(text){
   try{marked.setOptions({breaks:true,gfm:true});var html=marked.parse(text);return typeof DOMPurify!=="undefined"?DOMPurify.sanitize(html):esc(text);}
   catch(e){console.error("Markdown render error:",e);return esc(text);}
 }
+// Per-page capture records: lets the user verify what each page actually yielded.
+function renderPageRecords(recs){
+  if(!recs||!recs.length)return"";
+  const rows=recs.map((r,i)=>{
+    const ok=r.captured===true;
+    const badge=ok?'<span style="color:var(--ok);font-weight:600">captured</span>'
+                  :'<span style="color:var(--err);font-weight:600">not captured</span>';
+    const url=r.url?('<a href="'+esc(r.url)+'" target="_blank" rel="noopener noreferrer" style="color:var(--accent);text-decoration:none;word-break:break-all">'+esc(r.url)+'</a>'):'<span style="color:var(--muted)">(no URL)</span>';
+    const title=r.title?'<div style="color:var(--muted);margin-top:2px">'+esc(r.title)+'</div>':'';
+    const snippet=r.snippet?'<div style="margin-top:6px;padding:8px;background:rgba(0,0,0,0.25);border-radius:6px;color:var(--text);white-space:pre-wrap;word-break:break-word">'+esc(r.snippet)+'</div>':'';
+    const reason=(!ok&&r.reason)?'<div style="margin-top:6px;color:var(--err);font-style:italic">'+esc(r.reason)+'</div>':'';
+    const dupe=(r.duplicate_skips>0)?'<div style="margin-top:4px;font-size:10px;color:var(--muted)">duplicate hits skipped: '+r.duplicate_skips+'</div>':'';
+    return '<div style="padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.04)">'
+      +'<div style="display:flex;gap:8px;align-items:baseline;justify-content:space-between">'
+      +'<span style="font-size:11px;color:var(--muted)">#'+(i+1)+(r.step?' (step '+r.step+')':'')+'</span>'+badge+'</div>'
+      +'<div style="margin-top:4px;font-size:12px">'+url+'</div>'+title+snippet+reason+dupe+'</div>';
+  }).join("");
+  return '<div style="margin-top:10px;border-top:1px solid var(--border);padding-top:8px">'
+    +'<div style="font-size:11px;color:var(--muted);margin-bottom:4px">Pages visited ('+recs.length+')</div>'
+    +rows+'</div>';
+}
 let _settledTaskIds=new Set();
 let _settledReplyIds=new Set();
 function settleAll(tasks){tasks.forEach(t=>{_settledTaskIds.add(t.id);if(t.result||t.error||t.status!=="pending")_settledReplyIds.add(t.id);});}
@@ -9093,6 +9153,7 @@ function render(){
         +'<div class="msg-icon-row"><div class="msg-info-wrap"><button class="msg-info-btn'+btnStatusCls+'" tabindex="0">i</button>'
         +'<div class="msg-info-tip">'+tipRows+'</div></div>'+inlineIcons+'</div>';
       if(hasResult)assistantHtml+='<div class="msg-body">'+renderMarkdown(t.result.summary)+'</div>';
+      if(t.result&&t.result.page_records&&t.result.page_records.length)assistantHtml+=renderPageRecords(t.result.page_records);
       if(hasError)assistantHtml+='<div class="msg-error">'+esc(t.error)+'</div>';
       // Step streaming container — shows live step info for running tasks
       if(t.status==="running")assistantHtml+='<div id="steps-'+t.id+'" class="step-stream"></div>';
@@ -10235,6 +10296,17 @@ function saveResultToFile(taskId){
   if(t.result){
     if(t.result.summary)content+="## Result\\n"+t.result.summary+"\\n\\n";
     if(t.result.total_steps)content+="Steps: "+t.result.total_steps+"\\n";
+    if(t.result.page_records&&t.result.page_records.length){
+      content+="\\n## Pages Visited\\n";
+      t.result.page_records.forEach((r,i)=>{
+        content+=(i+1)+". "+(r.captured?"[captured]":"[not captured]")+" "+(r.url||"(no URL)")+"\\n";
+        if(r.title)content+="   Title: "+r.title+"\\n";
+        if(r.snippet)content+="   Snippet: "+r.snippet.replace(/\\n/g," ")+"\\n";
+        if(!r.captured&&r.reason)content+="   Reason: "+r.reason+"\\n";
+        if(r.duplicate_skips>0)content+="   Duplicate hits skipped: "+r.duplicate_skips+"\\n";
+      });
+      content+="\\n";
+    }
     if(t.result.total_duration_ms)content+="Duration: "+(t.result.total_duration_ms/1000).toFixed(1)+"s\\n";
     if(t.result.tokens_in)content+="Tokens: "+(t.result.tokens_in+t.result.tokens_out).toLocaleString()+"\\n";
     if(t.result.estimated_cost_usd)content+="Cost: $"+t.result.estimated_cost_usd.toFixed(4)+"\\n";
@@ -10960,6 +11032,7 @@ function toggleHistoryRow(taskId){
   const t=state.tasks.find(x=>x.id===taskId);if(!t)return;
   let html='<div class="history-detail">';
   if(t.result&&t.result.summary)html+='<div class="history-result">'+renderMarkdown(t.result.summary)+'</div>';
+  if(t.result&&t.result.page_records&&t.result.page_records.length)html+=renderPageRecords(t.result.page_records);
   if(t.error)html+='<div class="msg-error" style="margin-bottom:12px">'+esc(t.error)+'</div>';
   // Failure analysis card for ERROR tasks
   if(t.status==="error"&&t.result&&t.result.failure_summary&&t.result.failure_summary.failure_type){

@@ -99,10 +99,32 @@ class StepResult(BaseModel):
     duration_ms: int = 0
 
 
+class PageRecord(BaseModel):
+    """Per-page capture record from an engine's task run.
+
+    One record per unique page URL, in the order pages first appear in the
+    agent history. ``captured`` is True only when content was actually
+    obtained for that page; when it is False, ``reason`` explains why.
+    Later visits to an already-recorded URL do not create a new record --
+    they increment ``duplicate_skips`` on the original record instead.
+    """
+    url: str = ""
+    title: str = ""
+    snippet: str = Field(default="", description="Extracted body snippet for this page")
+    captured: bool = Field(default=False, description="Whether content was really obtained")
+    reason: str = Field(default="", description="Why content was not captured")
+    step: int = Field(default=0, description="1-based history step where the page was first seen")
+    duplicate_skips: int = Field(default=0, description="Later hits on the same URL that were skipped")
+
+
 class TaskResult(BaseModel):
     """Final synthesized result for a completed task."""
     summary: str = Field(..., description="LLM-synthesized response to the user's prompt")
     citations: list[Citation] = Field(default_factory=list)
+    page_records: list[PageRecord] = Field(
+        default_factory=list,
+        description="Verifiable per-page capture records, in order of first visit",
+    )
     total_steps: int = 0
     total_duration_ms: int = 0
     engine_used: EngineName = EngineName.AUTO

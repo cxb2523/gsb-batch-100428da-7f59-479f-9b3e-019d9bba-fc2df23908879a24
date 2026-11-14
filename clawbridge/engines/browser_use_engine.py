@@ -14,10 +14,16 @@ from typing import Any, Callable
 
 from clawbridge.config import get_settings
 from clawbridge.engines.base import EngineBase, EngineError
+from clawbridge.shared.page_records import (
+    build_page_records as _build_page_record_dicts,
+    final_result_text,
+    value_or_call,
+)
 from clawbridge.shared.schemas import (
     Citation,
     EngineName,
     EngineStatus,
+    PageRecord,
     StepResult,
     Task,
     TaskResult,
@@ -27,6 +33,18 @@ from clawbridge.shared.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def build_page_records(history: Any, final_text: str | None = None) -> list[PageRecord]:
+    """Build ordered, de-duplicated per-page capture records from agent history.
+
+    See :mod:`clawbridge.shared.page_records` for the record rules. This wrapper
+    only adapts the shared dict records to the ``PageRecord`` schema.
+    """
+    return [
+        PageRecord(**record)
+        for record in _build_page_record_dicts(history, final_text=final_text)
+    ]
 
 
 class BrowserUseEngine(EngineBase):
@@ -287,28 +305,44 @@ class BrowserUseEngine(EngineBase):
             )
 
     def _build_task_result(self, history: Any, duration_ms: int) -> TaskResult:
-        """Build a full TaskResult from browser-use agent history."""
-        try:
-            final_result = history.final_result() if callable(getattr(history, 'final_result', None)) else str(history)
+        """Build a full TaskResult from browser-use agent history.
 
+        Page records are always built, even if other history accessors fail --
+        they are the operator-verifiable part of the result.
+        """
+        final_result = final_result_text(history)
+
+        # Verifiable per-page capture records, in first-visit order
+        try:
+            page_records = build_page_records(history)
+        except Exception as e:
+            logger.warning(f"Error building page records: {e}")
+            page_records = []
+
+        try:
             # Collect citations from browsed URLs
             citations = []
-            if hasattr(history, 'urls'):
-                for url in (history.urls or []):
+            urls = value_or_call(getattr(history, 'urls', None)) or []
+            for url in urls:
+                if url:
                     citations.append(Citation(url=url))
 
             # Estimate token usage (browser-use tracks this internally)
             tokens = None
-            if hasattr(history, 'total_input_tokens'):
+            if getattr(history, 'total_input_tokens', None) is not None:
                 tokens = TokenUsage(
-                    input_tokens=getattr(history, 'total_input_tokens', 0),
-                    output_tokens=getattr(history, 'total_output_tokens', 0),
+                    input_tokens=getattr(history, 'total_input_tokens', 0) or 0,
+                    output_tokens=getattr(history, 'total_output_tokens', 0) or 0,
                 )
 
+            action_results = value_or_call(getattr(history, 'action_results', None)) or []
+            total_steps = len(action_results) if action_results else 0
+
             return TaskResult(
-                summary=str(final_result)[:5000],
+                summary=final_result[:5000],
                 citations=citations,
-                total_steps=len(history.action_results) if hasattr(history, 'action_results') else 0,
+                page_records=page_records,
+                total_steps=total_steps,
                 total_duration_ms=duration_ms,
                 engine_used=EngineName.BROWSER_USE,
                 tokens_used=tokens,
@@ -317,6 +351,7 @@ class BrowserUseEngine(EngineBase):
             logger.warning(f"Error building task result: {e}")
             return TaskResult(
                 summary=f"Task completed but result extraction failed: {e}",
+                page_records=page_records,
                 total_duration_ms=duration_ms,
                 engine_used=EngineName.BROWSER_USE,
             )
