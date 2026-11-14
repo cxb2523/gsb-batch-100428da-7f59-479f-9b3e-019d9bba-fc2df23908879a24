@@ -21,6 +21,9 @@ output/
 *.csv
 *.json
 
+# Keep extension test/package metadata tracked
+!chrome-extension/package.json
+
 # OS specific
 .DS_Store
 Thumbs.db

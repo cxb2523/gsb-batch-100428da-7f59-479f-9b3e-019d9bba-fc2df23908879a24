@@ -200,7 +200,7 @@ document.addEventListener('DOMContentLoaded', () => {
   // Reset Button Click Handler
   resetBtn.addEventListener('click', () => {
     scrapedData = [];
-    chrome.storage.local.remove(['comments', 'productName', 'isScraping', 'currentPagesLoaded', 'totalPagesRequested', 'statusMessage'], () => {
+    chrome.storage.local.remove(['comments', 'productName', 'isScraping', 'currentPagesLoaded', 'totalPagesRequested', 'statusMessage', 'scrapeCheckpoint'], () => {
       updateDashboardStats();
       renderLivePreview();
       exportBtn.disabled = true;
@@ -233,7 +233,7 @@ function syncStateFromStorage() {
   const copyBtn = document.getElementById('copyBtn');
   const progressBar = document.getElementById('progressBar');
 
-  chrome.storage.local.get(['comments', 'productName', 'isScraping', 'currentPagesLoaded', 'totalPagesRequested', 'statusMessage'], (result) => {
+  chrome.storage.local.get(['comments', 'productName', 'isScraping', 'currentPagesLoaded', 'totalPagesRequested', 'statusMessage', 'scrapeCheckpoint'], (result) => {
     if (result.comments) {
       scrapedData = result.comments;
     }
@@ -250,6 +250,17 @@ function syncStateFromStorage() {
     } else {
       exportBtn.disabled = true;
       copyBtn.disabled = true;
+    }
+
+    // Surface the resumable checkpoint: which page the next run continues
+    // from and which chunk CSVs have already been downloaded.
+    const checkpoint = result.scrapeCheckpoint;
+    if (checkpoint && !checkpoint.completed) {
+      const exportedCount = (checkpoint.exportedChunks || []).length;
+      showStatus(
+        'info',
+        `Checkpoint tersimpan: lanjutkan dari halaman ${checkpoint.nextPage} · ${checkpoint.totalComments || 0} ulasan · ${exportedCount} chunk CSV terunduh.`
+      );
     }
 
     if (result.isScraping) {
@@ -270,7 +281,7 @@ function syncStateFromStorage() {
       scrapeBtn.style.display = 'flex';
 
       if (result.statusMessage) {
-        if (result.statusMessage.includes('Selesai')) {
+        if (result.statusMessage.includes('Selesai') || result.statusMessage.includes('gagal dimuat')) {
           showStatus('success', result.statusMessage);
         } else if (result.statusMessage.includes('Dihentikan')) {
           showStatus('info', result.statusMessage);

@@ -29,7 +29,9 @@ git clone https://github.com/Tnembull/shopee-scraper-extension.git
 - 🐙 **Integrasi GitHub**: Tombol cepat untuk membuka repository GitHub langsung dari ekstensi.
 - 👀 **Live Review Preview**: Intip 3 ulasan terbaru secara real-time langsung di UI popup.
 - ⚡ **Auto Content Script Injection**: Script otomatis ter-inject jika ekstensi dibuka di tab Shopee yang belum teregister.
-- 📦 **Multi-Chunk Auto-Save**: Otomatis menyimpan file CSV per 100 halaman untuk scraping data skala besar.
+- 📦 **Multi-Chunk Auto-Save**: Otomatis menyimpan file CSV per 100 halaman (`CHUNK_SIZE`) untuk scraping data skala besar.
+- ♻️ **Checkpoint & Lanjutkan (Resumable)**: Progress setiap chunk dicatat di `chrome.storage.local` (nomor chunk, daftar chunk yang sudah diekspor beserta jumlah komentar & rentang halamannya, halaman lanjutan, dan alasan berakhirnya proses). Jika scraping terhenti karena tombol paginasi gagal atau pengguna menekan **Hentikan Process**, run berikutnya pada produk yang sama melanjutkan dari halaman berikutnya — chunk yang sudah diekspor tidak akan diekspor dua kali.
+- 🛟 **Tidak Ada Data Hilang**: Saat paginasi gagal atau proses dihentikan, komentar yang sudah terkumpul pada chunk berjalan tetap diekspor sebagai file `*_partial_*.csv` dan chunk tersebut **tidak** ditandai selesai.
 
 ---
 
@@ -74,6 +76,32 @@ CSV file menggunakan encoding `UTF-8 with BOM` agar emoji & simbol khusus tampil
 |----------|--------|----------|------|---------|
 | user123 | 5 | Positif | 2 hari yang lalu | Barang bagus, sesuai deskripsi... |
 | buyer456 | 1 | Negatif | 1 minggu yang lalu | Pengiriman lambat, barang penyok... |
+
+---
+
+## 🧪 Pengujian (Node.js, tanpa dependency)
+
+Logika chunk, checkpoint, dan ekspor CSV diuji dengan `node:test` memakai komentar buatan serta stub `chrome.storage.local` — tidak memerlukan halaman Shopee asli:
+
+```bash
+cd chrome-extension
+npm test          # menjalankan seluruh file tests/*.test.js
+npm run check     # syntax check content.js, popup.js, background.js
+```
+
+### Format checkpoint (`chrome.storage.local` → `scrapeCheckpoint`)
+
+| Field | Arti |
+|---|---|
+| `currentChunk` | Nomor chunk yang sedang/akan dikerjakan |
+| `nextPage` | Halaman pertama yang harus diambil saat melanjutkan |
+| `lastCompletedPage` | Halaman terakhir yang komentarnya sudah terekstrak |
+| `exportedChunks[]` | `{ chunkNumber, commentCount, startPage, endPage, partial, filename }` untuk setiap CSV yang sudah diunduh |
+| `endedEarly` / `endReason` | `pagination_failed` (tombol hilang / komentar tidak bertambah) atau `user_stopped`; `null` bila selesai normal |
+| `completed` | `true` hanya bila seluruh halaman diminta sudah selesai |
+| `productKey` / `maxPages` | Resume hanya berlaku bila produk dan jumlah halaman cocok |
+
+Tombol **🗑️ Reset / Hapus Data** juga menghapus checkpoint ini.
 
 ---
 
