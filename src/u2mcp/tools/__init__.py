@@ -14,6 +14,7 @@ import sys
 TOOL_MODULES = (
     "action",
     "app",
+    "batch",
     "clipboard",
     "delay",
     "device",
