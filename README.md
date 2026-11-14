@@ -60,7 +60,7 @@ with StealthSession() as session:
     resp = session.get('https://link-here.com')
 ```
 
-Stealth-Requests has a built-in retry feature that automatically waits 2 seconds and retries the request if it fails due to certain status codes (like 429, 503, etc.).
+Stealth-Requests has a built-in retry feature for responses with temporary failure status codes (like 429, 503, etc.). By default it waits 2 seconds between attempts.
 
 To enable retries, just pass the number of retry attempts using the `retry` argument:
 
@@ -68,6 +68,37 @@ To enable retries, just pass the number of retry attempts using the `retry` argu
 import stealth_requests as requests
 
 resp = requests.get('https://link-here.com', retry=3)
+```
+
+#### Retry timing
+
+The wait before each retry is configurable through three extra arguments, which can be set either when creating a session (applies to every request) or per request:
+
+- `retry_delay` – the fallback interval in seconds used when the response has no usable `Retry-After` header (defaults to 2).
+- `max_retry_delay` – upper bound in seconds for any single wait. A `Retry-After` value larger than this is capped instead of waited out in full.
+- `max_retry_time` – upper bound in seconds on the total time spent waiting across all retries. If the next wait would exceed this budget, retrying stops immediately and the last response is returned.
+
+```python
+with StealthSession(max_retry_delay=10, max_retry_time=30) as session:
+    resp = session.get('https://link-here.com', retry=5)
+
+# Or override for a single request:
+resp = session.get('https://link-here.com', retry=5, retry_delay=1, max_retry_time=15)
+```
+
+When the server sends a [`Retry-After`](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Retry-After) header, its value is honored directly — both the delta-seconds form (`Retry-After: 30`) and the HTTP-date form. If the header is missing or cannot be parsed, the request falls back to `retry_delay`.
+
+#### Inspecting what happened
+
+Every `StealthResponse` records the retry history of its request:
+
+- `resp.attempt_count` – how many times the request was actually sent (`1` when the first attempt succeeded).
+- `resp.retry_count` – number of retries that happened (`attempt_count - 1`).
+- `resp.retry_delays` – tuple of the seconds waited before each retry (empty on first-attempt success).
+
+```python
+resp = session.get('https://link-here.com', retry=3)
+print(resp.attempt_count, resp.retry_delays)  # e.g. 3 (2.0, 5.0)
 ```
 
 ### Sending Requests With Asyncio

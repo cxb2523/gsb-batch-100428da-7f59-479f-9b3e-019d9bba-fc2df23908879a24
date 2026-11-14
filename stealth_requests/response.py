@@ -1,13 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from urllib.parse import urlparse
-from typing import TYPE_CHECKING
 import re
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+from urllib.parse import urlparse
 
 if TYPE_CHECKING:
-    from lxml.html import HtmlElement
     from bs4 import BeautifulSoup
+    from lxml.html import HtmlElement
 
 
 @dataclass
@@ -26,15 +26,25 @@ PARSER_IMPORT_SOLUTION = "Install it using 'pip install stealth-requests[parsers
 
 
 class StealthResponse:
-    def __init__(self, resp, elapsed):
+    def __init__(self, resp, elapsed, attempt_count: int = 1, retry_delays: tuple[float, ...] = ()):
         self._response = resp
         self._elapsed = elapsed
+
+        # How many times the request was actually sent (1 means it succeeded on the first try)
+        # and the seconds waited before every retry, in order.
+        self.attempt_count = attempt_count
+        self.retry_delays = tuple(retry_delays)
 
         self._tree: HtmlElement | None = None
         self._important_meta_tags: Metadata | None = None
         self._links: tuple[str] = tuple()
         self._images: tuple[str] = tuple()
         self._tables: list[dict[str, list[str]]] | None = None
+
+    @property
+    def retry_count(self) -> int:
+        """Number of retries that actually happened (attempts minus the initial request)."""
+        return self.attempt_count - 1
 
     def __getattr__(self, name):
         return getattr(self._response, name)
