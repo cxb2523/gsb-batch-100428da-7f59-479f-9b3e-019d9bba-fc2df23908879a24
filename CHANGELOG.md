@@ -1,0 +1,667 @@
+# Changelog
+
+## Unreleased
+
+### Breaking
+
+- `QIRA_SCREEN_INDEX` is removed. Select the recorded (and driven) screen
+  with `QIRA_DISPLAY` / `--display` / `Qirabot(display=N)` instead; run
+  `qirabot displays` for the numbers.
+
+## 3.5.2 (2026-10-29)
+
+### Desktop: multiple displays
+
+- The desktop backend can drive a display other than the primary one:
+  `Qirabot(display=N)`, `QIRA_DISPLAY=N` or `qirabot desktop --display N`
+  (macOS and Windows). Screenshots capture only that display, action
+  coordinates stay relative to its screenshot (the adapter adds the
+  display's origin), and `--record` and the progress overlay follow it.
+  Numbering is 1-based and 1 is always the primary display, so omitting
+  the option changes nothing.
+- New `qirabot displays` command lists the displays and their numbers
+  (`--json` for scripts); `Display` and `list_displays` are exported from
+  `qirabot`.
+- An explicit `display=` / `--display` is strict: an unknown number fails at
+  construction, and a non-desktop target raises instead of ignoring it.
+  `--display` can't be combined with `--window-title` / `--hwnd`.
+  `QIRA_DISPLAY` is best-effort: a bad value warns and falls back to the
+  primary display.
+- `QIRA_SCREEN_INDEX` (raw avfoundation index) is deprecated in favor of
+  `QIRA_DISPLAY`; it is still honored, with a one-time warning, when no
+  display is selected.
+
+### Fixes
+
+- On multi-monitor Macs the overlay's glow bands and corner panel could
+  land mid-screen: they were sized from `mainScreen()` (the display with
+  the key window) but positioned in primary-display coordinates. They now
+  use the driven display (the primary by default).
+- A desktop screenshot refused by macOS for lack of the Screen Recording
+  permission now raises an error that says so, instead of a bare
+  `CalledProcessError` naming a temp file.
+
+### CLI
+
+- Task commands accept `--settle-seconds` (pause after each
+  screen-changing action; default `QIRA_SETTLE_SECONDS`, else per
+  platform).
+
+## 3.5.1 (2026-10-28)
+
+### iOS recording (WDA MJPEG stream)
+
+- `--record` on the direct WDA engine produced a time-lapsed, truncated
+  video: ffmpeg's raw mjpeg demuxer ignores wall-clock timestamps and
+  stamps a nominal 25fps, so a ~10fps device stream played back about 2.6x
+  fast and most frames were dropped (a 2-minute run came out as a 49s
+  video), and the report's per-step seek offsets landed in the wrong place.
+  Frames are now re-stamped with the time they arrive and kept
+  variable-rate, so video time is real time. The stream starts recording at
+  its first frame instead of after a multi-second probe, and frames are
+  scaled to a 1280px longest side (they used to be encoded at the phone's
+  full ~1200x2600, which libx264 couldn't keep up with in real time).
+
+### Report
+
+- The recording player follows the video's orientation: a portrait
+  recording sits in a sticky column beside the steps on screens 1240px and
+  wider (stacked above them on narrower ones); a landscape one is capped at
+  880px and centered above the steps.
+- A marker strip under the video has one tick per step, colored by
+  outcome; clicking a tick or the strip seeks there. While the video plays
+  the current step's row is highlighted and named under the player, and in
+  the side-by-side layout the table follows along. Clicking a step's `+m:ss`
+  offset no longer scrolls the page when the video is already on screen.
+  Steps that fall after the end of the recording are counted under the
+  player instead of silently getting no tick.
+- A step's decision text is clamped to four lines in the step table, with a
+  Show more toggle where it was actually cut. The screenshot lightbox and
+  printed reports keep the full text.
+
+### CLI
+
+- Text output ends with a `Report: <path>` line after the usage summary,
+  printed as a terminal hyperlink (Cmd/Ctrl+click in terminals that support
+  them). It appears whenever a report will be written, on failed and
+  cancelled runs too.
+
+### Engine
+
+- The `reason` field every tool carries now asks for one or two short
+  sentences that describe the action actually output, instead of "detailed
+  reasoning". Models had been using it as a scratchpad, writing page-long,
+  self-correcting analysis whose conclusion could differ from the
+  coordinates they then output. The built-in tool definitions change, so
+  the first request after upgrading misses the prompt cache once.
+
+## 3.5.0 (2026-10-27)
+
+### Breaking
+
+- `llm_decision_duration_ms` is removed from `SessionUsage`, `StepResult`
+  and the CLI `json` / `stream-json` output. What it covered depended on
+  which layer handled a failure (it missed session-level timeout
+  re-asks, for one); read `model_ms` and the wait fields below instead.
+- `step_duration_ms` is now wall-clock time. An `ai()` step runs from its
+  screenshot to the end of its action and settle pause (the final `done`
+  step ends with the decision), so custom tool time, a model-requested
+  `wait` and a failed action are all in it. A failed `ai()` step and every
+  single-step AI call (`click()` / `locate()` / `verify()` / `extract()`,
+  each `wait_for()` poll, each `retry` attempt) are timed too; those land
+  in `SessionUsage.step_duration_ms` only.
+- `on_step` fires after the step's action and settle pause, not before,
+  so the `StepResult` it receives is complete. The overlay still updates
+  before the action. CLI step lines (text and `stream-json`) arrive one
+  action + settle later than before. With pyautogui, a FailSafe triggered
+  during the action now means that step gets no `on_step` call.
+- `qirabot.report.write_html`: `outcomes` takes `RunStatus` strings only
+  (the legacy `True` / `False` values are gone), and a `stats` dict without
+  `total_steps` no longer falls back to the log length.
+
+### New fields
+
+- `SessionUsage` (`bot.usage`) and `StepResult` gain four `int` fields
+  (default `0`): `model_ms`, the round trip of answered model requests
+  (upload and download included), and the time lost to capacity,
+  `rate_limit_wait_ms` (429s) and `outage_wait_ms` (5xx, connection
+  failures), each the backoff sleeps plus the failed requests themselves,
+  and `timeout_wait_ms` (requests that ended in a timeout, 408/504
+  included). Deterministic failures (400/401/403, an unparsable response)
+  count in none of them.
+- These cover the same calls as `step_duration_ms`, so
+  `step_duration_ms − model_ms − waits` is the device side (screenshot,
+  action, settle, custom tools) plus a few milliseconds of local overhead,
+  per step and per session. A step's fields include its timeout re-asks,
+  tier escalation and fallback.
+- `StepResult` gains `model` (the model that answered; the fallback model
+  once the run switched) and `tier` (`"standard"` / `"flex"` /
+  `"priority"`, or `""` when the endpoint reported none), read from the
+  response that was committed.
+- A failed step still produces no `StepResult`. Its numbers are the run's
+  total minus the committed steps: diff `bot.usage` around `ai()` (the
+  second read in a `finally`), or, from the CLI, the `result` line's
+  `usage` minus the `step` lines.
+
+### Report redesign
+
+- New header: the title is `task_name` when set, else the first line of the
+  only task's instruction, else "N tasks", with a "Full instruction"
+  toggle for long or multi-line text. The meta line shows run time,
+  platform and screen size, and the run ID.
+- Three panels replace the stats list. **Outcome**: pass / fail / truncated
+  in green, red or amber. **Time**: total, the share lost to capacity, and
+  a model / device / rate-limit / outage / timeout bar. **Model & tokens**:
+  model and fallback, tier and escalation, and a token total that opens a
+  model × tier table (AI calls, prompt, cached, response, thinking, total;
+  failed and single-step calls included, unknown tier shown as `—`). The
+  table prints expanded.
+- With two or more tasks, a task overview lists each one's status,
+  instruction, steps, time and time breakdown, linked to its section.
+- Step tables gain Model, Duration (with a time-breakdown bar) and Waits
+  (tagged rate limit / outage / timeout; the row is tinted) columns.
+  Manual steps show `—` there.
+- Step output renders as Markdown (paragraphs, headings, nested lists,
+  bold, inline code; everything else escaped), so a model's formatted
+  answer reads as formatted. JSON-looking output stays verbatim. The
+  `done` step no longer repeats its answer as `result=…` and drops the
+  `success=` flag the ✓ / ✗ already shows.
+- The Time column shows a `+0:20` offset only when it can seek the
+  recording; without a seekable video it shows the clock time alone.
+- The screenshot viewer shows the frame on the left and one fixed side
+  panel on the right (below on narrow screens) with everything about the
+  step: action and status, time, duration, model and tier, waits, the
+  reasoning, params and output. Nothing moves when paging; neighbouring
+  frames are preloaded, and "Open full size" opens the original.
+- Light theme only; dark mode is dropped.
+- The CLI no longer passes a 60-character cut of the instruction as
+  `task_name` when `--name` is not given; the report titles the run from
+  the full instruction instead.
+- `write_html` gains `instructions`, `section_stats`, `tokens_by`,
+  `default_model` and `device`, all filled in by the client.
+
+### Fixes
+
+- The report's Tier row was empty on a standard-tier run with
+  `tier_escalation` on, even when calls were served, and billed, as
+  priority. It now reads `standard — some calls served as priority, and
+  billed at that rate`.
+- The report always has a Tier row: an unconfigured all-standard run
+  reads `standard` with a `default` note instead of leaving the row out.
+
+## 3.4.6 (2026-10-27)
+
+### Custom tool parameter names
+
+- A custom tool parameter named `reason` no longer fails the run with
+  `property name "reason" is reserved` (the docs' own
+  `wait_for_human(reason)` example hit this). The tool's `reason` reaches
+  the handler unchanged; the engine's per-step reasoning moves to
+  `step_reason` in that tool's schema only. Every other schema, and the
+  prompt-cache prefix, is byte-identical. `safety_decision` is allowed as a
+  parameter name too. The one rejected combination is a tool declaring both
+  `reason` and `step_reason`.
+- Coordinate-style parameter names (`x`, `y`, `locate`, `point_x`, …) are no
+  longer reserved either. A custom tool's params are never grounded, so a
+  game's `teleport(x, y)` gets its world coordinates verbatim, and the
+  report draws no crosshair for that step.
+- Every invalid custom tool definition now raises `ValueError` from `ai()`
+  before the run is registered, the way lambdas or a missing docstring
+  already did. Cases only the engine caught (a tool named like a built-in,
+  e.g. `wait`; a malformed dict-form schema) used to surface as an
+  `ActionError`, which read like a runtime failure. `except QirabotError`
+  no longer catches them, as with the other configuration errors.
+
+## 3.4.5 (2026-10-24)
+
+### Fallback model (same provider)
+
+- New `Qirabot(fallback_model=...)` / `QIRA_FALLBACK_MODEL` / CLI
+  `--fallback-model`: a second model on the same provider. When a call to
+  the primary still fails with a timeout, rate limit or refusal after the
+  transport retries and tier escalation, it is re-sent to the fallback,
+  which serves the rest of that `ai()` run; the next run starts on the
+  primary again. Applies to `extract()` / `verify()` / `locate()` too.
+- Accepts `"{provider}/{model}"` or a bare model name. A different provider,
+  or the primary model itself, is rejected at construction.
+- Only capacity failures switch; deterministic ones (400/401/403, safety)
+  do not. The report's model line names the fallback when it answered any
+  calls (`… — 3 calls served by fallback gemini-3.5-flash`).
+
+## 3.4.4 (2026-10-24)
+
+### Riding out an unstable model endpoint
+
+An overloaded Gemini endpoint used to end long `ai()` runs on the first slow
+or refused call, throwing away every step already made. Three changes, all
+aimed at keeping the run alive without retrying anything that is billed
+twice for nothing:
+
+- **A timed-out `ai()` step is re-asked once.** The step has not committed,
+  so the session is untouched and the identical request is re-sent. The
+  re-ask does not use up the corrective re-ask for an unusable reply.
+  `QIRA_TIMEOUT_RETRIES` sets the budget (default `1`; `0` restores
+  fail-on-first-timeout; invalid values fail at `ai()` start).
+  `extract()` / `verify()` / `locate()` are unchanged. The transport itself
+  still never retries a read timeout.
+- **Outages are ridden out longer.** 503/5xx and connect/pool failures now
+  back off 2s → 5s → 10s → 20s (five attempts, about half a minute) instead
+  of 1s → 2s. These requests are not billed. Exceptions: an escalated call,
+  and a flex probe with `tier_escalation` on, keep the short schedule — both
+  have a better move than waiting.
+- **`tier_escalation` now escalates standard on a timeout.** Previously only
+  flex did; standard timeouts failed outright. An overloaded endpoint shows
+  up as standard requests queued behind priority traffic, which priority
+  jumps. Still off by default, and still billed at priority only when
+  priority actually serves the request.
+
+## 3.4.3 (2026-10-19)
+
+### `max_duration`: a wall-clock budget for `ai()`
+
+- New `bot.ai(..., max_duration=seconds)` (also on bound targets) and CLI
+  `--max-duration` (`300` / `90s` / `5m` / `1h30m`). Default `None`: no cap,
+  behaviour unchanged. Applies alongside `max_steps`; whichever runs out
+  first ends the run.
+- Running out ends the run with the new status `"max_duration"` — a
+  truncation like `"max_steps"`: `success=False`,
+  `output="max duration reached"`, `notes` returned. Report badge
+  `MAX DURATION` (amber, tallied as truncated); CLI line
+  `Failed: max duration reached (5m03s/5m)`, exit 1; the SDK warning is
+  tagged `qira_event="max_duration"` and filtered by the CLI.
+- A soft limit, checked before each step: a step already deciding runs to
+  completion (a `done` it returns counts), so a run can overshoot by up to
+  one step. A model-requested `wait` is cut to the time remaining. Invalid
+  values (`<= 0`, non-finite, non-numbers) raise before the run starts.
+- The `stream-json` start line gains `max_duration` (seconds or `null`).
+
+### `save_note` data survives every ending
+
+- New `RunResult.notes`: the run's `save_note` contents, deduplicated
+  the same way the model sees them (a note fully contained in a later one
+  is replaced). Returned on every status — including `"max_steps"`, where
+  it is the data collected before the budget ran out. `output` and
+  `status` are unchanged (`"max steps reached"` / `"max_steps"`).
+- CLI: when a run ends `max_steps` / `goal_failed`, the text output prints
+  the saved notes under the `Failed:` line (step lines only show the
+  reason, so the collected data never reached the terminal before). The
+  `--output-format json` / `stream-json` result object gains a `notes`
+  array on every exit path (empty on `error` / `cancelled`).
+
+### Less repetition when a run hits `max_steps`
+
+- `report.html`: a `max_steps` section no longer gets the
+  `⚠ max steps reached (N)` banner — its `MAX STEPS` badge already says
+  so, and the step count is in the header. Banners remain for `error`.
+  A report with a single judged task also drops the one-row task summary,
+  which only repeated the section header; the tally stays.
+- CLI: the SDK's `stopped: step budget exhausted (N/N)` warning is no
+  longer printed during a CLI run; the result line now reads
+  `Failed: max steps reached (N/N)`. SDK callers still get the warning
+  (now tagged `extra={"qira_event": "max_steps"}` so it can be filtered).
+  `RunResult.output` and the JSON `output` stay `"max steps reached"`.
+
+### Fixes
+
+- `gemini-4-argon` rejects `thinkingLevel: MINIMAL` like the pro models do:
+  `thinking_level` `disabled` / `none` / `minimal` now map to `LOW` for
+  model names containing `-argon`.
+
+## 3.4.2 (2026-10-17)
+
+### Explicit Vertex credentials
+
+- New `vertex_credentials=` constructor option: pass a
+  `google.auth.credentials.Credentials` object (service account,
+  impersonated, WIF, or `refresh_handler`-based short-lived tokens) for
+  `gemini-vertex` instead of resolving ADC — e.g. different identities per
+  `Qirabot` instance in one process. The cloud-platform scope is applied
+  automatically.
+- Passing it together with an explicit `vertex_api_key=`, with a
+  non-`gemini-vertex` model, or with an injected `provider=` raises a
+  config error; a `QIRA_VERTEX_API_KEY` in the environment is ignored
+  (logged) when it is set. (#5)
+
+## 3.4.1 (2026-09-05)
+
+### Default model is now `gemini-3.8-flash`
+
+- Both Gemini providers (`gemini`, `gemini-vertex`) default to
+  `gemini-3.8-flash` instead of `gemini-3.6-flash`. An explicit
+  `model=` or `QIRA_MODEL` is unaffected.
+- Docs and examples no longer mention `gemini-3.6-pro`, a model that
+  never existed; the two places that need a non-default model string
+  now use `gemini/gemini-3.8-flash`.
+
+## 3.4.0 (2026-08-29)
+
+### v2 migration aids retired
+
+- A leftover v2-era `QIRA_API_KEY` no longer blocks construction: the
+  refuse-to-start migration guard, `qirabot doctor`'s leftover-key and
+  leftover-credential-file warnings, and the `auth.cloud_removed` error
+  code are gone. The variable is now simply ignored.
+- Removed the internal `_userconfig` module (the v2 credential file at
+  `~/.config/qirabot/config.json` is no longer read) and
+  `load_dotenv`'s injected-key origin tracking.
+- Comments and docs no longer reference the v2 cloud backend.
+
+### `RunStatus` gains `"cancelled"`
+
+- The public `RunStatus` literal is now the single status vocabulary
+  shared by `RunResult.status`, the report's section badges and the CLI
+  JSON result, and it gains `"cancelled"` — the value the CLI already
+  reported for Ctrl+C and the ESC kill switch. `ai()` itself still never
+  returns it: a user abort raises `QirabotError(code="user_abort")`.
+
+## 3.3.1 (2026-08-24)
+
+### Fix: `media_resolution="ultra_high"` was rejected with a 400
+
+- `ultra_high` now rides on each image part instead of
+  `generationConfig.mediaResolution`. The request-level field only
+  accepts `low` / `medium` / `high`, so every `ultra_high` run failed
+  with `INVALID_ARGUMENT` on both providers. History screenshots keep
+  their reduced `low` resolution, and the setting still needs a
+  Gemini 3 model.
+- On an endpoint that rejects per-part resolution fields, `ultra_high`
+  now falls back to request-level `high` — the closest supported
+  value — instead of resending a request that cannot succeed.
+
+## 3.3.0 (2026-08-16)
+
+### Consumption tiers: flex and priority
+
+- New `service_tier=` (`QIRA_SERVICE_TIER`, `--service-tier`) selects
+  `standard` (default), `flex` — roughly half price for slower, sheddable
+  capacity — or `priority`, a premium for capacity scheduled ahead of
+  standard traffic. Works on both providers: Vertex takes it as the
+  `X-Vertex-AI-LLM-Shared-Request-Type` header, the Gemini Developer API as
+  a top-level `service_tier` body field.
+- The tier you ask for is not always the tier you get, and billing follows
+  what was served. Every response is checked against the request —
+  `usageMetadata.trafficType` on Vertex, the `x-gemini-service-tier`
+  response header on the Gemini Developer API — and a mismatch logs one
+  warning per session. A regional `vertex_location` is rejected at
+  construction, since Vertex accepts the header off the global endpoint and
+  silently ignores it.
+- Flex widens the per-call timeout by 1.5x, and on the Gemini Developer API
+  bounds the queue wait server-side (`X-Server-Timeout`) so an interactive
+  step fails fast instead of hanging.
+- New `tier_escalation=` (`QIRA_TIER_ESCALATION`, `--tier-escalation`), off
+  by default: when a tier runs out of capacity, retry once one rung up
+  (`flex` → `standard` → `priority`) rather than losing an in-progress
+  `ai()` run. A rate limit hands off only after the backoff schedule is
+  exhausted — waiting out a rolling quota window is free, escalating is
+  not. A refusal hands off at once, and so does a flex request still queued
+  when its budget expires: on flex a timeout *is* the capacity signal, and
+  retrying a queue that just stalled costs a full widened timeout for
+  nothing. The escalated call itself skips the quota window: the tier below
+  already waited one out and the tiers commonly share the bucket.
+- Escalation is sticky. It applies to the whole session, not one call —
+  otherwise a congested tier charges every step of an `ai()` run the full
+  cost of rediscovering the same congestion. A flex attempt is also given a
+  short leash rather than the widened budget while escalation is on, since
+  it is a probe worth abandoning. Against a queued flex endpoint with
+  standard healthy, a 20-step run goes from completing nothing to
+  completing everything after a single probe.
+
+- The run report gives the tier its own header row, spelling out the served
+  side when it differs from the one requested. Which tier ran decides the
+  per-token rate, so a report that omitted it could not be reconciled
+  against a bill.
+
+### The run report header is labelled
+
+- The header was two dot-separated lines of bare fragments — an opaque id, a
+  model name, `in/out/think`, a duration of something unstated — which left
+  the reader to work out what each string was. It is now a label/value grid:
+  Run, Model, Tier, Steps, Tokens, Time, Run ID, each row present only when
+  it has something to say.
+- Token counts are named rather than abbreviated (`15.5k total — 15.1k
+  prompt, 410 response`), and the duration says what it measures. The report
+  now also shows how much of the step time was spent waiting on the model,
+  a figure the timeline had always collected but never rendered.
+
+### Fix: the run id names the directory it belongs to
+
+- The output directory was built from `task_id[:8]`, but the id carried a
+  `local-` prefix that ate six of those characters — a run reported as
+  `local-40746eb1` landed in `100621-local-40`. The console prints the id and
+  never the path, so the one link between them didn't line up. Worse, the
+  truncation threw away the id's uniqueness: two clients constructed in the
+  same second had a 1-in-256 chance of sharing an output directory and
+  interleaving their screenshots.
+- `bot.task_id` is now bare hex (`40746eb1`) and the directory carries it
+  whole (`qira_runs/2026-08-16/100621-40746eb1/`). The `local-` prefix dated
+  from the cloud service, where there was another kind of id to tell it
+  apart from; every run is local now, so it distinguished nothing.
+- Breaking for anything parsing `bot.task_id` or the `task_id` field of
+  `--output-format json` / `stream-json`: the value no longer starts with
+  `local-`.
+
+### Fix: no step is left without a screenshot in the report
+
+- A step that follows `save_note` is decided on the previous step's frame:
+  the note doesn't touch the device, so nothing is re-captured. That
+  optimisation was also deciding whether the report got a picture, so those
+  steps rendered an empty screenshot cell — indistinguishable from a lost
+  capture, and on the common `save_note` → `done` ending it meant the report
+  had no final frame at all. A six-step extraction run showed four images.
+- Such a step now shows the frame it was decided on, labelled *frame from an
+  earlier step* so a reused image can't be read as a fresh capture. No
+  duplicate file is written: the entry points at the frame already on disk,
+  unless the step marks coordinates, where the annotation is new information
+  and gets its own copy.
+
+### Fix: a slow model call is no longer retried like a transport blip
+
+- A read timeout means the request reached the model and the answer did not
+  come back inside the budget. It was being retried on the generic schedule,
+  so a hanging endpoint cost three full per-call budgets — over six minutes
+  on a decide — to re-ask a question that was already too slow once. Read
+  timeouts (and 408/504) now fail on the first occurrence; a worst-case
+  decide drops from ~363s to ~120s.
+- Failures that never reached the model — connect, write and pool timeouts —
+  are classified `UNAVAILABLE` instead of `TIMEOUT` and stay retryable, which
+  is what the old blanket rule was actually for.
+- Connect gets its own 5s budget rather than inheriting the call's. An
+  unreachable endpoint used to take the full timeout to report itself;
+  including retries it now surfaces in under 20s.
+
+### Fix: retry backoff is jittered
+
+- Both retry schedules were fixed constants, so concurrent qirabot
+  processes brushing the same per-minute quota — a CI matrix, a
+  multi-device run — retried in lockstep and kept colliding. Every delay is
+  now spread by ±20%.
+
+## 3.2.0 (2026-08-10)
+
+### Breaking: the cloud-era exceptions are gone
+
+- `InsufficientBalanceError`, `RateLimitError`, `QirabotConnectionError`
+  and `TaskTerminatedError` have been removed from `qirabot` and
+  `qirabot.exceptions`. v3 has no Qirabot server, no per-step billing and
+  no server-side task state, so none of them had anything left to
+  describe — they had been exported as never-raised stubs since 3.0.
+  Importing them now raises `ImportError`.
+- Migration: delete the `except` clauses written against them, or widen
+  them to `QirabotError`. Model-provider quota and connectivity problems
+  surface as `ActionError` (mid-run) or `AuthenticationError` (at
+  construction); rate limits are still retried inside the provider layer
+  and only surface as `ActionError` if they persist.
+
+### Fix: stale screen geometry after an iOS rotation
+
+- The WDA adapter cached the device's point size on first use, but WDA
+  reports the size of the *current* orientation. After a rotation, every
+  coordinate derived from `device_info()` — swipe gestures, annotation
+  scale — was computed against the pre-rotation screen. Rotation is now
+  detected from the screenshot frame itself, and the cached point size
+  and annotation scale are dropped when it flips.
+
+## 3.1.3 (2026-08-10)
+
+### Fix: stray Playwright teardown noise after `qirabot doctor`
+
+- `doctor` no longer occasionally trails "Task was destroyed but it is
+  pending!" / `TargetClosedError` after its last line. The Chromium
+  probe now runs Playwright in a subprocess, so the sync API's
+  quick-start/stop teardown race (seen on Windows) stays out of the
+  command's output. Diagnostics are unchanged.
+
+## 3.1.2 (2026-08-10)
+
+### Fix: ADC authentication in isolated installs
+
+- `requests` is now a declared dependency. google-auth's token-refresh
+  transport imports it at call time but only lists it as an optional
+  extra, so isolated installs (`uv tool install`, pipx) resolved ADC
+  credentials and then failed the token refresh — `qirabot doctor` and
+  every ADC-authenticated run reported a raw ImportError as a
+  credentials failure.
+- A missing transport now surfaces as `failed to refresh Google Cloud
+  credentials: ...` with auth context instead of an unwrapped
+  ImportError.
+
+## 3.1.1 (2026-08-06)
+
+### Language: any language, better adherence, new default
+
+- `language` now accepts any value: common tags (`zh`, `ja`, `ko`, `de`,
+  `fr`, …) map to the native name of the language in the prompt; anything
+  else — a rarer tag or a plain language name like `廣東話` — is passed to
+  the model as written. Previously everything except `zh` silently fell
+  back to English.
+- **Behavior change:** with `language` unset, responses now follow the
+  language the instruction is written in, instead of defaulting to English.
+  Pass `language="en"` to keep the old behavior.
+- The language requirement is now also stated on each tool's `reason`
+  field, so per-step reasoning drifts to the wrong language far less often
+  on tasks whose content is in another language.
+
+## 3.1.0 (2026-08-06)
+
+### Breaking: claude-vertex removed
+
+The `claude-vertex` provider is gone; `gemini-vertex` and `gemini` are the
+two remaining providers. A `model="claude-vertex/..."` value now fails at
+construction with the standard unknown-provider hint. Pin `qirabot<3.1` if
+you still need Claude on Vertex.
+
+### Vertex AI API key authentication (gemini-vertex)
+
+`gemini-vertex` models can now authenticate with a Vertex AI API key instead
+of ADC — no gcloud setup needed. Pass `Qirabot(vertex_api_key=...)`, set
+`QIRA_VERTEX_API_KEY`, or use the CLI's global `--vertex-api-key`.
+
+- This is a Google Cloud API key (created in the Cloud console or Vertex AI
+  express mode), **not** an AI Studio key. `GOOGLE_API_KEY` is deliberately
+  not read, since it commonly holds an AI Studio key that Vertex rejects.
+- API-key auth is project-bound server-side and only the global endpoint
+  accepts it: requests go to `aiplatform.googleapis.com` with the short
+  `publishers/google/...` path, and `vertex_project` / `vertex_location`
+  are ignored (logged) when a key is configured.
+- A configured key always wins over project/location settings.
+- `qirabot doctor` / `qirabot models` report key mode; with a Vertex API
+  key configured, ADC is not needed for anything.
+
+### New provider: `gemini` — Gemini Developer API with AI Studio keys
+
+`model="gemini/{model}"` (e.g. `gemini/gemini-3.6-flash`) calls the Gemini
+Developer API (`generativelanguage.googleapis.com`) instead of Vertex AI — no
+Google Cloud project, no ADC. Auth is an AI Studio API key:
+`Qirabot(gemini_api_key=...)`, `QIRA_GEMINI_API_KEY`, `GEMINI_API_KEY` (the
+official variable), or the CLI's global `--gemini-api-key`.
+
+- Same wire format and engine behavior as `gemini-vertex` (shared request
+  builder/parser); only host, path and auth differ.
+- The provider requires a key — there is no credential fallback — and the
+  missing-key error names the exact knobs.
+
+## 3.0.0 (2026-08-03)
+
+### The decision engine runs locally
+
+The engine runs inside the SDK process: each screenshot is sent directly from
+your machine to a vision model you configure on Google Vertex AI,
+authenticated with your own Google Cloud credentials (Application Default
+Credentials). No Qirabot account, no API key, no per-step billing, and no
+Qirabot server in the loop.
+
+**Configuration**
+
+- Authentication is Google Cloud ADC: set `GOOGLE_APPLICATION_CREDENTIALS` to
+  a service-account JSON, run `gcloud auth application-default login`, or run
+  on GCE (metadata server).
+- Model selection is explicit and local:
+  `Qirabot(model="{provider}/{model}")` or `QIRA_MODEL`, with provider one of
+  `claude-vertex` / `gemini-vertex`. Default:
+  `gemini-vertex/gemini-3.6-flash`.
+- Google Cloud project/region: `vertex_project=` / `vertex_location=`
+  constructor parameters, `--vertex-project` / `--vertex-location` CLI global
+  options, or `QIRA_VERTEX_PROJECT` / `QIRA_VERTEX_LOCATION` (falling back to
+  `GOOGLE_CLOUD_PROJECT` / `GOOGLE_CLOUD_LOCATION`, then to the project
+  carried by the ADC credentials; location defaults to `global`).
+- `task_id` is a local run id of the form `local-<hex>`; nothing is synced to
+  a server. `fail()` / `cancel()` record the run's terminal outcome locally
+  for the HTML report.
+- New required dependency: `google-auth`.
+- CLI: `qirabot models` lists the Vertex providers, their default models, and
+  checks ADC; `qirabot doctor` checks Python, Google Cloud credentials (ADC +
+  project), and backend dependencies.
+
+**Added**
+
+- Vertex AI providers: `claude-vertex`, `gemini-vertex`.
+- `QIRA_LOCATE_FORMAT` (optional; `bbox_yx_1000`) — element-location output
+  format override.
+- `QIRA_ENGINE_TRACE=<dir>` — debugging: appends one JSONL record per engine
+  step and saves the step screenshots into the directory.
+- CLI: `--output-format text|json|stream-json` on `browser` / `android` /
+  `ios` / `desktop`. `json` prints one final JSON result object on stdout
+  (`success`, `status`, `output`, `task_id`, `usage` token/step totals, and
+  the `report.html` path); `stream-json` prints NDJSON — a `start` line, one
+  line per AI step mirroring the SDK's `StepResult` fields, then the same
+  result object. Every exit path (done / failed / error / cancelled, and
+  setup failures such as an unreachable device) ends with a result object;
+  exit codes are unchanged, and the machine formats suppress all
+  human-readable stdout so the output stays parseable by scripts and CI.
+- CLI: `--media-resolution low|medium|high|ultra_high` on `browser` /
+  `android` / `ios` / `desktop` — screenshot detail the model sees
+  (gemini-vertex only; default `QIRA_MEDIA_RESOLUTION`, else `high`). The
+  constructor parameter and env var already existed; this exposes them as a
+  task option alongside `--thinking-level`.
+
+**Changed**
+
+- Engine: the completed-steps summary is run-length compressed at render
+  time (13 consecutive scrolls become one `scroll ×13` line — cheaper and
+  makes loops more visible to the model) and capped at 200 lines: beyond
+  that the oldest lines are dropped and replaced with an
+  `(earliest N actions omitted)` marker, bounding per-step prompt growth on
+  very long (hundreds of steps) tasks.
+- Engine: cache-friendly prompt layout for Gemini implicit caching. The step
+  summary and saved notes moved from the (head-of-prompt) system instruction
+  to a progress-context message near the tail of the conversation, and the
+  history window now truncates in batches (at 2x `max_entries`, folding back
+  to `max_entries`) instead of sliding one entry per step. Both system-prompt
+  halves and the replayed text history are now byte-stable across steps, so
+  the provider prefix cache covers system + tools + text history on every
+  step and only breaks once per `max_entries` steps. Claude behavior is
+  unchanged (its window never truncates within a task).
+
+**Fixed**
+
+- Engine: history screenshots no longer accumulate across steps. A stale
+  screenshot stayed attached to every history entry instead of only the most
+  recent one, so each decide request carried up to 6 images instead of 2 —
+  roughly doubling per-step input tokens on multi-step tasks.
+
+**Unchanged**
+
+- The automation API: `bot.ai()`, `bot.click/type/extract/verify/locate`,
+  `knowledge=`, `custom_tools=`, `on_step`, `thinking_level`
+  (minimal/low/medium/high), backends (browser/Android/iOS/desktop/Windows
+  window), HTML reports, screen/device recording, and the progress overlay.

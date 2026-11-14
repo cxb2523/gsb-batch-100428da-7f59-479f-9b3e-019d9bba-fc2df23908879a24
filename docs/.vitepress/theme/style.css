@@ -1,0 +1,59 @@
+/**
+ * Brand overrides for the default VitePress theme.
+ *
+ * The palette matches the marketing site / favicon gradient:
+ * violet #8b5cf6 -> indigo #6366f1 (see website/index.html).
+ *
+ * brand-1: text (links, active nav) — needs the most contrast
+ * brand-2: hover state
+ * brand-3: solid backgrounds (buttons) — white text sits on this
+ */
+:root {
+  --vp-c-brand-1: #6d28d9;
+  --vp-c-brand-2: #7c3aed;
+  --vp-c-brand-3: #7c3aed;
+  --vp-c-brand-soft: rgba(139, 92, 246, 0.14);
+}
+
+.dark {
+  --vp-c-brand-1: #a78bfa;
+  --vp-c-brand-2: #8b5cf6;
+  --vp-c-brand-3: #7c3aed;
+  --vp-c-brand-soft: rgba(139, 92, 246, 0.16);
+}
+
+/* Home hero: gradient name text + blurred gradient glow behind the logo. */
+:root {
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: linear-gradient(120deg, #8b5cf6 30%, #6366f1);
+  --vp-home-hero-image-background-image: linear-gradient(
+    -45deg,
+    #8b5cf6 50%,
+    #6366f1 50%
+  );
+  --vp-home-hero-image-filter: blur(44px);
+}
+
+@media (min-width: 640px) {
+  :root {
+    --vp-home-hero-image-filter: blur(56px);
+  }
+}
+
+@media (min-width: 960px) {
+  :root {
+    --vp-home-hero-image-filter: blur(68px);
+  }
+}
+
+/* Demo gallery (demos.md). The clips mix a landscape capture with 322×720
+   phone recordings; at full content width a portrait one renders ~1500px tall
+   and runs well past the viewport. Cap the height and centre the narrow ones. */
+.vp-doc video.demo-video {
+  display: block;
+  margin: 0 auto;
+  max-width: 100%;
+  max-height: min(70vh, 560px);
+  border-radius: 8px;
+  background: #000;
+}

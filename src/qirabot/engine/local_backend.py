@@ -1,0 +1,730 @@
+"""LocalBackend: the in-process decision engine behind the SDK client.
+
+The client talks to the engine through typed calls — an explicit
+:class:`AIRun` per ai() command, one method per single-step action. Session
+lifetime belongs to the caller's loop (a local variable, not backend state),
+so an abandoned run can never leak into the next one.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
+
+import httpx
+
+from . import actions
+from .engine import LocalEngine
+from .providers.base import Provider, ProviderError
+from .providers.fallback import FallbackProvider
+from .providers.service_tier import tier_label
+from .providers.gemini_api import GeminiApiProvider
+from .providers.gemini_vertex import GeminiVertexProvider
+from .providers.stats import ProviderStats, StatsSnapshot
+from .providers.registry import (
+    PROVIDER_GEMINI,
+    PROVIDER_GEMINI_VERTEX,
+    ModelSpec,
+    check_tier_location,
+    parse_model,
+    resolve_gemini_api_key,
+    resolve_fallback_model,
+    resolve_service_tier,
+    resolve_tier_escalation,
+    resolve_vertex_api_key,
+    resolve_vertex_location,
+    resolve_vertex_project,
+)
+from .providers.vertex_auth import VertexTokenSource
+from .custom_tools import parse_custom_tools, parse_exclude_tools, parse_knowledge
+from .session import LocalAISession, StepError, StepOutcome
+from .types import (
+    ConditionInput,
+    ExtractInput,
+    LocateInput,
+    LocateResult,
+    LocateUnparsableError,
+    ModelConfig,
+    TokenUsage,
+    UnsupportedScreenshotError,
+)
+
+if TYPE_CHECKING:
+    from google.auth.credentials import Credentials
+
+logger = logging.getLogger("qirabot.engine")
+
+
+@dataclass
+class LocateOutcome:
+    """One element-location call (click/type_text/…/locate). A model-level
+    failure (element not found, unparsable after retry, provider error) is a
+    result, not an exception — its spend is just as real and the caller folds
+    ``token_usage`` into the session totals either way."""
+
+    found: bool
+    x: int = 0
+    y: int = 0
+    error: str = ""
+    token_usage: TokenUsage = field(default_factory=TokenUsage)
+    coord_ms: int = 0
+    # Model that answered and tier that served it ("" when unknown or no
+    # answer), and this call's slice of the provider ledger.
+    model: str = ""
+    tier: str = ""
+    stats: StatsSnapshot = field(default_factory=StatsSnapshot)
+
+
+@dataclass
+class ExtractOutcome:
+    """One extract call."""
+
+    result: str
+    token_usage: TokenUsage = field(default_factory=TokenUsage)
+    model: str = ""  # as on LocateOutcome
+    tier: str = ""
+    stats: StatsSnapshot = field(default_factory=StatsSnapshot)
+
+
+@dataclass
+class ConditionOutcome:
+    """One assert/wait_for check. ``met`` carries the verdict — an unmet
+    condition is a valid result, not a failure; wait_for's SDK-side polling
+    depends on exactly this contract."""
+
+    met: bool
+    reasoning: str = ""
+    token_usage: TokenUsage = field(default_factory=TokenUsage)
+    model: str = ""  # as on LocateOutcome
+    tier: str = ""
+    stats: StatsSnapshot = field(default_factory=StatsSnapshot)
+
+
+def _tier_suffix(tier: str, escalate: bool) -> str:
+    """Startup-log fragment naming a non-default consumption tier — the whole
+    run is billed differently, so it belongs next to the model and project."""
+    if not tier:
+        return " tier=standard+escalate" if escalate else ""
+    return f" tier={tier}{'+escalate' if escalate else ''}"
+
+
+def _normalize_platform(platform: str) -> str:
+    # SDK adapters report "browser"; the engine's platform vocabulary
+    # (and its platform prompt files) say "chrome".
+    return actions.PLATFORM_CHROME if platform == "browser" else platform
+
+
+class AIRun:
+    """One in-flight ai() command, created by :meth:`LocalBackend.start_ai`.
+
+    The caller owns the lifetime: hold it for the duration of the loop and
+    drop it when the loop ends (finished, max steps, error, or abort). There
+    is no backend-side slot to reset — a run abandoned mid-way is garbage
+    collected with the loop frame and cannot hijack the next run."""
+
+    def __init__(self, backend: "LocalBackend", session: LocalAISession) -> None:
+        self._backend = backend
+        self._session = session
+
+    @property
+    def notes(self) -> list[str]:
+        """The run's save_note contents so far, deduplicated by the session
+        (see ``note_subsumed_by``). A copy: callers can't mutate what the
+        next decide call is shown."""
+        return list(self._session.notes)
+
+    def step(
+        self,
+        screenshot: bytes,
+        action_result: str = "",
+        device_width: int = 0,
+        device_height: int = 0,
+    ) -> StepOutcome:
+        """Run one decide→ground step. Raises :class:`StepError` (carrying
+        the failed attempts' token usage) for step-level failures and
+        :class:`ProviderError` for transport-level ones."""
+        if not screenshot:
+            raise StepError("screenshot required")
+        sess = self._session
+        is_first_step = sess.step_count == 0
+        trace_req = {
+            "action_result": action_result,
+            "device": [device_width, device_height],
+        }
+        if is_first_step:
+            trace_req["instruction"] = sess.instruction
+        before = self._backend.stats_snapshot()
+        try:
+            outcome = sess.step(
+                self._backend._engine,
+                screenshot,
+                action_result,
+                device_width,
+                device_height,
+                is_first_step,
+            )
+        except (StepError, ProviderError) as exc:
+            self._backend._trace.record("ai", screenshot, trace_req, {"error": str(exc)})
+            raise
+        # Every request this step sent — timeout re-asks, escalated and
+        # fallback attempts included. A failed step never gets here; its
+        # time stays visible in the session totals, read off the ledger.
+        outcome.stats = self._backend.stats_snapshot() - before
+        if not outcome.finished:
+            # History replay needs one screenshot per committed step (save_note
+            # steps re-send the previous frame; the duplicate keeps alignment).
+            sess.remember_screenshot(screenshot)
+        self._backend._trace.record("ai", screenshot, trace_req, _outcome_trace(outcome))
+        return outcome
+
+
+class LocalBackend:
+    """One backend per Qirabot instance. Stateless between calls apart from
+    the provider connection: ai() session state lives in the :class:`AIRun`
+    handed to the caller."""
+
+    def __init__(
+        self,
+        model: str,
+        vertex_project: str = "",
+        vertex_location: str = "",
+        vertex_api_key: str = "",
+        gemini_api_key: str = "",
+        vertex_credentials: Credentials | None = None,
+        thinking_level: str = "",
+        media_resolution: str = "",
+        locate_format: str = "",
+        annotate_for_model: bool = False,
+        service_tier: str = "",
+        tier_escalation: bool | None = None,
+        fallback_model: str = "",
+        provider: Provider | None = None,
+    ) -> None:
+        self._spec: ModelSpec = parse_model(model)
+        fallback = resolve_fallback_model(fallback_model, self._spec)
+        self._thinking_level = thinking_level
+        self._media_resolution = media_resolution
+        self._locate_format = locate_format
+        self._annotate_for_model = annotate_for_model
+        self._http: httpx.Client | None = None
+        self._trace: _Tracer | _NullTracer = _Tracer.from_env() or _NullTracer()
+        tier = resolve_service_tier(service_tier)
+        escalate = resolve_tier_escalation(tier_escalation)
+
+        if vertex_credentials is not None:
+            if provider is not None or self._spec.provider != PROVIDER_GEMINI_VERTEX:
+                raise ValueError(
+                    f"vertex_credentials is only supported with the "
+                    f'"{PROVIDER_GEMINI_VERTEX}" provider'
+                )
+            if vertex_api_key.strip():
+                raise ValueError(
+                    "cannot pass both vertex_credentials and vertex_api_key"
+                )
+
+        if provider is None and self._spec.provider == PROVIDER_GEMINI:
+            # Gemini Developer API (AI Studio keys): no ADC, no
+            # project/location — the key is the whole auth story
+            # (param > QIRA_GEMINI_API_KEY > GEMINI_API_KEY).
+            api_key = resolve_gemini_api_key(gemini_api_key)
+            if not api_key:
+                raise ValueError(
+                    "the gemini provider (Gemini Developer API / AI Studio) "
+                    "requires an API key; pass gemini_api_key= or set "
+                    "QIRA_GEMINI_API_KEY / GEMINI_API_KEY"
+                )
+            self._http = httpx.Client()
+            provider = GeminiApiProvider(
+                api_key, self._http, service_tier=tier, tier_escalation=escalate
+            )
+            logger.info(
+                "local engine: model=%s/%s auth=api-key endpoint=generativelanguage"
+                "%s",
+                self._spec.provider,
+                self._spec.model,
+                _tier_suffix(tier, escalate),
+            )
+        elif provider is None:
+            # gemini-vertex auth precedence: explicit vertex_credentials= >
+            # vertex_api_key= / QIRA_VERTEX_API_KEY > ADC. A configured
+            # QIRA_VERTEX_API_KEY still beats ambient ADC — the variable is
+            # qirabot-scoped, so setting it is a deliberate choice, unlike
+            # project/location vars, which commonly linger from an ADC-era setup.
+            if vertex_credentials is not None:
+                if os.environ.get("QIRA_VERTEX_API_KEY", "").strip():
+                    logger.info(
+                        "QIRA_VERTEX_API_KEY ignored: explicit vertex_credentials "
+                        "takes precedence"
+                    )
+                api_key = ""
+            else:
+                api_key = resolve_vertex_api_key(vertex_api_key)
+            if api_key:
+                if vertex_project.strip() or vertex_location.strip():
+                    logger.info(
+                        "vertex_project/vertex_location ignored: API-key auth "
+                        "is project-bound and global-endpoint only"
+                    )
+                self._http = httpx.Client()
+                provider = GeminiVertexProvider(
+                    "",
+                    "",
+                    None,
+                    self._http,
+                    api_key=api_key,
+                    service_tier=tier,
+                    tier_escalation=escalate,
+                )
+                logger.info(
+                    "local engine: model=%s/%s auth=api-key endpoint=global%s",
+                    self._spec.provider,
+                    self._spec.model,
+                    _tier_suffix(tier, escalate),
+                )
+            else:
+                tokens = VertexTokenSource(credentials=vertex_credentials)
+                location = resolve_vertex_location(vertex_location)
+                check_tier_location(tier, location)
+                project = resolve_vertex_project(vertex_project, tokens)
+                self._http = httpx.Client()
+                provider = GeminiVertexProvider(
+                    project,
+                    location,
+                    tokens,
+                    self._http,
+                    service_tier=tier,
+                    tier_escalation=escalate,
+                )
+                logger.info(
+                    "local engine: model=%s/%s project=%s location=%s%s",
+                    self._spec.provider,
+                    self._spec.model,
+                    project,
+                    location,
+                    _tier_suffix(tier, escalate),
+                )
+        self._provider = provider
+        self._tier = tier
+        # Same-provider fallback: a wrapper that swaps the model name on a
+        # capacity failure. The raw provider stays in self._provider for
+        # provider-level reporting (served tiers).
+        self._fallback: FallbackProvider | None = None
+        engine_provider: Provider = provider
+        if fallback:
+            self._fallback = FallbackProvider(provider, fallback, self._spec.provider)
+            engine_provider = self._fallback
+            logger.info("local engine: fallback model=%s/%s", self._spec.provider, fallback)
+        self._engine = LocalEngine(engine_provider, self._spec.model)
+
+    @property
+    def model_label(self) -> str:
+        """The model line of the run report. Names the fallback only when it
+        actually answered something — a configured but unused fallback is
+        noise, while one that served calls changes what the run cost and
+        which model made the decisions."""
+        label = f"{self._spec.provider}/{self._spec.model}"
+        fb = self._fallback
+        if fb is not None and fb.fallback_calls:
+            n = fb.fallback_calls
+            label += f" — {n} call{'s' if n != 1 else ''} served by fallback {fb.fallback_model}"
+        return label
+
+    @property
+    def current_model(self) -> str:
+        """The model the next call goes to: the fallback once this run has
+        switched to it, else the primary. Used to attribute the spend of a
+        failed call, which carries no answering model of its own."""
+        fb = self._fallback
+        if fb is not None and fb.active:
+            return fb.fallback_model
+        return self._spec.model
+
+    @property
+    def tier_label(self) -> str:
+        """Which consumption tier the run was billed at, for the report.
+
+        Always names a tier (``standard — default`` when none was configured
+        and standard was served); an unconfigured run that escalation moved
+        to priority says so. An injected provider need not report what it
+        served, so the served side is optional."""
+        served = getattr(self._provider, "served_tiers", ())
+        return tier_label(self._tier, tuple(served))
+
+    def stats_snapshot(self) -> StatsSnapshot:
+        """Model time and capacity waits across every provider call this
+        backend has made (see providers.stats).
+
+        Read off the raw provider, which serves the primary and the fallback
+        model alike. An injected provider need not keep a ledger; it reads
+        as zeros, the same way tier_label treats served_tiers."""
+        stats = getattr(self._provider, "stats", None)
+        return stats.snapshot() if isinstance(stats, ProviderStats) else StatsSnapshot()
+
+    def close(self) -> None:
+        if self._http is not None:
+            self._http.close()
+            self._http = None
+
+    # -- model config --------------------------------------------------
+
+    def _model_config(self, thinking_level: str = "") -> ModelConfig:
+        # Backend-level defaults. Without them the engine's
+        # _resolve_model_params fallbacks apply: temperature 0.2 (Gemini 3
+        # degrades below its recommended 1.0) and the API-side media
+        # resolution. Screenshots default to "high" — UI text is dense and
+        # the decision quality is the product.
+        # thinking_level: per-call override > constructor > "low". The
+        # explicit "low" floor keeps latency and cost predictable; leaving it
+        # unset would drift with the API-side default, which for Gemini 3 is
+        # high — slower and pricier on every step.
+        params: dict[str, Any] = {
+            "temperature": 1.0,
+            "media_resolution": self._media_resolution or "high",
+            "thinking_level": thinking_level or self._thinking_level or "low",
+        }
+        return ModelConfig(
+            provider=self._spec.provider,
+            model=self._spec.model,
+            params=params,
+            locate_format=self._locate_format,
+        )
+
+    # -- ai ---------------------------------------------------------------
+
+    def start_ai(
+        self,
+        instruction: str,
+        *,
+        platform: str,
+        max_steps: int = 20,
+        language: str = "",
+        thinking_level: str = "",
+        custom_tools: list[dict[str, Any]] | None = None,
+        exclude_tools: list[str] | None = None,
+        knowledge: str = "",
+    ) -> AIRun:
+        """Create the session for one ai() command and hand it to the caller.
+
+        ``custom_tools`` takes the SDK's wire-shaped definitions (name/
+        description/parameters dicts); validation lives here so the engine
+        enforces the same rules no matter who builds them. Raises ValueError
+        for invalid instruction/tools/knowledge."""
+        if not isinstance(instruction, str) or not instruction:
+            raise ValueError("ai requires a non-empty instruction")
+        # Each ai() run gives the primary model a fresh chance; within a run
+        # a switch to the fallback is sticky (see providers.fallback).
+        if self._fallback is not None:
+            self._fallback.reset()
+        platform = _normalize_platform(platform)
+        tools = parse_custom_tools(custom_tools) if custom_tools else []
+        excludes = parse_exclude_tools(exclude_tools, platform) if exclude_tools else []
+        knowledge_text = parse_knowledge(knowledge) if knowledge else ""
+        if tools or excludes:
+            logger.info(
+                "custom tools registered: %s; excluded: %s",
+                [d.name for d in tools],
+                excludes,
+            )
+        if knowledge_text:
+            logger.info(
+                "knowledge registered: %d bytes", len(knowledge_text.encode("utf-8"))
+            )
+        session = LocalAISession(
+            instruction=instruction,
+            platform=platform,
+            language=language,
+            max_steps=max_steps if max_steps > 0 else 20,
+            model_config=self._model_config(thinking_level),
+            knowledge=knowledge_text,
+            custom_tools=tools,
+            exclude_tools=excludes,
+            annotate_for_model=self._annotate_for_model,
+        )
+        return AIRun(self, session)
+
+    # -- single-step actions --------------------------------------------
+
+    def locate(
+        self,
+        screenshot: bytes,
+        locate: str,
+        *,
+        language: str = "",
+        thinking_level: str = "",
+    ) -> LocateOutcome:
+        """Resolve an element description to device coordinates with one VLM
+        call, retrying once on an unparsable response. Raises ValueError only
+        for a missing description; every model-level failure comes back as a
+        not-found outcome carrying the real spend."""
+        if not isinstance(locate, str) or not locate:
+            raise ValueError("locate parameter required")
+        before = self.stats_snapshot()
+        outcome = self._locate(screenshot, locate, language=language, thinking_level=thinking_level)
+        outcome.stats = self.stats_snapshot() - before
+        return outcome
+
+    def _locate(
+        self, screenshot: bytes, locate: str, *, language: str, thinking_level: str
+    ) -> LocateOutcome:
+        """The body of :meth:`locate`, which takes its ledger slice."""
+        start = time.monotonic()
+        answered: LocateResult | None = None
+        usage = TokenUsage()
+        result: LocateResult | None = None
+        error: Exception | None = None
+
+        for attempt in range(1, 3):
+            error = None
+            partial: LocateResult | None = None
+            try:
+                partial = self._engine.locate(
+                    LocateInput(
+                        locate=locate,
+                        screenshot=screenshot,
+                        language=language,
+                        model_config=self._model_config(thinking_level),
+                    )
+                )
+                result = partial
+            except UnsupportedScreenshotError:
+                # Deterministic, zero spend — never retried, never billed.
+                return self._locate_done(
+                    screenshot,
+                    locate,
+                    LocateOutcome(
+                        found=False, error="screenshot format not supported for locate"
+                    ),
+                )
+            except LocateUnparsableError as exc:
+                error = exc
+                partial = exc.result
+            except ProviderError as exc:
+                error = exc
+                # Timeouts are not retried: a shot that burned the locate
+                # budget won't fit a second attempt in the SDK's step budget.
+                if exc.category.value == "timeout":
+                    break
+
+            if partial is not None:
+                # Accumulate across attempts: a failed first attempt's spend
+                # is just as real as the successful second one.
+                usage.add(partial.token_usage)
+                answered = partial
+            if error is None:
+                break
+            if attempt == 1:
+                logger.warning("vlm locate failed; retrying once: %s", error)
+
+        coord_ms = int((time.monotonic() - start) * 1000)
+        # The last response that came back names the model and tier; with no
+        # response at all the spend (if any) goes to the current model.
+        model = answered.model_used if answered else self.current_model
+        tier = answered.served_tier if answered else ""
+
+        if error is not None:
+            outcome = LocateOutcome(
+                found=False,
+                error=str(error),
+                token_usage=usage,
+                coord_ms=coord_ms,
+                model=model,
+                tier=tier,
+            )
+        else:
+            assert result is not None
+            if result.found:
+                outcome = LocateOutcome(
+                    found=True,
+                    x=result.x,
+                    y=result.y,
+                    token_usage=usage,
+                    coord_ms=coord_ms,
+                    model=model,
+                    tier=tier,
+                )
+            else:
+                outcome = LocateOutcome(
+                    found=False,
+                    error=result.not_found_reason or f"element not found: {locate}",
+                    token_usage=usage,
+                    coord_ms=coord_ms,
+                    model=model,
+                    tier=tier,
+                )
+        return self._locate_done(screenshot, locate, outcome)
+
+    def _locate_done(
+        self, screenshot: bytes, locate: str, outcome: LocateOutcome
+    ) -> LocateOutcome:
+        self._trace.record(
+            "locate",
+            screenshot,
+            {"locate": locate},
+            {
+                "found": outcome.found,
+                "x": outcome.x,
+                "y": outcome.y,
+                "error": outcome.error,
+                "token_usage": vars(outcome.token_usage),
+            },
+        )
+        return outcome
+
+    def extract(
+        self,
+        screenshot: bytes,
+        instruction: str,
+        *,
+        platform: str = "",
+        language: str = "",
+        thinking_level: str = "",
+    ) -> ExtractOutcome:
+        """One extract call. Raises ValueError (engine-level failure) or
+        ProviderError; neither carries usage — these failure paths are not
+        metered."""
+        if not isinstance(instruction, str) or not instruction:
+            raise ValueError("extract requires instruction parameter")
+        before = self.stats_snapshot()
+        try:
+            result = self._engine.extract(
+                ExtractInput(
+                    prompt=instruction,
+                    screenshot=screenshot,
+                    platform=_normalize_platform(platform),
+                    language=language,
+                    model_config=self._model_config(thinking_level),
+                )
+            )
+        except (ValueError, ProviderError) as exc:
+            self._trace.record(
+                "extract", screenshot, {"instruction": instruction}, {"error": str(exc)}
+            )
+            raise
+        self._trace.record(
+            "extract",
+            screenshot,
+            {"instruction": instruction},
+            {"result": result.result, "token_usage": vars(result.token_usage)},
+        )
+        return ExtractOutcome(
+            result=result.result,
+            token_usage=result.token_usage,
+            model=result.model_used,
+            tier=result.served_tier,
+            stats=self.stats_snapshot() - before,
+        )
+
+    def check_condition(
+        self,
+        screenshot: bytes,
+        condition: str,
+        *,
+        platform: str = "",
+        language: str = "",
+        thinking_level: str = "",
+    ) -> ConditionOutcome:
+        """One assert/wait_for check. Raises like :meth:`extract`."""
+        if not isinstance(condition, str) or not condition:
+            raise ValueError("condition/assertion parameter required")
+        before = self.stats_snapshot()
+        try:
+            result = self._engine.check_condition(
+                ConditionInput(
+                    condition=condition,
+                    screenshot=screenshot,
+                    platform=_normalize_platform(platform),
+                    language=language,
+                    model_config=self._model_config(thinking_level),
+                )
+            )
+        except (ValueError, ProviderError) as exc:
+            self._trace.record(
+                "condition", screenshot, {"condition": condition}, {"error": str(exc)}
+            )
+            raise
+        self._trace.record(
+            "condition",
+            screenshot,
+            {"condition": condition},
+            {
+                "met": result.met,
+                "reasoning": result.reasoning,
+                "token_usage": vars(result.token_usage),
+            },
+        )
+        return ConditionOutcome(
+            met=result.met,
+            reasoning=result.reasoning,
+            token_usage=result.token_usage,
+            model=result.model_used,
+            tier=result.served_tier,
+            stats=self.stats_snapshot() - before,
+        )
+
+
+def _outcome_trace(outcome: StepOutcome) -> dict[str, Any]:
+    return {
+        "action_type": outcome.action_type,
+        "params": outcome.params,
+        "decision": outcome.decision,
+        "output": outcome.output,
+        "finished": outcome.finished,
+        "step_number": outcome.step_number,
+        "token_usage": vars(outcome.token_usage),
+    }
+
+
+class _Tracer:
+    """QIRA_ENGINE_TRACE=<dir>: append one JSONL record per engine call
+    (request/response sans screenshot bytes; the screenshot lands next to the
+    log under its sha256). Debug aid and regression corpus — never on by
+    default."""
+
+    def __init__(self, directory: str) -> None:
+        self._dir = directory
+
+    @classmethod
+    def from_env(cls) -> "_Tracer | None":
+        d = os.environ.get("QIRA_ENGINE_TRACE", "").strip()
+        if not d:
+            return None
+        os.makedirs(d, exist_ok=True)
+        return cls(d)
+
+    def record(
+        self,
+        action_type: str,
+        screenshot: bytes,
+        request: dict[str, Any],
+        response: dict[str, Any],
+    ) -> None:
+        try:
+            sha = ""
+            if screenshot:
+                sha = hashlib.sha256(screenshot).hexdigest()
+                path = os.path.join(self._dir, f"{sha}.img")
+                if not os.path.exists(path):
+                    with open(path, "wb") as f:
+                        f.write(screenshot)
+            entry = {
+                "ts": time.time(),
+                "action_type": action_type,
+                "screenshot_sha256": sha,
+                "request": request,
+                "response": response,
+            }
+            with open(os.path.join(self._dir, "trace.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        except OSError as exc:  # tracing must never break a step
+            logger.warning("engine trace write failed: %s", exc)
+
+
+# _Tracer.from_env returns None when tracing is off; give callers a no-op shim.
+class _NullTracer:
+    def record(self, *args: Any, **kwargs: Any) -> None:
+        return None

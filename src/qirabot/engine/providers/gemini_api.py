@@ -1,0 +1,111 @@
+"""Gemini via the Gemini Developer API (AI Studio API keys).
+
+Transport only: generativelanguage.googleapis.com with a models/{model} path
+(no project/location, no publishers/ prefix) and x-goog-api-key auth. The
+generateContent wire format is shared with the Vertex transport and lives in
+:mod:`._gemini_wire`.
+"""
+
+from __future__ import annotations
+
+import httpx
+
+from ._gemini_wire import parse_response, post_json, run_chat
+from .base import ChatRequest, ChatResponse
+from .service_tier import (
+    FLEX,
+    GEMINI_SERVED_TIER_HEADER,
+    SUPPORTED_TIERS,
+    TierCheck,
+    TierLadder,
+)
+from .stats import ProviderStats
+
+_PROVIDER = "gemini"
+
+_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+
+# Margin between the server's own deadline hint and the client timeout, so
+# the server gives up first and answers with a classifiable 503 instead of
+# the client tearing down a connection it can tell nothing from.
+_SERVER_TIMEOUT_MARGIN = 5.0
+
+
+class GeminiApiProvider:
+    def __init__(
+        self,
+        api_key: str,
+        http_client: httpx.Client,
+        service_tier: str = "",
+        tier_escalation: bool = False,
+    ) -> None:
+        self._api_key = api_key
+        self._http = http_client
+        self._stats = ProviderStats()
+        self._ladder = TierLadder(service_tier, tier_escalation, _PROVIDER)
+        self._tier_check = TierCheck(_PROVIDER)
+        # Sticky capability flag, see run_chat.
+        self._part_media_resolution = True
+
+    def _url(self, model: str) -> str:
+        return f"{_BASE_URL}/models/{model}:generateContent"
+
+    @property
+    def served_tiers(self) -> tuple[str, ...]:
+        """Distinct consumption tiers this provider was actually served
+        on, for the run report."""
+        return self._tier_check.served
+
+    @property
+    def stats(self) -> ProviderStats:
+        """Where this provider's request time went, for the usage totals
+        (see providers.stats)."""
+        return self._stats
+
+    def chat(self, request: ChatRequest, timeout: float) -> ChatResponse:
+        return self._ladder.run(
+            lambda tier, escalated: self._chat_once(request, timeout, tier, escalated)
+        )
+
+    def _chat_once(
+        self, request: ChatRequest, timeout: float, tier: str, escalated: bool
+    ) -> ChatResponse:
+        timeout = self._ladder.timeout_for(tier, timeout)
+        headers = {"x-goog-api-key": self._api_key}
+        if tier == FLEX:
+            # Flex requests queue. Bound the wait server-side rather than
+            # letting an interactive step hang for the endpoint's default
+            # ten minutes; over capacity we would rather fail and escalate.
+            headers["X-Server-Timeout"] = str(max(1, int(timeout - _SERVER_TIMEOUT_MARGIN)))
+
+        # The served tier only comes back as a response header here — unlike
+        # Vertex, the body carries no trafficType.
+        served: list[str] = []
+        post = post_json(
+            self._http,
+            self._url(request.model),
+            headers,
+            _PROVIDER,
+            timeout,
+            on_headers=lambda h: served.append(h.get(GEMINI_SERVED_TIER_HEADER, "")),
+            stats=self._stats,
+        )
+        data, self._part_media_resolution = run_chat(
+            request,
+            post,
+            self._part_media_resolution,
+            service_tier=tier,
+            wait_out_quota=self._ladder.wait_out_quota(escalated),
+            ride_out_outage=self._ladder.ride_out_outage(tier, escalated),
+            on_wait=self._stats.record_wait,
+        )
+        resp = parse_response(data, request.model)
+        reported = served[-1].strip().lower() if served else ""
+        resp.served_tier = reported if reported in SUPPORTED_TIERS else ""
+        self._tier_check.observe(
+            tier,
+            reported,
+            request.model,
+            "endpoint=generativelanguage",
+        )
+        return resp

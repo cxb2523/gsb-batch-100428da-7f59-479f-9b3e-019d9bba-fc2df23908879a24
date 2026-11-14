@@ -1,0 +1,29 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.env
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.DS_Store
+screenshots/
+user_data/
+qira_runs/
+plans/
+
+# virtualenvs
+venv/
+.venv/
+.ci-venv/
+env/
+
+# uv-generated lockfile: this is a published library, deps stay unpinned
+uv.lock
+
+# docs site (VitePress) — dist/ is already ignored globally above
+docs/node_modules/
+docs/.vitepress/cache/

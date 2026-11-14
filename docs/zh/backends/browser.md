@@ -1,0 +1,94 @@
+---
+title: Python AI 浏览器自动化(Playwright)——不写选择器
+description: 用 AI 视觉代替 CSS 选择器驱动 Chrome——Qirabot 可自动启动 Chromium,也能挂载到你现有的 Playwright 或 Selenium 会话。支持 headless、持久化 profile、CDP 接管。
+---
+
+# 浏览器自动化
+
+Qirabot 驱动浏览器时看的是像素,不是 DOM。AI 像人一样阅读渲染后的页面,
+所以在选择器方案失效的场景里也能正常工作:canvas 应用、跨域 iframe、
+shadow DOM、频繁 A/B 测试的布局,以及改版速度快过测试套件的页面。
+
+可以让 Qirabot 托管浏览器,也可以挂载到你已有的 Playwright / Selenium
+会话上。
+
+## 托管浏览器
+
+需要 `browser` extra:`uv pip install "qirabot[browser]"`,然后
+`qirabot install-browser`。
+
+最快的验证方式是 CLI,一条命令就能跑起来,不用写代码:
+
+```bash
+qirabot browser "打开热度最高的帖子并总结讨论内容" --url news.ycombinator.com
+qirabot browser "..." --headless --viewport 1920x1080
+qirabot browser "..." --user-data-dir ~/.qira-profile --channel chrome   # 登录态跨运行保留
+qirabot browser "..." --cdp-url http://localhost:9222                    # 接管已运行的 Chrome
+```
+
+`--cdp-url` 也适用于 browserless 之类的远程浏览器池。
+
+### 登录一次,后续复用
+
+需要账号的站点,登录这一步手动完成。手动登录不经过 AI 任务,不调用
+模型,也就不花 token。`open-browser` 会打开该 profile 的可见浏览器窗口;登录后关闭窗口,
+之后所有传入同一个 `--user-data-dir` 的运行都直接带着登录态启动:
+
+```bash
+qirabot open-browser --user-data-dir ~/.qira-profile --url news.ycombinator.com/login
+# 在窗口里完成登录,然后关闭它
+qirabot browser "打开热度最高的帖子并总结讨论内容" --user-data-dir ~/.qira-profile
+```
+
+同一个 profile 目录不能被两个浏览器同时占用,跑任务前先关掉登录窗口。
+如果登录墙(验证码、二次验证)出现在任务中途,见
+[human-in-the-loop](/zh/advanced/ai-tasks#人工介入-human-in-the-loop)。
+
+同样的运行也可以走 SDK。`bot.open()` 会自动启动 Chromium(底层为
+Playwright),你不需要写任何框架代码:
+
+```python
+from qirabot import Qirabot
+
+bot = Qirabot()
+page = bot.open("https://news.ycombinator.com")
+
+result = bot.ai(page, "打开热度最高的帖子并总结讨论内容")
+print(result.output)
+
+bot.close()
+```
+
+`bot.open()` 支持的参数和上面的 CLI flag 一一对应:`headless=True`、
+`viewport=(1920, 1080)`、`channel="chrome"`、额外的 Chromium 启动参数
+`args=[...]`、用 `cdp_url="http://localhost:9222"` 接管已在运行的 Chrome
+而不是新启一个,以及 `user_data_dir="~/.qira-profile"` 复用你用
+`open-browser` 登录好的配置目录(`~` 在所有平台都会展开)。
+
+## 挂载到你已有的会话
+
+如果你已经在自己的框架里跑着浏览器,可以跳过 `bot.open()`,把你自己的
+对象作为目标传入;也可以 `bind()` 一次,省去重复传参(`bind()` 详见
+[自定义 Adapter 与挂载](/zh/backends/custom-adapters)):
+
+- **Playwright**:传入你的 `page`;你的选择器和 AI 步骤自由混用。
+  完整指南:[Playwright + Qirabot](/zh/frameworks/playwright)。
+- **Selenium**:传入(或 `bind()`)你的 `driver`;不是 extra,自带
+  即可(`uv pip install qirabot selenium`)。完整指南:
+  [Selenium + Qirabot](/zh/frameworks/selenium)。
+- **pytest**:在现有测试套件里加 AI 断言和 AI 步骤,含 fixture 与 CI
+  说明。完整指南:[pytest + Qirabot](/zh/frameworks/pytest)。
+
+有一个值得提前知道的坑:点击可能打开新标签页,返回的 page 才是活动的
+那个,所以要保持 `page = bot.click(page, ...)` 的写法。细节和智能
+`go_back` 行为见
+[API 参考](/zh/reference/api#导航、滚动与按键-无-ai)。
+
+## 说明
+
+- headless 检测:无显示器环境(无 `DISPLAY`)下,`bot.open()` 和 CLI 自动
+  切换 headless 并给出警告。`open-browser` 是例外:它会直接报错,因为
+  看不见的浏览器没法手动登录。
+- `close_tab` 仅 Playwright 支持;`navigate`、`go_back`、`press_key`(含
+  `ctrl+w` 关闭当前标签页,记得重新赋值返回的 page)和 `scroll` 均可
+  用。完整的平台动作矩阵见 [API 参考](/zh/reference/api#平台支持矩阵)。

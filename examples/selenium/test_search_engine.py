@@ -1,0 +1,62 @@
+"""Bolt-on AI to Selenium: test Wikipedia search.
+
+Site: https://www.wikipedia.org
+
+Run:
+    pytest examples/selenium/test_search_engine.py
+"""
+
+import pytest
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from qirabot import Qirabot
+
+
+@pytest.fixture(scope="session")
+def driver():
+    driver = webdriver.Chrome()
+    yield driver
+    driver.quit()
+
+
+@pytest.fixture(scope="session")
+def bot(driver):
+    # bind(driver) once: the Selenium driver is stable across the session (tab/
+    # window focus moves via switch_to, the object stays the same), so calls drop
+    # the target. The with-block closes the Qirabot task after the last test.
+    with Qirabot(task_name="test-wikipedia-selenium").bind(driver) as bot:
+        yield bot
+
+
+def test_search_and_extract(driver, bot):
+    driver.get("https://www.wikipedia.org")
+
+    # Your existing Selenium code
+    search = driver.find_element(By.ID, "searchInput")
+    search.send_keys("Python programming language")
+    search.send_keys(Keys.RETURN)
+
+    # Bolt-on: AI extracts the summary
+    summary = bot.extract("Get the first paragraph of the article")
+    assert "Python" in summary
+
+
+def test_verify_page_layout(driver, bot):
+    driver.get("https://en.wikipedia.org/wiki/Python_(programming_language)")
+
+    # Bolt-on: AI checks page structure visually
+    assert bot.verify("Page has a table of contents")
+    assert bot.verify("Page has an infobox with language details")
+
+
+def test_navigate_sections(driver, bot):
+    driver.get("https://en.wikipedia.org/wiki/Python_(programming_language)")
+
+    # Bolt-on: AI clicks section link — no fragile selectors needed
+    result = bot.ai(
+        "Click 'History' in the table of contents, extract the first sentence",
+        max_steps=5,
+    )
+    assert result.success
+    assert result.output

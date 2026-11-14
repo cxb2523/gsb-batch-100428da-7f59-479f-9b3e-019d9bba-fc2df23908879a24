@@ -1,0 +1,255 @@
+"""Tool registry assembly: platform filtering, overrides, point-field
+substitution and common-field injection."""
+
+from typing import Any
+
+from qirabot.engine.tools import (
+    LOCATE_POINT_FIELDS,
+    ToolPromptDef,
+    ToolPromptOverride,
+    available_for_platform,
+    is_locate_field,
+    merge_common_fields,
+    prop,
+    resolve_desc,
+    resolve_schema,
+    response_language,
+    tool_definitions_for_platform,
+    with_point_fields,
+)
+from qirabot.engine.types import ToolDefinition
+
+
+def tool_by_name(defs: list[ToolDefinition], name: str) -> ToolDefinition | None:
+    for d in defs:
+        if d.name == name:
+            return d
+    return None
+
+
+class TestPlatformFiltering:
+    def test_chrome_list(self) -> None:
+        names = [d.name for d in tool_definitions_for_platform("chrome")]
+        assert names == [
+            "click",
+            "type_text",
+            "clear_text",
+            "scroll",
+            "scroll_at",
+            "navigate",
+            "go_back",
+            "wait",
+            "save_note",
+            "press_key",
+            "done",
+            "double_click",
+            "hover",
+            "drag",
+        ]
+
+    def test_android_excludes_browser_and_desktop_tools(self) -> None:
+        names = [d.name for d in tool_definitions_for_platform("android")]
+        for absent in ("navigate", "go_back", "hover", "right_click", "mouse_down", "key_down"):
+            assert absent not in names
+        assert "long_press" in names
+
+    def test_desktop_gets_mouse_and_key_primitives(self) -> None:
+        names = [d.name for d in tool_definitions_for_platform("desktop")]
+        for present in ("right_click", "mouse_down", "mouse_up", "key_down", "key_up", "hover"):
+            assert present in names
+        assert "long_press" not in names
+
+    def test_non_llm_actions_never_visible(self) -> None:
+        for platform in ("chrome", "android", "ios", "desktop"):
+            names = [d.name for d in tool_definitions_for_platform(platform)]
+            assert "take_screenshot" not in names
+            assert "type_text_direct" not in names
+            assert "close_current_tab" not in names
+
+
+class TestOverrides:
+    def test_click_desktop_gains_modifier(self) -> None:
+        desktop = tool_by_name(tool_definitions_for_platform("desktop"), "click")
+        chrome = tool_by_name(tool_definitions_for_platform("chrome"), "click")
+        assert desktop is not None and chrome is not None
+        assert "modifier" in desktop.parameters["properties"]
+        assert "modifier" not in chrome.parameters["properties"]
+
+    def test_press_key_desktop_gains_duration(self) -> None:
+        desktop = tool_by_name(tool_definitions_for_platform("desktop"), "press_key")
+        android = tool_by_name(tool_definitions_for_platform("android"), "press_key")
+        assert desktop is not None and android is not None
+        assert "duration_seconds" in desktop.parameters["properties"]
+        assert "duration_seconds" not in android.parameters["properties"]
+
+    def test_done_chrome_result_override(self) -> None:
+        chrome = tool_by_name(tool_definitions_for_platform("chrome"), "done")
+        android = tool_by_name(tool_definitions_for_platform("android"), "done")
+        assert chrome is not None and android is not None
+        # Platform variance lives in the result property description, not the
+        # tool description (which stays purely "when to call").
+        assert chrome.description == android.description
+        chrome_result = chrome.parameters["properties"]["result"]["description"]
+        android_result = android.parameters["properties"]["result"]["description"]
+        assert "extract the required information from the screenshot" in chrome_result
+        assert "extract the required information from the screenshot" not in android_result
+        assert "Parameters:" not in chrome.description
+
+    def test_resolve_helpers(self) -> None:
+        p = ToolPromptDef(
+            desc="default",
+            schema={"properties": {"a": prop("string", "x")}},
+            overrides={"chrome": ToolPromptOverride(desc="chrome desc")},
+        )
+        assert resolve_desc(p, "chrome") == "chrome desc"
+        assert resolve_desc(p, "android") == "default"
+        # Schema override absent -> default schema even when desc overridden.
+        assert resolve_schema(p, "chrome") == p.schema
+        assert available_for_platform(p, "anything")
+        p2 = ToolPromptDef(platforms=["ios"])
+        assert available_for_platform(p2, "ios")
+        assert not available_for_platform(p2, "android")
+
+
+class TestPointFields:
+    def test_locate_replaced_by_required_points(self) -> None:
+        click = tool_by_name(tool_definitions_for_platform("chrome"), "click")
+        assert click is not None
+        props = click.parameters["properties"]
+        assert "locate" not in props
+        assert "point_x" in props and "point_y" in props
+        required = click.parameters["required"]
+        assert "point_x" in required and "point_y" in required
+        assert "locate" not in required
+
+    def test_drag_gets_both_endpoint_pairs(self) -> None:
+        drag = tool_by_name(tool_definitions_for_platform("chrome"), "drag")
+        assert drag is not None
+        props = drag.parameters["properties"]
+        for f in ("start_point_x", "start_point_y", "end_point_x", "end_point_y"):
+            assert f in props
+        assert "start_locate" not in props and "end_locate" not in props
+        required = drag.parameters["required"]
+        for f in ("start_point_x", "start_point_y", "end_point_x", "end_point_y"):
+            assert f in required
+
+    def test_optional_locate_stays_optional(self) -> None:
+        # mouse_up's locate is optional: the points must appear but not be
+        # required, so the model can release in place.
+        mouse_up = tool_by_name(tool_definitions_for_platform("desktop"), "mouse_up")
+        assert mouse_up is not None
+        props = mouse_up.parameters["properties"]
+        assert "point_x" in props and "point_y" in props
+        required = mouse_up.parameters["required"]
+        assert "point_x" not in required and "point_y" not in required
+
+    def test_schema_without_properties_passthrough(self) -> None:
+        schema: dict[str, Any] = {}
+        assert with_point_fields(schema) is schema
+
+    def test_original_schema_not_mutated(self) -> None:
+        schema: dict[str, Any] = {
+            "properties": {"locate": prop("string", "d")},
+            "required": ["locate"],
+        }
+        with_point_fields(schema)
+        assert "locate" in schema["properties"]
+        assert schema["required"] == ["locate"]
+
+    def test_is_locate_field(self) -> None:
+        for locate, _, _ in LOCATE_POINT_FIELDS:
+            assert is_locate_field(locate)
+        assert not is_locate_field("point_x")
+
+
+class TestDurationUnits:
+    def test_model_facing_duration_params_carry_unit_suffix(self) -> None:
+        # wait/long_press expose duration_ms; the bare `duration` key exists
+        # only on the executor wire (session maps duration_ms -> duration).
+        wait = tool_by_name(tool_definitions_for_platform("chrome"), "wait")
+        long_press = tool_by_name(tool_definitions_for_platform("android"), "long_press")
+        assert wait is not None and long_press is not None
+        assert "duration_ms" in wait.parameters["properties"]
+        assert "duration_ms" in wait.parameters["required"]
+        assert "duration" not in wait.parameters["properties"]
+        assert "duration_ms" in long_press.parameters["properties"]
+        assert "duration" not in long_press.parameters["properties"]
+
+
+class TestMergeCommonFields:
+    def test_reason_injected_and_required(self) -> None:
+        merged = merge_common_fields({"properties": {"a": prop("string", "x")}, "required": ["a"]})
+        assert merged["type"] == "object"
+        assert "reason" in merged["properties"]
+        assert "a" in merged["properties"]
+        assert merged["required"] == ["a", "reason"]
+
+    def test_none_schema(self) -> None:
+        merged = merge_common_fields(None)
+        assert list(merged["properties"]) == ["reason"]
+        assert merged["required"] == ["reason"]
+
+    def test_reason_carries_language(self) -> None:
+        assert merge_common_fields(None, "zh")["properties"]["reason"]["description"].endswith(
+            "Respond in 中文"
+        )
+        assert merge_common_fields(None)["properties"]["reason"]["description"].endswith(
+            "Respond in the same language as the user's instruction"
+        )
+
+    def test_default_description_unchanged(self) -> None:
+        # The built-in tool list is part of the prompt-cache prefix and was
+        # tuned for language adherence; the rename option must not touch it.
+        assert merge_common_fields(None)["properties"]["reason"]["description"] == (
+            "In 1-2 short sentences: what changed in the UI since the last action, and why "
+            "this action. Decide on the action first; this must describe the action and "
+            "target you actually output, not exploratory analysis. "
+            "Respond in the same language as the user's instruction"
+        )
+
+    def test_renamed_reason_field(self) -> None:
+        own = prop("string", "the tool's own reason")
+        merged = merge_common_fields(
+            {"properties": {"reason": own}, "required": ["reason"]}, "zh", "step_reason"
+        )
+        assert list(merged["properties"]) == ["step_reason", "reason"]
+        assert merged["properties"]["reason"] == own
+        assert merged["required"] == ["reason", "step_reason"]
+        desc = merged["properties"]["step_reason"]["description"]
+        assert "separate from the tool's own `reason` parameter" in desc
+        assert desc.endswith("Respond in 中文")
+
+
+class TestResponseLanguage:
+    def test_known_tags_map_to_native_names(self) -> None:
+        assert response_language("zh") == "中文"
+        assert response_language("en") == "English"
+        assert response_language("ja") == "日本語"
+        assert response_language("ko") == "한국어"
+        assert response_language("de") == "Deutsch"
+        assert response_language("fr") == "Français"
+
+    def test_region_subtags(self) -> None:
+        assert response_language("zh-TW") == "繁體中文"
+        assert response_language("zh_HK") == "繁體中文"
+        assert response_language("zh-CN") == "中文"  # falls back to primary subtag
+        assert response_language("pt-BR") == "Português"
+
+    def test_empty_follows_instruction(self) -> None:
+        assert response_language("") == "the same language as the user's instruction"
+        assert response_language("   ") == "the same language as the user's instruction"
+
+    def test_unknown_values_pass_through(self) -> None:
+        assert response_language("tlh") == "tlh"
+        assert response_language("廣東話") == "廣東話"
+        assert response_language("formal German") == "formal German"
+
+    def test_pass_through_is_sanitized(self) -> None:
+        assert response_language("a\nb\tc") == "a b c"
+        assert len(response_language("x" * 100)) == 40
+
+    def test_every_llm_tool_has_reason(self) -> None:
+        for platform in ("chrome", "android", "ios", "desktop"):
+            for d in tool_definitions_for_platform(platform):
+                assert "reason" in d.parameters["properties"], d.name
+                assert "reason" in d.parameters["required"], d.name

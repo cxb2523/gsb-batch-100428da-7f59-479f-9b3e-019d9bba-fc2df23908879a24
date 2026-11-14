@@ -1,0 +1,452 @@
+"""LocalAISession: the multi-step ai() decision loop, one step per call.
+
+Token usage accumulates across ALL attempts of a step, including discarded
+re-decides — the user pays their own LLM bill, so under-reporting would lie
+to them.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from . import actions
+from .engine import LocalEngine
+from .history import History, default_history_config
+from .prompts import NORMALIZED_COORD_RULE
+from .providers.base import ErrorCategory, ProviderError
+from .providers.stats import StatsSnapshot
+from .coords import rescale_point
+from .types import (
+    Action,
+    ConversationTurn,
+    CustomToolDef,
+    DecisionInput,
+    DecisionResult,
+    ModelConfig,
+    TokenUsage,
+    UnparsableResponseError,
+)
+
+logger = logging.getLogger("qirabot.engine")
+
+# One initial decision plus at most one corrective re-decide — shared across
+# BOTH failure kinds (unparsable response and unusable coordinates); the two
+# together get a single retry, not one each.
+MAX_GROUNDING_ATTEMPTS = 2
+
+# Extra decide attempts a step gets when the model call times out, separate
+# from the grounding budget above. The transport deliberately never retries
+# a timeout (see providers.base.RETRYABLE_CATEGORIES) because in general a
+# second ask costs another full budget. An ai() step is the exception: the
+# step has not committed, so the session is untouched and re-asking is safe,
+# and the alternative is throwing away every step the run already made. On
+# an overloaded endpoint the second ask usually lands. QIRA_TIMEOUT_RETRIES
+# overrides it; 0 restores fail-on-first-timeout.
+DEFAULT_TIMEOUT_RETRIES = 1
+
+
+def resolve_timeout_retries(explicit: int | None = None) -> int:
+    """Timeout-retry budget: explicit value > QIRA_TIMEOUT_RETRIES > default.
+    Raises ValueError on a malformed or negative value rather than silently
+    running with a budget the user did not ask for."""
+    if explicit is not None:
+        n = explicit
+    else:
+        raw = os.environ.get("QIRA_TIMEOUT_RETRIES", "").strip()
+        if not raw:
+            return DEFAULT_TIMEOUT_RETRIES
+        try:
+            n = int(raw)
+        except ValueError:
+            raise ValueError(
+                f'invalid QIRA_TIMEOUT_RETRIES "{raw}"; expected a non-negative '
+                "integer (timeout retries)"
+            ) from None
+    if n < 0:
+        raise ValueError(f"invalid timeout retries {n}; expected a non-negative integer")
+    return n
+
+_UNPARSABLE_HINT = (
+    "Your previous response was empty or not a valid tool call. "
+    "Respond by calling exactly one of the provided tools."
+)
+
+
+class StepError(Exception):
+    """A step-level engine failure. ``usage`` carries the spend of every
+    decide attempt the step burned before failing — the SDK folds it into
+    its session totals even though no step committed."""
+
+    def __init__(self, message: str, usage: TokenUsage | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage if usage is not None else TokenUsage()
+
+
+@dataclass
+class StepOutcome:
+    """The engine-side result of one ai() step (pre-wire).
+
+    Carries no wall-clock duration: a step's time spans the screenshot
+    before it and the action and settle after it, all on the client's
+    side, so the client measures it."""
+
+    action_type: str = ""
+    params: dict[str, Any] = field(default_factory=dict)
+    decision: str = ""
+    output: str = ""
+    finished: bool = False
+    step_number: int = 0
+    model_used: str = ""
+    # Tier that served the committed decision ("standard"/"flex"/
+    # "priority"), "" when the endpoint gave no signal.
+    tier: str = ""
+    token_usage: TokenUsage = field(default_factory=TokenUsage)
+    coordinate_parse_ms: int = 0
+    # This step's share of the provider ledger (model time, capacity
+    # waits). AIRun.step fills it from two snapshots; the decision loop
+    # below never touches it.
+    stats: StatsSnapshot = field(default_factory=StatsSnapshot)
+
+
+class LocalAISession:
+    """State for one in-flight ai() command."""
+
+    def __init__(
+        self,
+        instruction: str,
+        platform: str,
+        language: str,
+        max_steps: int,
+        model_config: ModelConfig | None,
+        knowledge: str = "",
+        custom_tools: list[CustomToolDef] | None = None,
+        exclude_tools: list[str] | None = None,
+        annotate_for_model: bool = False,
+        timeout_retries: int | None = None,
+    ) -> None:
+        self.instruction = instruction
+        self.platform = platform
+        self.language = language
+        self.max_steps = max_steps
+        self.model_config = model_config
+        self.knowledge = knowledge
+        self.custom_tools = custom_tools or []
+        self.exclude_tools = exclude_tools or []
+        self.annotate_for_model = annotate_for_model
+        self.timeout_retries = resolve_timeout_retries(timeout_retries)
+        self.step_count = 0
+        self.notes: list[str] = []
+        self.history = History(default_history_config())
+        # Cached screenshots for history replay, capped at the history
+        # high-water mark (entries are batch-trimmed, so up to that many can
+        # be retained at once).
+        self.screenshots: list[bytes] = []
+        self._custom_names = {d.name for d in self.custom_tools}
+
+    def remember_screenshot(self, screenshot: bytes) -> None:
+        if not screenshot:
+            return
+        self.screenshots.append(screenshot)
+        # Cap at the history high-water mark so reverse alignment in
+        # attach_screenshots always has a screenshot for every retained entry.
+        window = self.history.high_water
+        if len(self.screenshots) > window:
+            self.screenshots = self.screenshots[-window:]
+
+    def step(
+        self,
+        engine: LocalEngine,
+        screenshot: bytes,
+        action_result: str,
+        device_width: int,
+        device_height: int,
+        is_first_step: bool,
+    ) -> StepOutcome:
+        """Run one decide→ground step. Mutates session state (step_count,
+        history, notes). Raises StepError for step-level failures."""
+        # Backfill the previous step's tool output with whatever the SDK
+        # reported (arrives with the NEXT request, not at execution time).
+        if not is_first_step and action_result:
+            self.history.backfill_last_tool_output(action_result)
+        self.history.attach_screenshots(self.screenshots)
+
+        hist_entries = self.history.entries()
+        hist_summary = self.history.summary()
+
+        usage = TokenUsage()
+        coord_ms = 0
+        correction_hint = ""
+        act: Action | None = None
+        result: DecisionResult | None = None
+        finished = False
+        is_save_note = False
+        raw_params_json = ""
+
+        attempt = 0
+        timeouts = 0
+        while True:
+            attempt += 1
+            try:
+                result = engine.decide(
+                    DecisionInput(
+                        instruction=self.instruction,
+                        knowledge=self.knowledge,
+                        platform=self.platform,
+                        language=self.language,
+                        current_screenshot=screenshot,
+                        history=hist_entries,
+                        is_first_step=is_first_step,
+                        notes=self.notes,
+                        summary=hist_summary,
+                        model_config=self.model_config,
+                        annotate_for_model=self.annotate_for_model,
+                        correction_hint=correction_hint,
+                        custom_tools=self.custom_tools,
+                        exclude_tools=self.exclude_tools,
+                    )
+                )
+            except ProviderError as exc:
+                # A timed-out decide produced no answer, so it does not use
+                # up the grounding budget: re-ask the identical request.
+                if exc.category != ErrorCategory.TIMEOUT or timeouts >= self.timeout_retries:
+                    raise
+                timeouts += 1
+                attempt -= 1
+                logger.warning(
+                    "decision timed out; re-asking (timeout retry %d/%d): %s",
+                    timeouts,
+                    self.timeout_retries,
+                    exc,
+                )
+                continue
+            except UnparsableResponseError as exc:
+                # The LLM call succeeded but the content was unusable —
+                # transient; re-decide once with corrective feedback, same
+                # budget as the grounding retry below.
+                partial = getattr(exc, "result", None)
+                if isinstance(partial, DecisionResult):
+                    usage.add(partial.token_usage)
+                if attempt < MAX_GROUNDING_ATTEMPTS:
+                    correction_hint = _UNPARSABLE_HINT
+                    logger.warning(
+                        "unparsable decision response; re-deciding (attempt %d): %s",
+                        attempt,
+                        exc,
+                    )
+                    continue
+                # `usage` holds every attempt's spend (same as the grounding
+                # path below).
+                raise StepError(str(exc), usage) from exc
+
+            usage.add(result.token_usage)
+            if result.action is None:
+                raise StepError("AI returned no action", usage)
+
+            act = result.action
+            finished = act.type == actions.DONE
+            is_save_note = act.type == actions.SAVE_NOTE
+
+            # History must replay the model's own normalized frame, captured
+            # before grounding rewrites params to device pixels.
+            raw_params_json = json.dumps(act.params, ensure_ascii=False)
+
+            coord_start = time.monotonic()
+            ground = _resolve_coordinates(
+                act,
+                device_width,
+                device_height,
+                finished=finished,
+                is_save_note=is_save_note,
+                is_custom=act.type in self._custom_names,
+            )
+            coord_ms += int((time.monotonic() - coord_start) * 1000)
+            if ground is None:
+                break
+            # Unusable inline coordinates (the discarded attempt's tokens are
+            # already in `usage` — deliberate deviation, see module docstring).
+            if attempt >= MAX_GROUNDING_ATTEMPTS:
+                msg = "inline grounding: model returned no usable coordinates"
+                if act.type == actions.DRAG:
+                    msg = "inline grounding: drag returned no usable coordinates"
+                raise StepError(msg, usage)
+            correction_hint = ground
+            logger.warning(
+                "inline grounding produced unusable coordinates; re-deciding "
+                "(attempt %d, action=%s)",
+                attempt,
+                act.type,
+            )
+
+        assert act is not None and result is not None
+
+        # The model-facing schema names the unit (duration_ms); the executor
+        # wire keeps the legacy `duration` (also ms) key that direct SDK
+        # callers share. History replays the model's frame (raw_params_json,
+        # captured above), so only the dispatched params are rewritten.
+        if act.type in (actions.WAIT, actions.LONG_PRESS) and "duration_ms" in act.params:
+            act.params["duration"] = act.params.pop("duration_ms")
+
+        # Accumulate note content after the loop, keyed on the committed
+        # action, so a re-decide can't double-append. Older notes fully
+        # contained in the new one are replaced, not kept — models sometimes
+        # re-save the whole accumulated list despite the prompts, and keeping
+        # every generation would grow Saved notes quadratically. Only the
+        # notes store is touched: history triads must keep replaying the
+        # save_note calls as the model actually made them (their bytes are
+        # also the provider cache prefix).
+        output = ""
+        if is_save_note:
+            content = act.params.get("content")
+            if isinstance(content, str) and content:
+                self.notes = [n for n in self.notes if not note_subsumed_by(n, content)]
+                self.notes.append(content)
+            output = "ok"
+
+        if finished:
+            r = act.params.get("result")
+            output = r if isinstance(r, str) else ""
+
+        self.step_count += 1
+        entry = ConversationTurn(
+            action_type=act.type,
+            action_params=raw_params_json,
+            reasoning=act.reasoning,
+        )
+        if is_save_note:
+            entry.tool_output = "ok"
+        self.history.add(entry)
+
+        return StepOutcome(
+            action_type=act.type,
+            params=act.params,
+            decision=act.reasoning,
+            output=output,
+            finished=finished,
+            step_number=self.step_count,
+            model_used=result.model_used,
+            tier=result.served_tier,
+            token_usage=usage,
+            coordinate_parse_ms=coord_ms,
+        )
+
+
+def note_subsumed_by(old: str, new: str) -> bool:
+    """True when the new note carries all of the old note's information, so
+    the old one can be dropped without loss (observed live: a model saving
+    [A] -> [A,B] -> pretty-printed [A..E] despite the do-not-resave rules).
+    Two deterministic checks, both lossless:
+
+    - JSON arrays: element containment on canonicalized elements — immune to
+      the compact-vs-pretty-printed reformatting models flip between, which
+      defeats any plain substring test (as do the brackets: "[{A}]" is not a
+      substring of "[{A}, {B}]").
+    - Anything else: whitespace-normalized substring containment.
+
+    Partial overlap keeps both notes — losing data is worse than repeating
+    some."""
+    old_items = _canonical_json_array(old)
+    new_items = _canonical_json_array(new)
+    if old_items is not None and new_items is not None:
+        return old_items <= new_items
+    return _strip_ws(old) in _strip_ws(new)
+
+
+def _canonical_json_array(content: str) -> set[str] | None:
+    """The content's top-level JSON array elements, each canonicalized
+    (sorted keys), or None when the content is not a JSON array."""
+    try:
+        data = json.loads(content)
+    except ValueError:
+        return None
+    if not isinstance(data, list):
+        return None
+    return {json.dumps(item, sort_keys=True, ensure_ascii=False) for item in data}
+
+
+def _strip_ws(s: str) -> str:
+    return "".join(s.split())
+
+
+def _resolve_coordinates(
+    act: Action,
+    dev_w: int,
+    dev_h: int,
+    finished: bool,
+    is_save_note: bool,
+    is_custom: bool,
+) -> str | None:
+    """Resolve target coordinates for a decided action, writing device pixels
+    onto act.params. Returns None when resolved (or nothing to resolve), or
+    the corrective hint string when the model must re-decide."""
+    # Custom tools execute client-side and their params are the tool's own
+    # arguments: a custom `locate` or `x` is not a screen target (which is
+    # why custom tools may use those names at all). Skip grounding outright.
+    if finished or is_save_note or is_custom or not act.params:
+        return None
+
+    if act.type == actions.DRAG:
+        # Drag carries two model-emitted points; resolve both endpoints into
+        # the start_/end_ coords the SDK dispatcher reads.
+        sx, sy, s_mode = rescale_point(
+            act.params.get("start_point_x"), act.params.get("start_point_y"), dev_w, dev_h
+        )
+        ex, ey, e_mode = rescale_point(
+            act.params.get("end_point_x"), act.params.get("end_point_y"), dev_w, dev_h
+        )
+        if not s_mode or not e_mode:
+            return (
+                "The coordinates from the previous drag are unusable (start={},{} end={},{}). "
+            "{}. Re-examine the screenshot and try again.".format(
+                    act.params.get("start_point_x"),
+                    act.params.get("start_point_y"),
+                    act.params.get("end_point_x"),
+                    act.params.get("end_point_y"),
+                    NORMALIZED_COORD_RULE,
+                )
+            )
+        if s_mode == "pixel" or e_mode == "pixel":
+            logger.warning("inline grounding salvaged raw pixel coordinates (drag)")
+        act.params["start_x"] = sx
+        act.params["start_y"] = sy
+        act.params["end_x"] = ex
+        act.params["end_y"] = ey
+        # Anchor the report crosshair at the drag's start point.
+        act.params["x"] = sx
+        act.params["y"] = sy
+        for k in ("start_point_x", "start_point_y", "end_point_x", "end_point_y"):
+            act.params.pop(k, None)
+        return None
+
+    locate = act.params.get("locate")
+    has_px = "point_x" in act.params
+    has_py = "point_y" in act.params
+    # A targeting action carries point fields. A partial point (one axis)
+    # goes through the retry path rather than silently dispatching without
+    # coordinates; a bare locate string (schema has no such field, but a
+    # hallucination can emit one) is treated the same way.
+    is_targeting = bool(locate) or has_px or has_py
+    if not is_targeting:
+        return None  # non-targeting action (scroll/wait/etc.)
+
+    x, y, mode = rescale_point(
+        act.params.get("point_x"), act.params.get("point_y"), dev_w, dev_h
+    )
+    if not mode:
+        return (
+            "The previously output point_x={}, point_y={} are unusable. "
+            "{}. Re-examine the screenshot and output point_x and point_y again.".format(
+                act.params.get("point_x"), act.params.get("point_y"), NORMALIZED_COORD_RULE
+            )
+        )
+    if mode == "pixel":
+        logger.warning("inline grounding salvaged raw pixel coordinates: %d,%d", x, y)
+    act.params["x"] = x
+    act.params["y"] = y
+    act.params.pop("point_x", None)
+    act.params.pop("point_y", None)
+    return None

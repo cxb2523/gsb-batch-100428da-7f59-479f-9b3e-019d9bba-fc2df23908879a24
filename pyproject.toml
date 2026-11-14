@@ -1,0 +1,139 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qirabot"
+version = "3.5.2"
+description = "AI vision-driven GUI automation across browsers, mobile, desktop, and games"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Qirabot Team", email = "support@qirabot.com" }
+]
+keywords = ["qirabot", "automation", "ai", "vision", "gui", "rpa", "cross-platform", "sdk", "testing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+dependencies = [
+    "httpx>=0.27.0",
+    "Pillow>=10.0",
+    "click>=8.1",
+    "rich>=13.0",
+    # ADC (service-account / gcloud / metadata-server) auth for the local
+    # decision engine's Vertex providers.
+    "google-auth>=2.30",
+    # google-auth's token-refresh transport imports `requests` at call time
+    # but only declares it as an optional extra — without this, isolated
+    # installs (uv tool) resolve ADC credentials and then fail the refresh.
+    "requests>=2.20",
+    # The progress overlay window, on by default in the CLI — macOS needs
+    # AppKit for it (Windows uses stdlib tkinter, other platforms no-op).
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+]
+
+[project.scripts]
+qirabot = "qirabot.cli.main:main"
+
+[project.urls]
+Homepage = "https://qirabot.com"
+Documentation = "https://qirabot.com/docs/"
+Repository = "https://github.com/qirabot/qirabot"
+Issues = "https://github.com/qirabot/qirabot/issues"
+
+[project.optional-dependencies]
+browser = ["playwright>=1.40,<2.0"]
+desktop = ["pyautogui>=0.9.54", "pyperclip>=1.8"]
+appium = ["Appium-Python-Client>=4.0"]
+agent = ["uvicorn>=0.30", "starlette>=0.37"]
+all = ["qirabot[browser,desktop,appium]"]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "mypy>=1.0.0",
+    # Pinned below 0.16: ruff 0.16.0 changed import-sorting and added rules
+    # (213 new findings). CI installs whatever this spec allows, so an open
+    # bound lets a new ruff release break the release gate overnight.
+    # Bump deliberately, migrating the codebase in the same change.
+    "ruff>=0.1.0,<0.16",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# The vendored ADBKeyboard IME (GPL-2.0, see ADBKEYBOARD_LICENSE.txt) that the
+# adb adapter installs on demand for non-ASCII text input.
+"qirabot.assets" = ["*.apk", "*.txt"]
+# Platform role prompts for the local decision engine, copied byte-for-byte
+# from the v2 server's internal/decision/prompts/*/standard.txt.
+"qirabot.engine" = ["prompt_data/*.txt"]
+# The bundled Agent Skill payload that `qirabot skill install` copies into an
+# agent's skills directory. Mirror of plugins/qirabot/skills/qirabot/ — edit
+# there and run scripts/sync_skill.py. The directory name is deliberately not
+# a Python identifier: templates/*.py run automation code at module top level
+# and must stay syntactically unimportable.
+"qirabot" = [
+    "skill-data/SKILL.md",
+    "skill-data/references/*.md",
+    "skill-data/scripts/*.py",
+    "skill-data/templates/*.py",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "playwright: Playwright browser tests",
+    "selenium: Selenium browser tests",
+    "desktop: Desktop pyautogui tests",
+    "appium: Appium mobile tests",
+]
+
+[tool.coverage.run]
+source = ["qirabot"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+# skill-data is a data payload, not source (and its dir name is not a valid
+# module name, which mypy would hard-error on).
+exclude = ['src/qirabot/skill-data/']
+
+# The lint job installs the browser extra so the Playwright adapter + client get
+# real type-checking. The other backends (desktop/mobile/selenium) stay out of
+# CI — their stubs are poor/untyped and would only add noise — so their lazily
+# imported modules are ignored here. AppKit (pyobjc, mac-only overlay helper)
+# is the same category.
+[[tool.mypy.overrides]]
+module = [
+    "selenium.*",
+    "appium.*",
+    "pyautogui",
+    "pyperclip",
+    "AppKit",
+    "google.auth.*",
+    "google.auth",
+]
+ignore_missing_imports = true
+
+# The overlay helper subclasses AppKit.NSObject, which resolves to Any on the
+# linux lint runner (no pyobjc stubs); the rest of the file stays strict.
+[[tool.mypy.overrides]]
+module = ["qirabot._overlay_helper"]
+disallow_subclassing_any = false
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+# skill-data mirrors plugins/qirabot/skills/qirabot/ byte-for-byte; a ruff
+# autofix here would drift it from the canonical copy.
+extend-exclude = ["src/qirabot/skill-data"]
