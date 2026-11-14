@@ -34,6 +34,46 @@ def sleep_with_stop(sec, stop_event):
             return
         time.sleep(min(0.05, end - time.time()))
 
+def anchor_problem_reason(ev, json_path):
+    """Explain why a click has no usable anchor, or return ``None`` if it has one."""
+    anchor = ev.get("anchor")
+    if anchor:
+        relpath = anchor.get("path") if isinstance(anchor, dict) else None
+        if not relpath:
+            return "anchor has no image path"
+        try:
+            apath = resolve_relative(json_path, relpath)
+        except Exception:
+            apath = relpath
+        if not os.path.exists(apath):
+            return f"anchor image missing: {apath}"
+        return None
+
+    err = ev.get("anchor_error")
+    if isinstance(err, dict):
+        code = err.get("code") or "unknown"
+        detail = err.get("detail")
+        return f"missing anchor ({code}: {detail})" if detail else f"missing anchor ({code})"
+    if err:
+        return f"missing anchor ({err})"
+    return "missing anchor (not captured)"
+
+
+def use_recorded_coords(replay_config, idx, reason, click_x, click_y):
+    """Apply the failsafe policy for a click whose anchor is unusable.
+
+    Returns ``(x, y)`` when the recorded coordinates should be used, or ``None``
+    when the step must be skipped.
+    """
+    if replay_config.fallback_to_absolute and click_x is not None and click_y is not None:
+        if replay_config.debug_match:
+            print(f"[run] {reason}; failsafe -> recorded (x,y)=({click_x},{click_y}) step={idx}")
+        return click_x, click_y
+    if replay_config.debug_match:
+        print(f"[run] {reason}; no failsafe, skipping step={idx}")
+    return None
+
+
 def install_esc_hotkey(stop_event: Event):
     from pynput import keyboard
     def on_press(key):
@@ -64,88 +104,103 @@ def run_events(
 
         click_x, click_y = ev.get("x"), ev.get("y")
 
-        if "anchor" in ev and ev["anchor"]:
-            anchor = ev["anchor"]
-            click_x, click_y = ev.get("x"), ev.get("y")
-            step_max_s = float(anchor.get("max_wait_s", replay_config.max_anchor_stubborn_s))
-            step_max_tries = int(anchor.get("max_tries", replay_config.max_anchor_tries))
+        if ev["type"] == "click":
+            problem = anchor_problem_reason(ev, json_path)
+            if problem is not None:
+                fallback = use_recorded_coords(replay_config, idx, problem, click_x, click_y)
+                if fallback is None:
+                    continue
+                click_x, click_y = fallback
+            else:
+                anchor = ev["anchor"]
+                step_max_s = float(anchor.get("max_wait_s", replay_config.max_anchor_stubborn_s))
+                step_max_tries = int(anchor.get("max_tries", replay_config.max_anchor_tries))
 
-            got_point_from_any = False
-            tlx = tly = w = h = None
+                got_point_from_any = False
+                tlx = tly = w = h = None
 
-            if vlm_config.enabled:
-                if replay_config.debug_match:
-                    print(f"[vlm] asking model for step={idx} …")
-                vlm_roi = None
-                if last_click_xy:
-                    L = vlm_config.roi_half_width
-                    cx, cy = last_click_xy
-                    sw, sh = screen_size()
-                    x1 = max(0, cx - L); y1 = max(0, cy - L)
-                    x2 = min(sw, cx + L); y2 = min(sh, cy + L)
-                    vlm_roi = (x1, y1, x2, y2)
-
-                anchor_path = resolve_relative(json_path, anchor.get("path", ""))
-                tmpl_bgr = imread_bgr(anchor_path)
-                screen_pil = grab_screen_pil()
-
-                vlm_xy = ask_vlm_for_click(
-                    screen_pil,
-                    Image.fromarray(cv2.cvtColor(tmpl_bgr, cv2.COLOR_BGR2RGB)),
-                    timeout=int(vlm_config.timeout_secs),
-                    roi=vlm_roi,
-                )
-                if vlm_xy is not None:
-                    vx, vy = vlm_xy
-                    screen_bgr = grab_screen_bgr()
-                    verified = mini_verify_match(
-                        screen_bgr,
-                        tmpl_bgr,
-                        (vx, vy),
-                        threshold=float(vlm_config.min_confidence),
-                        pad=int(vlm_config.verify_delta),
-                    )
-                    if verified:
-                        ox = int(anchor.get("ox", 0) or 0)
-                        oy = int(anchor.get("oy", 0) or 0)
-                        click_x, click_y = vx + ox, vy + oy
-                        got_point_from_any = True
-                        if replay_config.debug_match:
-                            print(f"[vlm] verified step={idx} -> ({click_x},{click_y})")
-                    elif replay_config.debug_match:
-                        print(f"[vlm] verification failed for step={idx}; falling back to OpenCV")
-
-            if not got_point_from_any:
-                start_t = time.time()
-                tries = 0
-                while not stop_event.is_set():
-                    tries += 1
-                    found = find_anchor(anchor, json_path, replay_config, last_xy=last_click_xy)
-                    if found is not None:
-                        tlx, tly, w, h = found
-                        ox = int(anchor.get("ox", 0) or 0)
-                        oy = int(anchor.get("oy", 0) or 0)
-                        click_x, click_y = tlx + ox, tly + oy
-                        got_point_from_any = True
-                        break
-
+                if vlm_config.enabled:
                     if replay_config.debug_match:
-                        print(f"[run] waiting for anchor… step={idx} try={tries}")
+                        print(f"[vlm] asking model for step={idx} …")
+                    vlm_roi = None
+                    if last_click_xy:
+                        L = vlm_config.roi_half_width
+                        cx, cy = last_click_xy
+                        sw, sh = screen_size()
+                        x1 = max(0, cx - L); y1 = max(0, cy - L)
+                        x2 = min(sw, cx + L); y2 = min(sh, cy + L)
+                        vlm_roi = (x1, y1, x2, y2)
 
-                    if (time.time() - start_t) >= step_max_s or tries >= step_max_tries:
+                    anchor_path = resolve_relative(json_path, anchor.get("path", ""))
+                    try:
+                        tmpl_bgr = imread_bgr(anchor_path)
+                    except Exception as exc:
+                        # A corrupt/unreadable image must not abort the whole run.
+                        tmpl_bgr = None
                         if replay_config.debug_match:
-                            print(f"[run] stubborn cap hit (t>={step_max_s}s or tries>={step_max_tries})")
-                        break
-                    time.sleep(replay_config.poll_sleep)
+                            print(f"[vlm] anchor image unreadable for step={idx} ({type(exc).__name__}: {exc}); "
+                                  f"falling back to OpenCV")
+
+                    if tmpl_bgr is not None:
+                        screen_pil = grab_screen_pil()
+
+                        vlm_xy = ask_vlm_for_click(
+                            screen_pil,
+                            Image.fromarray(cv2.cvtColor(tmpl_bgr, cv2.COLOR_BGR2RGB)),
+                            timeout=int(vlm_config.timeout_secs),
+                            roi=vlm_roi,
+                        )
+                        if vlm_xy is not None:
+                            vx, vy = vlm_xy
+                            screen_bgr = grab_screen_bgr()
+                            verified = mini_verify_match(
+                                screen_bgr,
+                                tmpl_bgr,
+                                (vx, vy),
+                                threshold=float(vlm_config.min_confidence),
+                                pad=int(vlm_config.verify_delta),
+                            )
+                            if verified:
+                                ox = int(anchor.get("ox", 0) or 0)
+                                oy = int(anchor.get("oy", 0) or 0)
+                                click_x, click_y = vx + ox, vy + oy
+                                got_point_from_any = True
+                                if replay_config.debug_match:
+                                    print(f"[vlm] verified step={idx} -> ({click_x},{click_y})")
+                            elif replay_config.debug_match:
+                                print(f"[vlm] verification failed for step={idx}; falling back to OpenCV")
 
                 if not got_point_from_any:
-                    if replay_config.fallback_to_absolute and (click_x is not None and click_y is not None):
+                    start_t = time.time()
+                    tries = 0
+                    while not stop_event.is_set():
+                        tries += 1
+                        found = find_anchor(anchor, json_path, replay_config, last_xy=last_click_xy)
+                        if found is not None:
+                            tlx, tly, w, h = found
+                            ox = int(anchor.get("ox", 0) or 0)
+                            oy = int(anchor.get("oy", 0) or 0)
+                            click_x, click_y = tlx + ox, tly + oy
+                            got_point_from_any = True
+                            break
+
                         if replay_config.debug_match:
-                            print(f"[run] FAILSAFE → recorded (x,y)=({click_x},{click_y})")
-                    else:
-                        if replay_config.debug_match:
-                            print("[run] anchor unresolved and no failsafe; skipping step")
-                        continue
+                            print(f"[run] waiting for anchor… step={idx} try={tries}")
+
+                        if (time.time() - start_t) >= step_max_s or tries >= step_max_tries:
+                            if replay_config.debug_match:
+                                print(f"[run] stubborn cap hit (t>={step_max_s}s or tries>={step_max_tries})")
+                            break
+                        time.sleep(replay_config.poll_sleep)
+
+                    if not got_point_from_any:
+                        if replay_config.fallback_to_absolute and (click_x is not None and click_y is not None):
+                            if replay_config.debug_match:
+                                print(f"[run] FAILSAFE → recorded (x,y)=({click_x},{click_y})")
+                        else:
+                            if replay_config.debug_match:
+                                print("[run] anchor unresolved and no failsafe; skipping step")
+                            continue
 
         delay = float(ev.get("delay", 0.0)) * random.uniform(float(slow_scale), float(fast_scale))
         if delay > 0:
