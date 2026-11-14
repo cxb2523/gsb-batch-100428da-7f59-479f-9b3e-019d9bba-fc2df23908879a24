@@ -48,15 +48,18 @@ def load_checkpoint() -> List[dict]:
         return None
 
 
-def save_progress_checkpoint(analyzed: List[dict], current_index: int, total: int):
-    """Save progress checkpoint"""
+def save_progress_checkpoint(analyzed: List[dict], errors: List[dict],
+                             current_index: int, total: int):
+    """Save progress checkpoint (analyzed results + failed sites + resume index)"""
     data = {
         'timestamp': datetime.now().isoformat(),
         'phase': 'analyzing_progress',
         'current_index': current_index,
         'total_sites': total,
         'analyzed_count': len(analyzed),
-        'analyzed': analyzed
+        'error_count': len(errors),
+        'analyzed': analyzed,
+        'errors': errors
     }
     with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -69,7 +72,8 @@ def load_progress_checkpoint():
     try:
         with open(PROGRESS_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        print(f"📂 Progress checkpoint loaded: {data.get('analyzed_count', 0)} analyzed")
+        print(f"📂 Progress checkpoint loaded: {data.get('analyzed_count', 0)} analyzed, "
+              f"{data.get('error_count', 0)} errors, resume at index {data.get('current_index', 0)}")
         return data
     except:
         return None
@@ -198,77 +202,123 @@ class Scanner:
         self.stats['discovered'] = len(sites)
         return sites
     
-    async def process(self, sites: List[dict], resume_from: int = 0) -> List[dict]:
-        """Phase 2 & 3: Crawl + Analyze"""
-        
+    async def process(self, sites: List[dict], resume_from: int = 0,
+                      prior_analyzed: List[dict] = None,
+                      prior_errors: List[dict] = None) -> List[dict]:
+        """Phase 2 & 3: Crawl + Analyze
+
+        - Only successfully crawled sites are sent to the analyzer, and each
+          analysis is matched back to its own site (no index drift).
+        - Failed sites are recorded in `errors` (identifiable per batch).
+        - After every batch the progress checkpoint is written to disk so an
+          interrupted run can resume from `current_index` without re-inserting
+          already-saved records.
+        """
+
         if not sites:
             return []
-        
+
         print(f"\n📍 PHASE 2 & 3: CRAWL + BATCH ANALYZE")
         print(f"📦 Batch size: {self.batch_size}")
+        if resume_from:
+            print(f"⏩ Resuming from index {resume_from} "
+                  f"({len(prior_analyzed or [])} already analyzed, "
+                  f"{len(prior_errors or [])} already failed)")
         print("-" * 60)
-        
+
         crawler = ImperialCrawler()
         await crawler.start()
-        
+
         analyzer = GeminiAnalyzer(batch_size=self.batch_size)
-        
-        all_analyzed = []
-        
+
+        # Carry over state from a previous (interrupted) run. These records
+        # were already inserted into the DB when their batch finished, so they
+        # are kept for the checkpoint/summary only - never re-inserted.
+        all_analyzed = list(prior_analyzed or [])
+        all_errors = list(prior_errors or [])
+
         # Process in batches
         for batch_start in range(resume_from, len(sites), self.batch_size):
             batch_end = min(batch_start + self.batch_size, len(sites))
             batch_sites = sites[batch_start:batch_end]
-            
+
             batch_num = (batch_start // self.batch_size) + 1
             total_batches = (len(sites) + self.batch_size - 1) // self.batch_size
-            
+
             print(f"\n📦 Batch {batch_num}/{total_batches} ({len(batch_sites)} sites)")
-            
-            # 1. Crawl
-            crawl_results = []
+
+            # 1. Crawl - keep (site, crawl_data) pairs so analysis results
+            #    always map back to the correct site
+            crawled_pairs = []  # List[Tuple[global_index, site, crawl_data]]
             for i, site in enumerate(batch_sites):
                 idx = batch_start + i + 1
                 domain = site.get('domain', '')[:30]
                 print(f"  [{idx}/{len(sites)}] {domain:30s} ", end="", flush=True)
-                
+
                 try:
                     crawl_data = await crawler.analyze(site['url'])
                     crawl_data['discovery'] = site
-                    crawl_results.append(crawl_data)
+                    crawled_pairs.append((batch_start + i, site, crawl_data))
                     self.stats['crawled'] += 1
-                    
+
                     providers = crawl_data.get('network', {}).get('providers_found', [])
                     print(f"✅{' 🎯 ' + str(providers) if providers else ''}")
-                    
+
                 except Exception as e:
                     print(f"❌ {type(e).__name__}")
                     self.stats['errors'] += 1
-            
-            # 2. Batch analyze
-            if crawl_results:
-                print(f"\n  🤖 Batch analyzing {len(crawl_results)} sites...")
+                    all_errors.append({
+                        'phase': 'crawl',
+                        'batch': batch_num,
+                        'index': batch_start + i,
+                        'url': site.get('url', ''),
+                        'domain': site.get('domain', ''),
+                        'error': f"{type(e).__name__}: {e}"
+                    })
+
+            # 2. Batch analyze - ONLY the successfully crawled sites
+            if crawled_pairs:
+                print(f"\n  🤖 Batch analyzing {len(crawled_pairs)} sites...")
+                crawl_results = [crawl_data for _, _, crawl_data in crawled_pairs]
                 batch_analyses = await analyzer.analyze_batch(crawl_results)
-                
-                # Process results
-                for analysis, site in zip(batch_analyses, batch_sites):
+
+                batch_analyzed = []
+                # Zip analyses with the crawled pairs (NOT the raw batch_sites)
+                # so discovered_via / category_hint never drift to a wrong site
+                for (site_index, site, crawl_data), analysis in zip(crawled_pairs, batch_analyses):
                     if analysis:
                         analysis['discovered_via'] = site.get('discovered_via', '')
                         if not analysis.get('category') or analysis['category'] == 'Other':
                             analysis['category'] = site.get('category_hint', 'Other')
-                        
-                        all_analyzed.append(analysis)
+
+                        batch_analyzed.append(analysis)
                         self.stats['analyzed'] += 1
-                
-                # Save batch
-                if all_analyzed:
-                    saved = self.db.batch_insert(all_analyzed)
+                    else:
+                        self.stats['errors'] += 1
+                        all_errors.append({
+                            'phase': 'analyze',
+                            'batch': batch_num,
+                            'index': site_index,
+                            'url': site.get('url', ''),
+                            'domain': site.get('domain', ''),
+                            'error': 'Analysis returned no result'
+                        })
+
+                # Save this batch's results immediately
+                if batch_analyzed:
+                    saved = self.db.batch_insert(batch_analyzed)
                     self.stats['saved'] += saved
                     print(f"  💾 Saved {saved} records")
-                    all_analyzed = []
-            
+                    all_analyzed.extend(batch_analyzed)
+
+            # 3. Persist progress after EVERY batch - resume continues from
+            #    batch_end, and already-saved records are not re-inserted
+            save_progress_checkpoint(all_analyzed, all_errors, batch_end, len(sites))
+            print(f"  💾 Progress checkpoint: index {batch_end}/{len(sites)} "
+                  f"({len(all_analyzed)} analyzed, {len(all_errors)} errors)")
+
             await asyncio.sleep(1)
-        
+
         await crawler.stop()
         return all_analyzed
     
@@ -289,9 +339,35 @@ class Scanner:
         if not sites:
             print("❌ No sites to process!")
             return
-        
+
+        # Resume progress (analyzed results + failed sites + next index)
+        resume_from = 0
+        prior_analyzed = []
+        prior_errors = []
+        if from_checkpoint:
+            progress = load_progress_checkpoint()
+            if progress:
+                if progress.get('total_sites') == len(sites):
+                    resume_from = progress.get('current_index', 0)
+                    prior_analyzed = progress.get('analyzed', [])
+                    prior_errors = progress.get('errors', [])
+                    # Already-saved records count toward the totals but are
+                    # NOT re-inserted into the database
+                    self.stats['analyzed'] += len(prior_analyzed)
+                    self.stats['saved'] += len(prior_analyzed)
+                    self.stats['errors'] += len(prior_errors)
+                else:
+                    print(f"⚠️  Progress checkpoint total ({progress.get('total_sites')}) "
+                          f"!= site list ({len(sites)}), starting from scratch")
+
+        if resume_from >= len(sites):
+            print("✅ All batches already completed in previous run - nothing to do")
+            return
+
         # Process
-        await self.process(sites)
+        await self.process(sites, resume_from=resume_from,
+                           prior_analyzed=prior_analyzed,
+                           prior_errors=prior_errors)
         
         # Summary
         duration = (datetime.now() - start_time).total_seconds()
