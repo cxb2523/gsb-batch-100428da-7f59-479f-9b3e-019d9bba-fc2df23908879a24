@@ -26,6 +26,34 @@ export interface NewsSource {
   favicon?: string;
 }
 
+export interface RegionSourceFailure {
+  sourceId: string;
+  error: string;
+}
+
+export interface RegionFetchStats {
+  /** Number of sources selected for this attempt (including failed ones). */
+  attemptedSources: number;
+  /** Sources that responded without throwing. */
+  successfulSources: number;
+  /** Sources that threw while fetching. */
+  failedSources: number;
+  /** Unique countries that contributed at least one article, in source selection order. */
+  coveredCountries: string[];
+  /** One entry per failed source; the rest of the region result is still returned. */
+  failures: RegionSourceFailure[];
+}
+
+export interface RegionFetchResult {
+  articles: NewsArticle[];
+  stats: RegionFetchStats;
+}
+
+export interface RegionNewsResult extends RegionFetchResult {
+  page: number;
+  limit: number;
+}
+
 export interface AggregatedStory {
   id: string;
   headline: string;

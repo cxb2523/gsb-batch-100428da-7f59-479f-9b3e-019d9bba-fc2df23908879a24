@@ -1,4 +1,10 @@
-import { AggregatedStory, NewsArticle, NewsFilters } from "@/types";
+import {
+  AggregatedStory,
+  NewsArticle,
+  NewsFilters,
+  RegionFetchResult,
+  RegionNewsResult,
+} from "@/types";
 import { globalCache, generateCacheKey } from "./cache";
 import { calculateSimilarity, estimateReadTime, extractKeywords, generateId } from "./utils";
 import { ALL_RSS_FEEDS, rssAggregator } from "./rss-aggregator";
@@ -6,6 +12,17 @@ import { isValidHttpUrl } from "./url-utils";
 
 const CACHE_TTL = 5 * 60 * 1000;
 const MAX_FEEDS = 60;
+
+/** Countries covered by the retained articles, in article order. */
+function coveredCountriesOf(articles: NewsArticle[]): string[] {
+  const countries: string[] = [];
+  for (const article of articles) {
+    if (!article.country) continue;
+    if (countries.includes(article.country)) continue;
+    countries.push(article.country);
+  }
+  return countries;
+}
 
 export function normalizeArticleUrl(url: string): string {
   try {
@@ -101,8 +118,19 @@ class NewsAggregator {
     return articles;
   }
 
-  async fetchRSSByRegion(regionId: string, limit = 50): Promise<NewsArticle[]> {
-    return cleanArticles(await rssAggregator.fetchByRegion(regionId, limit)).slice(0, limit);
+  async fetchRSSByRegion(regionId: string, limit = 50): Promise<RegionFetchResult> {
+    const regionResult = await rssAggregator.fetchByRegion(regionId, limit);
+    const articles = cleanArticles(regionResult.articles).slice(0, limit);
+
+    return {
+      articles,
+      // Recompute coverage after cleaning so the reported countries are the
+      // ones that actually made it into the returned list.
+      stats: {
+        ...regionResult.stats,
+        coveredCountries: coveredCountriesOf(articles),
+      },
+    };
   }
 
   async fetchRSSByCountry(countryCode: string, limit = 30): Promise<NewsArticle[]> {
@@ -202,9 +230,14 @@ class NewsAggregator {
     return paginate(articles, page, limit);
   }
 
-  async getNewsByRegion(regionId: string, page = 1, limit = 50): Promise<NewsArticle[]> {
-    const articles = await this.fetchRSSByRegion(regionId, Math.max(page * limit, limit));
-    return paginate(articles, page, limit);
+  async getNewsByRegion(regionId: string, page = 1, limit = 50): Promise<RegionNewsResult> {
+    const result = await this.fetchRSSByRegion(regionId, Math.max(page * limit, limit));
+    return {
+      articles: paginate(result.articles, page, limit),
+      stats: result.stats,
+      page,
+      limit,
+    };
   }
 
   private aggregateStories(articles: NewsArticle[]): AggregatedStory[] {

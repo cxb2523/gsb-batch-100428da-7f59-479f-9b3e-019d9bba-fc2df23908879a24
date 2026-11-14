@@ -1,5 +1,11 @@
 import Parser from "rss-parser";
-import { NewsArticle, NewsSource, RSSFeed } from "@/types";
+import {
+  NewsArticle,
+  NewsSource,
+  RSSFeed,
+  RegionFetchResult,
+  RegionSourceFailure,
+} from "@/types";
 import {
   extractKeywords,
   estimateReadTime,
@@ -4436,12 +4442,112 @@ export const ADDITIONAL_FEEDS: RSSFeed[] = [
 
 export const ALL_RSS_FEEDS = [...GLOBAL_RSS_FEEDS, ...ADDITIONAL_FEEDS];
 
+/**
+ * Country codes belonging to each region id. The order inside each list is not
+ * significant; feed selection groups by the order countries first appear in
+ * ALL_RSS_FEEDS so that results stay stable across runs.
+ */
+export const REGION_COUNTRY_CODES: Record<string, string[]> = {
+  asia: [
+    "jp", "cn", "in", "kr", "id", "th", "vn", "ph", "my", "sg", "bd", "pk",
+    "lk", "np", "mm", "mn", "tw", "hk", "kh", "la", "bt", "mv", "af",
+  ],
+  europe: [
+    "gb", "de", "fr", "it", "es", "nl", "be", "ch", "at", "se", "no", "dk",
+    "fi", "pl", "cz", "hu", "ro", "bg", "hr", "rs", "ua", "gr", "pt", "ie",
+    "ru", "by", "ee", "lv", "lt", "si", "ba", "mk", "al", "mt", "cy", "is",
+  ],
+  africa: [
+    "za", "ng", "eg", "ke", "et", "tz", "ug", "gh", "ma", "dz", "tn", "sn",
+    "ci", "cm", "zw", "zm", "bw", "na", "mz", "mg", "rw", "ss", "sd", "ly",
+  ],
+  "north-america": [
+    "us", "ca", "mx", "cu", "gt", "hn", "sv", "ni", "cr", "pa", "jm", "ht",
+    "do", "pr",
+  ],
+  "south-america": [
+    "br", "ar", "cl", "co", "pe", "ve", "ec", "bo", "py", "uy", "gy", "sr",
+    "gf",
+  ],
+  "middle-east": [
+    "sa", "ae", "qa", "kw", "bh", "om", "ye", "iq", "ir", "jo", "lb", "sy",
+    "il", "ps", "tr", "cy",
+  ],
+  oceania: [
+    "au", "nz", "pg", "fj", "sb", "vu", "nc", "pf", "ws", "to", "ki", "tv",
+    "nr",
+  ],
+};
+
+/** Number of sources attempted for a region request. */
+export const REGION_MAX_SOURCES = 20;
+
+/**
+ * Select region feeds with country round-robin coverage.
+ *
+ * Candidate feeds are grouped by country in first-appearance order. The first
+ * round takes the first feed of every country, the second round the second feed
+ * of every country, and so on until `maxSources` is reached. Compared with a
+ * plain `slice(0, maxSources)`, this guarantees that countries listed later in
+ * the feed table still get a slot. The algorithm is deterministic: no
+ * shuffling and no dependence on fetch timing.
+ */
+export function selectRegionFeeds(
+  regionId: string,
+  maxSources: number = REGION_MAX_SOURCES,
+  feeds: RSSFeed[] = ALL_RSS_FEEDS,
+): RSSFeed[] {
+  const countries = REGION_COUNTRY_CODES[regionId];
+  if (!countries || maxSources <= 0) return [];
+
+  const countrySet = new Set(countries);
+  const groups = new Map<string, RSSFeed[]>();
+
+  for (const feed of feeds) {
+    if (!countrySet.has(feed.source.country)) continue;
+    const group = groups.get(feed.source.country);
+    if (group) {
+      group.push(feed);
+    } else {
+      groups.set(feed.source.country, [feed]);
+    }
+  }
+
+  const countryOrder = [...groups.keys()];
+  const selected: RSSFeed[] = [];
+
+  for (let round = 0; selected.length < maxSources; round += 1) {
+    let pickedInRound = 0;
+
+    for (const country of countryOrder) {
+      if (selected.length >= maxSources) break;
+      const feed = groups.get(country)?.[round];
+      if (!feed) continue;
+      selected.push(feed);
+      pickedInRound += 1;
+    }
+
+    // Every country's queue is exhausted; nothing more to pick.
+    if (pickedInRound === 0) break;
+  }
+
+  return selected;
+}
+
 export class RSSAggregator {
   private feedCache = new Map<string, NewsArticle[]>();
   private readonly CACHE_TTL = 5 * 60 * 1000;
 
+  /**
+   * Fetch and parse a single feed. Throws on network/parse errors so callers
+   * can distinguish "no items" from "fetch failed"; use Promise.allSettled (or
+   * a try/catch) when one failing source must not break the whole response.
+   */
   async fetchFeed(feed: RSSFeed, limit: number = 10): Promise<NewsArticle[]> {
-    const cacheKey = `${feed.source.id}:${limit}`;
+    // Key by URL, not source id: several publishers share an id across the
+    // feed tables (e.g. "ktimes", "toi", "st"), and a shared key would serve
+    // another country's cached articles.
+    const cacheKey = `feed:${feed.url}:${limit}`;
     const cached = globalCache.get<NewsArticle[]>(cacheKey);
     if (cached) return cached;
 
@@ -4458,7 +4564,7 @@ export class RSSAggregator {
       return articles;
     } catch (error) {
       console.error(`RSS fetch error for ${feed.source.name}:`, error);
-      return [];
+      throw error;
     }
   }
 
@@ -4475,10 +4581,12 @@ export class RSSAggregator {
     const cached = globalCache.get<NewsArticle[]>(cacheKey);
     if (cached) return cached;
 
-    let feeds = ALL_RSS_FEEDS;
+    let feeds = [...ALL_RSS_FEEDS];
     if (category && category !== "general") {
       feeds = feeds.filter((f) => f.source.category === category);
     }
+    // Copy before shuffling: `sort` mutates, and ALL_RSS_FEEDS is shared with
+    // the region round-robin selection, whose order must stay stable.
     feeds = feeds.sort(() => Math.random() - 0.5).slice(0, maxFeeds);
 
     const allArticles: NewsArticle[] = [];
@@ -4515,197 +4623,100 @@ export class RSSAggregator {
     return unique;
   }
 
+  /**
+   * Fetch every source selected for a region.
+   *
+   * Source selection uses {@link selectRegionFeeds} (country round-robin), each
+   * source is fetched independently, and failures are reported in `stats`
+   * instead of aborting the batch. Results are sorted by publish time
+   * descending, de-duplicated by title, then truncated to `limit`.
+   *
+   * `candidateFeeds` is an optional injection point (used by tests and by
+   * callers that already resolved their own feed list); when provided, the
+   * response cache is bypassed so an injected list can never poison the cache.
+   */
   async fetchByRegion(
     regionId: string,
     limit: number = 30,
-  ): Promise<NewsArticle[]> {
+    candidateFeeds?: RSSFeed[],
+  ): Promise<RegionFetchResult> {
+    const useCache = candidateFeeds === undefined;
     const cacheKey = `region-rss:${regionId}:${limit}`;
-    const cached = globalCache.get<NewsArticle[]>(cacheKey);
-    if (cached) return cached;
+    if (useCache) {
+      const cached = globalCache.get<RegionFetchResult>(cacheKey);
+      if (cached) return cached;
+    }
 
-    const feeds = ALL_RSS_FEEDS.filter((f) => {
-      const regionMap: Record<string, string[]> = {
-        asia: [
-          "jp",
-          "cn",
-          "in",
-          "kr",
-          "id",
-          "th",
-          "vn",
-          "ph",
-          "my",
-          "sg",
-          "bd",
-          "pk",
-          "lk",
-          "np",
-          "mm",
-          "mn",
-          "tw",
-          "hk",
-          "kh",
-          "la",
-          "bt",
-          "mv",
-          "af",
-        ],
-        europe: [
-          "gb",
-          "de",
-          "fr",
-          "it",
-          "es",
-          "nl",
-          "be",
-          "ch",
-          "at",
-          "se",
-          "no",
-          "dk",
-          "fi",
-          "pl",
-          "cz",
-          "hu",
-          "ro",
-          "bg",
-          "hr",
-          "rs",
-          "ua",
-          "gr",
-          "pt",
-          "ie",
-          "ru",
-          "by",
-          "ee",
-          "lv",
-          "lt",
-          "si",
-          "ba",
-          "mk",
-          "al",
-          "mt",
-          "cy",
-          "is",
-        ],
-        africa: [
-          "za",
-          "ng",
-          "eg",
-          "ke",
-          "et",
-          "tz",
-          "ug",
-          "gh",
-          "ma",
-          "dz",
-          "tn",
-          "sn",
-          "ci",
-          "cm",
-          "zw",
-          "zm",
-          "bw",
-          "na",
-          "mz",
-          "mg",
-          "rw",
-          "ss",
-          "sd",
-          "ly",
-        ],
-        "north-america": [
-          "us",
-          "ca",
-          "mx",
-          "cu",
-          "gt",
-          "hn",
-          "sv",
-          "ni",
-          "cr",
-          "pa",
-          "jm",
-          "ht",
-          "do",
-          "pr",
-        ],
-        "south-america": [
-          "br",
-          "ar",
-          "cl",
-          "co",
-          "pe",
-          "ve",
-          "ec",
-          "bo",
-          "py",
-          "uy",
-          "gy",
-          "sr",
-          "gf",
-        ],
-        "middle-east": [
-          "sa",
-          "ae",
-          "qa",
-          "kw",
-          "bh",
-          "om",
-          "ye",
-          "iq",
-          "ir",
-          "jo",
-          "lb",
-          "sy",
-          "il",
-          "ps",
-          "tr",
-          "cy",
-        ],
-        oceania: [
-          "au",
-          "nz",
-          "pg",
-          "fj",
-          "sb",
-          "vu",
-          "nc",
-          "pf",
-          "ws",
-          "to",
-          "ki",
-          "tv",
-          "nr",
-        ],
-      };
-      return regionMap[regionId]?.includes(f.source.country);
-    });
-
+    const feeds = candidateFeeds ?? selectRegionFeeds(regionId);
+    const failures: RegionSourceFailure[] = [];
     const allArticles: NewsArticle[] = [];
+    let successfulSources = 0;
+
     const results = await Promise.allSettled(
-      feeds.slice(0, 20).map((feed) => this.fetchFeed(feed, 3)),
+      feeds.map((feed) => this.fetchFeed(feed, 3)),
     );
 
-    results.forEach((result) => {
+    results.forEach((result, index) => {
+      const feed = feeds[index];
       if (result.status === "fulfilled") {
+        successfulSources += 1;
         allArticles.push(...result.value);
+        return;
       }
+
+      const reason = result.reason;
+      failures.push({
+        sourceId: feed.source.id,
+        error:
+          reason instanceof Error
+            ? reason.message || reason.name
+            : String(reason ?? "Unknown error"),
+      });
     });
 
-    const unique = allArticles
+    const unique = this.sortAndDedupeArticles(allArticles).slice(0, limit);
+
+    // Countries that actually produced at least one retained article, in the
+    // order their feeds were selected (stable and reproducible).
+    const countriesWithContent = new Set(unique.map((article) => article.country));
+    const coveredCountries: string[] = [];
+    for (const feed of feeds) {
+      if (!countriesWithContent.has(feed.source.country)) continue;
+      if (coveredCountries.includes(feed.source.country)) continue;
+      coveredCountries.push(feed.source.country);
+    }
+
+    const result: RegionFetchResult = {
+      articles: unique,
+      stats: {
+        attemptedSources: feeds.length,
+        successfulSources,
+        failedSources: failures.length,
+        coveredCountries,
+        failures,
+      },
+    };
+
+    // Do not cache a total outage: every source failing is usually a passing
+    // network problem, and caching it would hide the retry for 5 minutes.
+    if (useCache && (feeds.length === 0 || successfulSources > 0)) {
+      globalCache.set(cacheKey, result, this.CACHE_TTL);
+    }
+
+    return result;
+  }
+
+  private sortAndDedupeArticles(articles: NewsArticle[]): NewsArticle[] {
+    return articles
       .sort(
         (a, b) =>
-          new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime(),
+          new Date(b.publishedAt).getTime() -
+          new Date(a.publishedAt).getTime(),
       )
       .filter(
         (article, idx, self) =>
           idx === self.findIndex((a) => a.title === article.title),
-      )
-      .slice(0, limit);
-
-    globalCache.set(cacheKey, unique, this.CACHE_TTL);
-    return unique;
+      );
   }
 
   private transformRSSItem(

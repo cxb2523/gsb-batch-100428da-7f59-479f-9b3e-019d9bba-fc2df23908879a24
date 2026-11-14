@@ -46,6 +46,12 @@ export default async function RegionPage({ params }: RegionPageProps) {
     getNewsByRegion(region, 1, 40),
   ]);
 
+  const articles = regionalNews.articles;
+  const { stats } = regionalNews;
+  const coverageLabel = stats.coveredCountries
+    .map((code) => COUNTRIES.find((c) => c.code === code)?.name || code.toUpperCase())
+    .join(", ");
+
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
       {/* Hero Header */}
@@ -97,7 +103,7 @@ export default async function RegionPage({ params }: RegionPageProps) {
                 </h2>
               </div>
               <NewsGrid
-                articles={regionalNews.slice(0, 12)}
+                articles={articles.slice(0, 12)}
                 variant="default"
                 columns={3}
                 showFeatured={true}
@@ -109,11 +115,20 @@ export default async function RegionPage({ params }: RegionPageProps) {
               <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-6">
                 More Headlines
               </h2>
-              <NewsGrid
-                articles={regionalNews.slice(12)}
-                variant="horizontal"
-                columns={1}
-              />
+              {articles.length > 12 ? (
+                <NewsGrid
+                  articles={articles.slice(12)}
+                  variant="horizontal"
+                  columns={1}
+                />
+              ) : null}
+              {articles.length === 0 && (
+                <p className="text-sm text-gray-500 dark:text-gray-400">
+                  {stats.failedSources > 0
+                    ? `No stories could be loaded right now: ${stats.failedSources} of ${stats.attemptedSources} sources failed.`
+                    : "No stories are available from the sources in this region right now."}
+                </p>
+              )}
             </section>
           </div>
 
@@ -159,15 +174,66 @@ export default async function RegionPage({ params }: RegionPageProps) {
                 <div className="flex justify-between">
                   <span className="text-white/80">News Sources</span>
                   <span className="font-semibold">
-                    {Math.floor(regionCountries.length * 2.5)}+
+                    {stats.successfulSources}/{stats.attemptedSources} online
                   </span>
                 </div>
                 <div className="flex justify-between">
-                  <span className="text-white/80">Languages</span>
-                  <span className="font-semibold">
-                    {Math.floor(regionCountries.length * 0.8)}+
+                  <span className="text-white/80">Failed Sources</span>
+                  <span className="font-semibold">{stats.failedSources}</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Fetch Coverage */}
+            <div className="bg-white dark:bg-gray-800 rounded-xl p-6 shadow">
+              <h3 className="font-bold text-gray-900 dark:text-white mb-4">
+                This Fetch
+              </h3>
+              <div className="space-y-2 text-sm">
+                <div className="flex justify-between">
+                  <span className="text-gray-500 dark:text-gray-400">Attempted</span>
+                  <span className="font-medium text-gray-900 dark:text-white">
+                    {stats.attemptedSources}
                   </span>
                 </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500 dark:text-gray-400">Succeeded</span>
+                  <span className="font-medium text-gray-900 dark:text-white">
+                    {stats.successfulSources}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-gray-500 dark:text-gray-400">Failed</span>
+                  <span className="font-medium text-gray-900 dark:text-white">
+                    {stats.failedSources}
+                  </span>
+                </div>
+                <div className="pt-2 border-t border-gray-100 dark:border-gray-700">
+                  <div className="text-gray-500 dark:text-gray-400 mb-1">
+                    Countries with stories ({stats.coveredCountries.length})
+                  </div>
+                  <p className="text-gray-900 dark:text-white break-words">
+                    {coverageLabel || "None"}
+                  </p>
+                </div>
+                {stats.failures.length > 0 && (
+                  <details className="pt-2 border-t border-gray-100 dark:border-gray-700">
+                    <summary className="cursor-pointer text-gray-500 dark:text-gray-400">
+                      Failed sources ({stats.failures.length})
+                    </summary>
+                    <ul className="mt-2 space-y-1">
+                      {stats.failures.map((failure) => (
+                        <li
+                          key={failure.sourceId}
+                          className="text-xs text-gray-600 dark:text-gray-300 break-words"
+                        >
+                          <span className="font-medium">{failure.sourceId}</span>:{" "}
+                          {failure.error}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
               </div>
             </div>
 
