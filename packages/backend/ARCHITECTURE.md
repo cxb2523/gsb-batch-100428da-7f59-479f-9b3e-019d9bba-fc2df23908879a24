@@ -63,6 +63,13 @@ API handlers call into services and stores, then send events to the frontend via
 
 Listens to `onInterceptResponse`. When a new host is seen and auto-crawl is enabled, starts a crawl via `CrawlerService.start()` (non-manual). Sends `job:created` and `crawl:started` so the frontend shows the job and logs. Respects “crawl in scope only” and skips static resources.
 
+Scheduling state is derived from real task state instead of a standalone set:
+
+- `pendingCrawls` maps a host to the in-flight `CrawlerService.start` promise. Concurrent interceptions of the same host await that same promise, so `start` is called at most once per host while a crawl is being started.
+- A host is considered "seen" while a crawl is pending, while it is explicitly suppressed (e.g. rejected by the HTTPQL filter), or while any job for it exists in `jobsStore`.
+- If `start` fails (rejected or `Error` result), or the job is deleted / all jobs are cleared, the host is no longer seen and the next matching interception starts a new crawl.
+- `clearSeenHosts()` only resets the in-memory suppression memory; in-flight crawls and persisted jobs are left untouched.
+
 ## Stores (`stores/`)
 
 | Store           | Purpose                         | Scope        | Interface     |
