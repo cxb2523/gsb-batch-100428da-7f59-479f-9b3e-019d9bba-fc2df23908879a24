@@ -30,7 +30,7 @@ MAX_ELEMENTS_PER_SAMPLE = 150
 
 
 def load_trace_files(dirs: list[Path]) -> list[tuple[Path, list[dict]]]:
-    """加载轨迹文件 → [(文件, [步, ...])]，过滤无法解析的行。"""
+    """加载轨迹文件 → [(文件, [步, ...])]，过滤无法解析的行与 meta/end 记录行。"""
     out = []
     for d in dirs:
         if not d.exists():
@@ -39,9 +39,14 @@ def load_trace_files(dirs: list[Path]) -> list[tuple[Path, list[dict]]]:
             steps = []
             for line in f.read_text(encoding="utf-8").splitlines():
                 try:
-                    steps.append(json.loads(line))
+                    rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                # 2026-11 起轨迹含任务级 meta/end 行（type 字段）；
+                # 旧文件没有 type，缺省按 step 处理
+                if rec.get("type", "step") != "step":
+                    continue
+                steps.append(rec)
             if steps:
                 out.append((f, steps))
     return out

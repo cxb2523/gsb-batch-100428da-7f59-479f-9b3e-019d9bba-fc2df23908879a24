@@ -129,12 +129,27 @@ class ExperienceStore:
 
 # ---- 结构化逐步轨迹（desktop-jev 阶段 0：SFT 原料采集） ----
 
+# 任务结束方式（end 行的 end_reason）：
+#   done        正常完成（VLM/Jev 输出 done）
+#   max_steps   达到最大步数仍未完成
+#   jev_blocked Jev 认输升级（BLOCKED，cascade protocol §4）
+#   interrupted 异常中断（观测/动作等抛出未捕获异常）——半截轨迹必须能和
+#               正常结束区分开，否则训练侧会把残轨当完整样本
+END_REASONS = ("done", "max_steps", "jev_blocked", "interrupted")
+
 
 class TraceRecorder:
-    """结构化逐步轨迹采集器。
+    """结构化逐步轨迹采集器：每次 run 产出一份可回放的任务记录。
 
-    每个任务一个 JSONL 文件（traces_full/{task_id}.jsonl），每步一行：
-    {goal, step_idx, foreground_title, elements, action, args, ok, detail, ts}
+    每个任务一个 JSONL 文件（traces_full/{task_id}.jsonl），按行顺序回放：
+      1. meta 行：{"type": "meta", task_id, goal, start_ts, start_time}
+      2. 每步一行：{"type": "step", goal, step_idx, foreground_title,
+                   elements, action, args, ok, detail, source, ts}
+      3. end 行：{"type": "end", end_reason, start_ts, end_ts, steps,
+                  wall_ms, write_failures, error}
+
+    2026-11 之前的旧格式没有 type 字段（每行都是步）；读取侧按
+    `rec.get("type", "step") == "step"` 过滤即可同时兼容新旧文件。
 
     与 ExperienceStore.record_trace 的区别：record_trace 只存任务级摘要
     （action+args+ok），供检索；这里存的是**每步的完整观测**（UIA 元素表），
@@ -147,13 +162,33 @@ class TraceRecorder:
         self.dir.mkdir(parents=True, exist_ok=True)
         self._path: Path | None = None
         self._goal: str = ""
+        self._task_id: str = ""
+        self._start_ts: float = 0.0
+
+    @property
+    def path(self) -> Path | None:
+        """当前任务的轨迹文件路径（start_task 前为 None）。"""
+        return self._path
 
     def start_task(self, goal: str) -> str:
-        """开始一个任务的采集，返回 task_id（时间戳 + goal 短哈希，文件名安全）。"""
+        """开始一个任务的采集：写 meta 行（此处即建文件，失败调用方可整体降级）。
+
+        返回 task_id（时间戳 + goal 短哈希，文件名安全）。
+        """
         digest = hashlib.sha1(goal.encode("utf-8")).hexdigest()[:8]
         task_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{digest}"
         self._path = self.dir / f"{task_id}.jsonl"
         self._goal = goal
+        self._task_id = task_id
+        self._start_ts = time.time()
+        self._write({
+            "type": "meta",
+            "task_id": task_id,
+            "goal": goal,
+            "start_ts": self._start_ts,
+            "start_time": time.strftime("%Y-%m-%d %H:%M:%S",
+                                        time.localtime(self._start_ts)),
+        })
         return task_id
 
     def record_step(self, step_idx: int, foreground_title: str,
@@ -164,9 +199,8 @@ class TraceRecorder:
         source 标注这一步的决策来源（vlm_trace = 大模型驾驶 / jev = 小模型快路径），
         训练侧据此分层报告指标（TRAINING §1：合成准确率再高也不算数）。
         """
-        if self._path is None:
-            raise RuntimeError("record_step 前请先 start_task")
         entry = {
+            "type": "step",
             "goal": self._goal,
             "step_idx": step_idx,
             "foreground_title": foreground_title,
@@ -178,5 +212,35 @@ class TraceRecorder:
             "source": source,
             "ts": time.time(),
         }
+        self._write(entry)
+
+    def finish_task(self, end_reason: str, steps: int, wall_ms: float = 0.0,
+                    write_failures: int = 0, error: str = "") -> None:
+        """写 end 行收尾：结束方式 + 起止时间 + 步数 + 采集期写入失败统计。
+
+        异常中断（end_reason="interrupted"）也必须调用——否则半截轨迹看起来
+        像正常结束。error 传中断异常的简述（正常结束传 ""）。
+        """
+        if end_reason not in END_REASONS:
+            raise ValueError(f"未知结束方式: {end_reason!r}（可选 {END_REASONS}）")
+        end_ts = time.time()
+        self._write({
+            "type": "end",
+            "task_id": self._task_id,
+            "goal": self._goal,
+            "end_reason": end_reason,
+            "start_ts": self._start_ts,
+            "end_ts": end_ts,
+            "end_time": time.strftime("%Y-%m-%d %H:%M:%S",
+                                      time.localtime(end_ts)),
+            "steps": steps,
+            "wall_ms": round(wall_ms, 1),
+            "write_failures": write_failures,
+            "error": error,
+        })
+
+    def _write(self, entry: dict) -> None:
+        if self._path is None:
+            raise RuntimeError("record_step 前请先 start_task")
         with open(self._path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")

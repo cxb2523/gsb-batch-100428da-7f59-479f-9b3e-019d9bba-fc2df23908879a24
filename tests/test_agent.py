@@ -330,8 +330,18 @@ def test_vlm_max_size_default():
 import json as _json
 
 
+def _read_trace(tmp_path):
+    """读本次 run 唯一的轨迹文件 → (meta, steps, end)，按行顺序回放。"""
+    files = list((tmp_path / "mem" / "traces_full").glob("*.jsonl"))
+    assert len(files) == 1
+    lines = [_json.loads(l) for l in files[0].read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["type"] == "meta" and lines[-1]["type"] == "end"
+    steps = [l for l in lines if l["type"] == "step"]
+    return lines[0], steps, lines[-1]
+
+
 def test_loop_records_full_trace(tmp_path):
-    """run 每步落盘一条结构化轨迹（含元素表与决策），done 步也记录。"""
+    """正常完成：轨迹可按顺序回放（meta→步→end），元素表与决策和 TaskResult 一致。"""
     from screen_use.memory import ExperienceStore
 
     provider = ScriptProvider([
@@ -346,17 +356,29 @@ def test_loop_records_full_trace(tmp_path):
         result = VisualLoop(tools, max_steps=5, memory=memory).run("点一下1号按钮")
     assert result.done is True
 
-    files = list((tmp_path / "mem" / "traces_full").glob("*.jsonl"))
-    assert len(files) == 1
-    steps = [_json.loads(l) for l in files[0].read_text(encoding="utf-8").splitlines()]
-    assert [s["action"] for s in steps] == ["click_id", "done"]
-    assert steps[0]["elements"] == FAKE_SHOT["elements"]
-    assert steps[0]["goal"] == "点一下1号按钮"
-    assert steps[0]["args"] == {"id": 1} and steps[0]["ok"] is True
+    meta, steps, end = _read_trace(tmp_path)
+    # meta：任务目标 + 开始时间
+    assert meta["goal"] == "点一下1号按钮" and meta["start_ts"] > 0
+    # 逐步：与 TaskResult.steps 一一对应（动作/参数/成败/元素表）
+    assert len(steps) == len(result.steps) == 2
+    for rec, step in zip(steps, result.steps):
+        assert rec["step_idx"] == step.index
+        assert rec["action"] == step.action and rec["args"] == step.args
+        assert rec["ok"] == step.ok
+        assert rec["elements"] == FAKE_SHOT["elements"]
+        assert rec["goal"] == "点一下1号按钮"
+    # end：结束方式 done + 起止时间
+    assert end["end_reason"] == "done"
+    assert end["steps"] == 2 and end["end_ts"] >= meta["start_ts"]
+    # 指标里的采集可观察性标记
+    assert result.metrics["trace_status"] == "active"
+    assert result.metrics["trace_write_failures"] == 0
+    assert result.metrics["end_reason"] == "done"
+    assert result.metrics["trace_path"].endswith(".jsonl")
 
 
 def test_loop_record_full_trace_disabled(tmp_path):
-    """record_full_trace=False 时不产生 traces_full 目录。"""
+    """record_full_trace=False 时不产生 traces_full 目录，指标里留下未采集标记。"""
     from screen_use.memory import ExperienceStore
 
     provider = ScriptProvider(['{"action": "done", "result": "ok"}'])
@@ -369,11 +391,107 @@ def test_loop_record_full_trace_disabled(tmp_path):
         result = VisualLoop(tools, max_steps=2, memory=memory).run("关闭采集")
     assert result.done is True
     assert not (tmp_path / "mem" / "traces_full").exists()
+    assert result.metrics["trace_status"] == "disabled"
+    assert result.metrics["trace_path"] == ""
 
 
 def test_record_full_trace_default():
     """record_full_trace 默认开启（不读 .env，隔离用户本机配置）。"""
     assert Settings(_env_file=None).record_full_trace is True
+
+
+def test_trace_end_reason_max_steps(tmp_path):
+    """达到最大步数：end 行与指标都记 max_steps，已执行的步完整保留。"""
+    from screen_use.memory import ExperienceStore
+
+    provider = ScriptProvider(['{"action": "wait", "seconds": 0}'])
+    tools = _loop_tools(provider)
+    memory = ExperienceStore(tmp_path / "mem")
+    with patch.object(ScreenUse, "screenshot", return_value=FAKE_SHOT), \
+         patch("screen_use.agent.time.sleep"):
+        result = VisualLoop(tools, max_steps=3, memory=memory).run("永远完不成")
+    assert result.done is False
+
+    meta, steps, end = _read_trace(tmp_path)
+    assert [s["action"] for s in steps] == ["wait"] * 3
+    assert end["end_reason"] == "max_steps" and end["steps"] == 3
+    assert result.metrics["end_reason"] == "max_steps"
+
+
+def test_trace_write_failure_counted(tmp_path):
+    """单步写入抛 OSError：任务照常完成，失败计数与原因摘要进指标和 end 行。"""
+    from screen_use.memory import ExperienceStore, TraceRecorder
+
+    provider = ScriptProvider([
+        '{"action": "wait", "seconds": 0}',
+        '{"action": "done", "result": "写盘失败也完成"}',
+    ])
+    tools = _loop_tools(provider)
+    memory = ExperienceStore(tmp_path / "mem")
+    with patch.object(ScreenUse, "screenshot", return_value=FAKE_SHOT), \
+         patch("screen_use.agent.time.sleep"), \
+         patch.object(TraceRecorder, "record_step",
+                      side_effect=OSError("磁盘已满")):
+        result = VisualLoop(tools, max_steps=5, memory=memory).run("写盘失败")
+
+    assert result.done is True and result.result == "写盘失败也完成"
+    assert result.metrics["trace_write_failures"] == 2  # 两步都写失败
+    assert "磁盘已满" in result.metrics["trace_write_error"]
+    assert result.metrics["trace_status"] == "active"
+    # end 行（finish_task 未被 patch）如实带上失败统计
+    _, steps, end = _read_trace(tmp_path)
+    assert steps == []  # 一步都没落盘成功
+    assert end["end_reason"] == "done" and end["write_failures"] == 2
+
+
+def test_trace_file_creation_failure_degrades(tmp_path):
+    """整个轨迹文件建不了（start_task 抛 OSError）→ 退化为不采集并留标记。"""
+    from screen_use.memory import ExperienceStore, TraceRecorder
+
+    provider = ScriptProvider(['{"action": "done", "result": "ok"}'])
+    tools = _loop_tools(provider)
+    memory = ExperienceStore(tmp_path / "mem")
+    with patch.object(ScreenUse, "screenshot", return_value=FAKE_SHOT), \
+         patch("screen_use.agent.time.sleep"), \
+         patch.object(TraceRecorder, "start_task",
+                      side_effect=OSError("只读文件系统")):
+        result = VisualLoop(tools, max_steps=2, memory=memory).run("建不了文件")
+
+    assert result.done is True
+    assert result.metrics["trace_status"] == "degraded"
+    assert "只读文件系统" in result.metrics["trace_write_error"]
+    assert result.metrics["trace_path"] == ""
+    assert not list((tmp_path / "mem" / "traces_full").glob("*.jsonl"))
+
+
+def test_trace_interrupted_flushes_steps(tmp_path):
+    """中途未捕获异常（观测爆炸）：已执行的步已落盘，end 行记 interrupted。"""
+    from screen_use.memory import ExperienceStore
+
+    provider = ScriptProvider([
+        '{"action": "wait", "seconds": 0}',
+        '{"action": "done", "result": "走不到"}',
+    ])
+    tools = _loop_tools(provider)
+    memory = ExperienceStore(tmp_path / "mem")
+    shots = iter([FAKE_SHOT, RuntimeError("观测爆炸")])
+
+    def flaky_screenshot(*_args, **_kwargs):
+        shot = next(shots)
+        if isinstance(shot, Exception):
+            raise shot
+        return shot
+
+    with patch.object(ScreenUse, "screenshot", flaky_screenshot), \
+         patch("screen_use.agent.time.sleep"):
+        with pytest.raises(RuntimeError, match="观测爆炸"):
+            VisualLoop(tools, max_steps=5, memory=memory).run("会中断的任务")
+
+    meta, steps, end = _read_trace(tmp_path)
+    assert [s["action"] for s in steps] == ["wait"]  # 第一步完整落盘
+    assert end["end_reason"] == "interrupted"
+    assert "观测爆炸" in end["error"]
+    assert end["steps"] == 1
 
 
 # ---- Jev 快路径（desktop-jev 阶段 4 接入，cascade protocol 中环） ----
@@ -601,3 +719,24 @@ def test_fast_path_does_not_reuse_across_steps(mock_uia):
     assert result.done is True
     assert len(jev.calls) == 2
     assert "enum_reuse" not in result.metrics
+
+
+def test_trace_end_reason_jev_blocked(mock_uia, tmp_path):
+    """Jev 认输升级：轨迹 end 行与指标都记 jev_blocked，blocked 步落盘。"""
+    from screen_use.memory import ExperienceStore
+
+    provider = ScriptProvider(["不该被调用"])
+    tools = _loop_tools(provider)
+    jev = FakeJev([{"action": "BLOCKED", "confidence": 0.99}])
+    memory = ExperienceStore(tmp_path / "mem")
+    with patch.object(ScreenUse, "screenshot", _no_screenshot), \
+         patch("screen_use.agent.time.sleep"):
+        result = VisualLoop(tools, max_steps=3, memory=memory, jev=jev).run(
+            "点击不存在的按钮")
+
+    assert result.escalated is True
+    assert result.metrics["end_reason"] == "jev_blocked"
+    meta, steps, end = _read_trace(tmp_path)
+    assert [s["action"] for s in steps] == ["blocked"]
+    assert steps[0]["source"] == "jev"
+    assert end["end_reason"] == "jev_blocked" and end["steps"] == 1

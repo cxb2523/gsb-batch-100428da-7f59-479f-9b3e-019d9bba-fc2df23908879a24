@@ -83,6 +83,13 @@ def _new_metrics() -> dict:
         "vlm_calls": 0, "screenshot_calls": 0,
         "jev_ms": 0.0, "vlm_ms": 0.0, "observe_ms": 0.0, "act_ms": 0.0,
         "ring": "none",
+        # 任务结束方式：done / max_steps / jev_blocked / interrupted
+        "end_reason": "",
+        # 轨迹采集可观察性（record_full_trace 链路）：
+        #   trace_status: active=正常采集 / disabled=配置关闭 / degraded=文件创建失败退化
+        "trace_status": "", "trace_path": "",
+        "trace_write_failures": 0,  # 单步落盘失败计数（失败不影响任务执行）
+        "trace_write_error": "",    # 失败原因摘要（首条错误；结束行失败也记这里）
     }
 
 
@@ -245,11 +252,21 @@ class VisualLoop:
         if self.tools.settings.record_full_trace:
             try:
                 recorder = TraceRecorder(self.memory.home)
-                recorder.start_task(goal)
-            except OSError:
+                recorder.start_task(goal)  # meta 行在此落盘，文件即创建
+                metrics["trace_status"] = "active"
+                metrics["trace_path"] = str(recorder.path)
+            except OSError as e:
+                # 整个轨迹文件都建不了 → 退化为不采集，指标里留可观察标记
                 recorder = None
+                metrics["trace_status"] = "degraded"
+                metrics["trace_write_error"] = f"轨迹文件创建失败: {e}"
+        else:
+            # 关闭采集：不建 traces_full 目录，但指标里必须看得出本次未采集
+            metrics["trace_status"] = "disabled"
 
         t_start = time.perf_counter()
+        end_reason = "max_steps"
+        interrupt: BaseException | None = None
         try:
             for i in range(1, self.max_steps + 1):
                 # ---- observe：Jev 快路径只要元素表（零截图/零编码），否则照旧截图 ----
@@ -272,12 +289,13 @@ class VisualLoop:
                                     ok=True, detail="Jev 认输（BLOCKED）", ring="jev")
                         result.steps.append(step)
                         metrics["jev_steps"] += 1
-                        self._trace(recorder, step, shot)
+                        self._trace(recorder, step, shot, metrics)
                         if on_step:
                             on_step(step)
                         result.escalated = True
                         result.escalation_reason = "blocked_action"
                         result.result = "Jev 判定目标不可达（BLOCKED）"
+                        end_reason = "jev_blocked"
                         self._record(result)
                         return result
                     decision = (jev_bridge.to_action(jev_decision)
@@ -314,7 +332,7 @@ class VisualLoop:
                                     args={}, ok=False, detail=str(e))
                         result.steps.append(step)
                         history.append(f"第{i}步: 决策失败 -> {e}")
-                        self._trace(recorder, step, shot)
+                        self._trace(recorder, step, shot, metrics)
                         if on_step:
                             on_step(step)
                         time.sleep(self.step_delay)
@@ -340,9 +358,10 @@ class VisualLoop:
                         result.result = str(decision.get("result", "完成"))
                         result.steps.append(step)
                         metrics["steps"] = len(result.steps)
-                        self._trace(recorder, step, shot)
+                        self._trace(recorder, step, shot, metrics)
                         if on_step:
                             on_step(step)
+                        end_reason = "done"
                         self._record(result)
                         return result
 
@@ -363,7 +382,7 @@ class VisualLoop:
                     jev_history.append(
                         jev_bridge.history_entry(step.action, step.args, step.ok)
                     )
-                    self._trace(recorder, step, shot)
+                    self._trace(recorder, step, shot, metrics)
                     if on_step:
                         on_step(step)
                     if not step.ok:
@@ -390,11 +409,19 @@ class VisualLoop:
                     history.append(f"[反思·{stuck_type.value}] {reflection}")
 
                 time.sleep(self.step_delay)
+        except BaseException as e:
+            # 观测/动作等未捕获异常 → 异常中断：已完成的步已逐步落盘，
+            # finally 里补写 end 行（interrupted），半截轨迹不会看起来像正常结束
+            end_reason = "interrupted"
+            interrupt = e
+            raise
         finally:
             metrics["wall_ms"] = (time.perf_counter() - t_start) * 1000
             metrics["ring"] = ("hybrid" if metrics["jev_steps"] and metrics["vlm_steps"]
                                else "jev" if metrics["jev_steps"]
                                else "vlm" if metrics["vlm_steps"] else "none")
+            metrics["end_reason"] = end_reason
+            self._finish_trace(recorder, result, metrics, interrupt)
             self._metrics = None
 
         self._record(result)
@@ -468,8 +495,13 @@ class VisualLoop:
         return ("\n【快路径提示】" + "，".join(bits)
                 + "。请独立判断，不要盲从；若你也认为无法完成，请输出 done 说明原因。")
 
-    def _trace(self, recorder: TraceRecorder | None, step: Step, shot: dict) -> None:
-        """desktop-jev 阶段 0：落盘一步「元素表 + 决策 + 结果」（写入失败不影响任务）。"""
+    def _trace(self, recorder: TraceRecorder | None, step: Step, shot: dict,
+               metrics: dict | None = None) -> None:
+        """desktop-jev 阶段 0：落盘一步「元素表 + 决策 + 结果」。
+
+        写入失败不影响任务执行，但必须可核对：计数并在指标里留原因摘要，
+        事后能区分「没采到」与「写了没写成功」。
+        """
         if recorder is None:
             return
         try:
@@ -478,8 +510,32 @@ class VisualLoop:
                 shot.get("elements", []), step.action, step.args, step.ok, step.detail,
                 source="jev" if step.ring == "jev" else "vlm_trace",
             )
-        except OSError:
-            pass
+        except OSError as e:
+            if metrics is not None:
+                metrics["trace_write_failures"] += 1
+                if not metrics["trace_write_error"]:
+                    metrics["trace_write_error"] = f"{type(e).__name__}: {e}"
+
+    def _finish_trace(self, recorder: TraceRecorder | None, result: TaskResult,
+                      metrics: dict, interrupt: BaseException | None = None) -> None:
+        """任务结束（含异常中断）补写 end 行：结束方式 + 起止时间 + 写入失败统计。"""
+        if recorder is None:
+            return
+        try:
+            recorder.finish_task(
+                metrics["end_reason"], steps=len(result.steps),
+                wall_ms=metrics["wall_ms"],
+                write_failures=metrics["trace_write_failures"],
+                error=(f"{type(interrupt).__name__}: {interrupt}"
+                       if interrupt else ""),
+            )
+        except OSError as e:
+            # end 行写不进也要在指标里可见（不计入单步失败数，摘要里说明）
+            note = f"结束行写入失败: {e}"
+            metrics["trace_write_error"] = (
+                f"{metrics['trace_write_error']}; {note}"
+                if metrics["trace_write_error"] else note
+            )
 
     def _record(self, result: TaskResult) -> None:
         """元学习：任务结束记录轨迹（写入失败不影响任务结果）。"""

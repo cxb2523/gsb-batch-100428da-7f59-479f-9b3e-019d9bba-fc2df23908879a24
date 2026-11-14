@@ -71,7 +71,7 @@ from screen_use.memory import TraceRecorder
 
 
 def test_trace_recorder_round_trip(tmp_path):
-    """落盘一步后可读回：goal/元素表/决策/结果完整，JSON 可序列化往返。"""
+    """落盘后可按行顺序回放：meta → 逐步（goal/元素表/决策/结果完整）→ end。"""
     rec = TraceRecorder(tmp_path / "mem")
     task_id = rec.start_task("在计算器算 78*9")
     elements = [
@@ -80,11 +80,18 @@ def test_trace_recorder_round_trip(tmp_path):
     ]
     rec.record_step(1, "计算器", elements, "click_id", {"id": 34}, True, "点击元素 #34")
     rec.record_step(2, "计算器", elements, "done", {"result": "ok"}, True)
+    rec.finish_task("done", steps=2, wall_ms=123.4)
 
     path = tmp_path / "mem" / "traces_full" / f"{task_id}.jsonl"
-    lines = path.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 2
-    first = json.loads(lines[0])
+    lines = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()]
+    assert [l["type"] for l in lines] == ["meta", "step", "step", "end"]
+
+    meta = lines[0]
+    assert meta["goal"] == "在计算器算 78*9"
+    assert meta["task_id"] == task_id
+    assert meta["start_ts"] > 0 and meta["start_time"]
+
+    first = lines[1]
     assert first["goal"] == "在计算器算 78*9"
     assert first["step_idx"] == 1
     assert first["foreground_title"] == "计算器"
@@ -92,6 +99,34 @@ def test_trace_recorder_round_trip(tmp_path):
     assert first["action"] == "click_id" and first["args"] == {"id": 34}
     assert first["ok"] is True and first["detail"] == "点击元素 #34"
     assert "ts" in first
+
+    end = lines[-1]
+    assert end["end_reason"] == "done"
+    assert end["steps"] == 2 and end["wall_ms"] == 123.4
+    assert end["end_ts"] >= end["start_ts"] > 0
+    assert end["write_failures"] == 0 and end["error"] == ""
+
+
+def test_trace_recorder_finish_task_interrupted(tmp_path):
+    """异常中断的收尾：end_reason=interrupted 且带错误简述，与正常结束可区分。"""
+    rec = TraceRecorder(tmp_path / "mem")
+    task_id = rec.start_task("会中断的任务")
+    rec.record_step(1, "w", [], "wait", {"seconds": 0}, True)
+    rec.finish_task("interrupted", steps=1, error="RuntimeError: 观测爆炸")
+
+    path = tmp_path / "mem" / "traces_full" / f"{task_id}.jsonl"
+    lines = [json.loads(l) for l in path.read_text(encoding="utf-8").splitlines()]
+    assert [l["type"] for l in lines] == ["meta", "step", "end"]
+    assert lines[-1]["end_reason"] == "interrupted"
+    assert "观测爆炸" in lines[-1]["error"]
+
+
+def test_trace_recorder_finish_task_rejects_unknown_reason(tmp_path):
+    import pytest
+    rec = TraceRecorder(tmp_path / "mem")
+    rec.start_task("任务")
+    with pytest.raises(ValueError, match="结束方式"):
+        rec.finish_task("maybe_done", steps=0)
 
 
 def test_trace_recorder_separate_task_files(tmp_path):

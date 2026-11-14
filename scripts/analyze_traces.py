@@ -30,9 +30,13 @@ def load_steps():
         steps = []
         for line in f.read_text(encoding="utf-8").splitlines():
             try:
-                steps.append(json.loads(line))
+                rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            # 跳过任务级 meta/end 记录行（旧文件无 type 字段，缺省即 step）
+            if rec.get("type", "step") != "step":
+                continue
+            steps.append(rec)
         yield f, steps
 
 
