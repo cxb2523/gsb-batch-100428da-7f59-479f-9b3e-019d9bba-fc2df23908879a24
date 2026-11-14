@@ -38,6 +38,7 @@ PyDispatcher==2.0.7
 pyee==13.0.1
 pylint==4.1.2
 pyOpenSSL==26.4.0
+pytest==9.0.3
 queuelib==1.10.0
 requests==2.34.2
 requests-file==3.0.1

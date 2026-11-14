@@ -7,8 +7,9 @@ FB_EMAIL ?=
 FB_PASSWORD ?=
 FB_PAGE_ID ?=
 FB_OUTPUT ?= fb.json
+FB_OUTCOMES ?= fb_outcomes.json
 
-.PHONY: pw-server-up pw-server-logs pw-server-down install check crawl freeze auth lint
+.PHONY: pw-server-up pw-server-logs pw-server-down install check test crawl freeze auth lint
 
 auth:
 	python save_auth.py
@@ -34,8 +35,11 @@ install:
 check:
 	scrapy check
 
+test:
+	python -I -m pytest tests/ -v
+
 crawl:
-	scrapy crawl fb_page -a page_id="$(FB_PAGE_ID)" -o $(FB_OUTPUT)
+	scrapy crawl fb_page -a page_id="$(FB_PAGE_ID)" -a outcome_output="$(FB_OUTCOMES)" -o $(FB_OUTPUT)
 
 freeze:
 	pip freeze > requirement.text

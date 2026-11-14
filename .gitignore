@@ -164,3 +164,4 @@ cython_debug/
 .idea/
 
 fb.json
+fb_outcomes.json

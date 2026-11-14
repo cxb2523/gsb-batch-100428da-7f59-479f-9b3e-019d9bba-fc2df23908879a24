@@ -75,8 +75,12 @@ Automated login always trips the bot check, so login is manual, once:
 - The session is saved to `auth.json` and every scrape request reuses it
   as a Playwright storage state.
 
-If the session expires the spider stops with `Session expired, rerun
-python save_auth.py`. Just run `make auth` again.
+If the session expires the run does not close silently anymore. The
+spider records the expiry as its stop cause, writes one
+`session_expired` outcome for the current page and every page that was
+not requested yet, and stops sending further requests. Just run
+`make auth` again and check the outcome report (below) to see what was
+and was not collected.
 
 ## Running the scraper
 
@@ -93,6 +97,71 @@ which is gitignored) and run plain `make crawl`.
 `FB_OUTPUT` defaults to `fb.json`. The flow is timeline to story to
 item: the timeline render yields one story url, the story render yields
 the post item with counts and comments.
+
+## Per-page outcome report
+
+When several pages are passed in `FB_PAGE_ID`, every page gets one
+verifiable ending so an operator can tell which pages were collected and
+which were not, and why. The endings are written alongside the crawl to
+a JSON report, `fb_outcomes.json` by default (override with
+`FB_OUTCOMES`, or the spider argument `outcome_output=...`). The report
+is rewritten after every outcome, so the endings already recorded
+survive the run being stopped mid-way.
+
+Each entry in `outcomes` carries the `page_id`, its `page_url`, a
+`status`, a human-readable `detail`, and — on success — the produced
+post in `post_ids` / `post_urls` so the entry can be cross-checked
+against the exported items. Possible statuses:
+
+- `success`: the page produced a post item; `post_ids` and `post_urls`
+  point at it.
+- `no_post_id`: the timeline rendered but no story id was found in it,
+  so no story request was sent.
+- `session_expired`: the login form was returned. The current page and
+  every later page get this status; no request is sent for the later
+  pages.
+- `parse_error`: any other parsing failure. The exception type and
+  message are in `detail`, and the remaining pages are still processed.
+
+The top-level `stop_reason` is `null` on a full run, or explains why the
+run stopped early (currently only a session expiry). Example:
+
+```json
+{
+  "stop_reason": "session expired at https://www.facebook.com/deadpage: rerun python save_auth.py",
+  "outcomes": [
+    {
+      "page_id": "goodpage",
+      "page_url": "https://www.facebook.com/goodpage",
+      "status": "success",
+      "detail": "produced 1 post item (999888)",
+      "post_ids": ["999888"],
+      "post_urls": ["https://www.facebook.com/story.php?story_fbid=999888&id=10001"]
+    },
+    {
+      "page_id": "blankpage",
+      "page_url": "https://www.facebook.com/blankpage",
+      "status": "no_post_id",
+      "detail": "no story id found in timeline response",
+      "post_ids": [],
+      "post_urls": []
+    },
+    {
+      "page_id": "deadpage",
+      "page_url": "https://www.facebook.com/deadpage",
+      "status": "session_expired",
+      "detail": "login form shown on timeline response",
+      "post_ids": [],
+      "post_urls": []
+    }
+  ]
+}
+```
+
+Pages are now processed one after another (each timeline request is
+chained from the previous page's ending) instead of being fanned out up
+front, which is what lets a session expiry stop the later pages
+deterministically. Rate limiting (`DOWNLOAD_DELAY`) is unchanged.
 
 ## Data schema
 
@@ -118,6 +187,22 @@ Each item in the output JSON:
 - `TWISTED_REACTOR`: asyncio selector reactor, required by
   scrapy-playwright on modern Scrapy.
 
+## Tests
+
+The outcome logic has offline tests that never touch the network or the
+Playwright browser. Responses are built from local HTML fragments in
+`tests/fixtures/` covering a timeline that yields a story id (success),
+a timeline without a story id (`no_post_id`), and the login form
+(session expiry), including asserting that after an expiry no request is
+yielded for the later pages. Run them in isolated mode:
+
+```
+python -I -m pytest tests/ -v
+```
+
+The root-level `conftest.py` puts the repository root on `sys.path`, so
+the package is importable even under `-I` (which ignores `PYTHONPATH`).
+
 ## Troubleshooting
 
 - Bot challenge or checkpoint after login. Slow down (`DOWNLOAD_DELAY`),
@@ -128,10 +213,15 @@ Each item in the output JSON:
 - Connection refused on `ws://localhost:3000/`. The server is down
   (`make pw-server-up`) or the `playwright` client and the Docker image
   versions drifted. They must match.
-- Session expired mid-run. The spider stops and asks to rerun
-  `make auth`. Refresh `auth.json` and scrape again.
+- Session expired mid-run. The spider records a `session_expired`
+  outcome for the current page and the pages left unprocessed, sets
+  `stop_reason` in `fb_outcomes.json`, and sends no further requests.
+  Refresh `auth.json` with `make auth` and scrape again; the report
+  tells you which pages need rerunning.
 - Empty output. The timeline render changed. Save a fresh snapshot and
-  check the article selectors against it.
+  check the article selectors against it. A page whose timeline has no
+  story id is reported as `no_post_id` in `fb_outcomes.json` instead of
+  being skipped silently.
 - Wrong text language. Post and comment language follows the test
   account's language setting, not the code. English account gets machine
   translations, Thai account gets the original text.
