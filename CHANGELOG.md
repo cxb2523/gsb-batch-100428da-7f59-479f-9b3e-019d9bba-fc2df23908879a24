@@ -1,0 +1,989 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [1.9.0] - 2026-10-02
+
+pytrends code runs on trendspyg after changing its imports.
+
+### Added
+- `trendspyg.compat`: pytrends 4.9.2's `TrendReq` (`trendspyg.compat.request`)
+  and its exceptions (`trendspyg.compat.exceptions`), with the same method
+  names, arguments and DataFrame shapes. Tests feed identical raw Google data
+  to pytrends 4.9.2 and to `trendspyg.compat` and compare the frames under
+  pandas 2 and 3. Requires pandas (`trendspyg[analysis]`); not imported by
+  `import trendspyg`.
+- One fetch per payload (direct, or a browser session if Google refuses)
+  serves `interest_over_time`, `related_queries` and every supported
+  `interest_by_region` view from memory. `inc_low_vol=True` and US metro areas
+  (`resolution="DMA"`) come from the same fetch by repeating the region request
+  with those settings, verified live (210 US metro areas; 229 instead of 56
+  countries with data).
+- `trending_searches`, `today_searches` and `realtime_trending_searches` are
+  served from the Trending Now feed; they answer HTTP 404 in pytrends 4.9.2.
+  `suggestions` and `categories` use plain HTTP, as before.
+- Opt-in `TrendReq(cache="disk", cookies="disk")` reuses the Explore disk cache
+  and returning-visitor cookie jar.
+- Migration guide: `docs/MIGRATING_FROM_PYTRENDS.md`.
+- A direct engine for keyword analysis: `engine="auto"` on
+  `download_google_trends_interest_over_time`, `download_google_trends_explore`
+  and `download_google_trends_comparison` asks Google directly first (the
+  requests pytrends made) and starts Chrome only if that fails; `engine="http"`
+  never starts Chrome. The default stays `"browser"`. `trendspyg.compat`
+  defaults to `"auto"`, and its comparison answers then carry each keyword's
+  related queries without extra sessions. Measured from one machine: 11 of 11
+  varied questions answered in 0.9-7 s each with every widget (median request
+  0.26 s), against 16-33 s per browser session, with the same dates and
+  regions. Direct answers repeated each other (50 of 53 values identical 40
+  minutes apart, from two countries) but differed from browser answers by up
+  to 7 points, for reasons not established. Google refused direct requests
+  after roughly a hundred in half an hour; the refusal lasted about five
+  minutes at first, and after heavier use both engines were refused. After a
+  refusal, direct requests pause for five minutes. Direct requests follow the
+  `HTTPS_PROXY`/`HTTP_PROXY` environment variables (verified through a rotating
+  residential proxy); Chrome is not given the proxy.
+
+### Not served (each says so)
+- `related_topics()` returns `None` tables with a `CompatWarning`: Google serves
+  the widget empty to automated sessions. `top_charts()` raises
+  `NotImplementedError` (Google's endpoint answers HTTP 404), as do multirange
+  requests and `get_historical_interest()`. `resolution="CITY"` is refused:
+  Google refused it for the US when tested. `proxies=` is refused rather than
+  silently ignored. Regions Google reports without data are omitted where
+  pytrends listed them as 0.
+
+### Compatibility
+- Existing calls behave as before: the new `engine` parameter is last and
+  defaults to `"browser"`. No CLI, MCP tool or data-schema changes. The browser
+  engine gained an optional, internal region-variant step used only by
+  `trendspyg.compat`.
+
+### Documentation
+- Interpreting data: rising related queries can contain searches unrelated to
+  the keyword. They were observed identically through trendspyg, a visible
+  browser and pytrends on one machine; treat them as leads.
+
+## [1.8.0] - 2026-09-10
+
+Choose the intended topic before interpreting search interest.
+
+### Added
+- `get_keyword_suggestions(keyword, language="en-US", *, cache=True, timeout=10.0)`
+  and the required-field `KeywordSuggestion` TypedDict (`mid`, `title`, `type`).
+  HTTP lookup needs no Chrome, caches repeats for one hour in memory, and makes
+  no disk/cookie writes. Empty results remain distinct from network/parse errors;
+  HTTP 403/429 stops immediately with `RateLimitError`.
+- Pipe-safe `trendspyg suggest -k TEXT` and ninth MCP tool `suggest_keywords`.
+  Users choose a candidate explicitly, then pass its ID to existing Explore tools.
+- Weekly live contract check for Google's topic response shape, plus input,
+  caching, failure and CLI/MCP tests.
+
+### Compatibility
+- Existing 47 exports, argument names/defaults and CLI/MCP tools remain available;
+  two additions bring the root API to 49 names. No existing data-schema changes
+  or new dependencies. Text keywords are never converted into topics automatically.
+- Added upgrade notes covering the observable CSV-filter, freshness, schema and
+  timeout corrections made in 1.7.0.
+
+### Documentation
+- Corrected stale Explore runtime ceilings in the API reference and docstrings:
+  retry settings control chart retries, while browser setup and cleanup add time.
+- Updated the roadmap and documented topic lookup, explicit selection and label
+  provenance. A successful instrumented comparison resolved the earlier
+  unverified lookup-to-comparison step.
+
+## [1.7.0] - 2026-09-09
+
+Reliable filtered exports, honest observation times, and complete collection-to-history workflows.
+
+### Fixed
+- CSV category filtering now uses Google's numeric IDs, selects the category
+  through the menu when needed, and verifies selection before exporting.
+- `active_only=True` verifies Google's switch is enabled before exporting; a
+  missing or ignored status filter raises `BrowserError`. Retries do not turn
+  an already-enabled filter off.
+- Explore uses eager navigation, finite page/transport/script timeouts and a
+  shared browser-work budget; driver transport failures raise `BrowserError`,
+  cleanup cannot mask the fetch error, and widget HTTP 403/429 stops immediately.
+  Driver startup/download remains separate from the browser-work budget.
+- RSS memory/disk cache hits retain the original `fetched_at`, including CLI
+  `--envelope`. Versioned cache keys coexist with older installations' entries.
+- Invalid `UK` suggests `GB`; empty RSS geographies raise `InvalidParameterError`.
+- Journalist and analysis examples handle redirected Windows Unicode output,
+  use numeric volume fields, preserve provenance and produce finished artifacts.
+  Removed automatic news-verification labels and unmeasured runtime claims.
+
+### Added
+- `watch --archive --db PATH` and optional `--context` event metadata; Python
+  watcher `include_context=True` adds `geo` and `observed_at` (monitor schema 1.1).
+- Opt-in `archive=True` on the four MCP Trending Now fetch tools, completing
+  the fetch-to-history workflow without changing storage defaults.
+- Keyword-only `cache=` on sync/async RSS batch functions and `envelope=True`
+  on single-region RSS functions for raw records with their fetch metadata.
+- Normalized envelope `request` field (schema 1.1): requested CSV filters;
+  `{}` on RSS. Archived schema-1.0 envelopes remain readable unchanged.
+- Tested keyword-study example with complete-period statistics, chart and
+  original response; interpretation and workflow guide.
+
+## [1.6.0] - 2026-08-19
+
+Returning-visitor sessions for the Explore path, plus four small things the
+2026-08-16 audit had queued.
+
+### Added
+- **`cookies="disk"` on the three Explore functions** (CLI `--cookies disk`;
+  the MCP interest tools use it by default) — each browser session reuses the
+  Google cookies the previous successful session was issued (a small JSON file
+  beside the archive DB, or `TRENDSPYG_COOKIES`), so trendspyg looks like one
+  returning visitor instead of a parade of new ones. **Why:** measured
+  2026-08-19 on an IP that had been busy — brand-new sessions (headed or
+  headless, warmed or not) were refused with Google's hard 429 page, while
+  sessions carrying an established jar were served, repeatedly, and this held
+  through the public API (explore 17s / interest-over-time 13s served; the same
+  call without the jar → `RateLimitError` in the same minute). Best-effort by
+  design: a missing/corrupt jar is ignored, a jar Google refuses is dropped
+  automatically, and only `google.com` cookies are kept (written atomically,
+  owner-readable where the OS supports it). Opt-in because it stores a Google
+  cookie on disk. `clear_explore_cookies()` (new public name, 47 in `__all__`)
+  deletes it. It does **not** unlock Related Topics — that widget stays empty
+  for headless sessions even with a trusted jar.
+- **`compare_trending(geos, compact=false)`** (MCP): `compact=true` returns
+  keyword / rank / volume_min / is_active per trend only — measured 45.8 KB →
+  2.8 KB for 3 geos — for agents that only need "what is trending where".
+  Default output unchanged.
+
+- **`is_empty` on the `ExploreEnvelope`** (`EXPLORE_SCHEMA_VERSION` 1.1 → 1.2,
+  additive): `True` when the interest series has no non-zero point — Google
+  answers a keyword it has no data for with an all-zero series (observed
+  2026-08-19), which trendspyg returns as-is, so agents can tell "no data"
+  from "genuinely flat". Honest limit: Google samples, so a keyword at the
+  noise floor came back all-zero on one run and with a lone `100` spike on
+  another an hour later (related queries and regions empty both times) — the
+  flag states what the series contains, it does not guess intent. The typed
+  `ExploreEnvelope` also gains the `gprop` field it had been missing since
+  1.5.0. `download_google_trends_interest_over_time` returns a bare list and is
+  unchanged; its docstring now says a no-data keyword comes back as zeros.
+
+### Changed
+- **A cached bigger Explore answer now serves a smaller question.** With
+  `cache="disk"`, `explore -k x --full` followed by `explore -k x` (or
+  `download_google_trends_interest_over_time`) is answered from the cached
+  full payload, trimmed to what was asked, instead of costing a second
+  browser session. The reverse (a cached small answer for a bigger question)
+  still fetches.
+- **The MCP handshake reports trendspyg's version.** `serverInfo.version`
+  used to be the mcp SDK's own version (`1.28.1` on the v1 line; an empty
+  string on v2); it is now trendspyg's — verified on SDK 1.28.1 and 2.0.0.
+- CI now also runs the MCP tests against the **v1** SDK line (`mcp<2`) — fresh
+  installs resolve v2, local development often has v1, and two v1-shaped test
+  assertions had reddened every 3.10+ cell of the matrix before this release.
+- Nine always-skipped placeholder tests in `tests/test_csv_downloader.py`
+  were removed — they could never run and asserted only `is not None`; the
+  browser-driven CSV export is checked live by `tests/test_live_contract.py`.
+
+## [1.5.2] - 2026-08-19
+
+One fix for the Explore path, found by driving Google's page from several
+browsers side by side.
+
+### Fixed
+- **Explore was answered with Google's hard 429 page for every session from a
+  "warm" IP — even a cold-started, headed, non-automated browser — as long as
+  the session carried no cookies.** The engine loaded
+  `/trends/explore?...` directly into a fresh profile; from an IP Google had
+  seen before, that cookieless request was refused outright (HTTP 429 on the
+  document itself), which is what 1.5.1's `RateLimitError` had been reporting
+  as a "hard block". The very same request succeeded once the session had
+  visited the Trends home page (which sets Google's `NID` cookie) — the classic
+  pytrends warm-up. Verified 2026-08-19 on an IP that had reported "blocked"
+  for three days: fresh-profile loads (Selenium and Playwright, headed and
+  headless) → 429; home page first → chart in ~3s. The engine now visits
+  `https://trends.google.com/` once per session before the Explore URL (a
+  best-effort extra GET, ~1-2s; failure there is ignored and the Explore load
+  decides). Applies to all three Explore functions, the CLI and the MCP tools.
+  The 8-10 sessions/hour figure and the 30+ minute cooldown quoted in
+  `RateLimitError` were measured with cookieless sessions; a genuine block of a
+  warmed-up session was not observed in this session and its duration is
+  unknown.
+
+### Changed
+- **Docs and metadata now state the measured Explore budget** instead of a
+  vague "rate-limit sensitive": roughly 8-10 fresh browser sessions in a short
+  burst is enough for Google's hard 429 block, and a `RateLimitError` then means
+  stop for tens of minutes at least, not retry — in the README, AGENTS.md,
+  CLI.md, the docs-site landing page and the MCP server's instructions and
+  interest/compare tool descriptions (which used to say "wait a few minutes"),
+  and the `RateLimitError` docstring. ROADMAP's Related Topics note records
+  the 2026-08-19 ground truth.
+  The README intro and data-source table now name what the Explore path
+  covers (comparison, YouTube/News/Images/Shopping) and link the docs site;
+  the PyPI summary and keywords were updated to match (`mcp`, `mcp-server`,
+  `youtube-trends`, `keyword-comparison`, `interest-by-region`, ...).
+
+### Notes
+- A keyword Google has no data for (e.g. a nonsense string) does **not**
+  error: Google's own API returns an all-zero series, so trendspyg returns
+  `interest_over_time` with every `value` 0, `related_queries` with empty
+  `top`/`rising`, and an empty `interest_by_region` (observed 2026-08-19).
+- The Related Topics (entity) widget *does* render items to a browser Google
+  trusts (seen 2026-08-19 in a headed browser with an established cookie jar);
+  the empty widget seen from automated sessions on 2026-08-11 was Google
+  distrusting the session, not missing data. Still not exposed as a data type.
+
+## [1.5.1] - 2026-08-16
+
+Two correctness fixes found by a full live audit, plus the test class that
+would have caught them.
+
+### Fixed
+- **`normalize=True` on the CSV path lost every timestamp** — Google writes
+  full month names (`"August 15, 2026 at 7:10:00 AM UTC+3"`) but the parser
+  only accepted abbreviated ones (`%b`). Every fixture was written in May, the
+  one month where the two forms coincide, so the bug passed the suite and
+  shipped in 0.5.0 → 1.5.0: from June onward every normalized CSV row had
+  `started_at`/`ended_at = None` and therefore `is_active = True` — including
+  finished trends (355 of 504 rows on 2026-08-16). Affected the library
+  (`normalize=True`), `trendspyg csv --normalize`, the MCP `get_trending_full`
+  tool, and CSV snapshots written to the archive. Full month names now parse
+  (abbreviated kept as a fallback). **Archive caveat:** CSV snapshots recorded
+  by 1.3.0–1.5.0 keep the `None` timestamps they were stored with — the raw
+  export is not retained, so they cannot be back-filled.
+- **Explore misreported Google's hard 429 block as a DOM change.** After
+  roughly 8-10 fresh browser sessions in an hour Google replaces the Explore
+  page with an "Error 429 (Too Many Requests)" page. The engine only knew the
+  soft-throttle phrases, so it reloaded the block page `max_retries` times
+  (~100s at defaults, deepening the block) and then raised
+  `BrowserError("the page structure may have changed")`. The block page (and
+  Google's "unusual traffic" interstitial) is now recognised at once and raises
+  `RateLimitError` immediately with hard-cooldown advice (30+ minutes; reuse
+  `cache="disk"`; use RSS). No reload ladder is spent on it. The MCP
+  interest/compare tools inherit the fast failure.
+
+### Added
+- **Weekly live-contract check** — `tests/test_live_contract.py` (marked
+  `network` + `contract`) asserts the real-format facts the code depends on:
+  every CSV timestamp string Google emits parses, the export headers are
+  unchanged, RSS items carry datetimes and parseable traffic, and one Explore
+  session still yields the interest/related/region widgets (reported as
+  *skipped/inconclusive* if Google rate-limits the runner). Run by
+  `.github/workflows/live-contract.yml` every Monday and on demand; kept
+  separate from the Tests workflow so a Google change can never redden the
+  Tests badge. Locally:
+  `pytest tests/test_live_contract.py -m contract -o addopts=""`.
+
+## [1.5.0] - 2026-08-11
+
+Google properties (YouTube/News/Images/Shopping), a hardened Explore collector,
+and a documentation site.
+
+### Added
+- **`gprop=` on all three Explore functions** (CLI: `--gprop`, MCP: both
+  interest tools) — analyze search interest on a specific Google property:
+  ``""``/``"web"`` (default), ``"images"``, ``"news"``, ``"youtube"``, or
+  ``"froogle"`` (Google Shopping). The pytrends `gprop` use case, verified
+  live: the property propagates into every widget request the page mints.
+  Validated up-front (a typo'd property never costs a browser run), part of
+  the disk-cache key, and recorded in envelopes as a new `gprop` field —
+  `EXPLORE_SCHEMA_VERSION` and `COMPARISON_SCHEMA_VERSION` bump 1.0 → 1.1
+  (additive; consumers tolerating unknown fields are unaffected).
+- **Documentation site** — https://flack0x.github.io/trendspyg/ (mkdocs-material,
+  deployed by CI on every push to main). The site pages include the canonical
+  repository markdown files directly, so docs cannot drift between GitHub and
+  the site.
+
+### Changed
+- **Related-queries collection hardened:** the Explore page issues TWO
+  `relatedsearches` requests — related *queries* (`keywordType: QUERY`) and
+  related *topics* (`ENTITY`). The collector now pins the queries slot to the
+  QUERY-kind request instead of relying on request order, so topic-shaped data
+  can never silently appear as related queries.
+- **`trendspyg/explore.py` is now a package** (`explore/` — public API,
+  `_engine.py` browser driving, `_parsers.py` pure parsers). Internal only:
+  every import path and public name is unchanged.
+- `examples/` brought under the CI lint gate (black/isort/flake8) and cleaned.
+
+### Investigated (recorded honestly, not shipped)
+- **Related Topics** (the fifth Explore data type): Google currently serves the
+  ENTITY widget *empty* to automated sessions — the Explore page itself renders
+  "doesn't have enough data" for topics while related queries load fine
+  (reproduced 4/4 in headless AND visible Chrome, keywords with known topic
+  data). Parsing it would ship a feature that returns nothing, so it waits;
+  the hardened collector above is the groundwork.
+
+## [1.4.0] - 2026-08-11
+
+Explore-path archiving + long-TTL disk cache — the deferred half of 1.3.0's
+archive story. All three data paths now record and cache.
+
+### Added
+- **Explore disk cache (opt-in)** — `cache="disk"` on
+  `download_google_trends_interest_over_time`, `download_google_trends_explore`
+  and `download_google_trends_comparison` (CLI: `trendspyg explore --cache disk`)
+  serves an identical recent request straight from the local archive DB — no
+  10-40s browser run, no rate-limit exposure. Freshness defaults to 1 hour for
+  `"now *"` timeframes (hourly points) and 24 hours for everything else
+  (daily/weekly points); override per call with `cache_ttl=` seconds (CLI
+  `--cache-ttl`). Cache hits keep the *original* `fetched_at`, so envelopes
+  stay honest about the data's age. Entries live in their own `explore_cache`
+  table — the RSS cache's minutes-scale pruning never touches them, and 1.3.0
+  installs tolerate the extra table (verified against the published 1.3.0
+  wheel; no DB schema version bump).
+- **Explore archiving (opt-in)** — `archive=True` on the same three functions
+  (CLI: `--archive`) records the full Explore/Comparison envelope as a local
+  snapshot (`source` = `"explore"` / `"explore_comparison"`) with every
+  keyword indexed: `read_archive(keyword=...)`, `get_keyword_history` and
+  `trendspyg history -k` see keyword-research history alongside trending
+  history (Explore appearances carry `rank`/`volume_min` None). Measured
+  growth: ~4-26 KB per snapshot depending on timeframe and widgets.
+- **Archive query filters:** `get_keyword_history` gains a `source=` filter,
+  and both it and `read_archive` also accept a *sequence* of sources (e.g.
+  `source=("rss", "csv")`). `get_archive_stats()` reports
+  `explore_cache_entries`. `trendspyg history --source` accepts `explore` /
+  `explore_comparison`. No new exported names — the public API stays 46.
+
+### Changed
+- **MCP:** `get_interest_over_time` and `compare_interest_over_time` now use
+  the disk cache — an agent re-asking the same question within the freshness
+  window gets an instant answer instead of a second 10-40s browser run, and
+  the cache survives server restarts (documented in the tool descriptions).
+  `get_trending_history` now filters to Trending-Now sources (`rss`/`csv`) so
+  archived research queries cannot pollute "what was trending". Still 8 tools.
+  Library and CLI caching stays opt-in — no behavior change there.
+
+## [1.3.0] - 2026-08-05
+
+Historical archiving + disk-backed cache — the last big planned 1.x feature.
+
+### Added
+- **Historical archiving (opt-in)** — record any RSS/CSV fetch as a normalized
+  snapshot in a local SQLite file: `archive=True` on all four RSS functions and
+  the CSV function, `--archive` on `trendspyg rss` / `trendspyg csv`. Google
+  offers no "what was trending on date X" anywhere, at any price — the archive
+  turns the ephemeral feed into a queryable dataset you own.
+- **Query surface:** `read_archive(...)` (filters by geo/source/time/keyword;
+  dict, json or dataframe output), `get_keyword_history(keyword, ...)` — "when
+  did X first trend and how did it move?" answered from an indexed table —
+  `get_archive_stats()`, `prune_archive(before, ...)`; new `ArchiveError`
+  exception and `KeywordHistoryPoint` typed shape. Public API grows 40 → 46
+  names (pinned in `tests/test_public_api.py`, covered in STABILITY.md).
+- **CLI `trendspyg history`** — JSON on stdout (pipe-clean, summaries on
+  stderr): snapshot queries, `--timeline -k <kw>` for a keyword's appearance
+  history, `--stats`, `--prune-before <time>`.
+- **8th MCP tool `get_trending_history`** — agents answer "what was trending
+  last Tuesday?" instantly from the local archive: no network, no browser,
+  compact payloads (keyword/rank/volume, not full envelopes).
+- **Disk-backed RSS cache (opt-in)** — `cache="disk"` (CLI: `--cache disk`)
+  persists the response cache in the same local DB, so repeated CLI runs and
+  MCP server restarts within the TTL reuse data instead of re-fetching Google.
+  Honors the existing `set_rss_cache_ttl` knob; cache hits return the exact
+  in-memory shapes (datetimes round-trip precisely).
+- **Storage:** one local SQLite file, Python-stdlib only — zero new
+  dependencies, no server, no keys. Default location is the platform data dir
+  (`%LOCALAPPDATA%`, `~/Library/Application Support`, or `$XDG_DATA_HOME`),
+  overridable per call (`db_path=`) or via the `TRENDSPYG_DB` env var.
+  Safe for concurrent processes (WAL mode — verified by a multi-process spike
+  on Windows). Archive/cache **writes never break a download**: failures emit a
+  `RuntimeWarning` and the fetch returns normally. Measured growth: ~15 KB per
+  RSS snapshot, roughly 130-260 MB/year at hourly cadence — `prune_archive`
+  reclaims space explicitly.
+
+### Fixed
+- README features list said the MCP server exposes "6 tools" — it has been 7
+  since 1.1.0 (the quickstart section was correct; the features bullet was
+  missed in that release's sweep). Also surfaced MCP SDK v1/v2 support in the
+  README's MCP section.
+
+## [1.2.0] - 2026-08-05
+
+### Added
+- **MCP SDK v2 support** — the MCP server now runs on the SDK's v2 stable line
+  (released 2026-07-28) as well as the v1 line: `build_server()` tries the v2
+  API (`MCPServer`) and falls back to v1 (`FastMCP`), and the `[mcp]` extra pin
+  widens from `mcp>=1.27,<2` to `mcp>=1.27,<3`. Fresh installs of
+  `trendspyg[mcp]` now resolve SDK v2; environments held on 1.x by another
+  package's pin keep working unchanged. The seven tools, their names, arguments
+  and behavior are identical on both lines.
+
+## [1.1.1] - 2026-07-23
+
+### Fixed
+- `download_google_trends_interest_over_time` now validates `output_format`
+  **before** launching the browser, matching
+  `download_google_trends_comparison` — a typo like `"jsonn"` fails in
+  milliseconds with the same `InvalidParameterError` instead of after a
+  10-30s browser run.
+
+### Changed
+- Docs honesty sweep: replaced the stale "~0.2s" RSS speed shorthand with the
+  measured, network-dependent framing ("typically 0.2-2s") everywhere it
+  survived — source docstrings, MCP tool descriptions and server instructions,
+  `trendspyg info` output, CLI.md, docs/API.md and AGENTS.md. See
+  [benchmarks/README.md](benchmarks/README.md) for the measured numbers.
+  Historical CHANGELOG/ROADMAP entries are unchanged.
+
+## [1.1.0] - 2026-07-10
+
+Multi-keyword comparison — the last big pytrends use case trendspyg didn't cover.
+
+### Added
+- **`download_google_trends_comparison(keywords, ...)`** — compare 2-5 keywords
+  on **one shared 0-100 scale** (Google scales single-keyword series
+  independently, so separate calls are *not* comparable — this is the correct
+  way, and it's one browser load instead of N). Returns a new
+  `ComparisonEnvelope`: values keyed **by keyword** (no index juggling),
+  Google's per-keyword `averages`, and a combined `interest_by_region` with the
+  winning keyword per region (`include_geo=False` to skip it).
+  `output_format="dataframe"`/`"csv"` render a pytrends-style table with one
+  column per keyword. Behavior verified live against Google's comparison page.
+  New exports: `ComparisonEnvelope`, `ComparisonPoint`,
+  `ComparisonRegionInterest` TypedDicts and `COMPARISON_SCHEMA_VERSION`.
+- **CLI: `-k` is now repeatable on `trendspyg explore`.** Pass `-k` 2-5 times
+  to get the comparison envelope (`trendspyg explore -k bitcoin -k ethereum
+  --quiet | jq .averages`). A single `-k` behaves exactly as before.
+- **MCP: seventh tool `compare_interest_over_time(keywords, geo, timeframe)`**
+  — same fail-fast retry profile as `get_interest_over_time` (~40s ceiling),
+  region fetch skipped to stay inside client timeouts. The tool description
+  steers agents here instead of looping single-keyword calls.
+
+Limits, stated honestly: at most 5 terms (Google's own comparison cap), terms
+containing a comma cannot be compared (it is the URL separator), and the
+comparison rides the same rate-limit-sensitive Explore path (~10-90s per call —
+not for polling).
+
+## [1.0.0] - 2026-07-09
+
+The stability declaration. No behavior changes — this release makes the implicit
+explicit: what the public API is, what semantic versioning promises here, and
+what the library actually measures like.
+
+### Added
+- **[STABILITY.md](STABILITY.md) — the API stability contract.** Defines exactly
+  what "public API" means (every name in `trendspyg.__all__`, the exception
+  hierarchy, the CLI commands/flags and their stdout/stderr pipe contract, the
+  MCP tool surface, the three versioned data schemas), the semver rules for
+  breaking/minor/patch, and a deprecation policy (`DeprecationWarning` for at
+  least one minor release before removal at a major). Honest carve-outs are
+  spelled out too: Google's upstream behavior, private `_names`, exception
+  message text, and performance are *not* guaranteed.
+- **Exceptions importable from the package root.** `from trendspyg import
+  RateLimitError` now works for all six exception classes
+  (`TrendspygException`, `DownloadError`, `RateLimitError`,
+  `InvalidParameterError`, `BrowserError`, `ParseError`).
+  `trendspyg.exceptions` remains valid — both paths are the same objects.
+- **API-lock test** (`tests/test_public_api.py`) — pins `trendspyg.__all__`
+  exactly, so the public surface can no longer drift without a deliberate,
+  reviewed change.
+- **Performance benchmarks** (`benchmarks/`) — a runnable suite: offline
+  microbenchmarks of the library's own overhead (parsing a 20-trend feed
+  ~0.6 ms, normalize ~38 µs, snapshot diff ~20 µs) plus opt-in live end-to-end
+  runs (RSS, CSV, Explore). Measured v1.0.0 numbers are recorded in
+  [benchmarks/README.md](benchmarks/README.md) — including the honest ones:
+  live RSS is network-dominated (1.4 s median on a high-RTT link, ~0.2 s on
+  low-latency links) and back-to-back browser runs get soft-throttled.
+
+### Changed
+- Development status classifier: Beta → **Production/Stable**.
+- Roadmap scoping, decided and recorded: data-visualization helpers are **cut**
+  (the `dataframe` output feeds pandas/matplotlib directly — a plotting module
+  would lock a wide new surface into the 1.0 contract for little gain);
+  historical data archiving is **deferred** to a 1.x feature release.
+
+Coverage note: the 1.0 goal of >90% test coverage was already exceeded in 0.9.0
+(98% aggregate, every module ≥89%, CI-gated at 95%/80%).
+
+## [0.9.0] - 2026-07-09
+
+Explore tuning knobs + a coverage push that puts every module at 89%+.
+
+### Added
+- **Explore: user-configurable retry/backoff.** `download_google_trends_interest_over_time`
+  and `download_google_trends_explore` gained `max_retries` (default 10 — chart-load attempts
+  past Google's soft-throttle) and `retry_wait` (default 8.0 — seconds to watch the chart per
+  attempt). Worst-case runtime ≈ `max_retries × (retry_wait + ~2s)`; lower both to fail fast,
+  raise them to be patient with a throttled IP. Defaults reproduce the previous hardcoded
+  behavior exactly — non-breaking. Bad values raise `InvalidParameterError`.
+- **CLI: the browser paths' tuning knobs are now flags.** `trendspyg explore` gained
+  `--max-retries` / `--retry-wait`, and `trendspyg csv` gained `--timeout` / `--max-retries`
+  (exposing the library parameters added in 0.7.0/0.9.0). Defaults unchanged.
+
+### Changed
+- **MCP: `get_interest_over_time` now uses a fail-fast retry profile** (`max_retries=4`,
+  `retry_wait=6` — a ~40s worst case instead of ~100s), so the tool call fits typical MCP
+  client timeouts. A persistent throttle now errors out quickly with a clear rate-limit
+  message instead of hanging the agent.
+- **explore.py raised from 78% to 100% test coverage** (+15 offline tests: driver
+  construction and stealth flags, cookie-banner handling, chart-wait edge cases, widget-URL
+  filtering, empty-widget fallbacks, parser edge cases, dataframe formatting). Every module
+  in the package now sits at 89%+ — aggregate 95% → 98%. CI gates tightened accordingly:
+  per-module floor 75% → 80%, aggregate floor 90% → 95%.
+
+## [0.8.0] - 2026-07-09
+
+An MCP server: use trendspyg directly from Claude and any MCP-compatible agent.
+
+### Added
+- **MCP server (`trendspyg-mcp`).** `pip install trendspyg[mcp]` (Python 3.10+; the core
+  library still supports 3.8+) and register the `trendspyg-mcp` command with any MCP client —
+  Claude Desktop, Claude Code (`claude mcp add trendspyg -- trendspyg-mcp`), Cursor, etc.
+  Six read-only tools, free and local, no API key:
+  - `get_trending_now(geo)` — normalized trending envelope (~0.2s, no browser)
+  - `compare_trending(geos)` — one call, up to 20 countries/states
+  - `get_trend_changes(geo)` — new / dropped / volume / rank changes since the last call
+    in the session (built on the pure `diff_trends` engine)
+  - `list_supported_options()` — all 125 countries, 51 US states, filters and timeframes
+  - `get_interest_over_time(keyword, geo, timeframe)` — Google's 0–100 series
+    (drives Chrome; 10–90s; the tool description warns agents honestly)
+  - `get_trending_full(geo, hours, category)` — 480+ trends with filters (drives Chrome,
+    ~10–15s; downloads to a temp dir that is always cleaned up)
+  - Depends on the stable MCP v1 SDK line (`mcp>=1.27,<2`) — pinned below the v2 rework.
+- **CI: per-module coverage floor (75%).** The aggregate coverage gate could hide a single
+  weak module behind a healthy average (explore.py once sat at 47% while the total showed
+  82%). A new `scripts/check_coverage_floor.py` gate now fails CI if any individual module
+  drops below 75%. Runnable locally:
+  `pytest tests/ --cov=trendspyg --cov-report=json -m "not network" && python scripts/check_coverage_floor.py`
+
+### Changed
+- **Test hardening: `cli.py` and `rss_downloader.py` raised from 77% to 100% coverage**
+  (+41 offline tests). Newly covered: the entire `explore` and `watch` CLI command bodies
+  (banners, output formats, error exits, Ctrl-C handling), `--normalize`/`--envelope`/`--quiet`
+  output branches, the full async fetch engine (session lifecycle, all error mappings, cache
+  hits), batch progress/delay paths, and every optional-dependency import guard
+  (click/pandas/aiohttp/tqdm). Aggregate coverage 86% → 95%; the CI aggregate gate was
+  tightened from 80% to 90% accordingly.
+- The `[all]` extra now includes the MCP server on Python 3.10+.
+
+## [0.7.0] - 2026-07-07
+
+Real-time monitoring, plus a reliability and hygiene pass.
+
+### Added
+- **Real-time monitoring (RSS-only).** Poll the fast RSS feed and stream the changes between
+  consecutive snapshots:
+  - `watch_google_trends_rss(geo, interval=60, iterations=None, ...)` — a generator that yields
+    `TrendChange` events (`new`, `dropped`, `volume_up`, `volume_down`, `rank_change`), with
+    `min_volume` / `events` / `keywords` filters and an optional fire-and-forget `webhook`.
+  - `diff_trends(old, new)` — a **pure, JSON-safe** diff of two RSS snapshots → `list[TrendChange]`
+    (no network, no browser — fully unit-testable).
+  - `filter_changes(...)` and `post_webhook(...)` helpers, a new `TrendChange` TypedDict, and
+    `MONITOR_SCHEMA_VERSION`.
+  - CLI: **`trendspyg watch`** streams one NDJSON change per line (stdout stays pipe-clean; pipe
+    it into `jq`, a file, or a webhook).
+  - Built entirely on the durable, browser-free RSS path — safe for continuous polling, unlike
+    the CSV/Explore paths.
+- **Schema-version constants exported from the package root** — `SCHEMA_VERSION`,
+  `EXPLORE_SCHEMA_VERSION`, `MONITOR_SCHEMA_VERSION` — so agents can detect shape drift.
+- `download_google_trends_csv` gained `timeout` and `max_retries` parameters.
+
+### Changed
+- **CSV path hardening.** Ported the Explore path's anti-detection kit (disable
+  `AutomationControlled` / `useAutomationExtension`, hide `navigator.webdriver`), pinned the UI
+  language with `&hl=en-US`, capped the page-load hang with a timeout, and **wired the
+  previously-dead retry wrapper** so transient scrape failures auto-retry (browser-start
+  failures are not retried).
+- Bumped the `requests` floor to `>=2.32.0` (cert-verification fix).
+
+### Fixed
+- **RSS `output_format` is validated up front**, before any network fetch — an invalid format
+  no longer makes a request to Google first.
+- **Explore distinguishes a throttle from a changed page.** When the chart never renders and no
+  rate-limit message appears, it now raises a clear `BrowserError` ("the Explore UI may have
+  changed") instead of a misleading `RateLimitError` telling you to wait and retry.
+- Corrected `docs/API.md`: the advertised `sort` values (`traffic`/`started`) do not exist — the
+  real values are `volume`/`recency`. Added the missing `dict` output format and the
+  always-present `traffic_min` field; removed a non-existent `RSSOutputFormat` symbol.
+- Refreshed `SECURITY.md`: supported-versions table now reflects a latest-release policy,
+  replaced a broken `safety check -r requirements.txt` instruction with `pip-audit`, and stated
+  the RSS XML trust assumption honestly.
+- Repaired 5 CSV validation tests that silently skipped forever on a bad import. Fixed stale doc
+  counts (`~360+` → `~480+` CSV trends; `114` → `125` countries comment) and a
+  `trendspy`→`trendspyg` typo.
+
+### Internal / CI
+- CI enforces a **lint + type-check gate** (black, isort, flake8, mypy — pinned so an upstream
+  linter release can't break the gate) plus a coverage floor, on every push and pull request.
+- CI test matrix covers **Python 3.8–3.13** (added 3.13).
+- Added a **PyPI Trusted Publishing** workflow (`publish.yml`, OIDC — no stored token); requires
+  a one-time trusted-publisher setup on PyPI to take effect.
+- Added **Dependabot** (pip + GitHub Actions) and merged the initial batch of CI action bumps.
+- Added offline fake-driver tests for the Explore browser engine (coverage 47% → 78%); the
+  package test suite now sits at ~86%.
+
+## [0.6.1] - 2026-06-08
+
+Metadata, packaging, and code-quality hardening only — **no runtime or API changes**.
+
+### Changed
+- **Expanded PyPI keywords** for discoverability: added `google-trends-api`,
+  `pytrends-alternative`, `interest-over-time`, `related-queries`, `trending`, and
+  `web-scraping` (dropped low-value generic terms).
+
+### Internal
+- Applied **black + isort** formatting across the codebase and made it **flake8/mypy
+  clean** (added `.flake8` config; fixed unused imports, placeholder-less f-strings, and
+  type annotations). No behavior change.
+- Added **Dependabot** (pip + GitHub Actions) for automated dependency updates.
+- Removed a stale, orphaned options-reference doc.
+
+## [0.6.0] - 2026-06-06
+
+### Added
+- **Explore path — keyword analysis over time.** Two new functions bring back the data the
+  archived `pytrends` was most used for, which trendspyg previously did not offer:
+  - `download_google_trends_interest_over_time(keyword, geo='US', timeframe='today 12-m', ...)`
+    — Google's 0-100 relative-interest time series for a search term. Returns a list of
+    `{date (ISO 8601), value (int), is_partial (bool)}`, oldest first. Supports
+    `output_format` `dict`/`json`/`csv`/`dataframe`.
+  - `download_google_trends_explore(keyword, ...)` — the full picture in a single browser
+    load: `interest_over_time` + `related_queries` (`top` + `rising`) + `interest_by_region`,
+    returned as an `ExploreEnvelope`.
+  - **CLI:** new `trendspyg explore` command (`-k/--keyword`, `--timeframe`, `--output`,
+    `--full`, `--quiet`).
+  - **Typed shapes:** `InterestPoint`, `RelatedQuery`, `RegionInterest`, `ExploreEnvelope`
+    exported from the package root. The Explore output is JSON-safe by construction (ISO
+    dates, int values, plain lists) — no `normalize` pass needed.
+- How it works: drives headless Chrome to the Explore page (reusing the existing anti-bot
+  setup + new stealth flags), retries past Google's transient "try again in a bit"
+  soft-throttle, then reads the widget data the page itself fetched. More durable than the
+  raw reverse-engineered endpoints that break pytrends/`trendspy`.
+
+### Notes
+- The Explore path is **rate-limit sensitive** by nature (Google defends the Explore
+  endpoints far more than the Trending Now feed). Expect ~10-90s per call with retries; a
+  clear `RateLimitError` is raised when Google persistently throttles. It is for analysis,
+  **not** high-frequency polling — use the RSS path for fast, frequent real-time checks.
+- Added the `Programming Language :: Python :: 3.13` classifier (already tested on 3.13).
+
+## [0.5.1] - 2026-05-22
+
+### Added
+- **`normalize=True` on the batch RSS functions.** `download_google_trends_rss_batch` and
+  `download_google_trends_rss_batch_async` now accept `normalize=True` — each geo maps to its
+  own `NormalizedEnvelope` instead of a raw trend list. This completes `normalize` coverage
+  across every RSS entry point (0.5.0 covered the single-geo RSS, async, and CSV functions).
+
+## [0.5.0] - 2026-05-22
+
+### Added
+- **`normalize=True` — unified, agent-friendly output.** `download_google_trends_rss`,
+  `download_google_trends_rss_async`, and `download_google_trends_csv` accept a new opt-in
+  `normalize=True` argument. When set, they return a `NormalizedEnvelope` — a single
+  JSON-native schema **identical across the RSS and CSV paths**, so a consumer (or AI agent)
+  learns one shape instead of two. Also on the CLI: `--normalize` on the `rss` and `csv`
+  commands prints the envelope as JSON (pipe-clean — no banner).
+  - Envelope: `{schema_version, source, geo, fetched_at, count, trends: [...]}`.
+  - Each trend: `keyword`, `rank`, `volume_text`, `volume_min` (int), `started_at`
+    (ISO 8601 | null), `ended_at` (ISO 8601 | null), `is_active` (bool), `related_queries`
+    (list[str]), `news` (list), `image` (obj | null), `explore_url`.
+  - The CSV path's raw quirks are fixed in the normalized output: `Search volume` `"5M+"`
+    becomes a real `volume_min` int; the localized `Started` string (with its U+202F narrow
+    no-break space) becomes an ISO 8601 timestamp; the comma-joined `Trend breakdown`
+    becomes a real `related_queries` list; empty `Ended` (`NaN`) becomes `null`.
+  - **Non-breaking** — default output of every function is unchanged; `normalize` is opt-in.
+- **`NormalizedTrend` and `NormalizedEnvelope` TypedDicts** — exported from the package root
+  for static typing and coding-agent autocomplete.
+
+### Changed
+- `_parse_traffic_to_min` moved from `rss_downloader` to `utils` — it is now shared by the
+  RSS path and the CSV normalization layer. Still importable from `rss_downloader` for
+  backward compatibility.
+
+## [0.4.5] - 2026-05-22
+
+### Fixed
+- **CSV path contaminated piped stdout** - `download_google_trends_csv()` printed all
+  `[INFO]` / `[OK]` / `[WARN]` progress messages to **stdout**, so `trendspyg csv ... --quiet`
+  was not pipe-safe despite the `--quiet` flag (added in 0.4.3 for exactly this purpose).
+  All progress output now goes to **stderr**; stdout carries only the requested data payload.
+  Found by running the CSV path live — the unit suite missed it because CSV tests are
+  network-marked and deselected by default.
+
+### Added
+- **`dict` output format for the CSV path** - `download_google_trends_csv(output_format='dict')`
+  now returns a list of row dicts, matching the RSS path and the README's stated formats.
+  Previously it raised `InvalidParameterError: Unsupported output format: dict` *after* a full
+  ~15s browser run. Also exposed on the CLI as `trendspyg csv --output dict`.
+
+### Changed
+- `trendspyg info` now reports the CSV path as `~480+ trends` (was `~360+`), matching the
+  README and observed live volume.
+
+## [0.4.4] - 2026-05-22
+
+### Fixed
+- **Broken documentation links on PyPI** - README doc links were relative (`docs/API.md`,
+  `CLI.md`, `AGENTS.md`, `CHANGELOG.md`, `examples/`, `LICENSE`). They resolved on GitHub but
+  404'd on the PyPI project page (e.g. `pypi.org/project/trendspyg/docs/API.md`). All converted
+  to absolute `github.com/flack0x/trendspyg` URLs so they work everywhere.
+
+### Added
+- **Agent header in README** - A one-line pointer under the badges directing coding agents to
+  `AGENTS.md`.
+- **`Agent Reference` PyPI URL** - Added to `[project.urls]`; surfaces in the PyPI sidebar so
+  agents that read package metadata find the agent reference faster.
+
+## [0.4.3] - 2026-04-24
+
+### Added
+- **Numeric traffic field** - Every RSS trend now includes `traffic_min: int` alongside the
+  human-readable `traffic: str`. Parses `"1000+"` → `1000`, `"50,000+"` → `50000`, `"2.5K+"` → `2500`,
+  `"1.5M+"` → `1500000`. Unparseable input safely returns `0` instead of crashing.
+  Use `traffic_min` for sorting and filtering without writing a parser yourself.
+- **Typed return shapes** - New `trendspyg.types` module exports `Trend`, `NewsArticle`,
+  `TrendImage`, `TrendEnvelope` as `TypedDict`s. Runtime values are still plain dicts (no
+  behavior change); IDEs and coding agents now get autocomplete and type checking.
+  Import from the package root: `from trendspyg import Trend, NewsArticle, ...`.
+- **`--envelope` CLI flag** - `trendspyg rss --envelope` wraps output in
+  `{fetched_at, geo, count, trends: [...]}`. Opt-in; default output shape is unchanged.
+  Useful for pipelines and archives that need the snapshot timestamp alongside the data.
+- **`[all]` install extra** - `pip install trendspyg[all]` now works (matches the README).
+  Bundles `cli`, `async`, and `analysis` extras.
+- **`AGENTS.md`** - Concise one-pager for coding agents (Claude Code, Codex, Gemini CLI)
+  so they can produce correct code in one pass without scanning the repo.
+
+### Fixed
+- **CLI version drift** - `trendspyg info` showed `0.3.0` and `__init__.py` hardcoded `0.4.0`
+  despite the package being `0.4.2`. All three now read from `trendspyg/version.py`.
+- **Windows console encoding** - `trendspyg rss` headlines rendered non-ASCII as `�` on
+  Windows (e.g. `Noël`, curly quotes). The CLI now forces UTF-8 on stdout/stderr at entry.
+- **Pipe-safe CLI output** - Added `--quiet` / `-q` to `rss` and `csv` to suppress human
+  banners and the `[OK] Success!` line. `trendspyg rss --output json --quiet | jq .` now works.
+- **CSV path failed in headless mode** - Google Trends serves a stripped page to detectably-
+  headless Chrome (no Export button in the expected location), causing the default CSV
+  download to time out. Added realistic `--window-size=1920,1080` and a Chrome 131 user-agent
+  to the headless options. Headed mode (`headless=False`) was unaffected.
+- **`traffic_min` column missing from `csv` and `dataframe` outputs** - the new `traffic_min`
+  field landed on `dict` and `json` paths but was dropped by `_format_output()` when flattening
+  to the tabular formats. Added it to both the DataFrame flatten dict and the CSV
+  fieldnames/row dict. Regression test covers all three non-dict formats.
+
+### Internal
+- Added `_parse_traffic_to_min()` helper in `rss_downloader.py` (unit-verified, 13 cases).
+- Added `_configure_stdout_encoding()` helper in `cli.py`; fails open on older Pythons.
+
+## [0.4.0] - 2026-01-12
+
+### Added
+- **Async Support** - New `download_google_trends_rss_async()` function for parallel fetching
+  - 50-100x faster for batch operations (fetch 125 countries in ~0.5s vs ~25s)
+  - Non-blocking for web applications (FastAPI, Django async views)
+  - Optional session reuse for connection pooling
+  - Full feature parity with sync version (all output formats supported)
+  - Requires `pip install trendspyg[async]` (aiohttp dependency)
+- **Batch Functions with Progress Bar** - New batch download functions
+  - `download_google_trends_rss_batch()` - Sync batch with tqdm progress bar
+  - `download_google_trends_rss_batch_async()` - Async batch with progress bar (fastest)
+  - Shows real-time progress: `Fetching trends: 45/125 [=====>    ] 36%`
+  - Optional delay parameter to avoid rate limits
+  - Configurable max_concurrent for async version
+- **Built-in Caching** - Thread-safe TTL cache for RSS results
+  - 5-minute default TTL to reduce API calls (configurable)
+  - Cache control functions: `clear_rss_cache()`, `get_rss_cache_stats()`, `set_rss_cache_ttl()`
+  - `cache=False` parameter to bypass cache and fetch fresh data
+  - Max 256 entries with LRU-style eviction
+  - Shared between sync and async functions
+  - Performance: ~60,000x speedup on cache hits
+- **Enhanced Error Messages** - Better error context with actionable suggestions
+  - HTTP status code detection (429/403 = rate limit, 404 = not found, 5xx = server error)
+  - `RateLimitError` with specific recovery steps
+  - Connection and timeout errors with troubleshooting tips
+  - Invalid parameter errors suggest similar valid values
+- pytest-asyncio for async test support
+- Comprehensive async, batch, cache, and error handling test suites
+
+### Changed
+- Refactored RSS downloader to use shared parsing and formatting helpers
+- Updated all documentation with async examples, batch examples, caching examples, and rate limit warnings
+- Updated roadmap to reflect async support and caching completion
+
+### Internal
+- Added `TTLCache` class in utils.py for thread-safe caching
+- Added `_parse_rss_xml()` helper for shared XML parsing logic
+- Added `_format_output()` helper for shared output formatting
+- Added `_make_cache_key()` helper for consistent cache key generation
+- Added `_handle_http_error()` helper for HTTP status code handling
+- Reduced code duplication between sync and async implementations
+
+## [0.3.0] - 2025-12-17
+
+### Added
+- **Command-Line Interface (CLI)** - Full-featured terminal interface
+  - `trendspyg rss` - Fast RSS downloads from terminal with comprehensive output
+  - `trendspyg csv` - Comprehensive CSV downloads from terminal with detailed display
+  - `trendspyg list` - List available options (countries, states, categories)
+  - `trendspyg info` - Package information and statistics
+  - All API features accessible via CLI
+  - Requires `pip install trendspyg[cli]`
+  - Shows all trends with traffic, news articles, images, and explore links
+- CLI documentation (CLI.md) with usage examples and tips
+
+### Changed
+- **Verified all 125 countries** return actual trends data (tested both RSS + CSV)
+- **Verified all 4 time periods** work correctly (4h: 75 trends, 24h: 364, 48h: 687, 7d: 2,737)
+- Updated country count documentation from 114 to 125 across all files
+- Enhanced CLI output to show comprehensive trend details instead of summaries
+- Updated package description to mention CLI
+
+### Fixed
+- Country count in documentation (was 114, now correctly shows 125)
+
+## [0.2.0] - 2025-11-04
+
+### Added
+- **RSS Feed Support** - New `download_google_trends_rss()` function for fast, rich media data access
+  - 50x faster than CSV (0.2s vs 10s)
+  - News articles with headlines, URLs, and sources (3-5 per trend)
+  - Trend images with attribution
+  - 4 output formats: dict, dataframe, json, csv
+  - Perfect for real-time monitoring, journalism, and qualitative research
+- Comprehensive documentation comparing RSS vs CSV data sources
+- Research use cases and workflow examples for both data sources
+
+### Changed
+- **Focused scope** - Removed Explore page functionality to focus exclusively on real-time "Trending Now" data
+- Streamlined codebase by removing experimental features
+- Updated API surface - now provides TWO core functions: `download_google_trends_csv()` and `download_google_trends_rss()`
+- Updated all documentation to reflect dual data source approach
+- Cleaner project structure
+
+### Removed
+- Explore page historical data functionality (experimental)
+- `download_explore_data()` function
+- `trendspyg/explorer.py` and `trendspyg/explorer_v2.py` modules
+- Playwright optional dependency
+- Explore-specific configuration constants (`EXPLORE_TIME_PERIODS`, `SEARCH_TYPES`, `DATA_SECTIONS`)
+
+### Why This Change?
+This release refocuses the library on its core strength: **real-time trending data**. The Explore page functionality was experimental and added significant complexity. Users needing historical trends can access Google Trends directly or use specialized tools.
+
+**RSS Addition:** Researchers need both fast monitoring (RSS) and comprehensive datasets (CSV) for different research methodologies. RSS provides qualitative data (news context, visual content) while CSV provides quantitative data (large datasets, statistical analysis). Together they form a complete toolkit.
+
+## [0.1.4] - 2025-11-03
+
+### Added
+- **Complete type hints** across entire codebase (PEP 484 compliant)
+  - All function signatures fully typed
+  - Type aliases for `OutputFormat` and `SortOption`
+  - Better IDE support with IntelliSense/autocomplete
+- **Multiple output format support**: CSV, JSON, Parquet, DataFrame
+  - `output_format='csv'` - Default CSV format (backward compatible)
+  - `output_format='json'` - JSON format for APIs and web applications
+  - `output_format='parquet'` - Efficient columnar storage (50-80% smaller files)
+  - `output_format='dataframe'` - Direct pandas DataFrame (no file I/O)
+- **Mypy strict mode** configuration for type safety
+- **Optional dependencies**: `pip install trendspyg[analysis]` for JSON/Parquet/DataFrame support
+
+### Changed
+- Updated `download_google_trends_csv()` signature with type hints
+- Enhanced error messages for missing dependencies (pandas, pyarrow)
+- Improved type safety throughout codebase
+- Updated mypy configuration from Python 3.8 to 3.9 minimum
+
+### Fixed
+- Type consistency in elapsed_time variable (int → float)
+- Minor type errors discovered by mypy strict mode
+
+### Internal
+- Added `_convert_csv_to_format()` helper function
+- Added pandas and pyarrow to analysis extras
+- Improved code maintainability with comprehensive type annotations
+- Added automated tests for all output formats
+
+## [0.1.3] - 2025-11-03
+
+### Added
+- **Input validation**: All parameters (geo, hours, category) are now validated with helpful error messages
+- **Retry logic**: Automatic retry with exponential backoff (3 attempts: 1s, 2s, 4s delays)
+- **Smart file detection**: Dynamic file checking (0.5s intervals, max 10s) instead of fixed 5-second wait
+- **Custom exceptions**: Detailed exception classes with troubleshooting guidance
+- **Prerequisites section** in README with Chrome installation requirements
+- **Comprehensive Troubleshooting guide** in README with common issues and solutions
+
+### Fixed
+- **Helpful error messages**: Specific exceptions (TimeoutException, NoSuchElementException) with actionable solutions
+- **Invalid input detection**: Suggests similar valid options when user provides invalid geo/category
+- **Better error context**: All errors now include possible causes and solutions
+- **CLI claim**: Removed non-existent CLI tool from pyproject.toml (coming in v0.2.0)
+
+### Improved
+- **Download speed**: File detection completes in 0.5s (previously waited fixed 5s)
+- **Error handling**: Browser initialization errors caught with installation guidance
+- **User experience**: Clear error messages guide users to solutions instead of cryptic stacktraces
+- **Reliability**: Automatic retries handle temporary network issues
+
+### Performance
+- **10x faster file detection**: From 5s fixed wait to 0.5s average detection time
+- **Automatic recovery**: 3 retries with backoff prevents failures from temporary issues
+
+## [0.1.2] - 2025-11-03
+
+### Fixed
+- **Active-only filter**: Fixed broken UI selectors for "Active trends only" toggle. Now uses correct CSS selectors (`button[aria-label*='select trend status']` and `button[role='switch']`).
+- **Menu closing**: Fixed element click intercepted error by using ESC key to properly close filter menus before clicking Export button.
+
+### Changed
+- **Sort parameter**: Documented that sort parameter only affects UI display, not CSV export order. CSV always exports in relevance order regardless of sort selection.
+- **Improved selectors**: Switched from fragile XPath selectors to more reliable CSS selectors using aria-label attributes.
+
+## [0.1.1] - 2025-11-03
+
+### Fixed
+- **Download path**: Fixed default download directory to use current working directory (`os.getcwd()`) instead of package installation directory. Files now save to `./downloads/` by default.
+- **Performance**: Improved page load waiting by replacing `time.sleep()` calls with proper `WebDriverWait` for Export button and sort button.
+- **Package naming**: Fixed remaining "trendspy" references to "trendspyg" in all files.
+
+### Changed
+- Increased timeout for sort button from 5s to 10s for better reliability.
+
+## [0.1.0] - 2025-11-03
+
+### Added
+- Initial project structure
+- Core configuration with 125 countries, 51 US states, 20 categories
+- Basic downloader functionality (refactored from existing code)
+- Python package setup
+- MIT License
+- Project documentation (README, roadmaps, guides)
+
+### Project Goals
+- Free, open-source alternative to abandoned pytrends
+- 188,000+ configuration combinations
+- Real-time monitoring capabilities
+- Best-in-class documentation
+
+[Unreleased]: https://github.com/flack0x/trendspyg/compare/v1.9.0...HEAD
+[1.9.0]: https://github.com/flack0x/trendspyg/compare/v1.8.0...v1.9.0
+[1.8.0]: https://github.com/flack0x/trendspyg/compare/v1.7.0...v1.8.0
+[1.7.0]: https://github.com/flack0x/trendspyg/compare/v1.6.0...v1.7.0
+[1.6.0]: https://github.com/flack0x/trendspyg/compare/v1.5.2...v1.6.0
+[1.5.2]: https://github.com/flack0x/trendspyg/compare/v1.5.1...v1.5.2
+[1.5.1]: https://github.com/flack0x/trendspyg/compare/v1.5.0...v1.5.1
+[1.5.0]: https://github.com/flack0x/trendspyg/compare/v1.4.0...v1.5.0
+[1.4.0]: https://github.com/flack0x/trendspyg/compare/v1.3.0...v1.4.0
+[1.3.0]: https://github.com/flack0x/trendspyg/compare/v1.2.0...v1.3.0
+[1.2.0]: https://github.com/flack0x/trendspyg/compare/v1.1.1...v1.2.0
+[1.1.1]: https://github.com/flack0x/trendspyg/compare/v1.1.0...v1.1.1
+[1.1.0]: https://github.com/flack0x/trendspyg/compare/v1.0.0...v1.1.0
+[1.0.0]: https://github.com/flack0x/trendspyg/compare/v0.9.0...v1.0.0
+[0.9.0]: https://github.com/flack0x/trendspyg/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/flack0x/trendspyg/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/flack0x/trendspyg/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/flack0x/trendspyg/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/flack0x/trendspyg/compare/v0.5.1...v0.6.0
+[0.5.1]: https://github.com/flack0x/trendspyg/compare/v0.5.0...v0.5.1
+[0.5.0]: https://github.com/flack0x/trendspyg/compare/v0.4.5...v0.5.0
+[0.4.5]: https://github.com/flack0x/trendspyg/compare/v0.4.4...v0.4.5
+[0.4.4]: https://github.com/flack0x/trendspyg/compare/v0.4.3...v0.4.4
+[0.4.3]: https://github.com/flack0x/trendspyg/compare/v0.4.2...v0.4.3
+[0.4.0]: https://github.com/flack0x/trendspyg/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/flack0x/trendspyg/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/flack0x/trendspyg/compare/v0.1.4...v0.2.0
+[0.1.4]: https://github.com/flack0x/trendspyg/compare/v0.1.3...v0.1.4
+[0.1.3]: https://github.com/flack0x/trendspyg/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/flack0x/trendspyg/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/flack0x/trendspyg/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/flack0x/trendspyg/releases/tag/v0.1.0

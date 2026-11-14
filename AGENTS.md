@@ -1,0 +1,354 @@
+# AGENTS.md
+
+Reference for coding agents (Claude Code, Codex, Gemini CLI, Cursor, etc.) working with the `trendspyg` library. Human-written; agent-readable. Keep it short — link out for depth.
+
+---
+
+## What this library does
+
+`trendspyg` is a Python library + CLI for Google Trends data. It is the maintained replacement for the archived `pytrends`. Three paths:
+
+- **RSS path** (`download_google_trends_rss`) — fast (typically 0.2–2s, network-dependent), ~10–20 current trends per region, includes news articles and images, no browser required. **Use this by default for "what's trending now?"**
+- **CSV path** (`download_google_trends_csv`) — comprehensive (~10s), 480+ current trends, supports time/category filtering, **requires Chrome + Selenium**. Use when you need the extra volume or filtering.
+- **Explore path** (`download_google_trends_interest_over_time`, `download_google_trends_explore`, `download_google_trends_comparison`) — **keyword analysis over time** (interest over time, related queries, interest by region, multi-keyword comparison on one shared scale) — the data `pytrends` was most used for. Requires Chrome; **rate-limit sensitive (~10–90s, may retry) — roughly 8–10 fresh browser sessions in a short burst triggers Google's hard 429 block for the machine's IP (`RateLimitError` at once; recovery tens of minutes at least)**. Use for "how is interest in keyword *X* moving / where does it peak / which of these terms wins?", **not** for high-frequency polling; identical repeats are free with `cache="disk"`.
+
+## Install
+
+```bash
+pip install trendspyg[all]      # everything
+pip install trendspyg           # core (RSS path + CSV path, no CLI/async/DataFrame)
+pip install trendspyg[cli]      # CLI only
+pip install trendspyg[async]    # async RSS
+pip install trendspyg[analysis] # DataFrame/JSON/Parquet output
+pip install trendspyg[mcp]      # MCP server (Python 3.10+)
+```
+
+## MCP server — the zero-code path
+
+If your host supports MCP, you don't need to write Python at all: register the
+`trendspyg-mcp` command (stdio) and call the tools directly.
+
+```bash
+pip install trendspyg[mcp]
+claude mcp add trendspyg -- trendspyg-mcp   # Claude Code; other clients: command = "trendspyg-mcp"
+```
+
+Tools: `get_trending_now(geo)`, `compare_trending(geos)` (≤20),
+`get_trend_changes(geo)` (diff since last call), `list_supported_options()`,
+`get_trending_history(geo, keyword, start, end, limit)` (what WAS trending, from
+the local archive — instant, only covers fetches recorded with archiving on) —
+all fast, no browser — plus `get_interest_over_time(keyword, geo, timeframe)`,
+`compare_interest_over_time(keywords, geo, timeframe)` (2–5 terms, one shared
+scale; ~10–40s, fail-fast retry profile) and `get_trending_full(geo, hours,
+category)` (~10–15s). The browser tools drive Chrome and are rate-limited:
+call once, never loop. Since 1.4.0 the two interest tools answer identical
+repeat questions instantly from a local disk cache (fresh 1h on `"now *"`
+timeframes, 24h otherwise; survives server restarts) — a repeat is safe, a
+*variation* still costs a browser run.
+
+## Minimal recipes
+
+1.7.0 workflow additions: Trending Now MCP tools accept `archive=true`;
+CLI `watch --archive --db PATH --context` records polls and labels event times;
+Python watcher uses `include_context=True`. Both RSS batch functions accept
+`cache="disk"`. Cache hits retain original observation times and do not create
+new history. Enable archiving from the first fetch, or use a fresh
+`get_trend_changes(archive=true)` poll after enabling it.
+See [interpretation and finished workflows](https://github.com/flack0x/trendspyg/blob/main/docs/INTERPRETING_DATA.md).
+
+### Resolve ambiguous keywords to topics (1.8.0)
+
+```python
+from trendspyg import get_keyword_suggestions
+candidates = get_keyword_suggestions("apple", language="en-US")
+# [{"mid": "/m/014j1m", "title": "Apple", "type": "Fruit"}, ...]
+```
+
+Lookup is HTTP-only, with a one-hour process-local cache (128 entries);
+`cache=False` bypasses it. No browser, cookies or disk writes. Choose the
+intended title/type explicitly, then pass its `mid` to an Explore function.
+Keep the selected ID-to-label mapping: comparison and archive keys remain IDs.
+Language controls labels, not analysis geography. These candidates are not a
+popularity ranking or Related Topics; an empty list is not zero interest.
+HTTP 403/429 raises `RateLimitError`, malformed data raises `ParseError`;
+lookup does not retry. CLI: `trendspyg suggest -k apple`. MCP's ninth tool:
+`suggest_keywords(keyword, language="en-US")` returns
+`{query, language, count, suggestions}` with the same three fields per candidate.
+Existing text-keyword calls stay unchanged; nothing selects a topic automatically.
+
+### Faster Explore calls (1.9.0, opt-in)
+
+Pass `engine="auto"` to any Explore function: Google is asked directly first
+(1-7s per full question when measured) and Chrome starts only if Google
+refuses. `engine="http"` never starts Chrome and raises `RateLimitError` on a
+refusal. Default `"browser"` is unchanged. Google still limits a machine: after
+a refusal, direct requests pause for five minutes; do not loop.
+
+### Existing pytrends code (1.9.0)
+
+Change the imports from `pytrends` to `trendspyg.compat`; nothing else:
+
+```python
+from trendspyg.compat.request import TrendReq  # was: from pytrends.request import TrendReq
+pytrends = TrendReq(hl="en-US", tz=360, cache="disk", cookies="disk")
+pytrends.build_payload(["coffee"], timeframe="today 5-y")
+df = pytrends.interest_over_time()  # same DataFrame shape as pytrends 4.9.2
+```
+
+Needs `trendspyg[analysis]`; Chrome only for the fallback. The first data call
+per payload asks Google directly (1-7s measured) or, if Google refuses, opens a
+browser session (~10-40s); later calls return from memory. Not served:
+`related_topics()` (warns, returns None tables), `top_charts()`, multirange,
+`resolution="CITY"`, `proxies=`. Full list: `docs/MIGRATING_FROM_PYTRENDS.md`.
+
+### Get unified, normalized data — recommended for agents
+
+Pass `normalize=True` to either download path. You get one JSON-native schema
+(a `NormalizedEnvelope`) that is **identical for the RSS and CSV paths** — learn
+it once, and every field is always present and JSON-safe.
+
+```python
+from trendspyg import download_google_trends_rss
+
+env = download_google_trends_rss(geo="US", normalize=True)
+# env: {"schema_version", "source", "geo", "fetched_at", "count", "request", "trends": [...]}
+for t in env["trends"]:
+    print(t["rank"], t["keyword"], t["volume_min"])   # volume_min is a real int
+```
+
+Same call shape for the CSV path: `download_google_trends_csv(geo="US", normalize=True)`.
+CLI: `trendspyg rss --geo US --normalize` prints the envelope as pipe-clean JSON.
+
+### Fetch trends for one region
+
+```python
+from trendspyg import download_google_trends_rss
+trends = download_google_trends_rss(geo="US")
+# trends: list[Trend]  (see type below)
+```
+
+### Interest over time for a keyword (the pytrends use case)
+
+```python
+from trendspyg import download_google_trends_interest_over_time
+series = download_google_trends_interest_over_time("bitcoin", geo="US", timeframe="today 12-m")
+# series: list[InterestPoint] -> [{"date": ISO8601, "value": int 0-100, "is_partial": bool}, ...]
+```
+
+Full Explore picture in one browser load:
+
+```python
+from trendspyg import download_google_trends_explore
+env = download_google_trends_explore("bitcoin", geo="US")
+# env: ExploreEnvelope -> interest_over_time + related_queries{top,rising} + interest_by_region
+```
+
+CLI: `trendspyg explore --keyword bitcoin --full --quiet | jq .`
+This path drives Chrome and is rate-limit sensitive — catch `RateLimitError` and back off; do not poll it frequently. The measured budget is roughly 8–10 fresh browser sessions in a short burst (~15 min) before Google serves its hard 429 block page to the IP; a `RateLimitError` then means stop for a long while (tens of minutes at least, sometimes much longer), never retry in a loop.
+
+Since 1.4.0, pass `cache="disk"` to any Explore function to serve identical
+recent requests from the local archive DB with **no browser run and no
+rate-limit exposure** (fresh 1h for `"now *"` timeframes, 24h otherwise;
+`cache_ttl=` overrides). A hit keeps the original `fetched_at` — check it if
+data age matters. Add `archive=True` to record envelopes for later querying.
+Since 1.6.0 a cached *full* explore answer also serves the plain
+interest-over-time question for the same keyword (no second browser run).
+
+Since 1.6.0, pass `cookies="disk"` to any Explore function to reuse Google's
+session cookies across calls (a small JSON file beside the archive DB, or
+`TRENDSPYG_COOKIES`). Measured 2026-08-19: once an IP has been busy, Google
+refuses *new* visitors with the hard 429 page while sessions carrying the saved
+jar are still served — so this is the setting to use for anything that runs
+repeatedly. Opt-in because it keeps a Google cookie on disk;
+`clear_explore_cookies()` deletes it; a jar Google refuses is dropped
+automatically. The MCP server's interest tools use it by default.
+
+Since 1.5.0, pass `gprop=` to analyze a specific Google property instead of
+web search: `"youtube"` (YouTube search interest — its own audience),
+`"news"`, `"images"`, or `"froogle"` (Google Shopping). Same 0-100 relative
+scale, same shapes, validated before the browser starts.
+
+### Compare 2-5 keywords on ONE shared scale (new in 1.1.0)
+
+**Use this to compare terms — never compare separate single-keyword calls.** Google
+scales each single-keyword series independently (its own max = 100), so only a
+comparison call returns directly comparable numbers. One browser load, not N.
+
+```python
+from trendspyg import download_google_trends_comparison
+env = download_google_trends_comparison(["bitcoin", "ethereum"], geo="US")
+# env: ComparisonEnvelope ->
+#   averages: {"bitcoin": 39, "ethereum": 7}                       # keyed by keyword
+#   interest_over_time: [{"date", "values": {kw: int}, "is_partial"}, ...]
+#   interest_by_region: [{"geo_code", "geo_name", "values": {kw: int}, "top_keyword"}, ...]
+```
+
+Limits: 2-5 distinct terms, no commas in a term (URL separator). Same Chrome +
+rate-limit profile as the other Explore calls. CLI: repeat `-k` —
+`trendspyg explore -k bitcoin -k ethereum --quiet | jq .averages`
+
+### Fetch many regions in parallel
+
+```python
+import asyncio
+from trendspyg import download_google_trends_rss_batch_async
+
+results = asyncio.run(
+    download_google_trends_rss_batch_async(
+        ["US", "GB", "DE", "JP"], max_concurrent=5, normalize=True
+    )
+)
+# results: dict[str, NormalizedEnvelope]  (geo -> envelope)
+# drop normalize=True to get dict[str, list[Trend]] instead
+```
+
+### Sort by volume
+
+```python
+trends = download_google_trends_rss(geo="US")
+top = sorted(trends, key=lambda t: t["traffic_min"], reverse=True)[:5]
+```
+
+### Pipe-safe JSON from the CLI
+
+```bash
+trendspyg rss --geo US --output json --quiet | jq '.[0].trend'
+trendspyg rss --geo US --output json --quiet --envelope | jq '.fetched_at, .count'
+```
+
+### Monitor for changes (new in 0.7.0)
+
+```python
+from trendspyg import watch_google_trends_rss, diff_trends
+
+# Stream changes between RSS snapshots — RSS-only, safe for continuous polling.
+for change in watch_google_trends_rss(geo="US", interval=60, events=["new", "volume_up"]):
+    print(change["event"], change["keyword"], change["volume_min"])
+
+# Or diff two snapshots yourself (pure, JSON-safe, no network):
+#   diff_trends(old_list, new_list) -> list[TrendChange]
+```
+
+`TrendChange` = `{event, keyword, rank, prev_rank, volume_min, prev_volume_min}` where
+`event ∈ {new, dropped, volume_up, volume_down, rank_change}`. The CLI equivalent
+`trendspyg watch` streams one NDJSON change per line. The constants `SCHEMA_VERSION`,
+`EXPLORE_SCHEMA_VERSION`, and `MONITOR_SCHEMA_VERSION` are importable from `trendspyg`
+for drift detection.
+
+### Archive fetches, then ask "what was trending?" (new in 1.3.0; Explore in 1.4.0)
+
+Google's feed is ephemeral; the archive records it locally as fetches happen.
+Nothing is recorded unless archiving is on — there is no retroactive data.
+
+```python
+from trendspyg import download_google_trends_rss, get_keyword_history, read_archive
+
+download_google_trends_rss(geo="US", archive=True)        # record while fetching
+download_google_trends_rss(geo="US", cache="disk")        # cache across processes
+
+read_archive(geo="US", start="2026-08-01", limit=5)       # envelopes, newest first
+get_keyword_history("bitcoin")                            # oldest first: when did it start?
+# -> [{"fetched_at", "geo", "source", "rank", "volume_min"}, ...]
+```
+
+The Explore path archives too (1.4.0): `source` is then `"explore"` /
+`"explore_comparison"` and `rank`/`volume_min` are `None` (research queries have
+no trending rank). Pass `source=("rss", "csv")` to `get_keyword_history` /
+`read_archive` to keep a timeline strictly "it trended".
+
+Archive/cache writes never break a fetch (they warn). One SQLite file (stdlib);
+override the path with `db_path=` or `TRENDSPYG_DB`. CLI: `trendspyg rss --archive`,
+`trendspyg explore -k bitcoin --cache disk --archive`,
+`trendspyg history -k bitcoin --timeline --quiet | jq .`
+
+## Return shapes (import from `trendspyg`)
+
+```python
+from trendspyg import Trend, NewsArticle, TrendImage, TrendEnvelope
+from trendspyg import InterestPoint, RelatedQuery, RegionInterest, ExploreEnvelope
+```
+
+- `Trend` — keys: `trend: str`, `traffic: str` (e.g. `"50,000+"`), `traffic_min: int` (parsed, always present, `0` if unparseable), `published: datetime | str`, `explore_link: str`, optional `image: TrendImage`, optional `news_articles: list[NewsArticle]`.
+- `NewsArticle` — `headline: str`, `url: str`, `source: str`, `image: str`.
+- `TrendImage` — `url: str`, `source: str`.
+- `TrendEnvelope` — `{fetched_at: str, geo: str, count: int, trends: list[Trend]}`. CLI `--envelope` or keyword-only `envelope=True` on single-region RSS functions (1.7.0); `normalize=True` takes precedence.
+
+The `Trend` / `NewsArticle` / `TrendImage` TypedDicts are `total=False` — `image` and `news_articles` keys are present only when the corresponding include flags are true (default: true).
+
+### Normalized shape (`normalize=True`)
+
+```python
+from trendspyg import NormalizedEnvelope, NormalizedTrend
+```
+
+- `NormalizedEnvelope` — `{schema_version: str, source: "rss"|"csv", geo: str, fetched_at: str, count: int, trends: list[NormalizedTrend], request: dict}`. Schema 1.1 (1.7.0) adds `request`: CSV's requested `hours/category/active_only/sort_by`; `{}` on RSS. Old archived envelopes may omit it. CSV verifies category and active-only selection; `sort_by` does not control export order.
+- `NormalizedTrend` — **every field is always present and JSON-safe**:
+  `keyword: str`, `rank: int`, `volume_text: str`, `volume_min: int`,
+  `started_at: str|None` (ISO 8601), `ended_at: str|None`, `is_active: bool`,
+  `related_queries: list[str]`, `news: list[NewsArticle]`, `image: TrendImage|None`,
+  `explore_url: str`. Fields a path cannot provide are `None`/`[]` — never missing.
+
+### Explore shapes (new in 0.6.0 — JSON-safe by construction, no `normalize` needed)
+
+- `InterestPoint` — `{date: str (ISO 8601), value: int (0-100), is_partial: bool}`.
+- `RelatedQuery` — `{query: str, value: int, formatted_value: str (e.g. "+3,650%", "Breakout"), link: str}`.
+- `RegionInterest` — `{geo_code: str, geo_name: str, value: int (0-100)}`.
+- `ExploreEnvelope` — `{schema_version, source: "explore", keyword, geo, timeframe, gprop, fetched_at, count, is_empty, interest_over_time: list[InterestPoint], related_queries: {"top": [...], "rising": [...]}, interest_by_region: list[RegionInterest]}` (`gprop` new in 1.5.0: "" = web, or images/news/youtube/froogle; `is_empty` new in 1.6.0 — schema 1.2 — True when the series has no non-zero point: Google answers a no-data keyword with zeros, returned as-is, so check this flag before reading "flat" as "nobody searched it". Caveat: Google samples, so a noise-floor keyword can be all-zero on one run and show a lone `100` spike on another; a lone spike with empty related queries/regions is still "no data" in practice).
+  `related_queries`/`interest_by_region` are empty lists when not requested or not returned by Google (the time series is guaranteed).
+- `ComparisonEnvelope` (new in 1.1.0) — `{schema_version, source: "explore_comparison", keywords: list[str], geo, timeframe, gprop, fetched_at, count, averages: {kw: int}, interest_over_time: list[ComparisonPoint], interest_by_region: list[ComparisonRegionInterest]}`.
+  `ComparisonPoint` = `{date, values: {kw: int 0-100}, is_partial}`; `ComparisonRegionInterest` = `{geo_code, geo_name, values: {kw: int}, top_keyword}`. All values share ONE 0-100 scale across the compared keywords.
+
+## Exceptions
+
+Catch `TrendspygException` to handle any library error. Since 1.0.0 all exception
+classes are importable from the package root (`from trendspyg import RateLimitError`);
+`trendspyg.exceptions` also works. Specifically:
+
+- `RateLimitError` — HTTP 429/403 from Google. Back off and retry.
+- `InvalidParameterError` — bad `geo`, `hours`, or `category`. Suggests valid values in the message.
+- `DownloadError` — network / parse failure. Retry.
+- `BrowserError` — CSV and Explore paths; Chrome/Selenium failed.
+- `RateLimitError` — also raised by the Explore path when Google persistently throttles (the "try again in a bit" state) or serves its hard 429 block page (after roughly 8–10 fresh sessions in a short burst). Back off — tens of minutes at least for the block page — and do not poll frequently; `cache="disk"` repeats cost no session.
+- `ParseError` — malformed response.
+
+## Things to know (read before coding)
+
+**For agents: pass `normalize=True`.** You get one stable, JSON-native schema across
+both paths (see the first recipe). The notes below describe the raw, non-normalized output.
+
+1. **Always prefer the RSS path.** CSV requires Chrome, takes ~10s, and is more fragile.
+2. **The library caches RSS results for 5 minutes.** Pass `cache=False` to bypass. Use `clear_rss_cache()`, `get_rss_cache_stats()`, `set_rss_cache_ttl(seconds)` to control it.
+3. **Rate limits are real.** When batching 50+ regions, set `max_concurrent<=5` and optionally `delay` between calls.
+4. **`traffic_min` is new in 0.4.3.** Use it for sorting/filtering. Don't re-parse `traffic` by hand.
+5. **Don't set `--envelope` unless you need it** — it changes the output shape.
+6. **CSV sort param only affects the UI, not the export order.** Don't rely on it.
+
+## Where things live
+
+```
+trendspyg/
+├── __init__.py          — public exports
+├── rss_downloader.py    — RSS path (sync + async + batch)
+├── downloader.py        — CSV path (Selenium)
+├── explore/             — Explore path (public API + _engine.py browser driving + _parsers.py)
+├── compat/              — pytrends-compatible TrendReq + exceptions (1.9.0; needs pandas)
+├── normalize.py         — normalize=True engine (RSS/CSV unified schema)
+├── cli.py               — click-based CLI
+├── types.py             — TypedDicts (Trend, ExploreEnvelope, ...)
+├── config.py            — COUNTRIES (125), US_STATES (51), CATEGORIES (20), TIME_PERIODS
+├── utils.py             — TTLCache + helpers
+├── exceptions.py        — TrendspygException + subclasses
+└── version.py           — single source of truth for __version__
+```
+
+## If you're generating code
+
+- Import from the top-level package (`from trendspyg import download_google_trends_rss`), not from submodules.
+- Use the TypedDicts for annotations — don't redefine the dict shape.
+- For batch fetches, default to the async batch function.
+- Respect cache by default; only pass `cache=False` when you know you need fresh data.
+- `geo` codes: uppercase ISO 3166 for countries (`"US"`, `"GB"`) or `"US-XX"` for US states (`"US-CA"`).
+
+---
+
+Full docs: `README.md`, `docs/API.md`, `CLI.md`, `CHANGELOG.md`, `examples/`.

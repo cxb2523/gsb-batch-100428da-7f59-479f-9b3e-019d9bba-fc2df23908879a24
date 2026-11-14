@@ -1,0 +1,161 @@
+"""
+trendspyg - Free, open-source Python library for Google Trends data
+
+A modern, actively-maintained alternative to the archived pytrends.
+Supports 125 countries, 51 US states, 20 categories, and multiple output formats.
+
+Three data paths:
+- **RSS Feed** (fast path): current trending topics with images & news
+  (typically 0.2-2s, network-dependent)
+- **CSV Export** (full path): ~480 current trends with time/category filtering (~10s)
+- **Explore** (keyword path): interest over time, related queries, and interest
+  by region for a specific term — the data pytrends was most used for
+
+Choose your data source:
+- Use RSS for: real-time monitoring, news context, images, qualitative research
+- Use CSV for: large trending datasets, time filtering, statistical analysis
+- Use Explore for: how interest in a keyword moves over time and where it peaks
+"""
+
+from .version import __version__
+
+__author__ = "flack0x"
+__license__ = "MIT"
+
+# Import the local archive + disk-cache query surface (new in 1.3.0)
+from .archive import (
+    get_archive_stats,
+    get_keyword_history,
+    prune_archive,
+    read_archive,
+)
+
+# Import core downloaders
+from .downloader import download_google_trends_csv
+
+# Import exceptions — catchable from the package root (part of the stable API)
+from .exceptions import (
+    ArchiveError,
+    BrowserError,
+    DownloadError,
+    InvalidParameterError,
+    ParseError,
+    RateLimitError,
+    TrendspygException,
+)
+
+# Import Explore path (keyword analysis: interest over time, related, geo,
+# multi-keyword comparison)
+from .explore import (
+    COMPARISON_SCHEMA_VERSION,
+    EXPLORE_SCHEMA_VERSION,
+    clear_explore_cookies,
+    download_google_trends_comparison,
+    download_google_trends_explore,
+    download_google_trends_interest_over_time,
+)
+from .keywords import get_keyword_suggestions
+
+# Import monitoring (real-time change detection, built on the RSS path — new in 0.7.0)
+from .monitor import (
+    MONITOR_SCHEMA_VERSION,
+    diff_trends,
+    filter_changes,
+    post_webhook,
+    watch_google_trends_rss,
+)
+from .normalize import SCHEMA_VERSION
+from .rss_downloader import (
+    download_google_trends_rss,
+    download_google_trends_rss_async,
+    download_google_trends_rss_batch,
+    download_google_trends_rss_batch_async,
+)
+
+# Import typed return shapes (static hints; runtime values are plain dicts)
+from .types import (
+    ComparisonEnvelope,
+    ComparisonPoint,
+    ComparisonRegionInterest,
+    ExploreEnvelope,
+    InterestPoint,
+    KeywordHistoryPoint,
+    KeywordSuggestion,
+    NewsArticle,
+    NormalizedEnvelope,
+    NormalizedTrend,
+    RegionInterest,
+    RelatedQuery,
+    Trend,
+    TrendChange,
+    TrendEnvelope,
+    TrendImage,
+)
+
+# Import cache utilities
+from .utils import (
+    clear_rss_cache,
+    get_rss_cache_stats,
+    set_rss_cache_ttl,
+)
+
+# Export public API
+__all__ = [
+    "__version__",
+    # Core downloaders
+    "download_google_trends_csv",  # Full-featured CSV download (480 trends, filtering)
+    "download_google_trends_rss",  # Fast RSS download (rich media, news articles)
+    "download_google_trends_rss_async",  # Async RSS download for parallel fetching
+    "download_google_trends_rss_batch",  # Batch RSS download with progress bar
+    "download_google_trends_rss_batch_async",  # Async batch RSS with progress bar (fastest)
+    # Explore path (keyword analysis over time)
+    "download_google_trends_interest_over_time",  # Keyword interest over time (pytrends core)
+    "download_google_trends_explore",  # Full Explore: interest + related + geo
+    "download_google_trends_comparison",  # Compare 2-5 keywords on one relative scale (1.1.0)
+    "clear_explore_cookies",  # Delete the cookie jar written by cookies="disk" (1.6.0)
+    "get_keyword_suggestions",  # Resolve text to topic candidates (1.8.0)
+    "KeywordSuggestion",
+    # Monitoring (real-time change detection, RSS-only — new in 0.7.0)
+    "watch_google_trends_rss",  # Poll the RSS feed and yield TrendChange events
+    "diff_trends",  # Pure diff of two RSS snapshots -> list[TrendChange]
+    "filter_changes",  # Filter changes by volume / event / watchlist
+    "post_webhook",  # Fire-and-forget POST of a change as JSON
+    # Cache control
+    "clear_rss_cache",  # Clear all cached RSS data
+    "get_rss_cache_stats",  # Get cache statistics (hits, misses, size)
+    "set_rss_cache_ttl",  # Set cache TTL (0 to disable; also governs the disk cache)
+    # Local archive + disk cache (new in 1.3.0; opt-in via archive=/cache="disk")
+    "read_archive",  # Read archived snapshots, newest first (filters + formats)
+    "get_keyword_history",  # Every archived appearance of a keyword, oldest first
+    "get_archive_stats",  # Counts, date range, geos, file size/path of the archive
+    "prune_archive",  # Delete snapshots older than a cutoff (explicit only)
+    # Exceptions (all subclass TrendspygException; also importable from trendspyg.exceptions)
+    "TrendspygException",  # Base class for every trendspyg error
+    "DownloadError",  # Download / network failure
+    "RateLimitError",  # Google throttled the request
+    "InvalidParameterError",  # Bad geo/hours/category/format argument
+    "BrowserError",  # Chrome / Selenium automation failure
+    "ParseError",  # RSS/CSV payload failed to parse
+    "ArchiveError",  # Local archive unreadable (writes never raise — they warn)
+    # Schema-version constants (detect envelope/shape drift)
+    "SCHEMA_VERSION",  # normalize=True NormalizedEnvelope schema
+    "EXPLORE_SCHEMA_VERSION",  # ExploreEnvelope schema
+    "MONITOR_SCHEMA_VERSION",  # TrendChange schema
+    "COMPARISON_SCHEMA_VERSION",  # ComparisonEnvelope schema (1.1.0)
+    # Typed return shapes
+    "Trend",  # TypedDict: single trend record
+    "NewsArticle",  # TypedDict: news article on a trend
+    "TrendImage",  # TypedDict: image on a trend
+    "TrendEnvelope",  # TypedDict: {fetched_at, geo, count, trends}
+    "NormalizedTrend",  # TypedDict: unified agent-friendly trend (normalize=True)
+    "NormalizedEnvelope",  # TypedDict: unified envelope (normalize=True)
+    "InterestPoint",  # TypedDict: one interest-over-time point
+    "RelatedQuery",  # TypedDict: a related search query (top/rising)
+    "RegionInterest",  # TypedDict: interest for one region
+    "ExploreEnvelope",  # TypedDict: full Explore result for a keyword
+    "ComparisonPoint",  # TypedDict: one multi-keyword comparison point (1.1.0)
+    "ComparisonRegionInterest",  # TypedDict: per-region values across compared keywords (1.1.0)
+    "ComparisonEnvelope",  # TypedDict: full multi-keyword comparison result (1.1.0)
+    "TrendChange",  # TypedDict: one change between two RSS snapshots (monitoring)
+    "KeywordHistoryPoint",  # TypedDict: one archived appearance of a keyword (1.3.0)
+]

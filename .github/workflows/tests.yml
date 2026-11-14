@@ -1,0 +1,92 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint:
+    name: Lint & type check
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .[analysis,async,cli,mcp]
+        # Pin gate tools to the versions the code was verified against, so an
+        # upstream linter release can't turn the gate red on its own.
+        pip install black==25.1.0 isort==8.0.1 flake8==7.3.0 mypy==1.20.2 \
+          types-tqdm==4.67.3.20260408 types-requests==2.32.4.20250913
+    - name: black (format check)
+      run: black --check trendspyg/ tests/ examples/
+    - name: isort (import order check)
+      run: isort --check-only --profile black --line-length 100 trendspyg/ tests/ examples/
+    - name: flake8 (lint)
+      run: flake8 trendspyg/ tests/ examples/
+    - name: mypy (type check)
+      run: mypy trendspyg/
+
+  # The MCP server supports two SDK lines (v1 FastMCP, v2 MCPServer). Fresh
+  # installs resolve v2, so the matrix above exercises v2; this job pins v1 so a
+  # change can never pass on one line and break the other unnoticed
+  # (2026-08-19: two v1-shaped test assertions reddened every 3.10+ cell).
+  mcp-sdk-v1:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v7
+    - uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+    - name: Install with the v1 MCP SDK line
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .[dev,analysis,async,cli] "mcp>=1.27,<2"
+        python -c "import importlib.metadata as m; v=m.version('mcp'); assert v.startswith('1.'), v; print('mcp', v)"
+    - name: MCP tests under SDK v1
+      run: pytest tests/test_mcp_server.py -v -o addopts=""
+
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v7
+      with:
+        python-version: ${{ matrix.python-version }}
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        # The mcp extra is marker-gated to Python 3.10+; on 3.8/3.9 cells it
+        # installs nothing and the MCP integration tests skip.
+        pip install -e .[dev,analysis,async,cli,mcp]
+
+    - name: Run tests with coverage
+      run: |
+        pytest tests/ -v --cov=trendspyg --cov-report=xml --cov-report=json --cov-report=term -m "not network" --cov-fail-under=95
+
+    # The aggregate floor above can hide one weak module behind a healthy
+    # average; this fails if ANY single module drops below 80%.
+    - name: Per-module coverage floor
+      run: python scripts/check_coverage_floor.py
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v7
+      if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+      with:
+        file: ./coverage.xml
+        fail_ci_if_error: false

@@ -1,0 +1,87 @@
+"""Custom exceptions for trendspyg."""
+
+
+class TrendspygException(Exception):
+    """Base exception for all trendspyg errors."""
+
+    pass
+
+
+class DownloadError(TrendspygException):
+    """Raised when download fails.
+
+    Common causes:
+    - Network connectivity issues
+    - Download timeout
+    - File save permission errors
+    """
+
+    pass
+
+
+class RateLimitError(TrendspygException):
+    """Raised when rate limit is exceeded.
+
+    Google Trends may temporarily block requests if too many are made. On the
+    RSS and CSV paths, waiting a few minutes is usually enough. On the Explore
+    path this is also raised at once for Google's hard 429 block page (roughly
+    8-10 fresh browser sessions in a short burst): stop for tens of minutes at
+    least — do not retry in a loop; identical repeats are free with
+    ``cache="disk"``.
+    """
+
+    pass
+
+
+class InvalidParameterError(TrendspygException):
+    """Raised when invalid parameters are provided.
+
+    Check that:
+    - geo is a valid country code (e.g., 'US', 'CA', 'UK')
+    - hours is one of: 4, 24, 48, 168
+    - category is valid (e.g., 'all', 'sports', 'technology')
+    """
+
+    pass
+
+
+class BrowserError(TrendspygException):
+    """Raised when browser automation fails.
+
+    Common causes:
+    - Chrome browser not installed
+    - ChromeDriver version mismatch
+    - Page load timeout
+    - UI element not found (Google may have changed their interface)
+
+    Solutions:
+    - Ensure Chrome browser is installed
+    - Update trendspyg: pip install --upgrade trendspyg
+    - Check GitHub issues for known UI changes
+    """
+
+    pass
+
+
+class ParseError(TrendspygException):
+    """Raised when parsing CSV/RSS data fails.
+
+    The downloaded file may be corrupted or in unexpected format.
+    """
+
+    pass
+
+
+class ArchiveError(TrendspygException):
+    """Raised when reading the local trends archive fails.
+
+    Common causes:
+    - The archive database file is corrupted or not a trendspyg archive
+    - The file was written by a newer trendspyg with a different layout
+    - No read permission on the archive path
+
+    Note: archive/cache WRITE failures during a download never raise — the
+    download still returns its data and a warning is emitted instead.
+    """
+
+    pass

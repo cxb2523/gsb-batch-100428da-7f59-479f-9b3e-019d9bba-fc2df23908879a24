@@ -1,0 +1,329 @@
+"""Typed return shapes for trendspyg public data.
+
+These are static-analysis hints only — runtime values are plain dicts. Exporting
+them means IDEs and coding agents (Claude Code, Codex, Gemini CLI, etc.) get
+autocomplete and type-checking without needing to scan the parser to learn the
+dict shape.
+
+Import from the package root:
+
+    from trendspyg import Trend, NewsArticle, TrendImage, TrendEnvelope
+
+The RSS TypedDicts use ``total=False`` — optional fields (``image``, ``news_articles``)
+are genuinely optional depending on the ``include_images`` / ``include_articles``
+flags passed to the downloader.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, TypedDict
+
+
+class KeywordSuggestion(TypedDict):
+    """One topic candidate; all fields present, with no popularity implied."""
+
+    mid: str
+    title: str
+    type: str
+
+
+class TrendImage(TypedDict, total=False):
+    """Image associated with a trend, from a news source."""
+
+    url: str
+    source: str
+
+
+class NewsArticle(TypedDict, total=False):
+    """A single news article attached to a trend."""
+
+    headline: str
+    url: str
+    source: str
+    image: str
+
+
+class Trend(TypedDict, total=False):
+    """A trending search term with metadata.
+
+    Keys:
+        trend: The search term (e.g. ``"Nia Long"``).
+        traffic: Human-readable traffic band (e.g. ``"50,000+"``).
+        traffic_min: Parsed lower bound of ``traffic`` as an int (new in 0.4.3).
+                     Use this for sorting/filtering; always present, 0 if unparseable.
+        published: ISO 8601 timestamp string, or a ``datetime`` before JSON serialization.
+        explore_link: URL to the Google Trends Explore page for this term.
+        image: Optional. Only present when ``include_images=True``.
+        news_articles: Optional. Only present when ``include_articles=True``.
+    """
+
+    trend: str
+    traffic: str
+    traffic_min: int
+    published: str
+    explore_link: str
+    image: TrendImage
+    news_articles: List[NewsArticle]
+
+
+class TrendEnvelope(TypedDict):
+    """Envelope wrapper returned by ``--envelope`` CLI flag (new in 0.4.3).
+
+    Useful for pipelines and archives where you need to know *when* and *where*
+    the snapshot was taken alongside the data itself.
+    """
+
+    fetched_at: str
+    geo: str
+    count: int
+    trends: List[Trend]
+
+
+class NormalizedTrend(TypedDict):
+    """A single trend in the unified, agent-friendly schema (``normalize=True``).
+
+    Unlike :class:`Trend`, every field here is **always present** and JSON-safe.
+    Fields a given source cannot provide are filled with ``None`` / ``[]`` —
+    never omitted — so an agent can rely on a fixed shape regardless of whether
+    the data came from the RSS or the CSV path.
+
+    Keys:
+        keyword: The search term, verbatim from the source.
+        rank: 1-based position in the source ordering.
+        volume_text: Raw human-readable volume (e.g. ``"5M+"``); ``""`` if unknown.
+        volume_min: Parsed lower bound of ``volume_text`` as an int; ``0`` if unparseable.
+        started_at: RSS publication time or CSV trend start, ISO 8601 or ``None``.
+        ended_at: ISO 8601 timestamp the trend ended, or ``None`` if still active.
+        is_active: ``True`` when ``ended_at`` is ``None``.
+        related_queries: Related search terms (CSV breakdown); ``[]`` for RSS.
+        news: News articles attached to the trend; ``[]`` for CSV.
+        image: Trend image, or ``None``.
+        explore_url: URL to the Google Trends Explore page for this term.
+    """
+
+    keyword: str
+    rank: int
+    volume_text: str
+    volume_min: int
+    started_at: Optional[str]
+    ended_at: Optional[str]
+    is_active: bool
+    related_queries: List[str]
+    news: List[NewsArticle]
+    image: Optional[TrendImage]
+    explore_url: str
+
+
+class NormalizedEnvelope(TypedDict):
+    """Envelope returned when ``normalize=True`` — unified across RSS and CSV.
+
+    The shape is identical no matter which download path produced it, so a
+    coding agent learns it once.
+    """
+
+    schema_version: str
+    source: str
+    geo: str
+    fetched_at: str
+    count: int
+    trends: List[NormalizedTrend]
+    request: Dict[str, Any]
+
+
+class InterestPoint(TypedDict):
+    """One point in an interest-over-time series (Explore path, new in 0.6.0).
+
+    Born JSON-safe — no ``normalize`` pass needed.
+
+    Keys:
+        date: ISO 8601 UTC timestamp of the period start.
+        value: Google's 0-100 relative-interest index.
+        is_partial: ``True`` for the final, still-in-progress period.
+    """
+
+    date: str
+    value: int
+    is_partial: bool
+
+
+class RelatedQuery(TypedDict):
+    """A related search query for an Explore keyword (new in 0.6.0).
+
+    Keys:
+        query: The related search term.
+        value: For ``top`` queries, a 0-100 relative score; for ``rising``
+            queries, the percent growth (e.g. ``3650``).
+        formatted_value: Google's display string, e.g. ``"100"``, ``"+3,650%"``
+            or ``"Breakout"``.
+        link: Absolute Google Trends Explore URL for the related term.
+    """
+
+    query: str
+    value: int
+    formatted_value: str
+    link: str
+
+
+class RegionInterest(TypedDict):
+    """Relative search interest for one region (Explore path, new in 0.6.0).
+
+    Keys:
+        geo_code: Region code (e.g. ``"US-CA"``).
+        geo_name: Human-readable region name (e.g. ``"California"``).
+        value: Google's 0-100 relative-interest index.
+    """
+
+    geo_code: str
+    geo_name: str
+    value: int
+
+
+class ExploreEnvelope(TypedDict):
+    """Full Explore result for a keyword (``download_google_trends_explore``).
+
+    New in 0.6.0. Every field present and JSON-safe — an agent learns the shape
+    once. ``related_queries`` / ``interest_by_region`` are empty lists when not
+    requested or not returned by Google (the time series is the guaranteed part).
+    """
+
+    schema_version: str
+    source: str
+    keyword: str
+    geo: str
+    timeframe: str
+    gprop: str  # 1.5.0 ("" = web, or images/news/youtube/froogle)
+    fetched_at: str
+    count: int
+    is_empty: bool  # 1.6.0 — Google had no data (all-zero series)
+    interest_over_time: List[InterestPoint]
+    related_queries: Dict[str, List[RelatedQuery]]
+    interest_by_region: List[RegionInterest]
+
+
+class ComparisonPoint(TypedDict):
+    """One point in a multi-keyword comparison series (new in 1.1.0).
+
+    Born JSON-safe. Values are keyed **by keyword** so no index juggling is
+    needed — Google returns them on a shared 0-100 scale, relative to the
+    strongest keyword in the comparison.
+
+    Keys:
+        date: ISO 8601 UTC timestamp of the period start.
+        values: ``{keyword: 0-100 relative interest}`` for every compared keyword.
+        is_partial: ``True`` for the final, still-in-progress period.
+    """
+
+    date: str
+    values: Dict[str, int]
+    is_partial: bool
+
+
+class ComparisonRegionInterest(TypedDict):
+    """Relative interest for one region across compared keywords (new in 1.1.0).
+
+    Keys:
+        geo_code: Region code (e.g. ``"US-WY"``).
+        geo_name: Human-readable region name (e.g. ``"Wyoming"``).
+        values: ``{keyword: 0-100 relative interest}`` within this region.
+        top_keyword: The compared keyword with the highest interest in this region.
+    """
+
+    geo_code: str
+    geo_name: str
+    values: Dict[str, int]
+    top_keyword: str
+
+
+class ComparisonEnvelope(TypedDict):
+    """Multi-keyword comparison result (``download_google_trends_comparison``).
+
+    New in 1.1.0. Every field present and JSON-safe. All values share one
+    relative 0-100 scale across the compared keywords — exactly what the
+    Google Trends comparison chart shows.
+    """
+
+    schema_version: str
+    source: str
+    keywords: List[str]
+    geo: str
+    timeframe: str
+    fetched_at: str
+    count: int
+    averages: Dict[str, int]
+    interest_over_time: List[ComparisonPoint]
+    interest_by_region: List[ComparisonRegionInterest]
+
+
+class _TrendChangeContext(TypedDict, total=False):
+    geo: str
+    observed_at: str
+
+
+class TrendChange(_TrendChangeContext):
+    """One change between two consecutive RSS snapshots (monitoring, new in 0.7.0).
+
+    Emitted by :func:`trendspyg.diff_trends` / :func:`trendspyg.watch_google_trends_rss`.
+    The six core fields are always present and JSON-safe; the ``None`` fields make the
+    direction unambiguous (a ``"new"`` trend has no ``prev_*``; a ``"dropped"``
+    one has no current ``rank``/``volume_min``).
+
+    Keys:
+        event: One of ``"new"``, ``"dropped"``, ``"volume_up"``, ``"volume_down"``,
+            ``"rank_change"``.
+        keyword: The trending search term.
+        rank: 1-based position in the *new* snapshot; ``None`` if the trend dropped out.
+        prev_rank: 1-based position in the *previous* snapshot; ``None`` if the trend is new.
+        volume_min: Parsed lower-bound traffic in the *new* snapshot; ``None`` if dropped.
+        prev_volume_min: Parsed lower-bound traffic in the *previous* snapshot; ``None`` if new.
+        geo: Present when the watcher uses ``include_context=True``.
+        observed_at: That poll's original UTC fetch time (with ``include_context=True``).
+    """
+
+    event: str
+    keyword: str
+    rank: Optional[int]
+    prev_rank: Optional[int]
+    volume_min: Optional[int]
+    prev_volume_min: Optional[int]
+
+
+class KeywordHistoryPoint(TypedDict):
+    """One archived appearance of a keyword (``get_keyword_history``, new in 1.3.0).
+
+    Every field always present and JSON-safe. Points are returned oldest first,
+    so the first element answers "when did this keyword first trend?".
+
+    Keys:
+        fetched_at: ISO 8601 UTC time the snapshot containing it was fetched.
+        geo: Region code of the snapshot.
+        source: Data path of the snapshot: ``"rss"``, ``"csv"``,
+            ``"explore"``, or ``"explore_comparison"``.
+        rank: 1-based position of the keyword in that snapshot; ``None`` for
+            Explore-path snapshots (research queries have no trending rank).
+        volume_min: Parsed lower-bound search volume; ``None`` if unknown.
+    """
+
+    fetched_at: str
+    geo: str
+    source: str
+    rank: Optional[int]
+    volume_min: Optional[int]
+
+
+__all__ = [
+    "TrendImage",
+    "NewsArticle",
+    "Trend",
+    "TrendEnvelope",
+    "NormalizedTrend",
+    "NormalizedEnvelope",
+    "InterestPoint",
+    "RelatedQuery",
+    "RegionInterest",
+    "ExploreEnvelope",
+    "ComparisonPoint",
+    "ComparisonRegionInterest",
+    "ComparisonEnvelope",
+    "TrendChange",
+    "KeywordHistoryPoint",
+]

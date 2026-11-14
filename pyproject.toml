@@ -1,0 +1,168 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trendspyg"
+version = "1.9.0"
+description = "Free, open-source Python library for Google Trends data: trending now, keyword interest over time, related queries, interest by region, 2-5-keyword comparison and YouTube/News/Images/Shopping interest. A maintained pytrends alternative with a pytrends-compatible TrendReq, a CLI and an MCP server for AI agents."
+readme = "README.md"
+authors = [
+    {name = "flack0x", email = "ali.marodis2@gmail.com"}
+]
+license = {text = "MIT"}
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+keywords = [
+    "google-trends",
+    "google-trends-api",
+    "google-trends-python",
+    "pytrends",
+    "pytrends-alternative",
+    "pytrends-compatible",
+    "trendreq",
+    "interest-over-time",
+    "interest-by-region",
+    "related-queries",
+    "keyword-comparison",
+    "youtube-trends",
+    "trending",
+    "trending-now",
+    "trending-searches",
+    "trends",
+    "mcp",
+    "mcp-server",
+    "ai-agents",
+    "web-scraping",
+    "seo",
+    "data-analysis",
+]
+requires-python = ">=3.8"
+dependencies = [
+    "selenium>=4.15.0",
+    "requests>=2.32.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-mock>=3.11.1",
+    "pytest-asyncio>=0.23.0",
+    "matplotlib>=3.7.0",  # exercises the keyword-study example in CI
+    "black>=23.7.0",
+    "flake8>=6.1.0",
+    "mypy>=1.5.0",
+    "isort>=5.12.0",
+    "types-tqdm>=4.65.0",
+    "types-requests>=2.31.0",
+]
+cli = [
+    "click>=8.0.0",
+    "tqdm>=4.65.0",
+]
+async = [
+    "aiohttp>=3.9.0",
+]
+analysis = [
+    "pandas>=2.0.0",
+    "pyarrow>=10.0.0",
+]
+mcp = [
+    # Dual-support: build_server() tries the v2 API (stable 2026-07-28) and
+    # falls back to the v1 line, so envs pinned to mcp<2 by other packages
+    # still work. The SDK needs Python 3.10+, so the extra is a no-op on
+    # 3.8/3.9 and the server module raises an actionable ImportError there.
+    "mcp>=1.27,<3; python_version >= '3.10'",
+]
+all = [
+    "click>=8.0.0",
+    "tqdm>=4.65.0",
+    "aiohttp>=3.9.0",
+    "pandas>=2.0.0",
+    "pyarrow>=10.0.0",
+    "mcp>=1.27,<3; python_version >= '3.10'",
+]
+
+[project.urls]
+Homepage = "https://github.com/flack0x/trendspyg"
+Documentation = "https://flack0x.github.io/trendspyg/"
+Repository = "https://github.com/flack0x/trendspyg"
+Issues = "https://github.com/flack0x/trendspyg/issues"
+Changelog = "https://github.com/flack0x/trendspyg/blob/main/CHANGELOG.md"
+"Agent Reference" = "https://github.com/flack0x/trendspyg/blob/main/AGENTS.md"
+
+[project.scripts]
+trendspyg = "trendspyg.cli:main"
+trendspyg-mcp = "trendspyg.mcp_server:main"
+
+[tool.setuptools]
+packages = ["trendspyg", "trendspyg.explore", "trendspyg.compat"]
+
+[tool.setuptools.package-data]
+trendspyg = ["py.typed"]
+
+[tool.black]
+line-length = 100
+target-version = ['py38', 'py39', 'py310', 'py311', 'py312', 'py313']
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "--cov=trendspyg --cov-report=term-missing --cov-report=html"
+asyncio_mode = "auto"
+markers = [
+    "network: tests that require network access",
+    "slow: tests that take a long time to run",
+    "asyncio: mark test as async",
+    "contract: weekly live checks that Google's real formats still match our fixtures (live-contract.yml)",
+]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_any_unimported = false
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+warn_unreachable = true
+strict_equality = true
+show_error_codes = true
+
+# Allow untyped calls for third-party libraries without stubs
+[[tool.mypy.overrides]]
+module = [
+    "selenium.*",
+    "pandas.*",
+    "aiohttp.*",
+    "click.*",
+    "mcp.*",
+    "mcp_types",
+]
+ignore_missing_imports = true
+# Don't type-check third-party library internals — their newer syntax (e.g. click's
+# match statements) must not fail our gate, which targets python_version 3.9.
+follow_imports = "skip"
