@@ -81,7 +81,10 @@ class NewsScraperPipeline:
         self.offline_mode = self.config.offline_mode
         
         # Initialize components
-        self.scraper = ArticleScraper(max_retries=self.config.max_retry_attempts)
+        self.scraper = ArticleScraper(
+            max_retries=self.config.max_retry_attempts,
+            min_interval_ms=self.config.scrape_min_interval_ms,
+        )
         self.summarizer = ArticleSummarizer(offline_mode=self.offline_mode)
         self.topic_extractor = TopicExtractor(offline_mode=self.offline_mode)
         self.embedder = ArticleEmbedder(offline_mode=self.offline_mode)

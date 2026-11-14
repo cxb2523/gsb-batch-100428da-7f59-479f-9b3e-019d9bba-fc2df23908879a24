@@ -64,6 +64,14 @@ PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "news_articles")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 MAX_RETRY_ATTEMPTS = int(os.getenv("MAX_RETRY_ATTEMPTS", 3))
 
+# Minimum delay between two scrapes that target the same host (milliseconds).
+# The batch scraper only waits when the previous request to the same host is
+# still inside this window; requests to other hosts are never delayed by it.
+try:
+    SCRAPE_MIN_INTERVAL_MS = float(os.getenv("SCRAPE_MIN_INTERVAL_MS", 500))
+except ValueError:
+    SCRAPE_MIN_INTERVAL_MS = 500.0
+
 def validate_config() -> bool:
     """
     Validates that all required configuration is present.
@@ -119,6 +127,8 @@ class Config:
     # Application settings
     max_retry_attempts: int = MAX_RETRY_ATTEMPTS
     log_level: str = LOG_LEVEL
+    # Minimum delay between two scrapes of the same host (milliseconds)
+    scrape_min_interval_ms: float = SCRAPE_MIN_INTERVAL_MS
     
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -139,7 +149,8 @@ class Config:
             "vector_db_type": self.vector_db_type,
             "vector_db_path": self.vector_db_path,
             "max_retry_attempts": self.max_retry_attempts,
-            "log_level": self.log_level
+            "log_level": self.log_level,
+            "scrape_min_interval_ms": self.scrape_min_interval_ms
         }
     
     def validate(self) -> bool:

@@ -8,7 +8,7 @@ extracting the headline, text content, publication date, and other metadata.
 import logging
 import time
 import re
-from typing import Dict, Optional, List, Any, Tuple
+from typing import Callable, Dict, Optional, List, Any, Tuple
 from urllib.parse import urlparse
 from dataclasses import dataclass
 
@@ -17,7 +17,12 @@ from newspaper import Article, ArticleException, Config
 from bs4 import BeautifulSoup
 from tqdm import tqdm
 
-from src.config import MAX_RETRY_ATTEMPTS
+from src.config import MAX_RETRY_ATTEMPTS, SCRAPE_MIN_INTERVAL_MS
+
+# Default used when no interval is supplied to ArticleScraper. Kept small so the
+# throttle does not noticeably slow down small batches while still protecting a
+# single site from a burst of consecutive requests.
+DEFAULT_MIN_SCRAPE_INTERVAL_MS = SCRAPE_MIN_INTERVAL_MS
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -35,20 +40,126 @@ class ScrapedArticle:
     image_url: Optional[str] = None
     article_posted: Optional[str] = None  # Publication date in ISO format
     article_indexed: Optional[str] = None  # When the article was scraped/indexed in ISO format
-    
+
     def __post_init__(self):
         """Initialize default values for optional fields."""
         if self.authors is None:
             self.authors = []
-        
+
         # Extract domain from URL if not provided
         if self.source_domain is None and self.url:
             parsed_url = urlparse(self.url)
             self.source_domain = parsed_url.netloc
-            
+
         # Set article_posted from publish_date if available
         if self.publish_date and not self.article_posted:
             self.article_posted = self.publish_date
+
+
+class FailureReason:
+    """Stable reason codes for URLs that could not be scraped in a batch."""
+    REQUEST_OR_PARSE_ERROR = "request_or_parse_error"
+    EMPTY_RESULT = "empty_result"
+    EMPTY_CONTENT = "empty_content"
+
+
+@dataclass
+class ScrapeOutcome:
+    """
+    Per-URL record produced by :meth:`ArticleScraper.scrape_urls`.
+
+    Attributes:
+        url: The URL exactly as it was passed to the batch entry point.
+        host: Lower-cased host name including a non-default port (``netloc``).
+        status: ``"success"`` or ``"failed"``.
+        waited_ms: Milliseconds actually spent waiting for the host throttle
+            before this URL was scraped (``0.0`` when no wait was needed).
+        headline: Article headline for successful scrapes.
+        text_length: Length of the cleaned article body for successful scrapes.
+        failure_reason: One of :class:`FailureReason` for failed scrapes.
+        error: Human readable error detail for failed scrapes (if available).
+        article: The scraped article object for successful scrapes.
+    """
+    url: str
+    host: str
+    status: str
+    waited_ms: float = 0.0
+    headline: Optional[str] = None
+    text_length: int = 0
+    failure_reason: Optional[str] = None
+    error: Optional[str] = None
+    article: Optional[ScrapedArticle] = None
+
+    @property
+    def succeeded(self) -> bool:
+        """Whether the URL produced a usable article."""
+        return self.status == "success"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return a JSON-friendly representation (excluding the article object)."""
+        return {
+            "url": self.url,
+            "host": self.host,
+            "status": self.status,
+            "waited_ms": self.waited_ms,
+            "headline": self.headline,
+            "text_length": self.text_length,
+            "failure_reason": self.failure_reason,
+            "error": self.error,
+        }
+
+
+class ScrapeBatchResult(list):
+    """
+    List of successfully scraped articles with per-URL outcome details.
+
+    This is a real ``list`` subclass, so existing callers that treat the result
+    of :meth:`ArticleScraper.scrape_urls` as ``List[ScrapedArticle]`` keep
+    working unchanged. In addition it exposes ``outcomes`` (one entry per input
+    URL, in input order) plus aggregate counters.
+    """
+
+    def __init__(self, outcomes: Optional[List[ScrapeOutcome]] = None):
+        self.outcomes = list(outcomes or [])
+        super().__init__(
+            outcome.article for outcome in self.outcomes
+            if outcome.succeeded and outcome.article is not None
+        )
+
+    @property
+    def articles(self) -> List[ScrapedArticle]:
+        """Alias returning the successful articles as a plain list."""
+        return list(self)
+
+    @property
+    def successes(self) -> List[ScrapeOutcome]:
+        """Outcome records for URLs that were scraped successfully."""
+        return [outcome for outcome in self.outcomes if outcome.succeeded]
+
+    @property
+    def failures(self) -> List[ScrapeOutcome]:
+        """Outcome records for URLs that failed."""
+        return [outcome for outcome in self.outcomes if not outcome.succeeded]
+
+    @property
+    def success_count(self) -> int:
+        """Number of URLs that were scraped successfully."""
+        return sum(1 for outcome in self.outcomes if outcome.succeeded)
+
+    @property
+    def failure_count(self) -> int:
+        """Number of URLs that failed."""
+        return len(self.outcomes) - self.success_count
+
+    @property
+    def total_waited_ms(self) -> float:
+        """Total milliseconds spent waiting on the per-host throttle."""
+        return sum(outcome.waited_ms for outcome in self.outcomes)
+
+    @property
+    def input_count(self) -> int:
+        """Number of URLs the batch was asked to scrape."""
+        return len(self.outcomes)
 
 
 class ArticleScraper:
@@ -91,14 +202,36 @@ class ArticleScraper:
         (r'Advertisement.*?\n', ''),  # Advertisement markers
     ]
     
-    def __init__(self, max_retries: int = MAX_RETRY_ATTEMPTS):
+    def __init__(
+        self,
+        max_retries: int = MAX_RETRY_ATTEMPTS,
+        min_interval_ms: Optional[float] = None,
+        clock: Optional[Callable[[], float]] = None,
+        sleep: Optional[Callable[[float], None]] = None,
+    ):
         """
         Initialize the ArticleScraper.
-        
+
         Args:
             max_retries: Maximum number of retry attempts for failed requests.
+            min_interval_ms: Minimum delay in milliseconds between two scrapes
+                that target the same host when using :meth:`scrape_urls`.
+                Defaults to ``SCRAPE_MIN_INTERVAL_MS`` (configurable through the
+                ``SCRAPE_MIN_INTERVAL_MS`` environment variable, 500 ms).
+            clock: Callable returning a monotonic time in seconds. Injectable for
+                tests; defaults to :func:`time.monotonic`.
+            sleep: Callable used to wait, receiving seconds. Injectable for
+                tests; defaults to :func:`time.sleep`.
         """
         self.max_retries = max_retries
+        if min_interval_ms is None:
+            min_interval_ms = DEFAULT_MIN_SCRAPE_INTERVAL_MS
+        self.min_interval_ms = max(0.0, float(min_interval_ms))
+        self._clock = clock or time.monotonic
+        self._sleep = sleep or time.sleep
+        # Per-host monotonic timestamp of the last scrape start, used by the
+        # batch throttle. Keyed by host name (including port), lower-cased.
+        self._host_last_start: Dict[str, float] = {}
         self.session = requests.Session()
         
         # Use a more realistic browser user agent
@@ -474,26 +607,150 @@ class ArticleScraper:
         
         return publish_date, authors, image_url
 
-    def scrape_urls(self, urls: List[str]) -> List[ScrapedArticle]:
+    @staticmethod
+    def _host_key(url: str) -> str:
         """
-        Scrape multiple URLs in sequence.
-        
+        Return the throttle key for a URL: its host name (including an explicit
+        port), lower-cased. URLs without a host resolve to an empty string, which
+        disables throttling for them.
+        """
+        try:
+            if not isinstance(url, str):
+                return ""
+            parsed = urlparse(url)
+        except (AttributeError, TypeError, ValueError):
+            return ""
+        netloc = parsed.netloc.lower()
+        # Ignore any userinfo, the throttle is per site, not per credentials.
+        if "@" in netloc:
+            netloc = netloc.rsplit("@", 1)[1]
+        return netloc
+
+    def _throttle(self, host: str) -> float:
+        """
+        Wait if the previous scrape of ``host`` started less than the minimum
+        interval ago, then remember the start of this scrape.
+
+        Spacing is measured between request starts against a monotonic clock,
+        so a slow previous request already satisfies the interval and no extra
+        sleep happens. Only the host being scraped is considered; other hosts
+        never block each other. Throttling never raises: if waiting fails, the
+        scrape still proceeds.
+
+        Args:
+            host: Host key obtained from :meth:`_host_key`.
+
+        Returns:
+            Milliseconds actually spent waiting.
+        """
+        interval = self.min_interval_ms / 1000.0
+        if interval <= 0 or not host:
+            return 0.0
+
+        previous = self._host_last_start.get(host)
+        waited = 0.0
+        if previous is not None:
+            remaining = previous + interval - self._clock()
+            if remaining > 0:
+                started = self._clock()
+                try:
+                    self._sleep(remaining)
+                except Exception as exc:  # throttling must not fail the scrape
+                    logger.warning(
+                        "Could not wait %.0f ms before scraping %s: %s",
+                        remaining * 1000.0, host, exc,
+                    )
+                waited = max(0.0, (self._clock() - started) * 1000.0)
+        self._host_last_start[host] = self._clock()
+        return waited
+
+    def _classify_result(self, article: Optional[ScrapedArticle]) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Derive a failure reason for a scrape result, if it is not usable.
+
+        Args:
+            article: Result returned by :meth:`scrape_url`.
+
+        Returns:
+            Tuple ``(failure_reason, error_detail)``. Both are ``None`` when the
+            article is usable.
+        """
+        if article is None:
+            return FailureReason.EMPTY_RESULT, None
+        if not article.text or not article.text.strip():
+            return FailureReason.EMPTY_CONTENT, None
+        return None, None
+
+    def scrape_urls(self, urls: List[str]) -> ScrapeBatchResult:
+        """
+        Scrape multiple URLs, throttling requests per host.
+
+        URLs are still requested one after another, but consecutive requests to
+        the same host (host name including port, lower-cased) are spaced by at
+        least ``min_interval_ms``. Requests to different hosts never wait for
+        each other. An exception raised while scraping one URL is recorded as a
+        failed outcome and does not abort the remaining URLs.
+
         Args:
             urls: List of URLs to scrape.
-            
+
         Returns:
-            List of successfully scraped ScrapedArticle objects.
+            ScrapeBatchResult: A list of successfully scraped ScrapedArticle
+            objects (unchanged shape for old callers) that also carries
+            ``outcomes`` with one record per input URL, in input order, plus
+            success/failure/wait counters.
         """
-        articles = []
-        
-        # Show progress bar for multiple URLs
+        outcomes: List[ScrapeOutcome] = []
+
         for url in tqdm(urls, desc="Scraping articles"):
-            article = self.scrape_url(url)
-            if article:
-                articles.append(article)
-        
-        logger.info(f"Successfully scraped {len(articles)} out of {len(urls)} articles")
-        return articles
+            host = self._host_key(url)
+            try:
+                waited_ms = self._throttle(host)
+            except Exception as exc:  # throttling must never fail a scrape
+                logger.warning(f"Could not throttle requests to {host}: {exc}")
+                waited_ms = 0.0
+
+            article: Optional[ScrapedArticle] = None
+            failure_reason: Optional[str] = None
+            error: Optional[str] = None
+            try:
+                article = self.scrape_url(url)
+                failure_reason, error = self._classify_result(article)
+            except Exception as exc:  # never let one URL abort the batch
+                logger.error(f"Error scraping {url}: {exc}")
+                failure_reason, error = FailureReason.REQUEST_OR_PARSE_ERROR, str(exc)
+                article = None
+
+            if failure_reason is None and article is not None:
+                outcomes.append(ScrapeOutcome(
+                    url=url,
+                    host=host,
+                    status="success",
+                    waited_ms=waited_ms,
+                    headline=article.headline,
+                    text_length=len(article.text or ""),
+                    article=article,
+                ))
+            else:
+                outcomes.append(ScrapeOutcome(
+                    url=url,
+                    host=host,
+                    status="failed",
+                    waited_ms=waited_ms,
+                    failure_reason=failure_reason,
+                    error=error,
+                ))
+
+        result = ScrapeBatchResult(outcomes)
+        logger.info(
+            "Batch scrape finished: %d succeeded, %d failed out of %d URL(s); "
+            "waited %.0f ms on per-host throttling",
+            result.success_count,
+            result.failure_count,
+            result.input_count,
+            result.total_waited_ms,
+        )
+        return result
 
     def _extract_with_beautiful_soup(self, url: str) -> Optional[ScrapedArticle]:
         """

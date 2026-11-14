@@ -75,6 +75,36 @@ Once you have installed the necessary packages, you can start using the AI News 
 4. **Search for topics**:
    Use the semantic search feature to find articles based on specific topics.
 
+### Batch scraping and per-site rate limiting
+
+`ArticleScraper.scrape_urls(urls)` scrapes a list of URLs sequentially while
+spacing requests **per host** (host name including port, lower-cased). Two
+consecutive requests to the same host are at least `SCRAPE_MIN_INTERVAL_MS`
+milliseconds apart; requests to different hosts never wait for each other.
+
+```bash
+# Default is 500 ms; export before running to change it
+export SCRAPE_MIN_INTERVAL_MS=1000
+```
+
+The return value is still a `list` of successfully scraped `ScrapedArticle`
+objects, so existing callers keep working. It is a `ScrapeBatchResult`, which
+also exposes one `outcomes` record per input URL (in input order):
+
+| field | meaning |
+| --- | --- |
+| `url` | original URL |
+| `host` | normalized host used for throttling |
+| `status` | `success` or `failed` |
+| `waited_ms` | milliseconds actually spent waiting for this host |
+| `headline`, `text_length` | title and body length on success |
+| `failure_reason` | `request_or_parse_error`, `empty_result` or `empty_content` |
+| `error` | exception message, when applicable |
+
+`success_count + failure_count == len(urls)`, a failing URL never aborts the
+rest of the batch, and one summary log line reports success/failure counts plus
+the total throttling wait.
+
 ## How It Works
 
 The AI News Scraper follows a systematic approach:
