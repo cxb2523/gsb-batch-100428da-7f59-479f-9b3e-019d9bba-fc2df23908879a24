@@ -172,6 +172,8 @@ The report includes counts of canonical timestamps, in-range rows, duplicate gro
 
 **Network errors:** A live provider needs access to the source. The `saved-html` provider supports offline parsing of a file you already have.
 
+**Partially failed multi-week ranges:** The HTML provider fetches each calendar week independently. When one week is blocked (for example by a security verification page) or fails to parse, that week is skipped, later weeks are still fetched, and events from the successful weeks are written to the CSV. A `Failed to fetch N calendar week(s):` summary listing each failed week's start date, reason, and raw error is printed to standard error; the command still exits successfully. If every requested week fails, the provider raises an `all_weeks_failed` error and the command exits with a non-zero status instead of writing an empty result.
+
 ## More Documentation
 
 - [FAQ: historical Forex Factory data, Python usage, backtesting, and troubleshooting](docs/faq.md)

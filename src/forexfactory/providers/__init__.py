@@ -1,6 +1,10 @@
 from .base import EconomicCalendarProvider, ProviderError
 from .forexfactory_export import ForexFactoryExportProvider
-from .forexfactory_html import ForexFactoryHtmlProvider
+from .forexfactory_html import (
+    ForexFactoryHtmlProvider,
+    WeeklyFetchFailure,
+    format_weekly_failures,
+)
 from .saved_html import SavedHtmlProvider
 
 __all__ = [
@@ -9,4 +13,6 @@ __all__ = [
     "ForexFactoryExportProvider",
     "ForexFactoryHtmlProvider",
     "SavedHtmlProvider",
+    "WeeklyFetchFailure",
+    "format_weekly_failures",
 ]

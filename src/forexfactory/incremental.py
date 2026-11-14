@@ -27,6 +27,9 @@ def scrape_incremental(
     """
     Fetch a requested date range with the chosen provider and merge it into the CSV cache.
     The merge is idempotent and preserves historical rows outside the requested range.
+
+    Returns the list of failed weeks (WeeklyFetchFailure) reported by the provider.
+    Providers that do not track per-week failures return an empty list.
     """
     ensure_csv_header(output_csv)
     existing_df = read_existing_data(output_csv)
@@ -35,11 +38,12 @@ def scrape_incremental(
     provider_kwargs.setdefault("scrape_details", scrape_details)
 
     events = provider.fetch_events(from_date, to_date, tzname, **provider_kwargs)
+    failed_weeks = list(getattr(provider, "weekly_failures", []) or [])
     df_new = pd.DataFrame(events)
     if df_new.empty:
         logger.info("Provider returned no events; CSV unchanged.")
         write_data_to_csv(existing_df, output_csv)
-        return
+        return failed_weeks
 
     if impact_filter and "impact" in df_new.columns:
         import re
@@ -53,3 +57,4 @@ def scrape_incremental(
     merged_df = merge_new_data(existing_df, df_new)
     write_data_to_csv(merged_df, output_csv)
     logger.info("Done. Added/updated %s provider rows.", max(len(merged_df) - len(existing_df), 0))
+    return failed_weeks

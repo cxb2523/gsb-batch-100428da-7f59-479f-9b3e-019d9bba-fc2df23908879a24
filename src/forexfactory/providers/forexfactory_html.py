@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from html import unescape
 from html.parser import HTMLParser
@@ -18,6 +19,39 @@ from .http import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Reason used when a weekly fetch fails for a reason that is not expressed as a
+# ProviderError (network errors, unexpected parsing errors, ...).
+GENERIC_FETCH_REASON = "request_failed"
+
+
+@dataclass
+class WeeklyFetchFailure:
+    """A single calendar week whose page could not be fetched or parsed."""
+
+    week_start: datetime
+    reason: str
+    error: str
+    url: str = ""
+
+    def as_dict(self) -> dict:
+        return {
+            "week_start": self.week_start.date().isoformat(),
+            "reason": self.reason,
+            "error": self.error,
+            "url": self.url,
+        }
+
+
+def format_weekly_failures(failures: list[WeeklyFetchFailure]) -> str:
+    """Render failed weeks as a human-readable multi-line summary."""
+    lines = [f"Failed to fetch {len(failures)} calendar week(s):"]
+    for failure in failures:
+        lines.append(
+            f"  - week of {failure.week_start.date().isoformat()} "
+            f"({failure.reason}): {failure.error}"
+        )
+    return "\n".join(lines)
 
 
 def _ff_date(dt: datetime) -> str:
@@ -166,26 +200,52 @@ class ForexFactoryHtmlProvider:
     def __init__(self, debug: bool = False, timeout: int = 30):
         self.debug = debug
         self.timeout = timeout
+        # Populated by fetch_events with the weeks that could not be scraped.
+        self.weekly_failures: list[WeeklyFetchFailure] = []
 
     def fetch_events(self, start_date: datetime, end_date: datetime, tzname: str, **kwargs) -> list[dict]:
         events: list[dict] = []
-        for week in iter_weeks(start_date, end_date):
+        self.weekly_failures = []
+        weeks = list(iter_weeks(start_date, end_date))
+        for week in weeks:
             url = f"https://www.forexfactory.com/calendar?week={_ff_date(week)}"
             logger.info("Fetching ForexFactory HTML: %s", url)
-            result = fetch_url(url, timeout=self.timeout)
-            export_links = discover_export_links(result.text, result.final_url)
-            issue = classify_http_calendar(result)
-            if issue:
-                if self.debug:
-                    dump_http_debug(result, issue, f"http_calendar_{week.date().isoformat()}", export_links)
-                raise ProviderError(issue, f"ForexFactory HTML fetch returned {issue} for {url}.")
-            if not calendar_rows_present(result.text):
-                if self.debug:
-                    dump_http_debug(result, "calendar_selector_missing", f"http_calendar_{week.date().isoformat()}", export_links)
-                raise ProviderError("calendar_selector_missing", f"Calendar rows were not found in fetched HTML for {url}.")
-            events.extend(parse_calendar_html(result.text, result.final_url, week, tzname))
+            try:
+                result = fetch_url(url, timeout=self.timeout)
+                export_links = discover_export_links(result.text, result.final_url)
+                issue = classify_http_calendar(result)
+                if issue:
+                    if self.debug:
+                        dump_http_debug(result, issue, f"http_calendar_{week.date().isoformat()}", export_links)
+                    raise ProviderError(issue, f"ForexFactory HTML fetch returned {issue} for {url}.")
+                if not calendar_rows_present(result.text):
+                    if self.debug:
+                        dump_http_debug(result, "calendar_selector_missing", f"http_calendar_{week.date().isoformat()}", export_links)
+                    raise ProviderError("calendar_selector_missing", f"Calendar rows were not found in fetched HTML for {url}.")
+                events.extend(parse_calendar_html(result.text, result.final_url, week, tzname))
+            except ProviderError as exc:
+                self._record_failure(week, exc.reason, str(exc), url)
+            except Exception as exc:  # network errors and unexpected parsing failures stay isolated to this week
+                self._record_failure(week, GENERIC_FETCH_REASON, f"{type(exc).__name__}: {exc}", url)
+
+        if weeks and len(self.weekly_failures) == len(weeks):
+            raise ProviderError(
+                "all_weeks_failed",
+                f"All {len(weeks)} calendar week(s) failed (all_weeks_failed):\n"
+                f"{format_weekly_failures(self.weekly_failures)}",
+            )
 
         return [
             event for event in events
             if event.get("datetime_local") and start_date.date().isoformat() <= event["date"] <= end_date.date().isoformat()
         ]
+
+    def _record_failure(self, week: datetime, reason: str, error: str, url: str) -> None:
+        failure = WeeklyFetchFailure(week_start=week, reason=reason, error=error, url=url)
+        self.weekly_failures.append(failure)
+        logger.warning(
+            "Skipping week of %s (%s): %s",
+            week.date().isoformat(),
+            reason,
+            error,
+        )

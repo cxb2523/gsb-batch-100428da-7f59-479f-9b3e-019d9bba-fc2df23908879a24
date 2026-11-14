@@ -1,11 +1,18 @@
 import argparse
 import logging
+import sys
 from datetime import datetime
 
 from dateutil.tz import gettz
 
 from .incremental import scrape_incremental
-from .providers import ForexFactoryExportProvider, ForexFactoryHtmlProvider, ProviderError, SavedHtmlProvider
+from .providers import (
+    ForexFactoryExportProvider,
+    ForexFactoryHtmlProvider,
+    ProviderError,
+    SavedHtmlProvider,
+    format_weekly_failures,
+)
 
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
@@ -99,7 +106,7 @@ def main(argv=None):
         provider_kwargs["all_dates"] = not (args.start and args.end)
 
     try:
-        scrape_incremental(
+        failed_weeks = scrape_incremental(
             from_date,
             to_date,
             args.csv,
@@ -112,6 +119,9 @@ def main(argv=None):
         )
     except (ProviderError, RuntimeError) as exc:
         parser.exit(4, f"error: {exc}\n")
+
+    if failed_weeks:
+        print(format_weekly_failures(failed_weeks), file=sys.stderr)
 
 
 if __name__ == "__main__":
