@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # The runtime modules (recorder, motor) bind Windows SendInput and a live
+      # display, so they can't be imported on a headless Linux runner. What CI
+      # can prove without a desktop: every module compiles, and the matcher's
+      # dependency stack resolves. That is exactly what this job checks.
+      - name: Compile all modules (syntax + bytecode)
+        run: python -m compileall -q reflex kernel journal
+
+      - name: Resolve runtime dependencies
+        run: pip install --quiet opencv-python-headless numpy mss

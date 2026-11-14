@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+frames/
+skills/
+*.log
+diag_find.jsonl
+mock_hits.jsonl
+mock_layout.json
+bench100/r*.log
+bench100/progress.txt
