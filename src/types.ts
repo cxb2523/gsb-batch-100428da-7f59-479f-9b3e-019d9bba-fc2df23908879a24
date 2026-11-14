@@ -419,3 +419,32 @@ export interface ApiResult<T> {
 	error?: string;
 	elapsedMs: number;
 }
+
+// ─── batch scrape ───────────────────────────────────────────────────────────
+
+export interface BatchScrapeRequest {
+	/** URLs to scrape, in the order results should be returned. */
+	urls: string[];
+	/** Maximum number of in-flight scrape requests. Defaults to 3. */
+	concurrency?: number;
+	/**
+	 * Formats requested for every URL. Accepts format entries (`{ type: "markdown" }`)
+	 * or bare format names (`"markdown"`). Defaults to the scrape endpoint default.
+	 */
+	formats?: NonNullable<ScrapeRequest["formats"]> | ScrapeFormat[];
+	/** Retries after the first attempt for retryable failures. Defaults to 2. */
+	maxRetries?: number;
+}
+
+export interface BatchScrapeResult {
+	url: string;
+	status: ApiResult<unknown>["status"];
+	/** Server response, passed through unchanged on success; `null` on failure. */
+	data: ScrapeResponse | null;
+	/** Original `ApiResult` error text on failure; `null` on success. */
+	error: string | null;
+	/** Number of attempts made for this URL (1 when no retry was needed). */
+	attempts: number;
+	/** Total wall-clock time spent on this URL, including retries and backoff. */
+	elapsedMs: number;
+}

@@ -3,6 +3,7 @@ export {
 	type ScrapeGraphAIClient,
 	type ScrapeGraphAIInput,
 	scrape,
+	batchScrape,
 	extract,
 	search,
 	getCredits,

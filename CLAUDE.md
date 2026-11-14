@@ -92,6 +92,7 @@ bun run playground
 | Method | Purpose |
 |--------|---------|
 | `sgai.scrape()` | AI data extraction from URL |
+| `sgai.batch.scrape()` | Scrape many URLs with bounded concurrency + retries |
 | `sgai.extract()` | Extract from raw HTML/text |
 | `sgai.search()` | Web search + extraction |
 | `sgai.crawl.start()` | Start crawl job |

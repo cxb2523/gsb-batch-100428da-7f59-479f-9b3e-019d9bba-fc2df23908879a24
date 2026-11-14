@@ -1,6 +1,8 @@
 import { env } from "./env.js";
 import type {
 	ApiResult,
+	BatchScrapeRequest,
+	BatchScrapeResult,
 	CrawlPagesQuery,
 	CrawlPagesResponse,
 	CrawlRequest,
@@ -62,6 +64,31 @@ function mapHttpError(status: number): string {
 	}
 }
 
+/** HTTP failures keep their status so batch retries can tell 429 apart from 4xx/5xx. */
+class HttpError extends Error {
+	readonly status: number;
+
+	constructor(status: number, message: string) {
+		super(message);
+		this.name = "HttpError";
+		this.status = status;
+	}
+}
+
+const NETWORK_ERROR_RE =
+	/fetch failed|network|econn(reset|refused|aborted)|enotfound|etimedout|socket hang up|timed? ?out/i;
+
+/** Only transient failures are retried: timeouts, network errors, and 429 rate limiting. */
+function isRetryableError(err: unknown): boolean {
+	if (err instanceof HttpError) return err.status === 429;
+	if (err instanceof DOMException && (err.name === "TimeoutError" || err.name === "AbortError"))
+		return true;
+	if (err instanceof TypeError) return true;
+	if (err instanceof SyntaxError) return false;
+	if (err instanceof Error) return NETWORK_ERROR_RE.test(err.message);
+	return false;
+}
+
 function parseServerTiming(header: string | null): number | null {
 	if (!header) return null;
 	const match = header.match(/dur=(\d+(?:\.\d+)?)/);
@@ -102,7 +129,7 @@ async function request<T>(
 				detail = `${detail}: ${typeof d === "string" ? d : JSON.stringify(d)}`;
 			}
 		} catch {}
-		throw new Error(detail);
+		throw new HttpError(res.status, detail);
 	}
 
 	const data = (await res.json()) as T;
@@ -112,16 +139,152 @@ async function request<T>(
 	return { data, elapsedMs };
 }
 
+async function scrapeDetailed(
+	apiKey: string,
+	params: ScrapeRequest,
+): Promise<{ result: ApiResult<ScrapeResponse>; error: unknown }> {
+	try {
+		const { data, elapsedMs } = await request<ScrapeResponse>("POST", "/scrape", apiKey, params);
+		return { result: ok(data, elapsedMs), error: null };
+	} catch (err) {
+		return { result: fail(err), error: err };
+	}
+}
+
 export async function scrape(
 	apiKey: string,
 	params: ScrapeRequest,
 ): Promise<ApiResult<ScrapeResponse>> {
-	try {
-		const { data, elapsedMs } = await request<ScrapeResponse>("POST", "/scrape", apiKey, params);
-		return ok(data, elapsedMs);
-	} catch (err) {
-		return fail(err);
+	return (await scrapeDetailed(apiKey, params)).result;
+}
+
+// ─── batch scrape ───────────────────────────────────────────────────────────
+
+const DEFAULT_BATCH_CONCURRENCY = 3;
+const DEFAULT_BATCH_MAX_RETRIES = 2;
+const MAX_RETRY_DELAY_MS = 10_000;
+
+/** Base delay between retries; exponential from there. Overridable so tests stay fast. */
+function retryBaseDelayMs(): number {
+	const raw = process.env.SGAI_BATCH_RETRY_BASE_MS;
+	if (raw === undefined) return 300;
+	const parsed = Number(raw);
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 300;
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function assertPositiveInteger(value: number | undefined, name: string, fallback: number): number {
+	if (value === undefined) return fallback;
+	if (!Number.isInteger(value) || value < 1)
+		throw new TypeError(`${name} must be a positive integer`);
+	return value;
+}
+
+function assertNonNegativeInteger(
+	value: number | undefined,
+	name: string,
+	fallback: number,
+): number {
+	if (value === undefined) return fallback;
+	if (!Number.isInteger(value) || value < 0)
+		throw new TypeError(`${name} must be a non-negative integer`);
+	return value;
+}
+
+function normalizeBatchFormats(formats: BatchScrapeRequest["formats"]): ScrapeRequest["formats"] {
+	if (!formats) return undefined;
+	return formats.map((format) =>
+		typeof format === "string" ? { type: format } : format,
+	) as ScrapeRequest["formats"];
+}
+
+async function scrapeWithRetry(
+	apiKey: string,
+	url: string,
+	formats: ScrapeRequest["formats"],
+	maxRetries: number,
+): Promise<BatchScrapeResult> {
+	const start = performance.now();
+	const params: ScrapeRequest = formats ? { url, formats } : { url };
+	let attempts = 0;
+	let last: ApiResult<ScrapeResponse>;
+
+	while (true) {
+		attempts++;
+		const { result, error } = await scrapeDetailed(apiKey, params);
+		last = result;
+
+		if (result.status === "success") break;
+		if (attempts > maxRetries) break;
+		if (!isRetryableError(error)) break;
+
+		const delay = Math.min(retryBaseDelayMs() * 2 ** (attempts - 1), MAX_RETRY_DELAY_MS);
+		if (delay > 0) await sleep(delay);
 	}
+
+	return {
+		url,
+		status: last.status,
+		data: last.data,
+		error: last.error ?? null,
+		attempts,
+		elapsedMs: Math.round(performance.now() - start),
+	};
+}
+
+async function mapWithConcurrency<T, R>(
+	items: T[],
+	limit: number,
+	fn: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+	const results = new Array<R>(items.length);
+	let next = 0;
+	const workerCount = Math.min(limit, items.length);
+
+	const worker = async () => {
+		while (true) {
+			const index = next++;
+			if (index >= items.length) return;
+			results[index] = await fn(items[index], index);
+		}
+	};
+
+	await Promise.all(Array.from({ length: workerCount }, worker));
+	return results;
+}
+
+/**
+ * Scrape many URLs with a bounded number of in-flight requests.
+ *
+ * Each URL goes through the regular `scrape` path, so successful results keep
+ * their server payload and failures keep their mapped error text. Results are
+ * returned in input order; failures are reported per item and never thrown.
+ */
+export async function batchScrape(
+	apiKey: string,
+	params: BatchScrapeRequest,
+): Promise<BatchScrapeResult[]> {
+	if (!Array.isArray(params.urls) || params.urls.some((url) => typeof url !== "string"))
+		throw new TypeError("urls must be an array of strings");
+
+	const concurrency = assertPositiveInteger(
+		params.concurrency,
+		"concurrency",
+		DEFAULT_BATCH_CONCURRENCY,
+	);
+	const maxRetries = assertNonNegativeInteger(
+		params.maxRetries,
+		"maxRetries",
+		DEFAULT_BATCH_MAX_RETRIES,
+	);
+	const formats = normalizeBatchFormats(params.formats);
+
+	return mapWithConcurrency(params.urls, concurrency, (url) =>
+		scrapeWithRetry(apiKey, url, formats, maxRetries),
+	);
 }
 
 export async function extract(
@@ -388,6 +551,9 @@ export function ScrapeGraphAI(opts?: ScrapeGraphAIInput) {
 	const key = resolveApiKey(opts);
 	return {
 		scrape: (params: ScrapeRequest) => scrape(key, params),
+		batch: {
+			scrape: (params: BatchScrapeRequest) => batchScrape(key, params),
+		},
 		extract: (params: ExtractRequestBase) => extract(key, params),
 		search: (params: SearchRequest) => search(key, params),
 		credits: () => getCredits(key),

@@ -126,6 +126,29 @@ const res = await sgai.scrape({
 - `branding` — Brand colors, typography, logos
 - `screenshot` — Page screenshot (fullPage, width, height, quality)
 
+### batch.scrape
+
+Scrape many URLs with bounded concurrency, retries, and per-URL results.
+
+```ts
+const results = await sgai.batch.scrape({
+  urls: ["https://a.com", "https://b.com", "https://c.com"],
+  concurrency: 3,                                  // in-flight limit (default 3)
+  formats: [{ type: "markdown" }],                 // applied to every URL
+  maxRetries: 2,                                   // retries per URL (default 2)
+});
+
+for (const r of results) {
+  // r.url, r.status, r.data, r.error, r.attempts, r.elapsedMs
+  if (r.status === "error") console.error(r.url, r.error, `after ${r.attempts} attempt(s)`);
+}
+```
+
+- Results come back in the same order as `urls`.
+- Each URL runs through the regular `scrape` path, so `data` on success and `error` on failure keep their usual shape and messages.
+- Only timeouts, network errors, and HTTP 429 are retried, with exponential backoff. Other errors (401, 402, 422, …) fail immediately.
+- A failing URL does not stop the others, and the call never throws for per-URL failures.
+
 ### extract
 
 Extract structured data from a URL, HTML, or markdown using AI.
@@ -253,6 +276,7 @@ const health = await sgai.healthy();
 | scrape | [`scrape_json_extraction.ts`](examples/scrape/scrape_json_extraction.ts) | Structured JSON extraction with schema |
 | scrape | [`scrape_pdf.ts`](examples/scrape/scrape_pdf.ts) | PDF document parsing with OCR metadata |
 | scrape | [`scrape_with_fetchconfig.ts`](examples/scrape/scrape_with_fetchconfig.ts) | JS rendering, stealth mode, scrolling |
+| scrape | [`scrape_batch.ts`](examples/scrape/scrape_batch.ts) | Batch scrape many URLs with bounded concurrency and retries |
 | extract | [`extract_basic.ts`](examples/extract/extract_basic.ts) | AI data extraction from URL |
 | extract | [`extract_with_schema.ts`](examples/extract/extract_with_schema.ts) | Extraction with JSON schema |
 | search | [`search_basic.ts`](examples/search/search_basic.ts) | Web search with results |
@@ -273,6 +297,7 @@ const health = await sgai.healthy();
 | `SGAI_API_URL` | Override API base URL | `https://v2-api.scrapegraphai.com/api` |
 | `SGAI_DEBUG` | Enable debug logging (`"1"`) | off |
 | `SGAI_TIMEOUT` | Request timeout in seconds | `120` |
+| `SGAI_BATCH_RETRY_BASE_MS` | Base backoff for `batch.scrape` retries (doubles per attempt) | `300` |
 
 ## Development
 
