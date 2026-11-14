@@ -107,6 +107,16 @@ def main() -> int:
 
     report = know.index(force=args.rebuild, verbose=args.verbose)
     print("结果：%s" % report.summary())
+    if report.failed:
+        print("\nOCR 失败 %d 个（已记入待重试清单，下次建索引自动再试）：" % len(report.failed))
+        for name, why in report.failed:
+            print("   %-54s %s" % (name[:52], why))
+    pending = know.pending_ocr()
+    if pending:
+        print("\n待重试清单共 %d 个（含之前轮次欠下的，重启不丢）：" % len(pending))
+        for row in pending:
+            print("   %-54s %s（已试 %d 次）" % (
+                Path(row["path"]).name[:52], row["reason"], row["attempts"]))
     if report.skipped:
         print("\n跳过 %d 个（这些不会被 AI 引用）：" % len(report.skipped))
         for name, why in report.skipped:

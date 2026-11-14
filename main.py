@@ -204,6 +204,16 @@ def index_knowledge(cfg: AppConfig, force: bool = False, verbose: bool = True) -
         return 1
     report = know.index(force=force, verbose=verbose)
     print("通知材料库：%s" % report.summary())
+    if report.failed:
+        print("\nOCR 失败 %d 个（已记入待重试清单，下次索引自动再试）：" % len(report.failed))
+        for name, why in report.failed[:40]:
+            print("   %s —— %s" % (name[:52], why))
+    pending = know.pending_ocr()
+    if pending:
+        print("\n待重试清单共 %d 个（含之前轮次欠下的）：" % len(pending))
+        for row in pending[:40]:
+            print("   %s —— %s（已试 %d 次）" % (
+                Path(row["path"]).name[:52], row["reason"], row["attempts"]))
     if report.skipped:
         print("\n跳过 %d 个（这些不会被 AI 引用）：" % len(report.skipped))
         for name, why in report.skipped[:40]:
@@ -305,6 +315,8 @@ class WeChatBot:
             if self.cfg.knowledge.auto_index:
                 report = self.knowledge.index()
                 log.info("通知材料库：%s", report.summary())
+                for name, why in report.failed[:10]:
+                    log.warning("   OCR 失败待重试 %s —— %s", name[:48], why)
                 for name, why in report.skipped[:10]:
                     log.info("   跳过 %s —— %s", name[:48], why)
                 if len(report.skipped) > 10:

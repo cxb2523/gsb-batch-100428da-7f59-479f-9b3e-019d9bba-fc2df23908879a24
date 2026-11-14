@@ -262,7 +262,19 @@ _PREFER_LANGS = ("zh-Hans-CN", "zh-Hans", "zh-Hant-TW", "zh-Hant", "ja", "en-US"
 
 
 class OcrUnavailable(Exception):
-    """这台机器上没有可用的 OCR（需要 Windows 10/11 自带的中文 OCR）。"""
+    """这台机器上没有可用的 OCR（需要 Windows 10/11 自带的中文 OCR）。
+
+    这是「引擎级」的问题：没装 winsdk、没装中文语言包、子进程根本起不来。
+    这种情况下整批文件都不该被记成「失败」—— 不是文件的错，修好之后自然能跑。
+    """
+
+
+class OcrFailed(Exception):
+    """这一份文件的 OCR 没跑成（子进程崩溃/超时/没给出结果）。
+
+    和 OcrUnavailable 的区别：引擎是好的，只是这一份没认出来。这种失败会
+    记进「待重试」清单（ocr_pending 表），下次索引自动再试，成功就销账。
+    """
 
 
 def join_ocr_spaces(text: str) -> str:
@@ -316,7 +328,7 @@ def ocr_available(prefer: str = "") -> Tuple[bool, str]:
     try:
         payload = _run_worker(["--mode", "check"] + (["--lang", prefer] if prefer else []),
                               timeout=90)
-    except OcrUnavailable as exc:
+    except (OcrUnavailable, OcrFailed) as exc:
         return False, str(exc)
     if not payload.get("ok"):
         return False, str(payload.get("why") or "Windows OCR 用不了")
@@ -352,7 +364,12 @@ def _python_exe() -> str:
 
 
 def _run_worker(args: Sequence[str], timeout: float) -> Dict[str, Any]:
-    """让子进程去 OCR，把 JSON 结果读回来。失败一律抛 OcrUnavailable。"""
+    """让子进程去 OCR，把 JSON 结果读回来。
+
+    失败分两类，别混在一起：
+      OcrUnavailable —— 引擎级（子进程都调不起来），整批都跑不了，不该记单份的账
+      OcrFailed      —— 这一份的事（超时、子进程崩了、结果文件缺失/解析不了）
+    """
     tmp = tempfile.mkdtemp(prefix="dsbot-ocr-")
     out = Path(tmp) / "result.json"
     cmd = [_python_exe(), "-X", "utf8", str(_WORKER), "--out", str(out)] + list(args)
@@ -362,7 +379,7 @@ def _run_worker(args: Sequence[str], timeout: float) -> Dict[str, Any]:
             proc = subprocess.run(cmd, capture_output=True, timeout=timeout, env=env,
                                   cwd=str(_WORKER.parent.parent))
         except subprocess.TimeoutExpired:
-            raise OcrUnavailable("OCR 算了超过 %d 秒还没完，这份先跳过" % int(timeout))
+            raise OcrFailed("OCR 超时（算了超过 %d 秒还没完）" % int(timeout))
         except OSError as exc:
             raise OcrUnavailable("调不起 OCR 子进程：%s" % exc)
         # 子进程是「写完结果再退出」，所以哪怕它退出码不好看，结果照样算数
@@ -375,8 +392,8 @@ def _run_worker(args: Sequence[str], timeout: float) -> Dict[str, Any]:
             return payload
         err = (proc.stderr or b"").decode("utf-8", "replace").strip()
         err = "；".join(line for line in err.splitlines()[-3:])
-        raise OcrUnavailable("OCR 子进程没给出结果（退出码 %s）%s"
-                             % (proc.returncode, "：" + err if err else ""))
+        raise OcrFailed("OCR 子进程没给出结果（退出码 %s）%s"
+                        % (proc.returncode, "：" + err if err else ""))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -456,6 +473,14 @@ async def _ocr_pdf_task(path: Path, dpi: int, max_pages: int, max_chars: int,
     return "\n".join(parts), done, total
 
 
+def _raise_ocr(payload: Dict[str, Any]) -> None:
+    """子进程说「没成」：区分是引擎没了（unavailable）还是这一份没认出来。"""
+    why = str(payload.get("why") or "OCR 没认出东西")
+    if payload.get("unavailable"):
+        raise OcrUnavailable(why)
+    raise OcrFailed(why)
+
+
 def ocr_pdf(path: Path, *, dpi: int = 300, max_pages: int = 10,
             max_chars: int = 3000, lang: str = "") -> Tuple[str, int, int]:
     """把扫描件 PDF 认成文字。返回 (正文, 识别了几页, 共几页)。"""
@@ -465,7 +490,7 @@ def ocr_pdf(path: Path, *, dpi: int = 300, max_pages: int = 10,
          "--dpi", str(int(dpi)), "--max-pages", str(pages), "--max-chars", str(int(max_chars))],
         timeout=min(600.0, 90.0 + 25.0 * pages))
     if not payload.get("ok"):
-        raise OcrUnavailable(str(payload.get("why") or "OCR 没认出东西"))
+        _raise_ocr(payload)
     return (str(payload.get("text") or ""), int(payload.get("pages") or 0),
             int(payload.get("total") or 0))
 
@@ -475,7 +500,7 @@ def ocr_image(path: Path, *, lang: str = "") -> str:
     payload = _run_worker(["--mode", "image", "--path", str(path), "--lang", lang or ""],
                           timeout=120.0)
     if not payload.get("ok"):
-        raise OcrUnavailable(str(payload.get("why") or "OCR 没认出东西"))
+        _raise_ocr(payload)
     return str(payload.get("text") or "")
 
 
@@ -635,6 +660,8 @@ class IndexReport:
     removed: int = 0
     skipped_unchanged: int = 0      # 上次就跳过了、这次连读都不用读的
     skipped: List[Tuple[str, str]] = field(default_factory=list)
+    failed: List[Tuple[str, str]] = field(default_factory=list)  # OCR 失败，待下轮重试
+    ocr_engine_down: str = ""       # OCR 引擎级问题（不是单份文件的错），空 = 引擎正常
     docs: int = 0
     chars: int = 0
     seconds: float = 0.0
@@ -646,10 +673,15 @@ class IndexReport:
             bits.append("移除 %d" % self.removed)
         if self.skipped:
             bits.append("跳过 %d" % len(self.skipped))
+        if self.failed:
+            bits.append("OCR 失败待重试 %d" % len(self.failed))
         if self.skipped_unchanged:
             bits.append("另有 %d 个上次已跳过（不再重读）" % self.skipped_unchanged)
-        return "、".join(bits) + "；库里现有 %d 份材料、约 %d 字（%.1fs）" % (
+        tail = "；库里现有 %d 份材料、约 %d 字（%.1fs）" % (
             self.docs, self.chars, self.seconds)
+        if self.ocr_engine_down:
+            tail += "。注意：OCR 引擎不可用 —— %s" % self.ocr_engine_down
+        return "、".join(bits) + tail
 
 
 # ---------------------------------------------------------------- 主类
@@ -733,12 +765,24 @@ class Knowledge:
                 size INTEGER,
                 reason TEXT
             );
+            CREATE TABLE IF NOT EXISTS ocr_pending (
+                path TEXT PRIMARY KEY,
+                mtime REAL,
+                size INTEGER,
+                reason TEXT,
+                attempts INTEGER,
+                updated_at REAL
+            );
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
             """
         )
+        # 老版本把「OCR 失败/用不了」当成永久跳过写进了 skips，文件没动就永远不再试。
+        # 现在这类情况走 ocr_pending 待重试，把老账清掉，让那批文件重新进入索引流程。
+        self._conn.execute(
+            "DELETE FROM skips WHERE reason LIKE '扫描件，OCR%'")
         self._conn.commit()
 
     def close(self) -> None:
@@ -837,12 +881,23 @@ class Knowledge:
         # 被拦下的文件（含隐私、重复、扫描件）也按 mtime+size 记一笔，
         # 否则每次启动都要把那几十个学生名单重新解析一遍，白白等十几秒。
         prev_skips = {row["path"]: row for row in self._conn.execute("SELECT * FROM skips")}
+        # 上轮 OCR 失败的文件：这轮自动重试（它们不在 docs/skips 里，自然会被重新处理），
+        # 成功或改判就销账，还失败就更新原因和次数。清单在 SQLite 里，重启不丢。
+        prev_pending = {row["path"]: row
+                        for row in self._conn.execute("SELECT * FROM ocr_pending")}
+        seen_pending = set()
+        ocr_down = ""               # 一旦确认引擎级故障，本轮剩下的文件不再挨个撞
         seen_paths = set()
         seen_skips = set()
         removed_any = False
 
+        def forget_pending():
+            with self._conn:
+                self._conn.execute("DELETE FROM ocr_pending WHERE path=?", (key,))
+
         def remember_skip(reason):
             report.skipped.append((path.name, reason))
+            forget_pending()        # 有了明确结论（隐私/重复/太大…），OCR 旧账一笔勾销
             if key in known:      # 以前进过库，现在不符合条件了（比如改了排除词）→ 清掉旧的
                 with self._conn:
                     self._conn.execute("DELETE FROM chunks WHERE doc_id=?", (known[key]["id"],))
@@ -912,24 +967,47 @@ class Knowledge:
             if (self.ocr_enabled and suffix in IMG_EXTS + (".pdf",)
                     and len(text) < self.ocr_trigger_chars):
                 ocr_ran = True
-                try:
-                    if suffix in IMG_EXTS:
-                        ocr_text, ocr_pages = ocr_image(path, lang=self.ocr_lang), 1
-                    else:
-                        ocr_text, ocr_pages, _total = ocr_pdf(
-                            path, dpi=self.ocr_dpi, max_pages=self.ocr_max_pages,
-                            max_chars=self.ocr_max_chars, lang=self.ocr_lang)
-                except OcrUnavailable as exc:
+                if ocr_down:
+                    # 引擎已经确认不行了：别再挨个起子进程撞一遍。不写 skips、不记失败，
+                    # 这不是文件的错 —— 下轮索引（或修好语言包后）自然会再试。
                     if not text.strip():
-                        remember_skip("扫描件，OCR 用不了：%s" % exc)
-                        continue
-                except Exception as exc:
-                    if not text.strip():
-                        remember_skip("扫描件，OCR 失败：%s" % exc)
+                        report.skipped.append(
+                            (path.name, "扫描件，OCR 引擎不可用，本轮跳过（不记失败）：%s"
+                             % ocr_down))
                         continue
                 else:
-                    if len(ocr_text) > len(text):
-                        text, kind = ocr_text, kind + "+ocr"
+                    try:
+                        if suffix in IMG_EXTS:
+                            ocr_text, ocr_pages = ocr_image(path, lang=self.ocr_lang), 1
+                        else:
+                            ocr_text, ocr_pages, _total = ocr_pdf(
+                                path, dpi=self.ocr_dpi, max_pages=self.ocr_max_pages,
+                                max_chars=self.ocr_max_chars, lang=self.ocr_lang)
+                    except OcrUnavailable as exc:
+                        # 引擎级故障（没装语言包、子进程起不来）：只记一次，不记单份的账
+                        ocr_down = str(exc)
+                        report.ocr_engine_down = ocr_down
+                        if not text.strip():
+                            report.skipped.append(
+                                (path.name, "扫描件，OCR 引擎不可用：%s" % exc))
+                            continue
+                    except OcrFailed as exc:
+                        # 这一份的事：记进待重试清单，其余文件照常入库
+                        if not text.strip():
+                            self._ocr_pending_note(key, stat, str(exc))
+                            seen_pending.add(key)
+                            report.failed.append((path.name, str(exc)))
+                            continue
+                    except Exception as exc:            # noqa: BLE001
+                        # 意料外的错也按单份失败记账，不能拖垮整批
+                        if not text.strip():
+                            self._ocr_pending_note(key, stat, "OCR 失败：%s" % exc)
+                            seen_pending.add(key)
+                            report.failed.append((path.name, "OCR 失败：%s" % exc))
+                            continue
+                    else:
+                        if len(ocr_text) > len(text):
+                            text, kind = ocr_text, kind + "+ocr"
             if len(text) < self.min_chars:
                 if ocr_ran:
                     remember_skip("文字太少（OCR 只认出 %d 字），大概是照片/表情包"
@@ -956,6 +1034,7 @@ class Knowledge:
                 continue
             with self._conn:                     # 这份现在进库了，旧的跳过记录作废
                 self._conn.execute("DELETE FROM skips WHERE path=?", (key,))
+            forget_pending()                     # OCR 欠的账也销了
             seen_skips.add(key)
             note = "（OCR %d 页）" % ocr_pages if ocr_pages and "ocr" in kind else ""
             if old:
@@ -987,6 +1066,12 @@ class Knowledge:
             for path in [p for p in prev_skips if p not in seen_skips]:
                 with self._conn:
                     self._conn.execute("DELETE FROM skips WHERE path=?", (path,))
+        for path in [p for p in prev_pending if p not in seen_pending]:
+            # 文件没了，欠的 OCR 账跟着销；文件还在只是这轮没扫到（比如 --no-wechat
+            # 或到单次上限），就留着等下轮 —— 和上面材料库的处理一个规矩。
+            if not os.path.isfile(path):
+                with self._conn:
+                    self._conn.execute("DELETE FROM ocr_pending WHERE path=?", (path,))
         with self._conn:
             self._conn.execute("INSERT INTO meta(key,value) VALUES('gate',?) "
                                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -998,6 +1083,27 @@ class Knowledge:
         report.chars = stats["chars"]
         report.seconds = time.time() - started
         return report
+
+    def _ocr_pending_note(self, key: str, stat: Any, reason: str) -> None:
+        """记一笔 OCR 失败待重试。同一份文件反复失败就累加次数、更新原因。"""
+        row = self._conn.execute(
+            "SELECT attempts FROM ocr_pending WHERE path=?", (key,)).fetchone()
+        attempts = (int(row["attempts"]) if row else 0) + 1
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO ocr_pending(path,mtime,size,reason,attempts,updated_at) "
+                "VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(path) DO UPDATE SET mtime=excluded.mtime, "
+                "size=excluded.size, reason=excluded.reason, "
+                "attempts=excluded.attempts, updated_at=excluded.updated_at",
+                (key, stat.st_mtime, stat.st_size, reason, attempts, time.time()))
+
+    def pending_ocr(self) -> List[Dict[str, Any]]:
+        """OCR 失败待重试的清单（落盘在 SQLite 里，重启后还在）。"""
+        rows = self._conn.execute(
+            "SELECT path, reason, attempts, updated_at FROM ocr_pending "
+            "ORDER BY updated_at DESC").fetchall()
+        return [dict(row) for row in rows]
 
     def _store(self, path: Path, text: str, kind: str, stat: Any) -> None:
         digest = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
@@ -1024,6 +1130,7 @@ class Knowledge:
             self._conn.execute("DELETE FROM chunks")
             self._conn.execute("DELETE FROM docs")
             self._conn.execute("DELETE FROM skips")
+            self._conn.execute("DELETE FROM ocr_pending")
         self._postings = None
 
     # ------------------------------------------------------------ 检索

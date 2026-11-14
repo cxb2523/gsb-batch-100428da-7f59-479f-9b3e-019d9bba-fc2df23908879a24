@@ -650,6 +650,225 @@ def test_ocr_image_end_to_end():
     print("  OK OCR 端到端：画一张图 → 认成文字 → 入库 → 搜得到")
 
 
+def _patch_ocr_worker(outcomes):
+    """把 OCR 子进程换成假的：不真起进程，按文件名装出各种子进程结局。
+
+    outcomes 里每个文件名对应一种结局：
+        ("ok", 文字)            正常写出结果文件，退出码 0
+        ("exit", 退出码, 报错)   子进程崩了：非零退出，结果文件压根没写
+        ("missing",)             退出码 0 但结果文件缺失（没写完就被打断）
+        ("timeout",)             子进程卡住，超时
+        ("unavailable", 原因)    引擎级故障（比如没装中文语言包）
+    返回还原函数，用完必须调回去（patch 的是 subprocess 模块本身）。
+    """
+    import dsbot.knowledge as kn
+
+    real_run = kn.subprocess.run
+
+    class _Proc:
+        def __init__(self, returncode=0, stderr=b""):
+            self.returncode = returncode
+            self.stderr = stderr
+
+    def fake_run(cmd, capture_output=False, timeout=None, env=None, cwd=None):
+        out = Path(cmd[cmd.index("--out") + 1])
+        name = Path(cmd[cmd.index("--path") + 1]).name if "--path" in cmd else ""
+        outcome = outcomes.get(name, ("ok", "识别出的通知正文"))
+        kind = outcome[0]
+        if kind == "ok":
+            out.write_text(json.dumps(
+                {"ok": True, "text": outcome[1], "pages": 1, "total": 1},
+                ensure_ascii=False), encoding="utf-8")
+            return _Proc(0)
+        if kind == "unavailable":
+            out.write_text(json.dumps(
+                {"ok": False, "unavailable": True, "why": outcome[1]},
+                ensure_ascii=False), encoding="utf-8")
+            return _Proc(1)
+        if kind == "exit":
+            return _Proc(outcome[1], outcome[2].encode("utf-8"))
+        if kind == "missing":
+            return _Proc(0)
+        if kind == "timeout":
+            raise kn.subprocess.TimeoutExpired(cmd, timeout)
+        raise AssertionError("未知的假结局：%r" % (outcome,))
+
+    kn.subprocess.run = fake_run
+
+    def restore():
+        kn.subprocess.run = real_run
+
+    return restore
+
+
+def _ocr_knowledge(tmp, src):
+    return Knowledge(tmp / "k.sqlite3", dirs=[str(src)], root=tmp,
+                     min_chars=10, ocr={"enabled": True, "trigger_chars": 60})
+
+
+def test_ocr_failure_is_resumable():
+    """单份 OCR 失败 = 记进待重试清单，其余照常入库；下轮自动重试，成功就销账。"""
+    long_text = "关于2026年秋季体测的通知，请各班于10月19日到东一体育场集合参加测试。"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = tmp / "knowledge"
+        src.mkdir()
+        for name in ("通知一.png", "通知二.png", "通知三.png"):
+            (src / name).write_bytes(b"\x89PNG fake " + name.encode("utf-8"))
+
+        outcomes = {
+            "通知一.png": ("ok", long_text),
+            "通知二.png": ("exit", -1073741819, "Access violation"),   # 子进程崩了
+            "通知三.png": ("ok", long_text + "（第三份）"),
+        }
+        restore = _patch_ocr_worker(outcomes)
+        try:
+            know = _ocr_knowledge(tmp, src)
+            try:
+                report = know.index()
+            finally:
+                know.close()
+        finally:
+            restore()
+
+        # 两份好的照常入库；崩掉的那一份进待重试，整批不中断
+        assert report.added == 2, report.summary()
+        assert len(report.failed) == 1, report.failed
+        assert report.failed[0][0] == "通知二.png"
+        assert "退出码" in report.failed[0][1], report.failed[0][1]
+        assert not report.ocr_engine_down, "单份崩溃不该算成引擎故障"
+        assert "失败待重试 1" in report.summary(), report.summary()
+
+        # 失败清单落盘了：换个 Knowledge 实例（相当于重启）还看得到、还会重试
+        know2 = _ocr_knowledge(tmp, src)
+        try:
+            pending = know2.pending_ocr()
+            assert len(pending) == 1, pending
+            assert "通知二.png" in pending[0]["path"]
+            assert pending[0]["attempts"] == 1
+        finally:
+            know2.close()
+
+        # 下一轮：子进程修好了，欠账的那份自动重试成功；已入库的两份不许重复入库
+        outcomes["通知二.png"] = ("ok", long_text + "（第二份补上了）")
+        restore = _patch_ocr_worker(outcomes)
+        try:
+            know3 = _ocr_knowledge(tmp, src)
+            try:
+                again = know3.index()
+                assert again.added == 1, again.summary()
+                assert again.unchanged == 2, again.summary()
+                assert again.failed == [], again.failed
+                assert know3.pending_ocr() == [], "重试成功要从待办里销账"
+                assert know3.stats()["docs"] == 3, know3.stats()
+                # 补进来的那份，正文（OCR 认出的文字）真的进了库
+                titles = [d["title"] for d in know3.list_docs()]
+                assert "通知二" in titles, titles
+                row = know3._conn.execute(
+                    "SELECT COUNT(*) AS n FROM chunks c JOIN docs d ON d.id=c.doc_id "
+                    "WHERE d.title='通知二' AND c.text LIKE '%东一体育场%'").fetchone()
+                assert row["n"] >= 1
+            finally:
+                know3.close()
+        finally:
+            restore()
+    print("  OK OCR：单份失败进待重试 / 整批不中断 / 下轮自动重试成功销账")
+
+
+def test_ocr_failure_reasons():
+    """结果文件缺失、超时：原因要写得人看得懂，留在待重试里，次数累加。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = tmp / "knowledge"
+        src.mkdir()
+        (src / "缺结果.png").write_bytes(b"\x89PNG fake a")
+        (src / "慢死.png").write_bytes(b"\x89PNG fake b")
+
+        restore = _patch_ocr_worker({
+            "缺结果.png": ("missing",),
+            "慢死.png": ("timeout",),
+        })
+        try:
+            know = _ocr_knowledge(tmp, src)
+            try:
+                report = know.index()
+                assert report.added == 0, report.summary()
+                reasons = dict(report.failed)
+                assert set(reasons) == {"缺结果.png", "慢死.png"}, reasons
+                assert "没给出结果" in reasons["缺结果.png"], reasons
+                assert "超时" in reasons["慢死.png"], reasons
+                # 失败的不许进「永久跳过」缓存 —— 否则文件没动就永远不再试
+                assert know._conn.execute(
+                    "SELECT COUNT(*) AS n FROM skips").fetchone()["n"] == 0
+
+                again = know.index()      # 还是同样的假结局：自动重试，次数累加
+                assert len(again.failed) == 2, again.failed
+                pending = {Path(r["path"]).name: r for r in know.pending_ocr()}
+                assert pending["缺结果.png"]["attempts"] == 2, pending
+                assert pending["慢死.png"]["attempts"] == 2, pending
+
+                # 文件从磁盘上没了，欠账跟着销
+                (src / "缺结果.png").unlink()
+                know.index()
+                left = [Path(r["path"]).name for r in know.pending_ocr()]
+                assert left == ["慢死.png"], left
+            finally:
+                know.close()
+        finally:
+            restore()
+    print("  OK OCR：结果缺失 / 超时记清原因，待重试累加，文件没了销账")
+
+
+def test_ocr_engine_unavailable_is_not_per_file_failure():
+    """引擎级故障（没装中文语言包）不该把整批记成失败；修好后下轮照常入库。"""
+    long_text = "关于医保缴费的通知，缴费截止到11月30日，请同学们及时办理。"
+    names = ("扫描件一.png", "扫描件二.png", "扫描件三.png")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = tmp / "knowledge"
+        src.mkdir()
+        for name in names:
+            (src / name).write_bytes(b"\x89PNG fake " + name.encode("utf-8"))
+
+        why = "Windows 里没装任何 OCR 语言包。去「设置 → 时间和语言 → 语言」添加。"
+        restore = _patch_ocr_worker({name: ("unavailable", why) for name in names})
+        try:
+            know = _ocr_knowledge(tmp, src)
+            try:
+                report = know.index()
+                assert report.added == 0, report.summary()
+                assert report.failed == [], "引擎故障不是单份文件的错，不该记失败账"
+                assert report.ocr_engine_down, "引擎故障要在报告里讲明白"
+                assert "语言包" in report.ocr_engine_down
+                assert "OCR 引擎不可用" in report.summary(), report.summary()
+                assert know.pending_ocr() == [], "待重试清单不该被引擎故障污染"
+                # 也不许记成「永久跳过」：不然装好语言包后文件没动就永远不再试
+                assert know._conn.execute(
+                    "SELECT COUNT(*) AS n FROM skips").fetchone()["n"] == 0
+            finally:
+                know.close()
+        finally:
+            restore()
+
+        # 装好语言包之后：下一轮索引直接把这三份收进来
+        restore = _patch_ocr_worker({name: ("ok", long_text + name) for name in names})
+        try:
+            know2 = _ocr_knowledge(tmp, src)
+            try:
+                again = know2.index()
+                assert again.added == 3, again.summary()
+                assert again.failed == []
+                assert not again.ocr_engine_down
+                assert know2.stats()["docs"] == 3
+            finally:
+                know2.close()
+        finally:
+            restore()
+    print("  OK OCR：引擎不可用 ≠ 单份失败（不记失败账，修好后自动收齐）")
+
+
 def test_single_instance_lock():
     """单实例锁：第二个进程抢不到，第一个退出后能重新抢到。"""
     import os
