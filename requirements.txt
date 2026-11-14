@@ -1,0 +1,7 @@
+requests
+requests-html
+lxml
+beautifulsoup4
+termcolor
+tqdm
+colorama
