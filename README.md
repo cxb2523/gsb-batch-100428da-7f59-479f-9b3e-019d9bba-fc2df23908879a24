@@ -42,6 +42,13 @@ The `MultithreadedCrawler` class is initialized with the following parameters:
 
 - **Queue-Based URL Management:** URLs to be crawled are managed using a shared queue, ensuring efficient and organized distribution of tasks among threads.
 
+- **Redirect-Aware Scope:** If the seed URL redirects to another site, the crawl scope follows the redirect: pending URLs belonging to the old site are dropped before they are distributed, already downloaded pages are kept, and links discovered on the new site continue to be queued normally.
+
+- **Structured Failure Report:** `metadata.json` keeps the crawled pages under `successful` and every failure under `failed`, as `{"url": "<original URL>", "final_url": "<URL the page ended up at>", "reason": "<reason>"}`:
+  - `http_status_error` - the page responded with a 4xx/5xx status (the status code is also included as `status`)
+  - `crawl_exception` - the page could not be fetched (the exception text is included as `message`)
+  - `redirect_out_of_scope` - the page redirected outside of the current crawl scope and was rejected
+
 - **Done Callback:** You have the option to set a callback function that will be executed after the crawling process is successfully completed, allowing you to perform specific actions or analyze the results.
 
 ## Dependencies
