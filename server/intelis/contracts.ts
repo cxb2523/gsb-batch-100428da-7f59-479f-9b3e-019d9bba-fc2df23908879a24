@@ -28,6 +28,25 @@ export type SourceCandidate = {
   text: string;
 };
 
+export const COLLECTION_OUTCOME_STATUSES = [
+  "rejected_by_safety",
+  "request_failed",
+  "content_too_short",
+  "duplicate_title",
+  "accepted",
+] as const;
+
+export type CollectionOutcomeStatus =
+  (typeof COLLECTION_OUTCOME_STATUSES)[number];
+
+export type CollectionOutcome = {
+  url: string;
+  sourceName: string;
+  title: string;
+  status: CollectionOutcomeStatus;
+  detail?: string;
+};
+
 export type AnalyzedFinding = {
   title: string;
   sourceUrl: string;
