@@ -118,6 +118,9 @@ export type {
     // Launch types
     LaunchOptions,
     LaunchResult,
+    TimezoneResolution,
+    TimezoneSource,
+    TimezoneFailure,
     FingerprintEngine,
     ResolvedEngine,
     SpoofEngine,

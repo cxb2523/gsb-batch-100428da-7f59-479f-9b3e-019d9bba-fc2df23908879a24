@@ -271,6 +271,43 @@ export interface BrowserProfilesOptions {
 /**
  * Result of launching a browser
  */
+/**
+ * Where the timezone Chrome was started with came from.
+ * `profile`: the stored profile names it. `relay-exit-ip`: detected through the
+ * local relay, so it is the IP a site actually sees. `proxy-host`: the relay
+ * lookup failed and the proxy host was looked up instead. `system`: no profile
+ * timezone and no usable proxy lookup, so Chrome keeps this machine's clock.
+ */
+export type TimezoneSource = 'profile' | 'relay-exit-ip' | 'proxy-host' | 'system';
+
+/** Why one GeoIP lookup gave no timezone. Kept so a fallback is never silent. */
+export interface TimezoneFailure {
+    /** The lookup that failed. */
+    step: 'relay-exit-ip' | 'proxy-host';
+    /** Machine-readable cause. */
+    code:
+        | 'timeout'
+        | 'unreachable'
+        | 'invalid-json'
+        | 'not-success'
+        | 'missing-timezone'
+        | 'http-error'
+        | 'no-relay';
+    /** What was observed, e.g. `ip-api.com answered status=fail`. */
+    detail: string;
+}
+
+/** The timezone Chrome was started with, plus where it came from and what failed on the way. */
+export interface TimezoneResolution {
+    /** IANA id handed to Chrome as `TZ`. */
+    timezone: string;
+    source: TimezoneSource;
+    /** Extra context, e.g. `Verona, United States` for a GeoIP hit. */
+    detail?: string;
+    /** Failed lookups, oldest first. Empty when the value came from the first attempt. */
+    failures: TimezoneFailure[];
+}
+
 export interface LaunchResult {
     /** WebSocket debugger URL for connecting Puppeteer/Playwright */
     wsEndpoint: string;
@@ -288,6 +325,8 @@ export interface LaunchResult {
     detached?: boolean;
     /** kernel spoofs inside Chromium. inject patches from JavaScript. real changes nothing. */
     engine: ResolvedEngine;
+    /** How the launched browser's timezone was chosen. Absent on a reused browser. */
+    timezone?: TimezoneResolution;
 }
 
 /**

@@ -11,6 +11,8 @@ import { launchChrome } from './launch';
 // Chrome and its DevTools socket are faked; everything between them is the real launcher.
 const fake = vi.hoisted(() => ({
     port: 0,
+    relayUrl: '',
+    relays: [] as Array<{ close: () => Promise<void> }>,
     launches: [] as Array<{ chromeFlags: string[]; envVars?: Record<string, string>; port?: number }>,
     cdpCalls: [] as string[],
 }));
@@ -32,9 +34,14 @@ vi.mock('./deps', () => ({
         on: () => undefined,
         close: async () => undefined,
     }),
+    loadProxyChain: async () => ({
+        anonymizeProxy: async () => fake.relayUrl,
+        closeAnonymizedProxy: async () => undefined,
+    }),
 }));
 
 let server: http.Server;
+const servers: http.Server[] = [];
 let dir: string;
 let chromePath: string;
 let launched: LaunchResult | null = null;
@@ -42,6 +49,7 @@ let launched: LaunchResult | null = null;
 beforeEach(async () => {
     fake.launches.length = 0;
     fake.cdpCalls.length = 0;
+    fake.relayUrl = '';
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'launch-'));
     chromePath = path.join(dir, 'chrome');
     fs.writeFileSync(chromePath, 'stock chrome');
@@ -56,6 +64,10 @@ afterEach(async () => {
     if (launched) await launched.close();
     launched = null;
     await new Promise<void>((resolve) => server.close(() => resolve()));
+    for (const relay of servers.splice(0)) {
+        relay.closeAllConnections?.();
+        relay.close();
+    }
     fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -129,5 +141,170 @@ describe('launchChrome DevTools port', () => {
         launched = await launch(realProfile);
 
         expect(fake.launches.map((options) => options.port)).toEqual([9301, undefined]);
+    });
+});
+
+/** A local relay stand-in answering however ip-api.com would have. */
+async function startFakeRelay(answer: string): Promise<void> {
+    const relay = http.createServer((_request, response) => response.end(answer));
+    servers.push(relay);
+    await new Promise<void>((resolve) => relay.listen(0, '127.0.0.1', resolve));
+    fake.relayUrl = `http://127.0.0.1:${(relay.address() as { port: number }).port}`;
+}
+
+/** A relay URL nothing answers on, so the probe fails as unreachable. */
+async function deadRelayUrl(): Promise<void> {
+    const probe = http.createServer();
+    await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve));
+    fake.relayUrl = `http://127.0.0.1:${(probe.address() as { port: number }).port}`;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+}
+
+const GEO_SUCCESS = JSON.stringify({
+    status: 'success', country: 'United States', regionName: 'New Jersey', city: 'Verona',
+    timezone: 'America/New_York',
+});
+
+function proxyProfile(overrides: Partial<StoredProfile> = {}): StoredProfile {
+    return {
+        id: 'gen-proxy', name: 'Proxied', createdAt: 0, updatedAt: 0,
+        proxy: { type: 'http', host: 'gate.provider.net', port: 8080 },
+        ...overrides,
+    };
+}
+
+/** ip-api.com is never really contacted: the direct host lookup gets this answer. */
+function stubHostLookup(answer: string, ok = true): void {
+    const realFetch = globalThis.fetch;
+    vi.stubGlobal('fetch', async (input: string | URL | Request, init?: RequestInit) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        // Chrome's DevTools probe also uses fetch; only the GeoIP request is answered here.
+        if (!url.includes('ip-api.com')) return realFetch(input, init);
+        return {
+            ok,
+            status: ok ? 200 : 429,
+            text: async () => answer,
+        };
+    });
+}
+
+function captureStderr(): { text: () => string; restore: () => void } {
+    const chunks: string[] = [];
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk: unknown) => {
+        chunks.push(String(chunk));
+        return true;
+    });
+    return { text: () => chunks.join(''), restore: () => spy.mockRestore() };
+}
+
+describe('launchChrome timezone origin in the startup log', () => {
+    const originalDebug = process.env.DEBUG;
+
+    beforeEach(() => {
+        delete process.env.DEBUG;
+    });
+
+    afterEach(() => {
+        vi.unstubAllGlobals();
+        if (originalDebug === undefined) delete process.env.DEBUG;
+        else process.env.DEBUG = originalDebug;
+        for (const relay of servers.splice(0)) relay.closeAllConnections?.(), relay.close();
+    });
+
+    it('reports a relay exit location, and uses it for TZ', async () => {
+        await startFakeRelay(GEO_SUCCESS);
+        process.env.DEBUG = 'browser-profiles';
+        const stderr = captureStderr();
+        try {
+            launched = await launch(proxyProfile());
+        } finally {
+            stderr.restore();
+        }
+
+        expect(launched.timezone).toEqual({
+            timezone: 'America/New_York',
+            source: 'relay-exit-ip',
+            detail: 'Verona, United States',
+            failures: [],
+        });
+        expect(fake.launches[0].envVars).toEqual({ TZ: 'America/New_York' });
+        expect(stderr.text()).toContain(
+            'Timezone for Chrome: America/New_York (source: relay-exit-ip, Verona, United States)'
+        );
+    });
+
+    it('warns with the reason when ip-api.com answers status=fail and the host lookup also fails', async () => {
+        await startFakeRelay(JSON.stringify({ status: 'fail' }));
+        stubHostLookup(JSON.stringify({ status: 'fail' }));
+        const stderr = captureStderr();
+        try {
+            launched = await launch(proxyProfile());
+        } finally {
+            stderr.restore();
+        }
+
+        expect(launched.timezone?.source).toBe('system');
+        expect(launched.timezone?.failures.map((failure) => [failure.step, failure.code])).toEqual([
+            ['relay-exit-ip', 'not-success'],
+            ['proxy-host', 'not-success'],
+        ]);
+        // Failures always reach stderr, no --verbose needed.
+        expect(stderr.text()).toContain('source: system');
+        expect(stderr.text()).toContain('relay-exit-ip failed: not-success (ip-api.com answered status=fail)');
+        expect(stderr.text()).toContain('proxy-host failed: not-success (ip-api.com answered status=fail)');
+    });
+
+    it('warns with the reason when the relay answers garbage but the proxy host resolves', async () => {
+        await startFakeRelay('<html>blocked</html>');
+        stubHostLookup(GEO_SUCCESS);
+        const stderr = captureStderr();
+        try {
+            launched = await launch(proxyProfile());
+        } finally {
+            stderr.restore();
+        }
+
+        expect(launched.timezone?.source).toBe('proxy-host');
+        expect(launched.timezone?.timezone).toBe('America/New_York');
+        expect(launched.timezone?.failures[0].code).toBe('invalid-json');
+        expect(fake.launches[0].envVars).toEqual({ TZ: 'America/New_York' });
+        expect(stderr.text()).toContain('source: proxy-host, Verona, United States');
+        expect(stderr.text()).toContain('relay-exit-ip failed: invalid-json');
+    });
+
+    it('warns with the reason when the relay is unreachable', async () => {
+        await deadRelayUrl();
+        stubHostLookup(GEO_SUCCESS);
+        const stderr = captureStderr();
+        try {
+            launched = await launch(proxyProfile());
+        } finally {
+            stderr.restore();
+        }
+
+        expect(launched.timezone?.source).toBe('proxy-host');
+        expect(launched.timezone?.failures).toEqual([expect.objectContaining({
+            step: 'relay-exit-ip', code: 'unreachable',
+        })]);
+        expect(stderr.text()).toContain('relay-exit-ip failed: unreachable');
+    });
+
+    it('never fails the launch when every lookup fails', async () => {
+        await deadRelayUrl();
+        stubHostLookup('', false);
+        const stderr = captureStderr();
+        try {
+            launched = await launch(proxyProfile());
+        } finally {
+            stderr.restore();
+        }
+
+        expect(launched.engine).toBe('inject');
+        expect(launched.timezone?.source).toBe('system');
+        expect(launched.timezone?.timezone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
+        expect(launched.timezone?.failures.map((failure) => failure.code)).toEqual([
+            'unreachable', 'http-error',
+        ]);
+        expect(stderr.text()).toContain('source: system');
     });
 });

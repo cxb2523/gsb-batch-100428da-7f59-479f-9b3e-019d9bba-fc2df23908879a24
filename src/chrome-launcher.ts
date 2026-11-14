@@ -5,7 +5,17 @@
 // ============================================================================
 
 export { getChromePath } from './launcher/chrome-path';
-export { buildProxyUrl, detectTimezoneFromIP, autoDetectTimezone } from './launcher/proxy';
+export {
+    buildProxyUrl,
+    detectTimezoneFromIP,
+    autoDetectTimezone,
+    probeExitLocation,
+    detectExitLocation,
+    resolveTimezone,
+    formatTimezoneResolution,
+    FALLBACK_TIMEZONE,
+} from './launcher/proxy';
+export type { GeoLocation, GeoLookupResult, ResolveTimezoneOptions } from './launcher/proxy';
 export { launchChrome } from './launcher/launch';
 export type { ChromeLaunchOptions } from './launcher/launch';
 export { closeBrowser, closeAllBrowsers, getRunningBrowsers } from './launcher/running';

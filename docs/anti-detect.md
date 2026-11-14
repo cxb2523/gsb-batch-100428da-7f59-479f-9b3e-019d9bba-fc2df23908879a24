@@ -58,7 +58,7 @@ a new one. Flags passed to the binary:
 | Brand | `--fingerprint-brand=Chrome`. The brand version is the binary's own, so the UA matches the browser. `fingerprint.userAgent` is ignored and a warning is logged. |
 | CPU cores | `--fingerprint-hardware-concurrency` when the profile sets it. Otherwise the seed decides. |
 | Language | `--lang` and `--accept-lang` |
-| Timezone | `--timezone` plus the `TZ` environment variable. With a proxy and no `timezone`, it comes from the IP the proxy exits from, looked up through the proxy itself. |
+| Timezone | `--timezone` plus the `TZ` environment variable. With a proxy and no `timezone`, it comes from the IP the proxy exits from, looked up through the proxy itself. A failed lookup falls back to the proxy host and then to this machine's clock; the startup log names which one won and why the earlier attempts failed. |
 | WebRTC | `--disable-non-proxied-udp` |
 | Canvas, audio | On, unless the profile sets that surface to `real` (`--disable-spoofing`) |
 | WebGL, fonts, client rects, device memory, webdriver | Derived inside the binary from the seed. `fingerprint.webgl` is not applied; current kernels no longer accept a vendor string. |
@@ -97,7 +97,7 @@ What the JavaScript path protects:
 | WebGL | Vendor and renderer strings and GPU parameters spoofed, noise added to buffer reads. The pair is picked once when the profile is created, consistent with its platform, and stored in `fingerprint.webgl`, so the same GPU is reported on every page and every launch. |
 | Workers | Every worker target (dedicated, module, shared, service) is paused at start, gets the navigator, user agent and WebGL spoof, and is then resumed, so it reports the same values as the main thread. `Worker` and `SharedWorker` are also wrapped from the page, for clients that inject without the launcher. |
 | Audio | Tiny noise added to AudioContext output, inaudible but enough to break the fingerprint. |
-| Timezone | Chrome is started with `TZ` set and `Emulation.setTimezoneOverride` is applied, so the clock and `Intl` agree. With a proxy and no explicit timezone, it is detected from the proxy exit IP. |
+| Timezone | Chrome is started with `TZ` set and `Emulation.setTimezoneOverride` is applied, so the clock and `Intl` agree. With a proxy and no explicit timezone, it is detected from the proxy exit IP; failing that, from the proxy host, then from this machine's clock. See [where the timezone came from](#where-the-timezone-came-from). |
 | Language | `navigator.language`, the Accept-Language header and `Intl` (`Emulation.setLocaleOverride`) come from the same profile field. Chrome on macOS ignores `--lang`, so without the override `Intl` reports the host's locale. |
 | Cookies | Cookies stored on the profile are installed once per launch with `Storage.setCookies`, so every tab and every browser context sees them. |
 
@@ -108,6 +108,38 @@ timezone can be resolved.
 Setting `fingerprint.userAgent` pins the user agent instead. It then wins over the detected version,
 and a warning is logged when its Chrome major differs from the running browser, because detectors
 compare the two.
+
+## Where the timezone came from
+
+A profile with no `timezone` behind a proxy has three possible sources, tried in this order:
+
+1. **`profile`** — the profile stores a timezone. Nothing is probed.
+2. **`relay-exit-ip`** — the local relay asks `ip-api.com` for the IP a site actually sees. A
+   gateway proxy's host is not its exit IP, so this is the answer that matters.
+3. **`proxy-host`** — the relay probe failed and the proxy's host was looked up directly instead.
+4. **`system`** — both lookups failed, so Chrome starts with this machine's timezone.
+
+The value is unchanged from earlier releases; what is new is that the launch reports it. Both
+`browser.open` and `browser.launch` write a startup line, and return the same object as
+`timezone` in their output:
+
+```
+Timezone for Chrome: America/New_York (source: relay-exit-ip, Verona, United States)
+```
+
+A fallback is never silent. Failed probes are kept with their cause — `timeout`, `unreachable`,
+`invalid-json`, `not-success`, `missing-timezone`, `http-error` or `no-relay` — and logged at warn
+level even without `--verbose`:
+
+```
+[browser-profiles:launcher-proxy] warn Timezone for Chrome: Asia/Tokyo (source: system; relay-exit-ip failed: unreachable (relay did not answer: ECONNREFUSED); proxy-host failed: not-success (ip-api.com answered status=fail))
+[browser-profiles:launcher-proxy] warn Timezone lookup relay-exit-ip failed: unreachable - relay did not answer: ECONNREFUSED
+[browser-profiles:launcher-proxy] warn Timezone lookup proxy-host failed: not-success - ip-api.com answered status=fail
+```
+
+A failed lookup never fails the launch. And when the source is `proxy-host` or `system` behind a
+proxy, the exit country is unverified: the clock can disagree with the IP a site sees, which is
+itself a detection signal. Pin `--timezone` when that matters.
 
 ## Per-tab injection
 

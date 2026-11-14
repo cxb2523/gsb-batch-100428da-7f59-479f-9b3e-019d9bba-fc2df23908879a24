@@ -27,6 +27,30 @@ CHROME_PATH=/opt/google/chrome/chrome browser-profiles open acme-main
 From the library, pass it instead: `new BrowserProfiles({ chromePath })` or
 `profiles.launch(id, { chromePath })`.
 
+## Timezone came from the wrong place
+
+An unset `timezone` behind a proxy is auto-detected, and the startup log always says which attempt
+produced the clock. `source: relay-exit-ip` means the exit IP was seen through the relay. Anything
+else means the exit country is unverified:
+
+```
+[browser-profiles:launcher-proxy] warn Timezone for Chrome: Asia/Tokyo (source: system; relay-exit-ip failed: unreachable (relay did not answer: ECONNREFUSED); proxy-host failed: not-success (ip-api.com answered status=fail))
+```
+
+- `source: proxy-host` — the relay probe failed and the proxy's host was looked up instead. A gateway
+  proxy exits elsewhere, so this can be another country.
+- `source: system` — both lookups failed and Chrome kept this machine's clock. A host timezone
+  behind a foreign proxy is a detection signal on its own.
+
+The `failures` list carries the cause of each attempt: `timeout`, `unreachable`, `invalid-json`,
+`not-success`, `missing-timezone`, `http-error`, or `no-relay` when the local relay was not
+available. Free `ip-api.com` allows 45 requests/minute, so a rate-limited answer shows up as
+`http-error` or `not-success`. The launch itself still succeeds; pin the value when it matters:
+
+```bash
+browser-profiles update acme-main --timezone America/New_York
+```
+
 ## Kernel mode on stock Chrome
 
 ```

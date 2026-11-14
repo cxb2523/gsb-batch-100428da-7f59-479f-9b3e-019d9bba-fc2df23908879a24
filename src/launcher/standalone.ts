@@ -5,7 +5,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import type { ProxyConfig, ResolvedEngine, StoredProfile } from '../types';
+import type { ProxyConfig, ResolvedEngine, StoredProfile, TimezoneResolution } from '../types';
 import { createLogger } from '../log';
 import { launchChrome } from './launch';
 
@@ -101,6 +101,9 @@ export interface StandaloneLaunchResult {
 
     /** kernel spoofs inside Chromium. inject patches from JavaScript. */
     engine: ResolvedEngine;
+
+    /** Where the timezone came from and what failed on the way. */
+    timezone?: TimezoneResolution;
 }
 
 /**
@@ -205,6 +208,7 @@ export async function launchChromeStandalone(options: StandaloneLaunchOptions = 
         port: result.port,
         close,
         engine: result.engine,
+        ...(result.timezone ? { timezone: result.timezone } : {}),
     };
 }
 

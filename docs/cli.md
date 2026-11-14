@@ -152,8 +152,12 @@ profile returns the running browser with `reused=true`. Close it with `browser c
 | `--port <value>` | Fixed DevTools port, e.g. `9301`, so a client configured ahead of time can connect to `http://127.0.0.1:<port>` (Playwright MCP `--cdp-endpoint`). Omit for a free port. A browser that is already running keeps its port. |
 | `--engine <auto\|kernel\|inject>` | Where the fingerprint is applied. `kernel` needs a fingerprint-chromium binary and spoofs inside Chromium with no JavaScript hooks. `inject` patches stock Chrome over CDP. `auto` (default) uses kernel when the executable contains `--fingerprint-platform`, otherwise inject. A real profile only accepts `auto`; `kernel` or `inject` fails with `INVALID_CONFIG`. |
 
-Output: `{ profileId, wsEndpoint, port, pid, reused, detached, engine }`. `engine` is `kernel`,
-`inject`, or `real` for a real profile (Chrome's own fingerprint, nothing applied).
+Output: `{ profileId, wsEndpoint, port, pid, reused, detached, engine, timezone? }`. `engine` is
+`kernel`, `inject`, or `real` for a real profile (Chrome's own fingerprint, nothing applied).
+`timezone` says where Chrome's `TZ` came from (`profile`, `relay-exit-ip`, `proxy-host` or
+`system`), with any failed lookups under `failures`; see
+[anti-detect.md](./anti-detect.md#where-the-timezone-came-from). It is also written to the startup
+log, and is absent when an already-running browser is reused.
 
 ## browser launch
 
@@ -169,8 +173,8 @@ when logins or cookies must survive.
 | `--detached` | As in `browser open`. |
 | `--engine <auto\|kernel\|inject>` | As in `browser open`. |
 
-Output: `{ profileId, wsEndpoint, port, pid, temporary: true, detached, engine }`. The `profileId` is a
-`tmp-...` id.
+Output: `{ profileId, wsEndpoint, port, pid, temporary: true, detached, engine, timezone? }`. The
+`profileId` is a `tmp-...` id. `timezone` is the same object `browser open` reports.
 
 ## browser close
 

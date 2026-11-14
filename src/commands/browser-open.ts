@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { Err, Ok } from '../types';
-import type { BrowserError, ResolvedEngine, Result } from '../types';
-import { DETACHED_PROXY_MESSAGE } from '../launcher/proxy';
+import type { BrowserError, ResolvedEngine, Result, TimezoneResolution } from '../types';
+import { DETACHED_PROXY_MESSAGE, describeTimezoneResolution } from '../launcher/proxy';
 import { REAL_ENGINE_ADVICE } from '../launcher/real';
 import { defineCommand, resolveProfile } from './define';
 import { detachedField, engineField, headlessField, idOrNameField } from './fields';
@@ -17,6 +17,8 @@ export interface BrowserOpened {
     detached: boolean;
     /** kernel spoofs inside Chromium. inject patches from JavaScript. real changes nothing. */
     engine: ResolvedEngine;
+    /** Where the launched browser's timezone came from and what failed on the way. */
+    timezone?: TimezoneResolution;
 }
 
 /** The launcher reports every problem as a thrown Error; keep the codes honest. */
@@ -82,6 +84,7 @@ export const browserOpen = defineCommand({
                 reused: result.reused === true,
                 detached: input.detached ?? false,
                 engine: result.engine,
+                ...(result.timezone ? { timezone: result.timezone } : {}),
             });
         } catch (thrown) {
             return Err(launchError(profile.id, thrown));
@@ -89,16 +92,20 @@ export const browserOpen = defineCommand({
     },
     render(output) {
         const how = output.reused ? 'Reused running browser' : 'Browser launched';
-        return [
+        const lines = [
             '',
             `${how} for profile ${output.profileId}`,
             `  wsEndpoint: ${output.wsEndpoint}`,
             `  port:       ${output.port}`,
             `  pid:        ${output.pid}`,
             `  engine:     ${output.engine}`,
+        ];
+        if (output.timezone) lines.push(`  timezone:   ${describeTimezoneResolution(output.timezone)}`);
+        lines.push(
             '',
             `Close with: browser-profiles browser close ${output.profileId}`,
             '',
-        ].join('\n');
+        );
+        return lines.join('\n');
     },
 });

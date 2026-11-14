@@ -1,7 +1,8 @@
 import { z } from 'zod';
 import { Err, Ok } from '../types';
-import type { BrowserError, ProxyConfig, ResolvedEngine, Result } from '../types';
+import type { BrowserError, ProxyConfig, ResolvedEngine, Result, TimezoneResolution } from '../types';
 import { launchChromeStandalone } from '../chrome-launcher';
+import { describeTimezoneResolution } from '../launcher/proxy';
 import { generateFingerprint } from '../fingerprint';
 import { defineCommand } from './define';
 import { launchErrorCode } from './browser-open';
@@ -19,6 +20,8 @@ export interface BrowserLaunched {
     detached: boolean;
     /** kernel spoofs inside Chromium. inject patches from JavaScript. */
     engine: ResolvedEngine;
+    /** Where the launched browser's timezone came from and what failed on the way. */
+    timezone?: TimezoneResolution;
 }
 
 export const browserLaunch = defineCommand({
@@ -78,6 +81,7 @@ export const browserLaunch = defineCommand({
                 temporary: true,
                 detached: input.detached ?? false,
                 engine: result.engine,
+                ...(result.timezone ? { timezone: result.timezone } : {}),
             });
         } catch (thrown) {
             const cause = thrown instanceof Error ? thrown : new Error(String(thrown));
@@ -89,16 +93,20 @@ export const browserLaunch = defineCommand({
         }
     },
     render(output) {
-        return [
+        const lines = [
             '',
             `Temporary browser launched (${output.profileId})`,
             `  wsEndpoint: ${output.wsEndpoint}`,
             `  port:       ${output.port}`,
             `  pid:        ${output.pid}`,
             `  engine:     ${output.engine}`,
+        ];
+        if (output.timezone) lines.push(`  timezone:   ${describeTimezoneResolution(output.timezone)}`);
+        lines.push(
             '',
             `Close with: browser-profiles browser close ${output.profileId}`,
             '',
-        ].join('\n');
+        );
+        return lines.join('\n');
     },
 });

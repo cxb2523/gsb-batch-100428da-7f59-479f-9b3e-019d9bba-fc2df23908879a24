@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **The launch log says where the timezone came from.** `browser.open`, `browser.launch`,
+  `launchChrome` and `launchChromeStandalone` now report a `timezone` object with the value, its
+  `source` (`profile`, `relay-exit-ip`, `proxy-host` or `system`) and any failed lookups under
+  `failures` (`timeout`, `unreachable`, `invalid-json`, `not-success`, `missing-timezone`,
+  `http-error`, `no-relay`). The startup log carries the same line, and failures are logged at warn
+  level even without `--verbose`, so a fallback to the proxy host or the system clock is visible
+  instead of silent. The timezone value itself is unchanged, and a failed lookup still never fails
+  the launch. `resolveTimezone` returns the object in place of a bare string (see
+  `docs/anti-detect.md#where-the-timezone-came-from`).
+
 ## [0.5.0] - 2026-10-04
 
 ### Added

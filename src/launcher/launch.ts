@@ -3,7 +3,7 @@
 // ============================================================================
 
 import { spoofSettings } from '../types';
-import type { LaunchOptions, LaunchResult, SpoofEngine, StoredProfile } from '../types';
+import type { LaunchOptions, LaunchResult, SpoofEngine, StoredProfile, TimezoneResolution } from '../types';
 import { createLogger } from '../log';
 import { deleteLockFile, lockFilePath, probeDevToolsPort, writeLockFile } from '../storage';
 import { startAutoAttach } from './auto-attach';
@@ -18,6 +18,7 @@ import type { ProtectionPlan } from './protections';
 import {
     assertDetachedLaunchAllowed,
     closeProxyRelay,
+    logTimezoneResolution,
     resolveTimezone,
     startProxyRelay,
 } from './proxy';
@@ -43,10 +44,37 @@ export interface ChromeLaunchOptions extends LaunchOptions {
 
 const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Real mode never auto-detects: Chrome keeps its own clock unless the profile names a timezone. */
+function realIdentity(profile: StoredProfile): LaunchIdentity {
+    if (!profile.timezone) {
+        // Nothing is forced on Chrome; reporting the system source keeps the startup log honest.
+        const systemTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        return {
+            engine: 'real',
+            resolution: { timezone: systemTimezone, source: 'system', failures: [] },
+        };
+    }
+    return {
+        engine: 'real',
+        timezone: profile.timezone,
+        resolution: { timezone: profile.timezone, source: 'profile', failures: [] },
+    };
+}
+
+/** Spoof engines always start Chrome with a timezone; a failed lookup falls back rather than throws. */
+async function spoofIdentity(
+    engine: SpoofEngine,
+    profile: StoredProfile,
+    relayUrl: string | undefined
+): Promise<LaunchIdentity> {
+    const resolution = await resolveTimezone(profile, relayUrl);
+    return { engine, timezone: resolution.timezone, resolution };
+}
+
 /** A real profile keeps Chrome's clock unless it names a timezone; a spoof always sets one. */
 type LaunchIdentity =
-    | { engine: 'real'; timezone?: string }
-    | { engine: SpoofEngine; timezone: string };
+    | { engine: 'real'; timezone?: string; resolution?: TimezoneResolution }
+    | { engine: SpoofEngine; timezone: string; resolution?: TimezoneResolution };
 
 async function browserEndpoint(port: number): Promise<string | null> {
     for (let attempt = 0; attempt < ENDPOINT_ATTEMPTS; attempt++) {
@@ -163,8 +191,10 @@ async function launchClaimed(options: ChromeLaunchOptions, userDataDir: string):
     }
     const relayUrl = profile.proxy ? await startProxyRelay(profile.proxy) : undefined;
     const identity: LaunchIdentity = engine === 'real'
-        ? { engine, timezone: profile.timezone }
-        : { engine, timezone: await resolveTimezone(profile, relayUrl) };
+        ? realIdentity(profile)
+        : await spoofIdentity(engine, profile, relayUrl);
+
+    if (identity.resolution) logTimezoneResolution(identity.resolution, log);
 
     log.debug(`Launching Chrome: ${executablePath}`);
     log.debug(`User data dir: ${userDataDir}`);
@@ -265,6 +295,7 @@ async function launchClaimed(options: ChromeLaunchOptions, userDataDir: string):
         close,
         detached,
         engine,
+        ...(identity.resolution ? { timezone: identity.resolution } : {}),
     };
 }
 

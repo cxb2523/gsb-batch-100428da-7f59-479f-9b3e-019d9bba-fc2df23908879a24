@@ -204,9 +204,17 @@ const { wsEndpoint, close } = await launchChromeStandalone({
 
 Lower-level exports, when you want the pieces: `launchChrome`, `closeBrowser`, `closeAllBrowsers`,
 `getChromePath`, `buildProxyUrl`, `detectTimezoneFromIP`, `autoDetectTimezone`,
+`resolveTimezone`, `probeExitLocation`, `formatTimezoneResolution`,
 `getAllProtectionScripts`, `createNavigatorScript`, and the raw scripts
 `WEBRTC_PROTECTION_SCRIPT`, `CANVAS_PROTECTION_SCRIPT`, `WEBGL_PROTECTION_SCRIPT`,
 `AUDIO_PROTECTION_SCRIPT`.
+
+`resolveTimezone(profile, relayUrl)` returns `{ timezone, source, detail?, failures }` rather than a
+bare string. `source` is `profile`, `relay-exit-ip`, `proxy-host` or `system`, and `failures` keeps
+the cause of every failed lookup (`timeout`, `unreachable`, `invalid-json`, `not-success`,
+`missing-timezone`, `http-error`, `no-relay`). `launchChrome` and `launchChromeStandalone` return
+the same object as `timezone`. `probeExitLocation(relayUrl)` is the relay probe on its own, and
+`formatTimezoneResolution` renders one line for a log.
 
 Fingerprint pieces that have to stay consistent with the running browser:
 
