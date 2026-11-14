@@ -269,12 +269,19 @@ class GestureSession:
                         f"rescaled to dist={dist:.0f}"
                     )
                     return plan
-                logger.debug("gesture session: code=-1 replaying human points")
-                return self._current_plan
-            plan = generate_archetype(self._current_archetype, dist)
-            self._current_plan = plan
-            logger.debug(f"gesture session: code=-1 resampling {self._current_archetype}")
-            return plan
+                # 重建失败（录制已不可用）也绝不回放旧像素序列——本次实测距离
+                # 已经变了，旧点列会把滑块拖到错误位置。作废旧状态后落到常规
+                # 选择：旧文件已在 _used_human_files 里，不会再被挑中；-1 不是
+                # 失败码，不消耗任何家族。
+                logger.debug("gesture session: code=-1 human rebuild failed; reselecting")
+                self._current_plan = None
+                self._current_archetype = None
+                self._current_human_rec = None
+            else:
+                plan = generate_archetype(self._current_archetype, dist)
+                self._current_plan = plan
+                logger.debug(f"gesture session: code=-1 resampling {self._current_archetype}")
+                return plan
 
         if last_code is not None and last_code != _PACKET_MISS:
             # 合成家族 consume 后永不回绕。human 不在这里预判耗尽：_first_available

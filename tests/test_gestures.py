@@ -240,3 +240,19 @@ def test_human_minus_1_rescales_to_new_distance():
         assert a.source_file == b.source_file
         assert a.points[-1][0] == pytest.approx(DIST)
         assert b.points[-1][0] == pytest.approx(180.0)
+
+
+def test_human_minus_1_rebuild_failure_never_returns_stale_pixels():
+    """code=-1 重建失败时不得直接复用旧像素序列（距离已变，旧点列会拖错位置）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        pool = SliderTrajectoryPool(tmp)
+        pool.save_trajectory(_human_points(DIST), "u1", DIST, True, source="human_cdp")
+        session = GestureSession(pool, "u1", trajectory_mode="recorded")
+        a = session.next(DIST, None)
+        assert a is not None and a.archetype == ARCHETYPE_HUMAN
+        # 录制在两次尝试间变为不可用：-1 只能重选，不能回放旧点列
+        session._current_human_rec = None
+        b = session.next(999.0, -1)
+        if b is not None:
+            assert b.points[-1][0] == pytest.approx(999.0)
+            assert list(b.points) != list(a.points) or b.source_file != a.source_file

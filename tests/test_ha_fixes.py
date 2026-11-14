@@ -41,6 +41,13 @@ class TestCookieDomainAndSnapshot:
         assert cookie_domain_for_url("https://h5api.m.goofish.com/punish") == ".goofish.com"
         assert cookie_domain_for_url("https://login.taobao.com/member/login.jhtml") == ".taobao.com"
         assert cookie_domain_for_url("https://passport.example.com.cn/x") == ".example.com.cn"
+        # 二级后缀不止 com.cn：SLD + 两字母 ccTLD 都要取到注册域
+        assert cookie_domain_for_url("https://www.example.edu.cn/") == ".example.edu.cn"
+        assert cookie_domain_for_url("https://shop.example.co.jp/") == ".example.co.jp"
+        assert cookie_domain_for_url("https://www.example.com.tw/") == ".example.com.tw"
+        # 普通 gTLD / 单段 ccTLD 不受影响
+        assert cookie_domain_for_url("https://www.example.com/") == ".example.com"
+        assert cookie_domain_for_url("https://example.cn/") == ".example.cn"
         assert cookie_domain_for_url("") == ".goofish.com"
 
     def test_parse_cookie_header_uses_target_domain(self):

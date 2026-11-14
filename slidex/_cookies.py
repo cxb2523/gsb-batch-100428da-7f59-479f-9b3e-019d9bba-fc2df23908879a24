@@ -6,19 +6,33 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
 
-_PUBLIC_SUFFIX_LIKE = {
+# 二级公共后缀（SLD.ccTLD）两段式判断：
+# - _PUBLIC_SUFFIX_PAIRS：显式枚举的两段公共后缀（example.com.cn 的注册域是
+#   example.com.cn，不是 com.cn）。
+# - _SLD_LABELS：通用 SLD 前缀。仅当末段是两字母 ccTLD 且倒数第二段命中时，
+#   注册域同样取三段——覆盖 edu.cn / ac.cn / co.jp / com.tw / co.uk 这类
+#   枚举不完的组合。单标签绝不直接匹配：example.com 的注册域仍是 example.com。
+_PUBLIC_SUFFIX_PAIRS = {
+    "com.cn",
+    "net.cn",
+    "org.cn",
+    "gov.cn",
+    "edu.cn",
+    "ac.cn",
+}
+
+_SLD_LABELS = {
     "com",
     "net",
     "org",
     "edu",
     "gov",
+    "mil",
+    "int",
+    "ac",
     "co",
-    "io",
-    "cn",
-    "com.cn",
-    "net.cn",
-    "org.cn",
-    "gov.cn",
+    "biz",
+    "info",
 }
 
 
@@ -32,9 +46,12 @@ def cookie_domain_for_url(url: str, fallback: str = ".goofish.com") -> str:
     labels = host.split(".")
     if len(labels) == 1:
         return f".{host}"
-    # example.com.cn / login.taobao.com → .taobao.com
-    if len(labels) >= 3 and ".".join(labels[-2:]) in _PUBLIC_SUFFIX_LIKE:
-        return "." + ".".join(labels[-3:])
+    # example.com.cn / login.taobao.com → .example.com.cn / .taobao.com
+    if len(labels) >= 3:
+        last_two = ".".join(labels[-2:])
+        sld_under_cctld = len(labels[-1]) == 2 and labels[-2] in _SLD_LABELS
+        if last_two in _PUBLIC_SUFFIX_PAIRS or sld_under_cctld:
+            return "." + ".".join(labels[-3:])
     return "." + ".".join(labels[-2:])
 
 
