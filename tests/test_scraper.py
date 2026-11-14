@@ -2,8 +2,12 @@
 
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
+
+import requests
 
 from pinterest_scraper.config import __version__
 from pinterest_scraper.dedupe import DedupeStore
@@ -103,13 +107,63 @@ class TestStorageAndDedupe(unittest.TestCase):
         self.assertEqual(p100["title"], "Pin 100 Updated")
 
 
+class _FakeResponse:
+    """Minimal stand-in for a streamed requests.Response."""
+
+    def __init__(self, body=b"", status_code=200, fail_after=None):
+        self.status_code = status_code
+        self.headers = {"Content-Type": "image/jpeg",
+                        "Content-Length": str(len(body))}
+        self._body = body
+        self._fail_after = fail_after
+
+    def iter_content(self, chunk_size):
+        sent = 0
+        for i in range(0, len(self._body), 8):  # small chunks to allow mid-stream failure
+            chunk = self._body[i:i + 8]
+            if self._fail_after is not None and sent + len(chunk) > self._fail_after:
+                raise requests.ConnectionError("connection dropped mid-stream")
+            sent += len(chunk)
+            yield chunk
+
+
+class _FakeSession:
+    """Fake requests.Session serving a fixed body; thread-safe."""
+
+    def __init__(self, body=b"", status_code=200, fail_after=None):
+        self._body = body
+        self._status = status_code
+        self._fail_after = fail_after
+        self.requests = 0
+        self._lock = threading.Lock()
+
+    def get(self, url, **kwargs):
+        with self._lock:
+            self.requests += 1
+        return _FakeResponse(self._body, self._status, self._fail_after)
+
+
+def _pin(pin_id, url=None):
+    return {"pin_id": pin_id,
+            "image_url": url or f"https://example.com/{pin_id}.jpg",
+            "is_video": False, "width": 0, "height": 0, "local_file": ""}
+
+
 class TestDownloader(unittest.TestCase):
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.out_dir = Path(self.tmp_dir.name)
+        # Skip the politeness/backoff sleeps so tests stay fast.
+        sleeper = mock.patch("pinterest_scraper.downloader.time.sleep",
+                             lambda *a, **k: None)
+        sleeper.start()
+        self.addCleanup(sleeper.stop)
 
     def tearDown(self):
         self.tmp_dir.cleanup()
+
+    def _leftover_temps(self):
+        return [p for p in self.out_dir.iterdir() if p.name.endswith(".part")]
 
     def test_existing_image_sets_local_file(self):
         # Pre-create image file
@@ -117,11 +171,86 @@ class TestDownloader(unittest.TestCase):
         existing_file.write_bytes(b"fake image data")
 
         pin = {"pin_id": "999", "image_url": "https://example.com/999.jpg", "local_file": ""}
-        import requests
         session = requests.Session()
         res = download_image(session, pin, self.out_dir)
         self.assertEqual(res, "EXISTS")
         self.assertEqual(pin["local_file"], "999.jpg")
+
+    def test_download_success_leaves_only_final_file(self):
+        body = b"\xff\xd8image-bytes" * 500
+        session = _FakeSession(body)
+        pin = _pin("777")
+        res = download_image(session, pin, self.out_dir)
+        self.assertEqual(res, "777.jpg")
+        self.assertEqual((self.out_dir / "777.jpg").read_bytes(), body)
+        self.assertEqual(pin["local_file"], "777.jpg")
+        self.assertEqual(self._leftover_temps(), [])
+        # Only the final file remains in the directory
+        self.assertEqual([p.name for p in self.out_dir.iterdir()], ["777.jpg"])
+
+    def test_interrupted_write_cleans_temp_and_leaves_no_dest(self):
+        body = b"x" * 4096
+        session = _FakeSession(body, fail_after=64)  # dies mid-stream
+        pin = _pin("888")
+        res = download_image(session, pin, self.out_dir, max_retries=2)
+        self.assertEqual(res, "")
+        self.assertFalse((self.out_dir / "888.jpg").exists())
+        self.assertEqual(self._leftover_temps(), [])
+
+        # Same via download_all: counted as failed, not downloaded
+        stats = download_all(session, [_pin("888")], self.out_dir,
+                             workers=1, min_width=0, min_height=0)
+        self.assertEqual(stats["failed"], 1)
+        self.assertEqual(stats["downloaded"], 0)
+        self.assertFalse((self.out_dir / "888.jpg").exists())
+        self.assertEqual(self._leftover_temps(), [])
+
+    def test_stale_fragment_is_repaired_and_counted(self):
+        body = b"complete-image" * 300
+        # Leftover temp fragment from a killed previous run (foreign run token)
+        frag = self.out_dir / ".555.deadbeefcafe.00112233.part"
+        frag.write_bytes(b"partial-")
+
+        pin = _pin("555")
+        res = download_image(_FakeSession(body), pin, self.out_dir)
+        self.assertEqual(res, "REPAIRED")
+        self.assertEqual((self.out_dir / "555.jpg").read_bytes(), body)
+        self.assertEqual(pin["local_file"], "555.jpg")
+        self.assertEqual(self._leftover_temps(), [])
+
+        # Again through download_all: goes to the repaired counter and the
+        # progress callback, not to downloaded or failed
+        frag.write_bytes(b"partial-")
+        (self.out_dir / "555.jpg").unlink()
+        progress = []
+        stats = download_all(_FakeSession(body), [_pin("555")], self.out_dir,
+                             workers=1, min_width=0, min_height=0,
+                             progress_cb=progress.append)
+        self.assertEqual(stats["repaired"], 1)
+        self.assertEqual(stats["downloaded"], 0)
+        self.assertEqual(stats["failed"], 0)
+        self.assertEqual(stats["skipped_existing"], 0)
+        self.assertEqual(progress[-1], 1)
+        self.assertEqual((self.out_dir / "555.jpg").read_bytes(), body)
+        self.assertEqual(self._leftover_temps(), [])
+
+        # After the repair the file is final: a rerun is a plain EXISTS
+        stats = download_all(_FakeSession(body), [_pin("555")], self.out_dir,
+                             workers=1, min_width=0, min_height=0)
+        self.assertEqual(stats["skipped_existing"], 1)
+        self.assertEqual(stats["repaired"], 0)
+
+    def test_concurrent_workers_same_pin_keep_file_intact(self):
+        body = bytes(range(256)) * 1024  # 256 KiB, forces overlapping streams
+        session = _FakeSession(body)
+        pins = [_pin("666"), _pin("666")]
+        stats = download_all(session, pins, self.out_dir,
+                             workers=2, min_width=0, min_height=0)
+        self.assertEqual((self.out_dir / "666.jpg").read_bytes(), body)
+        self.assertEqual(self._leftover_temps(), [])
+        self.assertEqual(stats["failed"], 0)
+        # Each worker either downloaded fresh or repaired — never a bad file
+        self.assertEqual(stats["downloaded"] + stats["repaired"], 2)
 
 
 class TestWebJob(unittest.TestCase):

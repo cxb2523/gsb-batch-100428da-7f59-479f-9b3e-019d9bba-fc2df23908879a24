@@ -54,7 +54,8 @@ def print_summary(stem: str, stats: dict | None, dedupe, saved: dict) -> None:
                       "already on disk", str(stats["skipped_existing"]))
         table.add_row("below min size", str(stats["skipped_small"]),
                       "video-only", str(stats["skipped_video"]))
-        table.add_row("failed downloads", str(stats["failed"]), "", "")
+        table.add_row("failed downloads", str(stats["failed"]),
+                      "fragments repaired", str(stats.get("repaired", 0)))
     table.add_row("total rows in metadata", str(saved["total"]), "", "")
     console.print(table)
     console.print(f"  [dim]metadata:[/] {saved['json']}")
