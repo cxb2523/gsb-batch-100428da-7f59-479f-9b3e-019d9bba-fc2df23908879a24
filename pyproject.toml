@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "krawler"
+version = "0.1.0"
+description = "A simple web crawler"
+authors = ["Hassan Abedi <hassan.abedi.t@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+validators = "^0.28.0"
+termcolor = "^2.4.0"
+robotexclusionrulesparser = "^1.7.1"
+requests-cache = "^1.2.0"
+decorator = "^5.1.1"
+six = "^1.16.0"
+pytest = "^8.1.1"
+black = "^24.4.0"
+pytest-cov = "^5.0.0"
+pytest-mock = "^3.14.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

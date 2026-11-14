@@ -1,0 +1,25 @@
+# EditorConfig is awesome: https://EditorConfig.org
+
+# Top-most EditorConfig file
+root = true
+
+# Unix-style newlines with a newline ending every file
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+indent_style = space
+trim_trailing_whitespace = true
+
+# Python specific setting
+[*.py]
+indent_size = 4
+max_line_length = 120
+
+# Markdown files have unique whitespace handling
+[*.md]
+trim_trailing_whitespace = false
+
+# Bash script specific settings
+[*.sh]
+indent_size = 2
