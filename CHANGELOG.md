@@ -1,0 +1,166 @@
+# Changelog
+
+## 0.4.4 (2026-11-14)
+
+### Security
+
+- **Hardened the regex row filter against regular expression denial of service (#16, CWE-1333).** A pathological `filter_value` pattern in `read_crawl_data` or `aggregate_crawl_data` could hang the tool call indefinitely through catastrophic backtracking (reproduced: a 7-character pattern against a 39-character cell ran for minutes). Three guards now apply: `filter_value` is capped at 512 characters, every per-cell match carries a 1-second timeout, and each filtering loop has a 20-second wall-clock budget. Exceeding any of them returns a clear error telling the agent how to adjust. Regex filtering semantics are unchanged.
+- User-supplied patterns now compile with the `regex` package instead of stdlib `re`. Its engine survives classic backtracking bombs outright and enforces match timeouts, which stdlib `re` cannot. This is the project's first new runtime dependency since 0.1.0; it is pure filtering infrastructure and adds no tool surface.
+
+## 0.4.3 (2026-10-17)
+
+### Bug fixes
+
+- **Fixed broken fresh installs: pinned `mcp>=1.30.0,<2`.** The mcp Python SDK 2.x renamed the FastMCP API this server imports, and the old unbounded `mcp>=1.26.0` constraint let new installs resolve mcp 2.x, crashing the server at startup (ModuleNotFoundError on `mcp.server.fastmcp`). Installs made while mcp 2.x was the default resolution were dead on arrival; reinstalling 0.4.3 fixes them.
+
+### Security
+
+- Refreshed the dependency lockfile. The previous lock carried 55 known advisories across 8 transitive packages (mcp, starlette, pyjwt, cryptography, anyio, idna, python-multipart, pydantic-settings); pip-audit now reports none.
+- SECURITY.md documents the limits of the SSRF protection: the seed URL check is a guardrail against prompt-injected crawl targets, not a sandbox around Screaming Frog, which follows redirects and checks discovered links itself.
+
+### Internal
+
+- New CI job installs the built wheel in a fresh environment with no lockfile and fails unless the server completes an MCP handshake. This is the guard that would have caught the mcp 2.x breakage, which the lockfile-pinned test matrix could not see.
+
+## 0.4.2 (2026-10-17)
+
+### Bug fixes
+
+- **Fixed consecutive crawls failing in memory storage mode (#12).** In memory storage mode, SF's `--save-crawl` writes a fixed-name `crawl.seospider` into the process working directory and refuses to start while it exists, so every crawl after the first failed with "crawl.seospider exists in output directory". Each crawl now gets its own `--output-folder`. In database storage mode nothing changes (the folder stays empty and is cleaned up).
+- **`crawl_status` no longer claims a memory-mode crawl is "saved in SF's internal database".** When SF wrote a `.seospider` file, the status now reports the file's path, explains that `list_crawls`/`export_crawl` cannot see it, and points to the database storage mode setting. The file is never auto-deleted.
+
+### Documentation
+
+- README now states the database storage mode requirement in Prerequisites and adds a troubleshooting row for the "crawl.seospider exists" error.
+
+## 0.4.1 (2026-08-31)
+
+### Fixed
+
+- **Export reference regenerated from the SF 24.1 CLI** (closes #11). The `screaming-frog://export-reference` resource listed ~27 bulk exports without submenu prefixes; the current CLI has 355, all submenu-prefixed (e.g. `Content:Soft 404 Inlinks`, `Links:All Inlinks`). Export names always passed through to the CLI, so exports like Soft 404 Inlinks worked all along — but anyone reading the stale reference would conclude they did not exist. The tabs and reports sections were regenerated the same way (33 tabs, 62 reports).
+- **Widened the export-name character allowlist** to accept `_`, `=` and `!`, which appear in valid SF export names (`Directives:Unavailable_After Inlinks`, `Accessibility:Role=text ...`, `AMP:Missing/Invalid <!doctype html> Tag`). These were the only names of the 355 the old pattern rejected.
+
+### Internal
+
+- Added RELEASING.md with the full version-bump checklist, including the MCP registry publish step that was previously skipped (registry sat at 0.1.0 while PyPI reached 0.4.0).
+- Tests for the newly-allowed export names (206 total).
+
+## 0.4.0 (2026-06-12)
+
+### New
+
+- **`aggregate_crawl_data` tool.** Server-side counts and group-by breakdowns over export CSVs. "How many 404s" or "status code distribution" now costs a few lines of output instead of an export dump, with the same filter options as `read_crawl_data` applied before aggregation. No code execution involved.
+- **`columns` parameter on `read_crawl_data`.** Request a subset of columns (e.g. `"Address,Status Code"`) so wide exports like Internal:All do not flood the context window.
+- **`--version` and `--help` flags.** The binary previously spoke MCP on stdin no matter what; checking the installed version required `uv tool list`. Informational flags now answer and exit without starting the server, and unknown arguments fail loudly instead of being ignored.
+- **MCP tool annotations.** All read tools declare `readOnlyHint`, `delete_crawl` declares `destructiveHint`, and `crawl_site` declares `openWorldHint`. MCP clients surface these hints in permission prompts. `export_crawl` deliberately does not claim to be read-only: loading a crawl with a newer Screaming Frog migrates it one-way.
+
+### Internal
+
+- Extracted shared helpers for export file resolution and row filtering, used by both CSV tools.
+- 26 new tests (200 total).
+
+## 0.3.4 (2026-06-11)
+
+### Documentation
+
+- **Added TROUBLESHOOTING.md** — step-by-step diagnostic guide for "Could not attach to MCP server" connection failures: manual server test, MCP handshake check, client log locations, and a symptom table.
+- **README setup now recommends `uv tool install` over `uvx` in MCP client configs.** Launching via `uvx` downloads the package environment at startup, which on a cold cache can exceed the client's 60-second initialize timeout and cause intermittent attach failures.
+- Synced `server.json` (MCP registry manifest) version, which was stuck at 0.1.0.
+
+## 0.3.3 (2026-05-08)
+
+### Bug fixes
+
+- **Fixed false "Crawl save failed" warning on SF 23.2.** Screaming Frog 23.2 logs `WARN - Crawl save failed {}` even when the crawl saves successfully. The server now detects this false positive by checking for the database shutdown confirmation that proves data was written to disk. Genuine save failures (no database shutdown) still produce the warning.
+
+## 0.3.2 (2026-05-08)
+
+### Bug fixes
+
+- Fixed PyPI publish workflow: pinned SHA was the annotated tag object, not the commit. Docker image lookup failed.
+- Updated README: removed reference to removed `max_urls` parameter.
+
+## 0.3.1 (2026-05-08)
+
+### Bug fixes
+
+- **Removed broken `max_urls` parameter from `crawl_site`.** The `--max-crawl-size` CLI flag doesn't exist in Screaming Frog. The parameter silently failed (SF exits 0 with FATAL). To limit crawl size, pass a config file via `config_file` instead.
+- **Fixed `crawl_status` always showing "URLs crawled: unknown".** The parser looked for "urls crawled" but SF logs "crawled N urls". Now extracts the numeric count.
+- **Fixed `crawl_status` falsely claiming "saved in SF's internal database"** when SF logged a FATAL error on startup or "Crawl save failed". Now detects both conditions and reports them accurately.
+- **Fixed `read_crawl_data` showing "No matching rows"** when offset exceeds total rows. Now shows "No rows at offset N (only M matching rows total)".
+
+### Improvements
+
+- `crawl_site` now detects immediate startup failures (FATAL errors, bad flags, license issues) within 2 seconds and returns an error instead of falsely reporting the crawl as started.
+- Pinned `pypa/gh-action-pypi-publish` to v1.14.0 SHA for supply chain safety.
+- Added 40 new tests (172 total): sf_check parsing, env var configuration, error format consistency, row count logic, crawl status parsing, offset behavior.
+
+## 0.3.0 (2026-05-08)
+
+### Bug fixes
+
+- Fixed `read_crawl_data` failing on Screaming Frog summary reports (`crawl_overview.csv` and similar `--save-report` exports). These files use a vertical key-value layout with section headers, not tabular CSVs -- `csv.DictReader` would misparse them and the error was silently swallowed.
+- Fixed `sf_check` returning "Version: unknown / License: unknown" on working installs. The `--help` flag doesn't emit version or license info; switched to `--list-crawls` (read-only) which does.
+- Fixed `export_crawl` data row count undercounting summary report files (no header row to subtract).
+- Fixed duplicated log filter list in `list_crawls` that could drift from the shared `_SF_LOG_FILTERS` constant.
+
+### Improvements
+
+- All error messages now include the exception type and message instead of opaque "Failed to ..." strings. Affects `crawl_site`, `list_crawls`, `export_crawl`, `delete_crawl`, `read_crawl_data`, and `sf_check`.
+- `SF_EXPORT_TTL_SECONDS` env var: configure how long exported CSV files are kept before auto-cleanup (default: 3600s / 1 hour). Useful for multi-hour audit sessions.
+- `SF_EXPORT_TIMEOUT_SECONDS` env var: configure max wait time for `export_crawl` operations (default: 300s / 5 minutes). Increase for very large crawls (100k+ URLs).
+
+### New features
+
+- Summary report parsing: `read_crawl_data` now detects and properly renders SF summary reports (e.g. `crawl_overview.csv`) as structured, readable text with section headers and key-value pairs.
+
+## 0.2.2 (2026-04-22)
+
+### Bug fixes
+
+- Fixed `UnicodeDecodeError` on Windows (cp1252 locale) that crashed `list_crawls` and could affect other subprocess calls (#5)
+- Added `encoding='utf-8', errors='replace'` to all `subprocess.run` calls so non-ASCII CLI output is handled safely on any locale
+- Added `None` guard on value length check in `read_crawl_data` CSV rendering
+
+## 0.2.1 (2026-04-20)
+
+### New features
+
+- `filter_mode` parameter for `read_crawl_data`: `contains` (default), `exact`, or `regex`
+- CI pipeline: tests run on push/PR across Python 3.10-3.13
+- Trusted publishing: PyPI releases via GitHub Actions (no manual token needed)
+
+## 0.2.0 (2026-04-20)
+
+### Security
+
+- Tightened input validation across all tool parameters
+- Strengthened SSRF protection with DNS resolution checks and IPv6 handling
+- Added config file path containment
+- Sanitized CLI output in error responses to prevent information leakage
+- Added `SECURITY.md` with vulnerability reporting policy
+- Added 98-test security test suite
+
+### New features
+
+- `SF_ALLOWED_DOMAINS` env var: optional comma-separated domain allowlist for crawl targets
+- `SF_CONFIG_DIR` env var: restrict `.seospiderconfig` file loading to a safe directory (default `~/.config/sf-mcp/configs/`)
+- `read_crawl_data` now validates `filter_column` against CSV headers and reports available columns on mismatch
+
+### Bug fixes
+
+- Fixed pipe buffer deadlock on long-running crawls (macOS)
+- Added 2-hour crawl timeout to prevent runaway processes
+- Capped `read_crawl_data` limit to 1000 rows to prevent memory exhaustion
+- Clamped negative `limit` and `offset` values to sane defaults
+- Rejected negative `max_urls` values in `crawl_site`
+- Fixed misleading pagination message when using offset
+
+### Internal
+
+- Deduplicated `sf_mcp.py` into thin wrapper over `src/screaming_frog_mcp/server.py`
+- Removed unused imports
+
+## 0.1.0 (2026-03-01)
+
+Initial release.

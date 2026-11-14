@@ -1,0 +1,1940 @@
+# -*- coding: utf-8 -*-
+"""
+Screaming Frog SEO Spider MCP Server
+
+Provides tools to crawl sites, export data, and manage crawl storage
+using Screaming Frog's CLI. All crawl data is stored in SF's internal
+database (~/.ScreamingFrogSEOSpider/ProjectInstanceData/).
+CSV exports are generated on-demand into temp dirs.
+"""
+
+import asyncio
+import csv
+import glob
+import ipaddress
+import logging
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+import regex
+import uuid
+from pathlib import Path
+from typing import Optional, Union
+from urllib.parse import urlparse
+
+from dotenv import load_dotenv
+from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+# --- Configuration ---
+
+SF_CLI_PATH = os.getenv(
+    "SF_CLI_PATH",
+    "/Applications/Screaming Frog SEO Spider.app/Contents/MacOS/ScreamingFrogSEOSpiderLauncher",
+)
+
+SF_DATA_DIR = Path.home() / ".ScreamingFrogSEOSpider" / "ProjectInstanceData"
+TEMP_EXPORT_BASE = Path.home() / ".cache" / "sf-mcp" / "exports"
+# Per-crawl output folders. Deliberately NOT under TEMP_EXPORT_BASE: the
+# export TTL sweep must never delete a crawl file SF wrote here when it
+# runs in memory storage mode (see issue #12).
+CRAWL_OUTPUT_BASE = Path.home() / ".cache" / "sf-mcp" / "crawl-output"
+EXPORT_TTL_SECONDS = int(os.getenv("SF_EXPORT_TTL_SECONDS", "3600"))  # default 1 hour
+MAX_CONCURRENT_CRAWLS = 2
+MAX_ACTIVE_EXPORTS = 10
+MAX_READ_LIMIT = 1000
+MAX_INPUT_LENGTH = 2000
+# Guards against regular expression denial of service in user-supplied
+# row filters (issue #16): pattern length cap, per-cell match timeout,
+# and a wall-clock budget for a whole filtering loop.
+MAX_FILTER_VALUE_LENGTH = 512
+REGEX_MATCH_TIMEOUT_SECONDS = 1.0
+FILTER_TIME_BUDGET_SECONDS = 20.0
+FILTER_BUDGET_CHECK_EVERY = 256  # rows between budget checks
+MAX_CRAWL_DURATION = 7200  # 2 hours
+EXPORT_TIMEOUT_SECONDS = int(os.getenv("SF_EXPORT_TIMEOUT_SECONDS", "300"))  # default 5 min
+
+# Optional domain allowlist for crawl targets (env var, comma-separated)
+_allowed_domains_raw = os.getenv("SF_ALLOWED_DOMAINS", "")
+ALLOWED_DOMAINS = [d.strip().lower() for d in _allowed_domains_raw.split(",") if d.strip()]
+
+# Allowed config directory for .seospiderconfig files
+CONFIG_DIR = Path(os.getenv(
+    "SF_CONFIG_DIR",
+    str(Path.home() / ".config" / "sf-mcp" / "configs"),
+))
+
+DEFAULT_EXPORT_TABS = (
+    "Internal:All,Response Codes:All,Page Titles:All,"
+    "Meta Description:All,H1:All,H2:All,Images:All,"
+    "Canonicals:All,Directives:All"
+)
+
+# Allowlisted CLI argument characters for export_tabs / bulk_export / save_report.
+# Derived from EXPORT_REFERENCE: alphanumeric, spaces, commas, colons, ampersands,
+# hyphens, dots, parens, plus signs, forward slashes, percent signs,
+# angle brackets (SF uses <head>, <body> in filter names).
+_CLI_ARG_PATTERN = re.compile(r'^[a-zA-Z0-9 ,:&\-\.\(\)\+/%<>_=!]+$')
+
+# --- State ---
+
+# Track running crawl processes: crawl_id -> {pid, proc, url, label, started}
+_running_crawls: dict = {}
+
+# Track temp export dirs: export_id -> {path, created, db_id}
+_export_dirs: dict = {}
+
+
+def _validate_url(url: str) -> Optional[str]:
+    """Returns error message if URL is invalid/dangerous, None if OK."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return "Invalid URL format."
+    if parsed.scheme not in ("http", "https"):
+        return f"Only http/https URLs are allowed, got: {parsed.scheme or 'none'}"
+    hostname = parsed.hostname or ""
+    if not hostname:
+        return "URL must include a hostname."
+
+    # Strip IPv6 brackets for ip_address() parsing
+    clean_host = hostname.strip("[]")
+
+    # Block private/internal IPs (literal IP in URL)
+    try:
+        ip = ipaddress.ip_address(clean_host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            return f"Internal/private addresses are not allowed: {hostname}"
+    except ValueError:
+        pass  # it's a domain name, not an IP -- that's fine
+
+    # Block known dangerous hostnames
+    blocked = {
+        "localhost",
+        "metadata.google.internal",
+        "metadata.internal",
+        "169.254.169.254",
+    }
+    if clean_host.lower() in blocked:
+        return f"Blocked hostname: {hostname}"
+
+    # Domain allowlist (if configured via SF_ALLOWED_DOMAINS env var)
+    if ALLOWED_DOMAINS:
+        if clean_host.lower() not in ALLOWED_DOMAINS:
+            return (
+                f"Domain {hostname} not in allowed list. "
+                f"Set SF_ALLOWED_DOMAINS to permit it."
+            )
+
+    # DNS resolution check: resolve the hostname and verify all IPs are public.
+    # Mitigates DNS rebinding attacks where a domain resolves to a private IP.
+    try:
+        addrs = socket.getaddrinfo(clean_host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        for family, _, _, _, sockaddr in addrs:
+            resolved_ip = ipaddress.ip_address(sockaddr[0])
+            if resolved_ip.is_private or resolved_ip.is_loopback or resolved_ip.is_link_local:
+                return f"Domain {hostname} resolves to internal address {sockaddr[0]}"
+    except socket.gaierror:
+        return f"Cannot resolve hostname: {hostname}"
+
+    return None
+
+
+def _validate_cli_arg(value: str, name: str) -> Optional[str]:
+    """Validate CLI argument values against an allowlist of safe characters."""
+    if not value or len(value) > MAX_INPUT_LENGTH:
+        return f"ERROR: {name} is empty or exceeds {MAX_INPUT_LENGTH} chars"
+    if value.strip().startswith("-"):
+        return f"ERROR: {name} must not start with '-'"
+    if not _CLI_ARG_PATTERN.match(value):
+        return f"ERROR: {name} contains invalid characters"
+    return None
+
+
+def _validate_db_id(db_id: str) -> Optional[str]:
+    """Validate db_id is a UUID (the format SF uses for crawl database IDs)."""
+    if not db_id or len(db_id) > 100:
+        return "ERROR: db_id is empty or too long"
+    # SF uses UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    if not re.match(r'^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$', db_id):
+        return "ERROR: db_id must be a valid UUID (e.g. from list_crawls)"
+    return None
+
+
+def _path_is_contained(target: Path, parent: Path) -> bool:
+    """Check that target is inside parent (no path traversal)."""
+    try:
+        target.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _sf_gui_is_running() -> bool:
+    """Check if the Screaming Frog GUI (Java process) is already running.
+    The headless CLI cannot access the crawl database while the GUI has it locked."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "ScreamingFrogSEOSpider.jar"],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
+            timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+SF_GUI_WARNING = (
+    "ERROR: Screaming Frog GUI is already running. "
+    "The headless CLI cannot access the crawl database while the GUI has it locked. "
+    "Please quit the SF GUI first, then retry."
+)
+
+# --- Server ---
+
+mcp = FastMCP("Screaming Frog SEO Spider")
+
+
+def _cleanup_old_exports():
+    """Remove temp export dirs older than EXPORT_TTL_SECONDS."""
+    now = time.time()
+    expired = [
+        eid for eid, info in _export_dirs.items()
+        if now - info["created"] > EXPORT_TTL_SECONDS
+    ]
+    for eid in expired:
+        path = _export_dirs[eid]["path"]
+        if path.exists() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+        del _export_dirs[eid]
+
+    # Also clean orphaned dirs on disk — skip symlinks
+    if TEMP_EXPORT_BASE.exists():
+        for d in TEMP_EXPORT_BASE.iterdir():
+            if d.is_symlink():
+                d.unlink()  # remove the symlink itself, never follow
+            elif d.is_dir():
+                age = now - d.stat().st_mtime
+                if age > EXPORT_TTL_SECONDS:
+                    shutil.rmtree(d, ignore_errors=True)
+
+
+def _build_crawl_cmd(url: str, output_dir: Path, config_path: Optional[Path] = None) -> list:
+    """Build the SF CLI command for a crawl.
+
+    Every crawl gets its own --output-folder. Without one, SF in memory
+    storage mode writes a fixed-name crawl.seospider into the process
+    working directory and refuses to start while it exists (issue #12).
+    In database storage mode the folder simply stays empty.
+    """
+    cmd = [
+        SF_CLI_PATH,
+        "--headless",
+        "--crawl", url,
+        "--save-crawl",
+        "--output-folder", str(output_dir),
+    ]
+    if config_path:
+        cmd.extend(["--config", str(config_path)])
+    return cmd
+
+
+def _find_memory_mode_save(output_dir: Optional[Path]) -> Optional[Path]:
+    """Return the .seospider file SF wrote into a crawl's output folder, if any.
+
+    A file here means SF runs in memory storage mode: --save-crawl produced
+    a crawl file instead of a database entry. In database mode (what the
+    rest of this server's tools require) the folder stays empty.
+    """
+    if not output_dir or not output_dir.exists():
+        return None
+    for f in sorted(output_dir.rglob("*.seospider")):
+        if not f.is_symlink():
+            return f
+    return None
+
+
+def _crawl_completion_guidance(
+    save_failed: bool,
+    fatal_error: Optional[str],
+    memory_save: Optional[Path],
+) -> str:
+    """The closing paragraph of a completed crawl_status report."""
+    if save_failed:
+        return (
+            "\n\nWARNING: Crawl save failed. The crawl data may not be "
+            "in SF's internal database. Check if the SF GUI has the "
+            "database locked, or try again."
+        )
+    if fatal_error:
+        return (
+            "\n\nThe crawl did not complete successfully. "
+            "Check the error above and try again."
+        )
+    if memory_save:
+        return (
+            f"\n\nScreaming Frog is in memory storage mode, so this crawl was "
+            f"written to a file instead of the internal database:\n"
+            f"  {memory_save}\n"
+            f"list_crawls and export_crawl read the internal database and will "
+            f"not see it. For the full workflow, switch SF to database storage "
+            f"mode ('File > Settings > Storage Mode' in the GUI; the default "
+            f"on current installs). The file stays on disk until you delete "
+            f"it and can be opened in the SF GUI."
+        )
+    return (
+        "\n\nThe crawl is saved in SF's internal database.\n"
+        "Use list_crawls() to see all saved crawls and get the DB ID.\n"
+        "Then use export_crawl(db_id='...') to export data as CSV."
+    )
+
+
+def _cleanup_completed_crawls():
+    """Remove completed crawl entries from memory and clean up log files."""
+    completed = [
+        cid for cid, info in _running_crawls.items()
+        if info["proc"].returncode is not None
+    ]
+    for cid in completed:
+        info = _running_crawls[cid]
+        _close_crawl_logs(info)
+        log_dir = info.get("log_dir")
+        if log_dir and log_dir.exists() and not log_dir.is_symlink():
+            shutil.rmtree(log_dir, ignore_errors=True)
+        # Remove the crawl's output folder only when SF left it empty
+        # (database mode). A .seospider file in it is the user's crawl
+        # data (memory mode) and is never auto-deleted.
+        output_dir = info.get("output_dir")
+        if (
+            output_dir
+            and output_dir.exists()
+            and not output_dir.is_symlink()
+            and _find_memory_mode_save(output_dir) is None
+        ):
+            shutil.rmtree(output_dir, ignore_errors=True)
+        del _running_crawls[cid]
+
+
+# Lines to filter from SF CLI output (contain internal paths, JVM info, etc.)
+_SF_LOG_FILTERS = [
+    "INFO  -", "WARNING:", "com.sun.", "Lock File",
+    "font", "proxy", "Signature", "License",
+    "Running:", "Platform", "Java Info", "VM args",
+    "Log File", "Fatal Log", "Logging Status",
+    "Memory:", "Licence", "Locale:", "Time Zone",
+    "Checking Licence", "antialias", "SfRoboto",
+]
+
+
+def _sanitize_sf_output(output: str) -> str:
+    """Filter verbose SF CLI log lines that may leak internal paths or config."""
+    lines = output.splitlines()
+    return "\n".join(
+        line for line in lines
+        if not any(skip in line for skip in _SF_LOG_FILTERS)
+    )
+
+
+def _close_crawl_logs(info: dict) -> None:
+    """Close log file handles for a crawl."""
+    for key in ("stdout_log", "stderr_log"):
+        fh = info.get(key)
+        if fh and not fh.closed:
+            fh.close()
+
+
+def _read_crawl_logs(info: dict) -> str:
+    """Read crawl log files and return combined output."""
+    output = ""
+    log_dir = info.get("log_dir")
+    if not log_dir:
+        return output
+    for name in ("stdout.log", "stderr.log"):
+        log_file = log_dir / name
+        if log_file.exists():
+            try:
+                output += log_file.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+    return output
+
+
+# Ensure export base dir exists with restricted permissions
+TEMP_EXPORT_BASE.mkdir(parents=True, exist_ok=True)
+os.chmod(TEMP_EXPORT_BASE, 0o700)
+
+# Clean up on startup
+_cleanup_old_exports()
+
+
+# --- Tools ---
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def sf_check() -> str:
+    """
+    Verify that Screaming Frog SEO Spider is installed and the CLI is accessible.
+    Returns version info and license status.
+    """
+    if not os.path.exists(SF_CLI_PATH):
+        return "ERROR: Screaming Frog CLI not found. Check SF_CLI_PATH in .env."
+
+    try:
+        # Use --list-crawls (read-only, works even with GUI running) because
+        # --help doesn't emit version or license info in its output.
+        result = subprocess.run(
+            [SF_CLI_PATH, "--headless", "--list-crawls"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        output = result.stdout + result.stderr
+
+        # Extract version and license info from the startup logs
+        version = "unknown"
+        license_status = "unknown"
+        for line in output.splitlines():
+            if "Running: Screaming Frog SEO Spider" in line:
+                version = line.split("Running: ")[-1].strip()
+            if "Licence Status:" in line:
+                license_status = line.split("Licence Status: ")[-1].strip()
+
+        return (
+            f"Screaming Frog is installed and accessible.\n"
+            f"Version: {version}\n"
+            f"License: {license_status}"
+        )
+    except subprocess.TimeoutExpired:
+        return "Screaming Frog CLI found but timed out during check."
+    except Exception as exc:
+        return f"ERROR: Could not check Screaming Frog installation: {type(exc).__name__}: {exc}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=True))
+async def crawl_site(
+    url: str,
+    config_file: Optional[str] = None,
+    label: Optional[str] = None,
+) -> str:
+    """
+    Start a background Screaming Frog crawl that saves to SF's internal database.
+
+    Args:
+        url: The URL to crawl (e.g. https://example.com)
+        config_file: Optional path to a .seospiderconfig file for crawl settings.
+            To limit the number of URLs crawled, set the limit in a config file
+            (Configuration > Spider > Limits in the SF GUI) and pass it here.
+        label: Optional label for identifying this crawl (e.g. 'freshgovjobs')
+
+    Returns:
+        A crawl_id to use with crawl_status to check progress.
+        The crawl runs in the background - use crawl_status to poll.
+    """
+    if not os.path.exists(SF_CLI_PATH):
+        return "ERROR: Screaming Frog CLI not found. Check SF_CLI_PATH in .env."
+
+    # Validate URL (SSRF protection)
+    url_err = _validate_url(url)
+    if url_err:
+        return f"ERROR: {url_err}"
+
+    if _sf_gui_is_running():
+        return SF_GUI_WARNING
+
+    # Enforce concurrent crawl limit
+    _cleanup_completed_crawls()
+    active = sum(1 for info in _running_crawls.values()
+                 if info["proc"].returncode is None)
+    if active >= MAX_CONCURRENT_CRAWLS:
+        return f"ERROR: Maximum {MAX_CONCURRENT_CRAWLS} concurrent crawls. Wait for running crawls to finish."
+
+    crawl_id = f"crawl-{uuid.uuid4().hex[:8]}"
+
+    config_path = None
+    if config_file:
+        config_path = Path(config_file).resolve()
+        if config_path.suffix != ".seospiderconfig":
+            return "ERROR: Config file must have .seospiderconfig extension."
+        if config_path.is_symlink():
+            return "ERROR: Config file must not be a symlink."
+        if not _path_is_contained(config_path, CONFIG_DIR):
+            return (
+                f"ERROR: Config files must be in {CONFIG_DIR}. "
+                f"Set SF_CONFIG_DIR to change the allowed directory."
+            )
+        if not config_path.exists():
+            return "ERROR: Config file not found."
+
+    output_dir = CRAWL_OUTPUT_BASE / crawl_id
+    cmd = _build_crawl_cmd(url, output_dir, config_path)
+
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        # Write crawl output to temp log files instead of PIPE to avoid
+        # pipe buffer deadlock on long-running crawls (macOS pipe buffer ~64KB).
+        log_dir = TEMP_EXPORT_BASE / f"{crawl_id}-logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        stdout_log = open(log_dir / "stdout.log", "w")
+        stderr_log = open(log_dir / "stderr.log", "w")
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=stdout_log,
+            stderr=stderr_log,
+        )
+
+        crawl_label = label or url.replace("https://", "").replace("http://", "").split("/")[0]
+
+        # Wait briefly to catch immediate startup failures (bad flags, license
+        # issues, etc.). SF FATAL errors happen in the first 1-2 seconds.
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pass  # still running -- that's the normal case
+
+        if proc.returncode is not None:
+            # Process already exited -- check for FATAL
+            stdout_log.close()
+            stderr_log.close()
+            early_output = ""
+            for name in ("stdout.log", "stderr.log"):
+                log_file = log_dir / name
+                if log_file.exists():
+                    try:
+                        early_output += log_file.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        pass
+            fatal_line = None
+            for line in early_output.splitlines():
+                if "FATAL" in line:
+                    fatal_line = line.strip()
+                    break
+            # Nothing useful was written on an immediate failure
+            if _find_memory_mode_save(output_dir) is None:
+                shutil.rmtree(output_dir, ignore_errors=True)
+            if fatal_line:
+                return f"ERROR: Crawl failed to start.\n{fatal_line}"
+            return (
+                f"ERROR: Crawl exited immediately (exit code {proc.returncode}). "
+                f"Check SF installation and license."
+            )
+
+        _running_crawls[crawl_id] = {
+            "proc": proc,
+            "url": url,
+            "label": crawl_label,
+            "started": time.time(),
+            "log_dir": log_dir,
+            "output_dir": output_dir,
+            "stdout_log": stdout_log,
+            "stderr_log": stderr_log,
+        }
+
+        return (
+            f"Crawl started in background.\n"
+            f"Crawl ID: {crawl_id}\n"
+            f"URL: {url}\n"
+            f"Label: {crawl_label}\n\n"
+            f"Use crawl_status(crawl_id='{crawl_id}') to check progress."
+        )
+    except Exception as exc:
+        logger.exception("Failed to start crawl")
+        return f"ERROR: Failed to start crawl: {type(exc).__name__}: {exc}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+async def crawl_status(crawl_id: str) -> str:
+    """
+    Check the status of a running or completed crawl.
+
+    Args:
+        crawl_id: The crawl_id returned by crawl_site
+    """
+    if crawl_id not in _running_crawls:
+        active = ", ".join(_running_crawls.keys()) if _running_crawls else "none"
+        return f"Unknown crawl_id: {crawl_id}\nActive crawls: {active}"
+
+    info = _running_crawls[crawl_id]
+    proc = info["proc"]
+    elapsed = time.time() - info["started"]
+    elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
+
+    if proc.returncode is None:
+        # Still running - check without blocking
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=0.1)
+        except asyncio.TimeoutError:
+            pass
+
+    # Enforce max crawl duration
+    if proc.returncode is None and elapsed > MAX_CRAWL_DURATION:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+        _close_crawl_logs(info)
+        return (
+            f"Crawl {crawl_id} terminated (exceeded {MAX_CRAWL_DURATION // 3600}h limit).\n"
+            f"URL: {info['url']}\n"
+            f"Elapsed: {elapsed_str}\n"
+            f"The partial crawl may be saved. Use list_crawls() to check."
+        )
+
+    if proc.returncode is None:
+        return (
+            f"Crawl {crawl_id} is still running.\n"
+            f"URL: {info['url']}\n"
+            f"Label: {info['label']}\n"
+            f"Elapsed: {elapsed_str}\n\n"
+            f"Use crawl_status(crawl_id='{crawl_id}') to check again."
+        )
+
+    # Process completed -- read logs from files
+    _close_crawl_logs(info)
+    log_output = _read_crawl_logs(info)
+
+    # Extract useful info from logs
+    urls_crawled = "unknown"
+    save_failed = False
+    db_shutdown_seen = False
+    fatal_error = None
+    for line in log_output.splitlines():
+        # SF logs: "Completed the spider of ... crawled N urls"
+        if "crawled" in line.lower() and "urls" in line.lower():
+            match = re.search(r"crawled\s+(\d+)\s+urls", line, re.IGNORECASE)
+            urls_crawled = match.group(1) if match else line.strip()
+        if "crawl save failed" in line.lower():
+            save_failed = True
+        if "shutdown database" in line.lower() and "projectinstancedata" in line.lower():
+            db_shutdown_seen = True
+        if "FATAL" in line and fatal_error is None:
+            fatal_error = line.strip()
+
+    # SF 23.2 logs "Crawl save failed {}" even when the crawl is saved
+    # successfully. Detect this false positive by checking for the database
+    # shutdown line that proves the data was written to disk.
+    if save_failed and db_shutdown_seen:
+        save_failed = False
+
+    # Determine actual status -- SF can exit 0 even on FATAL errors
+    if fatal_error and proc.returncode == 0:
+        status = "failed"
+    elif proc.returncode == 0:
+        status = "completed"
+    else:
+        status = f"failed (exit code {proc.returncode})"
+
+    result = (
+        f"Crawl {crawl_id} {status}.\n"
+        f"URL: {info['url']}\n"
+        f"Label: {info['label']}\n"
+        f"Elapsed: {elapsed_str}\n"
+        f"URLs crawled: {urls_crawled}\n"
+    )
+
+    if fatal_error:
+        result += f"\nFATAL: {fatal_error}\n"
+
+    if proc.returncode != 0 or fatal_error:
+        # Show last 20 lines of filtered output for debugging
+        filtered = _sanitize_sf_output(log_output)
+        tail = "\n".join(filtered.strip().splitlines()[-20:])
+        result += f"\nLast output:\n{tail}"
+
+    memory_save = _find_memory_mode_save(info.get("output_dir"))
+    result += _crawl_completion_guidance(save_failed, fatal_error, memory_save)
+
+    return result
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def list_crawls() -> str:
+    """
+    List all crawls saved in Screaming Frog's internal database.
+    Returns crawl names, Database IDs, and sizes.
+    Use the Database ID with export_crawl or delete_crawl.
+    """
+    if not os.path.exists(SF_CLI_PATH):
+        return "ERROR: Screaming Frog CLI not found. Check SF_CLI_PATH in .env."
+
+    # Note: --list-crawls works fine even when the GUI is running (read-only).
+    # No GUI check needed here.
+
+    try:
+        result = subprocess.run(
+            [SF_CLI_PATH, "--headless", "--list-crawls"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+
+        output = result.stdout + result.stderr
+
+        # Parse the crawl list from output
+        # SF outputs crawl info in its log format
+        crawl_lines = []
+        for line in output.splitlines():
+            # Filter out the verbose startup/info logs, keep crawl-relevant lines
+            if any(skip in line for skip in _SF_LOG_FILTERS):
+                continue
+            if line.strip():
+                crawl_lines.append(line.strip())
+
+        if not crawl_lines:
+            # If we couldn't parse structured output, try to extract from INFO lines
+            db_crawls = []
+            for line in output.splitlines():
+                if "Database Id" in line or "database" in line.lower():
+                    db_crawls.append(line.strip())
+
+            if db_crawls:
+                return "Saved crawls in SF database:\n\n" + "\n".join(db_crawls)
+
+            # Fallback: show the full filtered output
+            return (
+                "Screaming Frog --list-crawls output:\n\n"
+                + _sanitize_sf_output(output[-3000:])
+                + "\n\nNote: If no crawls are shown, the SF database may be empty."
+            )
+
+        return "Saved crawls in SF database:\n\n" + "\n".join(crawl_lines)
+
+    except subprocess.TimeoutExpired:
+        return "ERROR: Timed out listing crawls (60s limit)."
+    except Exception as exc:
+        logger.exception("Failed to list crawls")
+        return f"ERROR: Failed to list crawls: {type(exc).__name__}: {exc}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, openWorldHint=False))
+async def export_crawl(
+    db_id: str,
+    export_tabs: Optional[str] = None,
+    bulk_export: Optional[str] = None,
+    save_report: Optional[str] = None,
+) -> str:
+    """
+    Load a saved crawl from SF's database and export data as CSV files.
+
+    Args:
+        db_id: The Database ID from list_crawls (e.g. '1234' or a crawl identifier)
+        export_tabs: Comma-separated export tabs (default: Internal:All,Response Codes:All,Page Titles:All,Meta Description:All,H1:All,H2:All,Images:All,Canonicals:All,Directives:All). See the export-reference resource for all options.
+        bulk_export: Optional bulk export types (e.g. 'Links:All Inlinks,Content:Soft 404 Inlinks')
+        save_report: Optional reports to save (e.g. 'Crawl Overview')
+
+    Returns:
+        An export_id and list of generated CSV files. Use read_crawl_data to read them.
+    """
+    if not os.path.exists(SF_CLI_PATH):
+        return "ERROR: Screaming Frog CLI not found. Check SF_CLI_PATH in .env."
+
+    # Validate all inputs
+    db_err = _validate_db_id(db_id)
+    if db_err:
+        return db_err
+
+    for param_name, param_val in [("export_tabs", export_tabs), ("bulk_export", bulk_export), ("save_report", save_report)]:
+        if param_val:
+            arg_err = _validate_cli_arg(param_val, param_name)
+            if arg_err:
+                return arg_err
+
+    if _sf_gui_is_running():
+        return SF_GUI_WARNING
+
+    _cleanup_old_exports()
+
+    # Enforce export limit
+    if len(_export_dirs) >= MAX_ACTIVE_EXPORTS:
+        return f"ERROR: Maximum {MAX_ACTIVE_EXPORTS} active exports. Wait for cleanup or delete old exports."
+
+    export_id = f"export-{uuid.uuid4().hex[:8]}"
+    export_dir = TEMP_EXPORT_BASE / export_id
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    tabs = export_tabs or DEFAULT_EXPORT_TABS
+
+    cmd = [
+        SF_CLI_PATH,
+        "--headless",
+        "--load-crawl", db_id,
+        "--export-tabs", tabs,
+        "--output-folder", str(export_dir),
+        "--timestamped-output",
+    ]
+
+    if bulk_export:
+        cmd.extend(["--bulk-export", bulk_export])
+
+    if save_report:
+        cmd.extend(["--save-report", save_report])
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        stdout_raw, stderr_raw = await asyncio.wait_for(
+            proc.communicate(), timeout=EXPORT_TIMEOUT_SECONDS
+        )
+        stdout = stdout_raw.decode("utf-8", errors="replace")
+        stderr = stderr_raw.decode("utf-8", errors="replace")
+
+        if proc.returncode != 0:
+            filtered = _sanitize_sf_output(stdout + stderr)
+            tail = "\n".join(filtered.strip().splitlines()[-15:])
+            return f"ERROR exporting crawl (exit code {proc.returncode}):\n{tail}"
+
+        # List generated files
+        csv_files = sorted(export_dir.rglob("*.csv"))
+        file_list = []
+        for f in csv_files:
+            size = f.stat().st_size
+            size_str = f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / (1024 * 1024):.1f} MB"
+            rel_path = f.relative_to(export_dir)
+            file_list.append(f"  {rel_path} ({size_str})")
+
+        _export_dirs[export_id] = {
+            "path": export_dir,
+            "created": time.time(),
+            "db_id": db_id,
+        }
+
+        if not file_list:
+            return (
+                f"Export completed but no CSV files were generated.\n"
+                f"Export ID: {export_id}\n"
+                f"This may mean the crawl DB ID is invalid or the crawl has no data.\n"
+                f"Check the DB ID with list_crawls()."
+            )
+
+        # Check if CSVs are empty (headers only, no data rows).
+        # This is the telltale sign that the SF GUI has the database locked.
+        total_data_rows = 0
+        for f in csv_files:
+            try:
+                with open(f, "r", newline="", encoding="utf-8-sig") as fh:
+                    first_line = fh.readline()
+                    fh.seek(0)
+                    reader = csv.reader(fh)
+                    rows = sum(1 for _ in reader)
+                    # Summary reports (crawl_overview.csv etc.) have no header row;
+                    # tabular CSVs do. Only subtract header for tabular files.
+                    if _is_sf_summary_report(first_line):
+                        total_data_rows += rows
+                    else:
+                        total_data_rows += max(0, rows - 1)
+            except Exception:
+                pass
+
+        if total_data_rows == 0:
+            gui_hint = ""
+            if _sf_gui_is_running():
+                gui_hint = (
+                    " The Screaming Frog GUI is currently running — this is almost certainly "
+                    "the cause. Quit the GUI and re-run the export."
+                )
+            return (
+                f"WARNING: Export produced {len(csv_files)} CSV file(s) but ALL are empty "
+                f"(headers only, 0 data rows). This typically means the SF GUI has the "
+                f"crawl database locked.{gui_hint}\n\n"
+                f"Export ID: {export_id}\n"
+                f"DB ID: {db_id}"
+            )
+
+        return (
+            f"Export completed. {len(csv_files)} CSV files generated "
+            f"({total_data_rows} total data rows).\n"
+            f"Export ID: {export_id}\n"
+            f"DB ID: {db_id}\n\n"
+            f"Files:\n" + "\n".join(file_list) + "\n\n"
+            f"Use read_crawl_data(export_id='{export_id}', file='filename.csv') to read data.\n"
+            f"Files auto-delete after {EXPORT_TTL_SECONDS // 60} minutes."
+        )
+    except asyncio.TimeoutError:
+        return (
+            f"ERROR: Export timed out ({EXPORT_TIMEOUT_SECONDS}s limit). "
+            f"The crawl may be very large. Set SF_EXPORT_TIMEOUT_SECONDS to increase."
+        )
+    except Exception as exc:
+        logger.exception("Failed to export crawl")
+        return f"ERROR: Failed to export crawl: {type(exc).__name__}: {exc}"
+
+
+def _compile_row_filter(filter_value, filter_mode):
+    """Validate filter args shared by read_crawl_data and aggregate_crawl_data.
+
+    Returns (mode, filter_value_as_str, compiled_regex_or_None, error_or_None).
+
+    User-supplied patterns are compiled with the `regex` package rather than
+    stdlib `re`: its engine survives classic catastrophic-backtracking
+    patterns, and its match calls accept a hard timeout, which stdlib `re`
+    has no way to enforce (issue #16, CWE-1333).
+    """
+    mode = (filter_mode or "contains").lower()
+    if mode not in ("contains", "exact", "regex"):
+        return None, None, None, "ERROR: filter_mode must be 'contains', 'exact', or 'regex'"
+
+    if filter_value is not None:
+        filter_value = str(filter_value)
+        if len(filter_value) > MAX_FILTER_VALUE_LENGTH:
+            return None, None, None, (
+                f"ERROR: filter_value exceeds {MAX_FILTER_VALUE_LENGTH} "
+                f"characters. Use a shorter filter."
+            )
+
+    filter_regex = None
+    if mode == "regex" and filter_value:
+        try:
+            filter_regex = regex.compile(filter_value, regex.IGNORECASE)
+        except regex.error as e:
+            return None, None, None, f"ERROR: Invalid regex pattern: {e}"
+
+    return mode, filter_value, filter_regex, None
+
+
+def _row_matches(row, filter_column, filter_value, mode, filter_regex) -> bool:
+    """Apply the shared row filter. Callers skip rows where this returns False.
+
+    Regex matching carries a per-cell timeout; a pattern that backtracks
+    past it raises TimeoutError, which the tool loops turn into an error
+    message instead of a hung call.
+    """
+    if not (filter_column and filter_value):
+        return True
+    cell = row.get(filter_column) or ""
+    if mode == "exact":
+        return cell.lower() == filter_value.lower()
+    if mode == "regex":
+        return bool(filter_regex.search(cell, timeout=REGEX_MATCH_TIMEOUT_SECONDS))
+    return filter_value.lower() in cell.lower()  # contains
+
+
+_REGEX_TIMEOUT_ERROR = (
+    "ERROR: The regex filter timed out while matching a row (catastrophic "
+    "backtracking). Simplify the pattern: avoid nested or ambiguous "
+    "quantifiers like (a+)+ or (a|aa)+ and prefer anchored, specific "
+    "expressions."
+)
+
+
+def _budget_error() -> str:
+    return (
+        f"ERROR: Filtering exceeded the {FILTER_TIME_BUDGET_SECONDS:.0f}s "
+        f"time budget. Narrow the filter, request fewer columns, or "
+        f"paginate with offset and limit."
+    )
+
+
+def _resolve_export_file(export_id: str, file: str):
+    """Resolve an export file path safely, shared by the CSV-reading tools.
+
+    Returns (target_path, export_dir, None) on success,
+    or (None, None, error_string) on failure.
+    """
+    if export_id not in _export_dirs:
+        active = ", ".join(_export_dirs.keys()) if _export_dirs else "none"
+        return None, None, f"Unknown export_id: {export_id}\nActive exports: {active}"
+
+    export_dir = _export_dirs[export_id]["path"]
+    if not export_dir.exists():
+        del _export_dirs[export_id]
+        return None, None, "Export directory has been cleaned up. Run export_crawl again."
+
+    # Sanitize: strip path separators and traversal attempts
+    safe_file = Path(file).name
+    target = export_dir / file
+    if not _path_is_contained(target, export_dir):
+        target = export_dir / safe_file
+
+    if not target.exists():
+        # Search subdirectories -- only use the safe filename, escape glob chars
+        escaped = glob.escape(safe_file)
+        matches = [f for f in export_dir.rglob(escaped)
+                   if _path_is_contained(f, export_dir) and not f.is_symlink()]
+        if not matches:
+            matches = [f for f in export_dir.rglob(f"*{escaped}*")
+                       if _path_is_contained(f, export_dir) and not f.is_symlink()]
+        if not matches:
+            available = [str(f.relative_to(export_dir)) for f in export_dir.rglob("*.csv")]
+            return None, None, (
+                f"File '{safe_file}' not found.\nAvailable files:\n"
+                + "\n".join(f"  {f}" for f in available)
+            )
+        target = matches[0]
+
+    if not _path_is_contained(target, export_dir):
+        return None, None, "ERROR: Invalid file path."
+
+    return target, export_dir, None
+
+
+def _is_sf_summary_report(first_line: str) -> bool:
+    """Detect whether a CSV file is an SF summary report (e.g. crawl_overview.csv).
+
+    SF summary reports are vertical key-value layouts, not tabular CSVs.
+    The first row is always a two-cell pair like: "Site Crawled","https://..."
+    """
+    try:
+        cells = next(csv.reader([first_line]))
+    except (csv.Error, StopIteration):
+        return False
+    return (
+        len(cells) == 2
+        and cells[0].strip().lower() == "site crawled"
+    )
+
+
+def _read_sf_summary_report(f, target: Path, export_dir: Path) -> str:
+    """Parse an SF summary report (crawl_overview.csv and similar) into readable text.
+
+    These files have:
+    - Header key-value pairs (2 cells): "Site Crawled","https://example.com/"
+    - Section headers (1 cell): "Internal"
+    - Data rows (3-5 cells): "label","count","percent","total","description"
+    - Blank rows separating sections
+    """
+    reader = csv.reader(f)
+    output = f"File: {target.relative_to(export_dir)}\n"
+    output += "(Screaming Frog summary report)\n\n"
+
+    current_section = None
+
+    for row in reader:
+        # Skip empty rows
+        if not row or all(cell.strip() == "" for cell in row):
+            continue
+
+        cells = [cell.strip() for cell in row]
+
+        # Key-value header pair (exactly 2 non-empty cells).
+        # These appear at the top of the file before any section headers.
+        # Once we hit a section, 2-cell rows don't appear.
+        if len(cells) == 2 and cells[0] and cells[1] and current_section is None:
+            output += f"{cells[0]}: {cells[1]}\n"
+            continue
+
+        # Section header (single non-empty cell, not a number)
+        if len(cells) == 1 or (len(cells) >= 1 and all(c == "" for c in cells[1:])):
+            label = cells[0]
+            if label and not label.replace(",", "").replace(".", "").isdigit():
+                current_section = label
+                output += f"\n=== {label} ===\n"
+                continue
+
+        # Sub-header row (e.g. "Summary","URLs","% of Total",...)
+        # Detect by checking if it looks like column names (no pure-number cells)
+        if len(cells) >= 3 and not any(
+            c.replace(",", "").replace(".", "").replace("%", "").isdigit()
+            for c in cells if c
+        ):
+            # This is a column header row within the report; skip it
+            # (the data rows below are self-describing enough)
+            continue
+
+        # Data row: label, count, percent, and optionally total + description
+        if len(cells) >= 3:
+            label = cells[0]
+            count = cells[1]
+            pct = cells[2]
+            output += f"  {label}: {count} ({pct})\n"
+            continue
+
+        # Fallback: render whatever we got
+        output += "  " + " | ".join(cells) + "\n"
+
+    return output
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def read_crawl_data(
+    export_id: str,
+    file: str,
+    limit: int = 100,
+    offset: int = 0,
+    filter_column: Optional[str] = None,
+    filter_value: Optional[Union[str, int, float]] = None,
+    filter_mode: Optional[str] = None,
+    columns: Optional[str] = None,
+) -> str:
+    """
+    Read CSV data from an export. Use after export_crawl.
+
+    Args:
+        export_id: The export_id from export_crawl
+        file: CSV filename to read (from the file list in export_crawl output)
+        limit: Max rows to return (default 100, max 1000)
+        offset: Number of rows to skip (for pagination)
+        filter_column: Optional column name to filter by
+        filter_value: Optional value to match in the filter column
+        filter_mode: How to match filter_value: "contains" (default, case-insensitive substring), "exact" (case-insensitive exact match), or "regex" (Python regex)
+        columns: Optional comma-separated column names to return. Wide exports
+            (Internal:All has dozens of columns) flood the context; request
+            just the ones you need, e.g. "Address,Status Code".
+
+    Returns:
+        CSV data as formatted text with column headers.
+    """
+    # Clamp limit and offset to sane values
+    limit = max(1, min(limit, MAX_READ_LIMIT))
+    offset = max(0, offset)
+
+    mode, filter_value, filter_regex, err = _compile_row_filter(filter_value, filter_mode)
+    if err:
+        return err
+
+    target, export_dir, err = _resolve_export_file(export_id, file)
+    if err:
+        return err
+    safe_file = Path(file).name
+
+    try:
+        with open(target, "r", encoding="utf-8-sig") as f:
+            # Detect SF summary report format (e.g. crawl_overview.csv).
+            # These files are vertical key-value layouts with section headers
+            # and blank rows, NOT row-oriented tabular CSVs. The first row
+            # is a reliable signal: two cells like "Site Crawled","https://..."
+            first_line = f.readline()
+            f.seek(0)
+
+            if _is_sf_summary_report(first_line):
+                return _read_sf_summary_report(f, target, export_dir)
+
+            reader = csv.DictReader(f)
+
+            # Validate filter_column exists in headers
+            if filter_column and reader.fieldnames and filter_column not in reader.fieldnames:
+                available = ", ".join(reader.fieldnames[:20])
+                return f"Column '{filter_column}' not found.\nAvailable columns: {available}"
+
+            # Validate requested output columns
+            selected_columns = None
+            if columns:
+                selected_columns = [c.strip() for c in columns.split(",") if c.strip()]
+                if reader.fieldnames:
+                    missing = [c for c in selected_columns if c not in reader.fieldnames]
+                    if missing:
+                        available = ", ".join(reader.fieldnames[:20])
+                        return (
+                            f"Column{'s' if len(missing) != 1 else ''} "
+                            f"{', '.join(repr(c) for c in missing)} not found.\n"
+                            f"Available columns: {available}"
+                        )
+
+            rows = []
+            skipped = 0
+            scanned = 0
+            loop_start = time.time()
+            for row in reader:
+                scanned += 1
+                if scanned % FILTER_BUDGET_CHECK_EVERY == 0:
+                    if time.time() - loop_start > FILTER_TIME_BUDGET_SECONDS:
+                        return _budget_error()
+                try:
+                    if not _row_matches(row, filter_column, filter_value, mode, filter_regex):
+                        continue
+                except TimeoutError:
+                    return _REGEX_TIMEOUT_ERROR
+
+                if skipped < offset:
+                    skipped += 1
+                    continue
+
+                rows.append(row)
+                if len(rows) >= limit:
+                    break
+
+            if not rows:
+                total_available = skipped  # rows that matched filter but were skipped by offset
+                if offset > 0 and total_available > 0:
+                    return (
+                        f"No rows at offset {offset} in {file} "
+                        f"(only {total_available} matching row{'s' if total_available != 1 else ''} total)."
+                    )
+                return f"No matching rows in {file}."
+
+            # Format as text table
+            columns = selected_columns or list(rows[0].keys())
+
+            # Build output
+            output = f"File: {target.relative_to(export_dir)}\n"
+            output += f"Showing rows {offset + 1}-{offset + len(rows)}"
+            if filter_column:
+                output += f" (filtered: {filter_column} {mode} '{filter_value}')"
+            output += f"\n\n"
+
+            # Header
+            output += " | ".join(columns) + "\n"
+            output += "-+-".join("-" * min(len(c), 30) for c in columns) + "\n"
+
+            # Rows
+            for row in rows:
+                values = []
+                for col in columns:
+                    val = row.get(col, "")
+                    if val is not None and len(val) > 80:
+                        val = val[:77] + "..."
+                    values.append(val)
+                output += " | ".join(values) + "\n"
+
+            # Truncation note
+            if len(rows) == limit:
+                output += f"\n... limit of {limit} rows reached. Use offset={offset + limit} for next page."
+
+            return output
+
+    except Exception as exc:
+        logger.exception("Failed to read export data")
+        return f"ERROR: Failed to read {safe_file}: {type(exc).__name__}: {exc}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def aggregate_crawl_data(
+    export_id: str,
+    file: str,
+    group_by: Optional[str] = None,
+    top: int = 20,
+    filter_column: Optional[str] = None,
+    filter_value: Optional[Union[str, int, float]] = None,
+    filter_mode: Optional[str] = None,
+) -> str:
+    """
+    Aggregate CSV data from an export: row counts and group-by breakdowns.
+    Use instead of read_crawl_data when the question needs counts or a
+    distribution ("how many 404s", "status code breakdown") rather than
+    the rows themselves.
+
+    Args:
+        export_id: The export_id from export_crawl
+        file: CSV filename to aggregate (from the file list in export_crawl output)
+        group_by: Optional column name; counts rows per distinct value of it
+        top: Max distinct values to show, most common first (default 20, max 100)
+        filter_column: Optional column name to filter by before aggregating
+        filter_value: Optional value to match in the filter column
+        filter_mode: How to match filter_value: "contains" (default), "exact", or "regex"
+
+    Returns:
+        Total matching row count, plus per-value counts with percentages
+        when group_by is set.
+    """
+    top = max(1, min(top, 100))
+
+    mode, filter_value, filter_regex, err = _compile_row_filter(filter_value, filter_mode)
+    if err:
+        return err
+
+    target, export_dir, err = _resolve_export_file(export_id, file)
+    if err:
+        return err
+    safe_file = Path(file).name
+
+    try:
+        with open(target, "r", encoding="utf-8-sig") as f:
+            first_line = f.readline()
+            f.seek(0)
+            if _is_sf_summary_report(first_line):
+                return _read_sf_summary_report(f, target, export_dir)
+
+            reader = csv.DictReader(f)
+
+            if filter_column and reader.fieldnames and filter_column not in reader.fieldnames:
+                available = ", ".join(reader.fieldnames[:20])
+                return f"Column '{filter_column}' not found.\nAvailable columns: {available}"
+            if group_by and reader.fieldnames and group_by not in reader.fieldnames:
+                available = ", ".join(reader.fieldnames[:20])
+                return f"Column '{group_by}' not found.\nAvailable columns: {available}"
+
+            counts: dict = {}
+            total = 0
+            scanned = 0
+            loop_start = time.time()
+            for row in reader:
+                scanned += 1
+                if scanned % FILTER_BUDGET_CHECK_EVERY == 0:
+                    if time.time() - loop_start > FILTER_TIME_BUDGET_SECONDS:
+                        return _budget_error()
+                try:
+                    if not _row_matches(row, filter_column, filter_value, mode, filter_regex):
+                        continue
+                except TimeoutError:
+                    return _REGEX_TIMEOUT_ERROR
+                total += 1
+                if group_by:
+                    val = (row.get(group_by) or "").strip() or "(empty)"
+                    counts[val] = counts.get(val, 0) + 1
+
+            filt = ""
+            if filter_column and filter_value:
+                filt = f" (filtered: {filter_column} {mode} '{filter_value}')"
+
+            header = f"File: {target.relative_to(export_dir)}\n"
+            plural = "s" if total != 1 else ""
+
+            if not group_by:
+                return header + f"{total} matching row{plural}{filt}"
+
+            output = header + f"Total: {total} row{plural}{filt}\n"
+            output += f"Breakdown by {group_by}:\n"
+            ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            for val, n in ordered[:top]:
+                pct = (n / total * 100) if total else 0.0
+                display = val if len(val) <= 80 else val[:77] + "..."
+                output += f"  {display}: {n} ({pct:.1f}%)\n"
+            hidden = len(ordered) - top
+            if hidden > 0:
+                output += f"  ... and {hidden} more value{'s' if hidden != 1 else ''}. Increase top to see them.\n"
+            return output
+
+    except Exception as exc:
+        logger.exception("Failed to aggregate export data")
+        return f"ERROR: Failed to aggregate {safe_file}: {type(exc).__name__}: {exc}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False))
+def delete_crawl(db_id: str) -> str:
+    """
+    Delete a crawl from Screaming Frog's internal database to free disk space.
+
+    Args:
+        db_id: The Database ID from list_crawls
+
+    WARNING: This permanently deletes the crawl data. It cannot be undone.
+    """
+    if not os.path.exists(SF_CLI_PATH):
+        return "ERROR: Screaming Frog CLI not found. Check SF_CLI_PATH in .env."
+
+    db_err = _validate_db_id(db_id)
+    if db_err:
+        return db_err
+
+    if _sf_gui_is_running():
+        return SF_GUI_WARNING
+
+    try:
+        result = subprocess.run(
+            [SF_CLI_PATH, "--headless", "--delete-crawl", db_id],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+
+        output = result.stdout + result.stderr
+
+        if result.returncode == 0:
+            return f"Crawl {db_id} deleted successfully."
+
+        # Check for common errors -- filter internal paths from output
+        filtered = _sanitize_sf_output(output)
+        tail = "\n".join(filtered.strip().splitlines()[-10:])
+        return f"Delete may have failed (exit code {result.returncode}):\n{tail}"
+
+    except subprocess.TimeoutExpired:
+        return "ERROR: Delete timed out (60s limit)."
+    except Exception as exc:
+        logger.exception("Failed to delete crawl")
+        return f"ERROR: Failed to delete crawl: {type(exc).__name__}: {exc}"
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
+def storage_summary() -> str:
+    """
+    Show disk usage of Screaming Frog's internal crawl storage.
+    Returns total size and per-crawl breakdown of ProjectInstanceData.
+    """
+    if not SF_DATA_DIR.exists():
+        return "SF data directory not found."
+
+    total_size = 0
+    entries = []
+
+    for item in sorted(SF_DATA_DIR.iterdir()):
+        if item.is_dir():
+            dir_size = sum(f.stat().st_size for f in item.rglob("*") if f.is_file())
+            total_size += dir_size
+            size_str = _format_size(dir_size)
+            entries.append(f"  {item.name}: {size_str}")
+        elif item.is_file():
+            total_size += item.stat().st_size
+
+    # Also check temp exports
+    temp_size = 0
+    temp_count = 0
+    if TEMP_EXPORT_BASE.exists():
+        for d in TEMP_EXPORT_BASE.iterdir():
+            if d.is_dir():
+                temp_count += 1
+                temp_size += sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+
+    result = f"Screaming Frog Storage Summary\n{'=' * 40}\n\n"
+    result += f"Total DB size: {_format_size(total_size)}\n\n"
+
+    if entries:
+        result += "Crawl databases:\n" + "\n".join(entries) + "\n"
+    else:
+        result += "No crawl databases found.\n"
+
+    if temp_count > 0:
+        result += f"\nTemp exports: {temp_count} dirs, {_format_size(temp_size)}"
+        ttl_str = f"{EXPORT_TTL_SECONDS // 3600}h" if EXPORT_TTL_SECONDS >= 3600 else f"{EXPORT_TTL_SECONDS // 60}m"
+        result += f" (auto-cleaned after {ttl_str})"
+
+    return result
+
+
+def _format_size(size_bytes: int) -> str:
+    """Format bytes into human-readable size."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+
+
+# --- Resource ---
+
+EXPORT_REFERENCE = """
+# Screaming Frog Export Reference
+
+Generated from the Screaming Frog SEO Spider 24.1.0 CLI (`--help export-tabs`,
+`--help bulk-export`, `--help save-report`). Names vary by SF version; the
+installed CLI help output is always authoritative.
+
+## --export-tabs (Tab:Filter)
+Export data from the main crawl tabs. Format: "Tab:Filter", comma-separated.
+
+### Tabs and Filters:
+- AI: All, OpenAI Prompt 1, Ollama Prompt 1, Gemini Prompt 1, Anthropic Prompt 1, OpenAI Prompt 2, Ollama Prompt 2, Gemini Prompt 2, Anthropic Prompt 2, OpenAI Prompt 3, Ollama Prompt 3, Gemini Prompt 3, Anthropic Prompt 3, OpenAI Prompt 4, Ollama Prompt 4, Gemini Prompt 4, Anthropic Prompt 4, OpenAI Prompt 5, Ollama Prompt 5, Gemini Prompt 5, Anthropic Prompt 5, OpenAI Prompt 6, Ollama Prompt 6, Gemini Prompt 6, Anthropic Prompt 6, OpenAI Prompt 7, Ollama Prompt 7, Gemini Prompt 7, Anthropic Prompt 7, OpenAI Prompt 8, Ollama Prompt 8, Gemini Prompt 8, Anthropic Prompt 8, OpenAI Prompt 9, Ollama Prompt 9, Gemini Prompt 9, Anthropic Prompt 9, OpenAI Prompt 10, Ollama Prompt 10, Gemini Prompt 10, Anthropic Prompt 10, OpenAI Prompt 11, Ollama Prompt 11, Gemini Prompt 11, Anthropic Prompt 11, OpenAI Prompt 12, Ollama Prompt 12, Gemini Prompt 12, Anthropic Prompt 12, OpenAI Prompt 13, Ollama Prompt 13, Gemini Prompt 13, Anthropic Prompt 13, OpenAI Prompt 14, Ollama Prompt 14, Gemini Prompt 14, Anthropic Prompt 14, OpenAI Prompt 15, Ollama Prompt 15, Gemini Prompt 15, Anthropic Prompt 15, OpenAI Prompt 16, Ollama Prompt 16, Gemini Prompt 16, Anthropic Prompt 16, OpenAI Prompt 17, Ollama Prompt 17, Gemini Prompt 17, Anthropic Prompt 17, OpenAI Prompt 18, Ollama Prompt 18, Gemini Prompt 18, Anthropic Prompt 18, OpenAI Prompt 19, Ollama Prompt 19, Gemini Prompt 19, Anthropic Prompt 19, OpenAI Prompt 20, Ollama Prompt 20, Gemini Prompt 20, Anthropic Prompt 20, OpenAI Prompt 21, Ollama Prompt 21, Gemini Prompt 21, Anthropic Prompt 21, OpenAI Prompt 22, Ollama Prompt 22, Gemini Prompt 22, Anthropic Prompt 22, OpenAI Prompt 23, Ollama Prompt 23, Gemini Prompt 23, Anthropic Prompt 23, OpenAI Prompt 24, Ollama Prompt 24, Gemini Prompt 24, Anthropic Prompt 24, OpenAI Prompt 25, Ollama Prompt 25, Gemini Prompt 25, Anthropic Prompt 25, OpenAI Prompt 26, Ollama Prompt 26, Gemini Prompt 26, Anthropic Prompt 26, OpenAI Prompt 27, Ollama Prompt 27, Gemini Prompt 27, Anthropic Prompt 27, OpenAI Prompt 28, Ollama Prompt 28, Gemini Prompt 28, Anthropic Prompt 28, OpenAI Prompt 29, Ollama Prompt 29, Gemini Prompt 29, Anthropic Prompt 29, OpenAI Prompt 30, Ollama Prompt 30, Gemini Prompt 30, Anthropic Prompt 30, OpenAI Prompt 31, Ollama Prompt 31, Gemini Prompt 31, Anthropic Prompt 31, OpenAI Prompt 32, Ollama Prompt 32, Gemini Prompt 32, Anthropic Prompt 32, OpenAI Prompt 33, Ollama Prompt 33, Gemini Prompt 33, Anthropic Prompt 33, OpenAI Prompt 34, Ollama Prompt 34, Gemini Prompt 34, Anthropic Prompt 34, OpenAI Prompt 35, Ollama Prompt 35, Gemini Prompt 35, Anthropic Prompt 35, OpenAI Prompt 36, Ollama Prompt 36, Gemini Prompt 36, Anthropic Prompt 36, OpenAI Prompt 37, Ollama Prompt 37, Gemini Prompt 37, Anthropic Prompt 37, OpenAI Prompt 38, Ollama Prompt 38, Gemini Prompt 38, Anthropic Prompt 38, OpenAI Prompt 39, Ollama Prompt 39, Gemini Prompt 39, Anthropic Prompt 39, OpenAI Prompt 40, Ollama Prompt 40, Gemini Prompt 40, Anthropic Prompt 40, OpenAI Prompt 41, Ollama Prompt 41, Gemini Prompt 41, Anthropic Prompt 41, OpenAI Prompt 42, Ollama Prompt 42, Gemini Prompt 42, Anthropic Prompt 42, OpenAI Prompt 43, Ollama Prompt 43, Gemini Prompt 43, Anthropic Prompt 43, OpenAI Prompt 44, Ollama Prompt 44, Gemini Prompt 44, Anthropic Prompt 44, OpenAI Prompt 45, Ollama Prompt 45, Gemini Prompt 45, Anthropic Prompt 45, OpenAI Prompt 46, Ollama Prompt 46, Gemini Prompt 46, Anthropic Prompt 46, OpenAI Prompt 47, Ollama Prompt 47, Gemini Prompt 47, Anthropic Prompt 47, OpenAI Prompt 48, Ollama Prompt 48, Gemini Prompt 48, Anthropic Prompt 48, OpenAI Prompt 49, Ollama Prompt 49, Gemini Prompt 49, Anthropic Prompt 49, OpenAI Prompt 50, Ollama Prompt 50, Gemini Prompt 50, Anthropic Prompt 50, OpenAI Prompt 51, Ollama Prompt 51, Gemini Prompt 51, Anthropic Prompt 51, OpenAI Prompt 52, Ollama Prompt 52, Gemini Prompt 52, Anthropic Prompt 52, OpenAI Prompt 53, Ollama Prompt 53, Gemini Prompt 53, Anthropic Prompt 53, OpenAI Prompt 54, Ollama Prompt 54, Gemini Prompt 54, Anthropic Prompt 54, OpenAI Prompt 55, Ollama Prompt 55, Gemini Prompt 55, Anthropic Prompt 55, OpenAI Prompt 56, Ollama Prompt 56, Gemini Prompt 56, Anthropic Prompt 56, OpenAI Prompt 57, Ollama Prompt 57, Gemini Prompt 57, Anthropic Prompt 57, OpenAI Prompt 58, Ollama Prompt 58, Gemini Prompt 58, Anthropic Prompt 58, OpenAI Prompt 59, Ollama Prompt 59, Gemini Prompt 59, Anthropic Prompt 59, OpenAI Prompt 60, Ollama Prompt 60, Gemini Prompt 60, Anthropic Prompt 60, OpenAI Prompt 61, Ollama Prompt 61, Gemini Prompt 61, Anthropic Prompt 61, OpenAI Prompt 62, Ollama Prompt 62, Gemini Prompt 62, Anthropic Prompt 62, OpenAI Prompt 63, Ollama Prompt 63, Gemini Prompt 63, Anthropic Prompt 63, OpenAI Prompt 64, Ollama Prompt 64, Gemini Prompt 64, Anthropic Prompt 64, OpenAI Prompt 65, Ollama Prompt 65, Gemini Prompt 65, Anthropic Prompt 65, OpenAI Prompt 66, Ollama Prompt 66, Gemini Prompt 66, Anthropic Prompt 66, OpenAI Prompt 67, Ollama Prompt 67, Gemini Prompt 67, Anthropic Prompt 67, OpenAI Prompt 68, Ollama Prompt 68, Gemini Prompt 68, Anthropic Prompt 68, OpenAI Prompt 69, Ollama Prompt 69, Gemini Prompt 69, Anthropic Prompt 69, OpenAI Prompt 70, Ollama Prompt 70, Gemini Prompt 70, Anthropic Prompt 70, OpenAI Prompt 71, Ollama Prompt 71, Gemini Prompt 71, Anthropic Prompt 71, OpenAI Prompt 72, Ollama Prompt 72, Gemini Prompt 72, Anthropic Prompt 72, OpenAI Prompt 73, Ollama Prompt 73, Gemini Prompt 73, Anthropic Prompt 73, OpenAI Prompt 74, Ollama Prompt 74, Gemini Prompt 74, Anthropic Prompt 74, OpenAI Prompt 75, Ollama Prompt 75, Gemini Prompt 75, Anthropic Prompt 75, OpenAI Prompt 76, Ollama Prompt 76, Gemini Prompt 76, Anthropic Prompt 76, OpenAI Prompt 77, Ollama Prompt 77, Gemini Prompt 77, Anthropic Prompt 77, OpenAI Prompt 78, Ollama Prompt 78, Gemini Prompt 78, Anthropic Prompt 78, OpenAI Prompt 79, Ollama Prompt 79, Gemini Prompt 79, Anthropic Prompt 79, OpenAI Prompt 80, Ollama Prompt 80, Gemini Prompt 80, Anthropic Prompt 80, OpenAI Prompt 81, Ollama Prompt 81, Gemini Prompt 81, Anthropic Prompt 81, OpenAI Prompt 82, Ollama Prompt 82, Gemini Prompt 82, Anthropic Prompt 82, OpenAI Prompt 83, Ollama Prompt 83, Gemini Prompt 83, Anthropic Prompt 83, OpenAI Prompt 84, Ollama Prompt 84, Gemini Prompt 84, Anthropic Prompt 84, OpenAI Prompt 85, Ollama Prompt 85, Gemini Prompt 85, Anthropic Prompt 85, OpenAI Prompt 86, Ollama Prompt 86, Gemini Prompt 86, Anthropic Prompt 86, OpenAI Prompt 87, Ollama Prompt 87, Gemini Prompt 87, Anthropic Prompt 87, OpenAI Prompt 88, Ollama Prompt 88, Gemini Prompt 88, Anthropic Prompt 88, OpenAI Prompt 89, Ollama Prompt 89, Gemini Prompt 89, Anthropic Prompt 89, OpenAI Prompt 90, Ollama Prompt 90, Gemini Prompt 90, Anthropic Prompt 90, OpenAI Prompt 91, Ollama Prompt 91, Gemini Prompt 91, Anthropic Prompt 91, OpenAI Prompt 92, Ollama Prompt 92, Gemini Prompt 92, Anthropic Prompt 92, OpenAI Prompt 93, Ollama Prompt 93, Gemini Prompt 93, Anthropic Prompt 93, OpenAI Prompt 94, Ollama Prompt 94, Gemini Prompt 94, Anthropic Prompt 94, OpenAI Prompt 95, Ollama Prompt 95, Gemini Prompt 95, Anthropic Prompt 95, OpenAI Prompt 96, Ollama Prompt 96, Gemini Prompt 96, Anthropic Prompt 96, OpenAI Prompt 97, Ollama Prompt 97, Gemini Prompt 97, Anthropic Prompt 97, OpenAI Prompt 98, Ollama Prompt 98, Gemini Prompt 98, Anthropic Prompt 98, OpenAI Prompt 99, Ollama Prompt 99, Gemini Prompt 99, Anthropic Prompt 99, OpenAI Prompt 100, Ollama Prompt 100, Gemini Prompt 100, Anthropic Prompt 100
+- AMP: All, Non-200 Response, Missing Non-AMP Return Link, Missing Canonical to Non-AMP, Non-Indexable Canonical, Indexable, Non-Indexable, Missing <html amp> Tag, Missing/Invalid <!doctype html> Tag, Missing <head> Tag, Missing <body> Tag, Missing Canonical, Missing/Invalid <meta charset> Tag, Missing/Invalid <meta viewport> Tag, Missing/Invalid AMP Script, Missing/Invalid AMP Boilerplate, Contains Disallowed HTML, Other Validation Errors
+- Accessibility: All, Accessibility Score Poor, Accessibility Score Needs Improvement, Accessibility Score Good, Best Practice Violation, WCAG 2.0 A Violation, WCAG 2.0 AA Violation, WCAG 2.0 AAA Violation, WCAG 2.1 AA Violation, WCAG 2.2 AA Violation, Accesskey Attribute Value Must Be Unique, Ensure Elements Marked Presentational Are Ignored, Elements Must Not Have Tabindex Greater Than Zero, Scrollable Region Requires Keyboard Access, Skip-link Target Should Exist & Be Focusable, Required ARIA Attributes Must Be Provided, Role=text Should Have No Focusable Descendants, ARIA Attribute Must Be Used As Specified For Role, ARIA Attributes Require Valid Values, ARIA Attributes Require Valid Names, ARIA Commands Require Accessible Name, ARIA Dialog & Alertdialog Require Accessible Name, ARIA Input Fields Require Accessible Name, ARIA Meter Nodes Require Accessible Name, ARIA Progressbar Nodes Require Accessible Name, ARIA Role Should Be Appropriate For Element, ARIA Roles Must Be Contained By Required Parent, ARIA Roles Require Valid Values, ARIA Toggle Fields Require Accessible Name, ARIA Tooltip Nodes Require Accessible Name, ARIA Treeitem Nodes Require Accessible Name, Certain ARIA Roles Must Contain Specific Children, Deprecated ARIA Roles Must Not Be Used, Aria-braille Require Non-braille Equivalent, Aria-hidden Elements Contains Focusable Elements, Aria-hidden=true Must Not Be Used In <body>, Elements Must Only Use Permitted ARIA Attributes, Elements Must Use Allowed ARIA Attributes, IDs Used In ARIA & Labels Must Be Unique, Page Requires Means To Bypass Repeated Blocks, All Page Content Must Be Contained By Landmarks, Page Requires One Main Landmark, Page Must Not Have More Than One Banner Landmark, Banner Landmark Must Not Be In Another Landmark, Page Must Not Have Multiple Contentinfo Landmarks, Page Requires At Most One Main Landmark, Complementary Landmarks & Asides Must Be Top Level, Contentinfo Landmark Must Be Top Level Landmark, Main Landmark Must Not Be In Another Landmark, Landmarks Require Unique Role Or Accessible Name, Form <input> Elements Require Labels, Form Elements Should Have Visible Label, Form Field Must Not Have Multiple Label Elements, Autocomplete Attribute Must Be Used Correctly, Frames Require Title Attribute, Frames Require Unique Title Attribute, Frames Should Be Tested With axe-core, Frames With Focusable Content Must Not Use tabindex=-1, Page Must Contain <title>, Page Must Contain <h1>, Heading Levels Should Only Increase By One, Headings Should Not Be Empty, Meta Viewport Should Allow Zoom & Scale Up to 500%, Meta Viewport Zoom & Scaling Disabled, HTML Element Lang Attribute Value Must Be Valid, HTML Element Requires Lang Attribute, HTML Lang & XML Lang Value Should Match, Lang Attribute Requires Valid Value, Delayed Meta Refresh Must Not Be Used, Timed Meta Refresh Must Not Exist, Image Button Requires Alternate Text, Images Require Alternate Text, <object> Elements Require Alternate Text, Active <area> Elements Require Alternate Text, Alt Text Should Not Be Repeated As Text, Elements Marked role=img Require Alternate Text, SVG Images & Graphics Require Accessible Text, Server-Side Image Maps Must Not Be Used, <video> Elements Require <track> For Captions, <video> or <audio> Elements Must Not Auto-play, Buttons Require Discernible Text, Inline Text Spacing Must Be Adjustable, Input Buttons Require Discernible Text, Links Must Be Distinguishable, Links Require Discernible Text, Links With Same Accessible Name, Select Element Requires Accessible Name, Summary Elements Require Discernible Text, Deprecated <marquee> Element Must Not Be Used, <blink> Elements Deprecated & Must Not Be Used, Text Requires Higher Color Contrast Ratio, Text Requires Higher Color Contrast to Background, Touch Targets Require Sufficient Size & Spacing, Interactive Controls Must Not Be Nested, List Items Must Be Contained In List Elements, Lists Must Only Contain <li> Content Elements, <dl> Must Only Have Ordered <dt> & <dd> Groups, <dt> & <dd> Elements Must Be Contained by <dl>, <th> Element Requires Associated Data Cells, Table Header Attr Must Refer To Cell In Same Table, Table Headers Require Discernible Text, Table With Identical Summary & Caption Text, Scope Attribute Should Be Used Correctly On Tables
+- Analytics: All, Sessions Above 0, Bounce Rate Above 70%, No GA Data, Non-Indexable with GA Data, Orphan URLs
+- Canonicals: All, Contains Canonical, Self Referencing, Canonicalised, Missing, Multiple, Non-Indexable Canonical, Multiple Conflicting, Canonical Is Relative, Unlinked, Invalid Attribute In Annotation, Contains Fragment URL, Outside <head>
+- Change Detection: All, Word Count, Crawl Depth, Indexability, Page Titles, H1, Meta Description, Inlinks, Unique Inlinks, Internal Outlinks, Unique Internal Outlinks, External Outlinks, Unique External Outlinks, Structured Data Unique Types, Content
+- Content: All, Spelling Errors, Grammar Errors, Near Duplicates, Semantically Similar, Low Relevance Content, Exact Duplicates, Low Content Pages, Readability Difficult, Readability Very Difficult, Lorem Ipsum Placeholder, Soft 404 Pages
+- Custom Extraction: All, Extractor 1, Extractor 2, Extractor 3, Extractor 4, Extractor 5, Extractor 6, Extractor 7, Extractor 8, Extractor 9, Extractor 10, Extractor 11, Extractor 12, Extractor 13, Extractor 14, Extractor 15, Extractor 16, Extractor 17, Extractor 18, Extractor 19, Extractor 20, Extractor 21, Extractor 22, Extractor 23, Extractor 24, Extractor 25, Extractor 26, Extractor 27, Extractor 28, Extractor 29, Extractor 30, Extractor 31, Extractor 32, Extractor 33, Extractor 34, Extractor 35, Extractor 36, Extractor 37, Extractor 38, Extractor 39, Extractor 40, Extractor 41, Extractor 42, Extractor 43, Extractor 44, Extractor 45, Extractor 46, Extractor 47, Extractor 48, Extractor 49, Extractor 50, Extractor 51, Extractor 52, Extractor 53, Extractor 54, Extractor 55, Extractor 56, Extractor 57, Extractor 58, Extractor 59, Extractor 60, Extractor 61, Extractor 62, Extractor 63, Extractor 64, Extractor 65, Extractor 66, Extractor 67, Extractor 68, Extractor 69, Extractor 70, Extractor 71, Extractor 72, Extractor 73, Extractor 74, Extractor 75, Extractor 76, Extractor 77, Extractor 78, Extractor 79, Extractor 80, Extractor 81, Extractor 82, Extractor 83, Extractor 84, Extractor 85, Extractor 86, Extractor 87, Extractor 88, Extractor 89, Extractor 90, Extractor 91, Extractor 92, Extractor 93, Extractor 94, Extractor 95, Extractor 96, Extractor 97, Extractor 98, Extractor 99, Extractor 100
+- Custom JavaScript: All, Extractor 1, Extractor 2, Extractor 3, Extractor 4, Extractor 5, Extractor 6, Extractor 7, Extractor 8, Extractor 9, Extractor 10, Extractor 11, Extractor 12, Extractor 13, Extractor 14, Extractor 15, Extractor 16, Extractor 17, Extractor 18, Extractor 19, Extractor 20, Extractor 21, Extractor 22, Extractor 23, Extractor 24, Extractor 25, Extractor 26, Extractor 27, Extractor 28, Extractor 29, Extractor 30, Extractor 31, Extractor 32, Extractor 33, Extractor 34, Extractor 35, Extractor 36, Extractor 37, Extractor 38, Extractor 39, Extractor 40, Extractor 41, Extractor 42, Extractor 43, Extractor 44, Extractor 45, Extractor 46, Extractor 47, Extractor 48, Extractor 49, Extractor 50, Extractor 51, Extractor 52, Extractor 53, Extractor 54, Extractor 55, Extractor 56, Extractor 57, Extractor 58, Extractor 59, Extractor 60, Extractor 61, Extractor 62, Extractor 63, Extractor 64, Extractor 65, Extractor 66, Extractor 67, Extractor 68, Extractor 69, Extractor 70, Extractor 71, Extractor 72, Extractor 73, Extractor 74, Extractor 75, Extractor 76, Extractor 77, Extractor 78, Extractor 79, Extractor 80, Extractor 81, Extractor 82, Extractor 83, Extractor 84, Extractor 85, Extractor 86, Extractor 87, Extractor 88, Extractor 89, Extractor 90, Extractor 91, Extractor 92, Extractor 93, Extractor 94, Extractor 95, Extractor 96, Extractor 97, Extractor 98, Extractor 99, Extractor 100
+- Custom Search: All, Filter 1, Filter 2, Filter 3, Filter 4, Filter 5, Filter 6, Filter 7, Filter 8, Filter 9, Filter 10, Filter 11, Filter 12, Filter 13, Filter 14, Filter 15, Filter 16, Filter 17, Filter 18, Filter 19, Filter 20, Filter 21, Filter 22, Filter 23, Filter 24, Filter 25, Filter 26, Filter 27, Filter 28, Filter 29, Filter 30, Filter 31, Filter 32, Filter 33, Filter 34, Filter 35, Filter 36, Filter 37, Filter 38, Filter 39, Filter 40, Filter 41, Filter 42, Filter 43, Filter 44, Filter 45, Filter 46, Filter 47, Filter 48, Filter 49, Filter 50, Filter 51, Filter 52, Filter 53, Filter 54, Filter 55, Filter 56, Filter 57, Filter 58, Filter 59, Filter 60, Filter 61, Filter 62, Filter 63, Filter 64, Filter 65, Filter 66, Filter 67, Filter 68, Filter 69, Filter 70, Filter 71, Filter 72, Filter 73, Filter 74, Filter 75, Filter 76, Filter 77, Filter 78, Filter 79, Filter 80, Filter 81, Filter 82, Filter 83, Filter 84, Filter 85, Filter 86, Filter 87, Filter 88, Filter 89, Filter 90, Filter 91, Filter 92, Filter 93, Filter 94, Filter 95, Filter 96, Filter 97, Filter 98, Filter 99, Filter 100
+- Directives: All, Index, Noindex, Follow, Nofollow, None, NoArchive, NoSnippet, Max-Snippet, Max-Image-Preview, Max-Video-Preview, NoODP, NoYDIR, NoImageIndex, NoTranslate, Unavailable_After, Refresh, Outside <head>
+- External: All, HTML, JavaScript, CSS, Images, Plugins, Media, Fonts, XML, PDF, Other, Unknown
+- H1: All, Missing, Duplicate, Over X Characters, Multiple, Alt Text in H1, Non-Sequential
+- H2: All, Missing, Duplicate, Over X Characters, Multiple, Non-Sequential
+- Hreflang: All, Contains hreflang, Non-200 hreflang URLs, Unlinked hreflang URLs, Missing Return Links, Inconsistent Language & Region Return Links, Non-Canonical Return Links, Noindex Return Links, Incorrect Language & Region Codes, Multiple Entries, Missing Self Reference, Not Using Canonical, Missing X-Default, Missing, Outside <head>
+- Images: All, Over X kB, Missing Alt Text, Missing Alt Attribute, Alt Text Over X Characters, Background Images, Incorrectly Sized Images, Missing Size Attributes
+- Internal: All, HTML, JavaScript, CSS, Images, Plugins, Media, Fonts, XML, PDF, Other, Unknown
+- JavaScript: All, Uses Old AJAX Crawling Scheme URLs, Uses Old AJAX Crawling Scheme Meta Fragment Tag, Page Title Only in Rendered HTML, Page Title Updated by JavaScript, H1 Only in Rendered HTML, H1 Updated by JavaScript, Meta Description Only in Rendered HTML, Meta Description Updated by JavaScript, Canonical Only in Rendered HTML, Canonical Mismatch, Noindex Only in Original HTML, Nofollow Only in Original HTML, Contains JavaScript Links, Contains JavaScript Content, Pages with Blocked Resources, Pages with JavaScript Errors, Pages with JavaScript Warnings, Pages with Chrome Issues
+- Link Metrics: All
+- Links: All, Pages Without Internal Outlinks, Internal Nofollow Outlinks, Internal Outlinks With No Anchor Text, Non-Descriptive Anchor Text In Internal Outlinks, Pages With High External Outlinks, Pages With High Internal Outlinks, Follow & Nofollow Internal Inlinks To Page, Internal Nofollow Inlinks Only, Pages With High Crawl Depth, Outlinks To Localhost, Non-Indexable Page Inlinks Only, Pages With Uncrawlable Internal Outlinks
+- Meta Description: All, Missing, Duplicate, Over X Characters, Below X Characters, Over X Pixels, Below X Pixels, Multiple, Outside <head>
+- Meta Keywords: All, Missing, Duplicate, Multiple
+- Mobile: All, Viewport Not Set, Target Size, Content Not Sized Correctly, Illegible Font Size, Contains Unsupported Plugins, Mobile Alternate Link
+- Page Titles: All, Missing, Duplicate, Over X Characters, Below X Characters, Over X Pixels, Below X Pixels, Same as H1, Multiple, Outside <head>
+- PageSpeed: All, Minify CSS, Minify JavaScript, Reduce Unused CSS, Reduce Unused JavaScript, Reduce JavaScript Execution Time, Minimize Main-Thread Work, Request Errors, Layout Shift Culprits, Document Request Latency, Optimize DOM Size, Font Display, Improve Image Delivery, Legacy JavaScript, Render Blocking Requests, Use Efficient Cache Lifetimes, LCP Request Discovery, Forced Reflow, Avoid Enormous Network Payloads, Network Dependency Tree, Duplicated JavaScript
+- Pagination: All, Contains Pagination, First Page, Paginated 2+ Pages, Pagination URL Not in Anchor Tag, Non-200 Pagination URLs, Unlinked Pagination URLs, Non-Indexable, Multiple Pagination URLs, Pagination Loop, Sequence Error
+- Response Codes: All, Blocked by Robots.txt, Blocked Resource, No Response, Success (2xx), Redirection (3xx), Redirection (JavaScript), Redirection (Meta Refresh), Redirection (HTTP Refresh), Client Error (4xx), Server Error (5xx), Internal All, Internal Blocked by Robots.txt, Internal Blocked Resource, Internal No Response, Internal Success (2xx), Internal Redirection (3xx), Internal Redirection (JavaScript), Internal Redirection (Meta Refresh), Internal Redirection (HTTP Refresh), Internal Redirect Chain, Internal Redirect Loop, Internal Client Error (4xx), Internal Server Error (5xx), External All, External Blocked by Robots.txt, External Blocked Resource, External No Response, External Success (2xx), External Redirection (3xx), External Redirection (JavaScript), External Redirection (Meta Refresh), External Redirection (HTTP Refresh), External Client Error (4xx), External Server Error (5xx)
+- Search Console: All, Clicks Above 0, No Search Analytics Data, Non-Indexable with Search Analytics Data, Orphan URLs, URL is Not on Google, Indexable URL Not Indexed, URL is on Google But Has Issues, User-Declared Canonical Not Selected, Page is Not Mobile Friendly, AMP URL Invalid, Rich Result Invalid
+- Security: All, HTTP URLs, HTTPS URLs, Mixed Content, Form URL Insecure, Form on HTTP URL, Unsafe Cross-Origin Links, Missing HSTS Header, Bad Content Type, Missing X-Content-Type-Options Header, Missing X-Frame-Options Header, Protocol-Relative Resource Links, Missing Content-Security-Policy Header, Missing Secure Referrer-Policy Header
+- Sitemaps: All, URLs in Sitemap, URLs not in Sitemap, Orphan URLs, Non-Indexable URLs in Sitemap, URLs in Multiple Sitemaps, XML Sitemap with over 50k URLs, XML Sitemap over 50MB
+- Structured Data: All, Contains Structured Data, Missing, Validation Errors, Validation Warnings, Rich Result Validation Errors, Rich Result Validation Warnings, Parse Errors, Microdata URLs, JSON-LD URLs, RDFa URLs, Rich Result Feature Detected
+- URL: All, Non ASCII Characters, Underscores, Uppercase, Parameters, Over X Characters, Multiple Slashes, Repetitive Path, Contains Space, Broken Bookmark, Internal Search, GA Tracking Parameters
+- Validation: All, Invalid HTML Elements in <head>, <head> Not First In <html> Element, Missing <head> Tag, Multiple <head> Tags, Missing <body> Tag, Multiple <body> Tags, HTML Document Over XMB, Resource Over XMB, <body> Element Preceding <html>, High Carbon Rating
+
+## --bulk-export (Submenu:Export)
+Export large datasets. Comma-separated. Names match the Bulk Export menu in the
+SF UI, with submenu prefixes (e.g. "Links:All Inlinks", "Content:Soft 404 Inlinks").
+
+Available exports:
+- Queued URLs
+- Links:All Inlinks
+- Links:All Outlinks
+- Links:All Anchor Text
+- Links:External Links
+- Links:Pages With Uncrawlable Internal Outlinks
+- Links:Internal Nofollow Outlinks
+- Links:Internal Outlinks With No Anchor Text
+- Links:Non-Descriptive Anchor Text In Internal Outlinks
+- Links:Follow & Nofollow Internal Inlinks To Page
+- Links:Internal Nofollow Inlinks Only
+- Links:Outlinks To Localhost
+- Links:Non-Indexable Page Inlinks Only
+- Web:Screenshots
+- Web:Archived Website
+- Web:All Page Source
+- Web:All Page Text
+- Web:All PDF Documents
+- Web:All PDF Content
+- Web:All HTTP Request Headers
+- Web:All HTTP Response Headers
+- Web:All Cookies
+- Path Type:Absolute
+- Path Type:Protocol-Relative
+- Path Type:Root-Relative
+- Path Type:Path-Relative
+- Security:HTTP URLs Inlinks
+- Security:HTTPS URLs Inlinks
+- Security:Mixed Content
+- Security:Form URL Insecure
+- Security:Unsafe Cross-Origin Links
+- Security:Protocol-Relative Outlinks
+- Response Codes:Internal & External:Blocked by Robots.txt Inlinks
+- Response Codes:Internal & External:Blocked Resource Inlinks
+- Response Codes:Internal & External:No Response Inlinks
+- Response Codes:Internal & External:Success (2xx) Inlinks
+- Response Codes:Internal & External:Redirection (3xx) Inlinks
+- Response Codes:Internal & External:Redirection (JavaScript) Inlinks
+- Response Codes:Internal & External:Redirection (Meta Refresh) Inlinks
+- Response Codes:Internal & External:Redirection (HTTP Refresh) Inlinks
+- Response Codes:Internal & External:Client Error (4xx) Inlinks
+- Response Codes:Internal & External:Server Error (5xx) Inlinks
+- Response Codes:Internal & External:All Error (4xx 5xx & No Response) Inlinks
+- Response Codes:Internal:Internal Blocked by Robots.txt Inlinks
+- Response Codes:Internal:Internal Blocked Resource Inlinks
+- Response Codes:Internal:Internal No Response Inlinks
+- Response Codes:Internal:Internal Success (2xx) Inlinks
+- Response Codes:Internal:Internal Redirection (3xx) Inlinks
+- Response Codes:Internal:Internal Redirection (JavaScript) Inlinks
+- Response Codes:Internal:Internal Redirection (Meta Refresh) Inlinks
+- Response Codes:Internal:Internal Redirection (HTTP Refresh) Inlinks
+- Response Codes:Internal:Internal Redirect Chain Inlinks
+- Response Codes:Internal:Internal Redirect Loop Inlinks
+- Response Codes:Internal:Internal Client Error (4xx) Inlinks
+- Response Codes:Internal:Internal Server Error (5xx) Inlinks
+- Response Codes:Internal:Internal All Error (4xx 5xx & No Response) Inlinks
+- Response Codes:External:External Blocked by Robots.txt Inlinks
+- Response Codes:External:External Blocked Resource Inlinks
+- Response Codes:External:External No Response Inlinks
+- Response Codes:External:External Success (2xx) Inlinks
+- Response Codes:External:External Redirection (3xx) Inlinks
+- Response Codes:External:External Redirection (JavaScript) Inlinks
+- Response Codes:External:External Redirection (Meta Refresh) Inlinks
+- Response Codes:External:External Redirection (HTTP Refresh) Inlinks
+- Response Codes:External:External Client Error (4xx) Inlinks
+- Response Codes:External:External Server Error (5xx) Inlinks
+- Response Codes:External:External All Error (4xx 5xx & No Response) Inlinks
+- Content:Exact Duplicates
+- Content:Near Duplicates
+- Content:Semantically Similar
+- Content:Soft 404 Inlinks
+- Content:Spelling & Grammar Errors
+- Content:Spelling & Grammar Errors Summary
+- Images:All Image Inlinks
+- Images:Images Missing Alt Text Inlinks
+- Images:Images Missing Alt Attribute Inlinks
+- Images:Images Missing Alt Attribute & Text Inlinks
+- Images:Images Over X kB Inlinks
+- Images:Images with Alt Text Over X Characters
+- Images:Incorrectly Sized Images
+- Images:Missing Size Attributes
+- Canonicals:Contains Canonical Inlinks
+- Canonicals:Self Referencing Inlinks
+- Canonicals:Canonicalised Inlinks
+- Canonicals:Missing Inlinks
+- Canonicals:Multiple Inlinks
+- Canonicals:Multiple Conflicting Inlinks
+- Canonicals:Non-Indexable Canonical Inlinks
+- Canonicals:Canonical Is Relative Inlinks
+- Canonicals:Unlinked Inlinks
+- Canonicals:Invalid Attribute In Annotation Inlinks
+- Canonicals:Contains Fragment URL Inlinks
+- Canonicals:Outside <head> Inlinks
+- Directives:Index Inlinks
+- Directives:Noindex Inlinks
+- Directives:Follow Inlinks
+- Directives:Nofollow Inlinks
+- Directives:None Inlinks
+- Directives:NoArchive Inlinks
+- Directives:NoSnippet Inlinks
+- Directives:Max-Snippet Inlinks
+- Directives:Max-Image-Preview Inlinks
+- Directives:Max-Video-Preview Inlinks
+- Directives:NoODP Inlinks
+- Directives:NoYDIR Inlinks
+- Directives:NoImageIndex Inlinks
+- Directives:NoTranslate Inlinks
+- Directives:Unavailable_After Inlinks
+- Directives:Refresh Inlinks
+- Directives:Outside <head> Inlinks
+- JavaScript:Pages with Blocked Resources
+- JavaScript:Contains JavaScript Links
+- JavaScript:Pages with JavaScript Issues
+- AMP:All Inlinks
+- AMP:Non-200 Response Inlinks
+- AMP:Missing Non-AMP Return Link Inlinks
+- AMP:Missing Canonical to Non-AMP Inlinks
+- AMP:Non-Indexable Canonical Inlinks
+- AMP:Indexable Inlinks
+- AMP:Non-Indexable Inlinks
+- Structured Data:Contains Structured Data
+- Structured Data:Validation Errors
+- Structured Data:Validation Warnings
+- Structured Data:JSON-LD URLs
+- Structured Data:Microdata URLs
+- Structured Data:RDFa URLs
+- Sitemaps:URLs in Sitemap Inlinks
+- Sitemaps:Orphan URLs Inlinks
+- Sitemaps:Non-Indexable URLs in Sitemap Inlinks
+- Sitemaps:URLs in Multiple Sitemaps Inlinks
+- Custom Search:All Inlinks
+- Custom Search:Filter 1 Inlinks
+- Custom Search:Filter 2 Inlinks
+- Custom Search:Filter 3 Inlinks
+- Custom Search:Filter 4 Inlinks
+- Custom Search:Filter 5 Inlinks
+- Custom Search:Filter 6 Inlinks
+- Custom Search:Filter 7 Inlinks
+- Custom Search:Filter 8 Inlinks
+- Custom Search:Filter 9 Inlinks
+- Custom Search:Filter 10 Inlinks
+- Custom Search:Filter 11 Inlinks
+- Custom Search:Filter 12 Inlinks
+- Custom Search:Filter 13 Inlinks
+- Custom Search:Filter 14 Inlinks
+- Custom Search:Filter 15 Inlinks
+- Custom Search:Filter 16 Inlinks
+- Custom Search:Filter 17 Inlinks
+- Custom Search:Filter 18 Inlinks
+- Custom Search:Filter 19 Inlinks
+- Custom Search:Filter 20 Inlinks
+- Custom Search:Filter 21 Inlinks
+- Custom Search:Filter 22 Inlinks
+- Custom Search:Filter 23 Inlinks
+- Custom Search:Filter 24 Inlinks
+- Custom Search:Filter 25 Inlinks
+- Custom Search:Filter 26 Inlinks
+- Custom Search:Filter 27 Inlinks
+- Custom Search:Filter 28 Inlinks
+- Custom Search:Filter 29 Inlinks
+- Custom Search:Filter 30 Inlinks
+- Custom Search:Filter 31 Inlinks
+- Custom Search:Filter 32 Inlinks
+- Custom Search:Filter 33 Inlinks
+- Custom Search:Filter 34 Inlinks
+- Custom Search:Filter 35 Inlinks
+- Custom Search:Filter 36 Inlinks
+- Custom Search:Filter 37 Inlinks
+- Custom Search:Filter 38 Inlinks
+- Custom Search:Filter 39 Inlinks
+- Custom Search:Filter 40 Inlinks
+- Custom Search:Filter 41 Inlinks
+- Custom Search:Filter 42 Inlinks
+- Custom Search:Filter 43 Inlinks
+- Custom Search:Filter 44 Inlinks
+- Custom Search:Filter 45 Inlinks
+- Custom Search:Filter 46 Inlinks
+- Custom Search:Filter 47 Inlinks
+- Custom Search:Filter 48 Inlinks
+- Custom Search:Filter 49 Inlinks
+- Custom Search:Filter 50 Inlinks
+- Custom Search:Filter 51 Inlinks
+- Custom Search:Filter 52 Inlinks
+- Custom Search:Filter 53 Inlinks
+- Custom Search:Filter 54 Inlinks
+- Custom Search:Filter 55 Inlinks
+- Custom Search:Filter 56 Inlinks
+- Custom Search:Filter 57 Inlinks
+- Custom Search:Filter 58 Inlinks
+- Custom Search:Filter 59 Inlinks
+- Custom Search:Filter 60 Inlinks
+- Custom Search:Filter 61 Inlinks
+- Custom Search:Filter 62 Inlinks
+- Custom Search:Filter 63 Inlinks
+- Custom Search:Filter 64 Inlinks
+- Custom Search:Filter 65 Inlinks
+- Custom Search:Filter 66 Inlinks
+- Custom Search:Filter 67 Inlinks
+- Custom Search:Filter 68 Inlinks
+- Custom Search:Filter 69 Inlinks
+- Custom Search:Filter 70 Inlinks
+- Custom Search:Filter 71 Inlinks
+- Custom Search:Filter 72 Inlinks
+- Custom Search:Filter 73 Inlinks
+- Custom Search:Filter 74 Inlinks
+- Custom Search:Filter 75 Inlinks
+- Custom Search:Filter 76 Inlinks
+- Custom Search:Filter 77 Inlinks
+- Custom Search:Filter 78 Inlinks
+- Custom Search:Filter 79 Inlinks
+- Custom Search:Filter 80 Inlinks
+- Custom Search:Filter 81 Inlinks
+- Custom Search:Filter 82 Inlinks
+- Custom Search:Filter 83 Inlinks
+- Custom Search:Filter 84 Inlinks
+- Custom Search:Filter 85 Inlinks
+- Custom Search:Filter 86 Inlinks
+- Custom Search:Filter 87 Inlinks
+- Custom Search:Filter 88 Inlinks
+- Custom Search:Filter 89 Inlinks
+- Custom Search:Filter 90 Inlinks
+- Custom Search:Filter 91 Inlinks
+- Custom Search:Filter 92 Inlinks
+- Custom Search:Filter 93 Inlinks
+- Custom Search:Filter 94 Inlinks
+- Custom Search:Filter 95 Inlinks
+- Custom Search:Filter 96 Inlinks
+- Custom Search:Filter 97 Inlinks
+- Custom Search:Filter 98 Inlinks
+- Custom Search:Filter 99 Inlinks
+- Custom Search:Filter 100 Inlinks
+- Custom Extraction:All Inlinks
+- Custom Extraction:Extractor 1 Inlinks
+- Custom Extraction:Extractor 2 Inlinks
+- Custom Extraction:Extractor 3 Inlinks
+- Custom Extraction:Extractor 4 Inlinks
+- Custom Extraction:Extractor 5 Inlinks
+- Custom Extraction:Extractor 6 Inlinks
+- Custom Extraction:Extractor 7 Inlinks
+- Custom Extraction:Extractor 8 Inlinks
+- Custom Extraction:Extractor 9 Inlinks
+- Custom Extraction:Extractor 10 Inlinks
+- Custom Extraction:Extractor 11 Inlinks
+- Custom Extraction:Extractor 12 Inlinks
+- Custom Extraction:Extractor 13 Inlinks
+- Custom Extraction:Extractor 14 Inlinks
+- Custom Extraction:Extractor 15 Inlinks
+- Custom Extraction:Extractor 16 Inlinks
+- Custom Extraction:Extractor 17 Inlinks
+- Custom Extraction:Extractor 18 Inlinks
+- Custom Extraction:Extractor 19 Inlinks
+- Custom Extraction:Extractor 20 Inlinks
+- Custom Extraction:Extractor 21 Inlinks
+- Custom Extraction:Extractor 22 Inlinks
+- Custom Extraction:Extractor 23 Inlinks
+- Custom Extraction:Extractor 24 Inlinks
+- Custom Extraction:Extractor 25 Inlinks
+- Custom Extraction:Extractor 26 Inlinks
+- Custom Extraction:Extractor 27 Inlinks
+- Custom Extraction:Extractor 28 Inlinks
+- Custom Extraction:Extractor 29 Inlinks
+- Custom Extraction:Extractor 30 Inlinks
+- Custom Extraction:Extractor 31 Inlinks
+- Custom Extraction:Extractor 32 Inlinks
+- Custom Extraction:Extractor 33 Inlinks
+- Custom Extraction:Extractor 34 Inlinks
+- Custom Extraction:Extractor 35 Inlinks
+- Custom Extraction:Extractor 36 Inlinks
+- Custom Extraction:Extractor 37 Inlinks
+- Custom Extraction:Extractor 38 Inlinks
+- Custom Extraction:Extractor 39 Inlinks
+- Custom Extraction:Extractor 40 Inlinks
+- Custom Extraction:Extractor 41 Inlinks
+- Custom Extraction:Extractor 42 Inlinks
+- Custom Extraction:Extractor 43 Inlinks
+- Custom Extraction:Extractor 44 Inlinks
+- Custom Extraction:Extractor 45 Inlinks
+- Custom Extraction:Extractor 46 Inlinks
+- Custom Extraction:Extractor 47 Inlinks
+- Custom Extraction:Extractor 48 Inlinks
+- Custom Extraction:Extractor 49 Inlinks
+- Custom Extraction:Extractor 50 Inlinks
+- Custom Extraction:Extractor 51 Inlinks
+- Custom Extraction:Extractor 52 Inlinks
+- Custom Extraction:Extractor 53 Inlinks
+- Custom Extraction:Extractor 54 Inlinks
+- Custom Extraction:Extractor 55 Inlinks
+- Custom Extraction:Extractor 56 Inlinks
+- Custom Extraction:Extractor 57 Inlinks
+- Custom Extraction:Extractor 58 Inlinks
+- Custom Extraction:Extractor 59 Inlinks
+- Custom Extraction:Extractor 60 Inlinks
+- Custom Extraction:Extractor 61 Inlinks
+- Custom Extraction:Extractor 62 Inlinks
+- Custom Extraction:Extractor 63 Inlinks
+- Custom Extraction:Extractor 64 Inlinks
+- Custom Extraction:Extractor 65 Inlinks
+- Custom Extraction:Extractor 66 Inlinks
+- Custom Extraction:Extractor 67 Inlinks
+- Custom Extraction:Extractor 68 Inlinks
+- Custom Extraction:Extractor 69 Inlinks
+- Custom Extraction:Extractor 70 Inlinks
+- Custom Extraction:Extractor 71 Inlinks
+- Custom Extraction:Extractor 72 Inlinks
+- Custom Extraction:Extractor 73 Inlinks
+- Custom Extraction:Extractor 74 Inlinks
+- Custom Extraction:Extractor 75 Inlinks
+- Custom Extraction:Extractor 76 Inlinks
+- Custom Extraction:Extractor 77 Inlinks
+- Custom Extraction:Extractor 78 Inlinks
+- Custom Extraction:Extractor 79 Inlinks
+- Custom Extraction:Extractor 80 Inlinks
+- Custom Extraction:Extractor 81 Inlinks
+- Custom Extraction:Extractor 82 Inlinks
+- Custom Extraction:Extractor 83 Inlinks
+- Custom Extraction:Extractor 84 Inlinks
+- Custom Extraction:Extractor 85 Inlinks
+- Custom Extraction:Extractor 86 Inlinks
+- Custom Extraction:Extractor 87 Inlinks
+- Custom Extraction:Extractor 88 Inlinks
+- Custom Extraction:Extractor 89 Inlinks
+- Custom Extraction:Extractor 90 Inlinks
+- Custom Extraction:Extractor 91 Inlinks
+- Custom Extraction:Extractor 92 Inlinks
+- Custom Extraction:Extractor 93 Inlinks
+- Custom Extraction:Extractor 94 Inlinks
+- Custom Extraction:Extractor 95 Inlinks
+- Custom Extraction:Extractor 96 Inlinks
+- Custom Extraction:Extractor 97 Inlinks
+- Custom Extraction:Extractor 98 Inlinks
+- Custom Extraction:Extractor 99 Inlinks
+- Custom Extraction:Extractor 100 Inlinks
+- URL Inspection:Rich Results
+- URL Inspection:Referring Pages
+- URL Inspection:Sitemaps
+- Accessibility:All Violations
+- Accessibility:All Incomplete
+- Accessibility:Best Practice:All Violations
+- Accessibility:Best Practice:All Incomplete
+- Accessibility:WCAG 2.0 A:All Violations
+- Accessibility:WCAG 2.0 A:All Incomplete
+- Accessibility:WCAG 2.0 AA:All Violations
+- Accessibility:WCAG 2.0 AA:All Incomplete
+- Accessibility:WCAG 2.0 AAA:All Violations
+- Accessibility:WCAG 2.0 AAA:All Incomplete
+- Accessibility:WCAG 2.1 AA:All Violations
+- Accessibility:WCAG 2.1 AA:All Incomplete
+- Accessibility:WCAG 2.2 AA:All Violations
+- Accessibility:WCAG 2.2 AA:All Incomplete
+- Issues:All
+- Issues:Issue
+- Issues:Warning
+- Issues:Opportunity
+- AI:Images
+- AI:Text to Speech Audio
+
+## --save-report (Report)
+Save summary reports. Comma-separated, with submenu prefixes where shown.
+
+- Crawl Overview
+- Issues Overview
+- Segments Overview
+- Redirects:All Redirects
+- Redirects:Redirect Chains
+- Redirects:Redirect & Canonical Chains
+- Redirects:Redirects to Error
+- Canonicals:Canonical Chains
+- Canonicals:Non-Indexable Canonicals
+- Pagination:Non-200 Pagination URLs
+- Pagination:Unlinked Pagination URLs
+- Hreflang:All hreflang URLs
+- Hreflang:Non-200 hreflang URLs
+- Hreflang:Unlinked hreflang URLs
+- Hreflang:Missing Return Links
+- Hreflang:Inconsistent Language & Region Return Links
+- Hreflang:Non Canonical Return Links
+- Hreflang:Noindex Return Links
+- Insecure Content
+- SERP Summary
+- Orphan Pages
+- Structured Data:Validation Errors & Warnings Summary
+- Structured Data:Validation Errors & Warnings
+- Structured Data:Parse Errors
+- Structured Data:Google Rich Results Features Summary
+- Structured Data:Google Rich Results Features
+- Javascript:Javascript Console Log Summary
+- PageSpeed:PageSpeed Opportunities Summary
+- PageSpeed:CSS Coverage Summary
+- PageSpeed:JavaScript Coverage Summary
+- PageSpeed:Minify CSS
+- PageSpeed:Minify JavaScript
+- PageSpeed:Reduce Unused CSS
+- PageSpeed:Reduce Unused JavaScript
+- PageSpeed:Reduce JavaScript Execution Time
+- PageSpeed:Minimize Main-Thread Work
+- PageSpeed:Avoid Enormous Network Payloads
+- PageSpeed:User Timing Marks and Measures
+- PageSpeed:Layout Shift Culprits
+- PageSpeed:Optimize DOM Size
+- PageSpeed:Font Display
+- PageSpeed:Improve Image Delivery
+- PageSpeed:Legacy JavaScript
+- PageSpeed:Render Blocking Requests
+- PageSpeed:Use Efficient Cache Lifetimes
+- PageSpeed:LCP Request Discovery
+- PageSpeed:LCP Breakdown
+- PageSpeed:Forced Reflow
+- PageSpeed:3rd Parties
+- PageSpeed:Duplicated JavaScript
+- PageSpeed:Network Dependency Tree:Preconnect Candidates
+- PageSpeed:Network Dependency Tree:Critical Path Latency
+- PageSpeed:Document Request Latency:Number of Redirects
+- PageSpeed:Document Request Latency:Server Responds Quickly
+- PageSpeed:Document Request Latency:Applies Text Compression
+- Mobile:Viewport Not Set
+- Mobile:Target Size
+- Mobile:Content Not Sized Correctly
+- Mobile:Illegible Font Size
+- Accessibility:Accessibility Violations Summary
+- HTTP Headers:HTTP Header Summary
+- Cookies:Cookie Summary
+"""
+
+
+@mcp.resource("screaming-frog://export-reference")
+def get_export_reference() -> str:
+    """Complete reference of all Screaming Frog export options."""
+    return EXPORT_REFERENCE
+
+
+_USAGE = """\
+screaming-frog-mcp: headless MCP server for Screaming Frog SEO Spider.
+
+Run with no arguments from an MCP client. The server speaks JSON-RPC on
+stdin/stdout and prints nothing until the client sends a request.
+
+Options:
+  -V, --version   Print the package version and exit
+  -h, --help      Show this message and exit
+
+Docs and troubleshooting: https://github.com/bzsasson/screaming-frog-mcp
+"""
+
+
+def main(argv=None):
+    """Run the Screaming Frog MCP server, or answer --version/--help."""
+    args = list(sys.argv[1:] if argv is None else argv)
+
+    if any(a in ("-V", "--version") for a in args):
+        from importlib.metadata import PackageNotFoundError, version
+        try:
+            pkg_version = version("screaming-frog-mcp")
+        except PackageNotFoundError:
+            pkg_version = "unknown (not installed as a package)"
+        print(f"screaming-frog-mcp {pkg_version}")
+        return
+
+    if any(a in ("-h", "--help") for a in args):
+        print(_USAGE)
+        return
+
+    if args:
+        print(
+            f"screaming-frog-mcp: unrecognized argument(s): {' '.join(args)}\n"
+            "Use --help for usage.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+
+    mcp.run()
+
+
+if __name__ == "__main__":
+    main()
