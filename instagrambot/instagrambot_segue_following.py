@@ -8,6 +8,8 @@ import argparse
 import getpass
 import importlib
 import importlib.util
+import json
+import os
 import platform
 import re
 import subprocess
@@ -22,6 +24,14 @@ PACOTES_AUTOMACAO = [
 
 MODO_EXECUCAO = "codigo" # opcoes: "codigo" ou "terminal"
 
+# Arquivo local com o progresso do seguimento (pode ser trocado por --arquivo-progresso).
+ARQUIVO_PROGRESSO_PADRAO = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "progresso_seguindo.json",
+)
+
+VERSAO_PROGRESSO = 1
+
 #PREENCHA COM OS DADOS DA CONTA PARA LOGAR
 DADOS_BOT_CODIGO = {
     "usuario": "",
@@ -32,6 +42,7 @@ DADOS_BOT_CODIGO = {
     "tipo_lista": "seguidores", # opcoes: "seguidores" ou "seguindo"
     "limite_seguir": 50, # quantidade maxima de perfis para seguir por lote
     "intervalo_lote_segundos": 3600, # 1h de intervalo entre lotes de seguimento
+    "arquivo_progresso": "", # opcional: caminho do JSON de progresso; vazio usa ARQUIVO_PROGRESSO_PADRAO
 }
 
 
@@ -286,6 +297,541 @@ def extrair_total_perfis_lista(texto_total):
     return int(match.group(0).replace(".", "").replace(",", ""))
 
 
+def extrair_usuario_de_href(href):
+    if not href:
+        return None
+
+    caminho = re.sub(r"^https?://[^/]+/", "", href.strip())
+    caminho = caminho.split("?", 1)[0].split("#", 1)[0].strip("/")
+
+    if not caminho:
+        return None
+
+    segmento = caminho.split("/", 1)[0]
+
+    if segmento.lower() in ("accounts", "about", "developer", "direct", "explore", "p", "reels", "stories"):
+        return None
+
+    if not re.match(r"^[A-Za-z0-9._]{1,30}$", segmento):
+        return None
+
+    return segmento.lower()
+
+
+def obter_perfil_do_botao(botao_seguir):
+    try:
+        links = botao_seguir.find_elements(
+            By.XPATH,
+            "ancestor::div[.//a[starts-with(@href, '/') or contains(@href, 'instagram.com/')]][1]"
+            "//a[starts-with(@href, '/') or contains(@href, 'instagram.com/')]",
+        )
+    except Exception:
+        return None
+
+    for link in links:
+        perfil = extrair_usuario_de_href(link.get_attribute("href"))
+
+        if perfil:
+            return perfil
+
+    return None
+
+
+def resumir_erro(erro):
+    mensagem = " ".join(str(erro).split())
+
+    if mensagem:
+        resumo = f"{type(erro).__name__}: {mensagem}"
+    else:
+        resumo = type(erro).__name__
+
+    if len(resumo) > 300:
+        resumo = resumo[:297] + "..."
+
+    return resumo
+
+
+class ProgressoSeguir:
+    """Progresso local do seguimento, gravado em JSON apos cada tentativa."""
+
+    def __init__(self, caminho, perfil_alvo, tipo_lista, total_perfis_lista, imprimir=print):
+        self.caminho = caminho
+        self.perfil_alvo = perfil_alvo
+        self.tipo_lista = tipo_lista
+        self.total_perfis_lista = total_perfis_lista
+        self.imprimir = imprimir
+        self.indices = {}
+        self.seguidos = {}
+        self.falhas = {}
+        self.posicao_processada = 0
+        self.proximo_indice = 1
+
+    @classmethod
+    def abrir(cls, caminho, perfil_alvo, tipo_lista, total_perfis_lista, imprimir=print):
+        progresso = cls(caminho, perfil_alvo, tipo_lista, total_perfis_lista, imprimir)
+        progresso.carregar()
+        return progresso
+
+    def _limpar(self):
+        self.indices = {}
+        self.seguidos = {}
+        self.falhas = {}
+        self.posicao_processada = 0
+        self.proximo_indice = 1
+
+    def _recalcular_proximo_indice(self):
+        maiores_indices = [self.posicao_processada]
+        maiores_indices.extend(self.indices.values())
+        maiores_indices.extend(self.seguidos.values())
+        maiores_indices.extend(falha["indice"] for falha in self.falhas.values())
+        self.proximo_indice = max(maiores_indices, default=0) + 1
+
+    def _aplicar_dicionario(self, dados):
+        if dados.get("versao") != VERSAO_PROGRESSO:
+            raise ValueError("versao de progresso desconhecida")
+
+        if dados.get("perfil_alvo") != self.perfil_alvo or dados.get("tipo_lista") != self.tipo_lista:
+            raise ValueError("progresso pertence a outro perfil ou tipo de lista")
+
+        indices_carregados = dados.get("indices", {})
+
+        if not isinstance(indices_carregados, dict):
+            raise ValueError("campo indices invalido")
+
+        for perfil, indice in indices_carregados.items():
+            if not isinstance(perfil, str) or not perfil:
+                raise ValueError("perfil invalido no campo indices")
+
+            self.indices[perfil] = int(indice)
+
+            if self.indices[perfil] <= 0:
+                raise ValueError("indice invalido no campo indices")
+
+        for item in dados.get("seguidos", []):
+            if not isinstance(item, dict):
+                raise ValueError("item de seguidos invalido")
+
+            perfil = item.get("perfil")
+            indice = int(item.get("indice", 0))
+
+            if not isinstance(perfil, str) or not perfil or indice <= 0:
+                raise ValueError("item de seguidos invalido")
+
+            self.seguidos[perfil] = indice
+            self.indices.setdefault(perfil, indice)
+
+        for item in dados.get("falhas", []):
+            if not isinstance(item, dict):
+                raise ValueError("item de falhas invalido")
+
+            perfil = item.get("perfil")
+            indice = int(item.get("indice", 0))
+            motivo = item.get("motivo", "")
+
+            if not isinstance(perfil, str) or not perfil or indice <= 0:
+                raise ValueError("item de falhas invalido")
+
+            self.falhas[perfil] = {"indice": indice, "motivo": str(motivo)}
+            self.indices.setdefault(perfil, indice)
+
+        self.posicao_processada = int(dados.get("posicao_processada", 0))
+
+        if self.posicao_processada < 0:
+            raise ValueError("posicao processada invalida")
+
+        total_salvo = dados.get("total_perfis_lista")
+
+        if isinstance(total_salvo, int) and total_salvo != self.total_perfis_lista:
+            self.imprimir(
+                f"Aviso: o progresso foi salvo com total {total_salvo} e a lista atual tem "
+                f"{self.total_perfis_lista}. Perfis ja seguidos serao pulados mesmo assim."
+            )
+
+        self._recalcular_proximo_indice()
+
+    def carregar(self):
+        if not os.path.exists(self.caminho):
+            self.imprimir(
+                f"Arquivo de progresso nao encontrado ({self.caminho}). Iniciando o seguimento do zero."
+            )
+            return
+
+        try:
+            with open(self.caminho, "r", encoding="utf-8") as arquivo:
+                dados = json.load(arquivo)
+        except (OSError, ValueError) as erro:
+            self.imprimir(
+                f"Arquivo de progresso invalido ou corrompido ({self.caminho}): {erro}. Iniciando o seguimento do zero."
+            )
+            self._limpar()
+            return
+
+        if not isinstance(dados, dict):
+            self.imprimir(
+                f"Arquivo de progresso invalido ou corrompido ({self.caminho}): formato inesperado. Iniciando o seguimento do zero."
+            )
+            self._limpar()
+            return
+
+        try:
+            self._aplicar_dicionario(dados)
+        except (KeyError, TypeError, ValueError) as erro:
+            self.imprimir(
+                f"Arquivo de progresso invalido ou corrompido ({self.caminho}): {erro}. Iniciando o seguimento do zero."
+            )
+            self._limpar()
+            return
+
+        self.imprimir(
+            f"Progresso carregado de {self.caminho}: posicao processada {self.posicao_processada}, "
+            f"{len(self.seguidos)} perfil(is) ja seguido(s) e {len(self.falhas)} falha(s) pendente(s)."
+        )
+
+        falhas_pendentes = self.listar_falhas_pendentes()
+
+        if falhas_pendentes:
+            self.imprimir("Falhas da execucao anterior que serao tentadas novamente:")
+
+            for falha in falhas_pendentes:
+                self.imprimir(
+                    f"- Perfil {falha['indice']} ({falha['perfil']}): {falha['motivo']}"
+                )
+
+    def _dados_para_salvar(self):
+        return {
+            "versao": VERSAO_PROGRESSO,
+            "perfil_alvo": self.perfil_alvo,
+            "tipo_lista": self.tipo_lista,
+            "total_perfis_lista": self.total_perfis_lista,
+            "posicao_processada": self.posicao_processada,
+            "indices": {perfil: indice for perfil, indice in sorted(self.indices.items(), key=lambda item: item[1])},
+            "seguidos": [
+                {"indice": indice, "perfil": perfil}
+                for perfil, indice in sorted(self.seguidos.items(), key=lambda item: item[1])
+            ],
+            "falhas": [
+                {"indice": falha["indice"], "perfil": perfil, "motivo": falha["motivo"]}
+                for perfil, falha in sorted(self.falhas.items(), key=lambda item: item[1]["indice"])
+            ],
+            "atualizado_em": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        }
+
+    def salvar(self):
+        diretorio = os.path.dirname(os.path.abspath(self.caminho))
+
+        try:
+            os.makedirs(diretorio, exist_ok=True)
+            caminho_temporario = self.caminho + ".tmp"
+
+            with open(caminho_temporario, "w", encoding="utf-8") as arquivo:
+                json.dump(self._dados_para_salvar(), arquivo, ensure_ascii=False, indent=2)
+                arquivo.flush()
+                os.fsync(arquivo.fileno())
+
+            os.replace(caminho_temporario, self.caminho)
+            return True
+        except OSError as erro:
+            self.imprimir(f"Nao foi possivel salvar o progresso em {self.caminho}: {erro}")
+            return False
+
+    def obter_indice(self, perfil):
+        if perfil and perfil in self.indices:
+            return self.indices[perfil]
+
+        indice = self.proximo_indice
+        self.proximo_indice += 1
+
+        if perfil:
+            self.indices[perfil] = indice
+
+        return indice
+
+    def ja_seguido(self, perfil):
+        return bool(perfil) and perfil in self.seguidos
+
+    def registrar_sucesso(self, perfil, indice):
+        if perfil:
+            self.indices[perfil] = indice
+            self.seguidos[perfil] = indice
+            self.falhas.pop(perfil, None)
+
+        self.posicao_processada = max(self.posicao_processada, indice)
+        self.proximo_indice = max(self.proximo_indice, indice + 1)
+        self.salvar()
+
+    def registrar_falha(self, perfil, motivo, indice):
+        motivo_formatado = resumir_erro(motivo) if isinstance(motivo, BaseException) else str(motivo)
+
+        if perfil:
+            self.indices.setdefault(perfil, indice)
+            self.falhas[perfil] = {"indice": indice, "motivo": motivo_formatado}
+
+        self.posicao_processada = max(self.posicao_processada, indice)
+        self.proximo_indice = max(self.proximo_indice, indice + 1)
+        self.salvar()
+
+    def listar_falhas_pendentes(self):
+        return [
+            {"indice": falha["indice"], "perfil": perfil, "motivo": falha["motivo"]}
+            for perfil, falha in sorted(self.falhas.items(), key=lambda item: item[1]["indice"])
+        ]
+
+
+ROTULOS_GENERICOS_BOTAO = {"seguir", "seguindo", "follow", "following", "unfollow"}
+
+
+def _chave_do_botao(botao, perfil):
+    """Identidade estavel do botao para pular perfis ja seguidos.
+
+    Usa o perfil quando o Selenium consegue identificar o dono do botao. Caso contrario,
+    tenta atributos comuns em botoes de teste (perfil, username, nome, label...) e chaves
+    de dicionario. Botoes sem identidade estavel nao entram no arquivo de progresso.
+    """
+
+    if perfil:
+        return perfil
+
+    if isinstance(botao, str):
+        texto = " ".join(botao.split())
+
+        if texto and len(texto) <= 60 and texto.lower() not in ROTULOS_GENERICOS_BOTAO:
+            return texto
+
+        return None
+
+    if isinstance(botao, dict):
+        for chave in ("perfil", "username", "usuario", "nome", "label"):
+            valor = botao.get(chave)
+
+            if isinstance(valor, str):
+                valor = " ".join(valor.split())
+
+                if valor and len(valor) <= 60 and valor.lower() not in ROTULOS_GENERICOS_BOTAO:
+                    return valor
+
+        return None
+
+    for atributo in ("perfil", "username", "usuario", "nome", "label"):
+        try:
+            valor = getattr(botao, atributo, None)
+        except Exception:
+            continue
+
+        if callable(valor):
+            try:
+                valor = valor()
+            except Exception:
+                continue
+
+        if isinstance(valor, str):
+            valor = " ".join(valor.split())
+
+            if valor and len(valor) <= 60 and valor.lower() not in ROTULOS_GENERICOS_BOTAO:
+                return valor
+
+    return None
+
+
+def _identidade_botao(botao, chave):
+    if chave:
+        return ("chave", chave)
+
+    id_elemento = getattr(botao, "id", None)
+
+    if isinstance(id_elemento, str) and id_elemento:
+        return ("elemento", id_elemento)
+
+    return ("objeto", id(botao))
+
+
+def executar_lotes_seguir(
+    obter_botoes,
+    clicar,
+    progresso,
+    total_perfis_lista,
+    limite_seguir,
+    intervalo_lote_segundos,
+    perfil_do_botao=None,
+    preparar_clique=None,
+    rolar=None,
+    esperar=time.sleep,
+    pausa_entre_cliques=2.0,
+    pausa_apos_rolar=2.0,
+    max_rolagens_sem_novos=8,
+    imprimir=print,
+):
+    """Executa os cliques em lotes registrando sucesso/falha de cada botao.
+
+    obter_botoes deve retornar os botoes "Seguir" disponiveis na varredura atual.
+    clicar recebe um botao e pode lancar excecao; a falha e registrada sem interromper os demais.
+    perfil_do_botao e opcional e serve para identificar o perfil de cada botao.
+    """
+
+    total_seguidos = 0
+    total_falhas = 0
+    total_lote = 0
+    total_processados = 0
+    rolagens_sem_novos = 0
+    identidades_vistas = set()
+    falhas_execucao = []
+    resultados = []
+
+    imprimir(f"Iniciando cliques em Seguir na lista de {progresso.tipo_lista}.")
+    imprimir(f"Limite por lote: {limite_seguir}. Intervalo entre lotes: {intervalo_lote_segundos} segundos.")
+
+    while total_processados < total_perfis_lista and rolagens_sem_novos < max_rolagens_sem_novos:
+        try:
+            botoes = list(obter_botoes() or [])
+        except Exception as erro:
+            rolagens_sem_novos += 1
+            imprimir(f"Nao foi possivel ler os botoes Seguir desta varredura ({resumir_erro(erro)}). Tentando novamente.")
+
+            if rolar is not None:
+                rolar()
+
+            esperar(pausa_apos_rolar)
+            continue
+
+        botoes_novos = []
+        identidades_da_varredura = set()
+
+        for botao in botoes:
+            perfil = None
+
+            if perfil_do_botao is not None:
+                try:
+                    perfil = perfil_do_botao(botao)
+                except Exception:
+                    perfil = None
+
+            chave = _chave_do_botao(botao, perfil)
+            identidade = _identidade_botao(botao, chave)
+
+            if identidade in identidades_vistas or identidade in identidades_da_varredura:
+                continue
+
+            identidades_da_varredura.add(identidade)
+            botoes_novos.append((botao, chave, identidade))
+
+        if not botoes_novos:
+            rolagens_sem_novos += 1
+
+            if rolar is not None:
+                rolar()
+
+            esperar(pausa_apos_rolar)
+            continue
+
+        rolagens_sem_novos = 0
+        recomecar_apos_lote = False
+
+        for botao, chave, identidade in botoes_novos:
+            if total_processados >= total_perfis_lista:
+                break
+
+            identidades_vistas.add(identidade)
+            indice = progresso.obter_indice(chave)
+
+            if chave and progresso.ja_seguido(chave):
+                total_processados += 1
+                resultados.append({
+                    "indice": indice,
+                    "perfil": chave,
+                    "status": "ignorado",
+                    "motivo": "ja seguido em execucao anterior",
+                })
+                imprimir(f"Perfil {indice}/{total_perfis_lista} ({chave}) ja foi seguido em execucao anterior. Pulando.")
+                continue
+
+            # Sem identidade estavel (botao sem perfil localizavel) o resultado nao entra
+            # no progresso como perfil seguido; apenas a posicao processada e avancada.
+            rotulo = chave or ("botao_%d" % indice)
+
+            try:
+                if preparar_clique is not None:
+                    preparar_clique(botao)
+                clicar(botao)
+            except Exception as erro:
+                motivo = resumir_erro(erro)
+                progresso.registrar_falha(chave, motivo, indice)
+                total_falhas += 1
+                total_lote += 1
+                total_processados += 1
+                falhas_execucao.append({"indice": indice, "perfil": rotulo, "motivo": motivo})
+                resultados.append({
+                    "indice": indice,
+                    "perfil": rotulo,
+                    "status": "falha",
+                    "motivo": motivo,
+                })
+                imprimir(f"Falha ao seguir perfil {indice}/{total_perfis_lista} ({rotulo}): {motivo}")
+            else:
+                progresso.registrar_sucesso(chave, indice)
+                total_seguidos += 1
+                total_lote += 1
+                total_processados += 1
+                resultados.append({
+                    "indice": indice,
+                    "perfil": rotulo,
+                    "status": "sucesso",
+                    "motivo": "",
+                })
+                imprimir(f"Seguindo perfil {total_seguidos}/{total_perfis_lista} (lote {total_lote}/{limite_seguir})")
+
+            esperar(pausa_entre_cliques)
+
+            if total_lote >= limite_seguir and total_processados < total_perfis_lista:
+                imprimir(f"Limite do lote atingido. Aguardando {intervalo_lote_segundos} segundos para continuar de onde parou.")
+                esperar(intervalo_lote_segundos)
+                total_lote = 0
+                imprimir("Retomando cliques no modal.")
+
+                if rolar is not None:
+                    rolar()
+
+                esperar(pausa_apos_rolar)
+                recomecar_apos_lote = True
+                break
+
+        if not recomecar_apos_lote and total_processados < total_perfis_lista:
+            if rolar is not None:
+                rolar()
+
+            esperar(pausa_apos_rolar)
+
+    imprimir(f"Finalizado. Total seguido nesta execucao: {total_seguidos}")
+    imprimir(f"Resumo desta execucao: {total_seguidos} sucesso(s) e {total_falhas} falha(s).")
+    imprimir(f"Total ja seguido registrado no progresso: {len(progresso.seguidos)}.")
+
+    if falhas_execucao:
+        imprimir("Falhas desta execucao:")
+
+        for falha in sorted(falhas_execucao, key=lambda item: item["indice"]):
+            imprimir(
+                f"- Perfil {falha['indice']}/{total_perfis_lista} ({falha['perfil']}): {falha['motivo']}"
+            )
+
+    falhas_pendentes = progresso.listar_falhas_pendentes()
+
+    if falhas_pendentes:
+        imprimir(
+            f"Falhas pendentes no arquivo de progresso ({len(falhas_pendentes)}). "
+            "Elas serao tentadas novamente na proxima execucao:"
+        )
+
+        for falha in falhas_pendentes:
+            imprimir(
+                f"- Perfil {falha['indice']}/{total_perfis_lista} ({falha['perfil']}): {falha['motivo']}"
+            )
+
+    return {
+        "sucessos": total_seguidos,
+        "falhas": total_falhas,
+        "processados": total_processados,
+        "resultados": resultados,
+    }
+
+
 def esta_logado(driver):
     return driver.get_cookie("sessionid") is not None
 
@@ -414,6 +960,7 @@ class InstagramBot:
         tipo_lista,
         limite_seguir,
         intervalo_lote_segundos,
+        arquivo_progresso=ARQUIVO_PROGRESSO_PADRAO,
     ):
         self.usuario = usuario
         self.senha = senha
@@ -424,6 +971,7 @@ class InstagramBot:
         self.tipo_lista = tipo_lista
         self.limite_seguir = limite_seguir
         self.intervalo_lote_segundos = intervalo_lote_segundos
+        self.arquivo_progresso = arquivo_progresso
         self.driver = criar_driver_chrome()
 
     def login(self):
@@ -475,55 +1023,40 @@ class InstagramBot:
         modal = esperar_elemento(driver, "modal_lista_perfis", timeout=30)
         esperar_elemento_dentro(modal, "botao_seguir_modal", timeout=30)
 
-        total_seguidos = 0
-        total_lote = 0
-        tentativas_sem_novos_botoes = 0
+        progresso = ProgressoSeguir.abrir(
+            self.arquivo_progresso,
+            self.perfil,
+            self.tipo_lista,
+            total_perfis_lista,
+        )
 
-        print(f"Iniciando cliques em Seguir na lista de {self.tipo_lista}.")
-        print(f"Limite por lote: {self.limite_seguir}. Intervalo entre lotes: {self.intervalo_lote_segundos} segundos.")
-
-        while total_seguidos < total_perfis_lista and tentativas_sem_novos_botoes < 8:
-            botoes_seguir = [
+        def obter_botoes():
+            return [
                 botao for botao in encontrar_elementos_dentro(modal, "botao_seguir_modal")
                 if botao.is_displayed() and botao.is_enabled()
             ]
 
-            if not botoes_seguir:
-                tentativas_sem_novos_botoes += 1
-                self.rolar_modal_seguindo(modal)
-                time.sleep(2)
-                continue
+        def preparar_clique(botao_seguir):
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", botao_seguir)
+            time.sleep(0.5)
 
-            tentativas_sem_novos_botoes = 0
-
-            for botao_seguir in botoes_seguir:
-                if total_seguidos >= total_perfis_lista:
-                    break
-
-                try:
-                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", botao_seguir)
-                    time.sleep(0.5)
-                    botao_seguir.click()
-                    total_seguidos += 1
-                    total_lote += 1
-                    print(f"Seguindo perfil {total_seguidos}/{total_perfis_lista} (lote {total_lote}/{self.limite_seguir})")
-                    time.sleep(2)
-                except WebDriverException:
-                    continue
-
-                if total_lote >= self.limite_seguir and total_seguidos < total_perfis_lista:
-                    print(f"Limite do lote atingido. Aguardando {self.intervalo_lote_segundos} segundos para continuar de onde parou.")
-                    time.sleep(self.intervalo_lote_segundos)
-                    total_lote = 0
-                    print("Retomando cliques no modal.")
-                    self.rolar_modal_seguindo(modal)
-                    time.sleep(2)
-                    break
-
+        def rolar():
             self.rolar_modal_seguindo(modal)
-            time.sleep(2)
 
-        print(f"Finalizado. Total seguido nesta execucao: {total_seguidos}")
+        resultado = executar_lotes_seguir(
+            obter_botoes=obter_botoes,
+            clicar=lambda botao_seguir: botao_seguir.click(),
+            progresso=progresso,
+            total_perfis_lista=total_perfis_lista,
+            limite_seguir=self.limite_seguir,
+            intervalo_lote_segundos=self.intervalo_lote_segundos,
+            perfil_do_botao=obter_perfil_do_botao,
+            preparar_clique=preparar_clique,
+            rolar=rolar,
+        )
+
+        print(f"Progresso salvo em: {self.arquivo_progresso}")
+        return resultado
 
     def rolar_modal_seguindo(self, modal):
         self.driver.execute_script(
@@ -581,6 +1114,7 @@ def criar_parser_argumentos():
     parser.add_argument('--codigo-verificacao', help='Codigo de verificacao em 2 fatores.')
     parser.add_argument('--limite-seguir', dest='limite_seguir', type=int, default=50, help='Quantidade maxima de perfis para seguir por lote.')
     parser.add_argument('--intervalo-lote-segundos', dest='intervalo_lote_segundos', type=int, default=3600, help='Pausa entre lotes de cliques em Seguir.')
+    parser.add_argument('--arquivo-progresso', dest='arquivo_progresso', default=ARQUIVO_PROGRESSO_PADRAO, help='Arquivo JSON onde o progresso do seguimento e salvo e retomado.')
     return parser
 
 
@@ -661,10 +1195,13 @@ def coletar_dados_terminal(argumentos):
         'tipo_lista': argumentos.tipo_lista,
         'limite_seguir': argumentos.limite_seguir,
         'intervalo_lote_segundos': argumentos.intervalo_lote_segundos,
+        'arquivo_progresso': argumentos.arquivo_progresso,
     }
 
 
 def coletar_dados_codigo():
+    arquivo_progresso = DADOS_BOT_CODIGO.get('arquivo_progresso', '').strip() or ARQUIVO_PROGRESSO_PADRAO
+
     dados_bot = {
         'usuario': DADOS_BOT_CODIGO['usuario'].strip(),
         'senha': DADOS_BOT_CODIGO['senha'].strip(),
@@ -674,6 +1211,7 @@ def coletar_dados_codigo():
         'tipo_lista': DADOS_BOT_CODIGO['tipo_lista'].strip().lower(),
         'limite_seguir': int(DADOS_BOT_CODIGO['limite_seguir']),
         'intervalo_lote_segundos': int(DADOS_BOT_CODIGO['intervalo_lote_segundos']),
+        'arquivo_progresso': arquivo_progresso,
     }
     campos_pendentes = validar_formulario(dados_bot)
 
@@ -696,6 +1234,7 @@ def iniciar_bot(dados_bot):
         dados_bot['tipo_lista'],
         dados_bot['limite_seguir'],
         dados_bot['intervalo_lote_segundos'],
+        dados_bot.get('arquivo_progresso') or ARQUIVO_PROGRESSO_PADRAO,
     )
     bot_instagram.login()
 
@@ -709,6 +1248,7 @@ def executar_modo_terminal(argumentos):
 def executar_modo_codigo():
     dados_bot = coletar_dados_codigo()
     print('Iniciando automacao com dados definidos no codigo...')
+    print('Arquivo de progresso: ' + dados_bot['arquivo_progresso'])
     iniciar_bot(dados_bot)
 
 
