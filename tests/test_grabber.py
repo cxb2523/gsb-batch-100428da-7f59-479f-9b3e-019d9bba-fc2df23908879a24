@@ -122,6 +122,26 @@ def _stats():
                            "bytes", "downloaded_bytes")}
 
 
+class FlakyClient(FakeClient):
+    """FakeClient that raises (or returns nothing) for chosen message ids."""
+
+    def __init__(self, messages, fail_ids=(), none_ids=()):
+        super().__init__(messages)
+        self.fail_ids = set(fail_ids)
+        self.none_ids = set(none_ids)
+        self.download_attempts = []
+
+    async def download_media(self, msg, file=None, progress_callback=None, thumb=None):
+        self.download_attempts.append(msg.id)
+        if msg.id in self.fail_ids:
+            raise ConnectionError("network down")
+        if msg.id in self.none_ids:
+            return None
+        return await super().download_media(msg, file=file,
+                                            progress_callback=progress_callback,
+                                            thumb=thumb)
+
+
 # ─── parse_size / format_bytes ─────────────────────────────
 
 @pytest.mark.parametrize("text,expected", [
@@ -594,6 +614,87 @@ def test_grab_chat_respects_size_and_date_filters(monkeypatch, tmp_path):
     assert stats["found"] == 1   # 2 KB photo below --min-size, old pdf before --since
     downloaded = [p.name for p in (tmp_path / "out").rglob("*") if p.is_file()]
     assert len(downloaded) == 1 and downloaded[0].endswith("_3_fresh.pdf")
+
+
+# ─── watermark vs. failed downloads ────────────────────────
+
+def _photo_messages(ids):
+    return [FakeMessage(i, MessageMediaPhoto(Photo(id=100 + i, sizes=[PhotoSize(2048)])))
+            for i in ids]
+
+
+def _run_with(client, args, state, kinds=("photo", "document")):
+    import asyncio
+    stats = _stats()
+    asyncio.run(grabber.grab_chat(client, _Entity(id=1, title="My Group"), "me",
+                                  args, state, set(kinds), stats))
+    return stats
+
+
+def test_failed_download_stops_watermark_and_next_run_retries(monkeypatch, tmp_path):
+    monkeypatch.setattr(grabber, "STATE_FILE", tmp_path / "state.json")
+    args = grabber.parse_args(["--chat", "me", "--out", str(tmp_path / "out"),
+                               "--sleep", "0"])
+    messages = _photo_messages([1, 2, 3])
+    state = grabber.load_state()
+
+    # run 1: message 2's download blows up — the watermark must NOT pass it
+    stats = _run_with(FlakyClient(messages, fail_ids={2}), args, state)
+    assert stats["downloaded"] == 1
+    assert stats["errors"] == 1
+    assert state["chats"]["1"]["last_id"] == 1      # stopped before the failure
+    assert set(state["files"]) == {"p101"}
+
+    # run 2: the client is healthy again — the failed message is retried
+    client2 = FlakyClient(messages)
+    stats2 = _run_with(client2, args, state)
+    assert client2.calls[0]["min_id"] == 1          # incremental from the watermark
+    assert client2.download_attempts == [2, 3]      # msg 1 skipped as already-have
+    assert stats2["downloaded"] == 2
+    assert stats2["already"] == 1
+    assert stats2["errors"] == 0
+    assert state["chats"]["1"]["last_id"] == 3      # success advances as usual
+    assert set(state["files"]) == {"p101", "p102", "p103"}
+
+    files = [p for p in (tmp_path / "out").rglob("*") if p.is_file()]
+    assert len(files) == 3
+
+
+def test_download_returning_no_file_also_stops_watermark(monkeypatch, tmp_path):
+    monkeypatch.setattr(grabber, "STATE_FILE", tmp_path / "state.json")
+    args = grabber.parse_args(["--chat", "me", "--out", str(tmp_path / "out"),
+                               "--sleep", "0"])
+    state = grabber.load_state()
+    stats = _run_with(FlakyClient(_photo_messages([1, 2]), none_ids={1}), args, state)
+    assert stats["downloaded"] == 0
+    assert stats["errors"] == 1
+    assert "1" not in state["chats"]                # nothing may be watermarked
+    assert state["files"] == {}
+
+
+def test_text_and_filtered_messages_still_advance_watermark(monkeypatch, tmp_path):
+    monkeypatch.setattr(grabber, "STATE_FILE", tmp_path / "state.json")
+    args = grabber.parse_args(["--chat", "me", "--out", str(tmp_path / "out"),
+                               "--types", "photo", "--sleep", "0"])
+    state = grabber.load_state()
+    messages = [
+        FakeMessage(1, None),                       # plain text — never a file
+        FakeMessage(2, MessageMediaDocument(Document(  # filtered out by --types
+            id=20, size=7, mime_type="application/pdf",
+            attributes=[DocumentAttributeFilename("paper.pdf")]))),
+        FakeMessage(3, MessageMediaPhoto(Photo(id=10, sizes=[PhotoSize(2048)]))),
+        FakeMessage(4, MessageMediaDocument(Document(  # filtered tail message
+            id=21, size=7, mime_type="application/pdf",
+            attributes=[DocumentAttributeFilename("tail.pdf")]))),
+    ]
+    stats = _run_with(FakeClient(messages), args, state, kinds=("photo",))
+
+    assert stats["downloaded"] == 1                 # only the photo
+    assert stats["errors"] == 0
+    # text + filtered messages are not failures: the watermark passes them,
+    # including the filtered tail of the chat
+    assert state["chats"]["1"]["last_id"] == 4
+    assert set(state["files"]) == {"p10"}
 
 
 

@@ -601,7 +601,8 @@ async def grab_chat(client, entity, spec, args, state, kinds, stats) -> None:
                                         reverse=not descending)
         async for msg in messages:
             scanned += 1
-            if scanned % 200 == 0:  # checkpoint: crash-safe incremental progress
+            if scanned % 200 == 0 and not args["dry_run"]:
+                # checkpoint: crash-safe incremental progress (never on dry-run)
                 state["chats"][chat_key] = {"title": title, "last_id": max_id_seen,
                                             "updated": datetime.now(timezone.utc).isoformat()}
                 save_state(state)
@@ -610,13 +611,18 @@ async def grab_chat(client, entity, spec, args, state, kinds, stats) -> None:
                 max_id_seen = max(max_id_seen, msg.id)
                 continue
             when = getattr(msg, "date", None)
+            # فیلترها شکست نیستند: پیامِ ردشده عمداً کنار گذاشته شده، پس
+            # watermark می‌تواند از رویش عبور کند و در اجرای بعدی دوباره خوانده نشود.
             if args["since"] and when and when < args["since"]:
+                max_id_seen = max(max_id_seen, msg.id)
                 continue
             if args["until"] and when and when >= args["until"]:
+                max_id_seen = max(max_id_seen, msg.id)
                 continue
 
             entry = describe_media(msg.media)
             if entry is None or not wanted(entry, kinds, args["min_size"], args["max_size"]):
+                max_id_seen = max(max_id_seen, msg.id)
                 continue
 
             stats["found"] += 1
@@ -651,22 +657,32 @@ async def grab_chat(client, entity, spec, args, state, kinds, stats) -> None:
             except Exception as e:
                 stats["errors"] += 1
                 log(f"  ! failed: {name} ({type(e).__name__}: {e})")
-                continue
+                # شکست یعنی watermark نباید از این پیام عبور کند؛ وگرنه اجرای
+                # بعدی از بالای آن شروع می‌کند و فایل برای همیشه جا می‌ماند.
+                # اسکن را همین‌جا متوقف می‌کنیم تا watermark روی پیام قبلی بماند
+                # و اجرای بعدی این پیام را دوباره بگیرد.
+                break
             finally:
                 prog.finish()
 
-            if written:
-                real = Path(written)
-                stats["downloaded"] += 1
-                stats["downloaded_bytes"] += real.stat().st_size if real.exists() else int(size or 0)
-                state["files"][entry["key"]] = str(real)
-                log(f"  ✓ {entry['kind']:<10} {format_bytes(size):>10}  {real.name}")
-                if args["thumbs"]:
-                    try:
-                        await client.download_media(msg, file=str(real.with_suffix(".thumb.jpg")),
-                                                    thumb=-1)
-                    except Exception:
-                        pass
+            real = Path(written) if written else None
+            if real is None or not real.exists():
+                # دانلود «موفق» به نظر می‌رسد ولی فایلی روی دیسک نیست — این هم
+                # شکست است و نباید باعث عبور watermark شود.
+                stats["errors"] += 1
+                log(f"  ! failed: {name} (download returned no file)")
+                break
+
+            stats["downloaded"] += 1
+            stats["downloaded_bytes"] += real.stat().st_size
+            state["files"][entry["key"]] = str(real)
+            log(f"  ✓ {entry['kind']:<10} {format_bytes(size):>10}  {real.name}")
+            if args["thumbs"]:
+                try:
+                    await client.download_media(msg, file=str(real.with_suffix(".thumb.jpg")),
+                                                thumb=-1)
+                except Exception:
+                    pass
             max_id_seen = max(max_id_seen, msg.id)
 
             if not args["dry_run"] and args["sleep"]:
