@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>drag recheck harness</title>
+<style>
+  html, body { margin: 0; padding: 0; font-family: sans-serif; }
+  #source {
+    position: absolute; left: 60px; top: 120px; width: 80px; height: 60px;
+    background: #2b6cb0; color: white; display: flex;
+    align-items: center; justify-content: center; cursor: grab;
+  }
+  #target {
+    position: absolute; left: 420px; top: 200px; width: 120px; height: 90px;
+    border: 2px dashed #888; display: flex;
+    align-items: center; justify-content: center;
+    transition: left 120ms ease, top 120ms ease;
+  }
+  #target.armed { border-color: #2f855a; background: #c6f6d5; }
+  /* The overlay starts absent; the test arms it and the page adds it on the
+     first mousedown, covering exactly the target. */
+  #overlay {
+    position: absolute; left: 420px; top: 200px; width: 120px; height: 90px;
+    background: rgba(200, 60, 60, 0.35); display: none; z-index: 5;
+  }
+  #overlay.on { display: flex; }
+</style>
+</head>
+<body>
+  <div id="source" draggable="true">drag me</div>
+  <div id="target">drop here</div>
+  <div id="overlay">covered</div>
+  <script>
+    // Everything the test reads back, in one place. The event log keeps the
+    // raw DOM events with their `buttons` field, so the press/release pairing
+    // and the held-button mask are observable exactly as the page saw them.
+    window.__harness = {
+      events: [],
+      drops: 0,
+      // What the test arms before the gesture: "move" or "cover".
+      mode: null,
+      moved: false,
+      covered: false,
+      overlayClearsAt: 0
+    };
+    const h = window.__harness;
+    const log = (kind, ev) => h.events.push({
+      type: kind, buttons: ev.buttons, x: ev.clientX, y: ev.clientY
+    });
+    const source = document.getElementById("source");
+    const target = document.getElementById("target");
+    const overlay = document.getElementById("overlay");
+
+    addEventListener("mousedown", (ev) => log("mousedown", ev), true);
+    addEventListener("mouseup", (ev) => log("mouseup", ev), true);
+    addEventListener("mousemove", (ev) => log("mousemove", ev), true);
+
+    source.addEventListener("mousedown", () => {
+      if (h.mode === "move" && !h.moved) {
+        // A reflow after the press: the target jumps to a new place.
+        target.style.left = "620px";
+        target.style.top = "360px";
+        h.moved = true;
+      }
+      if (h.mode === "cover" && !h.covered) {
+        overlay.classList.add("on");
+        h.covered = true;
+        if (h.overlayClearsAt > 0) {
+          // The transient overlay: the page itself takes it away again after
+          // the given number of milliseconds, while the driver is still
+          // holding the button and re-checking.
+          setTimeout(() => {
+            overlay.classList.remove("on");
+            h.covered = false;
+          }, h.overlayClearsAt);
+        }
+      }
+    });
+
+    target.addEventListener("mouseup", () => {
+      h.drops += 1;
+      target.classList.add("armed");
+    });
+  </script>
+</body>
+</html>

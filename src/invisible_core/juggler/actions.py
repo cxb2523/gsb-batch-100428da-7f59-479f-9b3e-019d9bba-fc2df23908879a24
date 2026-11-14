@@ -288,7 +288,7 @@ class Actions:
                position=None, element_id: Optional[str] = None,
                trial: bool = False, strict: bool = False,
                force: bool = False, needs_point: bool = True,
-               once: bool = False):
+               once: bool = False, deadline: Optional[Deadline] = None):
         """Resolve, check, act, and if something doesn't match, START OVER.
 
         ⛔ `once` IS FOR A CLIENT WHOSE ORIGINAL DOES NOT START OVER. Selenium
@@ -332,12 +332,26 @@ class Actions:
         the hit-target check, the retry on detachment. A second loop for handles
         would be a second definition of "actionable" and a second click path,
         and two click paths are two fingerprints.
+
+        ⛔ `deadline` IS THE DRAG'S SHARED BUDGET. The target end of a
+        `drag_and_drop` is resolved only AFTER the source has been pressed, and
+        its retries must run inside the time the whole action has left, not on
+        a fresh budget of their own: a second 30 s loop after a slow source
+        would hold the mouse button down for a minute on a page that already
+        moved. Every other caller omits it and gets its own `Deadline(timeout)`,
+        exactly as before.
         """
         f = frame_id or self.lifecycle.main_frame
         if f is None:
             raise RuntimeError("no main frame: the page isn't ready")
         states = ACTION_STATES if states is None else states
-        deadline = Deadline(timeout)
+        # A handed-in deadline keeps the ORIGINAL timeout in every message:
+        # what the caller bounded is the action, not this half of it.
+        action_timeout = timeout
+        if deadline is None:
+            deadline = Deadline(timeout)
+        else:
+            timeout = None
         reason = "haven't tried yet"
         turns = 0
         while True:
@@ -510,7 +524,7 @@ class Actions:
             if deadline.passed():
                 raise ElementNotActionable(
                     "%r not actionable in %.0fs after %d attempts. Last "
-                    "reason: %s" % (selector, timeout, turns, reason))
+                    "reason: %s" % (selector, action_timeout, turns, reason))
             time.sleep(0.05)
 
     # ── the hit target ──────────────────────────────────────────────────────
@@ -1167,7 +1181,34 @@ class Actions:
         second was there because one jump alone did not reliably start the drag.
         With a real path it is not needed: the drag is born at the first point
         that clears Gecko's threshold, the way it is for a hand.
+
+        ⛔ THE SOURCE IS PRESSED ONCE, AND EVERYTHING AFTER THE PRESS IS A
+        RETRYABLE TARGET TURN, NEVER A SECOND PRESS. The press is the one thing
+        on this path that cannot be taken back, so it sits OUTSIDE every loop:
+        the source selector is resolved and its point taken once, the button
+        goes down once, and from then on the target is re-resolved from
+        scratch, re-pointed and hit-checked on every turn for as long as the
+        action's own deadline has time. A target that reflows away or gets an
+        overlay is therefore re-hit on its new geometry rather than silently
+        released on whatever moved under the pointer - and a turn that cannot
+        yet hit it starts another turn WITHOUT another `mousedown`, because the
+        press already happened and a retry loop must never be handed a reason
+        to press twice (the invariant `_act_on_target` is built on).
+
+        ⛔ A TURN THAT FAILS NAMES THE LAST REASON, it does not time out bare.
+        The target loop's `ElementNotActionable` carries the reason of its last
+        turn - "the selector finds nothing", "missing visible", "the event
+        would have landed elsewhere (<div id='overlay'>)" - so a target that
+        never becomes reachable says whether it was invisible, gone or covered.
+
+        ⛔ AND FAILURE NEVER LEAVES THE BUTTON DOWN. Whether the target runs out
+        of time, a hit check keeps failing, or anything in between raises, the
+        mouse is released exactly once and `_pressed` is cleared before the
+        exception leaves: the `buttons` field of the next click must not still
+        say "pressed". The release of the normal, successful path is the same
+        release, so down and up are paired on every path, one of each.
         """
+        force = bool(opts.get("force"))
         if opts.get("trial"):
             # ⛔ BOTH ENDS, AND NOT ONE EVENT. A drag that only checked the
             # source would answer half the question, and the half it skipped is
@@ -1180,28 +1221,78 @@ class Actions:
             self._retry(target, lambda f, el, p: p, timeout=timeout,
                         frame_id=frame_id, **opts)
             return None
+        # ⛔ ONE DEADLINE FOR THE WHOLE GESTURE. The source's resolve spends
+        # part of it; the target's loop below runs on what is LEFT rather than
+        # opening a second budget while the button is held down.
+        deadline = Deadline(timeout)
         start = self._retry(source, lambda f, el, p: p, timeout=timeout,
-                            frame_id=frame_id, **opts)
+                            frame_id=frame_id, deadline=deadline, **opts)
         # The approach is a path too: the cursor was somewhere before this call,
         # and arriving at the source in one event is the same tell as crossing
         # the page in one.
         self._glide(start)
         self._settle_before_press()
+        # Remember what else was held before this gesture: the cleanup must
+        # leave those buttons exactly as they were. A drag uses the left one.
+        held_before = self._pressed
         self._mouse_event("mousedown", start, buttons=BUTTON_MASK[0],
                           click_count=1)
+        self._pressed = BUTTON_MASK[0]
+        # Whether the release was already delivered by the target's own
+        # commit. If it was, the failure path must not release a second time -
+        # the miss it reports happened AFTER the release, and a second
+        # `mouseup` is a gesture no device makes.
+        released = False
 
         def run(f, element, point):
-            self._glide(point, buttons=BUTTON_MASK[0])
-            self._mouse_event("mouseup", point, buttons=0, click_count=1)
-            return point
+            # `_act_on_target` does the check AFTER the glide, which is where
+            # the race actually is: the pointer travels with the button down,
+            # the page reflows while it travels, and the point is re-judged on
+            # the layout of the moment before the release. A miss raises
+            # `WrongHitTarget`, which `_retry` absorbs as a fresh turn - the
+            # release is still unsent, so starting over is free.
+            #
+            # ⛔ THE RELEASE IS THE ONLY COMMIT EVENT, and it names the target
+            # so the engine reports where it LANDED with the dispatch itself. A
+            # target that moves during the travel after the check is caught
+            # here rather than reported as success. That miss is NOT retryable:
+            # the release already went out, so `ActionMissed` propagates past
+            # `_retry` (which does not catch it) to the cleanup below.
+            return self._act_on_target(
+                f, element, point,
+                approach=lambda: self._glide(point, buttons=BUTTON_MASK[0]),
+                commit=lambda: self._release_drag(point) or point,
+                force=force, lands=("mouseup",))
+
         try:
-            return self._retry(target, run, timeout=timeout, frame_id=frame_id,
-                               **opts)
-        except BaseException:
+            try:
+                result = self._retry(target, run, timeout=timeout,
+                                     frame_id=frame_id, deadline=deadline,
+                                     **opts)
+                released = True
+                return result
+            except ActionMissed:
+                # The release inside the commit was sent but landed off the
+                # element. Do not release again: the mouse is already up.
+                released = True
+                raise
+        finally:
             # ⛔ A button left down poisons EVERY subsequent action: the
-            # `buttons` field of every event after would say "pressed".
-            self._mouse_event("mouseup", start, buttons=0, click_count=1)
-            raise
+            # `buttons` field of every event after would say "pressed". Clear
+            # the state on the way out even if the corrective release itself
+            # cannot be delivered - a dead pipe cannot be fixed by holding the
+            # memory of a button down.
+            try:
+                if not released:
+                    self._release_drag(self.position)
+            finally:
+                self._pressed = held_before & ~BUTTON_MASK[0]
+
+    def _release_drag(self, point) -> None:
+        """The release that ends a drag: left button up, nothing stays pressed
+        of what THIS gesture pressed. Other buttons held before the drag are
+        untouched here - the caller restores their mask in `_pressed`."""
+        self._mouse_event("mouseup", point, buttons=0, click_count=1)
 
     # ── the pointer, by coordinates ─────────────────────────────────────────
     def move(self, x: float, y: float, *, steps: int = 1) -> None:
