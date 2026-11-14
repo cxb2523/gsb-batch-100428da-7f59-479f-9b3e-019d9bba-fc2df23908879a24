@@ -1,0 +1,35 @@
+# Virtual environment
+.venv/
+
+# Build artifacts
+dist/
+*.egg-info/
+
+# Config with real secrets
+config/settings.toml
+
+# Data directories
+/data
+/db
+/logs
+/reports
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Test cache
+.pytest_cache/
+.pytest_tmp/
+.pytest_tmp_run_*/
+
+# Local git worktrees
+.worktrees/
+
+
+# Claude local config
+.claude/
+
+# Local agent scratch
+.superpowers/
