@@ -1,5 +1,6 @@
 from .arguments import args
 from ..core.errors_modals import *
+from ..core.api.SSO_error import SSOPrepareError
 from ..core.config import config, add_user, set_default_username, update_last_login_info
 from .get_info import get_settings
 from .print_status import print_ipgw_status
@@ -33,7 +34,12 @@ def main():
                 logging.info("添加成功")
             else:
                 # 接下来，需要处理网络登录登出问题了。
-                main_ipgw = IPGW(bypass_proxy=args.bypass_system_proxy) # 将args.bypass_system_proxy的值传入bypass_proxy，默认为false
+                try:
+                    main_ipgw = IPGW(bypass_proxy=args.bypass_system_proxy) # 将args.bypass_system_proxy的值传入bypass_proxy，默认为false
+                except SSOPrepareError as e:
+                    # 抓取统一身份认证页面失败：错误信息已分类且面向用户可读，直接展示。
+                    logging.error(f"无法准备统一身份认证登录：{e}")
+                    return -7
                 current_ipgw_status = main_ipgw.get_status()
                 if args.action == 'status':
                     print_ipgw_status(current_ipgw_status)

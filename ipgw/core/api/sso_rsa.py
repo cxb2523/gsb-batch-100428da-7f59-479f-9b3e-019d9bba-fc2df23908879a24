@@ -7,27 +7,35 @@ from urllib.parse import urljoin, urlsplit
 from bs4 import BeautifulSoup
 from requests import Session
 
-from .SSO_error import BackendError
+from .SSO_error import LoginScriptNotFoundError, PublicKeyNotFoundError
+from .http_retry import get_with_retry, DEFAULT_MAX_ATTEMPTS, DEFAULT_RETRY_DELAY
 
 RSA_PADDING_OVERHEAD = 11
 
 
-def extract_login_page_rsa_public_key(session: Session, page_soup: BeautifulSoup) -> str:
+def extract_login_page_rsa_public_key(session: Session, page_soup: BeautifulSoup,
+                                      max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+                                      retry_delay: float = DEFAULT_RETRY_DELAY) -> str:
     login_js_src = None
+    script_srcs = []
     for script_tag in page_soup.find_all("script", src=True):
         script_src = script_tag.attrs.get("src", "")
+        script_srcs.append(script_src)
         script_name = urlsplit(script_src).path.rsplit("/", 1)[-1]
         if script_name in {"login_neu.js", "login_neu_new.js"}:
             login_js_src = script_src
             break
     if not login_js_src:
-        raise BackendError("cannot find login_neu.js or login_neu_new.js from SSO login page")
+        clue = f"页面中引用的脚本：{script_srcs}" if script_srcs else "页面中没有任何外部脚本"
+        raise LoginScriptNotFoundError(clue=clue)
 
     login_js_url = urljoin("https://pass.neu.edu.cn", login_js_src)
-    login_js_text = session.get(login_js_url).text
+    login_js_text = get_with_retry(session, login_js_url, "获取统一身份认证登录脚本",
+                                   max_attempts=max_attempts, retry_delay=retry_delay).text
     public_key_match = re.search(r'publicKeyStr\s*=\s*"([^"]+)"', login_js_text)
     if not public_key_match:
-        raise BackendError("cannot extract publicKeyStr from SSO login script")
+        raise PublicKeyNotFoundError(
+            clue=f"脚本 {login_js_url}（{len(login_js_text)} 字节）中未找到 publicKeyStr")
     return public_key_match.group(1)
 
 
