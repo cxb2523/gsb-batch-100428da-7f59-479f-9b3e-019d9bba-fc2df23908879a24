@@ -4,6 +4,7 @@ from typing import Optional, Union, Dict, Any, List
 from url_to_llm_text.config import ScraperConfig, load_config
 from url_to_llm_text.get_html_text import get_page_source
 from url_to_llm_text.get_llm_input_text import get_processed_text
+from url_to_llm_text.diagnostics import FailureCategory, Stage
 
 async def url_to_llm_text(
     url: str,
@@ -21,7 +22,8 @@ async def url_to_llm_text(
     remove_header_footer: Optional[bool] = None,
     proxy: Optional[Union[str, Dict[str, Any]]] = None,
     max_characters: Optional[int] = None,
-    config: Optional[Union[ScraperConfig, Dict[str, Any], str]] = None
+    config: Optional[Union[ScraperConfig, Dict[str, Any], str]] = None,
+    diagnostics: Optional[Any] = None
 ) -> str:
     """
     Main function to scrape a URL and return clean LLM-friendly text.
@@ -43,6 +45,9 @@ async def url_to_llm_text(
         proxy (str or dict, optional): Proxy URL string ("http://user:pass@host:port") or dict.
         max_characters (int, optional): Max character count in output (default unlimited).
         config (ScraperConfig, dict, or str, optional): Configuration object or path to YAML/JSON.
+        diagnostics (ScrapeDiagnostics, optional): Optional collector that records the
+            failure reason category and context for every pipeline stage. When omitted,
+            failures are still swallowed and an empty string returned, exactly as before.
 
     Returns:
         str: LLM-ready processed web page text.
@@ -55,10 +60,22 @@ async def url_to_llm_text(
             wait=wait,
             user_agent=user_agent,
             proxy=proxy,
-            config=cfg
+            config=cfg,
+            diagnostics=diagnostics
         )
 
         if not page_source:
+            # The fetch stage already recorded the concrete reason (missing
+            # Playwright, timeout, bad proxy, empty source, ...). Add a
+            # pipeline-level record so callers can see the failure happened
+            # before the processing stage was ever entered.
+            if diagnostics is not None:
+                diagnostics.record_failure(
+                    Stage.PIPELINE,
+                    FailureCategory.EMPTY_PAGE_SOURCE,
+                    message="Fetch stage produced no page source; processing skipped.",
+                    url=url,
+                )
             return ""
 
         llm_text = await get_processed_text(
@@ -75,10 +92,20 @@ async def url_to_llm_text(
             remove_header_footer=remove_header_footer,
             remove_tags=remove_tags,
             max_characters=max_characters,
-            config=cfg
+            config=cfg,
+            diagnostics=diagnostics
         )
 
+        if diagnostics is not None and diagnostics.ok:
+            diagnostics.record_success(Stage.PIPELINE, url=url)
         return llm_text
     except Exception as e:
         print("Error while scraping url: ", str(e))
+        if diagnostics is not None:
+            diagnostics.record_failure(
+                Stage.PIPELINE,
+                FailureCategory.PROCESSING_ERROR,
+                url=url,
+                exception=e,
+            )
         return ""

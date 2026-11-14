@@ -5,6 +5,7 @@ import re
 from urllib.parse import urljoin
 from typing import Optional, Union, Dict, Any, List
 from url_to_llm_text.config import ScraperConfig, load_config
+from url_to_llm_text.diagnostics import FailureCategory, Stage
 
 try:
     from minify_html import minify
@@ -70,7 +71,8 @@ async def get_processed_text(
     extract: Optional[bool] = None,
     remove_header_footer: Optional[bool] = None,
     max_characters: Optional[int] = None,
-    config: Optional[Union[ScraperConfig, Dict[str, Any], str]] = None
+    config: Optional[Union[ScraperConfig, Dict[str, Any], str]] = None,
+    diagnostics: Optional[Any] = None
 ) -> str:
     """
     Process html text into clean LLM-friendly input. Preserves tables in markdown,
@@ -92,6 +94,10 @@ async def get_processed_text(
         extract (bool, optional): If True, extract raw text only. Default False.
         max_characters (int, optional): Max character limit for output text (0 or None for unlimited).
         config (ScraperConfig, dict, or str, optional): Configuration object or path.
+        diagnostics (ScrapeDiagnostics, optional): Optional collector that records the
+            failure reason category and context (stage, exception type/message, URL).
+            When omitted, failures are still swallowed and an empty string returned,
+            exactly as before.
 
     Returns:
         str: LLM-ready processed web page text.
@@ -117,6 +123,13 @@ async def get_processed_text(
             soup = BeautifulSoup(page_source, parser)
         except Exception as e:
             print("Error in BeautifulSoup: ", str(e))
+            if diagnostics is not None:
+                diagnostics.record_failure(
+                    Stage.PROCESS,
+                    FailureCategory.HTML_PARSER_UNAVAILABLE,
+                    url=base_url,
+                    exception=e,
+                )
             soup = BeautifulSoup("", "html.parser")
 
         # ------- Remove tags ----------
@@ -287,8 +300,17 @@ async def get_processed_text(
         if _max_chars is not None and _max_chars > 0:
             text = text[:_max_chars]
 
+        if diagnostics is not None and not diagnostics.has_failure(Stage.PROCESS):
+            diagnostics.record_success(Stage.PROCESS, url=base_url)
         return text
 
     except Exception as e:
         print("Error while getting processed text: ", e)
+        if diagnostics is not None:
+            diagnostics.record_failure(
+                Stage.PROCESS,
+                FailureCategory.PROCESSING_ERROR,
+                url=base_url,
+                exception=e,
+            )
         return ""

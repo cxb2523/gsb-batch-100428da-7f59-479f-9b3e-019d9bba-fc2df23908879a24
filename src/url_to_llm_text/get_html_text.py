@@ -3,9 +3,12 @@
 from typing import Optional, Union, Dict, Any
 try:
     from playwright.async_api import async_playwright
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 except ImportError:
     async_playwright = None
+    PlaywrightTimeoutError = None
 from url_to_llm_text.config import ScraperConfig, load_config, parse_proxy
+from url_to_llm_text.diagnostics import FailureCategory, Stage
 
 TRACKER_DOMAINS = (
     "google-analytics.com",
@@ -21,12 +24,30 @@ TRACKER_DOMAINS = (
     "analytics.twitter.com"
 )
 
+
+def _classify_fetch_exception(exc: BaseException) -> str:
+    """Map a fetch-stage exception to a :class:`FailureCategory` value."""
+    # Playwright timeout (kept as a named import when playwright is available,
+    # but fall back to a name check so monkeypatched/fake errors classify too).
+    if PlaywrightTimeoutError is not None and isinstance(exc, PlaywrightTimeoutError):
+        return FailureCategory.NAVIGATION_TIMEOUT
+    if exc.__class__.__name__ == "TimeoutError":
+        return FailureCategory.NAVIGATION_TIMEOUT
+    message = str(exc).lower()
+    if "timeout" in message or "timed out" in message:
+        return FailureCategory.NAVIGATION_TIMEOUT
+    if "proxy" in message:
+        return FailureCategory.INVALID_PROXY
+    return FailureCategory.FETCH_ERROR
+
+
 async def get_page_source(
     url: str,
     wait: Optional[float] = None,
     user_agent: Optional[str] = None,
     proxy: Optional[Union[str, Dict[str, Any]]] = None,
-    config: Optional[Union[ScraperConfig, Dict[str, Any], str]] = None
+    config: Optional[Union[ScraperConfig, Dict[str, Any], str]] = None,
+    diagnostics: Optional[Any] = None
 ) -> str:
     """
     Get html text using Playwright with optional proxy support, bandwidth optimization,
@@ -38,6 +59,10 @@ async def get_page_source(
         user_agent (str, optional): Custom user agent. Defaults to modern Chrome in config.
         proxy (str or dict, optional): Proxy URL string ("http://user:pass@host:port") or Playwright proxy dict.
         config (ScraperConfig, dict, or str path, optional): ScraperConfig instance, dictionary, or YAML/JSON path.
+        diagnostics (ScrapeDiagnostics, optional): Optional collector that records the
+            failure reason category and context (stage, exception type/message, URL).
+            When omitted, failures are still swallowed and an empty string returned,
+            exactly as before.
 
     Returns:
         str: Raw HTML page source.
@@ -48,6 +73,17 @@ async def get_page_source(
         # Allow explicit function arguments to override config
         if proxy:
             proxy_config = parse_proxy(proxy)
+            if proxy_config is None:
+                # Explicitly requested proxy but it cannot be turned into a
+                # Playwright proxy configuration.
+                if diagnostics is not None:
+                    diagnostics.record_failure(
+                        Stage.FETCH,
+                        FailureCategory.INVALID_PROXY,
+                        message=f"Invalid proxy configuration: {proxy!r}",
+                        url=url,
+                    )
+                return ""
         else:
             proxy_config = parse_proxy(cfg.proxy)
 
@@ -135,8 +171,31 @@ async def get_page_source(
         await browser.close()
         await playwright.stop()
 
+        if not page_source:
+            if diagnostics is not None:
+                diagnostics.record_failure(
+                    Stage.FETCH,
+                    FailureCategory.EMPTY_PAGE_SOURCE,
+                    message="Page source returned by the browser is empty.",
+                    url=url,
+                )
+            return page_source
+
+        if diagnostics is not None:
+            diagnostics.record_success(Stage.FETCH, url=url)
         return page_source
 
     except Exception as e:
         print("Error while getting page source: ", str(e))
+        if diagnostics is not None:
+            if isinstance(e, ImportError) and async_playwright is None:
+                category = FailureCategory.PLAYWRIGHT_NOT_INSTALLED
+            else:
+                category = _classify_fetch_exception(e)
+            diagnostics.record_failure(
+                Stage.FETCH,
+                category,
+                url=url,
+                exception=e,
+            )
         return ""

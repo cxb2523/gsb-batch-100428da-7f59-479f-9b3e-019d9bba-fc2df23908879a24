@@ -56,6 +56,52 @@ print(llm_text)
 
 ---
 
+### Failure diagnostics (optional)
+
+By default every failure is swallowed and an empty string is returned, so a
+caller cannot tell an empty page apart from a timeout or a missing Playwright
+install. Pass a `ScrapeDiagnostics` collector through the optional
+`diagnostics=` argument to make failures programmatically inspectable. The
+return values are unchanged; when the argument is omitted behavior is exactly
+as before.
+
+```python
+from url_to_llm_text import url_to_llm_text, ScrapeDiagnostics, FailureCategory
+
+diag = ScrapeDiagnostics()
+text = await url_to_llm_text(url, diagnostics=diag)
+
+if not text:
+    failure = diag.last_failure
+    print(failure.stage)          # "fetch" | "process" | "pipeline"
+    print(failure.category)       # machine-readable reason, see below
+    print(failure.exception_type) # e.g. "TimeoutError", "ImportError"
+    print(failure.message)        # short exception/message text
+    print(failure.url)            # target URL (may be None at processing stage)
+```
+
+Failure categories (`FailureCategory`):
+
+| Category | Meaning |
+| --- | --- |
+| `PLAYWRIGHT_NOT_INSTALLED` | Playwright could not be imported |
+| `NAVIGATION_TIMEOUT` | Page navigation timed out |
+| `INVALID_PROXY` | Proxy argument could not be parsed or was rejected by the browser |
+| `HTML_PARSER_UNAVAILABLE` | Requested BeautifulSoup parser is unavailable / markup rejected |
+| `EMPTY_PAGE_SOURCE` | Fetch completed but the browser returned an empty source |
+| `PROCESSING_ERROR` | Any other exception while turning HTML into text |
+| `FETCH_ERROR` | Any other fetch-stage exception |
+
+Each `DiagnosticRecord` contains `stage`, `success`, `category`, `message`,
+`exception_type` and `url`. On success the collector records a success entry
+per stage and `diag.ok` is `True`. When a fetch fails, the pipeline records
+the fetch reason plus a pipeline-level `EMPTY_PAGE_SOURCE` entry and never
+enters the processing stage, so an empty result is unambiguously attributable
+to scraping rather than text processing. The same `diagnostics=` parameter
+works on `get_page_source` and `get_processed_text` individually.
+
+---
+
 ### Example Usage:
 
 suppose we want to scrape the product name, main product page link, image link and price from the url "https://www.ikea.com/in/en/cat/corner-sofas-10671/" using any openai model.
