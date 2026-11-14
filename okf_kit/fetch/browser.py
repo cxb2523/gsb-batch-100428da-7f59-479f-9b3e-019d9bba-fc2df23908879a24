@@ -8,7 +8,7 @@ without the extra installed exits with a clear install hint.
 from __future__ import annotations
 
 from ..mapper import normalize_url
-from ..model import Page, clean_markdown
+from ..model import FAIL_EMPTY, FAIL_HTTP_ERROR, FAIL_NETWORK_ERROR, Page, clean_markdown
 
 _INSTALL_HINT = (
     "--js needs the browser extra. Install it with:\n"
@@ -28,6 +28,8 @@ class BrowserFetcher:
         self._AsyncWebCrawler = AsyncWebCrawler
         self._browser_config = BrowserConfig(headless=True, verbose=verbose)
         self._crawler = None
+        # url -> failure category, same contract as HttpFetcher.outcomes
+        self.outcomes: dict[str, str] = {}
 
     async def _ensure(self):
         if self._crawler is None:
@@ -41,9 +43,15 @@ class BrowserFetcher:
         crawler = await self._ensure()
         result = await crawler.arun(url, config=CrawlerRunConfig())
         if not getattr(result, "success", False):
+            status = getattr(result, "status_code", None)
+            self.outcomes[url] = (
+                FAIL_HTTP_ERROR if isinstance(status, int) and status >= 400
+                else FAIL_NETWORK_ERROR
+            )
             return None
         markdown = getattr(result.markdown, "raw_markdown", None) or str(result.markdown or "")
         if not markdown.strip():
+            self.outcomes[url] = FAIL_EMPTY
             return None
         meta = result.metadata or {}
         links = [

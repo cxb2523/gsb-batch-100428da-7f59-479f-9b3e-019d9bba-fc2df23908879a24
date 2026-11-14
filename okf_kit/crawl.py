@@ -1,13 +1,15 @@
 """Crawl a site into an OKF bundle (`okf build`).
 
-`crawl_site` runs the level-by-level BFS and returns the deduped pages;
-`build_bundle` writes them. Both `build` and `sync` reuse `crawl_site`.
+`crawl_site` runs the level-by-level BFS and returns the deduped pages plus
+the per-URL failure outcomes the fetcher recorded; `build_bundle` writes them.
+Both `build` and `sync` reuse `crawl_site`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import sys
+from collections import Counter
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -75,8 +77,12 @@ async def crawl_site(
     path_prefix: str | None = None,
     scope: bool = True,
     on_page=None,
-) -> tuple[list[Page], str]:
-    """BFS over same-host links within the path scope; returns (pages, prefix).
+) -> tuple[list[Page], str, dict[str, str]]:
+    """BFS over same-host links within the path scope.
+
+    Returns (pages, prefix, failures): `failures` maps each URL the fetcher
+    gave up on to a stable category (see model.FAIL_*). Pages with an empty
+    body but followable links are used for discovery and are NOT failures.
 
     Scope: `path_prefix` if given (explicit), `/` if `scope=False` (whole host),
     else auto-derived from the seed page's final (post-redirect) URL.
@@ -131,7 +137,16 @@ async def crawl_site(
         current = next_level
         depth += 1
 
-    return pages, (prefix or "/")
+    # The fetcher records one outcome per URL it gave up on; a fetcher without
+    # outcome tracking (custom) just yields an empty map.
+    failures = dict(getattr(fetcher, "outcomes", None) or {})
+    return pages, (prefix or "/"), failures
+
+
+def format_failure_counts(failures: dict[str, str]) -> str:
+    """One-line per-category summary, e.g. 'http_error: 2, robots_denied: 1'."""
+    counts = Counter(failures.values())
+    return ", ".join(f"{cat}: {counts[cat]}" for cat in sorted(counts))
 
 
 def build_bundle(
@@ -174,7 +189,7 @@ async def _build(
         print(f"  ✓ [{page.depth}] {page.url} -> {path}")
 
     try:
-        pages, prefix = await crawl_site(
+        pages, prefix, failures = await crawl_site(
             seed,
             fetcher=fetcher,
             max_depth=max_depth,
@@ -185,6 +200,11 @@ async def _build(
         )
     finally:
         await fetcher.close()
+
+    if failures:
+        print(f"Fetch failures: {format_failure_counts(failures)}")
+        for url, category in sorted(failures.items()):
+            print(f"  ✗ [{category}] {url}")
 
     if not pages:
         print("No pages could be crawled — check the URL is reachable.", file=sys.stderr)
@@ -209,6 +229,7 @@ async def _build(
         },
         log_lines=[f"Built from {seed}: {len(records)} pages."],
         edges=compute_edges(pages, present),
+        failures=failures,
     )
 
     short = sum(1 for p in pages if len(p.markdown) < _SHORT_PAGE_CHARS)

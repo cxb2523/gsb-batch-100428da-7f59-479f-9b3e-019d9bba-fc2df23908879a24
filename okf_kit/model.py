@@ -56,3 +56,21 @@ class PageRecord:
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# Stable per-URL failure categories, recorded when a fetcher gives up on a URL.
+# Fetchers keep returning None for "don't write this page"; the category tells
+# the caller *why*, so build/sync can report and persist per-page outcomes.
+FAIL_ROBOTS_DENIED = "robots_denied"    # robots.txt disallows the path
+FAIL_HTTP_ERROR = "http_error"          # HTTP error status (404, 500, ...)
+FAIL_NETWORK_ERROR = "network_error"    # connection/timeout/other transport error
+FAIL_NON_HTML = "non_html"              # response wasn't HTML (pdf, json, ...)
+FAIL_EMPTY = "empty"                    # no extractable body and no links to follow
+
+FAILURE_CATEGORIES = (
+    FAIL_ROBOTS_DENIED,
+    FAIL_HTTP_ERROR,
+    FAIL_NETWORK_ERROR,
+    FAIL_NON_HTML,
+    FAIL_EMPTY,
+)

@@ -198,7 +198,8 @@ docs-okf/
         index.md             directory listing (every directory has one)
         home.md
         docs/…
-    .okf-kit/state.json      crawl config, per-page content hashes, link edges
+    .okf-kit/state.json      crawl config, per-page content hashes, link edges,
+                             per-URL crawl failures (url + category)
 ```
 
 ## FAQ

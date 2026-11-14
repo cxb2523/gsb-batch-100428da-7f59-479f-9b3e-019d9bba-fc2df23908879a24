@@ -15,11 +15,23 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 import trafilatura
-from selectolax.parser import HTMLParser
+
+try:  # selectolax >= 1.0 removed the modest backend (selectolax.parser)
+    from selectolax.lexbor import LexborHTMLParser as HTMLParser
+except ImportError:  # older selectolax
+    from selectolax.parser import HTMLParser
 
 from .. import __version__
 from ..mapper import normalize_url
-from ..model import Page, clean_markdown
+from ..model import (
+    FAIL_EMPTY,
+    FAIL_HTTP_ERROR,
+    FAIL_NETWORK_ERROR,
+    FAIL_NON_HTML,
+    FAIL_ROBOTS_DENIED,
+    Page,
+    clean_markdown,
+)
 
 _USER_AGENT = f"okf-kit/{__version__} (+https://github.com/vinodborole/okf-kit)"
 _SKIP_TAGS = ("script", "style", "noscript", "svg", "nav", "footer", "header")
@@ -72,18 +84,25 @@ class HttpFetcher:
         self._sem = asyncio.Semaphore(concurrency)
         self._robots: dict[str, urllib.robotparser.RobotFileParser | None] = {}
         self._robots_lock = asyncio.Lock()
+        # url -> failure category for every URL this fetcher gave up on
+        # (see model.FAIL_*). Successful fetches leave no entry.
+        self.outcomes: dict[str, str] = {}
 
     async def fetch(self, url: str) -> Page | None:
         async with self._sem:
             if self.respect_robots and not await self._allowed(url):
+                self.outcomes[url] = FAIL_ROBOTS_DENIED
                 return None
             try:
                 resp = await self._client.get(url)
             except httpx.HTTPError:
+                self.outcomes[url] = FAIL_NETWORK_ERROR
                 return None
             if resp.status_code >= 400:
+                self.outcomes[url] = FAIL_HTTP_ERROR
                 return None
             if "html" not in resp.headers.get("content-type", "").lower():
+                self.outcomes[url] = FAIL_NON_HTML
                 return None
 
             html = resp.text
@@ -96,6 +115,7 @@ class HttpFetcher:
             # Keep a content-less page only if it has links to follow (e.g. a
             # redirect/nav stub) — the crawler uses the links but won't write it.
             if not markdown and not links:
+                self.outcomes[url] = FAIL_EMPTY
                 return None
             return Page(
                 url=final_url,

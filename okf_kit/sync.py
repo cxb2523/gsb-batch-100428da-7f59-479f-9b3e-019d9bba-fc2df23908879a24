@@ -25,6 +25,7 @@ from .okf import validate_bundle
 from .writer import (
     bundle_path_for,
     compute_edges,
+    failure_entries,
     prune_empty_dirs,
     write_bundle_meta,
     write_concept,
@@ -71,7 +72,7 @@ async def run_sync(
     pages_cap = max_pages if max_pages is not None else config.get("max_pages", 200)
     js = config.get("fetcher") == "browser"
 
-    from .crawl import crawl_site, make_fetcher
+    from .crawl import crawl_site, format_failure_counts, make_fetcher
 
     print(f"okf sync: re-crawling {root_url}")
     fetcher = make_fetcher(js, respect_robots=config.get("respect_robots", True))
@@ -79,7 +80,7 @@ async def run_sync(
     # default to whole-host so their page set doesn't shift on sync.
     stored_prefix = config.get("path_prefix", "/")
     try:
-        crawled, _ = await crawl_site(
+        crawled, _, failures = await crawl_site(
             root_url,
             fetcher=fetcher,
             max_depth=depth,
@@ -89,6 +90,9 @@ async def run_sync(
         )
     finally:
         await fetcher.close()
+
+    if failures:
+        print(f"Fetch failures: {format_failure_counts(failures)}")
 
     new_pages = {}
     for page in crawled:
@@ -129,12 +133,16 @@ async def run_sync(
                    content_hash=new_hash[path])
         for path in sorted(new_pages)
     ]
+    # This round's failures are reported and persisted, but never feed the
+    # added/changed/removed diff or the safety-valve page count above.
+    failure_list = failure_entries(failures)
     report = {
         "synced_at": utcnow_iso(),
         "added": len(added),
         "changed": len(changed),
         "removed": len(removed),
         "pages": len(new_pages),
+        "failures": failure_list,
     }
     write_bundle_meta(
         bundle_dir,
@@ -144,6 +152,7 @@ async def run_sync(
         log_lines=[f"Sync: +{len(added)} added, ~{len(changed)} changed, -{len(removed)} removed."],
         last_sync=report,
         edges=compute_edges(list(new_pages.values()), set(new_pages)),
+        failures=failures,
     )
 
     for hook in post_sync:

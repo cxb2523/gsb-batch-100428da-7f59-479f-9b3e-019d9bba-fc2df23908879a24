@@ -3,6 +3,25 @@
 All notable changes to okf-kit are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+- **Per-URL fetch outcomes for `okf build` and `okf sync`.** When the crawler
+  gives up on a URL it now records a stable category — `robots_denied`,
+  `http_error`, `network_error`, `non_html`, or `empty` (no extractable body
+  and no links to follow) — instead of silently dropping it. Both commands
+  print per-category counts plus the failing URLs, and the bundle's
+  `.okf-kit/state.json` carries a `failures` list (`url` + `category` per
+  entry); `okf sync` also includes it in its report and `last_sync`. The
+  failure list is informational only: it never feeds the
+  added/changed/removed diff or the safety valve, and content-less pages that
+  still have followable links remain discovery-only, not failures.
+
+### Fixed
+- **selectolax 1.0 compatibility.** `selectolax.parser` (the modest backend)
+  was removed in selectolax 1.0; the HTTP fetcher now uses the lexbor backend
+  when available and falls back to the old import on older releases.
+
 ## 0.3.3 — 2026-07-15
 
 ### Fixed

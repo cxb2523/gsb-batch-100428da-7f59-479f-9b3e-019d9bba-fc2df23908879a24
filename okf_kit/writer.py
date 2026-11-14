@@ -90,6 +90,15 @@ def append_log(bundle_dir: Path, lines: list[str]) -> None:
     log.write_text(existing.rstrip() + "\n" + section, encoding="utf8")
 
 
+def failure_entries(failures: dict[str, str] | None) -> list[dict]:
+    """State.json shape for the crawl's per-URL failures: one entry per URL,
+    sorted for stable diffs. `pages` records are untouched by this."""
+    return [
+        {"url": url, "category": category}
+        for url, category in sorted((failures or {}).items())
+    ]
+
+
 def write_bundle_meta(
     bundle_dir: Path,
     records: list[PageRecord],
@@ -99,6 +108,7 @@ def write_bundle_meta(
     log_lines: list[str],
     last_sync: dict | None = None,
     edges: list[list[str]] | None = None,
+    failures: dict[str, str] | None = None,
 ) -> None:
     """Directory indexes + root index + log + state.json for the full set of
     current pages."""
@@ -124,6 +134,9 @@ def write_bundle_meta(
             for r in sorted(records, key=lambda r: r.path)
         ],
         "edges": edges or [],
+        # Per-URL crawl failures from the last build/sync (url + category).
+        # Informational only — never part of the sync diff.
+        "failures": failure_entries(failures),
     }
     if last_sync is not None:
         state["last_sync"] = last_sync
