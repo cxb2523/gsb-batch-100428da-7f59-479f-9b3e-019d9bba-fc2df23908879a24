@@ -97,12 +97,21 @@ async def run_collector_loop(
             items = await collect_fn()
             method = ""
             warning = ""
+            fallback = False
+            reason = ""
             if name == "twitter":
                 try:
-                    from collectors.twitter import last_method, last_warning
+                    from collectors.twitter import (
+                        last_fallback,
+                        last_method,
+                        last_reason,
+                        last_warning,
+                    )
 
                     method = last_method
                     warning = last_warning
+                    fallback = last_fallback
+                    reason = last_reason
                 except ImportError:
                     pass
 
@@ -114,6 +123,8 @@ async def run_collector_loop(
                     items_count=len(items),
                     method=method,
                     warning=warning,
+                    fallback=fallback,
+                    reason=reason,
                 )
                 ideas = await analyzer.process_items(items, storage)
                 await _send_alerts(ideas)
@@ -123,11 +134,19 @@ async def run_collector_loop(
                     items_count=len(items),
                     method=method,
                     warning=warning,
+                    fallback=fallback,
+                    reason=reason,
                 )
             else:
                 logger.info("Collector [%s] got 0 items", name)
                 _update_status(
-                    name, status="idle", items_count=0, method=method, warning=warning
+                    name,
+                    status="idle",
+                    items_count=0,
+                    method=method,
+                    warning=warning,
+                    fallback=fallback,
+                    reason=reason,
                 )
         except Exception as e:
             logger.error("Collector [%s] error: %s", name, e)

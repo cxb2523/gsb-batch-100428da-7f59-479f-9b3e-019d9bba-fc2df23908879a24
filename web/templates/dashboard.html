@@ -522,8 +522,13 @@
             if (c.status === 'analyzing') return 'analyzing ' + c.items_count;
             if (c.status === 'error') return 'error';
             var text = c.items_count > 0 ? c.items_count + ' items' : 'idle';
-            if (c.method) text += ' [' + c.method + ']';
+            if (c.method) text += ' [' + c.method + (c.fallback ? ' fallback' : '') + ']';
             return text;
+        }
+
+        function collectorTitle(c) {
+            if (!c || !c.warning) return '';
+            return c.reason ? c.warning + ' (reason: ' + c.reason + ')' : c.warning;
         }
 
         function renderCollectors(data) {
@@ -538,7 +543,8 @@
 
                 const dot = document.createElement('div');
                 dot.className = 'collector-dot ' + dotClass(c ? c.status : 'idle', c ? c.warning : '');
-                if (c && c.warning) el.title = c.warning;
+                const hint = collectorTitle(c);
+                if (hint) el.title = hint;
 
                 const nameEl = document.createElement('span');
                 nameEl.className = 'collector-name';

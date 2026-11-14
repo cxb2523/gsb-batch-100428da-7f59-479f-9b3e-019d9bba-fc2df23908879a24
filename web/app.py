@@ -67,8 +67,9 @@ async def dashboard(request: Request) -> HTMLResponse:
     storage = _get_storage()
     stats = storage.get_stats()
     return templates.TemplateResponse(
+        request,
         "dashboard.html",
-        {"request": request, "stats": stats},
+        {"stats": stats},
     )
 
 
@@ -80,8 +81,9 @@ async def idea_detail(request: Request, idea_id: str) -> HTMLResponse:
     if not idea:
         return HTMLResponse("<h1>Idea not found</h1>", status_code=404)
     return templates.TemplateResponse(
+        request,
         "idea_detail.html",
-        {"request": request, "idea": _idea_to_dict(idea)},
+        {"idea": _idea_to_dict(idea)},
     )
 
 
@@ -148,6 +150,8 @@ def update_collector_status(
     error: str = "",
     method: str = "",
     warning: str = "",
+    fallback: bool = False,
+    reason: str = "",
 ) -> None:
     """Обновить статус collector (вызывается из main.py scheduler)."""
     collector_status[name] = {
@@ -156,6 +160,8 @@ def update_collector_status(
         "error": error,
         "method": method,
         "warning": warning,
+        "fallback": fallback,
+        "reason": reason,
         "updated_at": datetime.utcnow().isoformat(),
     }
 

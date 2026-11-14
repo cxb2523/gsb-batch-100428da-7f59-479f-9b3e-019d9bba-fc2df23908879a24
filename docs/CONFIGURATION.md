@@ -46,7 +46,7 @@ All settings are configured via environment variables (`.env` file).
 
 - Collection runs on each source's configured interval, rather than as a real-time firehose.
 - Reddit, GitHub, Hacker News, Polymarket and RSS have separate collectors. Available results depend on source access, credentials and rate limits.
-- The X collector uses `twikit` with session cookies, with optional Camoufox login. It is not the official X API. Its Google News RSS fallback returns news articles, not direct X posts; the dashboard reports the collection method.
+- The X collector uses `twikit` with session cookies, with optional Camoufox login. It is not the official X API. Its Google News RSS fallback returns news articles, not direct X posts; the dashboard reports the collection method. Every run records a diagnostic outcome (`method`, `reason`, `fallback` flag, warning) that distinguishes: **twikit success** (`method=twikit`, no warning), **direct fallback because no usable cookies/session exist** (`reason=cookies_missing` / `cookies_invalid` / `cookies_unreadable` / `twikit_not_installed` / `login_unavailable` / `login_failed`), and **fallback after twikit requests failed with cookies present** (`reason=twikit_request_failed`, e.g. rate limit). A keyword whose `Latest` search fails but whose `Top` search succeeds counts as successful and never triggers the fallback; a successful run clears any warning left by a previous run.
 - Claude Code CLI performs screening and deeper analysis. Run it under an account with working authentication.
 - Configure `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_IDS` to enable alerts. Set `SCOUT_URL` to the dashboard address used in Telegram links.
 

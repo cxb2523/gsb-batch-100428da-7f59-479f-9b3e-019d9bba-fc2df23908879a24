@@ -1,4 +1,17 @@
-"""Twitter/X collector: twikit (cookies from Camoufox login) + Google News RSS fallback."""
+"""Twitter/X collector: twikit (cookies from Camoufox login) + Google News RSS fallback.
+
+Every collection run ends with a diagnostic outcome exposed via the
+module-level ``last_*`` variables:
+
+* ``last_method``   -- method that actually produced the returned items
+                       (``twikit`` or ``google_news_rss``);
+* ``last_reason``   -- machine-readable outcome reason (see ``REASON_*``);
+* ``last_fallback`` -- ``True`` when the Google News RSS fallback was used;
+* ``last_warning``  -- human-readable warning (empty on a healthy twikit run).
+
+This lets the dashboard distinguish an expected fallback (no cookies) from a
+broken twikit session (cookies present but requests failing, e.g. rate limit).
+"""
 
 import json
 import logging
@@ -16,71 +29,134 @@ logger = logging.getLogger(__name__)
 MAX_CONTENT_LEN = 2000
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
 
+# ---------------------------------------------------------------------------
+# Diagnostic outcome reasons
+# ---------------------------------------------------------------------------
+# twikit worked (possibly with some keywords failing -- see run logs).
+REASON_TWIKIT_OK = "twikit_ok"
+# No usable twikit session: fall back before any request is made.
+REASON_COOKIES_MISSING = "cookies_missing"
+REASON_COOKIES_INVALID = "cookies_invalid"
+REASON_COOKIES_UNREADABLE = "cookies_unreadable"
+REASON_TWIKIT_NOT_INSTALLED = "twikit_not_installed"
+REASON_LOGIN_UNAVAILABLE = "login_unavailable"
+REASON_LOGIN_FAILED = "login_failed"
+# Cookies/session existed but every twikit search request failed (rate limit,
+# network error, expired session, ...).
+REASON_TWIKIT_REQUEST_FAILED = "twikit_request_failed"
 
-async def _load_twikit_client() -> "twikit.Client | None":
-    """Load twikit client with cookies from Camoufox login."""
+# Human-readable warnings for the fallback outcomes.
+_FALLBACK_WARNINGS: dict[str, str] = {
+    REASON_COOKIES_MISSING: "Cookies missing — upload cookies to enable real tweets",
+    REASON_COOKIES_INVALID: (
+        "Twitter cookies invalid (auth_token/ct0 missing) — "
+        "re-login to enable real tweets"
+    ),
+    REASON_COOKIES_UNREADABLE: (
+        "Twitter cookies file unreadable — re-login to enable real tweets"
+    ),
+    REASON_TWIKIT_NOT_INSTALLED: (
+        "twikit not installed — using Google News fallback"
+    ),
+    REASON_LOGIN_UNAVAILABLE: (
+        "No valid cookies and auto-login not configured — "
+        "using Google News fallback"
+    ),
+    REASON_LOGIN_FAILED: (
+        "Camoufox re-login failed — using Google News fallback"
+    ),
+    REASON_TWIKIT_REQUEST_FAILED: (
+        "twikit failed (rate limit?) — using Google News fallback"
+    ),
+}
+
+
+async def _load_twikit_client() -> "tuple[twikit.Client | None, str]":
+    """Load twikit client with cookies from Camoufox login.
+
+    Returns ``(client, reason)``. On success ``reason`` is empty; otherwise
+    ``client`` is ``None`` and ``reason`` is one of the ``REASON_*``
+    constants describing why no session could be built.
+    """
     try:
         import twikit
     except ImportError:
         logger.warning("twikit not installed, skipping Twitter API")
-        return None
+        return None, REASON_TWIKIT_NOT_INSTALLED
 
     cookies_path = Path(settings.twitter_cookies_file)
     if not cookies_path.exists():
         logger.info("No Twitter cookies file, will try Camoufox login")
-        return None
+        return None, REASON_COOKIES_MISSING
 
     try:
         cookies = json.loads(cookies_path.read_text(encoding="utf-8"))
         if "auth_token" not in cookies or "ct0" not in cookies:
             logger.warning("Twitter cookies missing auth_token/ct0")
-            return None
+            return None, REASON_COOKIES_INVALID
 
         client = twikit.Client(language="en")
         client.set_cookies(cookies)
         logger.info("Twitter: twikit loaded %d cookies from file", len(cookies))
-        return client
+        return client, ""
 
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning("Error loading Twitter cookies: %s", exc)
-        return None
+        return None, REASON_COOKIES_UNREADABLE
 
 
-async def _try_camoufox_login() -> "twikit.Client | None":
-    """Try to re-login via Camoufox and return twikit client."""
+async def _try_camoufox_login() -> "tuple[twikit.Client | None, str]":
+    """Try to re-login via Camoufox and return ``(client, reason)``."""
     if not settings.twitter_username or not settings.twitter_password:
-        return None
+        return None, REASON_LOGIN_UNAVAILABLE
 
     try:
         from collectors.twitter_login import ensure_valid_cookies
     except ImportError:
         logger.warning("twitter_login module not available (camoufox not installed?)")
-        return None
+        return None, REASON_LOGIN_UNAVAILABLE
 
     success = await ensure_valid_cookies()
-    if success:
-        return await _load_twikit_client()
-    return None
+    if not success:
+        return None, REASON_LOGIN_FAILED
+
+    client, reason = await _load_twikit_client()
+    if client:
+        return client, ""
+    # Re-login reported success but the cookies still can't be loaded --
+    # keep the concrete load failure reason.
+    return None, reason or REASON_LOGIN_FAILED
 
 
-async def _collect_twikit() -> list[RawItem]:
-    """Собрать твиты через twikit (cookies from Camoufox)."""
+async def _collect_twikit() -> "tuple[list[RawItem], str, str]":
+    """Collect tweets through twikit (cookies from Camoufox).
+
+    Returns ``(items, reason, detail)``:
+
+    * ``reason == ""`` -- twikit was available and the search loop ran (items
+      may still be empty if no tweets matched the keywords);
+    * otherwise a ``REASON_*`` value explaining why no twikit request could
+      succeed, with ``detail`` carrying extra context (e.g. the last error).
+    """
     # Try loading existing cookies
-    client = await _load_twikit_client()
+    client, reason = await _load_twikit_client()
 
     # If no valid cookies, try Camoufox login
     if not client:
-        client = await _try_camoufox_login()
-
-    if not client:
-        return []
+        client, login_reason = await _try_camoufox_login()
+        if not client:
+            # Keep the more specific reason from the cookie load phase.
+            return [], reason or login_reason, ""
 
     items: list[RawItem] = []
     seen_ids: set[str] = set()
+    failed_keywords: list[str] = []
+    last_error: Exception | None = None
 
     try:
         for keyword in settings.twitter_keywords:
             results = None
+            last_product_error: Exception | None = None
             for product in ("Latest", "Top"):
                 try:
                     results = await client.search_tweet(
@@ -88,14 +164,25 @@ async def _collect_twikit() -> list[RawItem]:
                     )
                     break
                 except Exception as exc:
+                    last_product_error = exc
                     logger.debug(
                         "Twitter search '%s' (%s) failed: %s", keyword, product, exc
                     )
-            if not results:
-                logger.warning("Twitter search '%s' failed on all products", keyword)
+
+            if last_product_error is not None and results is None:
+                # Every product failed for this keyword.
+                last_error = last_product_error
+                failed_keywords.append(keyword)
+                logger.warning(
+                    "Twitter search '%s' failed on all products: %s",
+                    keyword,
+                    last_product_error,
+                )
                 continue
 
-            for tweet in results:
+            # An empty result list is a legitimate answer (no matching
+            # tweets), not a failure -- only a raised exception is.
+            for tweet in results or []:
                 if tweet.id in seen_ids:
                     continue
                 seen_ids.add(tweet.id)
@@ -120,11 +207,26 @@ async def _collect_twikit() -> list[RawItem]:
                     ),
                 )
 
+        if failed_keywords:
+            if len(failed_keywords) == len(settings.twitter_keywords):
+                detail = str(last_error) if last_error else ""
+                logger.error(
+                    "Twitter twikit requests failed for every keyword%s",
+                    f": {detail}" if detail else "",
+                )
+                return [], REASON_TWIKIT_REQUEST_FAILED, detail
+            logger.warning(
+                "Twitter twikit: %d/%d keywords failed, keeping partial results",
+                len(failed_keywords),
+                len(settings.twitter_keywords),
+            )
+
         logger.info("Twitter (twikit): collected %d tweets", len(items))
-        return items
+        return items, "", ""
     except Exception as exc:
+        # Failure outside the per-keyword search loop (session-level error).
         logger.error("Twitter twikit collector failed: %s", exc)
-        return []
+        return [], REASON_TWIKIT_REQUEST_FAILED, str(exc)
 
 
 async def _collect_google_news() -> list[RawItem]:
@@ -178,34 +280,49 @@ async def _collect_google_news() -> list[RawItem]:
         return []
 
 
-# Track collection method for UI status
+# Track collection outcome for UI status
 last_method: str = ""
+last_reason: str = ""
 last_warning: str = ""
+last_fallback: bool = False
 
 
 async def collect() -> list[RawItem]:
-    """Собрать контент: twikit (Camoufox cookies) -> Google News RSS fallback."""
-    global last_method, last_warning
+    """Собрать контент: twikit (Camoufox cookies) -> Google News RSS fallback.
+
+    Always records a diagnostic outcome in ``last_method`` / ``last_reason`` /
+    ``last_fallback`` / ``last_warning`` before returning. A successful twikit
+    run clears any warning left by a previous run.
+    """
+    global last_method, last_reason, last_warning, last_fallback
 
     if not settings.twitter_keywords:
         logger.warning("Twitter keywords not configured, skipping")
         return []
 
     # Попробовать twikit сначала
-    items = await _collect_twikit()
+    items, reason, detail = await _collect_twikit()
 
-    if items:
+    if not reason:
+        # twikit ran successfully (even if it found zero tweets) -- no
+        # fallback and never keep a stale warning from a previous run.
         last_method = "twikit"
+        last_reason = REASON_TWIKIT_OK
+        last_fallback = False
         last_warning = ""
+        return items
+
+    # Fallback на Google News RSS. The RSS mapping/params are untouched.
+    items = await _collect_google_news()
+    last_method = "google_news_rss"
+    last_reason = reason
+    last_fallback = True
+    last_warning = _FALLBACK_WARNINGS.get(
+        reason, "twikit unavailable — using Google News fallback"
+    )
+    if detail:
+        logger.warning("Twitter: %s (detail: %s)", last_warning, detail)
     else:
-        # Fallback на Google News RSS
-        items = await _collect_google_news()
-        last_method = "google_news_rss"
-        cookies_path = Path(settings.twitter_cookies_file)
-        if not cookies_path.exists():
-            last_warning = "Cookies missing — upload cookies to enable real tweets"
-        else:
-            last_warning = "twikit failed (rate limit?) — using Google News fallback"
         logger.warning("Twitter: %s", last_warning)
 
     return items
