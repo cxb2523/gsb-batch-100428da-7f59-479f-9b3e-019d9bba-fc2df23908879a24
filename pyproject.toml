@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capivara"
+version = "1.1.0"
+description = "Capivara — RPA low-code em Python, 100% em português"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+keywords = ["rpa", "selenium", "automacao", "pandas", "low-code", "capivara"]
+authors = [{ name = "Capivara", email = "capivara@arthurfaria.tech" }]
+
+[project.urls]
+Homepage = "https://github.com/capivara-rpa/capivara"
+Documentation = "https://github.com/capivara-rpa/capivara#readme"
+Issues = "https://github.com/capivara-rpa/capivara/issues"
+
+dependencies = [
+    "selenium>=4.20.0",
+    "requests>=2.31.0",
+    "pandas>=2.1.0",
+    "openpyxl>=3.1.0",
+    "loguru>=0.7.2",
+    "rich>=13.7.0",
+    "python-dotenv>=1.0.0",
+    "pyperclip>=1.8.2",
+    "cryptography>=42.0.0",
+    "pyzipper>=0.3.6",
+]
+
+[project.optional-dependencies]
+dev = ["ruff", "pytest", "pyinstaller>=6.0"]
+keyring = ["keyring>=24.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+# a raiz entra no sys.path para o atalho `pytest` achar o pacote `core`
+# mesmo sem `pip install -e .` (o `python -m pytest` já faz isso sozinho)
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+include = ["core*", "app*", "settings*", "bot_test*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501", "B904", "I001"]
