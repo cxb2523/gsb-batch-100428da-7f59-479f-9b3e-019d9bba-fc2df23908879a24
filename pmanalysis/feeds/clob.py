@@ -15,6 +15,11 @@ from pmanalysis.config import BOOK_DEPTH_BAND_CENTS, CLOB_API, CLOB_WS_URL
 
 log = logging.getLogger(__name__)
 
+# Per-token outcomes of a stale-quote REST fallback pull.
+FALLBACK_RECOVERED = "recovered"  # REST pull succeeded and the quote changed
+FALLBACK_UNCHANGED = "unchanged"  # REST pull succeeded but matched the cache
+FALLBACK_FAILED = "failed"  # REST pull raised; cache left untouched
+
 
 def valid_ask_cents(value: float) -> bool:
     return 0 < value < 98
@@ -233,12 +238,18 @@ class ClobFeed:
         self._last_update: dict[str, float] = {}
         self._books: dict[str, TokenBook] = {}
         self._trades: dict[str, TradeTape] = {}
+        self._fallback_outcomes: dict[str, str] = {}
         self._running = False
         self._connected = False
 
     @property
     def prices(self) -> dict[str, dict[str, float]]:
         return self._prices
+
+    @property
+    def fallback_outcomes(self) -> dict[str, str]:
+        """Last stale-fallback outcome per token (recovered/unchanged/failed)."""
+        return dict(self._fallback_outcomes)
 
     @property
     def connected(self) -> bool:
@@ -372,6 +383,45 @@ class ClobFeed:
         results = await asyncio.gather(*[_one(t) for t in token_ids])
         return [t for t in results if t]
 
+    async def refresh_stale_quotes(
+        self, token_ids: list[str], max_age_sec: float
+    ) -> dict[str, str]:
+        """REST /book fallback for tokens whose WS quote went stale.
+
+        Only tokens at or past ``max_age_sec`` are fetched — tokens with a
+        healthy WS flow are left alone. Each fetched token gets an auditable
+        outcome: ``recovered`` (quote actually changed), ``unchanged`` (REST
+        matched the cache, not a recovery), or ``failed`` (request raised).
+        One token's failure never aborts the rest of the batch, and failures
+        are never reported as recoveries.
+        """
+        stale = self.stale_tokens(token_ids, max_age_sec)
+        if not stale:
+            return {}
+
+        async def _one(token_id: str) -> tuple[str, str]:
+            try:
+                book = await self.fetch_book(token_id)
+            except Exception as exc:
+                log.warning("stale book refresh failed for %s: %s", token_id, exc)
+                return token_id, FALLBACK_FAILED
+            changed = self.apply_quote(token_id, book["best_ask"], book["best_bid"])
+            return token_id, FALLBACK_RECOVERED if changed else FALLBACK_UNCHANGED
+
+        outcomes = dict(await asyncio.gather(*[_one(t) for t in stale]))
+        self._fallback_outcomes.update(outcomes)
+        recovered = sum(1 for o in outcomes.values() if o == FALLBACK_RECOVERED)
+        unchanged = sum(1 for o in outcomes.values() if o == FALLBACK_UNCHANGED)
+        failed = sum(1 for o in outcomes.values() if o == FALLBACK_FAILED)
+        log.info(
+            "stale book fallback: %d recovered, %d unchanged, %d failed (of %d stale)",
+            recovered,
+            unchanged,
+            failed,
+            len(stale),
+        )
+        return outcomes
+
     def subscribe_msg(self, token_ids: list[str]) -> str:
         return json.dumps({
             "assets_ids": token_ids,
@@ -492,6 +542,7 @@ class ClobFeed:
             if token_id not in keep:
                 self._prices.pop(token_id, None)
                 self._last_update.pop(token_id, None)
+                self._fallback_outcomes.pop(token_id, None)
                 removed += 1
         for cache in (self._books, self._trades):
             for token_id in [t for t in cache if t not in keep]:

@@ -43,7 +43,7 @@ from pmanalysis.db.session import get_session, init_db
 from pmanalysis.export.parquet import export_window_parquet
 from pmanalysis.feeds.binance import BinanceFeed
 from pmanalysis.feeds.chainlink import ChainlinkFeed
-from pmanalysis.feeds.clob import ClobFeed
+from pmanalysis.feeds.clob import FALLBACK_RECOVERED, ClobFeed
 from pmanalysis.feeds.gamma import GammaClient
 
 log = logging.getLogger(__name__)
@@ -642,10 +642,17 @@ class CollectorService:
         while self._running:
             try:
                 if self._token_ids:
-                    stale = self.clob.stale_tokens(self._token_ids, CLOB_STALE_SEC)
-                    if stale:
-                        changed = await self.clob.seed_tokens(stale)
-                        await self._push_windows_for_tokens(changed)
+                    outcomes = await self.clob.refresh_stale_quotes(
+                        self._token_ids, CLOB_STALE_SEC
+                    )
+                    # Only genuinely recovered quotes trigger a push; an
+                    # unchanged REST pull is not a recovery, and a failed one
+                    # must not be pushed (or counted) as success.
+                    recovered = [
+                        t for t, o in outcomes.items() if o == FALLBACK_RECOVERED
+                    ]
+                    if recovered:
+                        await self._push_windows_for_tokens(recovered)
             except Exception as exc:
                 log.warning("book poll failed: %s", exc)
             await asyncio.sleep(BOOK_POLL_INTERVAL_SEC)
