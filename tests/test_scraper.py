@@ -1,0 +1,632 @@
+"""Integration tests for scraper class.
+
+These tests verify the Scraper class works correctly with Selector and BeautifulSoup
+to extract data from HTML content using CSS selectors.
+"""
+
+import re
+import threading
+from unittest.mock import MagicMock, patch
+
+import pytest
+from bs4 import BeautifulSoup
+from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import TemplateError
+from homeassistant.helpers.template import Template
+
+from custom_components.multiscrape.const import DEFAULT_SEPARATOR
+from custom_components.multiscrape.scrape_context import ScrapeContext
+from custom_components.multiscrape.scraper import Scraper
+from custom_components.multiscrape.selector import Selector
+
+from .fixtures.html_samples import (SAMPLE_HTML_EMPTY, SAMPLE_HTML_FULL,
+                                    SAMPLE_HTML_LIST, SAMPLE_HTML_MALFORMED,
+                                    SAMPLE_HTML_SPECIAL_TAGS)
+from .fixtures.json_samples import (SAMPLE_JSON_INVALID, SAMPLE_JSON_NESTED,
+                                    SAMPLE_JSON_SIMPLE)
+
+
+@pytest.fixture
+def scraper_instance(hass: HomeAssistant):
+    """Create a Scraper instance for testing."""
+    return Scraper("test_scraper", hass, None, "lxml", DEFAULT_SEPARATOR)
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+@pytest.mark.parametrize(
+    "selector_config,expected_value",
+    [
+        # Test text extraction
+        (
+            {"select": ".current-version h1", "extract": "text"},
+            "Current Version: 2024.8.3",
+        ),
+        # Test content extraction (inner HTML) - note: may include trailing newline
+        (
+            {"select": ".links", "extract": "content"},
+            '<a href="/latest-release-notes/">Release notes</a>',
+        ),
+        # Test tag extraction (outer HTML) - note: may include trailing newline
+        (
+            {"select": ".links", "extract": "tag"},
+            '<div class="links" style="links"><a href="/latest-release-notes/">Release notes</a></div>',
+        ),
+        # Test attribute extraction
+        (
+            {"select": ".links a", "attribute": "href"},
+            "/latest-release-notes/",
+        ),
+    ],
+)
+async def test_scraper_extraction_methods(
+    hass: HomeAssistant, scraper_instance, selector_config, expected_value
+):
+    """Test different extraction methods (text, content, tag, attribute)."""
+    # Arrange
+    await scraper_instance.set_content(SAMPLE_HTML_FULL)
+
+    # Convert string select to Template if present
+    if "select" in selector_config:
+        selector_config["select"] = Template(selector_config["select"], hass)
+
+    selector = Selector(hass, selector_config)
+
+    # Act
+    value = scraper_instance.scrape(selector, "test_sensor")
+
+    # Assert
+    # Normalize whitespace for comparison (BeautifulSoup may add newlines/spaces)
+    normalized_value = re.sub(r"\s+", " ", value).strip()
+    normalized_expected = re.sub(r"\s+", " ", expected_value).strip()
+    assert normalized_value == normalized_expected
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_with_list_selector(hass: HomeAssistant, scraper_instance):
+    """Test scraping multiple elements using list selector."""
+    # Arrange
+    await scraper_instance.set_content(SAMPLE_HTML_LIST)
+
+    selector_config = {
+        "select_list": Template(".item", hass),
+        "extract": "text",
+    }
+    selector = Selector(hass, selector_config)
+
+    # Act
+    value = scraper_instance.scrape(selector, "test_sensor")
+
+    # Assert
+    # Should return comma-separated values (DEFAULT_SEPARATOR is ", ")
+    # Note: DEFAULT_SEPARATOR is actually "," not ", " - let's check actual output
+    assert value == "Item 1,Item 2,Item 3"
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_with_special_tags(hass: HomeAssistant, scraper_instance):
+    """Test extraction from special tags (script, style, template)."""
+    # Arrange
+    await scraper_instance.set_content(SAMPLE_HTML_SPECIAL_TAGS)
+
+    # Test script tag
+    selector_config = {"select": Template("script", hass)}
+    selector = Selector(hass, selector_config)
+    value = scraper_instance.scrape(selector, "test_sensor")
+    assert 'console.log("test");' in value
+
+    # Test style tag
+    selector_config = {"select": Template("style", hass)}
+    selector = Selector(hass, selector_config)
+    value = scraper_instance.scrape(selector, "test_sensor")
+    assert ".test { color: red; }" in value
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_selector_not_found_raises_error(
+    hass: HomeAssistant, scraper_instance
+):
+    """Test that scraper raises ValueError when selector matches nothing."""
+    # Arrange
+    await scraper_instance.set_content(SAMPLE_HTML_FULL)
+
+    selector_config = {
+        "select": Template(".nonexistent-class", hass),
+        "extract": "text",
+    }
+    selector = Selector(hass, selector_config)
+
+    # Act & Assert
+    with pytest.raises(ValueError, match="Could not find a tag for given selector"):
+        scraper_instance.scrape(selector, "test_sensor")
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_handles_json_content(hass: HomeAssistant, scraper_instance):
+    """Test that scraper detects JSON content and preserves it for value_template."""
+    # Arrange
+    await scraper_instance.set_content(SAMPLE_JSON_SIMPLE)
+
+    # JSON content should not be parsed by BeautifulSoup
+    assert scraper_instance._soup is None
+    # Raw data is preserved for value_template (the canonical HA JSON path)
+    assert scraper_instance._data == SAMPLE_JSON_SIMPLE
+    assert scraper_instance._is_json is True
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_json_without_value_template_raises_error(
+    hass: HomeAssistant, scraper_instance
+):
+    """Test that attempting to scrape JSON without value_template raises error."""
+    # Arrange
+    await scraper_instance.set_content(SAMPLE_JSON_SIMPLE)
+
+    selector_config = {
+        "select": Template(".something", hass),
+        "extract": "text",
+    }
+    selector = Selector(hass, selector_config)
+
+    # Act & Assert
+    with pytest.raises(
+        ValueError,
+        match="JSON cannot be scraped. Please provide a value template to parse JSON response.",
+    ):
+        scraper_instance.scrape(selector, "test_sensor")
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_reset_clears_content(hass: HomeAssistant, scraper_instance):
+    """Test that reset() clears HTML soup and JSON state."""
+    # Arrange — first an HTML cycle
+    await scraper_instance.set_content(SAMPLE_HTML_FULL)
+    assert scraper_instance._data is not None
+    assert scraper_instance._soup is not None
+
+    # Act
+    scraper_instance.reset()
+
+    # Assert
+    assert scraper_instance._data is None
+    assert scraper_instance._soup is None
+    assert scraper_instance._is_json is False
+
+    # Arrange — now a JSON cycle
+    await scraper_instance.set_content(SAMPLE_JSON_SIMPLE)
+    assert scraper_instance._is_json is True
+
+    # Act
+    scraper_instance.reset()
+
+    # Assert
+    assert scraper_instance._data is None
+    assert scraper_instance._is_json is False
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_handles_empty_content(hass: HomeAssistant, scraper_instance):
+    """Test scraper behavior with empty content.
+
+    Current behavior: Empty content is parsed by BeautifulSoup, creating an empty soup.
+    This allows the scraper to continue operating even with empty responses.
+    """
+    # Arrange & Act
+    await scraper_instance.set_content(SAMPLE_HTML_EMPTY)
+
+    # Assert
+    assert scraper_instance._data == SAMPLE_HTML_EMPTY
+    # BeautifulSoup creates an empty soup object for empty string
+    assert scraper_instance._soup is not None
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_handles_malformed_html(hass: HomeAssistant, scraper_instance):
+    """Test that scraper handles malformed HTML gracefully."""
+    # Arrange & Act
+    await scraper_instance.set_content(SAMPLE_HTML_MALFORMED)
+
+    # Assert - BeautifulSoup should parse it without raising
+    assert scraper_instance._soup is not None
+    # Can still extract from the parsed structure
+    selector_config = {
+        "select": Template(".unclosed", hass),
+        "extract": "text",
+    }
+    selector = Selector(hass, selector_config)
+    value = scraper_instance.scrape(selector, "test_sensor")
+    assert "This paragraph is not closed" in value
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_formatted_content_prettifies_html(
+    hass: HomeAssistant, scraper_instance
+):
+    """Test that formatted_content returns prettified HTML."""
+    # Arrange
+    await scraper_instance.set_content("<div><p>Test</p></div>")
+
+    # Act
+    formatted = scraper_instance.formatted_content
+
+    # Assert
+    # Prettified HTML should have newlines and indentation
+    # BeautifulSoup wraps content in html/body tags and formats with newlines
+    assert "\n" in formatted
+    assert "<div>" in formatted
+    assert "Test" in formatted
+    # Verify it's actually formatted (has indentation)
+    assert "  " in formatted  # Multiple spaces indicate indentation
+
+
+# ============================================================================
+# JSON-specific scraper tests
+# ============================================================================
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_formatted_content_pretty_prints_json(
+    hass: HomeAssistant, scraper_instance
+):
+    """Test that formatted_content returns pretty-printed JSON for JSON responses."""
+    await scraper_instance.set_content(SAMPLE_JSON_NESTED)
+
+    formatted = scraper_instance.formatted_content
+
+    # Pretty-printed JSON has newlines, indentation, and quoted keys
+    assert "\n" in formatted
+    assert '"user"' in formatted
+    # 2-space indent (json.dumps indent=2)
+    assert "\n  " in formatted
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_handles_malformed_json_softly(
+    hass: HomeAssistant, scraper_instance
+):
+    """Test that malformed JSON soft-fails: detection succeeds, no exception, raw data preserved."""
+    # Act — should not raise
+    await scraper_instance.set_content(SAMPLE_JSON_INVALID)
+
+    # Assert state
+    assert scraper_instance._is_json is True
+    assert scraper_instance._data == SAMPLE_JSON_INVALID
+    # formatted_content falls back to raw when pretty-print fails
+    assert scraper_instance.formatted_content == SAMPLE_JSON_INVALID
+
+    # And select-style scraping still raises the JSON error
+    selector = Selector(hass, {"select": Template(".x", hass), "extract": "text"})
+    with pytest.raises(
+        ValueError,
+        match="JSON cannot be scraped",
+    ):
+        scraper_instance.scrape(selector, "test_sensor")
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_handles_recursion_error_softly(
+    hass: HomeAssistant, scraper_instance, monkeypatch
+):
+    """A JSON parse that raises RecursionError soft-fails in formatted_content."""
+    # Triggering a real RecursionError depends on sys.getrecursionlimit(), which
+    # varies across environments. Simulate the failure mode directly so the test
+    # is deterministic and doesn't produce huge debug output on CI.
+    await scraper_instance.set_content(SAMPLE_JSON_SIMPLE)
+    assert scraper_instance._is_json is True
+
+    def boom(*_args, **_kwargs):
+        raise RecursionError("simulated deeply-nested JSON")
+
+    monkeypatch.setattr(
+        "custom_components.multiscrape.scraper.json.loads", boom
+    )
+
+    # formatted_content falls back to raw on RecursionError
+    assert scraper_instance.formatted_content == SAMPLE_JSON_SIMPLE
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_json_value_template_still_works(
+    hass: HomeAssistant, scraper_instance
+):
+    """Backwards-compat: value_template against JSON (canonical HA pattern) still works."""
+    await scraper_instance.set_content(SAMPLE_JSON_SIMPLE)
+
+    selector = Selector(
+        hass,
+        {"value_template": Template("{{ value_json.name }}", hass)},
+    )
+
+    value = scraper_instance.scrape(selector, "test_sensor")
+
+    assert value == "John"
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_json_file_logging_uses_page_json(hass: HomeAssistant):
+    """Test that JSON content is logged to page_json.txt (not page_soup.txt)."""
+    file_manager = MagicMock()
+    scraper = Scraper("test_scraper", hass, file_manager, "lxml", DEFAULT_SEPARATOR)
+
+    await scraper.set_content(SAMPLE_JSON_SIMPLE)
+
+    file_manager.write.assert_called_once()
+    filename, content = file_manager.write.call_args.args
+    assert filename == "page_json.txt"
+    # Content is the pretty-printed form
+    assert '"name": "John"' in content
+
+
+# ============================================================================
+# ScrapeContext integration tests
+# ============================================================================
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_context_form_variables_in_value_template(
+    hass: HomeAssistant, scraper_instance
+):
+    """Test that form variables from ScrapeContext are available in value templates."""
+    await scraper_instance.set_content(SAMPLE_HTML_FULL)
+
+    selector_config = {
+        "select": Template(".current-version h1", hass),
+        "extract": "text",
+        "value_template": Template("{{ value }} (token={{ token }})", hass),
+    }
+    selector = Selector(hass, selector_config)
+
+    ctx = ScrapeContext(form_variables={"token": "abc123"})
+    value = scraper_instance.scrape(selector, "test_sensor", context=ctx)
+
+    assert value == "Current Version: 2024.8.3 (token=abc123)"
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_context_form_variables_in_just_value_template(
+    hass: HomeAssistant, scraper_instance
+):
+    """Test that form variables are available in just_value (no selector) templates."""
+    await scraper_instance.set_content(SAMPLE_JSON_SIMPLE)
+
+    selector_config = {
+        "value_template": Template("token={{ token }}", hass),
+    }
+    selector = Selector(hass, selector_config)
+
+    ctx = ScrapeContext(form_variables={"token": "secret"})
+    value = scraper_instance.scrape(selector, "test_sensor", context=ctx)
+
+    assert value == "token=secret"
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_context_immutability_across_calls(
+    hass: HomeAssistant, scraper_instance
+):
+    """Test that ScrapeContext is not mutated between successive scrape calls."""
+    await scraper_instance.set_content(SAMPLE_HTML_FULL)
+
+    selector_config = {
+        "select": Template(".current-version h1", hass),
+        "extract": "text",
+        "value_template": Template("{{ value }}", hass),
+    }
+    selector = Selector(hass, selector_config)
+
+    ctx = ScrapeContext(form_variables={"token": "abc"})
+
+    # Call scrape twice with the same context
+    value1 = scraper_instance.scrape(selector, "sensor1", context=ctx)
+    value2 = scraper_instance.scrape(selector, "sensor2", context=ctx)
+
+    # Both should succeed and return the same result
+    assert value1 == value2
+    # Context should be unchanged (no "value" key leaked into form_variables)
+    assert "value" not in ctx.form_variables
+    assert ctx.current_value is None
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_selects_registered_selectors_off_the_event_loop(
+    hass: HomeAssistant, scraper_instance
+):
+    """Registered selectors are selected in the executor, not in scrape() (#633)."""
+    single = Selector(
+        hass,
+        {
+            "name": "single",
+            "select": Template(".current-version h1", hass),
+            "value_template": Template("{{ value | upper }}", hass),
+        },
+    )
+    listed = Selector(hass, {"name": "listed", "select_list": Template("h1", hass)})
+    scraper_instance.register_selectors([single, listed])
+
+    threads = []
+    extract_value = scraper_instance._extract_value
+
+    def _record_thread(*args):
+        threads.append(threading.current_thread())
+        return extract_value(*args)
+
+    with patch.object(scraper_instance, "_extract_value", side_effect=_record_thread):
+        await scraper_instance.set_content(SAMPLE_HTML_FULL)
+        assert len(threads) == 2
+        assert threading.main_thread() not in threads
+
+        # scrape() reads the precomputed values and doesn't select again.
+        assert scraper_instance.scrape(single, "single") == "CURRENT VERSION: 2024.8.3"
+        assert scraper_instance.scrape(listed, "listed") == scraper_instance._extracted[listed]
+        assert len(threads) == 2
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_registered_selector_errors_are_raised_by_scrape(
+    hass: HomeAssistant, scraper_instance
+):
+    """Errors from the executor run surface from scrape(), so on_error still applies."""
+    missing = Selector(hass, {"name": "missing", "select": Template(".does-not-exist", hass)})
+    missing_list = Selector(
+        hass, {"name": "missing_list", "select_list": Template(".does-not-exist", hass)}
+    )
+    broken = Selector(hass, {"name": "broken", "select": Template("{{ 1 / 0 }}", hass)})
+    scraper_instance.register_selectors([missing, missing_list, broken])
+
+    await scraper_instance.set_content(SAMPLE_HTML_FULL)
+
+    with pytest.raises(ValueError, match="Could not find a tag"):
+        scraper_instance.scrape(missing, "missing")
+    with pytest.raises(ValueError, match="Could not find any tags"):
+        scraper_instance.scrape(missing_list, "missing_list")
+    with pytest.raises(TemplateError):
+        scraper_instance.scrape(broken, "broken")
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_unregistered_selector_falls_back_to_selecting_in_scrape(
+    hass: HomeAssistant, scraper_instance
+):
+    """After unregistering, a selector is no longer precomputed but still scrapes."""
+    selector = Selector(hass, {"name": "s", "select": Template(".current-version h1", hass)})
+    unregister = scraper_instance.register_selectors([selector])
+    await scraper_instance.set_content(SAMPLE_HTML_FULL)
+    assert selector in scraper_instance._extracted
+
+    unregister()
+    assert selector not in scraper_instance._extracted
+
+    await scraper_instance.set_content(SAMPLE_HTML_FULL)
+    assert scraper_instance._extracted == {}
+    assert scraper_instance.scrape(selector, "s") == "Current Version: 2024.8.3"
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_new_content_replaces_precomputed_values(
+    hass: HomeAssistant, scraper_instance
+):
+    """Values from a previous page never leak into the next one."""
+    selector = Selector(hass, {"name": "s", "select": Template(".current-version h1", hass)})
+    scraper_instance.register_selectors([selector])
+    await scraper_instance.set_content(SAMPLE_HTML_FULL)
+
+    scraper_instance.reset()
+    assert scraper_instance._extracted == {}
+
+    await scraper_instance.set_content(SAMPLE_JSON_SIMPLE)
+    with pytest.raises(ValueError, match="JSON cannot be scraped"):
+        scraper_instance.scrape(selector, "s")
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_discards_results_for_replaced_content(
+    hass: HomeAssistant, scraper_instance
+):
+    """A reset while the executor job runs must not resurrect its results."""
+    selector = Selector(hass, {"name": "s", "select": Template(".current-version h1", hass)})
+    scraper_instance.register_selectors([selector])
+
+    started = threading.Event()
+    release = threading.Event()
+    extract_batch = scraper_instance._extract_batch
+
+    def _blocking_batch(soup, jobs):
+        started.set()
+        release.wait(5)
+        return extract_batch(soup, jobs)
+
+    # A plain function, as the test harness runs Mock executor targets inline.
+    scraper_instance._extract_batch = _blocking_batch
+    task = hass.async_create_task(scraper_instance.set_content(SAMPLE_HTML_FULL))
+
+    # Reset while the executor job is still running, then let it finish.
+    await hass.async_add_executor_job(started.wait, 5)
+    scraper_instance.reset()
+    release.set()
+    await task
+
+    assert scraper_instance._extracted == {}
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_register_selectors_ignores_just_value_selectors(
+    hass: HomeAssistant, scraper_instance
+):
+    """A value_template-only selector has nothing to select, so it isn't registered."""
+    selector = Selector(hass, {"name": "v", "value_template": Template("{{ 42 }}", hass)})
+    scraper_instance.register_selectors([selector])
+    await scraper_instance.set_content(SAMPLE_HTML_FULL)
+
+    assert selector not in scraper_instance._extracted
+    assert scraper_instance.scrape(selector, "v") == 42
+
+
+@pytest.mark.integration
+@pytest.mark.async_test
+@pytest.mark.timeout(5)
+async def test_scraper_async_formatted_content_formats_off_the_event_loop(
+    hass: HomeAssistant, scraper_instance
+):
+    """Prettifying a large page must not block the event loop either (#633)."""
+    await scraper_instance.set_content(SAMPLE_HTML_FULL)
+
+    threads = []
+    prettify = BeautifulSoup.prettify
+
+    def _record_thread(*args, **kwargs):
+        threads.append(threading.current_thread())
+        return prettify(*args, **kwargs)
+
+    with patch.object(BeautifulSoup, "prettify", autospec=True, side_effect=_record_thread):
+        formatted = await scraper_instance.async_formatted_content()
+
+    assert formatted == scraper_instance.formatted_content
+    assert threads
+    assert threading.main_thread() not in threads

@@ -1,0 +1,431 @@
+# Multiscrape
+
+---
+
+> [!TIP]
+>
+> ## 👋 A quick note
+>
+> I run **[Smart Home Newsletter](https://smarthomenewsletter.com/?utm_source=github&utm_medium=readme&utm_campaign=multiscrape)** — a weekly curated digest for smart home enthusiasts.
+>
+> Each issue highlights the most relevant smart home **articles, news, and projects** from the past week.
+>
+> Since you're here, you're clearly into home automation — so you might genuinely enjoy the newsletter.
+>
+> 👉 [Subscribe at smarthomenewsletter.com](https://smarthomenewsletter.com/?utm_source=github&utm_medium=readme&utm_campaign=multiscrape)
+
+---
+
+[![GitHub Release][releases-shield]][releases]
+[![License][license-shield]](LICENSE)
+
+[![pre-commit][pre-commit-shield]][pre-commit]
+[![Black][black-shield]][black]
+
+[![hacs][hacsbadge]][hacs]
+![hacs installs](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Flauwbier.nl%2Fhacs%2Fmultiscrape&style=for-the-badge)
+
+[![Project Maintenance][maintenance-shield]][user_profile]
+[![BuyMeCoffee][buymecoffeebadge]][buymecoffee]
+
+[![Discord][discord-shield]][discord]
+[![Community Forum][forum-shield]][forum]
+
+## Need help with Multiscrape?
+
+If you don't manage to scrape the value you are looking for, please [enable debug logging](#debug-logging) and `log_response`. This will provide you with a lot of information for continued investigation. `log_response` will write all responses to files. If the value you want to scrape is not in the files with the output from BeautifulSoup (\*-soup.txt), Multiscrape will not be able to scrape it. Most likely it is retrieved in the background by javascript. Your best chance in this case, is to investigate the network traffic in de developer tools of your browser, and try to find a json response containing the value you are looking for.
+
+If all of this doesn't help, use the home assistant forum. I cannot give everyone personal assistance and please don't create github issues unless you are sure your issue isn't caused by configuration.
+Check the [wiki](https://github.com/danieldotnl/ha-multiscrape/wiki) for a scraping guide and other details on the functionality of this component.
+
+## Important note: be a good citizen and be aware of your responsibility
+
+You and you alone, are accountable for your scraping activities. Be a good (web) citizen. Set reasonable `scan_interval` timings, seek explicit permission before scraping, and adhere to local and international laws. Respect website policies, handle data ethically, mind resource usage, and regularly monitor your actions. Uphold these principles to ensure ethical and sustainable scraping practices.
+
+## Introduction
+
+This Home Assistant custom component can scrape multiple fields (using CSS selectors) from a single HTTP request (the existing scrape sensor can scrape a single field only). The scraped data becomes available in separate sensors.
+
+It is based on both the existing [Rest sensor](https://www.home-assistant.io/integrations/rest/) and the [Scrape sensor](https://www.home-assistant.io/integrations/scrape). Most properties of the Rest and Scrape sensor apply.
+
+<a href="https://www.buymeacoffee.com/danieldotnl" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/default-blue.png" alt="Buy Me A Coffee" style="height: 51px !important;width: 217px !important;" ></a>
+
+## Installation
+
+[![hacs][hacsbadge]][hacs]
+![hacs installs](https://img.shields.io/endpoint.svg?url=https%3A%2F%2Flauwbier.nl%2Fhacs%2Fmultiscrape&style=for-the-badge)
+
+[![Install quickly via a HACS link](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=danieldotnl&repository=ha-multiscrape&category=integration)\
+Install via HACS (default store) or install manually by copying the files in a new 'custom_components/multiscrape' directory.
+
+## Example configuration (YAML)
+
+_This code example is to be placed into /config/configuration.yaml_
+
+```yaml
+multiscrape:
+  - name: HA scraper
+    resource: https://www.home-assistant.io
+    scan_interval: 3600
+    sensor:
+      - unique_id: ha_latest_version
+        name: Latest version
+        select: ".release-date"
+        value_template: "{{ value | trim }}"
+      - unique_id: ha_release_date
+        icon: >-
+          {% if is_state('binary_sensor.ha_version_check', 'on') %}
+            mdi:alarm-light
+          {% else %}
+            mdi:bat
+          {% endif %}
+        name: Release date
+        select: ".release-date"
+        attribute: "title"
+        value_template: "{{ (value.split('released')[1]) }}"
+    binary_sensor:
+      - unique_id: ha_version_check
+        name: Latest version == 2021.7.0
+        select: ".release-date"
+        value_template: '{{ value | trim == "2021.7.0" }}'
+        attributes:
+          - name: Release notes link
+            select: ".release-date"
+            attribute: href
+```
+
+### Advanced Example Configuration (YAML)
+
+For background on splitting the HA configuration, see the [HA Documentation](https://www.home-assistant.io/docs/configuration/splitting_configuration/).
+
+_Inside the configuration.yaml file_
+
+```yaml
+multiscrape: !include multiscrape.yaml
+```
+
+Make a new file named /config/multiscrape.yaml
+
+_Inside the multiscrape.yaml file. Syntax is the same but starting at the resource level_
+
+```yaml
+- resource: https://www.home-assistant.io
+  scan_interval: 3600
+  sensor:
+    - unique_id: ha_latest_version
+      name: Latest version
+      select: ".release-date"
+      value_template: "{{ value | trim }}"
+    - unique_id: ha_release_date
+      icon: >-
+        {% if is_state('binary_sensor.ha_version_check', 'on') %}
+          mdi:alarm-light
+        {% else %}
+          mdi:bat
+        {% endif %}
+      name: Release date
+      select: ".release-date"
+      attribute: "title"
+      value_template: "{{ (value.split('released')[1]) }}"
+  binary_sensor:
+    - unique_id: ha_version_check
+      name: Latest version == 2021.7.0
+      select: ".release-date"
+      value_template: '{{ value | trim == "2021.7.0" }}'
+      attributes:
+        - name: Release notes link
+          select: ".release-date"
+          attribute: href
+```
+
+## Options
+
+Based on latest (pre) release.
+
+| name              | description                                                                                                               | required | default | type              |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------- | -------- | ------- | ----------------- |
+| name              | The name for the integration.                                                                                             | False    |         | string            |
+| resource          | The url for retrieving the site or a template that will output an url. Not required when `resource_template` is provided. | True     |         | string            |
+| resource_template | A template that will output an url after being rendered. Only required when `resource` is not provided.                   | True     |         | template          |
+| authentication    | Configure HTTP authentication. `basic` or `digest`. Use this with username and password fields.                           | False    |         | string            |
+| username          | The username for accessing the url.                                                                                       | False    |         | string            |
+| password          | The password for accessing the url.                                                                                       | False    |         | string            |
+| headers           | The headers for the requests.                                                                                             | False    |         | template - list   |
+| params            | The query params for the requests.                                                                                        | False    |         | template - list   |
+| method            | The method for the request. Either `POST`, `GET`, or `PUT`.                                                               | False    | GET     | string            |
+| payload           | Optional payload to send with a `POST` or `PUT` request.                                                                  | False    |         | template - string |
+| verify_ssl        | Verify the SSL certificate of the endpoint.                                                                               | False    | True    | boolean           |
+| log_response      | Log the HTTP responses and HTML parsed by BeautifulSoup in files. (Will be written to/config/multiscrape/name_of_config)  | False    | False   | boolean           |
+| timeout           | Defines max time to wait data from the endpoint.                                                                          | False    | 10      | int               |
+| scan_interval     | Determines how often the url will be requested.                                                                           | False    | 60      | int               |
+| max_retries       | Number of automatic retries after a failed run. Only applies when `scan_interval` is 0. See [Retries](#retries).          | False    | 3       | int               |
+| parser            | Determines the parser to be used with beautifulsoup. `lxml-xml` for xml recommended and `lxml` for everything else.       | False    | lxml    | string            |
+| list_separator    | Separator to be used in combination with `select_list` features.                                                          | False    | ,       | string            |
+| form_submit       | See [Form-submit](#form-submit)                                                                                           | False    |         |                   |
+| sensor            | See [Sensor](#sensorbinary-sensor)                                                                                        | False    |         | list              |
+| binary_sensor     | See [Binary sensor](#sensorbinary-sensor)                                                                                 | False    |         | list              |
+| button            | See [Refresh button](#refresh-button)                                                                                     | False    |         | list              |
+
+### Sensor/Binary Sensor
+
+Configure the sensors that will scrape the data.
+
+| name                | description                                                                                                                                                                                                      | required | default | type            |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ------- | --------------- |
+| unique_id           | Will be used as entity_id and enables editing the entity in the UI                                                                                                                                               | False    |         | string          |
+| name                | Friendly name for the sensor                                                                                                                                                                                     | False    |         | string          |
+|                     | See [Selector](#Selector) fields                                                                                                                                                                                 | True     |         |                 |
+| attributes          | See [Sensor attributes](#sensor-attributes)                                                                                                                                                                      | False    |         | list            |
+| unit_of_measurement | Defines the units of measurement of the sensor                                                                                                                                                                   | False    |         | string          |
+| device_class        | Sets the device_class for [sensors](https://www.home-assistant.io/integrations/sensor/) or [binary sensors](https://www.home-assistant.io/integrations/binary_sensor/)                                           | False    |         | string          |
+| state_class         | Defines the state class of the sensor, if any. (measurement, total or total_increasing) (not for binary_sensor)                                                                                                  | False    | None    | string          |
+| icon                | Defines the icon or a template for the icon of the sensor. The value of the selector (or value_template when given) is provided as input for the template. For binary sensors, the value is parsed in a boolean. | False    |         | string/template |
+| picture             | Contains a path to a local image and will set it as entity picture                                                                                                                                               | False    |         | string          |
+| force_update        | Sends update events even if the value hasn’t changed. Useful if you want to have meaningful value graphs in history.                                                                                             | False    | False   | boolean         |
+
+### Refresh button
+
+Configure a refresh button to manually trigger scraping.
+
+| name      | description                                                        | required | default | type   |
+| --------- | ------------------------------------------------------------------ | -------- | ------- | ------ |
+| unique_id | Will be used as entity_id and enables editing the entity in the UI | False    |         | string |
+| name      | Friendly name for the button                                       | False    |         | string |
+
+### Sensor attributes
+
+Configure the attributes on the sensor that can be set with additional scraping values.
+
+| name | description                               | required | default | type   |
+| ---- | ----------------------------------------- | -------- | ------- | ------ |
+| name | Name of the attribute (will be slugified) | True     |         | string |
+|      | See [Selector](#Selector) fields          | True     |         |        |
+
+### Form-submit
+
+Configure the form-submit functionality which enables you to submit a (login) form before scraping a site. More details on how this works [can be found on the wiki](https://github.com/danieldotnl/ha-multiscrape/wiki/Form-submit-functionality).
+
+| name              | description                                                                                                                                                                                           | required | default | type                  |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ------- | --------------------- |
+| resource          | The url for the site with the form. Not required when `resource_template` is provided.                                                                                                                | False    |         | string                |
+| resource_template | A template that will output the url for the site with the form. Only required when `resource` is not provided. Rendered without variables, since no scraped data exists yet.                          | False    |         | template              |
+| authentication    | Configure HTTP authentication for the form requests. `basic` or `digest`. Use this with username and password fields.                                                                                 | False    |         | string                |
+| username          | The username for the form requests.                                                                                                                                                                   | False    |         | string                |
+| password          | The password for the form requests.                                                                                                                                                                   | False    |         | string                |
+| headers           | The headers for the form requests.                                                                                                                                                                    | False    |         | template - list       |
+| params            | The query params for the form requests.                                                                                                                                                               | False    |         | template - list       |
+| method            | The method used to submit the form. Either `POST`, `GET` or `PUT`. When omitted, the `method` attribute of the selected `<form>` is used, falling back to `POST`.                                     | False    |         | string                |
+| payload           | A raw request body to submit instead of the url-encoded input fields. See [Form payload](#form-payload).                                                                                              | False    |         | template - string     |
+| timeout           | Max time to wait for the form page and the form submit response. When omitted, the top-level `timeout` is used.                                                                                       | False    |         | int                   |
+| select            | CSS selector used for selecting the form in the html. When omitted, the input fields are directly posted.                                                                                             | False    |         | string                |
+| input             | A dictionary with name/values which will be merged with the input fields on the form. Values are rendered as templates when the form is submitted. See [Form input templates](#form-input-templates). | False    |         | template - dictionary |
+| input_filter      | A list of input fields that should not be submitted with the form                                                                                                                                     | False    |         | string - list         |
+| submit_once       | Submit the form only once on startup instead of each scan interval                                                                                                                                    | False    | False   | boolean               |
+| resubmit_on_error | Resubmit the form after a scraping error is encountered                                                                                                                                               | False    | True    | boolean               |
+| variables         | See [Form Variables](#Form-Variables)                                                                                                                                                                 | False    |         | list                  |
+
+> **Breaking change:** `form_submit` has always accepted every HTTP option but honoured only some of them. `method`, `payload`, `timeout` and `resource_template` are now actually applied, and `verify_ssl` is rejected.
+>
+> - If you set `form_submit: verify_ssl:`, **remove it** or Home Assistant will refuse to load the multiscrape entry. SSL verification is configured once at the top level, because the form login and the data request deliberately share a single HTTP client so the login cookies carry over to the scrape.
+> - If you set `form_submit: method:`, check it. It used to be ignored and the form's own `method` attribute (or `POST`) was used instead; it is now applied.
+> - The same goes for `form_submit: timeout:`, which is now enforced on both form requests, and `form_submit: payload:`, which has never been submitted before and now replaces the url-encoded input fields.
+
+#### Form input templates
+
+> **Breaking change:** `form_submit: input:` values are now rendered as templates. If an existing value contains a literal `{{`, `{%` or `{#` (for example in a password), Home Assistant will refuse to load the whole multiscrape entry with a template syntax error. Escape the marker: `"{{ '{{' }}literal"`, `"{{ '{%' }}literal"` or `"{{ '{#' }}literal"`. Values are also stripped of leading and trailing whitespace, so `" secret "` is submitted as `secret`.
+
+The values in `input` are rendered as [Home Assistant templates](https://www.home-assistant.io/docs/configuration/templating/) at the moment the form is submitted. The input fields scraped from the form are available as the `form` variable, so a value can be computed from another field on the same form.
+
+This is what you need for login forms that hash the password in JavaScript using a nonce from a hidden field. For example, AT&T BGW320 gateways post `md5(access_code + nonce)`:
+
+```yaml
+multiscrape:
+  - resource: http://192.168.1.254/cgi-bin/nattable.ha
+    form_submit:
+      resource: http://192.168.1.254/cgi-bin/login.ha
+      select: "form"
+      input:
+        password: "**********"
+        hashpassword: "{{ md5('<access code>' ~ form.nonce) }}"
+      resubmit_on_error: true
+    sensor:
+      - unique_id: att_nat_sessions_in_use
+        name: NAT sessions in use
+        select: 'table[summary*="summary of session information"] tr:nth-child(2) td'
+```
+
+`md5`, `sha1`, `sha256` and `sha512` are built-in Home Assistant template functions (and filters), so no extra configuration is needed.
+
+Notes:
+
+- Use `form['field-name']` instead of `form.field-name` for field names that are not valid identifiers.
+- Fields listed in `input_filter` are still available in `form`, so you can use a field to compute a value without submitting the field itself.
+- `form` only contains `<input>` elements with a `name` attribute. `<select>`, `<textarea>` and values computed by JavaScript are not included.
+- An `<input>` without a `value` attribute gives `None`, so `form.password` is `None` in the example above. Use `| default('')` if you need an empty string.
+- When `select` is omitted no form is scraped, so `form` is empty.
+- These templates are rendered **strictly**: referencing a field that is not on the form raises an error instead of rendering an empty string, so a renamed or mistyped field can never silently submit the hash of your access code alone. Use `{{ form.field | default('') }}` for a genuinely optional field.
+- `form` is the only extra variable multiscrape provides here; the standard Home Assistant template functions are available as usual. [Form variables](#form-variables) are scraped from the form _response_, which does not exist yet when `input` is rendered, so they cannot be used in `input`.
+- Because the values hold credentials, multiscrape does not log the template or the scraped fields when rendering fails; the error only names the `input` key. (Home Assistant core may still log the template itself.)
+
+#### Form payload
+
+`payload` submits a raw request body instead of the url-encoded input fields. Use it for login endpoints that expect JSON rather than a form post.
+
+```yaml
+multiscrape:
+  - resource: https://example.com/data
+    form_submit:
+      resource: https://example.com/login
+      select: "form#login"
+      headers:
+        Content-Type: application/json
+      payload: >-
+        {"user": "admin", "hash": "{{ md5('<access code>' ~ form.nonce) }}"}
+```
+
+Notes:
+
+- `payload` **replaces** the input fields rather than merging with them: when both are configured, the input fields are not submitted and a debug line names the keys that were dropped. They cannot be merged, because a raw body and url-encoded fields are two different ways of filling the same request body. And the other way round — letting the input fields win — would make `payload` silently inert whenever `select` is set, which is the behaviour this option is fixing.
+- **No `Content-Type` is set for a raw body.** Set it yourself through `form_submit: headers:`, as in the example above.
+- The input fields scraped from the form are available as `form`, exactly as in [`input`](#form-input-templates), so a JSON body can embed a scraped nonce. All the notes there apply to `payload` too, including the escaping of literal `{{`, the strict rendering and the fact that failures are not logged because the body holds credentials.
+- A `payload` that renders to an empty string is treated as not configured, so the input fields are submitted as before.
+
+### Form Variables
+
+Configure the variables that will be scraped from the [`form_submit`](#form-submit) response. These variables can be used in the `value_template` of the main configuration of the current integration: a `selector` in sensors/attributes or in a `header`. A common use case is to populate the `X-Login-Token` header which is the result of the login.
+
+| name | description                      | required | default | type   |
+| ---- | -------------------------------- | -------- | ------- | ------ |
+| name | Name of the variable             | True     |         | string |
+|      | See [Selector](#Selector) fields | True     |         |        |
+
+Example:
+
+```yaml
+multiscrape:
+  - resource: "https://somesiteyouwanttoscrape.com"
+    form_submit:
+      submit_once: True
+      resource: "https://authforsomesiteyouwanttoscrape.com"
+      input:
+        email: "<email>"
+        password: "<password>"
+      variables:
+        - name: token
+          value_template: "{{ ... }}"
+    headers:
+      X-Login-Token: "{{ token }}"
+    sensor: ...
+```
+
+### Selector
+
+Used to configure scraping options.
+
+| name           | description                                                                                                                                                                                                                          | required | default | type            |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------- | ------- | --------------- |
+| select         | CSS selector used for retrieving the value of the attribute. Only required when `select_list` or `value_template` is not provided.                                                                                                   | False    |         | string/template |
+| select_list    | CSS selector for multiple values of multiple elements which will be returned as csv. When nothing matches, this is an error (like `select`) and `on_error` applies. Only required when `select` or `value_template` is not provided. | False    |         | string/template |
+| attribute      | Attribute from the selected element to read as value.                                                                                                                                                                                | False    |         | string          |
+| value_template | Defines a template applied to extract the value from the result of the selector (if provided) or raw page (if selector not provided)                                                                                                 | False    |         | string/template |
+| extract        | Determines how the result of the CSS selector is extracted. Only applicable to HTML. `text` returns just text, `content` returns the html content of the selected tag and `tag` returns html including the selected tag.             | False    | text    | string          |
+| on_error       | See [On-error](#on-error)                                                                                                                                                                                                            | False    |         |                 |
+
+### On-error
+
+Configure what should happen in case of a scraping error (the css selector does not return a value).
+
+| name    | description                                                                                                                                                                                                                                                             | required | default | type   |
+| ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- | ------- | ------ |
+| log     | Determines if and how something should be logged in case of a scraping error. Value can be either 'false', 'info', 'warning' or 'error'.                                                                                                                                | False    | error   | string |
+| value   | Determines what value the sensor/attribute should get in case of a scraping error. The value can be 'last' meaning that the value does not change, 'none' which results in HA showing 'Unkown' on the sensor, or 'default' which will show the specified default value. | False    | none    | string |
+| default | The default value to be used when the on-error value is set to 'default'.                                                                                                                                                                                               | False    |         | string |
+
+### Retries
+
+When `scan_interval` is 0, Multiscrape does not poll by itself: a run only happens when you trigger it (through the service or the refresh button). To keep a single failure from leaving the sensors stale until the next trigger, a failed run is retried automatically, up to `max_retries` times, 30 seconds apart. Once those are exhausted, Multiscrape logs an error and stops; a trigger after that starts over with a fresh set of retries. A trigger that arrives while a retry is still pending replaces it rather than starting a new set.
+
+Set `max_retries: 0` to switch the automatic retries off entirely. This is useful when the runs are already coordinated by something outside Multiscrape - for example an automation that polls a device which only accepts one connection at a time. In that setup an automatic retry would fire while the external loop is mid-request and the two would collide, so it is better to let the external mechanism decide when to try again.
+
+`max_retries` is ignored when `scan_interval` is not 0: a failed run is simply followed by the next scheduled one.
+
+## Services
+
+For each multiscrape instance, a service will be created to trigger a scrape run through an automation. (For manual triggering, the button entity can now be configured.)
+The services are named `multiscrape.trigger_{name of integration}`.
+
+Multiscrape also offers a `get_content` and a `scrape` service. `get_content` retrieves the content of the website you want to scrape. It shows the same data for which you now need to enable `log_response` and open the `page_soup.txt` file (or `page_json.txt` when the response is JSON).\
+`scrape` does what it says. It scrapes a website and provides the sensors and attributes.
+
+Both services accept the same configuration as what you would provide in your configuration yaml (what is described above), with a small but important caveat: if the service input contains templates, those are automatically parsed by home assistant when the service is being called. That is fine for templates like `resource` and `select`, but templates that need to be applied on the scraped data itself (like `value_template`), cannot be parsed when the service is called. Therefore you need to slightly alter the syntax and add a `!` in the middle. E.g. `{{` becomes `{!{` and `%}` becomes `%!}`. Multiscrape will then understand that this string needs to handled as a template after the service has been called.\
+_If someone has a better solution, please let me know!_
+
+The same applies to [form input templates](#form-input-templates) and the [form payload](#form-payload), which are both rendered against the scraped form: in a service call, write `hashpassword: "{!{ md5('<access code>' ~ form.nonce) }!}"`.
+
+To call one of those services, go to 'Developer tools' in Home Assistant and then to 'services'. Find the `multiscrape.get_content` or `multiscrape.scrape` services and go to yaml mode. There you enter your configuration.
+Example:
+
+```yaml
+service: multiscrape.scrape
+data:
+  name: HA scraper
+  resource: https://www.home-assistant.io
+  sensor:
+    - unique_id: ha_latest_version
+      name: Latest version
+      select: ".release-date"
+      value_template: "{!{ value | trim }!}"
+    - unique_id: ha_release_date
+      name: Release date
+      select: ".release-date"
+      attribute: "title"
+      value_template: "{!{ (value.split('released')[1]) }!}"
+```
+
+After removing the entire `multiscrape:` section from your YAML configuration, restart Home Assistant or call `multiscrape.reload` to shut down the configured scrapers.
+
+## Debug logging
+
+Debug logging can be enabled as follows:
+
+```yaml
+logger:
+  default: info
+  logs:
+    custom_components.multiscrape: debug
+```
+
+Depending on your issue, also consider enabling `log_response`.
+
+### Contributions are welcome!
+
+If you want to contribute to this please read the [Contribution guidelines](CONTRIBUTING.md)
+
+### Credits
+
+This project was generated from [@oncleben31](https://github.com/oncleben31)'s [Home Assistant Custom Component Cookiecutter](https://github.com/oncleben31/cookiecutter-homeassistant-custom-component) template.
+
+Code template was mainly taken from [@Ludeeus](https://github.com/ludeeus)'s [integration_blueprint][integration_blueprint] template
+
+---
+
+[integration_blueprint]: https://github.com/custom-components/integration_blueprint
+[black]: https://github.com/psf/black
+[black-shield]: https://img.shields.io/badge/code%20style-black-000000.svg?style=for-the-badge
+[buymecoffee]: https://www.buymeacoffee.com/danieldotnl
+[buymecoffeebadge]: https://img.shields.io/badge/buy%20me%20a%20coffee-donate-yellow.svg?style=for-the-badge
+[commits-shield]: https://img.shields.io/github/commit-activity/y/danieldotnl/ha-multiscrape.svg?style=for-the-badge
+[commits]: https://github.com/danieldotnl/ha-multiscrape/commits/main
+[hacs]: https://hacs.xyz
+[hacsbadge]: https://img.shields.io/badge/HACS-Default-orange.svg?style=for-the-badge
+[discord]: https://discord.gg/Qa5fW2R
+[discord-shield]: https://img.shields.io/discord/330944238910963714.svg?style=for-the-badge
+[forum-shield]: https://img.shields.io/badge/community-forum-brightgreen.svg?style=for-the-badge
+[forum]: https://community.home-assistant.io/t/scrape-sensor-improved-scraping-multiple-values/218350
+[license-shield]: https://img.shields.io/github/license/danieldotnl/ha-multiscrape.svg?style=for-the-badge
+[maintenance-shield]: https://img.shields.io/badge/maintainer-%40danieldotnl-blue.svg?style=for-the-badge
+[pre-commit]: https://github.com/pre-commit/pre-commit
+[pre-commit-shield]: https://img.shields.io/badge/pre--commit-enabled-brightgreen?style=for-the-badge
+[releases-shield]: https://img.shields.io/github/release/danieldotnl/ha-multiscrape.svg?style=for-the-badge
+[releases]: https://github.com/danieldotnl/multiscrape/releases
+[user_profile]: https://github.com/danieldotnl
