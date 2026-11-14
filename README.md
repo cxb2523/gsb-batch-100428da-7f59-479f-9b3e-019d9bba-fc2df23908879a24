@@ -154,8 +154,17 @@ CONFIG = {
     "MIHOMO_API": "http://127.0.0.1:9090",
     "MIHOMO_PROXY": "http://127.0.0.1:7892",
     "SWITCH_GROUP": "GLOBAL",
+    "SWITCH_MAX_RETRIES": 2,      # 切换失败后最多换几个节点重试（不含首次，0=不重试）
 }
 ```
+
+### 节点切换重试机制
+
+每轮访问先从检测结果中随机挑一个可用节点切到 `GLOBAL` 组。切换接口（`PUT /proxies/GLOBAL`）返回非 204 或请求异常时，**不会沿用切换前的旧节点继续访问**，而是从本轮候选之外再随机换一个未尝试过的节点重试，总尝试次数为 `1 + SWITCH_MAX_RETRIES`（候选节点不足时按实际数量封顶）：
+
+- 重试期间某次切换成功 → 本轮照常访问，日志 `status` 记为 `SUCCESS_RETRY`，`note` 记录失败尝试明细。
+- 重试全部失败 → 本轮记为 `SWITCH_FAILED`，**跳过浏览器访问**，避免用错误出口污染采集结果；该轮仍占一条日志，`visit_number` 保持连续。
+- 切换成功但出口 IP 查询失败 → 本轮照常访问，`exit_ip` 记为 `IP_QUERY_FAILED` 并在 `note` 标注查询失败原因，不阻断任务。
 
 ### 间隔模式说明
 
@@ -239,11 +248,22 @@ tail -n 10 logs/visit_log.csv
 awk -F',' '{print $5}' logs/visit_log.csv | sort -u | wc -l
 ```
 
-日志格式：
+日志格式（列结构固定为 10 列）：
 ```csv
 timestamp_utc,visit_number,url,proxy_node,exit_ip,user_agent,screen_width,screen_height,status,note
 2025-10-30T14:20:00Z,1,https://blog.csdn.net/xxx,日本节点,156.246.92.93,Mozilla/5.0...,1366,768,SUCCESS,CSDN博客
 ```
+
+代理链路下 `status` / `proxy_node` / `exit_ip` 区分四类结局（每轮都占一条记录，`visit_number` 连续）：
+
+| 结局 | status | proxy_node | exit_ip | note 说明 |
+|------|--------|-----------|---------|-----------|
+| 首次切换即成功 | `SUCCESS` | 实际节点名 | 实际出口 IP | 页面标题 |
+| 换节点重试后成功 | `SUCCESS_RETRY` | 最终生效节点名 | 实际出口 IP（或 `IP_QUERY_FAILED`） | 含失败尝试与重试次数 |
+| 切换重试耗尽，跳过访问 | `SWITCH_FAILED` | `SWITCH_FAILED` | `N/A` | 含每次尝试的节点与失败原因 |
+| 切换成功但 IP 查询失败 | `SUCCESS` / `SUCCESS_RETRY` | 实际节点名 | `IP_QUERY_FAILED` | 标注查询失败原因，本轮照常访问 |
+
+> 无代理运行时仍沿用旧约定：`proxy_node=DIRECT`、`exit_ip=N/A`。浏览器页面本身访问失败/异常时，代理链路下 `status` 仍反映切换层结局，页面错误写入 `note` 并带“浏览器访问失败”前缀。
 
 ---
 

@@ -40,9 +40,21 @@ CONFIG = {
     "MIHOMO_PROXY": "http://127.0.0.1:17890",  # Mihomo HTTP 代理地址
     "PROXY_GROUP": "NODE_TEST",  # Mihomo 代理组名称（用于读取节点列表）
     "SWITCH_GROUP": "GLOBAL",  # Mihomo 切换组名称（实际切换的组，流量走这个组）
+    # 节点切换重试：首次切换失败后，最多再换多少个“本轮未尝试过”的节点重试（不含首次）
+    # 总尝试次数 = 1 + SWITCH_MAX_RETRIES；重试仍失败则本轮记为 SWITCH_FAILED 并跳过浏览器访问
+    "SWITCH_MAX_RETRIES": 2,
     "PROXY_RESULTS": str(PROXY_RESULTS_PATH),  # 测试结果文件（固定到仓库根目录）
     "CSV_FILE": "visit_log.csv",  # 日志文件名
 }
+
+# ========== 日志结局标记（CSV 列结构不变，仅约定 status / 占位值的含义）==========
+STATUS_SUCCESS = "SUCCESS"                    # 首次切换即成功，访问正常完成
+STATUS_SUCCESS_RETRY = "SUCCESS_RETRY"        # 切换失败后换节点重试成功，访问正常完成
+STATUS_SWITCH_FAILED = "SWITCH_FAILED"        # 切换重试耗尽，本轮未打开浏览器
+# exit_ip 占位：切换成功但出口 IP 查询失败（本轮仍照常访问）
+EXIT_IP_QUERY_FAILED = "IP_QUERY_FAILED"
+# proxy_node 占位：本轮所有切换尝试均失败，没有任何节点切换成功
+PROXY_NODE_SWITCH_FAILED = "SWITCH_FAILED"
 
 # ========== Mihomo 代理池类 ==========
 class MihomoProxyPool:
@@ -100,12 +112,27 @@ class MihomoProxyPool:
         if not self.available_nodes:
             return None
         return random.choice(self.available_nodes)
-    
+
+    def get_round_candidates(self):
+        """
+        本轮候选节点：随机打乱后的可用节点列表（按 name 去重）。
+        切换重试时按顺序取用，保证每次重试都换成一个本轮没试过的节点，
+        不会静默沿用切换失败前的旧节点。
+        """
+        seen = set()
+        candidates = []
+        for node in random.sample(self.available_nodes, len(self.available_nodes)):
+            node_name = node.get("name")
+            if node_name and node_name not in seen:
+                seen.add(node_name)
+                candidates.append(node)
+        return candidates
+
     def switch_node(self, node_name):
         """切换 Mihomo 代理节点"""
         url = f"{self.api_url}/proxies/{self.switch_group}"
         payload = {"name": node_name}
-        
+
         try:
             response = requests.put(url, json=payload, timeout=5)
             if response.status_code == 204:
@@ -116,9 +143,61 @@ class MihomoProxyPool:
                 return False, f"HTTP {response.status_code}"
         except Exception as e:
             return False, str(e)
-    
-    def get_current_ip(self):
-        """获取当前出口 IP"""
+
+    def switch_with_retry(self, max_retries=None):
+        """
+        在本轮候选节点上切换代理，切换失败则换一个本轮未尝试过的节点重试。
+
+        Args:
+            max_retries: 首次切换失败后的最大重试次数（不含首次）；
+                         None 时取 CONFIG["SWITCH_MAX_RETRIES"]。
+
+        Returns:
+            dict:
+              success:      是否最终切换成功
+              node:         切换成功的节点 dict（失败为 None）
+              attempts:     每次尝试的记录 [{"node": 名称, "ok": bool, "msg": str}, ...]
+              retries_used: 实际使用的重试次数
+        """
+        if max_retries is None:
+            max_retries = CONFIG["SWITCH_MAX_RETRIES"]
+        max_retries = max(0, int(max_retries))
+
+        candidates = self.get_round_candidates()
+        attempts = []
+        # 总尝试次数 = 1（首次）+ max_retries，但不超过候选节点数
+        attempt_limit = min(1 + max_retries, len(candidates))
+
+        for idx in range(attempt_limit):
+            node = candidates[idx]
+            node_name = node.get("name")
+            ok, msg = self.switch_node(node_name)
+            attempts.append({"node": node_name, "ok": ok, "msg": msg})
+            if ok:
+                return {
+                    "success": True,
+                    "node": node,
+                    "attempts": attempts,
+                    "retries_used": idx,
+                }
+            print(f"  ⚠️  节点 {node_name} 切换失败（{msg}）"
+                  f"，这是第 {idx + 1}/{attempt_limit} 次尝试")
+
+        return {
+            "success": False,
+            "node": None,
+            "attempts": attempts,
+            "retries_used": len(attempts) - 1,
+        }
+
+    def get_current_ip_detail(self):
+        """
+        获取当前出口 IP（带失败原因）。
+        不引入新的外部服务，沿用原有的 ipify 查询。
+
+        Returns:
+            (ip, error): 成功时 error 为 None；失败时 ip 为 None，error 为原因字符串
+        """
         try:
             response = requests.get(
                 "https://api.ipify.org?format=json",
@@ -129,10 +208,18 @@ class MihomoProxyPool:
                 timeout=10
             )
             if response.status_code == 200:
-                return response.json().get("ip")
-        except:
-            pass
-        return None
+                ip = response.json().get("ip")
+                if ip:
+                    return ip, None
+                return None, f"响应缺少 ip 字段: {response.text[:100]}"
+            return None, f"HTTP {response.status_code}"
+        except Exception as e:
+            return None, str(e)
+
+    def get_current_ip(self):
+        """获取当前出口 IP（失败返回 None，保留旧接口供诊断脚本使用）"""
+        ip, _ = self.get_current_ip_detail()
+        return ip
     
     def __len__(self):
         return len(self.available_nodes)
@@ -346,60 +433,134 @@ def main():
             
             visit_count += 1
             user_agent, screen_size = get_random_device()
-            
-            # 切换代理节点
+
+            # 切换代理节点（失败时换本轮未尝试过的节点重试，不沿用旧节点）
             proxy_node = None
             exit_ip = None
+            switch_base_status = None  # 切换阶段的结局分类：SUCCESS / SUCCESS_RETRY / SWITCH_FAILED
+            ip_query_error = None      # 切换成功但出口 IP 查询失败时的原因
+            skip_visit = False         # 切换耗尽失败时跳过浏览器访问
             if use_proxy and proxy_pool:
-                node = proxy_pool.get_random_node()
-                if node:
+                print(f"\n[访问 #{visit_count}]")
+                result = proxy_pool.switch_with_retry()
+                attempts = result["attempts"]
+
+                if not result["success"]:
+                    # 切换重试耗尽：本轮记为失败并跳过浏览器访问，避免用错误出口污染采集结果
+                    switch_base_status = STATUS_SWITCH_FAILED
+                    proxy_node = PROXY_NODE_SWITCH_FAILED
+                    skip_visit = True
+                    tried = "; ".join(
+                        f"{a['node']}->{'OK' if a['ok'] else a['msg']}" for a in attempts
+                    )
+                    note = (
+                        f"节点切换重试耗尽（共尝试 {len(attempts)} 次，"
+                        f"上限 {CONFIG['SWITCH_MAX_RETRIES']} 次重试），跳过浏览器访问；尝试明细: {tried}"
+                    )
+                    print(f"  ❌ {note}")
+                    log_visit(visit_count, url, proxy_node, "N/A",
+                              user_agent, screen_size, STATUS_SWITCH_FAILED, note)
+                else:
+                    node = result["node"]
                     node_name = node.get("name")
                     latency = node.get("latency_ms", node.get("latency", "N/A"))
-                    
-                    print(f"\n[访问 #{visit_count}]")
-                    print(f"  🔄 切换节点: {node_name} (延迟: {latency}ms)")
-                    
-                    success, msg = proxy_pool.switch_node(node_name)
-                    if success:
-                        print(f"  ✅ 节点切换成功")
-                        proxy_node = node_name
-                        
-                        # 验证 IP 地址
-                        print(f"  🔍 查询出口 IP...")
-                        exit_ip = proxy_pool.get_current_ip()
-                        if exit_ip:
-                            print(f"  🌍 当前 IP: {exit_ip}")
-                        else:
-                            print(f"  ⚠️  无法获取 IP")
+                    proxy_node = node_name
+                    switch_base_status = (
+                        STATUS_SUCCESS_RETRY if result["retries_used"] > 0 else STATUS_SUCCESS
+                    )
+
+                    if result["retries_used"] > 0:
+                        tried = "; ".join(
+                            f"{a['node']}->{'OK' if a['ok'] else a['msg']}" for a in attempts[:-1]
+                        )
+                        print(f"  ✅ 节点切换成功（重试 {result['retries_used']} 次后）: "
+                              f"{node_name} (延迟: {latency}ms)；失败尝试: {tried}")
                     else:
-                        print(f"  ❌ 节点切换失败: {msg}")
+                        print(f"  🔄 切换节点: {node_name} (延迟: {latency}ms)")
+                        print(f"  ✅ 节点切换成功")
+
+                    # 验证出口 IP；查询失败不阻断本轮访问，仅在日志中明确标注
+                    print(f"  🔍 查询出口 IP...")
+                    exit_ip, ip_query_error = proxy_pool.get_current_ip_detail()
+                    if exit_ip:
+                        print(f"  🌍 当前 IP: {exit_ip}")
+                    else:
+                        print(f"  ⚠️  出口 IP 查询失败（不影响本轮访问）: {ip_query_error}")
             else:
                 print(f"\n[访问 #{visit_count}]")
-            
+
+            if skip_visit:
+                # 切换耗尽失败也占一条记录（上面已写入），visit_number 已自增、保持连续
+                if max_visits == 0 or visit_count < max_visits:
+                    interval = get_interval(CONFIG["INTERVAL_MODE"], CONFIG["INTERVAL_MEAN"])
+                    mode_desc = "固定" if CONFIG["INTERVAL_MODE"] == "fixed" else "泊松分布"
+                    print(f"  ⏳ 等待 {interval:.1f} 秒（{mode_desc}）...")
+                    time.sleep(interval)
+                continue
+
             # 关闭旧driver
             if driver:
                 try:
                     driver.quit()
                 except:
                     pass
-            
+
             print(f"  🖥️  设备: {screen_size['width']}x{screen_size['height']}")
-            
+
             try:
                 driver = create_driver(user_agent, screen_size, use_proxy, CONFIG["HEADLESS"])
-                status, note = visit_page(driver, url)
-                
-                if status == "SUCCESS":
+                page_status, page_note = visit_page(driver, url)
+
+                if use_proxy and proxy_pool:
+                    # 代理链路下，status 反映切换/IP 层的四类结局，浏览器结局写入 note
+                    note_parts = []
+                    if page_status == STATUS_SUCCESS:
+                        note_parts.append(page_note)
+                    else:
+                        note_parts.append(f"浏览器访问失败({page_status}): {page_note}")
+                    if switch_base_status == STATUS_SUCCESS_RETRY:
+                        note_parts.append(
+                            f"节点切换重试 {result['retries_used']} 次后成功"
+                        )
+                    if ip_query_error:
+                        # 切换成功但出口 IP 查询失败：明确标注该异常
+                        note_parts.append(
+                            f"出口IP查询失败({ip_query_error})，已按切换成功的节点 {proxy_node} 照常访问"
+                        )
+                        if not exit_ip:
+                            exit_ip = EXIT_IP_QUERY_FAILED
+                    note = "；".join(note_parts)
+                    status = switch_base_status
+                else:
+                    status, note = page_status, page_note
+
+                if status == STATUS_SUCCESS:
                     print(f"  ✅ 访问成功 - 页面: {note}")
                 else:
-                    print(f"  ❌ 访问失败: {note}")
-                
+                    print(f"  ❌ 访问结束({status}): {note}")
+
                 log_visit(visit_count, url, proxy_node, exit_ip, user_agent, screen_size, status, note)
-                
+
             except Exception as e:
                 error_msg = str(e)
                 print(f"  ❌ 发生异常: {error_msg}")
-                log_visit(visit_count, url, proxy_node, exit_ip, user_agent, screen_size, "EXCEPTION", error_msg)
+                if use_proxy and proxy_pool:
+                    # 浏览器异常也保留切换阶段的结局分类，避免与“没开代理”混淆
+                    note_parts = [error_msg]
+                    if switch_base_status == STATUS_SUCCESS_RETRY:
+                        note_parts.append(
+                            f"节点切换重试 {result['retries_used']} 次后成功"
+                        )
+                    if ip_query_error:
+                        note_parts.append(f"出口IP查询失败({ip_query_error})")
+                        if not exit_ip:
+                            exit_ip = EXIT_IP_QUERY_FAILED
+                    status = switch_base_status
+                    log_visit(visit_count, url, proxy_node, exit_ip,
+                              user_agent, screen_size, status, "；".join(note_parts))
+                else:
+                    log_visit(visit_count, url, proxy_node, exit_ip,
+                              user_agent, screen_size, "EXCEPTION", error_msg)
             
             if max_visits == 0 or visit_count < max_visits:
                 interval = get_interval(CONFIG["INTERVAL_MODE"], CONFIG["INTERVAL_MEAN"])
