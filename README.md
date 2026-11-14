@@ -1,0 +1,66 @@
+# Scrape.do Scrapers
+
+_Stop relying on overpriced APIs for popular domains!_ 🤚🏻
+
+This repository contains scraping samples for the most scraped domains on the web, with full-length tutorials and functioning scrapers mainly built with Python and NodeJS (_NodeJS files included in separate folders_).
+
+Scrapers in this repository are programmed to help you understand the basics of scraping these popular websites and serving as a base for you to customize and use in your own projects.
+
+For Python, you'll be using: 
+- __Python 3.8+__, 
+- [__Requests__](https://github.com/psf/requests) for handling HTTP requests, 
+- [__Beautiful Soup__](https://pypi.org/project/beautifulsoup4/) for parsing information, 
+- and [__urllib.parse__](https://docs.python.org/3/library/urllib.parse.html) for URL encoding.
+
+This repository also uses [Scrape.do](https://scrape.do/)'s web scraping API, __to bypass Web Application Firewalls (WAFs)__ of the domains you're scraping and also __interacting with the browser__.
+
+## Available Scrapers
+
+| Domain | Status | Scraped Data | Tutorial | Last Updated |
+|--------|--------|---------|----------|--------------|
+| [Amazon (External)](https://github.com/scrape-do/amazon-scraper) | 🟢 Working | • Product data from single pages<br>• Product variants with different sizes<br>• Search results and ads | [Scrape Product Data from Amazon](https://scrape.do/blog/amazon-scraping/) | Dec 18, 2025 |
+| [eBay](./ebay-scraper/) | 🟢 Working | • Basic product listings<br>• Product reviews with pagination<br>• Search results with multiple layouts<br>• Product variants and hidden data | [Scrape Products, Reviews, and Variants from eBay](https://scrape.do/blog/ebay-scraping/) | Aug 1, 2025 |
+| [Etsy](./etsy-scraper/) | 🟢 Working | • Category and search result listings<br>• Single product details via JSON-LD<br>• Product reviews via internal API<br>• Pricing, ratings, and seller information | [Scrape Products and Reviews from Etsy](https://scrape.do/blog/etsy-scraping/) | Oct 30, 2025 |
+| [Google AI Overview](./google-ai-overview-scraper/) | 🟢 Working | • AI Overview text blocks and references<br>• Deferred state handling via SERP API<br>• Playwright browser extraction | [Scrape AI Overview Summaries from Google](https://scrape.do/blog/scrape-google-ai-overview/) | Mar 19, 2026 |
+| [Google Maps](./google-maps-scraper/) | 🟢 Working | • Business listings via protobuf API<br>• Place details, hours, and contact info<br>• Customer reviews with sorting and pagination | [Scrape Business Data and Reviews from Google Maps](https://scrape.do/blog/google-maps-scraping/) | Mar 19, 2026 |
+| [Google News](./google-news-scraper/) | 🟢 Working | • News tab headlines and metadata<br>• Full article content as markdown<br>• Top stories via SERP API | [Scrape Headlines and Articles from Google News](https://scrape.do/blog/google-news-scraping/) | Mar 19, 2026 |
+| [Google Scholar](./google-scholar-scraper/) | 🟢 Working | • Search results with paper metadata<br>• Article download as markdown<br>• Author profiles and citation stats | [Scrape Papers and Author Profiles from Google Scholar](https://scrape.do/blog/google-scholar-scraping/) | Mar 19, 2026 |
+| [Google Search](./google-search-scraper/) | 🟢 Working | • First page organic results<br>• All paginated organic results<br>• Paid search ads and FAQs<br>• Related search terms<br>• SERP API structured search | [Scrape Organic Results, Ads, and FAQs from Google](https://scrape.do/blog/scraping-google-search-results/) | Mar 19, 2026 |
+| [Google Shopping](./google-shopping-scraper/) | 🟢 Working | • Search results with async pagination<br>• Product details via hidden OAPV endpoint<br>• Seller offers, reviews, and forums<br>• Full pipeline with JSON export<br>• AI Mode shopping recommendations | [Scrape Products, Sellers, and Reviews from Google Shopping](https://scrape.do/blog/google-shopping-scraping/) | Mar 19, 2026 |
+| [Google Trends](./google-trends-scraper/) | 🟢 Working | • Interest over time and by region<br>• Related queries (top and rising)<br>• Trending Now topics with news articles | [Scrape Trends, Regional Data, and Related Queries from Google](https://scrape.do/blog/google-trends-scraping/) | Mar 19, 2026 |
+| [Bing](./bing-scraper/) | 🟢 Working | • Organic web search results with pagination<br>• Image search results with download option<br>• Shopping/product listings | [Scrape Search Results, Images, and Products from Bing](https://scrape.do/blog/cineworld-scraping/) | Oct 21, 2025 |
+| [G2](./g2-scraper/) | 🟢 Working | • Company and product data<br>• Product reviews<br>• Search results and categories | [Scrape Company Data and Reviews from G2](https://scrape.do/blog/g2-scraping/) | Aug 5, 2025 |
+| [DoorDash](./doordash-scraper/) | 🟢 Working | • Consumer address registration<br>• Restaurant and store listings<br>• Category-specific products<br>• Full menu catalogs | [Scrape Restaurants, Products, and Menus from DoorDash](https://scrape.do/blog/doordash-scraping/) | Jul 17, 2025 |
+| [Best Buy](./bestbuy-scraper/) | 🟢 Working | • Product listings with Selenium<br>• Product data with cloud rendering<br>• Brand, price, rating, SKU, and URL extraction | [Scrape Products from Best Buy](https://scrape.do/blog/best-buy-scraping/) | Feb 18, 2026 |
+| [Uber Eats](./ubereats-scraper/) | 🟢 Working | • Store listings via API<br>• Store listings via frontend<br>• Restaurant menus<br>• Chain store products | [Scrape Stores, Menus, and Products from Uber Eats](https://scrape.do/blog/ubereats-scraping/) | Aug 1, 2025 |
+| [Zillow](./zillow-scraper/) | 🟢 Working | • Property listing details<br>• Pricing and market data | [Scrape Property Data from Zillow](https://scrape.do/blog/zillow-scraping/) | Aug 5, 2025 |
+| [Naver](./naver-scraper/) | 🟢 Working | • E-commerce product pages<br>• Product data via API<br>• Paid search advertisements<br>• Organic search results<br>• Image search results | [Scrape Products and Search Results from Naver](https://scrape.do/blog/naver-scraping/) | Sep 1, 2025 |
+| [Chewy](./chewy-scraper/) | 🟢 Working | • Pet product information<br>• Names and pricing | [Scrape Pet Products from Chewy](https://scrape.do/blog/chewy-scraping/) | Aug 5, 2025 |
+| [Mouser](./mouser-scraper/) | 🟢 Working | • Electronic component data<br>• Product names and pricing | [Scrape Electronic Components from Mouser](https://scrape.do/blog/mouser-scraping/) | Aug 5, 2025 |
+| [Fnac](./fnac-scraper/) | 🟢 Working | • French retail product data<br>• Names and pricing | [Scrape Products from Fnac](https://scrape.do/blog/fnac-scraping/) | Aug 5, 2025 |
+| [Ubersuggest](./ubersuggest-scraper/) | 🟢 Working | • Bearer token generation<br>• Keyword overview data<br>• SERP results<br>• Automated keyword analysis | [Scrape Keyword Data from Ubersuggest](https://scrape.do/blog/ubersuggest-scraping/) | Jun 23, 2025 |
+| [Zomato](./zomato-scraper/) | 🟢 Working | • Restaurant information<br>• Delivery menu data | [Scrape Restaurant Data from Zomato](https://scrape.do/blog/zomato-scraping/) | Jul 2, 2025 |
+| [Allegro](./allegro-scraper/) | 🟢 Working | • Polish e-commerce products<br>• Names, pricing, and ratings | [Scrape Products from Allegro](https://scrape.do/blog/allegro-scraping/) | Aug 5, 2025 |
+| [AUTODOC](./AUTODOC-scraper/) | 🟢 Working | • Automotive parts data<br>• Product details and pricing | [Scrape Auto Parts from AUTODOC](https://scrape.do/blog/autodoc-de-scraping/) | Aug 5, 2025 |
+| [AutoScout24](./autoscout24-scraper/) | 🟢 Working | • Car listing information<br>• Vehicle names and pricing | [Scrape Car Listings from AutoScout24](https://scrape.do/blog/autoscout24-scraping/) | Aug 5, 2025 |
+| [Idealista](./idealista-scraper/) | 🟢 Working | • Spanish real estate listings<br>• Property details, pricing, and location data<br>• Search results with pagination | [Scrape Property Data from Idealista](https://scrape.do/blog/idealista-scraping/) | Aug 6, 2025 |
+| [FastPeopleSearch](./fastpeoplesearch-scraper/) | 🟢 Working | • Person information lookup<br>• Names, ages, addresses, and ZIP codes<br>• Phone numbers and email addresses<br>• Aliases and relatives | [Scrape People Data from FastPeopleSearch](https://scrape.do/blog/fast-people-search-scraping/) | Feb 24, 2026 |
+| [HungerStation](./hungerstation-scraper/) | 🟢 Working | • Restaurant listings<br>• Store menu items | [Scrape Restaurants and Menus from HungerStation](https://scrape.do/blog/hunger-station-scraping/) | Jul 17, 2025 |
+| [Imovelweb](./imovelweb-scraper/) | 🟢 Working | • Brazilian real estate data<br>• Property details and pricing | [Scrape Properties from Imovelweb](https://scrape.do/blog/imovelweb-scraping/) | Aug 5, 2025 |
+| [Klium](./klium-scraper/) | 🟢 Working | • Tool and equipment data<br>• Product names, pricing, and stock | [Scrape Tools from Klium](https://scrape.do/blog/klium-scraping/) | Aug 5, 2025 |
+| [MSC Direct](./mscdirect-scraper/) | 🟢 Working | • Industrial supply products<br>• Brand, names, and pricing | [Scrape Industrial Supplies from MSC Direct](https://scrape.do/blog/mscdirect-scraping/) | Aug 5, 2025 |
+| [TicketMaster](./ticketmaster-scraper/) | 🟢 Working | • Event details and schedules<br>• Dates, venues, and locations | [Scrape Events from TicketMaster](https://scrape.do/blog/ticketmaster-scraping/) | Aug 5, 2025 |
+| [TruePeopleSearch](./truepeoplesearch-scraper/) | 🟢 Working | • Person information lookup<br>• Names, ages, addresses, and ZIP codes<br>• Phone numbers and email addresses<br>• Aliases and relatives | [Scrape People Data from TruePeopleSearch](https://scrape.do/blog/true-people-search-scraping/) | Feb 24, 2026 |
+| [Walmart](./walmart-scraper/) | 🟢 Working | • Individual product details with store-specific pricing<br>• Product variations (sizes, colors, packs)<br>• Category pages with pagination<br>• Price and stock change tracking | [Scrape Complete Grocery Data from Walmart](https://scrape.do/blog/walmart-scraping/) | Sep 2, 2025 |
+| [Zoro](./zoro-scraper/) | 🟢 Working | • Industrial business supplies<br>• Product names and manufacturer data | [Scrape Business Supplies from Zoro](https://scrape.do/blog/zoro-scraping/) | Aug 5, 2025 |
+| [Cineworld](./cineworld-scraper/) | 🟢 Working | • Movie screenings and showtimes<br>• Ticket prices for all screening types | [Scrape Screenings and Ticket Prices from Cineworld](https://scrape.do/blog/cineworld-scraping/) | Aug 27, 2025 |
+| [Regmovies](./regmovies-scraper/) | 🟢 Working | • Regal Cinemas movie screenings<br>• Ticket prices and availability | [Scrape Screenings and Ticket Prices from Regmovies](https://scrape.do/blog/regmovies-com-scraping/) | Aug 27, 2025 |
+| [Redfin](./redfin-scraper/) | 🟢 Working | • Property details<br>• Local listings and details | [Scrape Property Details and Search Results from Redfin](https://scrape.do/blog/redfin-scraping/) | Oct 03, 2025 |
+| [PeopleSearchNow](./peoplesearchnow-scraper/) | 🟢 Working | • Person information lookup<br>• Names, ages, and addresses | - | Feb 19, 2026 |
+| [SearchPeopleFree](./search-people-free-scraper/) | 🟢 Working | • Person information lookup<br>• Names, ages, addresses, and ZIP codes<br>• Phone numbers and email addresses<br>• Spouse and family members | [Scrape Person Data from SearchPeopleFree](https://scrape.do/blog/search-people-free-scraping/) | Feb 24, 2026 |
+| [WhitePages](./white-pages-scraper/) | 🟢 Working | • Person information lookup<br>• Names, ages, and addresses<br>• Phone numbers and ZIP codes | [Scrape Person Data from WhitePages](https://scrape.do/blog/white-pages-scraping/) | Feb 24, 2026 |
+| [Reddit](./reddit-scraper/) | 🟢 Working | • Subreddit posts with pagination<br>• Search results with cursor-based pagination<br>• Comments matching search queries | [Scrape Posts, Search Results, and Comments from Reddit](https://scrape.do/blog/reddit-scraping/) | Mar 11, 2026 |
+| [Rightmove](./rightmove-scraper/) | 🟢 Working | • Paginated property listing results<br>• Address, price, type, bedrooms, agent, and phone<br>• Full property details via embedded PAGE_MODEL JSON | [Scrape Property Listings and Details from Rightmove](https://scrape.do/blog/rightmove-scraping/) | Apr 6, 2026 |
+| [Wayfair](./wayfair-scraper/) | 🟢 Working | • Single product details with images and reviews<br>• Category pages with pagination and deduplication<br>• Full variation map (color × size) with per-variation pricing and stock | [Scrape Products, Categories, and Variations from Wayfair](https://scrape.do/blog/wayfair-scraping/) | Apr 6, 2026 |
+| [Alibaba](./alibaba-scraper/) | 🟢 Working | • Paginated category listings via embedded JSON<br>• Full product details with price tiers, MOQ, and attributes<br>• Paginated reviews via signed MTOP API requests | [How to Scrape Alibaba Product Listings, Prices, and Reviews](https://scrape.do/blog/alibaba-scraping/) | Apr 8, 2026 |
+| [DigiKey](./digikey-scraper/) | 🟢 Working | • Paginated category listings via LZ-String cursor pagination<br>• Full product details with pricing tiers and dynamic attributes | [How to Scrape DigiKey: Product Data, Pricing, and Specifications](https://scrape.do/blog/digikey-scraping/) | Apr 8, 2026 |
