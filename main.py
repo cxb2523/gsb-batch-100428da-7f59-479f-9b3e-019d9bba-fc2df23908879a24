@@ -62,7 +62,7 @@ def main() -> int:
 
         if summary.captcha:
             run_status, exit_code = "captcha", 2
-            _write_alert(run_date, summary.errors)
+            _write_alert(run_date, summary)
         elif summary.keywords_failed:
             run_status, exit_code = "partial", 1
         else:
@@ -75,6 +75,13 @@ def main() -> int:
             print(f"[错误] {e}")
         print(f"[采集] {run_status}: {summary.keywords_ok}/{summary.keywords_total} 词, "
               f"{summary.items_saved} 条快照")
+        _print_detail_stats(summary)
+        if summary.captcha:
+            if summary.captcha_detail_step is not None:
+                print(f"[熔断] 关键词「{summary.captcha_keyword}」详情补数进行到第 "
+                      f"{summary.captcha_detail_step} 条时命中风控，已采记录已入库，整轮熔断")
+            else:
+                print(f"[熔断] 关键词「{summary.captcha_keyword}」搜索阶段命中风控，整轮熔断")
 
     # 指标与输出——采集熔断/部分失败也照常出报告（半量好过没有）
     out_dir = mock_dir if args.mock else config.RUNTIME_DIR
@@ -105,15 +112,35 @@ def main() -> int:
     return exit_code
 
 
-def _write_alert(run_date: str, errors: list[str]) -> None:
+def _print_detail_stats(summary) -> None:
+    """按词打印详情补数计数：尝试/成功/失败，单条静默失败在此可见。"""
+    if not summary.detail_stats:
+        return
+    print("[补数] 详情补数（想要数）按词统计:")
+    for word, st in summary.detail_stats.items():
+        print(f"  - {word}: 尝试 {st.attempted} / 成功 {st.success} / 失败 {st.failed}"
+              + (f"（熔断于第 {st.attempted} 条）"
+                 if summary.captcha and word == summary.captcha_keyword else ""))
+
+
+def _write_alert(run_date: str, summary) -> None:
     """滑块熔断告警文件（现阶段无人值守的替代通知，将来接告警模块）。"""
     config.ALERT_DIR.mkdir(parents=True, exist_ok=True)
     import datetime as _dt
+    if summary.captcha_detail_step is not None:
+        progress = (f"熔断位置: 关键词「{summary.captcha_keyword}」详情补数第 "
+                    f"{summary.captcha_detail_step} 条；该词已采记录与已补想要数已正常入库。")
+    else:
+        progress = f"熔断位置: 关键词「{summary.captcha_keyword}」搜索阶段（该词无记录入库）。"
+    detail_lines = ["", "## 详情补数进度", progress, ""]
+    for word, st in summary.detail_stats.items():
+        detail_lines.append(f"- {word}: 尝试 {st.attempted} / 成功 {st.success} / 失败 {st.failed}")
     content = (f"# 风控告警 {run_date}\n\n"
                f"时间: {_dt.datetime.now():%Y-%m-%d %H:%M:%S}\n\n"
                "当日采集已熔断（命中滑块/风控，不重试不硬闯）。\n"
                "已采数据照常出报告。人工处理：过一段时间再跑，或检查 cookies 是否失效。\n\n"
-               "## 错误明细\n" + "\n".join(f"- {e}" for e in errors) + "\n")
+               "## 错误明细\n" + "\n".join(f"- {e}" for e in summary.errors) + "\n"
+               + "\n".join(detail_lines) + "\n")
     (config.ALERT_DIR / f"alert_{run_date}.md").write_text(content, encoding="utf-8")
     print(f"[告警] 已写入 {config.ALERT_DIR / f'alert_{run_date}.md'}")
 
