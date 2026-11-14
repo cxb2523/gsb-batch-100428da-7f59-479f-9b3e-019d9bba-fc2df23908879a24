@@ -142,15 +142,215 @@ Add mouse movement, scrolling, and timed delays.
 
 ### Full Flow Example
 
-All combined: stealth, headers, proxies, behavior — in one script.
+All combined: stealth, a random user agent and **proxy failover** — in one
+script. Both implementations expose the same entry point and the same result
+fields:
 
-| Parameter     | Description                                       | Example                                          |
-| ------------- | ------------------------------------------------- | ------------------------------------------------ |
-| `proxy`       | Proxy server URL with auth                        | `'http://user:pass@proxy.example:8000'`          |
-| `user_agent`  | Browser user agent string                         | `'Mozilla/5.0 (Windows NT 10.0; Win64; x64)...'` |
-| `target_url`  | URL to navigate and scrape                        | `'https://example.com'`                          |
-| `headless`    | Whether to run browser in headless mode           | `True` (Python) / `true` (Node.js)               |
-| `delay_range` | Range (seconds) for random delays between actions | `0.5 to 2 seconds`                               |
+| Language | File                          | Function                                         |
+| -------- | ----------------------------- | ------------------------------------------------ |
+| Python   | `Python/full_flow_example.py` | `scrape_with_proxy_rotation(...)` (async)        |
+| Node.js  | `NodeJS/full_flow_example.js` | `scrapeWithProxyRotation(...)` (also exported as `scrape_with_proxy_rotation`) |
+
+#### Flow
+
+1. The proxy pool is shuffled, so every proxy is attempted **at most once, in
+   random order** (duplicate entries are removed).
+2. For each proxy a **fresh browser context** is created with that proxy and a
+   randomly chosen UA from the UA pool, then the target URL is navigated.
+3. A failed navigation — proxy unreachable, DNS/TLS/network error, timeout,
+   HTTP status ≥ 400, or empty HTML — is recorded and that context is closed.
+   The next proxy is tried.
+4. The first success returns immediately with the HTML. When every proxy has
+   failed, `ProxyRotationError` is raised (Python) / rejected (Node.js); empty
+   content is never returned silently.
+
+#### Parameters
+
+The proxy/UA pools stay in-script constants, but each call accepts overrides.
+Precedence is **argument > environment variable > constant**.
+
+| Parameter      | Python                                | Node.js                            | Env variable            | Default                     |
+| -------------- | ------------------------------------- | ---------------------------------- | ----------------------- | --------------------------- |
+| Proxy pool     | `proxies` (list or separated string)  | `proxies` (array or separated string) | `FULL_FLOW_PROXIES`   | `PROXIES` constant          |
+| UA pool        | `user_agents`                         | `userAgents`                       | `FULL_FLOW_USER_AGENTS` | `USER_AGENTS` constant      |
+| Target URL     | `target_url`                          | `targetUrl`                        | `FULL_FLOW_TARGET_URL`  | `https://example.com`       |
+| Headless       | `headless`                            | `headless`                         | `FULL_FLOW_HEADLESS`    | `true`                      |
+| Timeout (ms)   | `timeout_ms`                          | `timeoutMs`                        | `FULL_FLOW_TIMEOUT_MS`  | `60000`                     |
+| Proxy bypass   | `proxy_bypass`                        | `proxyBypass`                      | `FULL_FLOW_PROXY_BYPASS`| unset                       |
+| Print JSON     | — (CLI only)                          | — (CLI only)                       | `FULL_FLOW_PRINT_JSON`  | unset (prints first 500 chars) |
+
+Pool env values accept a JSON array or a newline-separated list; proxies also
+accept commas (UA strings contain commas, so use newlines or a JSON array
+there). A bare string argument is parsed the same way.
+
+#### Return value (identical field names in both languages)
+
+| Field              | Meaning                                                              |
+| ------------------ | -------------------------------------------------------------------- |
+| `success`          | Always `true` on a successful return.                                |
+| `url`              | Target URL that was loaded.                                          |
+| `html`             | Full page HTML.                                                      |
+| `proxy`            | The proxy actually used, masked (password replaced by `***`).        |
+| `proxy_index`      | Position of that proxy in the pool as supplied — lets you match the masked label back to the exact entry. Also present on failure records. |
+| `user_agent`       | The UA actually used.                                                |
+| `failed_attempts`  | Ordered list of failures before the success (empty on a first-try win). |
+| `attempt_count`    | Total attempts made, i.e. failures + 1 on success.                   |
+
+Each item of `failed_attempts` has:
+
+| Field         | Meaning                                                          |
+| ------------- | ---------------------------------------------------------------- |
+| `proxy`       | Masked proxy identifier (`http://user:***@host:port`).            |
+| `proxy_index` | Index of that proxy in the supplied pool.                        |
+| `user_agent`  | UA used for that attempt.                                        |
+| `error_type`  | Exception/error name (e.g. `Error`, `TimeoutError`, `HttpStatusError`). |
+| `error`       | Error message, truncated to 500 characters.                      |
+
+#### Error when every proxy fails
+
+`ProxyRotationError` carries `target_url`, `failed_attempts` (same records as
+above) and `attempted_count`, and its message names the number of proxies
+tried, e.g.:
+
+```
+All 2 proxy attempt(s) failed for https://example.com.
+Attempts: [1] http://127.0.0.1:1 -> Error: net::ERR_PROXY_CONNECTION_FAILED ...;
+          [2] http://user:***@127.0.0.1:8080 -> HttpStatusError: HTTP 502 ...
+```
+
+An empty/misconfigured pool raises `ValueError` (Python) / a plain `Error`
+(Node.js) instead of silently doing nothing.
+
+#### Usage
+
+Python:
+
+```python
+import asyncio
+from full_flow_example import scrape_with_proxy_rotation, ProxyRotationError
+
+async def run():
+    try:
+        result = await scrape_with_proxy_rotation(
+            proxies=["http://user:pass@proxy-a.example:8000",
+                     "http://user:pass@proxy-b.example:8000"],
+            user_agents=["Mozilla/5.0 (Windows NT 10.0; Win64; x64) ..."],
+            target_url="https://example.com",
+            timeout_ms=60000,
+        )
+    except ProxyRotationError as error:
+        print(error.attempted_count, error.failed_attempts)
+        return
+    print(result["proxy"], result["attempt_count"], len(result["failed_attempts"]))
+    print(result["html"][:500])
+
+asyncio.run(run())
+```
+
+Node.js:
+
+```js
+const { scrapeWithProxyRotation, ProxyRotationError } = require('./full_flow_example');
+
+(async () => {
+  try {
+    const result = await scrapeWithProxyRotation({
+      proxies: ['http://user:pass@proxy-a.example:8000', 'http://user:pass@proxy-b.example:8000'],
+      userAgents: ['Mozilla/5.0 (Windows NT 10.0; Win64; x64) ...'],
+      targetUrl: 'https://example.com',
+      timeoutMs: 60000,
+    });
+    console.log(result.proxy, result.attempt_count, result.failed_attempts.length);
+    console.log(result.html.slice(0, 500));
+  } catch (error) {
+    if (error instanceof ProxyRotationError) {
+      console.error(error.attempted_count, error.failed_attempts);
+    } else {
+      throw error;
+    }
+  }
+})();
+```
+
+Both files also run standalone. The process exits `1` when every proxy failed
+and `2` on a configuration error (empty pool, bad timeout, unparsable proxy):
+
+```bash
+FULL_FLOW_PROXIES="http://127.0.0.1:1
+http://127.0.0.1:2" FULL_FLOW_USER_AGENTS="Mozilla/5.0 ..." \
+FULL_FLOW_TARGET_URL="https://example.com" python Python/full_flow_example.py
+
+FULL_FLOW_PROXIES="http://127.0.0.1:1,http://127.0.0.1:2" \
+FULL_FLOW_USER_AGENTS="Mozilla/5.0 ..." \
+FULL_FLOW_TARGET_URL="https://example.com" node NodeJS/full_flow_example.js
+```
+
+#### Injecting a pool and simulating failures locally
+
+The proxy constants in the files are **unreachable placeholders**, so out of
+the box the example can only demonstrate the all-failed path. Inject a real
+pool with `FULL_FLOW_PROXIES` or the `proxies` argument (Node.js:
+`FULL_FLOW_PROXIES` or `options.proxies`).
+
+To exercise rotation without any real proxy or external network, start local
+ports that fail in different ways and point the pool at them:
+
+- a **closed port** → connection refused (acts as a dead proxy);
+- a local **HTTP server that replies `502`** → proxy reachable but broken.
+
+Then point `FULL_FLOW_TARGET_URL` at a local page and add
+`FULL_FLOW_PROXY_BYPASS="<-loopback>"`, because Chromium bypasses loopback
+addresses by default. A minimal Node.js mock (Python's `http.server` works the
+same way):
+
+```js
+// mock-proxy.js: run `node mock-proxy.js 18081 18082`
+const http = require('http');
+const refused = Number(process.argv[2]); // keep this port closed
+const broken = Number(process.argv[3]);
+
+http.createServer((req, res) => {
+  res.writeHead(502, { 'Content-Length': '0' });
+  res.end();
+}).on('connect', (req, socket) => {
+  socket.end('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+}).listen(broken, '127.0.0.1', () => {
+  console.log(`bad proxy  http://127.0.0.1:${broken}`);
+  console.log(`dead proxy http://127.0.0.1:${refused} (nothing listens here)`);
+});
+```
+
+```bash
+# terminal 1: a page to load (and a broken proxy)
+python -m http.server 18080 --bind 127.0.0.1
+node mock-proxy.js 18081 18082
+
+# terminal 2: every proxy fails -> ProxyRotationError with 2 attempts
+FULL_FLOW_PROXIES="http://127.0.0.1:18081,http://127.0.0.1:18082" \
+FULL_FLOW_USER_AGENTS="Mozilla/5.0 ..." \
+FULL_FLOW_TARGET_URL="http://127.0.0.1:18080/" \
+FULL_FLOW_PROXY_BYPASS="<-loopback>" \
+python Python/full_flow_example.py
+```
+
+A truly working local forward proxy (needed to demonstrate the success path
+end-to-end) can be any HTTP proxy that accepts absolute-URI requests; set
+`FULL_FLOW_PROXIES` to `dead-port,working-proxy` and the run should record one
+failure and then succeed. **Mock results only prove the rotation/error-handling
+logic — they are not evidence that the production proxy + target combination
+works. Validate the real chain with a real proxy and the real target.**
+
+#### Notes
+
+- Playwright credentials are split out of the proxy URL into
+  `username`/`password` automatically; IPv6 hosts are bracketed.
+- The Node.js script uses `playwright-extra` + `playwright-extra-plugin-stealth`
+  when that plugin actually loads, and falls back to plain `playwright`
+  otherwise (some published versions of the plugin are only a placeholder that
+  throws). The Python script supports both `playwright-stealth` 1.x and 2.x.
+- Only `full_flow_example.py` / `full_flow_example.js` changed; the other demo
+  scripts keep their original behavior.
+
 
 
 ## Disclaimer
