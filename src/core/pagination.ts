@@ -1,0 +1,222 @@
+import { legacyBatchUrl, parseBatchEnvelope, type BatchEnvelope } from './batchexecute.ts';
+import type { OnDegradation } from './degradation.ts';
+import { ParseError } from './errors.ts';
+import type { HttpClient } from './http.ts';
+import { detectPaginationTokenCycle, type OnIntegrityEvent } from './integrity.ts';
+import { getPath, type Path } from './path.ts';
+import { parseRaw, rawArrayPathSchema, rawOptionalArrayPathSchema } from './raw.ts';
+import { extract, type Extracted, type FieldSpec, type SpecMap } from './spec.ts';
+import * as z from 'zod/mini';
+import { safeParse } from 'zod/v4/core';
+
+export const CLUSTER_RPC_ID = 'qnKhOb';
+export const CLUSTER_PAGE_SIZE = 100;
+export const MAX_REPEATED_PAGES = 3;
+
+const NOT_FOUND_STATUS = 5;
+
+export function buildClusterBody(numberOfApps: number, withToken: string): string {
+  return `f.req=%5B%5B%5B%22qnKhOb%22%2C%22%5B%5Bnull%2C%5B%5B10%2C%5B10%2C${numberOfApps.toString()}%5D%5D%2Ctrue%2Cnull%2C%5B96%2C27%2C4%2C8%2C57%2C30%2C110%2C79%2C11%2C16%2C49%2C1%2C3%2C9%2C12%2C104%2C55%2C56%2C51%2C10%2C34%2C77%5D%5D%2Cnull%2C%5C%22${withToken}%5C%22%5D%5D%22%2Cnull%2C%22generic%22%5D%5D%5D`;
+}
+
+function asToken(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function isExhausted(envelope: BatchEnvelope): boolean {
+  return envelope.payload === null && envelope.status === NOT_FOUND_STATUS;
+}
+
+type AppSpecMap = SpecMap & { appId: FieldSpec<string> };
+
+export interface ClusterLayout {
+  apps: Path;
+  token: Path;
+}
+
+export interface ClusterPagesParams<M extends SpecMap> {
+  client: HttpClient;
+  lang: string;
+  country: string;
+  initialApps: Extracted<M>[];
+  initialToken: string | undefined;
+  itemSpecs: M;
+  appsPath: Path;
+  tokenPath: Path;
+  fallbackLayouts?: readonly ClusterLayout[];
+  context: string;
+  onDegradation?: OnDegradation;
+  onIntegrityEvent?: OnIntegrityEvent;
+}
+
+export interface FetchClusterAppsParams<M extends AppSpecMap> extends ClusterPagesParams<M> {
+  num: number;
+}
+
+function numericPath(path: Path, context: string): number[] {
+  const result: number[] = [];
+  for (const segment of path) {
+    if (typeof segment !== 'number') {
+      throw new ParseError(`${context} response path must contain only array indexes`);
+    }
+    result.push(segment);
+  }
+  return result;
+}
+
+interface PreparedLayout {
+  layout: ClusterLayout;
+  appsSchema: z.ZodMiniType;
+  tokenSchema: z.ZodMiniType;
+}
+
+function prepareLayout(layout: ClusterLayout, context: string): PreparedLayout {
+  return {
+    layout,
+    appsSchema: rawArrayPathSchema(numericPath(layout.apps, context), z.array(z.unknown())),
+    tokenSchema: rawOptionalArrayPathSchema(
+      numericPath(layout.token, context),
+      z.nullable(z.string()),
+    ),
+  };
+}
+
+function carriesApps(payload: unknown, layout: ClusterLayout): boolean {
+  const apps = getPath(payload, layout.apps);
+  return Array.isArray(apps) && apps.length > 0;
+}
+
+function resolveLayout(
+  payload: unknown,
+  primary: PreparedLayout,
+  fallbacks: readonly PreparedLayout[],
+  context: string,
+): PreparedLayout {
+  const matching = [primary, ...fallbacks].filter(
+    (candidate) => safeParse(candidate.appsSchema, payload).success,
+  );
+  const resolved =
+    matching.find((candidate) => carriesApps(payload, candidate.layout)) ?? matching[0] ?? primary;
+  parseRaw(resolved.appsSchema, payload, `${context} continuation apps response`);
+  parseRaw(resolved.tokenSchema, payload, `${context} continuation token response`);
+  return resolved;
+}
+
+function reportFallbackLayout(
+  used: PreparedLayout,
+  primary: PreparedLayout,
+  context: string,
+  onIntegrityEvent?: OnIntegrityEvent,
+): void {
+  if (used === primary) {
+    return;
+  }
+  const error = new ParseError(
+    `${context}: continuation apps resolved at ${used.layout.apps.join('.')} instead of ${primary.layout.apps.join('.')}`,
+  );
+  onIntegrityEvent?.({ context, reason: 'rpc-anchor-fallback', error });
+}
+
+function takeUnseen<Item extends { appId: string }>(
+  items: Item[],
+  seenAppIds: Set<string>,
+): Item[] {
+  return items.filter((item) => {
+    if (seenAppIds.has(item.appId)) {
+      return false;
+    }
+    seenAppIds.add(item.appId);
+    return true;
+  });
+}
+
+export async function* uniqueAppPages<Item extends { appId: string }>(
+  pages: AsyncIterable<Item[]>,
+): AsyncGenerator<Item[], void, undefined> {
+  const seenAppIds = new Set<string>();
+  let repeatedPages = 0;
+
+  for await (const page of pages) {
+    const unseen = takeUnseen(page, seenAppIds);
+    if (unseen.length > 0) {
+      repeatedPages = 0;
+      yield unseen;
+    } else if (page.length > 0) {
+      repeatedPages += 1;
+      if (repeatedPages >= MAX_REPEATED_PAGES) {
+        return;
+      }
+    }
+  }
+}
+
+export async function* clusterPages<M extends SpecMap>(
+  params: ClusterPagesParams<M>,
+): AsyncGenerator<Extracted<M>[], void, undefined> {
+  const { client, lang, country, itemSpecs, context } = params;
+
+  if (params.initialApps.length > 0) {
+    yield params.initialApps;
+  }
+
+  const seenTokens = new Set<string>();
+  let token = asToken(params.initialToken);
+  const primary = prepareLayout({ apps: params.appsPath, token: params.tokenPath }, context);
+  const fallbacks = (params.fallbackLayouts ?? []).map((layout) => prepareLayout(layout, context));
+
+  while (token !== undefined) {
+    if (detectPaginationTokenCycle(seenTokens, token, context, params.onIntegrityEvent)) {
+      return;
+    }
+    const body = buildClusterBody(CLUSTER_PAGE_SIZE, token);
+
+    let page: Extracted<M>[];
+    let used: PreparedLayout;
+    try {
+      const text = await client.request({
+        url: legacyBatchUrl(lang, country),
+        method: 'POST',
+        body,
+      });
+      const envelope = parseBatchEnvelope(text, CLUSTER_RPC_ID);
+      if (isExhausted(envelope)) {
+        return;
+      }
+      const { payload } = envelope;
+      used = resolveLayout(payload, primary, fallbacks, context);
+
+      const apps = getPath(payload, used.layout.apps);
+      if (!Array.isArray(apps) || apps.length === 0) {
+        return;
+      }
+      page = apps.map((item) => extract(item, itemSpecs, context));
+      token = asToken(getPath(payload, used.layout.token));
+    } catch (error) {
+      if (error instanceof ParseError) {
+        params.onDegradation?.({ context, reason: 'cluster-page-parse', error });
+        return;
+      }
+      throw error;
+    }
+    reportFallbackLayout(used, primary, context, params.onIntegrityEvent);
+    yield page;
+  }
+}
+
+export async function fetchClusterApps<M extends AppSpecMap>(
+  params: FetchClusterAppsParams<M>,
+): Promise<Extracted<M>[]> {
+  const { num, ...pageParams } = params;
+  const collected: Extracted<M>[] = [];
+
+  for await (const page of uniqueAppPages(clusterPages(pageParams))) {
+    for (const item of page) {
+      collected.push(item);
+    }
+    if (collected.length >= num) {
+      break;
+    }
+  }
+
+  return collected.slice(0, num);
+}

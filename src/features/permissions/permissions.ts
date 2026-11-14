@@ -1,0 +1,67 @@
+import * as z from 'zod/mini';
+import { permission } from '../../constants.ts';
+import { legacyBatchUrl, parseBatchResponse } from '../../core/batchexecute.ts';
+import { clientFromOptions, type ResolveClient } from '../../core/http.ts';
+import { narrowByFlag } from '../../core/flagNarrowed.ts';
+import { appIdSchema, baseOptionsSchema, parseOptions } from '../../core/options.ts';
+import { parseRaw } from '../../core/raw.ts';
+import { permissionSchema, type AppPermission } from './schema.ts';
+import {
+  buildPermissionsBody,
+  commonPermissionsResponseSchema,
+  mapPermissions,
+  otherPermissionsResponseSchema,
+  PERMISSIONS_RPC_ID,
+} from './specs.ts';
+
+const PERMISSIONS_CONTEXT = 'permissions';
+
+export const permissionsOptionsSchema = z.extend(baseOptionsSchema, {
+  appId: appIdSchema,
+  short: z._default(z.boolean(), false),
+});
+
+export type PermissionsOptions = z.input<typeof permissionsOptionsSchema>;
+
+const permissionsResultSchema = z.array(permissionSchema);
+
+function uniqueCommonPermissions(entries: readonly AppPermission[]): string[] {
+  const names = entries
+    .filter((entry) => entry.type === permission.COMMON)
+    .map((entry) => entry.permission);
+  return [...new Set(names)];
+}
+
+export function createPermissions(resolveClient: ResolveClient = clientFromOptions) {
+  return async function permissions(
+    options: PermissionsOptions,
+  ): Promise<AppPermission[] | string[]> {
+    const parsed = parseOptions(permissionsOptionsSchema, options, PERMISSIONS_CONTEXT);
+    const client = resolveClient(parsed);
+
+    const text = await client.request({
+      url: legacyBatchUrl(parsed.lang, parsed.country),
+      method: 'POST',
+      body: buildPermissionsBody(parsed.appId),
+    });
+
+    const payload = parseBatchResponse(text, PERMISSIONS_RPC_ID);
+    parseRaw(commonPermissionsResponseSchema, payload, `${PERMISSIONS_CONTEXT} common response`);
+    parseRaw(otherPermissionsResponseSchema, payload, `${PERMISSIONS_CONTEXT} other response`);
+    const entries = permissionsResultSchema.parse(mapPermissions(payload));
+
+    if (!parsed.short) {
+      return entries;
+    }
+    return uniqueCommonPermissions(entries);
+  };
+}
+
+export const narrowPermissions = narrowByFlag<
+  'short',
+  PermissionsOptions,
+  AppPermission[],
+  string[]
+>;
+
+export const permissions = narrowPermissions(createPermissions());

@@ -1,0 +1,131 @@
+{
+  "name": "@mradex77/google-play-scraper",
+  "version": "1.6.0",
+  "description": "Google Play scraper for Node.js and Cloudflare Workers with a fully typed TypeScript API. Fetch app details, search results, top charts, reviews, permissions and data safety from the Play Store.",
+  "keywords": [
+    "google-play",
+    "google-play-scraper",
+    "google-play-api",
+    "play-store",
+    "play-store-api",
+    "playstore",
+    "scraper",
+    "web-scraping",
+    "android",
+    "android-apps",
+    "app-store",
+    "app-data",
+    "app-reviews",
+    "reviews",
+    "aso",
+    "app-store-optimization",
+    "market-research",
+    "typescript",
+    "nodejs",
+    "cloudflare-workers",
+    "zod",
+    "cli"
+  ],
+  "homepage": "https://github.com/MrAdex77/google-play-scraper#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MrAdex77/google-play-scraper.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MrAdex77/google-play-scraper/issues"
+  },
+  "author": "MrAdex77 (https://github.com/MrAdex77)",
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/MrAdex77"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "pnpm@11.10.0",
+  "bin": {
+    "google-play-scraper": "./dist/cli.js"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      },
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      }
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsdown",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit",
+    "bench": "vitest bench --run --project \"unit (bench)\" --reporter=verbose",
+    "test": "vitest run --project unit",
+    "test:watch": "vitest --project unit",
+    "test:coverage": "vitest run --project unit --coverage",
+    "test:e2e": "vitest run --project e2e",
+    "test:workers": "pnpm build && vitest run --project workers",
+    "check:package": "pnpm build && publint && attw --pack .",
+    "coverage:live": "node scripts/live-coverage-report.ts",
+    "docs:api": "typedoc",
+    "fixtures:update": "node scripts/update-fixtures.ts",
+    "example": "node examples/all-methods.ts",
+    "prepare": "husky",
+    "prepublishOnly": "pnpm build"
+  },
+  "lint-staged": {
+    "*.ts": [
+      "eslint --fix",
+      "prettier --write"
+    ],
+    "*.{js,json,md,yml,yaml}": [
+      "prettier --write"
+    ]
+  },
+  "dependencies": {
+    "lru-cache": "^11.5.2",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@arethetypeswrong/cli": "^0.18.5",
+    "@commitlint/cli": "^21.2.1",
+    "@commitlint/config-conventional": "^21.2.0",
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^26.1.2",
+    "@vitest/coverage-v8": "^5.0.3",
+    "cheerio": "1.2.0",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.8.0",
+    "eslint-config-prettier": "^10.1.8",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.3.0",
+    "miniflare": "^4.20260730.0",
+    "prettier": "^3.9.6",
+    "publint": "^0.3.22",
+    "tsdown": "^0.23.0",
+    "typedoc": "^0.28.20",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.65.0",
+    "vitest": "^5.0.3"
+  }
+}

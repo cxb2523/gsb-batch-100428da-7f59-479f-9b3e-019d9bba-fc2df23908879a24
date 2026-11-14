@@ -1,0 +1,168 @@
+import {
+  developerIdFromUrl,
+  isFreeMicros,
+  microsToUnits,
+  resolveAppUrl,
+} from '../../core/appItemTransforms.ts';
+import { htmlText, plainText } from '../../core/htmlText.ts';
+import { getPath, type Path } from '../../core/path.ts';
+import { rawArrayPathSchema } from '../../core/raw.ts';
+import type { ScriptRootSpec } from '../../core/scriptRoot.ts';
+import { deriveScriptDataSelection } from '../../core/scriptData.ts';
+import { defaulted, optional, required, type SpecMap } from '../../core/spec.ts';
+import { searchResultSchema } from './schema.ts';
+import * as z from 'zod/mini';
+
+const shape = searchResultSchema.shape;
+const REQUIRED = required();
+const OPTIONAL = optional();
+const DEFAULT_PRICE = defaulted(() => 0);
+const DEFAULT_NOT_FREE = defaulted(() => false);
+
+export type PriceFilter = 'all' | 'free' | 'paid';
+export const SEARCH_RPC_ID = 'lGYRle';
+
+export const INITIAL_MAPPINGS = {
+  sections: [0, 1],
+} satisfies Record<string, Path>;
+
+export const EXACT_MATCH_MAPPINGS = {
+  card: [23],
+  appId: [16, 3, '12', 0, 0],
+} satisfies Record<string, Path>;
+
+export function isExactMatchCard(value: unknown): boolean {
+  return typeof getPath(value, EXACT_MATCH_MAPPINGS.appId) === 'string';
+}
+
+export const searchRootSpec = {
+  rpcId: SEARCH_RPC_ID,
+  paths: [['ds:4']],
+  schema: rawArrayPathSchema(INITIAL_MAPPINGS.sections, z.array(z.unknown())),
+  missing: REQUIRED,
+} satisfies ScriptRootSpec;
+
+export const searchScriptDataSelection = deriveScriptDataSelection([searchRootSpec]);
+
+export const SECTIONS_MAPPING = {
+  apps: [22, 0],
+  token: [22, 1, 3, 1],
+} satisfies Record<string, Path>;
+
+export const CLUSTER_MAPPINGS = {
+  apps: [0, 0, 0],
+  token: [0, 0, 7, 1],
+} satisfies Record<string, Path>;
+
+const PAGE_SUMMARY_CELL = { paths: [[0, 13, 1]], missing: OPTIONAL };
+
+export const searchItemSpecs = {
+  title: { paths: [[0, 3]], missing: REQUIRED, schema: shape.title },
+  appId: { paths: [[0, 0, 0]], missing: REQUIRED, schema: shape.appId },
+  url: { paths: [[0, 10, 4, 2]], missing: REQUIRED, schema: shape.url, transform: resolveAppUrl },
+  icon: { paths: [[0, 1, 3, 2]], missing: REQUIRED, schema: shape.icon },
+  developer: { paths: [[0, 14]], missing: REQUIRED, schema: shape.developer },
+  currency: { paths: [[0, 8, 1, 0, 1]], missing: OPTIONAL, schema: shape.currency },
+  price: {
+    paths: [[0, 8, 1, 0, 0]],
+    missing: DEFAULT_PRICE,
+    schema: shape.price,
+    transform: microsToUnits,
+  },
+  free: {
+    paths: [[0, 8, 1, 0, 0]],
+    missing: DEFAULT_NOT_FREE,
+    schema: shape.free,
+    transform: isFreeMicros,
+  },
+  summary: { ...PAGE_SUMMARY_CELL, schema: shape.summary, transform: plainText },
+  summaryHTML: { ...PAGE_SUMMARY_CELL, schema: shape.summaryHTML, transform: htmlText },
+  scoreText: { paths: [[0, 4, 0]], missing: OPTIONAL, schema: shape.scoreText },
+  score: { paths: [[0, 4, 1]], missing: OPTIONAL, schema: shape.score },
+} satisfies SpecMap;
+
+const EXACT_MATCH_OFFER_NODE = {
+  url: [17, 0, 0, 4, 2],
+  price: [17, 0, 2, 0, 1, 0, 0],
+  currency: [17, 0, 2, 0, 1, 0, 1],
+} satisfies Record<string, Path>;
+
+const EXACT_MATCH_DETAIL_NODE = {
+  url: [16, 2, 41, 0, 2],
+  price: [16, 2, 57, 0, 0, 0, 0, 1, 0, 0],
+  currency: [16, 2, 57, 0, 0, 0, 0, 1, 0, 1],
+} satisfies Record<string, Path>;
+
+const EXACT_MATCH_SUMMARY_CELL = { paths: [[16, 2, 73, 0, 1]], missing: OPTIONAL };
+
+export const exactMatchSpecs = {
+  title: { paths: [[16, 2, 0, 0]], missing: REQUIRED, schema: shape.title },
+  appId: { paths: [EXACT_MATCH_MAPPINGS.appId], missing: REQUIRED, schema: shape.appId },
+  url: {
+    paths: [EXACT_MATCH_OFFER_NODE.url, EXACT_MATCH_DETAIL_NODE.url],
+    missing: REQUIRED,
+    schema: shape.url,
+    transform: resolveAppUrl,
+  },
+  icon: { paths: [[16, 2, 95, 0, 3, 2]], missing: REQUIRED, schema: shape.icon },
+  developer: { paths: [[16, 2, 68, 0]], missing: REQUIRED, schema: shape.developer },
+  developerId: {
+    paths: [[16, 2, 68, 1, 4, 2]],
+    missing: OPTIONAL,
+    schema: shape.developerId,
+    transform: developerIdFromUrl,
+  },
+  currency: {
+    paths: [EXACT_MATCH_OFFER_NODE.currency, EXACT_MATCH_DETAIL_NODE.currency],
+    missing: OPTIONAL,
+    schema: shape.currency,
+  },
+  price: {
+    paths: [EXACT_MATCH_OFFER_NODE.price, EXACT_MATCH_DETAIL_NODE.price],
+    missing: DEFAULT_PRICE,
+    schema: shape.price,
+    transform: microsToUnits,
+  },
+  free: {
+    paths: [EXACT_MATCH_OFFER_NODE.price, EXACT_MATCH_DETAIL_NODE.price],
+    missing: DEFAULT_NOT_FREE,
+    schema: shape.free,
+    transform: isFreeMicros,
+  },
+  summary: { ...EXACT_MATCH_SUMMARY_CELL, schema: shape.summary, transform: plainText },
+  summaryHTML: { ...EXACT_MATCH_SUMMARY_CELL, schema: shape.summaryHTML, transform: htmlText },
+  scoreText: { paths: [[16, 2, 51, 0, 0]], missing: OPTIONAL, schema: shape.scoreText },
+  score: { paths: [[16, 2, 51, 0, 1]], missing: OPTIONAL, schema: shape.score },
+} satisfies SpecMap;
+
+export function priceGoogleValue(value: PriceFilter): number {
+  switch (value) {
+    case 'free':
+      return 1;
+    case 'paid':
+      return 2;
+    default:
+      return 0;
+  }
+}
+
+export function matchesPriceFilter(free: boolean, filter: PriceFilter): boolean {
+  switch (filter) {
+    case 'free':
+      return free;
+    case 'paid':
+      return !free;
+    default:
+      return true;
+  }
+}
+
+export function filterByPrice<T extends { free: boolean }>(
+  items: readonly T[],
+  filter: PriceFilter,
+): T[] {
+  if (filter === 'all') {
+    return [...items];
+  }
+  return items.filter((item) => matchesPriceFilter(item.free, filter));
+}

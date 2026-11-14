@@ -1,0 +1,266 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { apps, createApps } from './apps.ts';
+import { createClient } from '../../client.ts';
+import { memoized } from '../memoized/memoized.ts';
+import type { GetApp } from '../../core/fullDetail.ts';
+import { NotFoundError, ValidationError } from '../../core/errors.ts';
+import type { App } from '../app/schema.ts';
+import type { OnDegradation } from '../../core/degradation.ts';
+import type { OnIntegrityEvent } from '../../core/integrity.ts';
+import { changeRoutingTableEntry } from '../../../test/helpers/responseMutation.ts';
+import { MALFORMED_APP_IDS } from '../../../test/helpers/appIds.ts';
+
+const readFixture = (name: string): string =>
+  readFileSync(
+    fileURLToPath(new URL(`../../../test/fixtures/app/${name}`, import.meta.url)),
+    'utf8',
+  );
+
+const translateHtml = readFixture('translate.html');
+const reroutedHtml = changeRoutingTableEntry(translateHtml, 'ds:5', { rpcId: 'unrelatedRpc' });
+
+const urlOf = (input: string | URL | Request): string =>
+  typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+
+const fetchReturning = (body: string, status = 200): typeof fetch => {
+  const impl: typeof fetch = () => Promise.resolve(new Response(body, { status }));
+  return impl;
+};
+
+interface CountingFetch {
+  fetchImpl: typeof fetch;
+  state: { calls: number };
+}
+
+const countingAppFetch = (): CountingFetch => {
+  const state = { calls: 0 };
+  const fetchImpl: typeof fetch = () => {
+    state.calls += 1;
+    return Promise.resolve(new Response(translateHtml, { status: 200 }));
+  };
+  return { fetchImpl, state };
+};
+
+describe('apps', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('resolves ids in order with fully parsed app objects', async () => {
+    const appIds = ['com.one', 'com.two', 'com.three'];
+
+    const result = await apps({
+      appIds,
+      requestOptions: { fetchImpl: fetchReturning(translateHtml) },
+    });
+
+    expect(result.map((entry) => entry.appId)).toEqual(appIds);
+    for (const [index, entry] of result.entries()) {
+      expect(entry.status).toBe('fulfilled');
+      if (entry.status === 'fulfilled') {
+        expect(entry.app.appId).toBe(appIds[index]);
+        expect(entry.app.title.length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  it('captures a not found id as rejected while the rest fulfill', async () => {
+    const appIds = ['com.one', 'com.missing', 'com.three'];
+    const fetchImpl: typeof fetch = (input) => {
+      const missing = urlOf(input).includes('com.missing');
+      return Promise.resolve(
+        new Response(missing ? 'nope' : translateHtml, { status: missing ? 404 : 200 }),
+      );
+    };
+
+    const result = await apps({ appIds, requestOptions: { fetchImpl } });
+
+    expect(result[0]?.status).toBe('fulfilled');
+    expect(result[2]?.status).toBe('fulfilled');
+    const rejected = result[1];
+    expect(rejected?.status).toBe('rejected');
+    if (rejected?.status === 'rejected') {
+      expect(rejected.error).toBeInstanceOf(NotFoundError);
+      expect(rejected.appId).toBe('com.missing');
+    }
+  });
+
+  it('rejects the whole batch with a failure that did not come from the library', async () => {
+    const boom = new TypeError('kaboom');
+    const failing = createApps(() => Promise.reject(boom));
+
+    await expect(failing({ appIds: ['com.x', 'com.y'] })).rejects.toBe(boom);
+  });
+
+  it('rejects with the abort reason instead of capturing a cancelled call per id', async () => {
+    const reason = new Error('budget exceeded');
+    const controller = new AbortController();
+    controller.abort(reason);
+    const { fetchImpl, state } = countingAppFetch();
+
+    await expect(
+      apps({
+        appIds: ['com.a', 'com.b'],
+        requestOptions: { fetchImpl, signal: controller.signal },
+      }),
+    ).rejects.toBe(reason);
+    expect(state.calls).toBe(0);
+  });
+
+  it('surfaces an error thrown by the observability callback', async () => {
+    const callbackFailure = new Error('callback failed');
+
+    await expect(
+      apps({
+        appIds: ['com.a'],
+        onIntegrityEvent: () => {
+          throw callbackFailure;
+        },
+        requestOptions: { fetchImpl: fetchReturning(reroutedHtml) },
+      }),
+    ).rejects.toBe(callbackFailure);
+  });
+
+  it('honors the concurrency limit', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const getApp: GetApp<App> = async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await Promise.resolve();
+      inFlight -= 1;
+      return {} as App;
+    };
+    const batched = createApps(getApp);
+    const appIds = Array.from({ length: 12 }, (_unused, index) => `com.app${index.toString()}`);
+
+    await batched({ appIds, concurrency: 3 });
+
+    expect(peak).toBe(3);
+  });
+
+  it('rejects empty, zero-concurrency, and oversized batches through validation', async () => {
+    await expect(apps({ appIds: [] })).rejects.toBeInstanceOf(ValidationError);
+    await expect(apps({ appIds: ['com.a'], concurrency: 0 })).rejects.toBeInstanceOf(
+      ValidationError,
+    );
+
+    const tooMany = Array.from({ length: 251 }, (_unused, index) => `com.app${index.toString()}`);
+    await expect(apps({ appIds: tooMany })).rejects.toBeInstanceOf(ValidationError);
+  });
+
+  it('turns every malformed appId into a rejected entry without a request', async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+    const appIds = MALFORMED_APP_IDS.filter((appId) => appId.length > 0);
+
+    const result = await apps({ appIds, requestOptions: { fetchImpl } });
+
+    expect(result.map((entry) => entry.appId)).toEqual(appIds);
+    for (const entry of result) {
+      expect(entry.status).toBe('rejected');
+      if (entry.status === 'rejected') {
+        expect(entry.error).toBeInstanceOf(ValidationError);
+        expect(entry.error.message).toMatch(/^app: appId: must be/);
+      }
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('keeps the batch alive around a malformed appId and preserves order', async () => {
+    const appIds = ['com.one', 'com.żółw.app', 'com.three'];
+    const fetch = countingAppFetch();
+
+    const result = await apps({ appIds, requestOptions: { fetchImpl: fetch.fetchImpl } });
+
+    expect(result.map((entry) => [entry.appId, entry.status])).toEqual([
+      ['com.one', 'fulfilled'],
+      ['com.żółw.app', 'rejected'],
+      ['com.three', 'fulfilled'],
+    ]);
+    expect(fetch.state.calls).toBe(2);
+  });
+
+  it('still rejects an empty string through whole call validation', async () => {
+    await expect(apps({ appIds: ['com.one', ''] })).rejects.toBeInstanceOf(ValidationError);
+  });
+
+  it('caps the request rate at the shared client limiter despite a higher concurrency', async () => {
+    vi.useFakeTimers();
+    const start = Date.now();
+    const startTimes: number[] = [];
+    const fetchImpl: typeof fetch = () => {
+      startTimes.push(Date.now() - start);
+      return Promise.resolve(new Response(translateHtml, { status: 200 }));
+    };
+    const client = createClient({ throttle: 2, requestOptions: { fetchImpl } });
+
+    const pending = client.apps({
+      appIds: ['com.a', 'com.b', 'com.c', 'com.d'],
+      concurrency: 5,
+    });
+    await vi.runAllTimersAsync();
+    await pending;
+
+    expect(startTimes.sort((first, second) => first - second)).toEqual([0, 0, 1000, 1000]);
+  });
+
+  it('fetches a repeated id once across memoized batches', async () => {
+    const client = memoized();
+    const fetch = countingAppFetch();
+    const requestOptions = { fetchImpl: fetch.fetchImpl };
+
+    await client.apps({ appIds: ['com.a', 'com.b'], requestOptions });
+    expect(fetch.state.calls).toBe(2);
+
+    await client.apps({ appIds: ['com.b', 'com.c'], requestOptions });
+    expect(fetch.state.calls).toBe(3);
+  });
+  it('forwards per-call observability callbacks to every app lookup', async () => {
+    const onDegradation: OnDegradation = () => undefined;
+    const onIntegrityEvent: OnIntegrityEvent = () => undefined;
+    const received: unknown[] = [];
+    const getApp: GetApp<App> = (params) => {
+      received.push([params.onDegradation, params.onIntegrityEvent]);
+      return Promise.resolve({} as App);
+    };
+
+    await createApps(getApp)({ appIds: ['com.a', 'com.b'], onDegradation, onIntegrityEvent });
+
+    expect(received).toEqual([
+      [onDegradation, onIntegrityEvent],
+      [onDegradation, onIntegrityEvent],
+    ]);
+  });
+
+  it('reports app integrity events to the batch callback', async () => {
+    const contexts: string[] = [];
+
+    await apps({
+      appIds: ['com.a', 'com.b'],
+      onIntegrityEvent: (event) => contexts.push(event.context),
+      requestOptions: { fetchImpl: fetchReturning(reroutedHtml) },
+    });
+
+    expect(contexts).toEqual(['app details', 'app details']);
+  });
+
+  it('replays cached app integrity events to a per-call batch callback over the client default', async () => {
+    const clientContexts: string[] = [];
+    const client = memoized({
+      onIntegrityEvent: (event) => clientContexts.push(`client:${event.context}`),
+      requestOptions: { fetchImpl: fetchReturning(reroutedHtml) },
+    });
+    await client.app({ appId: 'com.a' });
+    const batchContexts: string[] = [];
+
+    await client.apps({
+      appIds: ['com.a'],
+      onIntegrityEvent: (event) => batchContexts.push(`batch:${event.context}`),
+    });
+
+    expect(clientContexts).toEqual(['client:app details']);
+    expect(batchContexts).toEqual(['batch:app details']);
+  });
+});

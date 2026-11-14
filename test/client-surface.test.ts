@@ -1,0 +1,29 @@
+import { describe, expect, it } from 'vitest';
+import gplay, { createClient, device, memoized } from '../src/index.ts';
+
+const FACTORY_ONLY_MEMBERS = ['createClient', 'memoized'];
+const CACHED_ONLY_MEMBERS = ['cache'];
+
+const memberNames = (surface: object): string[] => Object.keys(surface).sort();
+
+describe('client surface parity', () => {
+  it('exposes the same members on the default export and a shared client', () => {
+    const expected = memberNames(gplay).filter((name) => !FACTORY_ONLY_MEMBERS.includes(name));
+
+    expect(memberNames(createClient())).toEqual(expected);
+  });
+
+  it('exposes the shared client surface plus cache controls on a cached client', () => {
+    const expected = memberNames({ ...createClient(), cache: undefined });
+
+    expect(memberNames(memoized())).toEqual(expected);
+    expect(CACHED_ONLY_MEMBERS.every((name) => name in memoized())).toBe(true);
+  });
+
+  it('shares one frozen device vocabulary across every surface', () => {
+    expect(Object.isFrozen(device)).toBe(true);
+    expect(gplay.device).toBe(device);
+    expect(createClient().device).toBe(device);
+    expect(memoized().device).toBe(device);
+  });
+});

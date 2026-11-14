@@ -1,0 +1,322 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { describe, expect, it, vi } from 'vitest';
+import { createList, list, type ListOptions } from './list.ts';
+import { listItemSchema } from './schema.ts';
+import { buildListBody, CLUSTER_NAMES, LIST_RPC_ID } from './specs.ts';
+import type { App } from '../app/schema.ts';
+import type { OnIntegrityEvent } from '../../core/integrity.ts';
+import type { OnDegradation } from '../../core/degradation.ts';
+import { ParseError, SpecError, ValidationError } from '../../core/errors.ts';
+import { plainText } from '../../core/htmlText.ts';
+import { expectConvertedSummaries, expectHtmlSummaries } from '../../../test/helpers/plainText.ts';
+
+vi.mock(import('../../core/htmlText.ts'), { spy: true });
+
+const plainTextSpy = vi.mocked(plainText);
+
+const topFreeGame = readFileSync(
+  fileURLToPath(new URL('../../../test/fixtures/list/topfree-game.txt', import.meta.url)),
+  'utf8',
+);
+
+const fetchReturning = (body: string, status = 200): typeof fetch => {
+  const impl: typeof fetch = () => Promise.resolve(new Response(body, { status }));
+  return impl;
+};
+
+const recordingFetch = (body: string): { fetchImpl: typeof fetch; bodies: string[] } => {
+  const bodies: string[] = [];
+  const fetchImpl: typeof fetch = (_input, init) => {
+    bodies.push(typeof init?.body === 'string' ? init.body : '');
+    return Promise.resolve(new Response(body, { status: 200 }));
+  };
+  return { fetchImpl, bodies };
+};
+
+const listBatch = (payload: unknown): string => {
+  const frame = [['wrb.fr', LIST_RPC_ID, JSON.stringify(payload), null, null, null, 'generic']];
+  const json = JSON.stringify(frame);
+  return `)]}'\n\n${json.length.toString()}\n${json}`;
+};
+
+const pricelessListCore = (id: string): unknown[] => {
+  const core: unknown[] = [];
+  core[0] = [id];
+  core[1] = [null, null, null, [null, null, `https://icon.example/${id}`]];
+  core[3] = `App ${id}`;
+  core[10] = [null, null, null, null, [null, null, `/store/apps/details?id=${id}`]];
+  core[14] = `Dev ${id}`;
+  return core;
+};
+
+const listPayload = (ids: string[]): unknown => {
+  const cluster: unknown[] = [];
+  cluster[28] = [ids.map((id) => [pricelessListCore(id)])];
+  const container: unknown[] = [];
+  container[1] = [cluster];
+  return [container];
+};
+
+describe('list degraded payloads', () => {
+  it('returns an empty list when the payload carries an empty apps collection', async () => {
+    const items = await list({
+      requestOptions: { fetchImpl: fetchReturning(listBatch(listPayload([]))) },
+    });
+
+    expect(items).toEqual([]);
+  });
+
+  it('returns an empty list when google reports a collection with no entries', async () => {
+    const items = await list({
+      collection: 'TOP_PAID',
+      requestOptions: {
+        fetchImpl: fetchReturning(listBatch([[null, null, null, [], false, ['token']]])),
+      },
+    });
+
+    expect(items).toEqual([]);
+  });
+
+  it('rejects a payload with no apps path', async () => {
+    await expect(
+      list({ requestOptions: { fetchImpl: fetchReturning(listBatch([])) } }),
+    ).rejects.toBeInstanceOf(ParseError);
+  });
+
+  it('throws a SpecError naming url when the link cell is missing', async () => {
+    const core = pricelessListCore('com.free.app');
+    core[10] = null;
+    const cluster: unknown[] = [];
+    cluster[28] = [[[core]]];
+    const container: unknown[] = [];
+    container[1] = [cluster];
+
+    let thrown: unknown;
+    try {
+      await list({ requestOptions: { fetchImpl: fetchReturning(listBatch([container])) } });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(SpecError);
+    const failedFields = (thrown as SpecError).failures.map((failure) => failure.field);
+    expect(failedFields).toContain('url');
+  });
+
+  it('parses a priceless item as costing zero without a currency', async () => {
+    const items = await list({
+      requestOptions: { fetchImpl: fetchReturning(listBatch(listPayload(['com.free.app']))) },
+    });
+
+    expect(items).toHaveLength(1);
+    expect(items[0]?.appId).toBe('com.free.app');
+    expect(items[0]?.price).toBe(0);
+    expect(items[0]?.free).toBe(false);
+    expect(items[0]?.currency).toBeUndefined();
+  });
+});
+
+describe('list fixture parsing', () => {
+  it('decodes the recorded collection into at least fifty validated apps', async () => {
+    const items = await list({
+      collection: 'TOP_FREE',
+      category: 'GAME',
+      num: 100,
+      requestOptions: { fetchImpl: fetchReturning(topFreeGame) },
+    });
+
+    expect(items.length).toBeGreaterThanOrEqual(50);
+    for (const item of items) {
+      expect(() => listItemSchema.parse(item)).not.toThrow();
+      expect(new URL(item.url).origin).toBe('https://play.google.com');
+    }
+    expect(new Set(items.map((item) => item.appId)).size).toBe(items.length);
+    expect(items.some((item) => item.free && item.price === 0)).toBe(true);
+  });
+
+  it('returns plain text summaries for every recorded item', async () => {
+    plainTextSpy.mockClear();
+    const items = await list({
+      collection: 'TOP_FREE',
+      category: 'GAME',
+      num: 100,
+      requestOptions: { fetchImpl: fetchReturning(topFreeGame) },
+    });
+
+    expectConvertedSummaries(plainTextSpy, items, 'top free game');
+    expectHtmlSummaries(items, 'top free game');
+    const holeStars = items.find((item) => item.summary?.startsWith('Hole Stars'));
+    expect(holeStars?.summary).toContain('Shine\n\nLooking for a game that\u2019s fun');
+    expect(holeStars?.summary).toContain("Whether you're sorting");
+    expect(holeStars?.summaryHTML).toContain('Shine<br><br>Looking for a game that\u2019s fun');
+  });
+});
+
+describe('buildListBody interpolation', () => {
+  it('places num, collection and category into the encoded template', () => {
+    const body = buildListBody({
+      num: '100',
+      collection: CLUSTER_NAMES.TOP_FREE,
+      category: 'GAME',
+    });
+
+    expect(body.startsWith('f.req=')).toBe(true);
+    expect(body).toContain('&at=');
+
+    const numOffset = body.indexOf('%5B20%2C100%5D');
+    const collectionOffset = body.indexOf('%5C%22topselling_free%5C%22');
+    const categoryOffset = body.indexOf('%5C%22GAME%5C%22');
+
+    expect(numOffset).toBeGreaterThan(-1);
+    expect(collectionOffset).toBeGreaterThan(-1);
+    expect(categoryOffset).toBeGreaterThan(-1);
+    expect(numOffset).toBeLessThan(collectionOffset);
+    expect(collectionOffset).toBeLessThan(categoryOffset);
+  });
+
+  it('posts the built body verbatim to the batch endpoint', async () => {
+    const { fetchImpl, bodies } = recordingFetch(topFreeGame);
+
+    await list({
+      collection: 'GROSSING',
+      category: 'SOCIAL',
+      num: 25,
+      requestOptions: { fetchImpl },
+    });
+
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain('%5B20%2C25%5D');
+    expect(bodies[0]).toContain('%5C%22topgrossing%5C%22');
+    expect(bodies[0]).toContain('%5C%22SOCIAL%5C%22');
+  });
+});
+
+describe('list num cap', () => {
+  it('never returns more items than num when the server over-serves', async () => {
+    const items = await list({
+      collection: 'TOP_FREE',
+      category: 'GAME',
+      num: 5,
+      requestOptions: { fetchImpl: fetchReturning(topFreeGame) },
+    });
+
+    expect(items).toHaveLength(5);
+  });
+
+  it('keeps the server order when slicing to num', async () => {
+    const ids = ['com.a.one', 'com.a.two', 'com.a.three'];
+    const items = await list({
+      num: 2,
+      requestOptions: { fetchImpl: fetchReturning(listBatch(listPayload(ids))) },
+    });
+
+    expect(items.map((item) => item.appId)).toEqual(['com.a.one', 'com.a.two']);
+  });
+
+  it('resolves full detail only for the first num items', async () => {
+    const requested: string[] = [];
+    const detailed = createList((params) => {
+      requested.push(params.appId);
+      return Promise.resolve({ appId: params.appId } as App);
+    });
+
+    const ids = ['com.a.one', 'com.a.two', 'com.a.three', 'com.a.four'];
+
+    const items = await detailed({
+      num: 2,
+      fullDetail: true,
+      requestOptions: { fetchImpl: fetchReturning(listBatch(listPayload(ids))) },
+    });
+
+    expect(requested).toEqual(['com.a.one', 'com.a.two']);
+    expect(items.map((item) => item.appId)).toEqual(['com.a.one', 'com.a.two']);
+  });
+});
+
+describe('list option validation', () => {
+  it('rejects an invalid collection naming the field', async () => {
+    const error = await list({ collection: 'NOPE' } as unknown as ListOptions).catch(
+      (reason: unknown) => reason,
+    );
+    expect(error).toBeInstanceOf(ValidationError);
+    expect((error as Error).message).toContain('collection');
+  });
+
+  it('rejects an invalid category naming the field', async () => {
+    const error = await list({ category: 'NOPE' } as unknown as ListOptions).catch(
+      (reason: unknown) => reason,
+    );
+    expect(error).toBeInstanceOf(ValidationError);
+    expect((error as Error).message).toContain('category');
+  });
+
+  it('accepts each valid age range and rejects others', async () => {
+    for (const age of ['AGE_RANGE1', 'AGE_RANGE2', 'AGE_RANGE3'] as const) {
+      const items = await list({
+        age,
+        num: 5,
+        requestOptions: { fetchImpl: fetchReturning(topFreeGame) },
+      });
+      expect(Array.isArray(items)).toBe(true);
+    }
+
+    await expect(list({ age: 'AGE_RANGE9' } as unknown as ListOptions)).rejects.toBeInstanceOf(
+      ValidationError,
+    );
+  });
+});
+
+describe('list fullDetail', () => {
+  it('forwards per-call observability callbacks to each detail lookup', async () => {
+    const onDegradation: OnDegradation = () => undefined;
+    const onIntegrityEvent: OnIntegrityEvent = () => undefined;
+    const received: [unknown, unknown][] = [];
+    const detailed = createList((params) => {
+      received.push([params.onDegradation, params.onIntegrityEvent]);
+      return Promise.resolve({ appId: params.appId } as App);
+    });
+
+    await detailed({
+      collection: 'TOP_FREE',
+      category: 'GAME',
+      num: 5,
+      requestOptions: { fetchImpl: fetchReturning(topFreeGame) },
+      fullDetail: true,
+      onDegradation,
+      onIntegrityEvent,
+    });
+
+    expect(received.length).toBeGreaterThan(0);
+    for (const pair of received) {
+      expect(pair).toEqual([onDegradation, onIntegrityEvent]);
+    }
+  });
+
+  it('resolves each item through the injected getApp exactly once', async () => {
+    const plain = await list({
+      collection: 'TOP_FREE',
+      category: 'GAME',
+      num: 100,
+      requestOptions: { fetchImpl: fetchReturning(topFreeGame) },
+    });
+
+    const requested: string[] = [];
+    const listWithStub = createList((params) => {
+      requested.push(params.appId);
+      return Promise.resolve({ appId: params.appId, description: `detail ${params.appId}` } as App);
+    });
+
+    const detailed = (await listWithStub({
+      collection: 'TOP_FREE',
+      category: 'GAME',
+      num: 100,
+      fullDetail: true,
+      requestOptions: { fetchImpl: fetchReturning(topFreeGame) },
+    })) as App[];
+
+    expect(requested).toEqual(plain.map((item) => item.appId));
+    expect(detailed).toHaveLength(plain.length);
+    expect(detailed.every((item) => item.description.startsWith('detail '))).toBe(true);
+  });
+});

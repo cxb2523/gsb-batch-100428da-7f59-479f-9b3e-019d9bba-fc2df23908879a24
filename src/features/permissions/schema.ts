@@ -1,0 +1,15 @@
+import * as z from 'zod/mini';
+import { permission } from '../../constants.ts';
+
+export const permissionTypeSchema = z.union([
+  z.literal(permission.COMMON),
+  z.literal(permission.OTHER),
+]);
+
+export const permissionSchema = z.object({
+  permission: z.string(),
+  type: permissionTypeSchema,
+  group: z.string(),
+});
+
+export type AppPermission = z.infer<typeof permissionSchema>;

@@ -1,0 +1,78 @@
+import { safeParse, type $ZodType } from 'zod/v4/core';
+import * as z from 'zod/mini';
+import type { OnDegradation } from './degradation.ts';
+import type { OnRequest, OnResponse, OnRetry } from './http.ts';
+import type { OnIntegrityEvent } from './integrity.ts';
+import { ValidationError } from './errors.ts';
+
+export const requestOptionsSchema = z.object({
+  headers: z.optional(z.record(z.string(), z.string())),
+  fetchImpl: z.optional(z.custom<typeof fetch>((value) => typeof value === 'function')),
+  timeoutMs: z.optional(z.int().check(z.positive(), z.lte(120000))),
+  retries: z.optional(z.int().check(z.gte(0), z.lte(5))),
+  signal: z.optional(z.custom<AbortSignal>((value) => value instanceof AbortSignal)),
+  onRequest: z.optional(z.custom<OnRequest>((value) => typeof value === 'function')),
+  onResponse: z.optional(z.custom<OnResponse>((value) => typeof value === 'function')),
+  onRetry: z.optional(z.custom<OnRetry>((value) => typeof value === 'function')),
+});
+
+export type RequestOptions = z.infer<typeof requestOptionsSchema>;
+
+const APP_ID_PATTERN = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/;
+const APP_ID_MAX_LENGTH = 255;
+const APP_ID_FORMAT_MESSAGE =
+  'must be an Android package name: two or more dot separated segments, each starting with a letter and using only letters, digits, and underscores';
+const APP_ID_LENGTH_MESSAGE = `must be at most ${APP_ID_MAX_LENGTH.toString()} characters`;
+
+export const appIdSchema = z
+  .string()
+  .check(
+    z.maxLength(APP_ID_MAX_LENGTH, APP_ID_LENGTH_MESSAGE),
+    z.regex(APP_ID_PATTERN, APP_ID_FORMAT_MESSAGE),
+  );
+
+export const baseOptionsSchema = z.object({
+  lang: z._default(z.string().check(z.minLength(2), z.maxLength(7)), 'en'),
+  country: z._default(z.string().check(z.length(2)), 'us'),
+  throttle: z.optional(z.number().check(z.positive(), z.lte(50))),
+  requestOptions: z.optional(requestOptionsSchema),
+  onDegradation: z.optional(z.custom<OnDegradation>((value) => typeof value === 'function')),
+  onIntegrityEvent: z.optional(z.custom<OnIntegrityEvent>((value) => typeof value === 'function')),
+});
+
+export type BaseOptions = z.infer<typeof baseOptionsSchema>;
+
+export type ObservabilityOptions = Pick<BaseOptions, 'onDegradation' | 'onIntegrityEvent'>;
+
+export type ObservableSchema = $ZodType<unknown, ObservabilityOptions>;
+
+export type SchemaBoundMethod<Schema extends ObservableSchema, Result> = (
+  options: z.input<Schema>,
+) => Promise<Result>;
+
+export type MethodWrapper<Name extends string = string> = <Schema extends ObservableSchema, Result>(
+  name: Name,
+  schema: Schema,
+  fn: SchemaBoundMethod<Schema, Result>,
+) => SchemaBoundMethod<Schema, Result>;
+
+export function normalizeCountry(country: string): string {
+  return country.toLowerCase();
+}
+
+export function hasUniqueCountriesIgnoringCase(countries: readonly string[]): boolean {
+  const normalized = countries.map(normalizeCountry);
+  return new Set(normalized).size === normalized.length;
+}
+
+export function parseOptions<Schema extends $ZodType>(
+  schema: Schema,
+  input: unknown,
+  context: string,
+): z.infer<Schema> {
+  const result = safeParse(schema, input);
+  if (!result.success) {
+    throw ValidationError.fromZod(result.error, context);
+  }
+  return result.data;
+}

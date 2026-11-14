@@ -1,0 +1,59 @@
+import * as z from 'zod/mini';
+import { buildBatchBody, parseBatchResponse } from '../../core/batchexecute.ts';
+import { clientFromOptions, type ResolveClient } from '../../core/http.ts';
+import { baseOptionsSchema, parseOptions } from '../../core/options.ts';
+import { getPath } from '../../core/path.ts';
+import { parseRaw } from '../../core/raw.ts';
+import {
+  buildSuggestPayload,
+  SUGGEST_RPC_ID,
+  SUGGESTION_TEXT_PATH,
+  SUGGESTIONS_PATH,
+  suggestResponseSchema,
+  suggestUrl,
+} from './specs.ts';
+
+export const suggestOptionsSchema = z.extend(baseOptionsSchema, {
+  term: z.string().check(z.minLength(1)),
+});
+
+export type SuggestOptions = z.input<typeof suggestOptionsSchema>;
+
+const SUGGEST_CONTEXT = 'suggest';
+const MAX_SUGGESTIONS = 5;
+const suggestionTextsSchema = z.array(z.string());
+
+export function createSuggest(resolveClient: ResolveClient = clientFromOptions) {
+  return async function suggest(options: SuggestOptions): Promise<string[]> {
+    const parsed = parseOptions(suggestOptionsSchema, options, SUGGEST_CONTEXT);
+
+    const client = resolveClient(parsed);
+    const body = buildBatchBody(SUGGEST_RPC_ID, buildSuggestPayload(parsed.term), []);
+    const text = await client.request({
+      url: suggestUrl(parsed.lang, parsed.country),
+      method: 'POST',
+      body,
+    });
+
+    const payload = parseBatchResponse(text, SUGGEST_RPC_ID);
+    parseRaw(suggestResponseSchema, payload, `${SUGGEST_CONTEXT} response`);
+    if (payload === null) {
+      return [];
+    }
+
+    const entries = getPath(payload, SUGGESTIONS_PATH);
+    if (!Array.isArray(entries)) {
+      return [];
+    }
+
+    const suggestions = parseRaw(
+      suggestionTextsSchema,
+      entries.map((entry) => getPath(entry, SUGGESTION_TEXT_PATH)),
+      `${SUGGEST_CONTEXT} entries`,
+    );
+
+    return suggestions.slice(0, MAX_SUGGESTIONS);
+  };
+}
+
+export const suggest = createSuggest();

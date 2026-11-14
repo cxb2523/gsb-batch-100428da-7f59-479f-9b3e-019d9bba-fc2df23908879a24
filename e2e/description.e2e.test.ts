@@ -1,0 +1,73 @@
+import { expect, it } from 'vitest';
+import { htmlToPlainText } from '../src/core/htmlText.ts';
+import { sanitizeText } from '../src/core/text.ts';
+import { cheerioText } from '../test/helpers/plainText.ts';
+import { liveClient, liveDescribe } from './helpers.ts';
+
+const SUPPORTED_NAMED_ENTITIES = new Set(['amp', 'lt', 'gt', 'quot', 'apos', 'nbsp']);
+const ALLOWED_TAG = /^<\/?(?:b|i|u|br)\s*\/?>$/;
+const TAG_SCAN = /<[^>]*>/g;
+const NAMED_ENTITY_SCAN = /&([a-zA-Z]+);/g;
+
+function unsupportedNamedEntities(html: string): string[] {
+  const offenders: string[] = [];
+  for (const match of html.matchAll(NAMED_ENTITY_SCAN)) {
+    const name = match[1];
+    if (name !== undefined && !SUPPORTED_NAMED_ENTITIES.has(name)) {
+      offenders.push(match[0]);
+    }
+  }
+  return offenders;
+}
+
+function unexpectedTags(html: string): string[] {
+  const offenders: string[] = [];
+  for (const match of html.matchAll(TAG_SCAN)) {
+    if (!ALLOWED_TAG.test(match[0])) {
+      offenders.push(match[0]);
+    }
+  }
+  return [...new Set(offenders)];
+}
+
+const DESCRIPTION_BASKET = [
+  { appId: 'com.google.android.apps.translate', lang: 'en', country: 'us', script: 'latin' },
+  { appId: 'com.mojang.minecraftpe', lang: 'en', country: 'us', script: 'latin paid' },
+  { appId: 'com.adex77.WhereAmI', lang: 'pl', country: 'pl', script: 'polish localized' },
+  { appId: 'jp.naver.line.android', lang: 'ja', country: 'jp', script: 'japanese' },
+  { appId: 'com.kakao.talk', lang: 'ko', country: 'kr', script: 'korean' },
+  { appId: 'com.whatsapp', lang: 'ar', country: 'sa', script: 'arabic rtl' },
+  { appId: 'org.telegram.messenger', lang: 'ru', country: 'ru', script: 'cyrillic' },
+  { appId: 'com.google.android.youtube', lang: 'hi', country: 'in', script: 'devanagari' },
+  { appId: 'com.waze', lang: 'he', country: 'il', script: 'hebrew rtl' },
+  { appId: 'com.king.candycrushsaga', lang: 'en', country: 'us', script: 'emoji rich' },
+] as const;
+
+liveDescribe('description live parity without cheerio', () => {
+  for (const { appId, lang, country, script } of DESCRIPTION_BASKET) {
+    it(`matches cheerio for ${appId} (${script}, ${lang}-${country})`, async () => {
+      const result = await liveClient.app({ appId, lang, country });
+      const html = result.descriptionHTML;
+
+      expect(html.length).toBeGreaterThan(0);
+      expect(result.description.length).toBeGreaterThan(0);
+
+      expect(htmlToPlainText(html)).toBe(cheerioText(html));
+      expect(result.description).toBe(sanitizeText(htmlToPlainText(html)));
+
+      expect(
+        unsupportedNamedEntities(html),
+        `${appId} serves named entities outside the supported set`,
+      ).toEqual([]);
+      expect(
+        unexpectedTags(html),
+        `${appId} serves markup beyond the bare inline tags the decoder assumes`,
+      ).toEqual([]);
+
+      expect(result.description.includes('\r')).toBe(false);
+      if (html.includes('<br>')) {
+        expect(result.description).toContain('\n');
+      }
+    });
+  }
+});

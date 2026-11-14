@@ -1,0 +1,161 @@
+import * as z from 'zod/mini';
+import type { Device } from '../../constants.ts';
+import type { Path } from '../../core/path.ts';
+import { rawArrayPathSchema, rawOptionalArrayPathSchema } from '../../core/raw.ts';
+import { defaulted, optional, required, type SpecMap } from '../../core/spec.ts';
+import { sanitizeText } from '../../core/text.ts';
+import { appDetailsUrl } from '../../core/url.ts';
+import { reviewSchema } from './schema.ts';
+
+export const REVIEWS_RPC_ID = 'UsvDTd';
+export const DEFAULT_REVIEWS_PAGE_SIZE = 150;
+export const MAX_REVIEWS_PAGE_SIZE = 4500;
+
+export const DEVICE_IDS: Record<Device, number> = {
+  mobile: 2,
+  tablet: 3,
+  watch: 4,
+  chromebook: 5,
+  tv: 6,
+};
+
+export interface ReviewsRequest {
+  appId: string;
+  sort: number;
+  count: number;
+  token?: string;
+  score?: number;
+  device?: Device;
+}
+
+function filterSlot(score: number | undefined, deviceName: Device | undefined): readonly unknown[] {
+  if (score === undefined && deviceName === undefined) {
+    return [];
+  }
+  const deviceId = deviceName === undefined ? null : DEVICE_IDS[deviceName];
+  return [null, score ?? null, null, null, null, null, null, null, deviceId];
+}
+
+function encodeSlot(value: unknown): string {
+  return encodeURIComponent(JSON.stringify(value));
+}
+
+function tokenSlot(token: string | undefined): string {
+  return token === undefined ? 'null' : `%5C%22${token}%5C%22`;
+}
+
+export function buildReviewsBody(request: ReviewsRequest): string {
+  const page = `%5B${request.count.toString()}%2Cnull%2C${tokenSlot(request.token)}%5D`;
+  const filters = encodeSlot(filterSlot(request.score, request.device));
+  return `f.req=%5B%5B%5B%22UsvDTd%22%2C%22%5Bnull%2Cnull%2C%5B2%2C${request.sort.toString()}%2C${page}%2Cnull%2C${filters}%5D%2C%5B%5C%22${request.appId}%5C%22%2C7%5D%5D%22%2Cnull%2C%22generic%22%5D%5D%5D`;
+}
+
+export function reviewUrl(appId: string, reviewId: string): string {
+  return appDetailsUrl({ id: appId, reviewId });
+}
+
+export const REVIEWS_RESPONSE_PATHS = {
+  reviews: [0],
+  token: [1, 1],
+} satisfies Record<string, Path>;
+
+export const reviewsCollectionResponseSchema = z.union([
+  z.literal(null),
+  z.tuple([]),
+  rawArrayPathSchema(REVIEWS_RESPONSE_PATHS.reviews, z.nullable(z.array(z.unknown()))),
+]);
+export const reviewsTokenResponseSchema = z.union([
+  z.literal(null),
+  rawOptionalArrayPathSchema(REVIEWS_RESPONSE_PATHS.token, z.nullable(z.string())),
+]);
+
+const shape = reviewSchema.shape;
+const REQUIRED = required();
+const OPTIONAL = optional();
+
+interface RawCriteria {
+  criteria: unknown;
+  rating: unknown;
+}
+
+const MILLISECONDS_PER_SECOND = 1000;
+const NANOSECONDS_PER_MILLISECOND = 1_000_000;
+const MAX_NANOSECONDS = 999_999_999;
+
+const dateTupleSchema = z.tuple(
+  [
+    z.int().check(z.gte(0)),
+    z.optional(z.nullable(z.int().check(z.gte(0), z.lte(MAX_NANOSECONDS)))),
+  ],
+  z.unknown(),
+);
+
+function generateDate(value: unknown): string | undefined {
+  const parsed = dateTupleSchema.safeParse(value);
+  if (!parsed.success) {
+    return undefined;
+  }
+  const [seconds, nanos] = parsed.data;
+  const milliseconds =
+    seconds * MILLISECONDS_PER_SECOND + Math.floor((nanos ?? 0) / NANOSECONDS_PER_MILLISECOND);
+  const date = new Date(milliseconds);
+  return Number.isNaN(date.getTime()) ? undefined : date.toISOString();
+}
+
+function alwaysNull(): null {
+  return null;
+}
+
+function emptyToUndefined(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function cleanReplyText(value: unknown): string | undefined {
+  return emptyToUndefined(sanitizeText(value));
+}
+
+function buildCriteria(entry: unknown): RawCriteria {
+  if (!Array.isArray(entry)) {
+    return { criteria: undefined, rating: null };
+  }
+  const fields: readonly unknown[] = entry;
+  const ratingHolder = fields[1];
+  const ratingFields: readonly unknown[] = Array.isArray(ratingHolder) ? ratingHolder : [];
+  const rating = ratingFields.length > 0 ? ratingFields[0] : null;
+  return { criteria: fields[0], rating };
+}
+
+function mapCriterias(value: unknown): RawCriteria[] {
+  return Array.isArray(value) ? value.map(buildCriteria) : [];
+}
+
+export const reviewItemSpecs = {
+  id: { paths: [[0]], missing: REQUIRED, schema: shape.id },
+  userName: { paths: [[1, 0]], missing: REQUIRED, schema: shape.userName },
+  userImage: { paths: [[1, 1, 3, 2]], missing: OPTIONAL, schema: shape.userImage },
+  date: { paths: [[5]], missing: REQUIRED, schema: shape.date, transform: generateDate },
+  score: { paths: [[2]], missing: REQUIRED, schema: shape.score },
+  scoreText: { paths: [[2]], missing: REQUIRED, schema: shape.scoreText, transform: String },
+  title: { paths: [[0]], missing: REQUIRED, schema: shape.title, transform: alwaysNull },
+  text: { paths: [[4]], missing: OPTIONAL, schema: shape.text, transform: sanitizeText },
+  replyDate: {
+    paths: [[7, 2]],
+    missing: OPTIONAL,
+    schema: shape.replyDate,
+    transform: generateDate,
+  },
+  replyText: {
+    paths: [[7, 1]],
+    missing: OPTIONAL,
+    schema: shape.replyText,
+    transform: cleanReplyText,
+  },
+  version: { paths: [[10]], missing: OPTIONAL, schema: shape.version, transform: emptyToUndefined },
+  thumbsUp: { paths: [[6]], missing: OPTIONAL, schema: shape.thumbsUp },
+  criterias: {
+    paths: [[12, 0]],
+    missing: defaulted(() => []),
+    schema: shape.criterias,
+    transform: mapCriterias,
+  },
+} satisfies SpecMap;

@@ -1,0 +1,159 @@
+import { describe, expect, it } from 'vitest';
+import { plainText } from '../../core/htmlText.ts';
+import {
+  buildHistogram,
+  categoriesFromDetail,
+  descriptionHtmlLocalized,
+  extractCategories,
+  extractComments,
+  extractScreenshots,
+  normalizeAndroidVersion,
+  priceText,
+} from './transforms.ts';
+
+const detailWithDescriptions = (translated: unknown, original: unknown): unknown[] => {
+  const detail: unknown[] = [];
+  detail[12] = [[[null, translated]]];
+  detail[72] = [[null, original]];
+  return detail;
+};
+
+describe('descriptionHtmlLocalized', () => {
+  it('prefers the translated description when present', () => {
+    expect(descriptionHtmlLocalized(detailWithDescriptions('Hallo', 'Hello'))).toBe('Hallo');
+  });
+
+  it('falls back to the original when the translation is empty', () => {
+    expect(descriptionHtmlLocalized(detailWithDescriptions('', 'Hello'))).toBe('Hello');
+  });
+
+  it('returns undefined when neither description is a string', () => {
+    expect(descriptionHtmlLocalized(detailWithDescriptions(null, null))).toBeUndefined();
+    expect(descriptionHtmlLocalized(undefined)).toBeUndefined();
+  });
+});
+
+describe('priceText', () => {
+  it('keeps a nonempty price label', () => {
+    expect(priceText('PLN 5.99')).toBe('PLN 5.99');
+  });
+
+  it('defaults to Free for empty or missing labels', () => {
+    expect(priceText('')).toBe('Free');
+    expect(priceText(undefined)).toBe('Free');
+  });
+});
+
+describe('normalizeAndroidVersion', () => {
+  it('extracts the leading numeric token', () => {
+    expect(normalizeAndroidVersion('4.4 and up')).toBe('4.4');
+  });
+
+  it('returns VARY for non numeric or missing values', () => {
+    expect(normalizeAndroidVersion('Varies with device')).toBe('VARY');
+    expect(normalizeAndroidVersion(undefined)).toBe('VARY');
+  });
+});
+
+describe('buildHistogram', () => {
+  it('reads each star bucket count from the container', () => {
+    const container = [null, [null, 11], [null, 22], [null, 33], [null, 44], [null, 55]];
+    expect(buildHistogram(container)).toEqual({ 1: 11, 2: 22, 3: 33, 4: 44, 5: 55 });
+  });
+
+  it('fills zeros when the container is missing', () => {
+    expect(buildHistogram(undefined)).toEqual({ 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 });
+  });
+});
+
+const commentEntry = (text: unknown): unknown[] => {
+  const entry: unknown[] = [];
+  entry[1] = ['Reviewer'];
+  entry[4] = text;
+  entry[5] = [1700000000];
+  entry[10] = '1.2.3';
+  return entry;
+};
+
+describe('extractComments', () => {
+  it('collects up to five string comments from a validated root', () => {
+    const comments = Array.from({ length: 7 }, (_unused, index) =>
+      commentEntry(`comment ${index.toString()}`),
+    );
+    const result = extractComments([comments]);
+    expect(result).toHaveLength(5);
+    expect(result[0]).toBe('comment 0');
+  });
+
+  it('skips non string texts', () => {
+    const comments = [commentEntry('kept'), commentEntry(null)];
+    expect(extractComments([comments])).toEqual(['kept']);
+  });
+
+  it('returns an empty list for an absent root', () => {
+    expect(extractComments([])).toEqual([]);
+    expect(extractComments(undefined)).toEqual([]);
+  });
+});
+
+describe('extractScreenshots', () => {
+  it('keeps only entries resolving to string urls', () => {
+    const shots = [
+      [null, null, null, [null, null, 'https://img.example/1.png']],
+      [null, null, null, [null, null, null]],
+      [null, null, null, [null, null, 'https://img.example/2.png']],
+    ];
+    expect(extractScreenshots(shots)).toEqual([
+      'https://img.example/1.png',
+      'https://img.example/2.png',
+    ]);
+  });
+
+  it('returns an empty list for a non array value', () => {
+    expect(extractScreenshots(undefined)).toEqual([]);
+  });
+});
+
+describe('extractCategories', () => {
+  it('walks nested arrays and captures name and id leaves', () => {
+    const tree = [[['Casual', null, 'GAME_CASUAL', null]], [['Puzzle', null, null, null]]];
+    expect(extractCategories(tree)).toEqual([
+      { name: 'Casual', id: 'GAME_CASUAL' },
+      { name: 'Puzzle', id: null },
+    ]);
+  });
+
+  it('returns the accumulator untouched for empty or non array input', () => {
+    expect(extractCategories(undefined)).toEqual([]);
+    expect(extractCategories([])).toEqual([]);
+  });
+});
+
+describe('categoriesFromDetail', () => {
+  it('prefers the category tree when it yields entries', () => {
+    const detail: unknown[] = [];
+    detail[118] = [[['Tools', null, 'TOOLS', null]]];
+    expect(categoriesFromDetail(detail)).toEqual([{ name: 'Tools', id: 'TOOLS' }]);
+  });
+
+  it('falls back to the genre cell when the tree is empty', () => {
+    const detail: unknown[] = [];
+    detail[79] = [[['Trivia', null, 'GAME_TRIVIA']]];
+    expect(categoriesFromDetail(detail)).toEqual([{ name: 'Trivia', id: 'GAME_TRIVIA' }]);
+  });
+
+  it('returns an empty list when neither source resolves', () => {
+    expect(categoriesFromDetail([])).toEqual([]);
+  });
+});
+
+describe('description sanitization', () => {
+  it('strips null bytes and control characters from parsed description text', () => {
+    expect(plainText('good\u0000 text\u0007')).toBe('good text');
+  });
+
+  it('strips control characters from the localized html description', () => {
+    const detail = detailWithDescriptions('Hallo\u0000 Welt', 'Hello');
+    expect(descriptionHtmlLocalized(detail)).toBe('Hallo Welt');
+  });
+});

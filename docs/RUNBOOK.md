@@ -1,0 +1,734 @@
+# Play Store Contract Breakage Runbook
+
+Google Play changes its page structure without notice. When it does, the recorded
+fixtures still parse but the live pages no longer match the paths in `specs.ts`.
+This runbook turns that break into a fifteen minute patch.
+
+1. **Signal.** The scheduled `Live contract tests` workflow fails and an issue
+   labeled `contract-breakage` appears, or users report a `SpecError`. The issue
+   names every failing suite in its title and lists each failing test with the
+   `SpecError` field lines (broken fields and the paths that were tried) inline,
+   so triage starts without opening the run log.
+
+2. **Refresh and reproduce.** Run `pnpm fixtures:update`, then `pnpm test`. The
+   failing tests throw `SpecError`s that name every broken field and the paths
+   that were tried. Scope the refresh to the features named in the issue title
+   with `pnpm fixtures:update <feature>` (for example `pnpm fixtures:update app`)
+   to skip re-recording unaffected suites.
+
+   `search/biedronka-pl.html` is recorded from the `pl` storefront on purpose: it
+   is the only fixture whose exact match card sits outside the first section, so
+   it is the offline reproduction of issue #113. A refresh that flattens it fails
+   the shape gate in `src/features/search/search.test.ts` with a message naming
+   the re-record task. Re-record it from a query that still serves a card outside
+   the first section rather than deleting the gate.
+
+   `cluster/offer-items.json` is a frozen live snapshot that `pnpm fixtures:update`
+   never touches: it holds 16 raw continuation items captured on 2026-10-02,
+   including a sale to zero that no longer exists to record. Keep it as is, and
+   add a new entry beside it when a fresh offer shape needs pinning.
+
+3. **Repair the paths.** Open the matching `src/features/<name>/specs.ts`, inspect
+   the refreshed fixture (search the expected value in the raw HTML or batch
+   payload to find its new indexes), and update only the paths. Prefer appending
+   the new path before the old one so both page generations keep working during
+   rollout.
+
+4. **Check moved blocks.** When a whole `ds:` block moved, inspect
+   `AF_dataServiceRequests` in the refreshed fixture. One RPC ID may bind several
+   `ds:` blocks. The parser evaluates every block bound to the declared RPC ID
+   and selects the only candidate that passes the root's structural schema. If
+   the RPC ID changed, update the root spec's `rpcId`. Do not change it merely
+   because the absolute block key moved.
+
+5. **Verify and ship.** Verify with `pnpm test && pnpm test:e2e`, commit as
+   `fix(<feature>): repair <field> paths after play store change`, merge, and let
+   Release Please cut the patch.
+
+6. **Close out.** Close the breakage issue with a link to the fix commit.
+
+## RPC anchor diagnostics
+
+An `rpc-anchor-fallback` integrity event means no block reached through the
+declared RPC ID passed structural validation, but a declared absolute `ds:`
+fallback did. Treat the event as an early contract-drift warning even when the
+public result still looks correct.
+
+1. Refresh only the affected fixture with `pnpm fixtures:update <feature>` and
+   reproduce with `pnpm test`.
+2. Inspect `AF_dataServiceRequests` and list every key bound to the event's RPC
+   ID. Compare each block with the root schema and the recorded fixture before
+   changing the anchor.
+3. Update the `rpcId` only when Google changed the stable RPC ID for the same
+   response semantics.
+4. Update an absolute fallback only after confirming that the new block carries
+   the same semantic root. Keep still-valid fallbacks during a rollout.
+5. Add or update an in-memory routing mutation that moves the root, reverses
+   routing order, and proves no fallback event is emitted on the repaired route.
+
+An ambiguity `ParseError` names two or more routed keys because more than one
+candidate passed the structural root schema. Routing-table order must not decide
+the winner. Inspect the candidates and tighten the schema around stable root
+structure until exactly one validates; do not pick the first key or delete a
+valid route to silence the error.
+
+A `developer` continuation raises the same event with a message of the form
+`continuation apps resolved at <path> instead of <path>`. It means the page carrying the apps
+sat at the declared fallback layout rather than at the primary one, so the public result is
+still complete. The primary layout follows the kind of `devId`: `NUMERIC_CLUSTER_LAYOUT` for
+numeric ids and `NAME_CLUSTER_LAYOUT` for names, both in `src/features/developer/specs.ts`.
+
+1. Record the continuation with `pnpm fixtures:update developer-continuation` and compare the
+   apps and token positions with both layouts.
+2. Promote the layout Google now serves to primary for that kind of `devId` and keep the other
+   as the fallback during the rollout.
+3. Extend the recorded fixture tests so the repaired route emits no event.
+
+The other integrity reasons have narrower responses:
+
+- `optional-section-parse`: refresh the fixture and inspect the named
+  best-effort section. Required fields and roots must still fail loudly.
+- `pagination-token-cycle`: preserve the captured request sequence, confirm the
+  repeated token, and inspect the pagination response before changing token
+  extraction. Tokens must never be written to logs or event messages.
+- `section-anchor-fallback`: the exact match card resolved outside its declared
+  anchor. The event message names the section and index where it was found.
+  Refresh the search fixture, move `EXACT_MATCH_MAPPINGS.card` to the reported
+  index, and confirm the event stops. The public result is already correct, so
+  this is a scheduled repair rather than an outage for consumers, but leaving it
+  unrepaired means the next drift has no anchor left to fall back from. The
+  exact match tripwire below therefore fails the live run on it, the same way
+  the suite already fails on `rpc-anchor-fallback`, so that the repair is
+  actually scheduled rather than accumulated.
+
+### Cluster continuation end
+
+The last continuation page of a cluster serves its token node (`[0, 0, 7]` for
+`similar`) as `null`, or omits it. That is the normal end of the list, and the
+optional raw path schemas read `null` like an absent value. A
+`cluster-page-parse` event whose message names the token response means the
+node held something that is neither `null`, absent nor a `[?, token]` pair, so
+treat it as a path drift and diff the `PAGINATION_MAPPINGS` and
+`CLUSTER_MAPPINGS` constants against a fresh recorded continuation
+(`pnpm fixtures:update similar-continuation`).
+
+A continuation that Google answers with a null payload and status `5` (a
+`wrb.fr` frame whose data slot is `null` and whose status slot reads
+`[5, null, [[...PlayDataError, [1]]]]`) ends the list the same way and raises no
+event: the server had nothing more to serve for that token. Any other status
+with a null payload still raises `cluster-page-parse`. Status `3` is what Google
+returns when the request body itself is malformed, so treat it as a drift in
+`buildClusterBody` or `clusterUrl` rather than in the response paths.
+
+## Live contract assertion rules
+
+The scheduled suite exists to catch scraper breakage, not catalogue movement. An
+assertion that fails because Google reshuffled its catalogue creates a false
+`contract-breakage` issue and trains everyone to ignore the signal. By default
+an assertion under `e2e/` must therefore stay true no matter what Google serves
+today, which leaves four ordinary kinds:
+
+1. **Shape.** A field exists with the right type, a url resolves to the store
+   origin, an icon is served over https.
+2. **Cross-field consistency.** Two fields that come from _different_ page
+   nodes have to agree: `free` against `price` and `currency`, `score` against
+   `scoreText`, `installs` against `minInstalls`, the histogram against the
+   rating count. These are the sharpest breakage detectors in the suite because
+   a drifted path breaks the agreement immediately while catalogue movement
+   never does. Two fields parsed from the same node are not an invariant, they
+   are a tautology: `offersIAP` and `IAPRange` both read `[1, 2, 19, 0]`, so
+   only the shape of `IAPRange` is worth asserting. Agreement is only an
+   invariant where the page derives one field from the other. Two counts that
+   Google computes separately are not in a subset relation even when one reads
+   as a subset of the other in every sample: issue #175 came from requiring
+   the review count to stay at or below the rating count, and a game three
+   weeks out of preregistration served 145 ratings, a histogram summing to 143
+   and 376 reviews. A bound between two independently computed quantities,
+   measured from samples, is catalogue state whatever its margin. The
+   histogram tolerance below is different in kind: the buckets and the rating
+   count are one identity (the buckets sum to the count) read at two moments,
+   and the tolerance absorbs the lag between those moments.
+3. **Self-anchoring.** The assertion derives its expectation from the same
+   run, for example the search result set matching the first page it was built
+   from, or `list` returning exactly `num` items for a `num` below the chart
+   depth the same run just measured.
+4. **Immutable fact.** A release date already in the past, an app id that
+   resolves forever, a category id that is part of the taxonomy constant.
+
+Two further kinds are deliberate exceptions that do detect external change, so
+each one has to be registered in this runbook before it is written:
+
+5. **Controlled anchor.** A listing this repository's maintainer owns, such as
+   `com.adex77.WhereAmI` or the `Adex77` developer id. A change there is a
+   deliberate change by the person reading the failure, not a surprise. Prefer
+   this over any pool whenever an owned listing can carry the state.
+6. **Regime tripwire and maintained anchor pool.** A documented probe of
+   Google's serving behaviour, listed under "Serving regime tripwires", or a pool
+   that guards a state no owned listing can reach, listed under "Maintained
+   anchor pools". These fail on purpose when Google changes, and their failure
+   messages have to name the maintenance task rather than read as a parse break.
+
+Outside those two registered exceptions, never assert third-party catalogue
+state. Concretely, do not pin how many apps Google recommends for a listing,
+how many apps a developer publishes, whether a specific app currently has zero
+reviews or zero ratings, whether a category is currently empty, whether a game
+is still in preregistration, where an app ranks for a search term, or whether a
+class of item is currently served inside a Google served set: an unrated legacy
+review behind the watch filter, a tablet review inside a recent date window, a
+shared data entry that declares a purpose, or any review at all behind a device
+or score filter. Issue #161 came from the first of those: the parser accepted
+every review Google served, and the run failed because Google served a watch
+window without one of its 2011 era unrated reviews, which it served again an
+hour later. Issue #169 came from the last: the Maps watch stream served nothing
+for three attempts over thirty seconds and 2802 reviews three hours later, and
+Spotify's watch stream flipped the same way within minutes. A filtered stream
+is a Google served subset, so its emptiness is served state even on a flagship;
+take the anchor for a filtered probe from `findReviewFilterAnchor` in
+`e2e/reviewAnchors.ts` instead of naming an app. Assert the invariant that holds
+in either state and let the test follow the catalogue.
+
+When a state still deserves live coverage, branch on what the page actually
+reports instead of assuming a state:
+
+```ts
+if (listing.ratings === undefined) {
+  expect(page.data).toEqual([]);
+}
+expectReviewsContract(page.data, label);
+await annotate(`${label}: ${page.data.length.toString()} reviews`, 'notice');
+```
+
+A rating does not imply a written review, so the rated branch asserts the
+contract on whatever Google serves and reports the count instead of requiring
+one.
+
+Report which branch ran with vitest's `annotate` so a reader of the run can see
+that coverage moved, without the run failing over it.
+
+### Counting rules
+
+Counts are where catalogue state sneaks back in, so they get their own rules.
+Issue #116 came from a suite that demanded a hundred apps from Google's own
+developer page. Measured on 2026-09-10, two consecutive calls returned 94 and
+then 95 apps, with different sets and 84 of 94 positions reordered, so no fixed
+number could ever have been right. Issue #119 repeated it on a top chart: the
+suite pinned TOP_FREE APPLICATION at 200 apps and on 2026-09-17 Google served
+199, three calls in a row, while GAME_TRIVIA, recorded at 162 a week earlier,
+filled to 200.
+
+Count floors never detect a parse break. Every item extractor is all or
+nothing: a malformed item throws a `SpecError`, and every path that skips data
+on purpose reports it through `onDegradation` or `onIntegrityEvent`. A drifted
+path therefore shows up as an error, an event, or an empty array, never as a few
+items fewer. The one surface that can lose part of its result silently is
+`permissions`, whose common and other sections resolve independently, and that
+is guarded by requiring both sections on the owned `com.adex77.WhereAmI`
+listing rather than by a count. The group name of each entry is read leniently
+(an unreadable name becomes an empty string), so the live suite also requires a
+non empty `group` on every entry. A live count assertion may only take one of
+these shapes:
+
+1. **Non empty.** `count > 0` on an unfiltered primary surface (a flagship's
+   first review page, a chart, a search, a developer page, the report sections
+   of the primary anchor) or on an owned listing, where emptiness is the
+   symptom of a path that drifted onto nothing. A filtered or secondary review
+   stream of a third party app is served state even when it is non empty today
+   (issue #169), so its anchor comes from `findReviewFilterAnchor` and nothing
+   downstream requires it to be non empty. A test that needs two items to mean
+   anything, such as an ordering check, may require two.
+2. **Requested ceiling.** `count <= num`. `num` is forwarded or sliced by this
+   library, so returning more than was asked is a real break.
+   `expectRequestedCountContract` asserts both this and the non empty shape.
+3. **Proven equality.** `count === num` only when the same run proves more than
+   `num` items exist: an anchor fetched first served more than `num`, or served a
+   continuation token and `num` sits one item past it.
+4. **Relational.** A count measured against another count from the same run,
+   such as an aggregate against the first page it continued from, or an overlap
+   against the size of the page it was taken from.
+5. **Library constants and controlled anchors.** A cap this library imposes
+   (`SIMILAR_MAX_APPS`, the five suggestion cap), the taxonomy constant behind
+   `categories()`, and exhaustion probes on owned listings.
+
+Everything else is catalogue state: a floor such as "more than ten results", a
+ceiling such as "at most forty on the first page", or an equality such as "the
+chart holds 200 apps". None of them is allowed, whatever the measured margin.
+
+Request counts are counts too. The library issues `ceil(num / pageSize)`
+requests only while Google fills every sized page; a short page makes it follow
+the token once more, so `requests === 1` and `requests === 3` pin the page fill
+rather than the code. Two shapes keep what a request count can prove:
+
+1. **Sized floor.** `requests >= ceil(count / pageSize)` through
+   `expectSizedRequestFloor`, where `count` is what the call returned. No single
+   request may serve more than `pageSize` items, so the bound holds whether the
+   stream filled `num` or ran out before it. A page size that never reached
+   Google serves the library's fallback page size (150 for a manual page, 4500
+   for a `num` read), covers the count in fewer requests, and fails the bound,
+   while a short page only adds requests.
+
+2. **Stop after the first item.** An iterator that must not prefetch is proven
+   lazy by breaking after the first yielded item and requiring one request,
+   which holds for any non empty page.
+
+The offline suite proves that the request body carries the size, so a live
+test never needs an exact request count for that. The one exact request count
+left in the suite sits on the owned `com.adex77.WhereAmI` exhaustion probe,
+which rule 5 above allows: its whole catalogue fits one page by the
+maintainer's own choice.
+
+"A continuation was followed" is expressed against the first page of the same
+surface, never against a constant. Fetch that page with
+`fetchDeveloperFirstPage`, `fetchSearchFirstPage` or `fetchSimilarFirstPage`, or
+read a `paginate: true` reviews page through `reviewsAnchor`, then hand it to
+`expectContinuationContract`, which requires the aggregate to stay within the
+requested limit and to exceed the page it continued from. A probe whose first page stops carrying a token fails with a
+message naming the re-anchor task, because that is a serving regime change and
+not a parse break.
+
+Whether one third party listing serves a continuation token is served state, so
+a continuation probe never names a single third party app or term as its
+anchor. Search takes its anchor from `findSearchContinuationAnchor`, a filtered
+review stream from `findReviewFilterAnchor`, and a similar cluster from
+`findSimilarContinuationAnchor`; each walks a maintained pool and fails only
+when no anchor serves a token. For search and similar the anchor and the
+library call under test also have to read the same first page, because Google
+can serve one cluster with a token on one request and without it on the next:
+build both on one `memoizingResolveClient()` so the aggregate is measured
+against the page it actually continued from.
+
+Three shapes follow from those rules and are worth copying. `num` equal to the
+live first page count must return exactly that page, and `num` one past it must
+return exactly one more item, which pins the slice at the sharpest place there
+is, the cluster boundary. For a single request surface such as `list`, request
+far past the depth first, then request half of what that run served and require
+exactly that many, which proves `num` reaches Google without naming a depth.
+Every number derives from the same run, so they hold whether the catalogue grows
+or shrinks.
+
+Exact slicing beyond the boundary belongs offline, where it is deterministic:
+`src/features/developer/developer.test.ts` already proves `num` 13 across a
+recorded continuation and `num` 5 when the first page satisfies it.
+
+### Shared invariants
+
+`e2e/contracts.ts` holds the invariant helpers. Reach for them before writing a
+bespoke loop of assertions, and add to them when a new cross-field agreement
+turns up:
+
+- `expectAppItemContract` and `expectAppItemsContract` for search, list, similar
+  and developer items.
+- `expectListingContract` for a full `app()` result, which composes the offer,
+  offer node, rating, histogram, installs, purchase and release state
+  invariants.
+- `expectReviewContract` and `expectReviewsContract` for review pages.
+- `expectRequestedCountContract` for any result requested with a `num`.
+- `expectSizedRequestFloor` for a request counter measured against `num` and
+  `pageSize`.
+- `expectTaxonomyMembership` for a listing's `genreId` and category ids, which
+  are immutable facts of the taxonomy constant rather than a publisher's current
+  category.
+- `expectContinuationContract` for a paginated aggregate measured against the
+  first page it continued from.
+- `findReviewFilterAnchor` in `e2e/reviewAnchors.ts` for any review probe that
+  carries a `device` or `score` filter. It walks `REVIEW_FILTER_ANCHORS` and
+  returns the first app whose filtered first page serves reviews and a
+  continuation token, so the probe never requires a single third party app to
+  serve a filtered stream.
+- `expectSearchListingAgreement` for a search item measured against the same
+  app's listing, which catches drift on either surface.
+- `expectOfferAgreement` for a cluster item measured against the same app's
+  listing within one run. `expectListingOffersAgree` in `e2e/helpers.ts` samples
+  priced items first, then free ones, and requires an item priced above zero in
+  that sample, so a surface that reads the price from anything but the offer
+  micros cannot pass on free apps or sales to zero alone.
+- `expectFieldFilledSomewhere` and `expectFieldFilledOnEachPageShape` in
+  `e2e/fieldPresence.ts` for the optional fields of a result set, which must be
+  filled on at least one item of every page shape the set contains. See
+  "Optional field presence".
+
+The offer fields deserve their own note, because they are the one place where
+absence carries meaning. `price`, `currency` and `priceText` are three sibling
+indices of a single offer node, and `originalPrice` and `discountEndDate` hang
+off the same parent. When Google serves no offer node the parser falls back to
+`price` 0, `free` false and `priceText` "Free", so an undefined `currency` is
+the signal that the whole node was missing. `expectOfferNodeConsistency` asserts
+that implication on every listing: it fires the moment one of those indices
+drifts while its siblings still resolve, and never fires when a listing changes
+what it costs.
+
+A consequence worth stating plainly: `free` false is not the claim "this app
+costs money", because an offerless listing also reads as `free` false with
+`price` 0. Read `currency` first when deciding which state a listing is in.
+
+Continuation items (`similar` and `developer` past their first page) read
+`price` and `free` from the offer micros like first page items do, never from
+the display text, because the text is
+locale formatted: `4,69 €` and `R$ 19,99` carry a decimal comma, `￥1,300` a
+thousands comma, and an Arabic storefront serves Eastern Arabic digits. A
+listing on sale to zero is `price` 0 and `free` true on every surface, the same
+as its `app()` result. A continuation item with no offer node at all reads
+`free` true, because Google drops the node for free apps on those pages, while
+a first page item with no offer node reads `free` false like a search row. So
+an undefined `currency` on a continuation item does not separate a free app
+from an offerless listing; call `app()` when that distinction matters.
+
+Two tolerances in the suite are measured, not guessed, and both sit between
+fields the page derives from one another:
+
+- The histogram tracks the rating count to within `max(10, 10% of ratings)`.
+  The histogram total always sat at or below the rating count, and the gap
+  ratio grows as listings shrink: measured on 2026-09-17 across 35 listings it
+  was under 0.01% above a million ratings, 1.07% at 3556, 1.63% at 7723 and
+  5.1% at 39, where the floor of ten takes over, and on 2026-10-29 across 150
+  rated listings the worst gaps were 2 of 13, 1 of 7 and 3 of 26, all inside
+  the floor. The earlier 1% figure came from flagship listings only. The
+  review count is not part of this tolerance in any direction: it is a count
+  Google computes on its own and it exceeded the rating count on
+  `com.tencent.mhadv` (issue #175).
+- `scoreText` is the score rounded to one decimal, so it agrees to within 0.051
+  once the locale decimal comma is normalized.
+
+Two localized formats decide whether a check runs at all. The install count
+comparison only runs when the string is plain grouped ASCII digits, so a
+storefront that abbreviates the tier (`10万+`) or uses Arabic-Indic digits skips
+the equality instead of comparing a value it cannot read. The `IAPRange` shape
+check accepts any Unicode decimal digit, because the Arabic storefront serves
+`‏١٢٫٩٩ ج.م.‏ - ‏١٢٬٢٤٩٫٩٩ ج.م.‏ لكل عنصر` and the Japanese one serves
+`￥50～￥57,800/アイテム`.
+
+Re-measure with a scratch probe before moving either of them.
+
+### Maintained anchor pools
+
+A state that needs a live true branch belongs on a controlled anchor whenever an
+owned listing can reach it. `com.adex77.WhereAmI` carries `adSupported`,
+`offersIAP`, and every optional media field (`video`, `videoImage`, `IAPRange`,
+`released`, `contentRatingDescription`, `recentChanges`), so those gates sit on
+it directly rather than on a pool of third-party apps.
+
+Three states have no owned anchor, because Google decides them and none can be
+arranged for a maintainer's own app:
+
+- `EXACT_MATCH_CARD_CANDIDATES` in `e2e/search.e2e.test.ts` must keep one
+  package id whose search serves an exact match card. It is registered under
+  "Serving regime tripwires" above, where its re-anchoring task is written out.
+- `PLAY_PASS_CANDIDATES` in `e2e/edgeCases.e2e.test.ts` must keep one title in
+  Play Pass. It runs against four titles and fails only when all four have left,
+  which is the only live gate on the `[1, 2, 62]` path.
+- `PAID_CATALOGUE_DEV_ID` in `e2e/developer.e2e.test.ts`, the German cluster of
+  the first `PAID_SIMILAR_CONTINUATION_ANCHORS` entry that serves a token and
+  the German paid search continuation in `e2e/search.e2e.test.ts` must each
+  keep serving a priced item past the first page, because
+  `expectListingOffersAgree` can only prove that a continuation price was read
+  from the offer micros on an item that costs something. Its failure message
+  ends in "re-anchor the paid sample". Measured on 2026-11-12,
+  `PAID_CATALOGUE_DEV_ID` published 110 apps, every one of them paid, on both
+  the `de` and `sa` storefronts.
+- `SIMILAR_CONTINUATION_ANCHORS` and `PAID_SIMILAR_CONTINUATION_ANCHORS` in
+  `e2e/similarAnchors.ts` must each keep one listing whose similar cluster
+  serves a continuation token on its first page. See "Similar continuation
+  pool" below.
+- `REVIEW_FILTER_ANCHORS` in `e2e/reviewAnchors.ts` must keep one phone first
+  listing whose review stream serves a page with a continuation token behind
+  every device filter and behind a score filter. `findReviewFilterAnchor` walks
+  the pool and fails only when no anchor serves both reviews and a token: every
+  filtered page empty means Google changed the filter regime and the `device`
+  and `score` options return nothing for everyone, while reviews without a token
+  on every anchor means the filtered streams shrank below one page, so the pool
+  needs larger listings. The message names the filter it tried so the two states
+  can be told apart from the page sizes. Measured on 2026-10-23, `com.whatsapp`,
+  `com.google.android.youtube`, `com.netflix.mediaclient` and
+  `com.facebook.katana` each served 40 reviews with a token for tablet, watch,
+  Chromebook and TV, and `com.whatsapp` served 20 one star reviews with a token
+  on every sort and a five star page of 5 with a token; Maps, Strava and Google
+  Fit were left out because their TV streams are shorter than one page.
+  Re-anchor as
+  `test(e2e): re-anchor the review filter pool`.
+- The data safety suite carries four single listing anchors whose state Google
+  or the publisher decides: Instagram declaring shared data, YouTube Kids
+  serving a linked security practice description, VK offered on the `us`
+  storefront and withheld on `de`, and PhonePe gaining the UPI practice on the
+  `in` storefront. Each failure message ends in "re-anchor the ... anchor".
+
+The play pass failure message says "re-anchor the pool". That is a maintenance
+task, not a
+scraper break: replace the drifted ids with listings that are in the wanted
+state and commit as `test(e2e): re-anchor the play pass pool`. Never delete the
+pool assertion instead, since dropping it leaves `isAvailableInPlayPass` with no
+live coverage of its true branch.
+
+`PREREGISTRATION_CANDIDATES` deliberately carries no such gate. Preregistration
+listings launch, so the suite asserts the state conditional invariants on each
+candidate and annotates how many are still unlaunched. Both branches of the
+parser are covered offline in `src/features/app/app.test.ts`, so a fully
+launched pool costs live coverage but never fails the run.
+
+Preregistration and the offer node are independent, and conflating them broke
+the scheduled run once already. Measured on 2026-08-28,
+`com.ironhidegames.android.kingdomrush6.genesis` preregistered while serving a
+full `[0, "USD", ""]` offer tuple, while three other candidates preregistered
+with no offer node at all. Carrying an offer node is the publisher's choice, not
+a property of the release state, so never assert one from the other.
+
+Refresh that list from Google's own preregistration shelf, which search does not
+surface:
+
+```
+https://play.google.com/store/apps/collection/promotion_3000000d51_pre_registration_games?hl=en&gl=us
+```
+
+Scrape the `id=` parameters out of that page, confirm `preregister` on a handful
+with `app()`, and commit the replacements as
+`test(e2e): refresh the preregistration candidates`.
+
+### Similar continuation pool
+
+A similar cluster is a set Google recommends, so its size and whether its first
+page carries a continuation token are served state. Issue #197 came from
+pinning both on single third party apps. Measured on 2026-11-12,
+`com.tencent.mhadv`, the sparse anchor that had served a first page with a
+token and a second page of 20 apps, served 27 apps and no token three times in
+a row, and the German cluster of `com.mojang.minecraftpe` served 31 apps
+without a token on five requests and 50 apps with a token on a sixth, minutes
+apart. Every tokenless page parsed cleanly and held no token anywhere in its
+HTML, so the parser read exactly what Google served.
+
+`findSimilarContinuationAnchor` therefore walks a pool and returns the first
+listing whose first page serves a token, and every similar continuation test
+runs the library on the same `memoizingResolveClient()` that surfaced the
+anchor, so a cluster that flips between two requests cannot split the anchor
+from the result. `SIMILAR_CONTINUATION_ANCHORS` holds four flagships
+(`com.google.android.apps.translate`, `com.whatsapp`, `com.spotify.music`,
+`com.duolingo`), each serving 50 apps and a token on the `us` storefront on
+2026-11-12. `PAID_SIMILAR_CONTINUATION_ANCHORS` holds four paid games for the
+German offer probe: `com.and.games505.TerrariaPaid` and
+`com.ustwo.monumentvalley` served 32 priced items past the first page,
+`com.robtopx.geometryjump` 11, and `com.mojang.minecraftpe` 3 on the requests
+that carried a token.
+
+`SPARSE_SIMILAR_ANCHORS` holds clusters that ended below `SIMILAR_MAX_APPS`
+after a continuation, which is the only live route onto a final page with a
+null token node: `com.innersloth.spacemafia` ended at 75 apps,
+`com.robtopx.geometryjump` at 78 and `com.nianticlabs.pokemongo` at 91, and
+`com.tencent.mhadv` stays first in the pool for the day its cluster grows back.
+Where a cluster ends is served state too, so the sparse probe annotates what
+the token node of the continuation page held and never asserts it. The
+`similar-continuation` fixture recorder walks the same pool and records the
+first cluster that ends on a null token node. Both walks skip a pool entry
+whose listing or cluster link answers 404, so one shrunken or delisted listing
+cannot fail the probe or abort `pnpm fixtures:update`.
+`test/fixtures/similar/mhadv-continuation-last.txt` keeps the name of the
+listing it was first recorded from, and the offline tests pin its 20 apps and
+the `DHGAMES` developer link, so update them together with any fresh recording.
+
+The tokenless branch is covered on the owned `com.adex77.WhereAmI` listing: a
+first page without a token must be the whole result, compared by app id against
+the first page of the same run.
+
+When the pool fails because no anchor serves a token:
+
+1. Probe a handful of flagship listings with `fetchSimilarFirstPage` and read
+   `token`. If any of them serves one, replace the pool whose app ids the
+   message lists in `e2e/similarAnchors.ts` with listings that do and commit as
+   `test(e2e): re-anchor the similar continuation pool`.
+2. If none does, either Google stopped paginating similar clusters or the first
+   page token moved off `CLUSTER_PAGE_MAPPINGS.token`. Record a cluster page
+   with `pnpm fixtures:update similar` and search it for a string beginning
+   `IAB`, which is how every continuation token has started so far. A token
+   found at another index is a path drift to repair in
+   `src/features/similar/specs.ts`; no token on a cluster the browser still
+   scrolls means the pagination contract changed and has to be ported again.
+
+## Serving regime tripwires
+
+Three e2e tests pin the current Google Play serving regime instead of the code:
+
+- `confirms google still serves an exact match card for a package id search` in
+  `e2e/search.e2e.test.ts`
+- `confirms google still serves a search continuation token for a short term` in
+  `e2e/search.e2e.test.ts`
+- `confirms the numeric first page still requires a continuation` in
+  `e2e/developer.e2e.test.ts`
+
+The exact match tripwire is the only live gate on the card path. The card is
+parsed by `exactMatchSpecs`, which shares no path with the ordinary result
+specs, and four of its fields have a single source each in the page, so a
+drift there deletes the top result silently. On the first result page
+`developerId` is produced by `exactMatchSpecs` alone (continuation results read
+it from the cluster item link), so a first result carrying one proves the card
+path ran rather than the list happening to rank the app first. No owned listing
+can carry this state: measured on 2026-09-11, a package id search for
+`com.adex77.WhereAmI` serves a list and no card in both the `us` and `pl`
+storefronts, so `EXACT_MATCH_CARD_CANDIDATES` is a maintained pool under the
+rules above and fails only when every anchor has lost its card. Re-anchor the
+pool against package ids Google still serves a card for and commit as
+`test(e2e): re-anchor the exact match pool`. Never delete the assertion
+instead, since dropping it leaves the card path with no live coverage at all.
+
+No page size or chart depth is pinned as a constant, because a size that is
+asserted fails the day Google resizes a page that the parser still reads
+correctly. Every size the suite needs is read live. Measured for reference only:
+on 2026-09-10 the numeric developer first page served 10 apps and a token, the
+similar cluster's first page 50 apps and a token, an English search first page
+30 results for "geography quiz" and 20 for "panda", and a reviews page 150
+reviews. On 2026-10-02 a search first page carried a continuation token for the
+single character terms and digits (50 apps) and for a minority of app names
+(an exact match card plus 21 or 22 apps, among them "minecraft", "gmail" and
+"reddit"), and for none of 89 randomly drawn app titles. The continuation
+served 100 apps per request and ended at 180 to 250 apps in total, a count that
+moved between runs, so only the first page of the same run is ever a reference.
+On 2026-09-17 TOP_FREE APPLICATION served 199 apps at `num` 250 and
+500, GAME_TRIVIA 200, and every chart honoured a smaller `num` exactly. On 2026-09-22 the
+reviews RPC honoured every page size from 1 to 4500 exactly, served an empty payload with no
+token for 4501 and above, applied the score filter on all three sorts and the device filter
+for the four exposed device ids across two pages, and treated a continuation token as a
+position cursor independent of the filters and page size that minted it.
+
+A tripwire failure means Google changed the serving regime, not that the code
+broke. Re-port the affected contract before touching the assertion.
+
+Two of the three tripwires live in `e2e/search.e2e.test.ts` and fail for
+unrelated reasons. The continuation token one is answered by the procedure
+below. The exact match card one is answered by re-anchoring the pool as
+described above it.
+
+Search pagination is opportunistic. Google serves a continuation token only for
+some terms, so `SEARCH_CONTINUATION_ANCHORS` in `e2e/searchAnchors.ts` is a
+maintained pool: the tripwire fails only when no anchor serves a token, and the
+continuation tests take the first anchor that does. Every other assertion about
+the continuation is relational (the aggregate stays within `num`, exceeds the
+first page of the same run, repeats no app).
+
+When the search continuation token tripwire fires because no anchor serves a
+token:
+
+1. Probe a few single character terms and app names with `fetchSearchFirstPage`
+   and read `page.token`. If any of them still serves one, replace the pool in
+   `e2e/searchAnchors.ts` with terms that do and commit as
+   `test(e2e): re-anchor the search continuation pool`.
+2. If none does, Google withdrew search pagination again, as it did in
+   July 2026. Open `play.google.com/store/search?q=a&c=apps` in a browser with
+   the network panel filtered to `batchexecute` and scroll to the bottom of the
+   results. Note the `rpcids` of any request that returns app items: in July
+   2026 only `teXCtc` fired and it returns related-search chips, not apps.
+3. Do not touch the continuation tests until step 1 or 2 has decided whether the
+   regime changed. A continuation that is still served but fails to parse shows
+   up as a `cluster-page-parse` degradation event with the continuation tests
+   red and the tripwire green. Search continuation items use the cluster item
+   shape (`src/core/clusterItem.ts`), the same one `similar` and `developer`
+   read, so diff a fresh recorded continuation
+   (`pnpm fixtures:update search-continuation`) against
+   `test/fixtures/search/fl-studio-mobile-continuation.txt`.
+
+Never satisfy a tripwire by weakening it: thresholds fall under hard rule 11,
+so the fix is always a re-port of the contract, never a threshold tweak.
+
+## Optional field presence
+
+An optional field (`score`, `scoreText`, `summary`, `currency`, review `text`,
+`userImage`) legally parses as `undefined`, so a path that drifts onto nothing
+produces a green run with hollow data instead of a `SpecError`. The live
+suites guard that through `expectFieldFilledSomewhere`, which requires each
+listed field to be filled on at least one item of the result set, and
+`expectFieldFilledOnEachPageShape`, which runs the same check on the first page and
+on the continuation of an aggregate that crossed a cluster boundary. Those are
+the two signatures a drift has: a moved path fills nothing on any item, and a
+continuation shape that broke fills nothing past the first page. How many
+items fill a field is catalogue state (a chess search filled `score` on 23 of
+30 results on 2026-10-29, a top chart on 100 of 100), so no suite asserts a
+fill ratio.
+
+A failing gate names the page shape in its label, and that label is the
+triage:
+
+- **A `... first page` label, or a surface without a continuation** means a
+  moved path. Run `pnpm coverage:live` to see which other anchors starve the
+  same field, then fix the matching `src/features/<name>/specs.ts` per the
+  steps above and refresh the fixtures with `pnpm fixtures:update`.
+- **A `... continuation` label while the `... first page` gate of the same
+  test is green** means the continuation shape broke, so start at
+  `src/core/clusterItem.ts`. The report script reads whole aggregates and
+  cannot show this split, which is why the gate carries it.
+
+Never satisfy a presence gate by dropping the field from the list or by turning
+it into a ratio (hard rule 11): the fix is a re-port of the path.
+
+## Rate limit and cancellation semantics
+
+Two symptoms in this area look like breakage and are not.
+
+**A `RateLimitError` with no retries.** The client honors a `Retry-After` header
+only up to `MAX_RETRY_AFTER_MS`, 60 seconds, in `src/core/http.ts`. A longer
+value ends the call immediately with the mapped status error rather than parking
+it for minutes; the ceiling is fixed and independent of `timeoutMs`. One fetch, no retry, and a `429` in the
+error's `status` is the expected shape, not a bug. If Google starts routinely
+serving values above the cap, that is a serving regime change: record the
+measured values in a pull request before touching the constant, and never raise
+it to green a run.
+
+**A wait that ignores the header.** `Retry-After` is parsed to RFC 9110's
+grammar, `1*DIGIT` or an HTTP date beginning with a day name. Anything else,
+including an empty header, `1e3`, `0x10`, `1.5` and a past or present date, falls
+back to jittered exponential backoff. A server sending a non-conforming value
+will therefore appear to be ignored, which is correct.
+
+Cancellation is terminal and immediate at every stage: before the call, during
+the request or body read, during backoff or a `Retry-After` wait, and while
+queued behind a throttle slot. An aborted call performs no fetch, consumes no
+rate slot, and leaves no listener on the caller's signal. It emits no lifecycle
+hook event past the point of abort, with one exception: a custom `fetchImpl`
+that ignores `init.signal` still yields an `onResponse` event when its late
+response settles, and the call then rejects with the caller's reason. `e2e/client.e2e.test.ts` gates the queued
+case live: with a throttle of one request per second, four calls sharing one
+signal must all settle inside the first throttle window. Before the fix that run
+took 3002 ms; after it, 205 ms. A regression there means the signal stopped
+reaching the limiter, not that Google changed anything.
+
+## Cache semantics
+
+Three symptoms around `memoized()` look like breakage and are not.
+
+**A degradation or integrity event on a call that made no request.** Cache
+hits replay the events recorded when the entry was fetched, in their original
+order, to the callbacks of the call that hit. That is by design: a cached
+degraded payload must be reported as degraded to every caller, or the
+`onDegradation` and `onIntegrityEvent` channels stop being observability the
+moment a cache sits in front of them. `src/core/cache.ts` records the events on
+the entry; `src/core/cache.test.ts` pins the replay across a callback boundary.
+Lifecycle hooks are not replayed, because no request happened.
+
+**`cache.size` falling without any call.** Entries expire on `maxAgeMs` through
+lru-cache's `ttlAutopurge`, whose timers are unref'd and never hold the process
+open. A falling `size` between calls is expiry, not eviction of live data.
+
+**Two callers with different inline callbacks hitting one entry.** Callbacks,
+lifecycle hooks, `throttle` and `concurrency` are excluded from the cache key on
+purpose, and the key is built from the options after validation and defaulting.
+If a change to a feature's options schema starts fragmenting the cache, the
+`createKeyBuilder` tests in `src/core/cache.test.ts` are where it shows.
+`country` is lowercased in the key because Google serves byte-identical listings
+for `gl=us` and `gl=US`; that equivalence was measured live on 2026-09-22 on
+prices, install bands and search ranking, and is the only normalization the key
+applies beyond sorting properties.
+
+## Workers runtime parity
+
+`pnpm test:workers` builds the package, bundles `workers/probe.ts` with the
+conditions Wrangler uses (`workerd`, `worker`, `browser`), and runs every
+scenario in `workers/scenarios.ts` twice against the same recorded fixtures: in
+Node.js from `src/`, and in workerd from `dist/` at each date in
+`COMPATIBILITY_DATES`. A test is named `<scenario> matches Node.js` under the
+date that failed. `e2e/workers.e2e.test.ts` runs a subset of the scenarios
+against live Google Play from inside workerd.
+
+| Symptom                                                                         | Cause                                                                             | Fix                                                                                                                                                   |
+| ------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| The whole file fails in `beforeAll` with esbuild `Could not resolve "node:..."` | A Node.js only module reached the published build                                 | `pnpm lint` names the file when it is under `src/`. Otherwise a dependency now resolves its `node` build: pin or replace it                           |
+| Only `2022-01-01` fails                                                         | Code uses an API the legacy URL parser or an older runtime lacks                  | Route it through a runtime neutral helper such as `parseUrl` in `src/core/url.ts` and add the API to `no-restricted-properties` in `eslint.config.js` |
+| Every date fails for one scenario                                               | Node.js and workerd disagree on a web API the scenario reaches                    | Compare the two `outcome` and `requests` values in the diff, then fix the code, never the scenario                                                    |
+| `<scenario> consumes exactly the responses it was served` fails                 | A refreshed fixture or a code change altered how many requests the scenario makes | Update `SERVED` in `workers/parity.workers.test.ts` to the new request sequence                                                                       |
+| Only the live file fails while the Node.js e2e file for the same method passes  | A runtime difference that the fixtures do not cover                               | Reproduce it offline by adding a scenario, then fix the code                                                                                          |
+
+Raise `COMPATIBILITY_DATES.current` only to a date the installed workerd
+accepts: workerd rejects dates newer than its own build, and Miniflare
+`4.20260730.0` accepts up to `2026-08-06`.

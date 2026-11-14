@@ -1,0 +1,590 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { describe, expect, it, vi } from 'vitest';
+import { app, type AppOptions } from './app.ts';
+import { getPath } from '../../core/path.ts';
+import { parseScriptData } from '../../core/scriptData.ts';
+import { NotFoundError, SpecError, ValidationError } from '../../core/errors.ts';
+import { MALFORMED_APP_IDS } from '../../../test/helpers/appIds.ts';
+import { APP_DETAILS_RPC_ID, appCommentsRootSchema, appDetailsRootSchema } from './specs.ts';
+import { expectHtmlTwin } from '../../../test/helpers/plainText.ts';
+
+const readFixture = (name: string): string =>
+  readFileSync(
+    fileURLToPath(new URL(`../../../test/fixtures/app/${name}`, import.meta.url)),
+    'utf8',
+  );
+
+const translateHtml = readFixture('translate.html');
+const minecraftHtml = readFixture('minecraft.html');
+const whereAmIHtml = readFixture('whereami.html');
+const whatsappHtml = readFixture('whatsapp.html');
+
+const fetchReturning = (body: string, status = 200): typeof fetch => {
+  const impl: typeof fetch = () => Promise.resolve(new Response(body, { status }));
+  return impl;
+};
+
+const buildScriptData = (key: string, value: unknown): string =>
+  `<script>AF_initDataCallback({key: '${key}', hash: '1', data:${JSON.stringify(value)}, sideChannel: {}});</script>`;
+
+const buildServiceTable = (entries: Record<string, string>): string => {
+  const pairs = Object.entries(entries)
+    .map(([key, rpcId]) => `'${key}' : {id:'${rpcId}'}`)
+    .join(',');
+  return `<script>; var AF_dataServiceRequests = {${pairs}}; var AF_initDataChunkQueue = [];</script>`;
+};
+
+const commentEntry = (text: string): unknown[] => {
+  const entry: unknown[] = [];
+  entry[1] = ['Reviewer'];
+  entry[4] = text;
+  entry[5] = [1700000000];
+  entry[10] = '1.2.3';
+  return entry;
+};
+
+const appHtmlWithCommentRoot = (key: string, comments: unknown[], routed: boolean): string => {
+  const details = parseScriptData(translateHtml).blocks['ds:5'];
+  const routing = routed ? buildServiceTable({ [key]: APP_DETAILS_RPC_ID }) : '';
+  return `${buildScriptData('ds:5', details)}${buildScriptData(key, [comments])}${routing}`;
+};
+
+describe('app', () => {
+  it('parses the translate details page into a validated result', async () => {
+    const appId = 'com.google.android.apps.translate';
+    const result = await app({
+      appId,
+      requestOptions: { fetchImpl: fetchReturning(translateHtml) },
+    });
+
+    expect(result.title).toContain('Translate');
+    expect(result.free).toBe(true);
+    expect(result.price).toBe(0);
+    expect(result.score).toBeGreaterThanOrEqual(3.5);
+    expect(result.score).toBeLessThanOrEqual(5);
+
+    const histogramKeys = Object.keys(result.histogram).sort();
+    expect(histogramKeys).toEqual(['1', '2', '3', '4', '5']);
+    const histogramSum = Object.values(result.histogram).reduce((total, value) => total + value, 0);
+    expect(histogramSum).toBeGreaterThan(0);
+
+    expect(result.screenshots.length).toBeGreaterThan(3);
+    expect(result.developer).toBe('Google LLC');
+    expect(result.installs?.endsWith('+')).toBe(true);
+    expect(result.appId).toBe(appId);
+    expect(result.url).toContain(`id=${appId}`);
+    expect(result.comments).toEqual([]);
+  });
+
+  it('returns a name based developer id decoded from the developer link', async () => {
+    const result = await app({
+      appId: 'com.whatsapp',
+      requestOptions: { fetchImpl: fetchReturning(whatsappHtml) },
+    });
+
+    expect(result.developer).toBe('WhatsApp LLC');
+    expect(result.developerId).toBe('WhatsApp LLC');
+    expect(result.developerInternalID).toBe('WhatsApp LLC');
+  });
+
+  it('parses paid app fields from the minecraft details page', async () => {
+    const result = await app({
+      appId: 'com.mojang.minecraftpe',
+      requestOptions: { fetchImpl: fetchReturning(minecraftHtml) },
+    });
+
+    expect(result.free).toBe(false);
+    expect(result.price).toBeGreaterThan(0);
+    expect(result.currency).toMatch(/^[A-Z]{3}$/);
+    expect(result.offersIAP).toBe(true);
+    expect(result.comments).toEqual([]);
+  });
+
+  it('parses the Where Am I geography game details page', async () => {
+    const appId = 'com.adex77.WhereAmI';
+    const result = await app({
+      appId,
+      requestOptions: { fetchImpl: fetchReturning(whereAmIHtml) },
+    });
+
+    expect(result.title).toBe('Where Am I? - GeoGuess Game');
+    expect(result.appId).toBe(appId);
+    expect(result.developer).toBe('Adex77');
+    expect(result.free).toBe(true);
+    expect(result.price).toBe(0);
+    expect(result.released).toBe('Jan 2, 2021');
+    expect(result.score).toBeGreaterThanOrEqual(0);
+    expect(result.score).toBeLessThanOrEqual(5);
+    expect(result.screenshots.length).toBeGreaterThan(0);
+    expect(result.comments).toEqual([]);
+  });
+
+  it('parses non-empty comments from the ds:8 fallback', async () => {
+    const result = await app({
+      appId: 'com.google.android.apps.translate',
+      requestOptions: {
+        fetchImpl: fetchReturning(
+          appHtmlWithCommentRoot('ds:8', [commentEntry('primary comment')], false),
+        ),
+      },
+    });
+
+    expect(result.comments).toEqual(['primary comment']);
+  });
+
+  it('parses non-empty comments from the ds:9 fallback', async () => {
+    const result = await app({
+      appId: 'com.google.android.apps.translate',
+      requestOptions: {
+        fetchImpl: fetchReturning(
+          appHtmlWithCommentRoot('ds:9', [commentEntry('secondary comment')], false),
+        ),
+      },
+    });
+
+    expect(result.comments).toEqual(['secondary comment']);
+  });
+
+  it('parses non-empty comments reached through the Ws7gDc route', async () => {
+    const result = await app({
+      appId: 'com.google.android.apps.translate',
+      requestOptions: {
+        fetchImpl: fetchReturning(
+          appHtmlWithCommentRoot('ds:11', [commentEntry('routed comment')], true),
+        ),
+      },
+    });
+
+    expect(result.comments).toEqual(['routed comment']);
+  });
+
+  it('keeps details and comments root schemas mutually exclusive', () => {
+    const data = parseScriptData(translateHtml);
+    const details = data.blocks['ds:5'];
+    const comments = [[commentEntry('comment')]];
+
+    expect(appDetailsRootSchema.safeParse(details).success).toBe(true);
+    expect(appCommentsRootSchema.safeParse(details).success).toBe(false);
+    expect(appDetailsRootSchema.safeParse(comments).success).toBe(false);
+    expect(appCommentsRootSchema.safeParse(comments).success).toBe(true);
+  });
+
+  it('rejects the current similar cluster as comments and accepts the empty ds:9 variant', () => {
+    const data = parseScriptData(translateHtml);
+
+    expect(appCommentsRootSchema.safeParse(data.blocks['ds:8']).success).toBe(false);
+    expect(appCommentsRootSchema.safeParse(data.blocks['ds:9']).success).toBe(true);
+  });
+
+  it('sanitizes control characters out of the changelog and description', async () => {
+    const appId = 'com.google.android.apps.translate';
+    const data = parseScriptData(translateHtml);
+    const ds5 = data.blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    const changelogHolder = (details[144] as unknown[])[1] as unknown[];
+    changelogHolder[1] = 'Bug\u0000 fixes\u0007 and speedups';
+    const dirtyHtml = buildScriptData('ds:5', ds5);
+
+    const result = await app({
+      appId,
+      requestOptions: { fetchImpl: fetchReturning(dirtyHtml) },
+    });
+
+    expect(result.recentChanges).toBe('Bug fixes and speedups');
+    expect(result.description.includes(String.fromCharCode(0))).toBe(false);
+  });
+
+  it('turns the summary and changelog into plain text', async () => {
+    const data = parseScriptData(translateHtml);
+    const ds5 = data.blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    const summaryHolder = (details[73] as unknown[])[0] as unknown[];
+    summaryHolder[1] = 'Hunt &amp; <b>Explore</b> the &quot;wild&quot;';
+    const changelogHolder = (details[144] as unknown[])[1] as unknown[];
+    changelogHolder[1] = '&#8226; Modern Android &amp; TV UI<br>&#8226; It&#39;s <i>faster</i>';
+
+    const result = await app({
+      appId: 'com.google.android.apps.translate',
+      requestOptions: { fetchImpl: fetchReturning(buildScriptData('ds:5', ds5)) },
+    });
+
+    expect(result.summary).toBe('Hunt & Explore the "wild"');
+    expect(result.summaryHTML).toBe('Hunt &amp; <b>Explore</b> the &quot;wild&quot;');
+    expect(result.recentChanges).toBe("\u2022 Modern Android & TV UI\n\u2022 It's faster");
+    expect(result.recentChangesHTML).toBe(
+      '&#8226; Modern Android &amp; TV UI<br>&#8226; It&#39;s <i>faster</i>',
+    );
+  });
+
+  it('decodes the changelog entities recorded in the minecraft and where am i fixtures', async () => {
+    const minecraft = await app({
+      appId: 'com.mojang.minecraftpe',
+      requestOptions: { fetchImpl: fetchReturning(minecraftHtml) },
+    });
+    const whereAmI = await app({
+      appId: 'com.adex77.WhereAmI',
+      requestOptions: { fetchImpl: fetchReturning(whereAmIHtml) },
+    });
+
+    expect(minecraft.recentChanges).toBe("What's new in 26.32: Various bug fixes!");
+    expect(whereAmI.recentChanges).toContain('Ranked System & ELO Matchmaking');
+    expect(whereAmI.recentChanges).toContain('\nNew Campaigns');
+    expect(whereAmI.recentChanges).not.toMatch(/<br>|&amp;/);
+    expect(whereAmI.recentChangesHTML).toContain('Ranked System &amp; ELO Matchmaking');
+    expectHtmlTwin(minecraft.recentChanges, minecraft.recentChangesHTML, 'minecraft changelog');
+    expectHtmlTwin(whereAmI.recentChanges, whereAmI.recentChangesHTML, 'where am i changelog');
+    expectHtmlTwin(whereAmI.summary, whereAmI.summaryHTML, 'where am i summary');
+  });
+
+  it('rejects a summary that is not a string', async () => {
+    const data = parseScriptData(translateHtml);
+    const ds5 = data.blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    const summaryHolder = (details[73] as unknown[])[0] as unknown[];
+    summaryHolder[1] = 42;
+
+    await expect(
+      app({
+        appId: 'com.google.android.apps.translate',
+        requestOptions: { fetchImpl: fetchReturning(buildScriptData('ds:5', ds5)) },
+      }),
+    ).rejects.toBeInstanceOf(SpecError);
+  });
+
+  it('rejects a changelog that is not a string', async () => {
+    const data = parseScriptData(translateHtml);
+    const ds5 = data.blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    const changelogHolder = (details[144] as unknown[])[1] as unknown[];
+    changelogHolder[1] = 42;
+
+    await expect(
+      app({
+        appId: 'com.google.android.apps.translate',
+        requestOptions: { fetchImpl: fetchReturning(buildScriptData('ds:5', ds5)) },
+      }),
+    ).rejects.toBeInstanceOf(SpecError);
+  });
+
+  it('resolves version, update time, and changelog through the shifted fallback paths', async () => {
+    const appId = 'com.google.android.apps.translate';
+    const baseline = await app({
+      appId,
+      requestOptions: { fetchImpl: fetchReturning(translateHtml) },
+    });
+
+    const data = parseScriptData(translateHtml);
+    const ds5 = data.blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    details.push({ '141': details[140], '145': details[144], '146': details[145] });
+    details[140] = null;
+    details[144] = null;
+    details[145] = null;
+    const shiftedHtml = buildScriptData('ds:5', ds5);
+
+    const result = await app({
+      appId,
+      requestOptions: { fetchImpl: fetchReturning(shiftedHtml) },
+    });
+
+    expect(result.version).toBe(baseline.version);
+    expect(result.updated).toBe(baseline.updated);
+    expect(result.recentChanges).toBe(baseline.recentChanges);
+    expect(result.androidVersion).toBe(baseline.androidVersion);
+    expect(result.androidVersionText).toBe(baseline.androidVersionText);
+  });
+
+  it('reports VARY variants when the version block is absent everywhere', async () => {
+    const data = parseScriptData(translateHtml);
+    const ds5 = data.blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    details[140] = null;
+    details[69] = [];
+    const blankedHtml = buildScriptData('ds:5', ds5);
+
+    const result = await app({
+      appId: 'com.google.android.apps.translate',
+      requestOptions: { fetchImpl: fetchReturning(blankedHtml) },
+    });
+
+    expect(result.version).toBe('VARY');
+    expect(result.androidVersion).toBe('VARY');
+    expect(result.androidVersionText).toBe('Varies with device');
+    expect(result.developerEmail).toBeUndefined();
+    expect(result.developerLegalAddress).toBeUndefined();
+    expect(result.developerLegalPhoneNumber).toBeUndefined();
+  });
+
+  it('distinguishes absent commercial flags from present enabled flags', async () => {
+    const absent = await app({
+      appId: 'com.google.android.apps.translate',
+      requestOptions: { fetchImpl: fetchReturning(translateHtml) },
+    });
+
+    expect(absent.offersIAP).toBe(false);
+    expect(absent.IAPRange).toBeUndefined();
+    expect(absent.adSupported).toBe(false);
+    expect(absent.earlyAccessEnabled).toBe(false);
+    expect(absent.isAvailableInPlayPass).toBe(false);
+
+    const data = parseScriptData(translateHtml);
+    const ds5 = data.blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    const availability = details[18] as unknown[];
+    availability[2] = 'early-access';
+    details[62] = ['play-pass'];
+    details[19] = ['$0.99 per item', [0]];
+    const enabledHtml = buildScriptData('ds:5', ds5);
+
+    const enabled = await app({
+      appId: 'com.google.android.apps.translate',
+      requestOptions: { fetchImpl: fetchReturning(enabledHtml) },
+    });
+
+    expect(enabled.earlyAccessEnabled).toBe(true);
+    expect(enabled.isAvailableInPlayPass).toBe(true);
+    expect(enabled.offersIAP).toBe(true);
+    expect(enabled.IAPRange).toBe('$0.99 per item');
+  });
+
+  it.each([
+    [['$0.99 per item', [0]], true, '$0.99 per item'],
+    [['', [0]], false, ''],
+    [[null, [0]], false, undefined],
+    [[], false, undefined],
+  ])('reads offersIAP from the first purchase cell of %j', async (cell, offers, range) => {
+    const ds5 = parseScriptData(translateHtml).blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    details[19] = cell;
+
+    const result = await app({
+      appId: 'com.google.android.apps.translate',
+      requestOptions: { fetchImpl: fetchReturning(buildScriptData('ds:5', ds5)) },
+    });
+
+    expect(result.offersIAP).toBe(offers);
+    expect(result.IAPRange).toBe(range);
+  });
+
+  it.each([
+    ['com.google.android.apps.translate', translateHtml, false],
+    ['com.mojang.minecraftpe', minecraftHtml, true],
+    ['com.adex77.WhereAmI', whereAmIHtml, true],
+    ['com.whatsapp', whatsappHtml, true],
+  ])('reads offersIAP for %s from the same cell as IAPRange', async (appId, html, offers) => {
+    const result = await app({ appId, requestOptions: { fetchImpl: fetchReturning(html) } });
+
+    expect(result.offersIAP).toBe(offers);
+    expect(result.offersIAP).toBe(Boolean(result.IAPRange));
+  });
+
+  it('parses a preregistration listing that carries no offer node', async () => {
+    const data = parseScriptData(translateHtml);
+    const ds5 = data.blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    details[57] = null;
+    details[18] = [1];
+    const preregisterHtml = buildScriptData('ds:5', ds5);
+
+    const result = await app({
+      appId: 'com.google.android.apps.translate',
+      requestOptions: { fetchImpl: fetchReturning(preregisterHtml) },
+    });
+
+    expect(result.preregister).toBe(true);
+    expect(result.earlyAccessEnabled).toBe(false);
+    expect(result.price).toBe(0);
+    expect(result.free).toBe(false);
+    expect(result.priceText).toBe('Free');
+    expect(result.currency).toBeUndefined();
+    expect(result.originalPrice).toBeUndefined();
+    expect(result.discountEndDate).toBeUndefined();
+  });
+
+  it('parses a preregistration listing that still carries a free offer node', async () => {
+    const data = parseScriptData(translateHtml);
+    const ds5 = data.blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    const offer = getPath(details, [57, 0, 0, 0, 0]) as unknown[];
+    offer[1] = [[0, 'USD', '']];
+    details[18] = [1];
+    const preregisterHtml = buildScriptData('ds:5', ds5);
+
+    const result = await app({
+      appId: 'com.google.android.apps.translate',
+      requestOptions: { fetchImpl: fetchReturning(preregisterHtml) },
+    });
+
+    expect(result.preregister).toBe(true);
+    expect(result.price).toBe(0);
+    expect(result.free).toBe(true);
+    expect(result.priceText).toBe('Free');
+    expect(result.currency).toBe('USD');
+    expect(result.originalPrice).toBeUndefined();
+  });
+
+  it('reports early access alongside preregistration when the offer node is absent', async () => {
+    const data = parseScriptData(translateHtml);
+    const ds5 = data.blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    details[57] = null;
+    details[18] = [1, null, 'early-access'];
+    const earlyAccessHtml = buildScriptData('ds:5', ds5);
+
+    const result = await app({
+      appId: 'com.google.android.apps.translate',
+      requestOptions: { fetchImpl: fetchReturning(earlyAccessHtml) },
+    });
+
+    expect(result.preregister).toBe(true);
+    expect(result.earlyAccessEnabled).toBe(true);
+    expect(result.free).toBe(false);
+    expect(result.priceText).toBe('Free');
+  });
+
+  it('exposes the original price when a discount is active', async () => {
+    const data = parseScriptData(minecraftHtml);
+    const ds5 = data.blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    const offer = getPath(details, [57, 0, 0, 0, 0]) as unknown[];
+    const pricePair = offer[1] as unknown[];
+    pricePair[1] = [0];
+    const undiscountedHtml = buildScriptData('ds:5', ds5);
+
+    const undiscounted = await app({
+      appId: 'com.mojang.minecraftpe',
+      requestOptions: { fetchImpl: fetchReturning(undiscountedHtml) },
+    });
+
+    expect(undiscounted.originalPrice).toBeUndefined();
+
+    pricePair[1] = [10_990_000];
+    const discountedHtml = buildScriptData('ds:5', ds5);
+
+    const result = await app({
+      appId: 'com.mojang.minecraftpe',
+      requestOptions: { fetchImpl: fetchReturning(discountedHtml) },
+    });
+
+    expect(result.originalPrice).toBe(10.99);
+    expect(result.price).toBeGreaterThan(0);
+    expect(result.free).toBe(false);
+  });
+
+  it('reads the discount end date from the timestamp beside its localized labels', async () => {
+    const data = parseScriptData(minecraftHtml);
+    const ds5 = data.blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    const offer = getPath(details, [57, 0, 0, 0, 0]) as unknown[];
+    offer[14] = [[1786492799], 'Sale ends in 12 days', 'Offer ends 8/12/26, 1:59 AM'];
+
+    const result = await app({
+      appId: 'com.mojang.minecraftpe',
+      requestOptions: { fetchImpl: fetchReturning(buildScriptData('ds:5', ds5)) },
+    });
+
+    expect(result.discountEndDate).toBe(1786492799000);
+  });
+
+  it('rejects a discount end date that is not a timestamp', async () => {
+    const data = parseScriptData(minecraftHtml);
+    const ds5 = data.blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    const offer = getPath(details, [57, 0, 0, 0, 0]) as unknown[];
+    offer[14] = [['not a timestamp'], 'Sale ends in 12 days'];
+
+    await expect(
+      app({
+        appId: 'com.mojang.minecraftpe',
+        requestOptions: { fetchImpl: fetchReturning(buildScriptData('ds:5', ds5)) },
+      }),
+    ).rejects.toBeInstanceOf(SpecError);
+  });
+
+  it('throws a SpecError naming the field when the title path is blank', async () => {
+    const data = parseScriptData(translateHtml);
+    const ds5 = data.blocks['ds:5'] as unknown[];
+    const details = (ds5[1] as unknown[])[2] as unknown[];
+    const titleContainer = details[0] as unknown[];
+    titleContainer[0] = null;
+    const blankedHtml = buildScriptData('ds:5', ds5);
+
+    let thrown: unknown;
+    try {
+      await app({
+        appId: 'com.google.android.apps.translate',
+        requestOptions: { fetchImpl: fetchReturning(blankedHtml) },
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBeInstanceOf(SpecError);
+    const failedFields = (thrown as SpecError).failures.map((failure) => failure.field);
+    expect(failedFields).toContain('title');
+  });
+
+  it('surfaces a NotFoundError for a 404 response', async () => {
+    await expect(
+      app({
+        appId: 'com.example.missing',
+        requestOptions: { fetchImpl: fetchReturning('not found', 404) },
+      }),
+    ).rejects.toBeInstanceOf(NotFoundError);
+  });
+
+  it('rejects options without an appId through validation', async () => {
+    await expect(app({} as AppOptions)).rejects.toBeInstanceOf(ValidationError);
+  });
+
+  it('rejects every malformed appId before any request', async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+
+    for (const appId of MALFORMED_APP_IDS) {
+      await expect(app({ appId, requestOptions: { fetchImpl } })).rejects.toThrow(
+        /^app: appId: must be/,
+      );
+    }
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('keeps the exact appId, case included, in the url and the result', async () => {
+    const appId = 'com.adex77.WhereAmI';
+    const fetchImpl = vi.fn<typeof fetch>(() => Promise.resolve(new Response(whereAmIHtml)));
+
+    const result = await app({ appId, requestOptions: { fetchImpl } });
+
+    expect(result.appId).toBe(appId);
+    expect(result.url).toContain('id=com.adex77.WhereAmI&');
+  });
+});
+
+describe('app rating counts', () => {
+  const RATING_NODE = [1, 2, 51];
+  const RECORDED_LISTINGS = [
+    { appId: 'com.google.android.apps.translate', html: translateHtml },
+    { appId: 'com.mojang.minecraftpe', html: minecraftHtml },
+    { appId: 'com.adex77.WhereAmI', html: whereAmIHtml },
+    { appId: 'com.whatsapp', html: whatsappHtml },
+  ];
+
+  it.each(RECORDED_LISTINGS)(
+    'reads the counts of $appId from the cells of the rating node',
+    async ({ appId, html }) => {
+      const details = parseScriptData(html).blocks['ds:5'];
+      const ratingNode = getPath(details, RATING_NODE);
+      const buckets = Array.from({ length: 5 }, (_, index) =>
+        getPath(ratingNode, [1, index + 1, 1]),
+      );
+
+      const result = await app({ appId, requestOptions: { fetchImpl: fetchReturning(html) } });
+
+      expect(result.ratings).toBe(getPath(ratingNode, [2, 1]));
+      expect(result.reviews).toBe(getPath(ratingNode, [3, 1]));
+      expect(Object.values(result.histogram)).toEqual(buckets);
+      expect(Number.isInteger(result.ratings) && Number.isInteger(result.reviews)).toBe(true);
+    },
+  );
+});

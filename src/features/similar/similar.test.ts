@@ -1,0 +1,459 @@
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { describe, expect, it, vi } from 'vitest';
+import { createSimilar, similar, type SimilarOptions } from './similar.ts';
+import { similarAppSchema } from './schema.ts';
+import { findSimilarClusterPath, PAGINATION_MAPPINGS, similarClusterUrl } from './specs.ts';
+import { parseScriptData } from '../../core/scriptData.ts';
+import type { App } from '../app/schema.ts';
+import type { OnIntegrityEvent } from '../../core/integrity.ts';
+import type { DegradationEvent, OnDegradation } from '../../core/degradation.ts';
+import { MALFORMED_APP_IDS } from '../../../test/helpers/appIds.ts';
+import { ParseError, ValidationError } from '../../core/errors.ts';
+import { plainText } from '../../core/htmlText.ts';
+import { expectConvertedSummaries, expectHtmlSummaries } from '../../../test/helpers/plainText.ts';
+import { clusterDeveloperLinks } from '../../../test/helpers/clusterDeveloperLinks.ts';
+import { clusterOfferItems } from '../../../test/helpers/clusterOfferItems.ts';
+
+vi.mock(import('../../core/htmlText.ts'), { spy: true });
+
+const plainTextSpy = vi.mocked(plainText);
+
+const SOURCE_APP_ID = 'com.google.android.apps.translate';
+
+const readFixture = (name: string): string =>
+  readFileSync(
+    fileURLToPath(new URL(`../../../test/fixtures/similar/${name}`, import.meta.url)),
+    'utf8',
+  );
+
+const detailsHtml = readFixture('translate-details.html');
+const clusterHtml = readFixture('translate-cluster.html');
+const lastContinuation = readFixture('mhadv-continuation-last.txt');
+const LAST_CONTINUATION_APP_COUNT = 20;
+
+const sequenceFetch = (bodies: string[]): { fetchImpl: typeof fetch; count: () => number } => {
+  let index = 0;
+  const impl: typeof fetch = () => {
+    const body = bodies[Math.min(index, bodies.length - 1)] ?? '';
+    index += 1;
+    return Promise.resolve(new Response(body, { status: 200 }));
+  };
+  return { fetchImpl: impl, count: () => index };
+};
+
+const continuationBatch = (apps: unknown[]): string => {
+  const clusterNode: unknown[] = [];
+  clusterNode[0] = apps;
+  clusterNode[7] = [null, null];
+  const payload = [[clusterNode]];
+  const frame = [['wrb.fr', 'qnKhOb', JSON.stringify(payload), null, null, null, 'generic']];
+  const json = JSON.stringify(frame);
+  return `)]}'\n\n${json.length.toString()}\n${json}`;
+};
+
+const emptyClusterBatch = (): string => continuationBatch([]);
+
+const noClusterDetails =
+  "<script>AF_initDataCallback({key: 'ds:5', hash: '1', data:[[]], sideChannel: {}});</script>";
+
+describe('similar cluster discovery', () => {
+  it('locates a similar cluster path inside the details fixture', () => {
+    const path = findSimilarClusterPath(parseScriptData(detailsHtml));
+    expect(typeof path).toBe('string');
+    expect((path ?? '').length).toBeGreaterThan(0);
+  });
+});
+
+describe('similarClusterUrl', () => {
+  const clusterPath = '/store/apps/collection/cluster?gsr=SogBaix%3D%3D:S:ANO1ljIr9E8';
+
+  it('appends the storefront to the cluster link google served', () => {
+    expect(similarClusterUrl(clusterPath, 'de', 'de')).toBe(
+      `https://play.google.com${clusterPath}&gl=de&hl=de`,
+    );
+  });
+
+  it('encodes language and country so they cannot add query parameters', () => {
+    const url = new URL(similarClusterUrl(clusterPath, 'en&x=1', 'u#'));
+    expect(url.searchParams.get('hl')).toBe('en&x=1');
+    expect(url.searchParams.get('gl')).toBe('u#');
+    expect(url.searchParams.has('x')).toBe(false);
+  });
+
+  it('keeps a userinfo shaped link on play.google.com', () => {
+    const url = new URL(similarClusterUrl('@evil.example/cluster?gsr=x', 'en', 'us'));
+    expect(url.origin).toBe('https://play.google.com');
+  });
+
+  it.each(['//evil.example/cluster?gsr=x', 'https://evil.example/c?x'])(
+    'rejects a cluster link %s that leaves play.google.com',
+    (foreignPath) => {
+      expect(() => similarClusterUrl(foreignPath, 'en', 'us')).toThrow(ParseError);
+    },
+  );
+});
+
+describe('similar fixture parsing', () => {
+  it('parses at least five validated apps from the cluster fixture', async () => {
+    const { fetchImpl } = sequenceFetch([detailsHtml, clusterHtml, emptyClusterBatch()]);
+
+    const items = await similar({
+      appId: SOURCE_APP_ID,
+      requestOptions: { fetchImpl },
+    });
+
+    expect(items.length).toBeGreaterThanOrEqual(5);
+    for (const item of items) {
+      expect(() => similarAppSchema.parse(item)).not.toThrow();
+      expect(new URL(item.url).origin).toBe('https://play.google.com');
+    }
+    expect(new Set(items.map((item) => item.appId)).size).toBe(items.length);
+  });
+
+  it('returns plain text summaries for the recorded cluster', async () => {
+    plainTextSpy.mockClear();
+    const { fetchImpl } = sequenceFetch([detailsHtml, clusterHtml, emptyClusterBatch()]);
+
+    const items = await similar({
+      appId: SOURCE_APP_ID,
+      requestOptions: { fetchImpl },
+    });
+
+    expectConvertedSummaries(plainTextSpy, items, 'translate cluster');
+    expectHtmlSummaries(items, 'translate cluster');
+  });
+
+  it('never returns the source app among the similar results', async () => {
+    const { fetchImpl } = sequenceFetch([detailsHtml, clusterHtml, emptyClusterBatch()]);
+
+    const items = await similar({
+      appId: SOURCE_APP_ID,
+      requestOptions: { fetchImpl },
+    });
+
+    expect(items.some((item) => item.appId === SOURCE_APP_ID)).toBe(false);
+  });
+
+  it('keeps the final continuation page whose token node is null', async () => {
+    const firstPage = sequenceFetch([detailsHtml, clusterHtml, emptyClusterBatch()]);
+    const baseline = await similar({
+      appId: SOURCE_APP_ID,
+      requestOptions: { fetchImpl: firstPage.fetchImpl },
+    });
+    const { fetchImpl, count } = sequenceFetch([detailsHtml, clusterHtml, lastContinuation]);
+    const events: DegradationEvent[] = [];
+
+    const items = await similar({
+      appId: SOURCE_APP_ID,
+      requestOptions: { fetchImpl },
+      onDegradation: (event) => events.push(event),
+    });
+
+    expect(events).toEqual([]);
+    expect(count()).toBe(3);
+    expect(items).toHaveLength(baseline.length + LAST_CONTINUATION_APP_COUNT);
+    expect(items.slice(0, baseline.length)).toEqual(baseline);
+    for (const item of items) {
+      expect(() => similarAppSchema.parse(item)).not.toThrow();
+    }
+    expect(new Set(items.map((item) => item.appId)).size).toBe(items.length);
+  });
+
+  it('reads the developer link of every final continuation item', async () => {
+    const { fetchImpl } = sequenceFetch([detailsHtml, clusterHtml, lastContinuation]);
+
+    const items = await similar({
+      appId: SOURCE_APP_ID,
+      requestOptions: { fetchImpl },
+    });
+    const firstPageItems = items.slice(0, -LAST_CONTINUATION_APP_COUNT);
+    const continuationItems = items.slice(-LAST_CONTINUATION_APP_COUNT);
+
+    expect(firstPageItems.length).toBeGreaterThan(0);
+    expect(firstPageItems.filter((item) => item.developerId !== undefined)).toEqual([]);
+    expect(continuationItems.map((item) => [item.appId, item.developerId])).toEqual(
+      clusterDeveloperLinks(lastContinuation, PAGINATION_MAPPINGS.apps),
+    );
+    expect(continuationItems.map((item) => item.developerId)).toContain('DHGAMES');
+  });
+
+  it('returns an empty list when the details page has no similar cluster', async () => {
+    const { fetchImpl, count } = sequenceFetch([noClusterDetails]);
+
+    const items = await similar({
+      appId: SOURCE_APP_ID,
+      requestOptions: { fetchImpl },
+    });
+
+    expect(items).toEqual([]);
+    expect(count()).toBe(1);
+  });
+});
+
+const serviceTable = `<script>; var AF_dataServiceRequests = {'ds:3' : {id: 'ag2B9c'}}; var AF_initDataChunkQueue</script>`;
+
+const detailsWithClusters = (clusters: unknown): string => {
+  const root: unknown[] = [];
+  root[1] = [null, clusters];
+  const block = `<script>AF_initDataCallback({key: 'ds:3', hash: '1', data:${JSON.stringify(root)}, sideChannel: {}});</script>`;
+  return `${serviceTable}${block}`;
+};
+
+const clusterEntry = (title: string, path: unknown): unknown[] => {
+  const entry: unknown[] = [];
+  entry[21] = [null, [title, null, [null, null, null, null, [null, null, path]]]];
+  return entry;
+};
+
+describe('similar cluster fallbacks', () => {
+  it('rejects a routed clusters block that is not an array', () => {
+    const data = parseScriptData(detailsWithClusters('not-clusters'));
+    expect(() => findSimilarClusterPath(data)).toThrow(ParseError);
+  });
+
+  it('accepts the null cluster collection google serves for apps with no recommendations', () => {
+    const data = parseScriptData(detailsWithClusters(null));
+    expect(findSimilarClusterPath(data)).toBeUndefined();
+  });
+
+  it('skips unrelated titles and non string paths', () => {
+    const clusters = [
+      clusterEntry('More by this developer', '/unrelated'),
+      clusterEntry('Similar apps', null),
+    ];
+    const data = parseScriptData(detailsWithClusters(clusters));
+    expect(findSimilarClusterPath(data)).toBeUndefined();
+  });
+
+  it('accepts a Similar games cluster', () => {
+    const clusters = [clusterEntry('Similar games', '/store/apps/collection/cluster?gsr=games')];
+    const data = parseScriptData(detailsWithClusters(clusters));
+    expect(findSimilarClusterPath(data)).toBe('/store/apps/collection/cluster?gsr=games');
+  });
+
+  it('parses a priceless cluster item as costing zero', async () => {
+    const core: unknown[] = [];
+    core[0] = ['com.priceless.app'];
+    core[1] = [null, null, null, [null, null, 'https://icon.example/priceless']];
+    core[3] = 'Priceless App';
+    core[10] = [null, null, null, null, [null, null, '/store/apps/details?id=com.priceless.app']];
+    core[14] = 'Priceless Dev';
+    const cluster: unknown[] = [];
+    cluster[21] = [[core]];
+    const clusterPage = `<script>AF_initDataCallback({key: 'ds:3', hash: '1', data:${JSON.stringify([[null, [cluster]]])}, sideChannel: {}});</script>`;
+    const details = detailsWithClusters([
+      clusterEntry('Similar apps', '/store/apps/collection/cluster?gsr=apps'),
+    ]);
+    const { fetchImpl } = sequenceFetch([details, clusterPage]);
+
+    const items = await similar({
+      appId: SOURCE_APP_ID,
+      requestOptions: { fetchImpl },
+    });
+
+    expect(items).toHaveLength(1);
+    expect(items[0]?.appId).toBe('com.priceless.app');
+    expect(items[0]?.price).toBe(0);
+    expect(items[0]?.free).toBe(false);
+    expect(items[0]?.currency).toBeUndefined();
+  });
+
+  it('returns an empty list when the cluster page carries no apps', async () => {
+    const details = detailsWithClusters([
+      clusterEntry('Similar apps', '/store/apps/collection/cluster?gsr=apps'),
+    ]);
+    const emptyClusterPage = `<script>AF_initDataCallback({key: 'ds:3', hash: '1', data:[[]], sideChannel: {}});</script>`;
+    const { fetchImpl, count } = sequenceFetch([details, emptyClusterPage]);
+
+    const items = await similar({
+      appId: SOURCE_APP_ID,
+      requestOptions: { fetchImpl },
+    });
+
+    expect(items).toEqual([]);
+    expect(count()).toBe(2);
+  });
+
+  it('rejects a malformed cluster page root', async () => {
+    const details = detailsWithClusters([
+      clusterEntry('Similar apps', '/store/apps/collection/cluster?gsr=apps'),
+    ]);
+    const malformedClusterPage = `<script>AF_initDataCallback({key: 'ds:3', hash: '1', data:[null], sideChannel: {}});</script>`;
+
+    await expect(
+      similar({
+        appId: SOURCE_APP_ID,
+        requestOptions: { fetchImpl: sequenceFetch([details, malformedClusterPage]).fetchImpl },
+      }),
+    ).rejects.toBeInstanceOf(ParseError);
+  });
+});
+
+describe('similar options', () => {
+  it('rejects a missing appId through validation', async () => {
+    await expect(similar({} as SimilarOptions)).rejects.toBeInstanceOf(ValidationError);
+  });
+
+  it('rejects every malformed appId before any request', async () => {
+    const fetchImpl = vi.fn<typeof fetch>();
+
+    for (const appId of MALFORMED_APP_IDS) {
+      await expect(similar({ appId, requestOptions: { fetchImpl } })).rejects.toThrow(
+        /^similar: appId: must be/,
+      );
+    }
+
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+});
+
+describe('similar fullDetail', () => {
+  it('forwards per-call observability callbacks to each detail lookup', async () => {
+    const onDegradation: OnDegradation = () => undefined;
+    const onIntegrityEvent: OnIntegrityEvent = () => undefined;
+    const received: [unknown, unknown][] = [];
+    const detailed = createSimilar((params) => {
+      received.push([params.onDegradation, params.onIntegrityEvent]);
+      return Promise.resolve({ appId: params.appId } as App);
+    });
+
+    await detailed({
+      appId: SOURCE_APP_ID,
+      requestOptions: {
+        fetchImpl: sequenceFetch([detailsHtml, clusterHtml, emptyClusterBatch()]).fetchImpl,
+      },
+      fullDetail: true,
+      onDegradation,
+      onIntegrityEvent,
+    });
+
+    expect(received.length).toBeGreaterThan(0);
+    for (const pair of received) {
+      expect(pair).toEqual([onDegradation, onIntegrityEvent]);
+    }
+  });
+
+  it('resolves each app through the injected getApp exactly once', async () => {
+    const plain = await similar({
+      appId: SOURCE_APP_ID,
+      requestOptions: {
+        fetchImpl: sequenceFetch([detailsHtml, clusterHtml, emptyClusterBatch()]).fetchImpl,
+      },
+    });
+
+    const requested: string[] = [];
+    const detailed = createSimilar((params) => {
+      requested.push(params.appId);
+      return Promise.resolve({ appId: params.appId, description: `detail ${params.appId}` } as App);
+    });
+
+    const apps = (await detailed({
+      appId: SOURCE_APP_ID,
+      fullDetail: true,
+      requestOptions: {
+        fetchImpl: sequenceFetch([detailsHtml, clusterHtml, emptyClusterBatch()]).fetchImpl,
+      },
+    })) as App[];
+
+    expect(requested).toEqual(plain.map((item) => item.appId));
+    expect(apps.every((item) => item.description.startsWith('detail '))).toBe(true);
+  });
+
+  it('returns an empty list without resolving details when there is no cluster', async () => {
+    const { fetchImpl, count } = sequenceFetch([noClusterDetails]);
+    const requested: string[] = [];
+    const detailed = createSimilar((params) => {
+      requested.push(params.appId);
+      return Promise.resolve({ appId: params.appId } as App);
+    });
+
+    const apps = (await detailed({
+      appId: SOURCE_APP_ID,
+      fullDetail: true,
+      requestOptions: { fetchImpl },
+    })) as App[];
+
+    expect(apps).toEqual([]);
+    expect(requested).toEqual([]);
+    expect(count()).toBe(1);
+  });
+});
+
+const firstPageCore = (appId: string, offer: unknown): unknown[] => {
+  const core: unknown[] = [];
+  core[0] = [appId];
+  core[1] = [null, null, null, [null, null, `https://icon.example/${appId}`]];
+  core[3] = `App ${appId}`;
+  core[8] = offer;
+  core[10] = [null, null, null, null, [null, null, `/store/apps/details?id=${appId}`]];
+  core[14] = `Dev ${appId}`;
+  return core;
+};
+
+const firstPageWithToken = (core: unknown[], token: string): string => {
+  const cluster: unknown[] = [];
+  cluster[21] = [[core], [null, null, null, [null, token]]];
+  return `<script>AF_initDataCallback({key: 'ds:3', hash: '1', data:${JSON.stringify([[null, [cluster]]])}, sideChannel: {}});</script>`;
+};
+
+const similarDetails = (): string =>
+  detailsWithClusters([clusterEntry('Similar apps', '/store/apps/collection/cluster?gsr=apps')]);
+
+describe('similar continuation offers', () => {
+  it('keeps a sale to zero free and reads comma decimal prices exactly', async () => {
+    const { fetchImpl } = sequenceFetch([
+      similarDetails(),
+      firstPageWithToken(
+        firstPageCore('com.first.page', [null, [[4_690_000, 'EUR', '4,69 €']]]),
+        'next-token',
+      ),
+      continuationBatch([
+        clusterOfferItems['de:com.zigzagame.evertale'],
+        clusterOfferItems['de:com.mojang.minecraftpe'],
+        clusterOfferItems['de:com.chucklefish.stardewvalley'],
+      ]),
+    ]);
+
+    const result = await similar({
+      appId: SOURCE_APP_ID,
+      country: 'de',
+      lang: 'de',
+      requestOptions: { fetchImpl },
+    });
+
+    expect(result.map((item) => [item.appId, item.price, item.free, item.currency])).toEqual([
+      ['com.first.page', 4.69, false, 'EUR'],
+      ['com.zigzagame.evertale', 0, true, 'EUR'],
+      ['com.mojang.minecraftpe', 6.99, false, 'EUR'],
+      ['com.chucklefish.stardewvalley', 4.69, false, 'EUR'],
+    ]);
+  });
+
+  it('keeps an arabic digit continuation page instead of dropping it', async () => {
+    const { fetchImpl } = sequenceFetch([
+      similarDetails(),
+      firstPageWithToken(firstPageCore('com.first.page', undefined), 'next-token'),
+      continuationBatch([
+        clusterOfferItems['sa:com.mojang.minecraftpe'],
+        clusterOfferItems['sa:com.chucklefish.stardewvalley'],
+      ]),
+    ]);
+    const events: DegradationEvent[] = [];
+
+    const result = await similar({
+      appId: SOURCE_APP_ID,
+      country: 'sa',
+      lang: 'ar',
+      onDegradation: (event) => events.push(event),
+      requestOptions: { fetchImpl },
+    });
+
+    expect(events).toEqual([]);
+    expect(result.map((item) => [item.appId, item.price, item.currency])).toEqual([
+      ['com.first.page', 0, undefined],
+      ['com.mojang.minecraftpe', 29.99, 'SAR'],
+      ['com.chucklefish.stardewvalley', 20.99, 'SAR'],
+    ]);
+  });
+});

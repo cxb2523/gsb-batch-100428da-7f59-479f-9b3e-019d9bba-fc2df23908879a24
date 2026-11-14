@@ -1,0 +1,235 @@
+import { describe, expect, it } from 'vitest';
+import { createSearchIterator, searchIterator } from './searchIterator.ts';
+import { searchResultSchema } from './schema.ts';
+import { ValidationError } from '../../core/errors.ts';
+import { clusterBatchResponse, clusterItem } from '../../../test/helpers/clusterResponse.ts';
+
+const sequenceFetch = (bodies: string[]): { fetchImpl: typeof fetch; count: () => number } => {
+  let index = 0;
+  const impl: typeof fetch = () => {
+    const body = bodies[Math.min(index, bodies.length - 1)] ?? '';
+    index += 1;
+    return Promise.resolve(new Response(body, { status: 200 }));
+  };
+  return { fetchImpl: impl, count: () => index };
+};
+
+const buildScriptData = (key: string, value: unknown): string =>
+  `<script>AF_initDataCallback({key: '${key}', hash: '1', data:${JSON.stringify(value)}, sideChannel: {}});</script>`;
+
+const coreData = (id: string, priceMicros = 0): unknown[] => {
+  const core: unknown[] = [];
+  core[0] = [id];
+  core[1] = [null, null, null, [null, null, `https://icon.example/${id}`]];
+  core[3] = `App ${id}`;
+  core[4] = ['4.5', 4.5];
+  core[8] = [null, [[priceMicros, 'USD']]];
+  core[10] = [null, null, null, null, [null, null, `/store/apps/details?id=${id}`]];
+  core[13] = [null, `Summary of ${id}`];
+  core[14] = `Dev ${id}`;
+  return core;
+};
+
+const exactMatchNode = (id: string): unknown[] => {
+  const detail: unknown[] = [];
+  detail[0] = [`App ${id}`];
+  detail[68] = [
+    `Dev ${id}`,
+    [null, null, null, null, [null, null, `/store/apps/dev?id=${id}-dev`]],
+  ];
+  detail[73] = [[null, `Summary of ${id}`]];
+  detail[95] = [[null, null, null, [null, null, `https://icon.example/${id}`]]];
+  const node16: unknown[] = [];
+  node16[2] = detail;
+  node16[3] = { '12': [[id]] };
+  const node17: unknown[] = [
+    [[null, null, null, null, [null, null, `/store/apps/details?id=${id}`]]],
+  ];
+  const root: unknown[] = [];
+  root[16] = node16;
+  root[17] = node17;
+  return root;
+};
+
+const searchPageHtml = (ids: string[], token: string, exactMatchId?: string): string => {
+  const section: unknown[] = [];
+  section[22] = [ids.map((id) => [coreData(id)]), [null, null, null, [null, token]]];
+  if (exactMatchId !== undefined) {
+    section[23] = exactMatchNode(exactMatchId);
+  }
+  return buildScriptData('ds:4', [[null, [section]]]);
+};
+
+const searchPageWithSections = (sections: readonly unknown[]): string =>
+  buildScriptData('ds:4', [[null, sections]]);
+
+const appsSection = (ids: string[], token?: string): unknown[] => {
+  const section: unknown[] = [];
+  section[22] =
+    token === undefined
+      ? [ids.map((id) => [coreData(id)])]
+      : [ids.map((id) => [coreData(id)]), [null, null, null, [null, token]]];
+  return section;
+};
+
+const exactMatchSection = (id: string, index = 23): unknown[] => {
+  const section: unknown[] = [];
+  section[index] = exactMatchNode(id);
+  return section;
+};
+
+const clusterBatch = (
+  entries: { id: string; priceMicros?: number }[],
+  nextToken: string | null,
+): string =>
+  clusterBatchResponse(
+    entries.map((entry) => clusterItem(entry.id, entry.priceMicros)),
+    nextToken,
+  );
+
+const collect = async (
+  generator: AsyncGenerator<{ appId: string }>,
+  limit = Infinity,
+): Promise<string[]> => {
+  const ids: string[] = [];
+  for await (const item of generator) {
+    ids.push(item.appId);
+    if (ids.length >= limit) {
+      break;
+    }
+  }
+  return ids;
+};
+
+describe('searchIterator laziness', () => {
+  it('performs zero fetches before consumption', () => {
+    const { fetchImpl, count } = sequenceFetch([searchPageHtml(['a'], 'next')]);
+    searchIterator({ term: 'panda', requestOptions: { fetchImpl } });
+    expect(count()).toBe(0);
+  });
+
+  it('stops fetching when the consumer breaks after the first page', async () => {
+    const { fetchImpl, count } = sequenceFetch([
+      searchPageHtml(['a', 'b', 'c'], 'next'),
+      clusterBatch([{ id: 'd' }], null),
+    ]);
+
+    const ids = await collect(searchIterator({ term: 'panda', requestOptions: { fetchImpl } }), 2);
+
+    expect(ids).toEqual(['a', 'b']);
+    expect(count()).toBe(1);
+  });
+});
+
+describe('searchIterator streaming', () => {
+  it('applies the price filter to continuation pages', async () => {
+    const { fetchImpl } = sequenceFetch([
+      searchPageHtml(['free1'], 'next'),
+      clusterBatch([{ id: 'paid1', priceMicros: 990000 }, { id: 'free2' }], null),
+    ]);
+
+    const ids: string[] = [];
+    for await (const item of searchIterator({
+      term: 'panda',
+      price: 'paid',
+      requestOptions: { fetchImpl },
+    })) {
+      expect(() => searchResultSchema.parse(item)).not.toThrow();
+      ids.push(item.appId);
+    }
+
+    expect(ids).toEqual(['paid1']);
+  });
+
+  it('yields an app once even when later pages repeat it', async () => {
+    const { fetchImpl } = sequenceFetch([
+      searchPageHtml(['a'], 'next'),
+      clusterBatch([{ id: 'b' }, { id: 'c' }], 'last'),
+      clusterBatch([{ id: 'c' }, { id: 'a' }, { id: 'd' }], null),
+    ]);
+
+    const ids = await collect(searchIterator({ term: 'panda', requestOptions: { fetchImpl } }));
+
+    expect(ids).toEqual(['a', 'b', 'c', 'd']);
+  });
+
+  it('prepends the exact match exactly once across pages', async () => {
+    const { fetchImpl } = sequenceFetch([
+      searchPageHtml(['a', 'b'], 'next', 'exact'),
+      clusterBatch([{ id: 'c' }], null),
+    ]);
+
+    const ids = await collect(searchIterator({ term: 'panda', requestOptions: { fetchImpl } }));
+
+    expect(ids).toEqual(['exact', 'a', 'b', 'c']);
+    expect(ids.filter((id) => id === 'exact')).toHaveLength(1);
+  });
+
+  it('keeps a free continuation copy of an app the first page lists as paid', async () => {
+    const section: unknown[] = [];
+    section[22] = [[[coreData('dual', 990_000)]], [null, null, null, [null, 'next']]];
+    const { fetchImpl } = sequenceFetch([
+      buildScriptData('ds:4', [[null, [section]]]),
+      clusterBatch([{ id: 'dual' }, { id: 'free2' }], null),
+    ]);
+
+    const ids = await collect(
+      searchIterator({ term: 'panda', price: 'free', requestOptions: { fetchImpl } }),
+    );
+
+    expect(ids).toEqual(['dual', 'free2']);
+  });
+
+  it('keeps the exact match card over a continuation copy of the same app', async () => {
+    const { fetchImpl } = sequenceFetch([
+      searchPageHtml(['a'], 'next', 'exact'),
+      clusterBatch([{ id: 'exact' }, { id: 'c' }], null),
+    ]);
+
+    const results = [];
+    for await (const item of searchIterator({ term: 'panda', requestOptions: { fetchImpl } })) {
+      results.push(item);
+    }
+
+    expect(results.map((item) => item.appId)).toEqual(['exact', 'a', 'c']);
+    expect(results[0]?.developerId).toBe('exact-dev');
+  });
+
+  it('surfaces a card anchored in a section after the result list', async () => {
+    const { fetchImpl } = sequenceFetch([
+      searchPageWithSections([appsSection(['a', 'b']), exactMatchSection('exact')]),
+    ]);
+
+    const ids = await collect(searchIterator({ term: 'panda', requestOptions: { fetchImpl } }));
+
+    expect(ids).toEqual(['exact', 'a', 'b']);
+  });
+
+  it('streams the card alone when the page carries no result list', async () => {
+    const { fetchImpl } = sequenceFetch([searchPageWithSections([exactMatchSection('exact', 24)])]);
+
+    const ids = await collect(searchIterator({ term: 'panda', requestOptions: { fetchImpl } }));
+
+    expect(ids).toEqual(['exact']);
+  });
+});
+
+describe('searchIterator validation', () => {
+  it('throws a ValidationError synchronously for a missing term', () => {
+    expect(() => searchIterator({ term: '' })).toThrow(ValidationError);
+  });
+
+  it('routes through an injected resolveClient', async () => {
+    const { fetchImpl } = sequenceFetch([searchPageHtml(['a'], 'next'), clusterBatch([], null)]);
+    const bound = createSearchIterator(() => ({
+      request: (req) =>
+        fetchImpl(req.url, { method: req.method, body: req.body }).then((response) =>
+          response.text(),
+        ),
+    }));
+
+    const ids = await collect(bound({ term: 'panda' }));
+
+    expect(ids).toEqual(['a']);
+  });
+});

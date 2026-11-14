@@ -1,0 +1,387 @@
+import type { RequestOptions } from './options.ts';
+import {
+  BlockedError,
+  GooglePlayError,
+  HttpError,
+  NotFoundError,
+  RateLimitError,
+} from './errors.ts';
+import { parseUrl } from './url.ts';
+
+export interface HttpRequest {
+  url: string;
+  method?: 'GET' | 'POST';
+  body?: string;
+  headers?: Record<string, string>;
+}
+
+export type Limiter = (signal?: AbortSignal) => Promise<void>;
+
+export interface RequestEvent {
+  url: string;
+  method: 'GET' | 'POST';
+  attempt: number;
+}
+
+export interface ResponseEvent extends RequestEvent {
+  status: number;
+  durationMs: number;
+}
+
+export interface RetryEvent extends RequestEvent {
+  delayMs: number;
+  reason: 'status' | 'network';
+  status?: number;
+}
+
+export type OnRequest = (event: RequestEvent) => void;
+export type OnResponse = (event: ResponseEvent) => void;
+export type OnRetry = (event: RetryEvent) => void;
+
+export interface HttpClientConfig {
+  fetchImpl?: typeof fetch;
+  throttle?: number;
+  limiter?: Limiter;
+  retries?: number;
+  timeoutMs?: number;
+  headers?: Record<string, string>;
+  signal?: AbortSignal;
+  onRequest?: OnRequest;
+  onResponse?: OnResponse;
+  onRetry?: OnRetry;
+}
+
+export interface HttpClient {
+  request(req: HttpRequest): Promise<string>;
+}
+
+type Attempt = { body: string } | { delayMs: number };
+
+export type ResolveClient = (opts: {
+  throttle?: number;
+  requestOptions?: RequestOptions;
+}) => HttpClient;
+
+const DEFAULT_RETRIES = 2;
+const DEFAULT_TIMEOUT_MS = 30000;
+const BASE_BACKOFF_MS = 500;
+const THROTTLE_WINDOW_MS = 1000;
+
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+const ANY_MIME = '*';
+
+const DEFAULT_HEADERS: Record<string, string> = {
+  'User-Agent': USER_AGENT,
+  Accept: `text/html,${ANY_MIME}/${ANY_MIME}`,
+  'Accept-Language': 'en-US,en;q=0.9',
+};
+
+const FORM_CONTENT_TYPE = 'application/x-www-form-urlencoded;charset=UTF-8';
+
+const DELTA_SECONDS = /^\d+$/;
+
+const HTTP_DATE_DAY_NAME = /^[A-Za-z]{3}/;
+
+const MAX_RETRY_AFTER_MS = 60000;
+
+function settleAfter(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const settle = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', settle);
+      resolve();
+    };
+    const timer = setTimeout(settle, Math.max(0, ms));
+    signal?.addEventListener('abort', settle, { once: true });
+  });
+}
+
+function onAbort(signal: AbortSignal, listener: () => void): void {
+  signal.addEventListener('abort', listener, { once: true });
+  if (signal.aborted) {
+    listener();
+  }
+}
+
+function settledOrAborted(pending: Promise<void>, signal: AbortSignal | undefined): Promise<void> {
+  if (signal === undefined) {
+    return pending;
+  }
+  return new Promise<void>((resolve) => {
+    const settle = (): void => {
+      signal.removeEventListener('abort', settle);
+      resolve();
+    };
+    onAbort(signal, settle);
+    pending.then(settle, settle);
+  }).then(() => {
+    signal.throwIfAborted();
+    return pending;
+  });
+}
+
+async function wait(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  signal?.throwIfAborted();
+  await settleAfter(ms, signal);
+  signal?.throwIfAborted();
+}
+
+function emit<Event>(hook: ((event: Event) => unknown) | undefined, event: Event): void {
+  if (hook === undefined) {
+    return;
+  }
+  try {
+    const result = hook(event);
+    if (result instanceof Promise) {
+      result.catch(() => undefined);
+    }
+  } catch {
+    return;
+  }
+}
+
+export function createRateLimiter(rate: number): Limiter {
+  let timestamps: number[] = [];
+  let tail: Promise<void> = Promise.resolve();
+
+  const reserve = async (signal: AbortSignal | undefined): Promise<void> => {
+    signal?.throwIfAborted();
+    const now = Date.now();
+    const windowStart = now - THROTTLE_WINDOW_MS;
+    timestamps = timestamps.filter((timestamp) => timestamp > windowStart);
+    if (timestamps.length >= rate) {
+      const oldest = timestamps[0] ?? now;
+      await wait(oldest + THROTTLE_WINDOW_MS - now, signal);
+      return reserve(signal);
+    }
+    timestamps.push(Date.now());
+  };
+
+  return (signal) => {
+    const result = tail.then(() => reserve(signal));
+    tail = result.catch(() => undefined);
+    return settledOrAborted(result, signal);
+  };
+}
+
+function buildHeaders(
+  method: 'GET' | 'POST',
+  configHeaders: Record<string, string> | undefined,
+  requestHeaders: Record<string, string> | undefined,
+): Record<string, string> {
+  const headers: Record<string, string> = { ...DEFAULT_HEADERS };
+  if (method === 'POST') {
+    headers['Content-Type'] = FORM_CONTENT_TYPE;
+  }
+  Object.assign(headers, configHeaders ?? {}, requestHeaders ?? {});
+  return headers;
+}
+
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function retryAfterDateMs(header: string, response: Response): number | undefined {
+  const until = HTTP_DATE_DAY_NAME.test(header) ? Date.parse(header) : Number.NaN;
+  if (Number.isNaN(until)) {
+    return undefined;
+  }
+  const serverDate = Date.parse(response.headers.get('date') ?? '');
+  const from = Number.isNaN(serverDate) ? Date.now() : serverDate;
+  const waitMs = until - from;
+  return waitMs > 0 ? waitMs : undefined;
+}
+
+function parseRetryAfter(response: Response): number | undefined {
+  const header = response.headers.get('retry-after');
+  if (header === null) {
+    return undefined;
+  }
+  return DELTA_SECONDS.test(header) ? Number(header) * 1000 : retryAfterDateMs(header, response);
+}
+
+function jitteredBackoff(attempt: number): number {
+  return Math.random() * (BASE_BACKOFF_MS * 2 ** attempt);
+}
+
+function mapStatusToError(status: number, url: string): GooglePlayError {
+  if (status === 404) {
+    return new NotFoundError('App not found (404)', status, url);
+  }
+  if (status === 429) {
+    return new RateLimitError('Rate limited by Google Play (429)', status, url);
+  }
+  return new HttpError(`Request to ${url} failed with status ${status.toString()}`, status, url);
+}
+
+interface AttemptSignal {
+  signal: AbortSignal;
+  release: () => void;
+}
+
+function attemptSignalFor(timeoutMs: number, caller: AbortSignal | undefined): AttemptSignal {
+  const controller = new AbortController();
+  const forwardAbort = (): void => {
+    controller.abort(caller?.reason);
+  };
+  const timer = setTimeout(() => {
+    controller.abort(new DOMException('The operation timed out.', 'TimeoutError'));
+  }, timeoutMs);
+  if (caller !== undefined) {
+    onAbort(caller, forwardAbort);
+  }
+  return {
+    signal: controller.signal,
+    release: () => {
+      clearTimeout(timer);
+      caller?.removeEventListener('abort', forwardAbort);
+    },
+  };
+}
+
+function discardBody(response: Response): void {
+  response.body?.cancel().catch(() => undefined);
+}
+
+const CONSENT_HOST = 'consent.google.com';
+
+const GOOGLE_DOMAIN = 'google.com';
+
+const CAPTCHA_PATH_PREFIX = '/sorry/';
+
+type Block = 'consent wall' | 'captcha challenge';
+
+function isGoogleHost(hostname: string): boolean {
+  return hostname === GOOGLE_DOMAIN || hostname.endsWith(`.${GOOGLE_DOMAIN}`);
+}
+
+function isCaptchaChallenge(url: URL): boolean {
+  return isGoogleHost(url.hostname) && url.pathname.startsWith(CAPTCHA_PATH_PREFIX);
+}
+
+function blockOf(finalUrl: string): Block | undefined {
+  const url = parseUrl(finalUrl);
+  if (url === undefined) {
+    return undefined;
+  }
+  if (url.host === CONSENT_HOST) {
+    return 'consent wall';
+  }
+  return isCaptchaChallenge(url) ? 'captcha challenge' : undefined;
+}
+
+function blockedError(block: Block): BlockedError {
+  return new BlockedError(`Blocked by Google Play (${block})`);
+}
+
+export function createHttpClient(config: HttpClientConfig = {}): HttpClient {
+  const fetchImpl = config.fetchImpl ?? fetch;
+  const retries = config.retries ?? DEFAULT_RETRIES;
+  const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const callerSignal = config.signal;
+  const limiter =
+    config.limiter ??
+    (config.throttle !== undefined ? createRateLimiter(config.throttle) : undefined);
+
+  const request = async (req: HttpRequest): Promise<string> => {
+    const method = req.method ?? 'GET';
+    const headers = buildHeaders(method, config.headers, req.headers);
+    const eventFor = (attempt: number): RequestEvent => ({
+      url: req.url,
+      method,
+      attempt: attempt + 1,
+    });
+
+    const attemptOnce = async (attempt: number): Promise<Attempt> => {
+      emit(config.onRequest, eventFor(attempt));
+      const startedAt = performance.now();
+      const attemptSignal = attemptSignalFor(timeoutMs, callerSignal);
+      try {
+        const response = await fetchImpl(req.url, {
+          method,
+          headers,
+          body: req.body,
+          signal: attemptSignal.signal,
+        });
+        const block = blockOf(response.url);
+        const body = response.ok && block === undefined ? await response.text() : undefined;
+        emit(config.onResponse, {
+          ...eventFor(attempt),
+          status: response.status,
+          durationMs: performance.now() - startedAt,
+        });
+        if (body !== undefined) {
+          return { body };
+        }
+
+        discardBody(response);
+        if (block === 'consent wall') {
+          throw blockedError(block);
+        }
+        const retryAfterMs = parseRetryAfter(response);
+        const honored = retryAfterMs === undefined || retryAfterMs <= MAX_RETRY_AFTER_MS;
+        const retryable = block !== undefined || isRetryableStatus(response.status);
+        if (retryable && attempt < retries && honored) {
+          callerSignal?.throwIfAborted();
+          const delayMs = retryAfterMs ?? jitteredBackoff(attempt);
+          emit(config.onRetry, {
+            ...eventFor(attempt),
+            delayMs,
+            reason: 'status',
+            status: response.status,
+          });
+          return { delayMs };
+        }
+
+        throw block === undefined
+          ? mapStatusToError(response.status, req.url)
+          : blockedError(block);
+      } catch (error) {
+        if (error instanceof GooglePlayError) {
+          throw error;
+        }
+        callerSignal?.throwIfAborted();
+        if (attempt < retries) {
+          const delayMs = jitteredBackoff(attempt);
+          emit(config.onRetry, { ...eventFor(attempt), delayMs, reason: 'network' });
+          return { delayMs };
+        }
+        const httpError = new HttpError(`Network request to ${req.url} failed`, 0, req.url);
+        httpError.cause = error;
+        throw httpError;
+      } finally {
+        attemptSignal.release();
+      }
+    };
+
+    for (let attempt = 0; ; attempt += 1) {
+      callerSignal?.throwIfAborted();
+      if (limiter) {
+        await limiter(callerSignal);
+      }
+      callerSignal?.throwIfAborted();
+      const outcome = await attemptOnce(attempt);
+      callerSignal?.throwIfAborted();
+      if ('body' in outcome) {
+        return outcome.body;
+      }
+      await wait(outcome.delayMs, callerSignal);
+    }
+  };
+
+  return { request };
+}
+
+export function clientFromOptions(opts: {
+  throttle?: number;
+  limiter?: Limiter;
+  requestOptions?: RequestOptions;
+}): HttpClient {
+  return createHttpClient({
+    ...opts.requestOptions,
+    throttle: opts.throttle,
+    limiter: opts.limiter,
+  });
+}

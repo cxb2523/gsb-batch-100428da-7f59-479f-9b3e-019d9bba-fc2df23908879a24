@@ -1,0 +1,27 @@
+import { expect, it } from 'vitest';
+import { categories, category } from '../src/index.ts';
+import { liveClient, liveDescribe } from './helpers.ts';
+
+liveDescribe('categories live contract', () => {
+  it('returns exactly the category taxonomy constant', async () => {
+    const result = await categories();
+
+    expect(result).toEqual(Object.values(category));
+  });
+
+  it('returns codes that resolve to real Google Play category listings', async () => {
+    const all = await categories();
+    const sample = ['GAME_PUZZLE', 'MAPS_AND_NAVIGATION', 'PHOTOGRAPHY'] as const;
+
+    for (const cat of sample) {
+      expect(all).toContain(cat);
+      const items = await liveClient.list({
+        collection: 'TOP_FREE',
+        category: cat,
+        num: 3,
+      });
+      expect(items.length).toBeGreaterThan(0);
+      expect(items[0]!.appId.length).toBeGreaterThan(0);
+    }
+  });
+});

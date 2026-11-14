@@ -1,0 +1,483 @@
+import { expect } from 'vitest';
+import { category, type App, type AppItem, type Review, type ReviewsResult } from '../src/index.ts';
+import { expectHtmlTwin, oraclePlainText } from '../test/helpers/plainText.ts';
+import { expectReviewLink } from '../test/helpers/reviewLink.ts';
+
+const PLAY_ORIGIN = 'https://play.google.com';
+const HTTPS_PROTOCOL = 'https:';
+const MAX_SCORE = 5;
+const SCORE_TEXT_ROUNDING_TOLERANCE = 0.051;
+const HISTOGRAM_LAG_RATIO = 0.1;
+const HISTOGRAM_LAG_FLOOR = 10;
+const ONE_DECIMAL_SCORE_TEXT = /^\d+[.,]\d+$/;
+const ASCII_DIGIT = /[0-9]/;
+const NON_ASCII_DIGIT = /[^0-9]/g;
+const ABBREVIATED_SCALE_LETTER = /\p{L}/u;
+const QUOTED_PRICE_DIGIT = /\p{Nd}/u;
+const ISO_4217_CURRENCY = /^[A-Z]{3}$/;
+const ANDROID_MARKET_LAUNCH_MS = 1_223_856_000_000;
+const CLOCK_SKEW_TOLERANCE_MS = 172_800_000;
+const OFFERLESS_PRICE_TEXT = 'Free';
+const CATEGORY_TAXONOMY: ReadonlySet<string> = new Set(Object.values(category));
+const TAXONOMY_HINT =
+  'is not in the category constant, add the code to category in src/constants.ts if google introduced it';
+
+export interface OfferFields {
+  price: number;
+  free: boolean;
+  currency?: string;
+}
+
+export interface RatingFields {
+  score?: number;
+  scoreText?: string;
+}
+
+function roundedScoreText(scoreText: string): number | undefined {
+  if (!ONE_DECIMAL_SCORE_TEXT.test(scoreText)) {
+    return undefined;
+  }
+  return Number.parseFloat(scoreText.replace(',', '.'));
+}
+
+function groupedDigitsValue(text: string): number | undefined {
+  if (!ASCII_DIGIT.test(text) || ABBREVIATED_SCALE_LETTER.test(text)) {
+    return undefined;
+  }
+  return Number.parseInt(text.replace(NON_ASCII_DIGIT, ''), 10);
+}
+
+function histogramTotal(histogram: App['histogram']): number {
+  return Object.values(histogram).reduce((sum, count) => sum + count, 0);
+}
+
+function expectCount(value: number, label: string): void {
+  expect(
+    Number.isInteger(value) && value >= 0,
+    `${label} must be a non negative integer, got ${value.toString()}`,
+  ).toBe(true);
+}
+
+export function expectOfferConsistency(offer: OfferFields, label: string): void {
+  expect(Number.isFinite(offer.price), `${label}: price must be a finite number`).toBe(true);
+  expect(offer.price, `${label}: price must never be negative`).toBeGreaterThanOrEqual(0);
+
+  if (offer.free) {
+    expect(offer.price, `${label}: a free listing must cost zero`).toBe(0);
+    return;
+  }
+  if (offer.currency === undefined) {
+    expect(offer.price, `${label}: a listing without an offer node must cost zero`).toBe(0);
+    return;
+  }
+  expect(offer.price, `${label}: a paid listing must cost more than zero`).toBeGreaterThan(0);
+}
+
+export function expectRatingConsistency(rating: RatingFields, label: string): void {
+  expect(
+    rating.score === undefined,
+    `${label}: score and scoreText must be present together, got score=${String(rating.score)} scoreText=${String(rating.scoreText)}`,
+  ).toBe(rating.scoreText === undefined);
+
+  if (rating.score === undefined || rating.scoreText === undefined) {
+    return;
+  }
+
+  expect(rating.score, `${label}: score must not be below zero`).toBeGreaterThanOrEqual(0);
+  expect(
+    rating.score,
+    `${label}: score must not exceed ${MAX_SCORE.toString()}`,
+  ).toBeLessThanOrEqual(MAX_SCORE);
+
+  const rounded = roundedScoreText(rating.scoreText);
+  if (rounded === undefined) {
+    return;
+  }
+  expect(
+    Math.abs(rounded - rating.score),
+    `${label}: scoreText "${rating.scoreText}" must round score ${rating.score.toString()}`,
+  ).toBeLessThanOrEqual(SCORE_TEXT_ROUNDING_TOLERANCE);
+}
+
+export function expectAppItemContract(item: AppItem, label: string): void {
+  const scoped = `${label} ${item.appId}`;
+
+  expect(item.appId.length, `${label}: appId must not be empty`).toBeGreaterThan(0);
+  expect(item.title.length, `${scoped}: title must not be empty`).toBeGreaterThan(0);
+  expect(item.developer.length, `${scoped}: developer must not be empty`).toBeGreaterThan(0);
+  expect(new URL(item.url).origin, `${scoped}: url must address the play store`).toBe(PLAY_ORIGIN);
+  expect(item.url, `${scoped}: url must carry the same appId as the item`).toContain(item.appId);
+  expect(new URL(item.icon).protocol, `${scoped}: icon must be served over https`).toBe(
+    HTTPS_PROTOCOL,
+  );
+
+  expectHtmlTwin(item.summary, item.summaryHTML, `${scoped} summary`);
+  expectOfferConsistency(item, scoped);
+  expectRatingConsistency(item, scoped);
+}
+
+export function expectAppItemsContract(items: readonly AppItem[], label: string): void {
+  for (const item of items) {
+    expectAppItemContract(item, label);
+  }
+  expect(
+    new Set(items.map((item) => item.appId)).size,
+    `${label}: every returned appId must be unique`,
+  ).toBe(items.length);
+}
+
+export function expectRequestedCountContract(count: number, num: number, label: string): void {
+  expect(count, `${label}: a live anchor must serve at least one item`).toBeGreaterThan(0);
+  expect(
+    count,
+    `${label}: a result must never exceed the ${num.toString()} items requested`,
+  ).toBeLessThanOrEqual(num);
+}
+
+export function expectSizedRequestFloor(
+  requests: number,
+  count: number,
+  pageSize: number,
+  label: string,
+): void {
+  const floor = Math.ceil(count / pageSize);
+  expect(
+    requests,
+    `${label}: ${requests.toString()} requests cannot have served ${count.toString()} items at pageSize ${pageSize.toString()}, at least ${floor.toString()} are needed, so the page size never reached google`,
+  ).toBeGreaterThanOrEqual(floor);
+}
+
+export interface ContinuationAnchor {
+  firstPageCount: number;
+  token: string | undefined;
+}
+
+export function reviewsAnchor(page: ReviewsResult, label: string): ContinuationAnchor {
+  expect(
+    page.data.length,
+    `${label}: the reviews first page serves no reviews at all`,
+  ).toBeGreaterThan(0);
+  return { firstPageCount: page.data.length, token: page.nextPaginationToken ?? undefined };
+}
+
+export function expectContinuationContract(
+  anchor: ContinuationAnchor,
+  count: number,
+  limit: number,
+  label: string,
+): void {
+  expect(
+    limit,
+    `${label}: the probe must request more than the ${anchor.firstPageCount.toString()} items the first page serves`,
+  ).toBeGreaterThan(anchor.firstPageCount);
+  expect(
+    count,
+    `${label}: a paginated result must never exceed the ${limit.toString()} items requested`,
+  ).toBeLessThanOrEqual(limit);
+  expect(
+    anchor.token,
+    `${label}: the first page carries no continuation token any more, re-anchor the continuation probe`,
+  ).toBeDefined();
+  expect(
+    count,
+    `${label}: a followed continuation must return more than the ${anchor.firstPageCount.toString()} items on the first page`,
+  ).toBeGreaterThan(anchor.firstPageCount);
+}
+
+export function expectSearchListingAgreement(item: AppItem, listing: App, label: string): void {
+  expect(item.appId, `${label}: the search surface must resolve the same appId`).toBe(
+    listing.appId,
+  );
+  expect(item.title, `${label}: the search surface must resolve the same title`).toBe(
+    listing.title,
+  );
+  expect(item.developer, `${label}: the search surface must resolve the same developer`).toBe(
+    listing.developer,
+  );
+}
+
+export function expectOfferAgreement(item: AppItem, listing: App, label: string): void {
+  const scoped = `${label} ${item.appId}`;
+
+  expect(item.appId, `${scoped}: the surfaces must resolve the same appId`).toBe(listing.appId);
+  if (listing.currency === undefined) {
+    expect(item.price, `${scoped}: an offerless listing must read as costing zero`).toBe(0);
+    return;
+  }
+  expect(item.price, `${scoped}: the item price must equal the listing price`).toBe(listing.price);
+  expect(item.free, `${scoped}: the item free flag must equal the listing free flag`).toBe(
+    listing.free,
+  );
+  if (item.currency !== undefined) {
+    expect(item.currency, `${scoped}: the item currency must equal the listing currency`).toBe(
+      listing.currency,
+    );
+  }
+}
+
+export function expectTaxonomyMembership(listing: App, label: string): void {
+  const scoped = `${label} ${listing.appId}`;
+
+  expect(
+    CATEGORY_TAXONOMY.has(listing.genreId),
+    `${scoped}: genreId "${listing.genreId}" ${TAXONOMY_HINT}`,
+  ).toBe(true);
+  for (const entry of listing.categories) {
+    if (entry.id !== null) {
+      expect(
+        CATEGORY_TAXONOMY.has(entry.id),
+        `${scoped}: category id "${entry.id}" ${TAXONOMY_HINT}`,
+      ).toBe(true);
+    }
+  }
+}
+
+export function expectReviewContract(review: Review, appId: string, label: string): void {
+  const scoped = `${label} ${review.id}`;
+
+  expect(review.id.length, `${label}: review id must not be empty`).toBeGreaterThan(0);
+  expect(review.userName.length, `${scoped}: userName must not be empty`).toBeGreaterThan(0);
+  expect(
+    review.score,
+    `${scoped}: score must be a star rating or zero for an unrated legacy review`,
+  ).toBeGreaterThanOrEqual(0);
+  expect(
+    review.score,
+    `${scoped}: score must not exceed ${MAX_SCORE.toString()}`,
+  ).toBeLessThanOrEqual(MAX_SCORE);
+  expect(review.scoreText, `${scoped}: scoreText must spell the score`).toBe(String(review.score));
+  expectReviewLink(review, appId, label);
+  expect(Number.isNaN(Date.parse(review.date)), `${scoped}: date must parse`).toBe(false);
+  expect(
+    Date.parse(review.date),
+    `${scoped}: date must sit after the store launched`,
+  ).toBeGreaterThan(ANDROID_MARKET_LAUNCH_MS);
+  expect(Date.parse(review.date), `${scoped}: date must not sit in the future`).toBeLessThan(
+    Date.now() + CLOCK_SKEW_TOLERANCE_MS,
+  );
+
+  if (review.replyDate !== undefined) {
+    expect(
+      Date.parse(review.replyDate),
+      `${scoped}: a developer reply must sit after the store launched`,
+    ).toBeGreaterThan(ANDROID_MARKET_LAUNCH_MS);
+    expect(
+      Date.parse(review.replyDate),
+      `${scoped}: a developer reply must not sit in the future`,
+    ).toBeLessThan(Date.now() + CLOCK_SKEW_TOLERANCE_MS);
+  }
+  if (review.thumbsUp !== undefined) {
+    expect(review.thumbsUp, `${scoped}: thumbsUp must not be negative`).toBeGreaterThanOrEqual(0);
+  }
+  if (review.userImage !== undefined) {
+    expect(new URL(review.userImage).protocol, `${scoped}: userImage must be https`).toBe(
+      HTTPS_PROTOCOL,
+    );
+  }
+}
+
+export function expectReviewsContract(
+  reviews: readonly Review[],
+  appId: string,
+  label: string,
+): void {
+  for (const review of reviews) {
+    expectReviewContract(review, appId, label);
+  }
+  expect(
+    new Set(reviews.map((review) => review.id)).size,
+    `${label}: every returned review id must be unique`,
+  ).toBe(reviews.length);
+}
+
+export function expectInstallsConsistency(listing: App, label: string): void {
+  expect(
+    listing.minInstalls !== undefined,
+    `${label}: installs and minInstalls must be present together`,
+  ).toBe(listing.installs !== undefined);
+
+  if (listing.maxInstalls !== undefined) {
+    expect(
+      listing.maxInstalls,
+      `${label}: maxInstalls must not be negative`,
+    ).toBeGreaterThanOrEqual(0);
+  }
+
+  if (listing.installs === undefined || listing.minInstalls === undefined) {
+    return;
+  }
+
+  expect(listing.minInstalls, `${label}: minInstalls must be positive`).toBeGreaterThan(0);
+  if (listing.maxInstalls !== undefined) {
+    expect(
+      listing.maxInstalls,
+      `${label}: maxInstalls must not fall below minInstalls`,
+    ).toBeGreaterThanOrEqual(listing.minInstalls);
+  }
+
+  const formatted = groupedDigitsValue(listing.installs);
+  if (formatted === undefined) {
+    return;
+  }
+  expect(formatted, `${label}: installs "${listing.installs}" must spell out minInstalls`).toBe(
+    listing.minInstalls,
+  );
+}
+
+export function expectRatingSurfaceConsistency(listing: App, label: string): void {
+  const total = histogramTotal(listing.histogram);
+  for (const [star, count] of Object.entries(listing.histogram)) {
+    expect(count, `${label}: histogram bucket ${star} must not be negative`).toBeGreaterThanOrEqual(
+      0,
+    );
+  }
+
+  if (listing.ratings === undefined) {
+    expect(
+      listing.score,
+      `${label}: a listing without ratings must carry no score`,
+    ).toBeUndefined();
+    expect(total, `${label}: a listing without ratings must carry an empty histogram`).toBe(0);
+    expect(
+      listing.reviews,
+      `${label}: a listing without ratings must carry no review count`,
+    ).toBeUndefined();
+    return;
+  }
+
+  expect(listing.score, `${label}: a rated listing must carry a score`).toBeDefined();
+  expectCount(listing.ratings, `${label}: the rating count`);
+  if (listing.reviews !== undefined) {
+    expectCount(listing.reviews, `${label}: the review count`);
+  }
+
+  const lag = Math.max(HISTOGRAM_LAG_FLOOR, Math.ceil(listing.ratings * HISTOGRAM_LAG_RATIO));
+  const histogramMessage = `${label}: histogram total ${total.toString()} must track the rating count ${listing.ratings.toString()}`;
+  expect(total, histogramMessage).toBeGreaterThanOrEqual(listing.ratings - lag);
+  expect(total, histogramMessage).toBeLessThanOrEqual(listing.ratings + lag);
+}
+
+export function expectPurchaseConsistency(listing: App, label: string): void {
+  expect(
+    listing.offersIAP,
+    `${label}: offersIAP and IAPRange read the same cell, so a range means purchases are offered`,
+  ).toBe(Boolean(listing.IAPRange));
+  if (listing.IAPRange === undefined || listing.IAPRange.length === 0) {
+    return;
+  }
+  expect(
+    QUOTED_PRICE_DIGIT.test(listing.IAPRange),
+    `${label}: IAPRange "${listing.IAPRange}" must quote a price`,
+  ).toBe(true);
+}
+
+export function expectOfferNodeConsistency(listing: App, label: string): void {
+  if (listing.currency !== undefined) {
+    expect(
+      ISO_4217_CURRENCY.test(listing.currency),
+      `${label}: currency "${listing.currency}" must be an ISO 4217 code`,
+    ).toBe(true);
+    return;
+  }
+
+  expect(listing.price, `${label}: a listing without an offer node must cost zero`).toBe(0);
+  expect(listing.free, `${label}: a free offer cannot be read without the currency beside it`).toBe(
+    false,
+  );
+  expect(
+    listing.priceText,
+    `${label}: a listing without an offer node falls back to "${OFFERLESS_PRICE_TEXT}"`,
+  ).toBe(OFFERLESS_PRICE_TEXT);
+  expect(
+    listing.originalPrice,
+    `${label}: a listing without an offer node carries no original price`,
+  ).toBeUndefined();
+  expect(
+    listing.discountEndDate,
+    `${label}: a listing without an offer node carries no discount deadline`,
+  ).toBeUndefined();
+}
+
+export function expectReleaseStateConsistency(listing: App, label: string): void {
+  if (!listing.preregister) {
+    return;
+  }
+
+  expect(listing.available, `${label}: a preregistration listing must read as available`).toBe(
+    true,
+  );
+  expect(
+    listing.released,
+    `${label}: a preregistration listing has no release date`,
+  ).toBeUndefined();
+  expect(listing.installs, `${label}: a preregistration listing has no installs`).toBeUndefined();
+  expect(
+    listing.minInstalls,
+    `${label}: a preregistration listing has no minInstalls`,
+  ).toBeUndefined();
+  expect(listing.ratings, `${label}: a preregistration listing has no ratings`).toBeUndefined();
+  expect(listing.score, `${label}: a preregistration listing has no score`).toBeUndefined();
+  expect(
+    histogramTotal(listing.histogram),
+    `${label}: a preregistration listing has an empty histogram`,
+  ).toBe(0);
+}
+
+export function expectListingContract(listing: App, label: string): void {
+  const scoped = `${label} ${listing.appId}`;
+
+  expect(listing.appId.length, `${label}: appId must not be empty`).toBeGreaterThan(0);
+  expect(listing.title.length, `${scoped}: title must not be empty`).toBeGreaterThan(0);
+  expect(listing.description.length, `${scoped}: description must not be empty`).toBeGreaterThan(0);
+  expect(
+    listing.descriptionHTML.length,
+    `${scoped}: descriptionHTML must not be empty`,
+  ).toBeGreaterThan(0);
+  expect(listing.description, `${scoped}: description must be descriptionHTML decoded once`).toBe(
+    oraclePlainText(listing.descriptionHTML),
+  );
+  expectHtmlTwin(listing.summary, listing.summaryHTML, `${scoped} summary`);
+  expectHtmlTwin(listing.recentChanges, listing.recentChangesHTML, `${scoped} recentChanges`);
+  expect(listing.developer.length, `${scoped}: developer must not be empty`).toBeGreaterThan(0);
+  expect(listing.developerId.length, `${scoped}: developerId must not be empty`).toBeGreaterThan(0);
+  expect(listing.genreId.length, `${scoped}: genreId must not be empty`).toBeGreaterThan(0);
+  expect(typeof listing.offersIAP, `${scoped}: offersIAP must be a boolean`).toBe('boolean');
+  expect(new URL(listing.url).origin, `${scoped}: url must address the play store`).toBe(
+    PLAY_ORIGIN,
+  );
+  expect(listing.url, `${scoped}: url must carry the same appId as the listing`).toContain(
+    listing.appId,
+  );
+  expect(new URL(listing.icon).protocol, `${scoped}: icon must be served over https`).toBe(
+    HTTPS_PROTOCOL,
+  );
+  expect(
+    listing.screenshots.length,
+    `${scoped}: a listing must publish screenshots`,
+  ).toBeGreaterThan(0);
+  for (const screenshot of listing.screenshots) {
+    expect(new URL(screenshot).protocol, `${scoped}: screenshots must be served over https`).toBe(
+      HTTPS_PROTOCOL,
+    );
+  }
+  expect(listing.categories.length, `${scoped}: a listing must carry a category`).toBeGreaterThan(
+    0,
+  );
+  for (const category of listing.categories) {
+    expect(category.name.length, `${scoped}: category names must not be empty`).toBeGreaterThan(0);
+  }
+  expect(listing.updated, `${scoped}: updated must sit after the store launched`).toBeGreaterThan(
+    ANDROID_MARKET_LAUNCH_MS,
+  );
+  expect(listing.updated, `${scoped}: updated must not sit in the future`).toBeLessThan(
+    Date.now() + CLOCK_SKEW_TOLERANCE_MS,
+  );
+
+  expectOfferConsistency(listing, scoped);
+  expectOfferNodeConsistency(listing, scoped);
+  expectRatingConsistency(listing, scoped);
+  expectRatingSurfaceConsistency(listing, scoped);
+  expectInstallsConsistency(listing, scoped);
+  expectPurchaseConsistency(listing, scoped);
+  expectReleaseStateConsistency(listing, scoped);
+}

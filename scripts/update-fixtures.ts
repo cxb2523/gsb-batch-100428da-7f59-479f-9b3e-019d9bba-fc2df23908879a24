@@ -1,0 +1,532 @@
+import { mkdir, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { BASE_URL } from '../src/constants.ts';
+import { buildBatchBody, parseBatchResponse } from '../src/core/batchexecute.ts';
+import { createHttpClient, type HttpClient } from '../src/core/http.ts';
+import { fetchDeveloperFirstPage } from '../src/features/developer/developer.ts';
+import { fetchSearchFirstPage } from '../src/features/search/search.ts';
+import { buildSuggestPayload, SUGGEST_RPC_ID, suggestUrl } from '../src/features/suggest/specs.ts';
+import { buildListBody, CLUSTER_NAMES, listUrl } from '../src/features/list/specs.ts';
+import { category, collection, device, sort, type Device } from '../src/constants.ts';
+import { developerUrl } from '../src/features/developer/specs.ts';
+import {
+  findSimilarClusterPath,
+  PAGINATION_MAPPINGS,
+  similarClusterUrl,
+  similarDetailsUrl,
+} from '../src/features/similar/specs.ts';
+import {
+  buildReviewsBody,
+  REVIEWS_RESPONSE_PATHS,
+  REVIEWS_RPC_ID,
+} from '../src/features/reviews/specs.ts';
+import { buildPermissionsBody } from '../src/features/permissions/specs.ts';
+import { legacyBatchUrl } from '../src/core/batchexecute.ts';
+import { dataSafetyUrl } from '../src/features/datasafety/specs.ts';
+import { getPath } from '../src/core/path.ts';
+import { buildClusterBody, CLUSTER_PAGE_SIZE, CLUSTER_RPC_ID } from '../src/core/pagination.ts';
+import { parseScriptData } from '../src/core/scriptData.ts';
+import {
+  fetchListedSimilarFirstPage,
+  similarQueryFor,
+  SPARSE_SIMILAR_ANCHORS,
+} from '../e2e/similarAnchors.ts';
+
+interface Recorder {
+  name: string;
+  run(client: HttpClient): Promise<void>;
+}
+
+const THROTTLE_REQUESTS_PER_SECOND = 1;
+
+const fixturesRoot = fileURLToPath(new URL('../test/fixtures', import.meta.url));
+
+async function writeFixture(relativePath: string, body: string): Promise<void> {
+  const target = join(fixturesRoot, relativePath);
+  await mkdir(dirname(target), { recursive: true });
+  await writeFile(target, body, 'utf8');
+}
+
+function detailsUrl(appId: string): string {
+  const params = new URLSearchParams({ id: appId, hl: 'en', gl: 'us' });
+  return `${BASE_URL}/store/apps/details?${params.toString()}`;
+}
+
+function appPageRecorder(appId: string, file: string): Recorder {
+  return {
+    name: 'app',
+    async run(client) {
+      const html = await client.request({ url: detailsUrl(appId) });
+      await writeFixture(file, html);
+    },
+  };
+}
+
+interface Storefront {
+  country: string;
+  lang: string;
+}
+
+const DEFAULT_STOREFRONT: Storefront = { country: 'us', lang: 'en' };
+
+function searchUrl(term: string, storefront: Storefront): string {
+  const params = new URLSearchParams({
+    c: 'apps',
+    q: term,
+    hl: storefront.lang,
+    gl: storefront.country,
+    price: '0',
+  });
+  return `${BASE_URL}/store/search?${params.toString()}`;
+}
+
+function searchHtmlRecorder(
+  term: string,
+  file: string,
+  storefront: Storefront = DEFAULT_STOREFRONT,
+): Recorder {
+  return {
+    name: 'search',
+    async run(client) {
+      const html = await client.request({ url: searchUrl(term, storefront) });
+      await writeFixture(file, html);
+    },
+  };
+}
+
+function searchContinuationRecorder(
+  term: string,
+  htmlFile: string,
+  continuationFile: string,
+): Recorder {
+  return {
+    name: 'search-continuation',
+    async run(client) {
+      const html = await client.request({ url: searchUrl(term, DEFAULT_STOREFRONT) });
+      await writeFixture(htmlFile, html);
+
+      const replay: HttpClient = { request: () => Promise.resolve(html) };
+      const { page } = await fetchSearchFirstPage(
+        { term, ...DEFAULT_STOREFRONT, price: 'all' },
+        () => replay,
+      );
+      if (page.token === undefined) {
+        throw new Error(`no search continuation token for "${term}"`);
+      }
+
+      const continuation = await client.request({
+        url: legacyBatchUrl(DEFAULT_STOREFRONT.lang, DEFAULT_STOREFRONT.country),
+        method: 'POST',
+        body: buildClusterBody(CLUSTER_PAGE_SIZE, page.token),
+      });
+      await writeFixture(continuationFile, continuation);
+    },
+  };
+}
+
+function suggestRecorder(term: string, file: string): Recorder {
+  return {
+    name: 'suggest',
+    async run(client) {
+      const body = buildBatchBody(SUGGEST_RPC_ID, buildSuggestPayload(term), []);
+      const response = await client.request({
+        url: suggestUrl('en', 'us'),
+        method: 'POST',
+        body,
+      });
+      await writeFixture(file, response);
+    },
+  };
+}
+
+function listRecorder(
+  collectionValue: keyof typeof collection,
+  categoryValue: keyof typeof category,
+  num: number,
+  file: string,
+): Recorder {
+  return {
+    name: 'list',
+    async run(client) {
+      const body = buildListBody({
+        num: num.toString(),
+        collection: CLUSTER_NAMES[collection[collectionValue]],
+        category: category[categoryValue],
+      });
+      const response = await client.request({
+        url: listUrl('en', 'us'),
+        method: 'POST',
+        body,
+      });
+      await writeFixture(file, response);
+    },
+  };
+}
+
+function developerRecorder(devId: string, file: string): Recorder {
+  return {
+    name: 'developer',
+    async run(client) {
+      const html = await client.request({ url: developerUrl(devId, 'en', 'us') });
+      await writeFixture(file, html);
+    },
+  };
+}
+
+interface DeveloperContinuationRecording {
+  devId: string;
+  firstPageFile?: string;
+  continuationFile: string;
+}
+
+function developerContinuationRecorder(recording: DeveloperContinuationRecording): Recorder {
+  const { devId } = recording;
+  return {
+    name: 'developer-continuation',
+    async run(client) {
+      const html = await client.request({ url: developerUrl(devId, 'en', 'us') });
+      if (recording.firstPageFile !== undefined) {
+        await writeFixture(recording.firstPageFile, html);
+      }
+
+      const replay: HttpClient = { request: () => Promise.resolve(html) };
+      const { token } = await fetchDeveloperFirstPage(
+        { devId, lang: 'en', country: 'us', throttle: THROTTLE_REQUESTS_PER_SECOND },
+        () => replay,
+      );
+      if (token === undefined) {
+        throw new Error(`no developer continuation token for "${devId}"`);
+      }
+
+      const response = await client.request({
+        url: legacyBatchUrl('en', 'us'),
+        method: 'POST',
+        body: buildClusterBody(CLUSTER_PAGE_SIZE, token),
+      });
+      await writeFixture(recording.continuationFile, response);
+    },
+  };
+}
+
+function similarRecorder(appId: string, detailsFile: string, clusterFile: string): Recorder {
+  return {
+    name: 'similar',
+    async run(client) {
+      const detailsHtml = await client.request({ url: similarDetailsUrl(appId, 'us') });
+      await writeFixture(detailsFile, detailsHtml);
+
+      const clusterPath = findSimilarClusterPath(parseScriptData(detailsHtml));
+      if (clusterPath === undefined) {
+        throw new Error(`no similar cluster found for "${appId}"`);
+      }
+      const clusterHtml = await client.request({
+        url: similarClusterUrl(clusterPath, 'en', 'us'),
+      });
+      await writeFixture(clusterFile, clusterHtml);
+    },
+  };
+}
+
+const SIMILAR_CONTINUATION_REQUEST_LIMIT = 10;
+const SIMILAR_TOKEN_NODE_PATH = PAGINATION_MAPPINGS.token.slice(0, -1);
+
+function endsOnNullTokenNode(payload: unknown): boolean {
+  const apps = getPath(payload, PAGINATION_MAPPINGS.apps);
+  return (
+    getPath(payload, SIMILAR_TOKEN_NODE_PATH) === null && Array.isArray(apps) && apps.length > 0
+  );
+}
+
+async function finalSimilarContinuationPage(
+  client: HttpClient,
+  appId: string,
+): Promise<string | undefined> {
+  const query = similarQueryFor(appId);
+  let token = (await fetchListedSimilarFirstPage(query, () => client))?.token;
+  for (
+    let request = 0;
+    request < SIMILAR_CONTINUATION_REQUEST_LIMIT && token !== undefined;
+    request += 1
+  ) {
+    const text = await client.request({
+      url: legacyBatchUrl(query.lang, query.country),
+      method: 'POST',
+      body: buildClusterBody(CLUSTER_PAGE_SIZE, token),
+    });
+    const payload = parseBatchResponse(text, CLUSTER_RPC_ID);
+    const next = getPath(payload, PAGINATION_MAPPINGS.token);
+    if (typeof next !== 'string') {
+      return endsOnNullTokenNode(payload) ? text : undefined;
+    }
+    token = next;
+  }
+  return undefined;
+}
+
+function similarContinuationRecorder(appIds: readonly string[], file: string): Recorder {
+  return {
+    name: 'similar-continuation',
+    async run(client) {
+      for (const appId of appIds) {
+        const text = await finalSimilarContinuationPage(client, appId);
+        if (text !== undefined) {
+          await writeFixture(file, text);
+          return;
+        }
+      }
+      throw new Error(
+        `no cluster among ${appIds.join(', ')} ends on a continuation page with a null token node, re-anchor SPARSE_SIMILAR_ANCHORS in e2e/similarAnchors.ts`,
+      );
+    },
+  };
+}
+
+interface ReviewsRecording {
+  name: string;
+  appId: string;
+  count: number;
+  score?: number;
+  device?: Device;
+  initialFile: string;
+  page2File?: string;
+}
+
+function reviewsRecorder(recording: ReviewsRecording): Recorder {
+  const request = {
+    appId: recording.appId,
+    sort: sort.NEWEST,
+    count: recording.count,
+    score: recording.score,
+    device: recording.device,
+  };
+  return {
+    name: recording.name,
+    async run(client) {
+      const initialText = await client.request({
+        url: legacyBatchUrl('en', 'us'),
+        method: 'POST',
+        body: buildReviewsBody(request),
+      });
+      await writeFixture(recording.initialFile, initialText);
+      if (recording.page2File === undefined) {
+        return;
+      }
+
+      const payload = parseBatchResponse(initialText, REVIEWS_RPC_ID);
+      const token = getPath(payload, REVIEWS_RESPONSE_PATHS.token);
+      if (typeof token !== 'string') {
+        throw new Error(`no reviews pagination token for "${recording.appId}"`);
+      }
+
+      const page2Text = await client.request({
+        url: legacyBatchUrl('en', 'us'),
+        method: 'POST',
+        body: buildReviewsBody({ ...request, token }),
+      });
+      await writeFixture(recording.page2File, page2Text);
+    },
+  };
+}
+
+function permissionsRecorder(
+  name: string,
+  appId: string,
+  file: string,
+  storefront: Storefront = DEFAULT_STOREFRONT,
+): Recorder {
+  return {
+    name,
+    async run(client) {
+      const response = await client.request({
+        url: legacyBatchUrl(storefront.lang, storefront.country),
+        method: 'POST',
+        body: buildPermissionsBody(appId),
+      });
+      await writeFixture(file, response);
+    },
+  };
+}
+
+function dataSafetyRecorder(appId: string, file: string): Recorder {
+  return {
+    name: 'datasafety',
+    async run(client) {
+      const html = await client.request({ url: dataSafetyUrl(appId, 'en', 'us') });
+      await writeFixture(file, html);
+    },
+  };
+}
+
+const MISSING_APP_ID = 'com.adex77.definitely.not.a.real.app';
+const ERROR_PAGE_TAIL_MARKER = '<div id="af-error-page">';
+
+function dataSafetyMissingRecorder(lang: string, file: string, tailOnly: boolean): Recorder {
+  return {
+    name: 'datasafety-missing',
+    async run(client) {
+      const html = await client.request({ url: dataSafetyUrl(MISSING_APP_ID, lang, 'us') });
+      const tailStart = html.indexOf(ERROR_PAGE_TAIL_MARKER);
+      if (tailOnly && tailStart === -1) {
+        throw new Error(`no error page container in the ${lang} response`);
+      }
+      await writeFixture(file, tailOnly ? html.slice(tailStart) : html);
+    },
+  };
+}
+
+const SYNTHETIC_DETAILS_LIKE_HTML = `<!doctype html>
+<html lang="en">
+  <head>
+    <title>details-like</title>
+  </head>
+  <body>
+    <script nonce="a">AF_initDataCallback({key: 'ds:4', hash: '1', data:[["from-ds4"]], sideChannel: {}});</script>
+    <script nonce="b">AF_initDataCallback({key: 'ds:5', hash: '2', data:[[["Panda App"], ["com.panda.app"]], [null, "5,000,000+"], {"nested": {"deep": "value"}}], sideChannel: {}});</script>
+    <script nonce="c">AF_initDataCallback({key: 'ds:9', hash: '3', data:[oops not valid json], sideChannel: {}});</script>
+    <script nonce="e">var somePrefix = 1; var AF_dataServiceRequests = {'ds:4': {id: 'rpcFour', request: [[null]]}, 'ds:5': {id: 'rpcFive', request: [[null]]}}; var AF_initDataChunkQueue = [];</script>
+  </body>
+</html>
+`;
+
+const SYNTHETIC_BATCH_CHUNKED = String.raw`)]}'
+
+347
+[["wrb.fr","rpcChunk","[[\"suggestion-one\"],[\"suggestion-two\"]]",null,null,null,"generic"],["di",42],["af.httprm",42,"c",13]]
+26
+[["e",4,null,null,131]]
+`;
+
+function syntheticRecorder(file: string, content: string): Recorder {
+  return {
+    name: 'synthetic',
+    async run() {
+      await writeFixture(file, content);
+    },
+  };
+}
+
+const recorders: Recorder[] = [
+  appPageRecorder('com.google.android.apps.translate', 'app/translate.html'),
+  appPageRecorder('com.mojang.minecraftpe', 'app/minecraft.html'),
+  appPageRecorder('com.adex77.WhereAmI', 'app/whereami.html'),
+  appPageRecorder('com.whatsapp', 'app/whatsapp.html'),
+  searchHtmlRecorder('panda', 'search/panda.html'),
+  searchHtmlRecorder('where am i', 'search/where-am-i.html'),
+  searchHtmlRecorder('biedronka', 'search/biedronka-pl.html', { country: 'pl', lang: 'pl' }),
+  searchContinuationRecorder(
+    'FL Studio Mobile',
+    'search/fl-studio-mobile.html',
+    'search/fl-studio-mobile-continuation.txt',
+  ),
+  suggestRecorder('pand', 'suggest/pand.txt'),
+  listRecorder('TOP_FREE', 'GAME', 100, 'list/topfree-game.txt'),
+  developerRecorder('5700313618786177705', 'developer/google.html'),
+  developerRecorder('Mojang', 'developer/mojang.html'),
+  developerContinuationRecorder({
+    devId: '5700313618786177705',
+    continuationFile: 'developer/google-continuation.txt',
+  }),
+  developerContinuationRecorder({
+    devId: 'Google LLC',
+    firstPageFile: 'developer/google-name.html',
+    continuationFile: 'developer/google-name-continuation.txt',
+  }),
+  developerContinuationRecorder({
+    devId: '6298676178012338170',
+    continuationFile: 'developer/null-continuation.txt',
+  }),
+  similarRecorder(
+    'com.google.android.apps.translate',
+    'similar/translate-details.html',
+    'similar/translate-cluster.html',
+  ),
+  similarContinuationRecorder(SPARSE_SIMILAR_ANCHORS, 'similar/mhadv-continuation-last.txt'),
+  reviewsRecorder({
+    name: 'reviews',
+    appId: 'com.google.android.apps.translate',
+    count: 150,
+    initialFile: 'reviews/translate-initial.txt',
+    page2File: 'reviews/translate-page2.txt',
+  }),
+  reviewsRecorder({
+    name: 'reviews-filtered',
+    appId: 'com.google.android.apps.translate',
+    count: 10,
+    score: 5,
+    initialFile: 'reviews/translate-score5-size10-initial.txt',
+    page2File: 'reviews/translate-score5-size10-page2.txt',
+  }),
+  reviewsRecorder({
+    name: 'reviews-filtered',
+    appId: 'com.google.android.apps.translate',
+    count: 10,
+    device: device.TABLET,
+    initialFile: 'reviews/translate-tablet-size10.txt',
+  }),
+  permissionsRecorder(
+    'permissions',
+    'com.google.android.apps.translate',
+    'permissions/translate.txt',
+  ),
+  permissionsRecorder('permission-groups', 'com.whatsapp', 'permissions/whatsapp.txt'),
+  permissionsRecorder('permission-groups', 'com.whatsapp', 'permissions/whatsapp-de.txt', {
+    country: 'de',
+    lang: 'de',
+  }),
+  permissionsRecorder(
+    'permission-groups',
+    'com.google.android.apps.translate',
+    'permissions/translate-ja.txt',
+    {
+      country: 'jp',
+      lang: 'ja',
+    },
+  ),
+  permissionsRecorder(
+    'permission-groups',
+    'jp.kadokawa.gb.machisuba',
+    'permissions/other-only.txt',
+  ),
+  permissionsRecorder('permission-groups', 'org.asccp.app2019', 'permissions/common-only.txt'),
+  permissionsRecorder('permission-groups', 'com.watchfacestudio.awfwave', 'permissions/none.txt'),
+  permissionsRecorder('permission-groups', 'com.adex77.WhereAmI', 'permissions/where-am-i.txt'),
+  dataSafetyRecorder('com.google.android.apps.translate', 'datasafety/translate.html'),
+  dataSafetyMissingRecorder('pt', 'datasafety/missing-pt.html', false),
+  dataSafetyMissingRecorder('de', 'datasafety/missing-de.tail.html', true),
+  dataSafetyMissingRecorder('ja', 'datasafety/missing-ja.tail.html', true),
+  dataSafetyMissingRecorder('ar', 'datasafety/missing-ar.tail.html', true),
+  dataSafetyMissingRecorder('ru', 'datasafety/missing-ru.tail.html', true),
+  dataSafetyMissingRecorder('zh', 'datasafety/missing-zh.tail.html', true),
+  syntheticRecorder('synthetic/details-like.html', SYNTHETIC_DETAILS_LIKE_HTML),
+  syntheticRecorder('synthetic/batch-chunked.txt', SYNTHETIC_BATCH_CHUNKED),
+];
+
+function parseRequestedName(args: readonly string[]): string | undefined {
+  const onlyIndex = args.indexOf('--only');
+  if (onlyIndex !== -1) {
+    return args[onlyIndex + 1];
+  }
+  return args[0];
+}
+
+async function main(): Promise<void> {
+  const requested = parseRequestedName(process.argv.slice(2));
+  const selected = requested
+    ? recorders.filter((recorder) => recorder.name === requested)
+    : recorders;
+
+  if (selected.length === 0) {
+    throw new Error(`no fixture recorder registered under "${requested ?? ''}"`);
+  }
+
+  const client = createHttpClient({ throttle: THROTTLE_REQUESTS_PER_SECOND });
+  for (const recorder of selected) {
+    await recorder.run(client);
+  }
+}
+
+main().catch((error: unknown) => {
+  process.exitCode = 1;
+  throw error;
+});

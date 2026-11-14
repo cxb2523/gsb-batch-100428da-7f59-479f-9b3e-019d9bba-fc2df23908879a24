@@ -1,0 +1,99 @@
+import { $ZodError, parse, type $ZodType } from 'zod/v4/core';
+import type * as z from 'zod/mini';
+import type { Path } from './path.ts';
+import { getPath } from './path.ts';
+import type { ScriptData } from './scriptData.ts';
+import type { SpecFailure } from './errors.ts';
+import { formatZodIssues, SpecError } from './errors.ts';
+
+export interface FieldSpec<T = unknown> {
+  paths: readonly Path[];
+  missing: MissingPolicy;
+  schema: $ZodType<T>;
+  transform?: (value: unknown) => unknown;
+}
+
+export type MissingPolicy =
+  { kind: 'required' } | { kind: 'optional' } | { kind: 'default'; create: () => unknown };
+
+export const required = (): MissingPolicy => ({ kind: 'required' });
+export const optional = (): MissingPolicy => ({ kind: 'optional' });
+export const defaulted = (create: () => unknown): MissingPolicy => ({ kind: 'default', create });
+
+export type SpecMap = Record<string, FieldSpec>;
+export type Extracted<M extends SpecMap> = { [K in keyof M]: z.infer<M[K]['schema']> };
+
+function isScriptData(source: unknown): source is ScriptData {
+  return (
+    typeof source === 'object' &&
+    source !== null &&
+    'blocks' in source &&
+    'serviceRequests' in source
+  );
+}
+
+type ResolvedValue = { found: true; value: unknown } | { found: false };
+
+function resolveValue(root: unknown, paths: readonly Path[]): ResolvedValue {
+  for (const path of paths) {
+    const value = getPath(root, path);
+    if (value !== undefined && value !== null) {
+      return { found: true, value };
+    }
+  }
+  return { found: false };
+}
+
+function failureMessage(error: unknown): string {
+  if (error instanceof $ZodError) {
+    return formatZodIssues(error);
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === 'string') {
+    return error;
+  }
+  return 'non-error thrown during extraction';
+}
+
+export function extract<M extends SpecMap>(
+  source: unknown,
+  specs: M,
+  context: string,
+): Extracted<M>;
+export function extract(source: unknown, specs: SpecMap, context: string): Record<string, unknown> {
+  const root = isScriptData(source) ? source.blocks : source;
+  const result: Record<string, unknown> = {};
+  const failures: SpecFailure[] = [];
+
+  for (const [field, spec] of Object.entries(specs)) {
+    const paths = spec.paths;
+    const resolved = resolveValue(root, paths);
+    try {
+      if (!resolved.found && spec.missing.kind === 'required') {
+        failures.push({ field, paths, message: 'required value missing' });
+        continue;
+      }
+      if (!resolved.found && spec.missing.kind === 'optional') {
+        result[field] = parse(spec.schema, undefined);
+        continue;
+      }
+      if (!resolved.found && spec.missing.kind === 'default') {
+        result[field] = parse(spec.schema, spec.missing.create());
+        continue;
+      }
+      const raw = resolved.found ? resolved.value : undefined;
+      const input = spec.transform ? spec.transform(raw) : raw;
+      result[field] = parse(spec.schema, input);
+    } catch (error) {
+      failures.push({ field, paths, message: failureMessage(error) });
+    }
+  }
+
+  if (failures.length > 0) {
+    throw new SpecError(context, failures);
+  }
+
+  return result;
+}

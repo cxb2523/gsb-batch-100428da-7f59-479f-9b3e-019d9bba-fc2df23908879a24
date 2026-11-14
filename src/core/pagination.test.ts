@@ -1,0 +1,818 @@
+import { describe, expect, it } from 'vitest';
+import * as z from 'zod/mini';
+import {
+  buildClusterBody,
+  clusterPages,
+  CLUSTER_PAGE_SIZE,
+  fetchClusterApps,
+  MAX_REPEATED_PAGES,
+  uniqueAppPages,
+} from './pagination.ts';
+import type { DegradationEvent } from './degradation.ts';
+import { ParseError } from './errors.ts';
+import type { HttpClient, HttpRequest } from './http.ts';
+import type { IntegrityEvent } from './integrity.ts';
+import { required, type SpecMap } from './spec.ts';
+
+const itemSpecs = {
+  appId: { paths: [[0]], missing: required(), schema: z.string() },
+} satisfies SpecMap;
+
+const APPS_PATH = [0, 0, 0];
+const TOKEN_PATH = [0, 0, 7, 1];
+const FALLBACK_LAYOUT = { apps: [0, 6, 0], token: [0, 6, 7, 1] };
+
+const framedBatchResponse = (payload: unknown): string => {
+  const frame = [['wrb.fr', 'qnKhOb', JSON.stringify(payload), null, null, null, 'generic']];
+  return `)]}'\n\n${JSON.stringify(frame).length.toString()}\n${JSON.stringify(frame)}`;
+};
+
+const batchResponseInSlot = (slot: number, apps: unknown[], tokenNode: unknown): string => {
+  const inner: unknown[] = [];
+  inner[0] = apps;
+  inner[7] = tokenNode;
+  const wrap: unknown[] = [];
+  wrap[slot] = inner;
+  return framedBatchResponse([wrap]);
+};
+
+const batchResponseWithTokenNode = (apps: unknown[], tokenNode: unknown): string =>
+  batchResponseInSlot(0, apps, tokenNode);
+
+const batchResponse = (apps: unknown[], token: string | null): string =>
+  batchResponseWithTokenNode(apps, [null, token]);
+
+const NULL_PAYLOAD_RESPONSE = `)]}'\n\n${JSON.stringify([
+  [
+    'wrb.fr',
+    'qnKhOb',
+    null,
+    null,
+    null,
+    [
+      5,
+      null,
+      [['type.googleapis.com/wireless.android.finsky.boq.web.data.store.error.PlayDataError', [1]]],
+    ],
+    'generic',
+  ],
+  ['di', 53],
+])}\n`;
+
+const fallbackBatchResponse = (apps: unknown[], token: string | null): string =>
+  batchResponseInSlot(6, apps, [null, token]);
+
+const batchResponseWithoutToken = (apps: unknown[]): string => framedBatchResponse([[[apps]]]);
+
+const queuedClient = (responses: string[]): { client: HttpClient; requests: HttpRequest[] } => {
+  const requests: HttpRequest[] = [];
+  let index = 0;
+  const client: HttpClient = {
+    request(req) {
+      requests.push(req);
+      const body = responses[index] ?? batchResponse([], null);
+      index += 1;
+      return Promise.resolve(body);
+    },
+  };
+  return { client, requests };
+};
+
+describe('buildClusterBody', () => {
+  it('interpolates the page size and pagination token verbatim', () => {
+    const body = buildClusterBody(CLUSTER_PAGE_SIZE, 'TOKEN123');
+    expect(body).toContain(`%2C${CLUSTER_PAGE_SIZE.toString()}%5D%5D`);
+    expect(body).toContain('%5C%22TOKEN123%5C%22');
+    expect(body.startsWith('f.req=')).toBe(true);
+  });
+});
+
+const collectPages = async <T>(generator: AsyncGenerator<T[]>): Promise<T[][]> => {
+  const pages: T[][] = [];
+  for await (const page of generator) {
+    pages.push(page);
+  }
+  return pages;
+};
+
+describe('clusterPages', () => {
+  it('yields the initial page first, then each fetched continuation page', async () => {
+    const { client, requests } = queuedClient([
+      batchResponse([['a'], ['b']], 't2'),
+      batchResponse([['c'], ['d']], null),
+    ]);
+
+    const pages = await collectPages(
+      clusterPages({
+        client,
+        lang: 'en',
+        country: 'us',
+        initialApps: [{ appId: 'seed' }],
+        initialToken: 't1',
+        itemSpecs,
+        appsPath: APPS_PATH,
+        tokenPath: TOKEN_PATH,
+        context: 'test',
+      }),
+    );
+
+    expect(pages.map((page) => page.map((item) => item.appId))).toEqual([
+      ['seed'],
+      ['a', 'b'],
+      ['c', 'd'],
+    ]);
+    expect(requests).toHaveLength(2);
+  });
+
+  it('skips the initial yield when there are no initial apps', async () => {
+    const { client } = queuedClient([batchResponse([['a']], null)]);
+
+    const pages = await collectPages(
+      clusterPages({
+        client,
+        lang: 'en',
+        country: 'us',
+        initialApps: [],
+        initialToken: 't1',
+        itemSpecs,
+        appsPath: APPS_PATH,
+        tokenPath: TOKEN_PATH,
+        context: 'test',
+      }),
+    );
+
+    expect(pages.map((page) => page.map((item) => item.appId))).toEqual([['a']]);
+  });
+
+  it('ends when a page returns no continuation token', async () => {
+    const { client, requests } = queuedClient([batchResponse([['a']], null)]);
+
+    const pages = await collectPages(
+      clusterPages({
+        client,
+        lang: 'en',
+        country: 'us',
+        initialApps: [],
+        initialToken: 't1',
+        itemSpecs,
+        appsPath: APPS_PATH,
+        tokenPath: TOKEN_PATH,
+        context: 'test',
+      }),
+    );
+
+    expect(pages).toHaveLength(1);
+    expect(requests).toHaveLength(1);
+  });
+
+  it('ends when a page omits the continuation token holder', async () => {
+    const { client, requests } = queuedClient([batchResponseWithoutToken([['a']])]);
+
+    const pages = await collectPages(
+      clusterPages({
+        client,
+        lang: 'en',
+        country: 'us',
+        initialApps: [],
+        initialToken: 't1',
+        itemSpecs,
+        appsPath: APPS_PATH,
+        tokenPath: TOKEN_PATH,
+        context: 'test',
+      }),
+    );
+
+    expect(pages.map((page) => page.map((item) => item.appId))).toEqual([['a']]);
+    expect(requests).toHaveLength(1);
+  });
+
+  it('keeps the final page when its continuation token node is null', async () => {
+    const { client, requests } = queuedClient([
+      batchResponse([['a']], 't2'),
+      batchResponseWithTokenNode([['b'], ['c']], null),
+    ]);
+    const events: DegradationEvent[] = [];
+
+    const pages = await collectPages(
+      clusterPages({
+        client,
+        lang: 'en',
+        country: 'us',
+        initialApps: [{ appId: 'seed' }],
+        initialToken: 't1',
+        itemSpecs,
+        appsPath: APPS_PATH,
+        tokenPath: TOKEN_PATH,
+        context: 'test',
+        onDegradation: (event) => events.push(event),
+      }),
+    );
+
+    expect(pages.map((page) => page.map((item) => item.appId))).toEqual([
+      ['seed'],
+      ['a'],
+      ['b', 'c'],
+    ]);
+    expect(requests).toHaveLength(2);
+    expect(events).toEqual([]);
+  });
+
+  it('still degrades when the continuation token node has the wrong type', async () => {
+    const { client } = queuedClient([batchResponseWithTokenNode([['a']], 'not-a-token-node')]);
+    const events: DegradationEvent[] = [];
+
+    const pages = await collectPages(
+      clusterPages({
+        client,
+        lang: 'en',
+        country: 'us',
+        initialApps: [{ appId: 'seed' }],
+        initialToken: 't1',
+        itemSpecs,
+        appsPath: APPS_PATH,
+        tokenPath: TOKEN_PATH,
+        context: 'test',
+        onDegradation: (event) => events.push(event),
+      }),
+    );
+
+    expect(pages.map((page) => page.map((item) => item.appId))).toEqual([['seed']]);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.reason).toBe('cluster-page-parse');
+    expect(events[0]?.error.message).toContain('0.0.7');
+  });
+
+  it('rejects a response path containing a non-array segment', async () => {
+    const { client } = queuedClient([]);
+    const generator = clusterPages({
+      client,
+      lang: 'en',
+      country: 'us',
+      initialApps: [],
+      initialToken: 't1',
+      itemSpecs,
+      appsPath: ['root'],
+      tokenPath: TOKEN_PATH,
+      context: 'test',
+    });
+
+    await expect(collectPages(generator)).rejects.toThrow(
+      'test response path must contain only array indexes',
+    );
+  });
+
+  it('stops when the server repeats a pagination token', async () => {
+    const { client, requests } = queuedClient([
+      batchResponse([['a']], 'repeated-token'),
+      batchResponse([['b']], 'repeated-token'),
+    ]);
+
+    const events: IntegrityEvent[] = [];
+    const pages = await collectPages(
+      clusterPages({
+        client,
+        lang: 'en',
+        country: 'us',
+        initialApps: [],
+        initialToken: 'repeated-token',
+        itemSpecs,
+        appsPath: APPS_PATH,
+        tokenPath: TOKEN_PATH,
+        context: 'test',
+        onIntegrityEvent: (event) => events.push(event),
+      }),
+    );
+
+    expect(pages.map((page) => page.map((item) => item.appId))).toEqual([['a']]);
+    expect(requests).toHaveLength(1);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.context).toBe('test');
+    expect(events[0]?.reason).toBe('pagination-token-cycle');
+    expect(events[0]?.error).toBeInstanceOf(ParseError);
+    expect(events[0]?.error.message).not.toContain('repeated-token');
+  });
+
+  it('lets a throwing token cycle callback surface to the consumer', async () => {
+    const { client } = queuedClient([batchResponse([['a']], 'repeated-token')]);
+    const generator = clusterPages({
+      client,
+      lang: 'en',
+      country: 'us',
+      initialApps: [],
+      initialToken: 'repeated-token',
+      itemSpecs,
+      appsPath: APPS_PATH,
+      tokenPath: TOKEN_PATH,
+      context: 'test',
+      onIntegrityEvent: () => {
+        throw new Error('consumer handler bug');
+      },
+    });
+
+    await expect(collectPages(generator)).rejects.toThrow('consumer handler bug');
+  });
+
+  it('stops gracefully when a continuation page fails to parse', async () => {
+    const { client, requests } = queuedClient([batchResponse([[42]], 't2')]);
+    const events: DegradationEvent[] = [];
+
+    const pages = await collectPages(
+      clusterPages({
+        client,
+        lang: 'en',
+        country: 'us',
+        initialApps: [{ appId: 'seed' }],
+        initialToken: 't1',
+        itemSpecs,
+        appsPath: APPS_PATH,
+        tokenPath: TOKEN_PATH,
+        context: 'test',
+        onDegradation: (event) => events.push(event),
+      }),
+    );
+
+    expect(pages.map((page) => page.map((item) => item.appId))).toEqual([['seed']]);
+    expect(requests).toHaveLength(1);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.context).toBe('test');
+    expect(events[0]?.reason).toBe('cluster-page-parse');
+    expect(events[0]?.error).toBeInstanceOf(ParseError);
+  });
+
+  it('emits no degradation event on a clean full pagination', async () => {
+    const { client } = queuedClient([batchResponse([['a']], 't2'), batchResponse([['b']], null)]);
+    const events: DegradationEvent[] = [];
+
+    const pages = await collectPages(
+      clusterPages({
+        client,
+        lang: 'en',
+        country: 'us',
+        initialApps: [{ appId: 'seed' }],
+        initialToken: 't1',
+        itemSpecs,
+        appsPath: APPS_PATH,
+        tokenPath: TOKEN_PATH,
+        context: 'test',
+        onDegradation: (event) => events.push(event),
+      }),
+    );
+
+    expect(pages).toHaveLength(3);
+    expect(events).toEqual([]);
+  });
+
+  it('propagates non-parse errors from the continuation request', async () => {
+    const client: HttpClient = {
+      request() {
+        return Promise.reject(new Error('network down'));
+      },
+    };
+    const events: DegradationEvent[] = [];
+
+    const generator = clusterPages({
+      client,
+      lang: 'en',
+      country: 'us',
+      initialApps: [],
+      initialToken: 't1',
+      itemSpecs,
+      appsPath: APPS_PATH,
+      tokenPath: TOKEN_PATH,
+      context: 'test',
+      onDegradation: (event) => events.push(event),
+    });
+
+    await expect(collectPages(generator)).rejects.toThrow('network down');
+    expect(events).toEqual([]);
+  });
+
+  it('lets a throwing degradation callback surface to the consumer', async () => {
+    const { client } = queuedClient([batchResponse([[42]], 't2')]);
+
+    const generator = clusterPages({
+      client,
+      lang: 'en',
+      country: 'us',
+      initialApps: [],
+      initialToken: 't1',
+      itemSpecs,
+      appsPath: APPS_PATH,
+      tokenPath: TOKEN_PATH,
+      context: 'test',
+      onDegradation: () => {
+        throw new Error('consumer handler bug');
+      },
+    });
+
+    await expect(collectPages(generator)).rejects.toThrow('consumer handler bug');
+  });
+});
+
+describe('uniqueAppPages', () => {
+  const pagesFrom = (responses: string[]) => {
+    const { client, requests } = queuedClient(responses);
+    const pages = collectPages(
+      uniqueAppPages(
+        clusterPages({
+          client,
+          lang: 'en',
+          country: 'us',
+          initialApps: [{ appId: 'seed' }, { appId: 'a' }],
+          initialToken: 't1',
+          itemSpecs,
+          appsPath: APPS_PATH,
+          tokenPath: TOKEN_PATH,
+          context: 'test',
+        }),
+      ),
+    );
+    return { pages, requests };
+  };
+
+  const fromArrays = async function* (pages: { appId: string }[][]) {
+    for (const page of pages) {
+      await Promise.resolve();
+      yield page;
+    }
+  };
+
+  const idsOf = (pages: { appId: string }[][]): string[][] =>
+    pages.map((page) => page.map((item) => item.appId));
+
+  const repeats = (count: number): { appId: string }[][] =>
+    Array.from({ length: count }, () => [{ appId: 'seed' }]);
+
+  it('yields an app served again on a later page only once', async () => {
+    const { pages } = pagesFrom([
+      batchResponse([['a'], ['b'], ['seed']], 't2'),
+      batchResponse([['b'], ['c']], null),
+    ]);
+
+    expect(idsOf(await pages)).toEqual([['seed', 'a'], ['b'], ['c']]);
+  });
+
+  it('keeps following the token past a page made only of repeated apps', async () => {
+    const { pages, requests } = pagesFrom([
+      batchResponse([['seed'], ['a']], 't2'),
+      batchResponse([['d']], null),
+    ]);
+
+    expect(idsOf(await pages)).toEqual([['seed', 'a'], ['d']]);
+    expect(requests).toHaveLength(2);
+  });
+
+  it('stops requesting after consecutive pages that repeat only earlier apps', async () => {
+    const responses = Array.from({ length: MAX_REPEATED_PAGES + 2 }, (_, index) =>
+      batchResponse([['seed'], ['a']], `repeat-${index.toString()}`),
+    );
+    const { pages, requests } = pagesFrom(responses);
+
+    expect(idsOf(await pages)).toEqual([['seed', 'a']]);
+    expect(requests).toHaveLength(MAX_REPEATED_PAGES);
+  });
+
+  it('restarts the repeated page count when a page brings a new app', async () => {
+    const pages = await collectPages(
+      uniqueAppPages(
+        fromArrays([
+          [{ appId: 'seed' }],
+          ...repeats(MAX_REPEATED_PAGES - 1),
+          [{ appId: 'b' }],
+          ...repeats(MAX_REPEATED_PAGES - 1),
+          [{ appId: 'c' }],
+        ]),
+      ),
+    );
+
+    expect(idsOf(pages)).toEqual([['seed'], ['b'], ['c']]);
+  });
+
+  it('does not count an empty page as a repeated page', async () => {
+    const pages = await collectPages(
+      uniqueAppPages(
+        fromArrays([
+          [{ appId: 'seed' }],
+          ...repeats(MAX_REPEATED_PAGES - 1),
+          [],
+          [],
+          [{ appId: 'b' }],
+        ]),
+      ),
+    );
+
+    expect(idsOf(pages)).toEqual([['seed'], ['b']]);
+  });
+
+  it('drops an app repeated inside one page', async () => {
+    const pages = await collectPages(
+      uniqueAppPages(fromArrays([[{ appId: 'seed' }, { appId: 'seed' }]])),
+    );
+
+    expect(pages).toEqual([[{ appId: 'seed' }]]);
+  });
+});
+
+describe('clusterPages null continuation payload', () => {
+  const runNull = async (responses: string[]) => {
+    const { client, requests } = queuedClient(responses);
+    const events: IntegrityEvent[] = [];
+    const degradations: DegradationEvent[] = [];
+    const pages = await collectPages(
+      clusterPages({
+        client,
+        lang: 'en',
+        country: 'us',
+        initialApps: [{ appId: 'seed' }],
+        initialToken: 't1',
+        itemSpecs,
+        appsPath: APPS_PATH,
+        tokenPath: TOKEN_PATH,
+        fallbackLayouts: [FALLBACK_LAYOUT],
+        context: 'test',
+        onIntegrityEvent: (event) => events.push(event),
+        onDegradation: (event) => degradations.push(event),
+      }),
+    );
+    return { pages, requests, events, degradations };
+  };
+
+  it('ends the stream without an event when the server answers with a null payload', async () => {
+    const { pages, requests, events, degradations } = await runNull([NULL_PAYLOAD_RESPONSE]);
+
+    expect(pages.map((page) => page.map((item) => item.appId))).toEqual([['seed']]);
+    expect(requests).toHaveLength(1);
+    expect(events).toEqual([]);
+    expect(degradations).toEqual([]);
+  });
+
+  it('degrades when a null payload carries a status other than not found', async () => {
+    const invalidRequest = NULL_PAYLOAD_RESPONSE.replace('[5,null,', '[3,null,');
+    const { pages, events, degradations } = await runNull([invalidRequest]);
+
+    expect(pages.map((page) => page.map((item) => item.appId))).toEqual([['seed']]);
+    expect(events).toEqual([]);
+    expect(degradations).toHaveLength(1);
+    expect(degradations[0]?.reason).toBe('cluster-page-parse');
+    expect(degradations[0]?.error.message).toContain('test continuation apps response');
+  });
+
+  it('keeps the pages collected before a null payload', async () => {
+    const { pages, requests, degradations } = await runNull([
+      batchResponse([['a']], 't2'),
+      NULL_PAYLOAD_RESPONSE,
+    ]);
+
+    expect(pages.map((page) => page.map((item) => item.appId))).toEqual([['seed'], ['a']]);
+    expect(requests).toHaveLength(2);
+    expect(degradations).toEqual([]);
+  });
+});
+
+describe('clusterPages layout fallbacks', () => {
+  const run = (
+    responses: string[],
+    overrides: Partial<Parameters<typeof clusterPages<typeof itemSpecs>>[0]> = {},
+  ) => {
+    const { client, requests } = queuedClient(responses);
+    const events: IntegrityEvent[] = [];
+    const degradations: DegradationEvent[] = [];
+    const pages = collectPages(
+      clusterPages({
+        client,
+        lang: 'en',
+        country: 'us',
+        initialApps: [],
+        initialToken: 't1',
+        itemSpecs,
+        appsPath: APPS_PATH,
+        tokenPath: TOKEN_PATH,
+        fallbackLayouts: [FALLBACK_LAYOUT],
+        context: 'test',
+        onIntegrityEvent: (event) => events.push(event),
+        onDegradation: (event) => degradations.push(event),
+        ...overrides,
+      }),
+    );
+    return { pages, requests, events, degradations };
+  };
+
+  it('reads a continuation from the fallback layout and reports the anchor fallback', async () => {
+    const { pages, events, degradations } = run([fallbackBatchResponse([['a'], ['b']], null)]);
+
+    expect((await pages).map((page) => page.map((item) => item.appId))).toEqual([['a', 'b']]);
+    expect(degradations).toEqual([]);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.context).toBe('test');
+    expect(events[0]?.reason).toBe('rpc-anchor-fallback');
+    expect(events[0]?.error).toBeInstanceOf(ParseError);
+    expect(events[0]?.error.message).toBe(
+      'test: continuation apps resolved at 0.6.0 instead of 0.0.0',
+    );
+  });
+
+  it('follows the fallback token path to the next continuation page', async () => {
+    const { pages, requests, events } = run([
+      fallbackBatchResponse([['a']], 't2'),
+      fallbackBatchResponse([['b']], null),
+    ]);
+
+    expect((await pages).map((page) => page.map((item) => item.appId))).toEqual([['a'], ['b']]);
+    expect(requests).toHaveLength(2);
+    expect(events.map((event) => event.reason)).toEqual([
+      'rpc-anchor-fallback',
+      'rpc-anchor-fallback',
+    ]);
+  });
+
+  it('keeps the primary layout without an event when it carries the apps', async () => {
+    const { pages, events } = run([batchResponse([['a']], 't2'), batchResponse([['b']], null)]);
+
+    expect((await pages).map((page) => page.map((item) => item.appId))).toEqual([['a'], ['b']]);
+    expect(events).toEqual([]);
+  });
+
+  it('prefers the primary layout when both layouts carry apps', async () => {
+    const wrap: unknown[] = [];
+    wrap[0] = [[['primary']]];
+    wrap[6] = [[['fallback']]];
+    const { pages, events } = run([framedBatchResponse([wrap])]);
+
+    expect((await pages).map((page) => page.map((item) => item.appId))).toEqual([['primary']]);
+    expect(events).toEqual([]);
+  });
+
+  it('reads a populated fallback layout when the primary layout holds an empty list', async () => {
+    const wrap: unknown[] = [];
+    wrap[0] = [[]];
+    wrap[6] = [[['fallback']]];
+    const { pages, events, degradations } = run([framedBatchResponse([wrap])]);
+
+    expect((await pages).map((page) => page.map((item) => item.appId))).toEqual([['fallback']]);
+    expect(degradations).toEqual([]);
+    expect(events.map((event) => event.reason)).toEqual(['rpc-anchor-fallback']);
+  });
+
+  it('degrades with the primary path when no layout carries apps', async () => {
+    const { pages, events, degradations } = run([framedBatchResponse([[null, null]])]);
+
+    expect(await pages).toEqual([]);
+    expect(events).toEqual([]);
+    expect(degradations).toHaveLength(1);
+    expect(degradations[0]?.reason).toBe('cluster-page-parse');
+    expect(degradations[0]?.error.message).toContain('test continuation apps response');
+  });
+
+  it('ends silently when the fallback layout serves an empty apps list', async () => {
+    const { pages, requests, events, degradations } = run([fallbackBatchResponse([], null)]);
+
+    expect(await pages).toEqual([]);
+    expect(requests).toHaveLength(1);
+    expect(events).toEqual([]);
+    expect(degradations).toEqual([]);
+  });
+
+  it('rejects a fallback layout containing a non-array segment', async () => {
+    const { pages } = run([], { fallbackLayouts: [{ apps: ['root'], token: TOKEN_PATH }] });
+
+    await expect(pages).rejects.toThrow('test response path must contain only array indexes');
+  });
+});
+
+describe('fetchClusterApps', () => {
+  it('returns the first page when the continuation page is malformed', async () => {
+    const { client, requests } = queuedClient([batchResponse([[42]], 't2')]);
+    const events: DegradationEvent[] = [];
+
+    const result = await fetchClusterApps({
+      client,
+      lang: 'en',
+      country: 'us',
+      num: 10,
+      initialApps: [{ appId: 'seed' }],
+      initialToken: 't1',
+      itemSpecs,
+      appsPath: APPS_PATH,
+      tokenPath: TOKEN_PATH,
+      context: 'test',
+      onDegradation: (event) => events.push(event),
+    });
+
+    expect(result).toEqual([{ appId: 'seed' }]);
+    expect(requests).toHaveLength(1);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.context).toBe('test');
+    expect(events[0]?.reason).toBe('cluster-page-parse');
+    expect(events[0]?.error).toBeInstanceOf(ParseError);
+  });
+
+  it('follows the pagination token across pages until it runs out', async () => {
+    const { client, requests } = queuedClient([
+      batchResponse([['a'], ['b']], 't2'),
+      batchResponse([['c'], ['d']], null),
+    ]);
+
+    const result = await fetchClusterApps({
+      client,
+      lang: 'en',
+      country: 'us',
+      num: 10,
+      initialApps: [],
+      initialToken: 't1',
+      itemSpecs,
+      appsPath: APPS_PATH,
+      tokenPath: TOKEN_PATH,
+      context: 'test',
+    });
+
+    expect(result.map((item) => item.appId)).toEqual(['a', 'b', 'c', 'd']);
+    expect(requests).toHaveLength(2);
+    expect(requests[0]?.method).toBe('POST');
+  });
+
+  it('never returns more than num and stops requesting once satisfied', async () => {
+    const { client, requests } = queuedClient([
+      batchResponse([['a'], ['b']], 't2'),
+      batchResponse([['c'], ['d']], 't3'),
+    ]);
+
+    const result = await fetchClusterApps({
+      client,
+      lang: 'en',
+      country: 'us',
+      num: 3,
+      initialApps: [],
+      initialToken: 't1',
+      itemSpecs,
+      appsPath: APPS_PATH,
+      tokenPath: TOKEN_PATH,
+      context: 'test',
+    });
+
+    expect(result).toHaveLength(3);
+    expect(requests).toHaveLength(2);
+  });
+
+  it('treats an empty apps page as the end of pagination', async () => {
+    const { client, requests } = queuedClient([batchResponse([], 'still-a-token')]);
+
+    const result = await fetchClusterApps({
+      client,
+      lang: 'en',
+      country: 'us',
+      num: 10,
+      initialApps: [{ appId: 'seed' }],
+      initialToken: 't1',
+      itemSpecs,
+      appsPath: APPS_PATH,
+      tokenPath: TOKEN_PATH,
+      context: 'test',
+    });
+
+    expect(result).toEqual([{ appId: 'seed' }]);
+    expect(requests).toHaveLength(1);
+  });
+
+  it('does not request anything when no initial token exists', async () => {
+    const { client, requests } = queuedClient([]);
+
+    const result = await fetchClusterApps({
+      client,
+      lang: 'en',
+      country: 'us',
+      num: 10,
+      initialApps: [{ appId: 'seed' }],
+      initialToken: undefined,
+      itemSpecs,
+      appsPath: APPS_PATH,
+      tokenPath: TOKEN_PATH,
+      context: 'test',
+    });
+
+    expect(result).toEqual([{ appId: 'seed' }]);
+    expect(requests).toHaveLength(0);
+  });
+
+  it('does not count repeated apps toward num', async () => {
+    const { client, requests } = queuedClient([
+      batchResponse([['seed'], ['a']], 't2'),
+      batchResponse([['b'], ['c']], null),
+    ]);
+
+    const result = await fetchClusterApps({
+      client,
+      lang: 'en',
+      country: 'us',
+      num: 3,
+      initialApps: [{ appId: 'seed' }],
+      initialToken: 't1',
+      itemSpecs,
+      appsPath: APPS_PATH,
+      tokenPath: TOKEN_PATH,
+      context: 'test',
+    });
+
+    expect(result.map((item) => item.appId)).toEqual(['seed', 'a', 'b']);
+    expect(requests).toHaveLength(2);
+  });
+});
