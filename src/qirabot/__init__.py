@@ -25,6 +25,7 @@ from qirabot.exceptions import (
     ActionError,
     AuthenticationError,
     MissingDependencyError,
+    NoOpenPageError,
     QirabotError,
     QirabotTimeoutError,
 )
@@ -57,6 +58,7 @@ __all__ = [
     "LocateResult",
     "MissingDependencyError",
     "MjpegStreamRecorder",
+    "NoOpenPageError",
     "Overlay",
     "Qirabot",
     "QirabotError",

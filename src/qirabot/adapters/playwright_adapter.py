@@ -6,10 +6,9 @@ import logging
 from typing import Any
 
 from qirabot.adapters.base import DeviceAdapter, DeviceInfo, ScreenshotConfig
+from qirabot.exceptions import NoOpenPageError
 
 logger = logging.getLogger("qirabot")
-
-_NEW_TAB_ACTIONS = frozenset({"click", "double_click", "type_text", "press_key"})
 
 _KEY_ALIASES = {"ctrl": "Control", "alt": "Alt", "cmd": "Meta", "meta": "Meta", "shift": "Shift"}
 
@@ -25,6 +24,7 @@ class PlaywrightAdapter(DeviceAdapter):
     def __init__(self, page: Any) -> None:
         self._page = page
         self._new_page: Any | None = None
+        self._closed = False
         # Keep the context we hooked and the exact handler object so close()
         # can unhook it. Re-deriving self._page.context later may yield a
         # different (or closed) context after tab switches.
@@ -37,6 +37,11 @@ class PlaywrightAdapter(DeviceAdapter):
     def close(self) -> None:
         # Remove the "page" listener we registered in __init__; without this it
         # outlives the adapter and accumulates on the (longer-lived) context.
+        # Idempotent: a second close() must not raise (the listener is already
+        # gone) nor touch a possibly-closed context again.
+        if self._closed:
+            return
+        self._closed = True
         try:
             self._context.remove_listener("page", self._on_page)
         except Exception:
@@ -47,33 +52,51 @@ class PlaywrightAdapter(DeviceAdapter):
         t = type(target)
         return t.__module__.startswith("playwright.") and t.__name__ == "Page"
 
-    def _switch_if_new_tab(self) -> None:
-        if self._new_page is None:
-            try:
-                self._page.context.wait_for_event("page", timeout=1000)
-            except Exception:
-                return
-        if self._new_page is not None:
-            new_page = self._new_page
-            self._new_page = None
-            new_page.wait_for_load_state()
-            self._page = new_page
-            logger.info("switched to new tab: %s", self._page.url)
+    def _reconfirm_page(self) -> None:
+        """Re-confirm ``self._page`` after an action — for EVERY action type.
 
-    def _switch_if_tab_closed(self) -> None:
-        if not self._page.is_closed():
-            return
-        pages = self._page.context.pages
-        if pages:
+        Any action can change which tab we should drive: a click/type may open
+        target=_blank, navigate (or a script's own page.goto) may replace or
+        close the tab, and window.close / Ctrl+W / page.close() kills the
+        current one. Collection scripts also drive the raw page directly
+        between adapter calls. Operating on a stale page afterwards yields
+        wrong screenshots and coordinates, so after each action:
+          1. a tab opened during the action wins (wait for it to load);
+          2. else if the current page is closed, fall back to the last
+             still-open page in the context;
+          3. else give a late popup a brief chance to appear;
+          4. if no open page remains, raise instead of driving a closed page.
+        """
+        if self._new_page is None and not self._page.is_closed():
+            # Brief grace for a popup that fires just after the action returned.
+            try:
+                self._new_page = self._context.wait_for_event("page", timeout=1000)
+            except Exception:
+                pass
+        new_page, self._new_page = self._new_page, None
+        if new_page is not None and not new_page.is_closed():
+            try:
+                new_page.wait_for_load_state()
+            except Exception:
+                pass
+            if not new_page.is_closed():
+                self._page = new_page
+                logger.info("switched to new tab: %s", new_page.url)
+                return
+        if self._page.is_closed():
+            pages = [p for p in self._context.pages if not p.is_closed()]
+            if not pages:
+                raise NoOpenPageError(
+                    "every page in the browser context is closed; "
+                    "no page left to operate on"
+                )
             self._page = pages[-1]
-            logger.info("switched to previous tab: %s", self._page.url)
+            logger.info("current tab closed; switched to last open tab: %s", self._page.url)
 
     def execute(self, action_type: str, params: dict[str, Any]) -> None:
         self._new_page = None
         super().execute(action_type, params)
-        if action_type in _NEW_TAB_ACTIONS:
-            self._switch_if_new_tab()
-        self._switch_if_tab_closed()
+        self._reconfirm_page()
 
     @property
     def current_target(self) -> Any:
@@ -133,6 +156,9 @@ class PlaywrightAdapter(DeviceAdapter):
 
     def navigate(self, url: str) -> None:
         self._page.goto(url, wait_until="domcontentloaded")
+        # A goto can replace the tab (redirect to a new window, script closing
+        # the old one) — run the same confirmation as every other action.
+        self._reconfirm_page()
 
     def go_back(self) -> None:
         # Try history back first. A link opened in a NEW tab has no back history,
@@ -142,13 +168,13 @@ class PlaywrightAdapter(DeviceAdapter):
         # treated as a real back and the tab is kept.
         before = self._page.url
         self._page.go_back(wait_until="domcontentloaded")
-        self._switch_if_tab_closed()
-        if self._page.url == before and len(self._page.context.pages) > 1:
+        self._reconfirm_page()
+        if self._page.url == before and len(self._context.pages) > 1:
             self.close_tab()
 
     def close_tab(self) -> None:
         self._page.close()
-        self._switch_if_tab_closed()
+        self._reconfirm_page()
 
     def drag(self, from_x: float, from_y: float, to_x: float, to_y: float) -> None:
         # A single move from source to target often fails to fire HTML5

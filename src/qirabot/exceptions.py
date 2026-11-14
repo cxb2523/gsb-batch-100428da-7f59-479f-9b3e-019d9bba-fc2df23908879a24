@@ -31,6 +31,16 @@ class ActionError(QirabotError):
     """AI action failed."""
 
 
+class NoOpenPageError(ActionError):
+    """No open page remains in the browser context to operate on.
+
+    Raised by the Playwright adapter when the current tab was closed (by the
+    page itself, a script, or an action) and the context has no other open
+    page to fall back to. Continuing would mean driving a closed page, which
+    only fails later with a far less clear error.
+    """
+
+
 class QirabotTimeoutError(QirabotError):
     """Operation timed out (client-side)."""
 
