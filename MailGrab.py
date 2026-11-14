@@ -564,14 +564,28 @@ if __name__ == "__main__":
 
         return emailList, scrappedUrlList, emails, scrappedUrls
 
-    def printQuietSummary(emails, scrappedUrls):
+    def printQuietSummary(emails, scrappedUrls, seedOutcomes=None):
         # --quiet suppresses all normal console output via Console(quiet=True); this is the
-        # one thing still printed, a plain stdout line meant for piping into other tools
-        print(json.dumps({
+        # one thing still printed, a plain stdout line meant for piping into other tools.
+        # seedOutcomes (batch mode only) adds a per-seed url/status/error breakdown so a
+        # script can tell exactly which seeds failed and why, not just that something did.
+        summary = {
             "emailCount": len(emails),
             "urlCount": len(scrappedUrls),
             "outputFiles": ["_emails.txt", "_scrappedUrls.txt", "_emails.csv", "_results.json"],
-        }))
+        }
+        if seedOutcomes is not None:
+            summary["seedCount"] = len(seedOutcomes)
+            summary["succeededSeedCount"] = sum(1 for o in seedOutcomes if o["status"] == "success")
+            summary["failedSeedCount"] = sum(1 for o in seedOutcomes if o["status"] == "failed")
+            summary["seeds"] = seedOutcomes
+        print(json.dumps(summary))
+
+    def _shortErrorMessage(exception):
+        # requests' ConnectionError str() embeds the whole urllib3 cause chain (one very
+        # long line) -- fine for the log file, unusable in a one-line console/JSON summary
+        message = str(exception).replace("\r", " ").replace("\n", " ")
+        return message if len(message) <= 200 else message[:197] + "..."
 
     def _isDisguisedTimeout(connectionError):
         # Mounting a Retry-based HTTPAdapter makes requests wrap a read/connect timeout's
@@ -588,7 +602,10 @@ if __name__ == "__main__":
         return isinstance(reason, (ReadTimeoutError, ConnectTimeoutError))
 
     def _fetchAndExtract(url, session, timeoutSeconds, count):
-        # Fetches one url and returns (emails found, links discovered); errors are logged and swallowed
+        # Fetches one url and returns (emails found, links discovered, social links, error);
+        # errors are logged and swallowed -- the crawl continues -- but a short reason string
+        # comes back as the 4th element (None on success) so batch mode can attribute a
+        # failed seed to its cause instead of just printing one generic error.
         bn = Text(f"[{count}]")
         bn.stylize("bold #5bc0de")
         pText = Text(" Processing: ")
@@ -606,47 +623,49 @@ if __name__ == "__main__":
             log.exception("HTTP Error: {}".format(e))
             console.print(sInfo + " Skipping Url: {}".format(eUrl))
             log.info("Skipping Url: {}".format(eUrl))
-            return set(), [], set()
+            return set(), [], set(), "HTTP Error: {}".format(_shortErrorMessage(e))
         except r.exceptions.ConnectionError as e:
             if _isDisguisedTimeout(e):
                 console.print(sDanger + " Timeout Error: {}".format(e))
                 log.error("Timeout Error: {}".format(e))
                 log.exception("Timeout Error: {}".format(e))
+                reason = "Timeout: {}".format(_shortErrorMessage(e))
             else:
                 console.print(sDanger + " Connection Error: {}".format(e))
                 log.error("Connection Error: {}".format(e))
                 log.exception("Connection Error: {}".format(e))
+                reason = "Connection Error: {}".format(_shortErrorMessage(e))
             console.print(sInfo + " Skipping Url: {}".format(eUrl))
             log.info("Skipping Url: {}".format(eUrl))
-            return set(), [], set()
+            return set(), [], set(), reason
         except r.exceptions.Timeout as e:
             console.print(sDanger + " Timeout Error: {}".format(e))
             log.error("Timeout Error: {}".format(e))
             log.exception("Timeout Error: {}".format(e))
             console.print(sInfo + " Skipping Url: {}".format(eUrl))
             log.info("Skipping Url: {}".format(eUrl))
-            return set(), [], set()
+            return set(), [], set(), "Timeout: {}".format(_shortErrorMessage(e))
         except r.exceptions.TooManyRedirects as e:
             console.print(sDanger + " Too Many Redirects: {}".format(e))
             log.error("Too Many Redirects: {}".format(e))
             log.exception("Too Many Redirects: {}".format(e))
             console.print(sInfo + " Skipping Url: {}".format(eUrl))
             log.info("Skipping Url: {}".format(eUrl))
-            return set(), [], set()
+            return set(), [], set(), "Too Many Redirects: {}".format(_shortErrorMessage(e))
         except r.exceptions.RequestException as e:
             console.print(sDanger + " Request Exception: {}".format(e))
             log.error("Request Exception: {}".format(e))
             log.exception("Request Exception: {}".format(e))
             console.print(sInfo + " Skipping Url: {}".format(eUrl))
             log.info("Skipping Url: {}".format(eUrl))
-            return set(), [], set()
+            return set(), [], set(), "Request Failed: {}".format(_shortErrorMessage(e))
         except Exception as e:
             console.print(sDanger + " Exception: {}".format(e))
             log.error("Exception: {}".format(e))
             log.exception("Exception: {}".format(e))
             console.print(sInfo + " Skipping Url: {}".format(eUrl))
             log.info("Skipping Url: {}".format(eUrl))
-            return set(), [], set()
+            return set(), [], set(), "Unexpected {}: {}".format(type(e).__name__, _shortErrorMessage(e))
         # Quantifiers are bounded (RFC-realistic max lengths) rather than unbounded (+):
         # unbounded here caused the same catastrophic backtracking on a long run of word
         # characters with no "@" (minified JS, a base64 blob, a long hash) as the
@@ -690,17 +709,19 @@ if __name__ == "__main__":
                 len(placeholders), ", ".join(sorted(placeholders))))
             log.info("Filtered placeholder emails: {}".format(sorted(placeholders)))
         newEmails -= placeholders
-        return newEmails, discoveredLinks, socialLinks
+        return newEmails, discoveredLinks, socialLinks, None
 
     def crawlUrls(seedUrl, depth, session, maxWorkers, delaySeconds, timeoutSeconds,
                   sameDomainOnly=False, ignoreRobots=False, userAgent="",
                   visited=None, emails=None, emailSources=None, socialLinks=None,
-                  robotsCache=None, maxHops=None, useSitemap=False):
+                  robotsCache=None, maxHops=None, useSitemap=False, fetchErrors=None):
         # BFS-crawls seedUrl up to `depth` pages total, fetching each batch concurrently.
         # visited/emails/emailSources/socialLinks/robotsCache, when passed in, are mutated
         # in place so a batch run over multiple seeds shares dedup/cache state and partial
         # progress survives Ctrl-C. Each queued item is (url, hopCount) so maxHops can cap
         # link-distance from the seed independently of depth's total-page-count cap.
+        # fetchErrors, when passed in, gets (url, reason) appended for every page whose
+        # fetch failed -- batch mode uses it to attribute a seed's failure to its cause.
         seedUrl = up.urldefrag(seedUrl)[0]
         scrappedUrls = visited if visited is not None else set()
         emails = emails if emails is not None else set()
@@ -749,7 +770,9 @@ if __name__ == "__main__":
                         _fetchAndExtract, url, session, timeoutSeconds, count)] = (url, hop)
                 for future in as_completed(futures):
                     sourceUrl, hop = futures[future]
-                    newEmails, discoveredLinks, newSocialLinks = future.result()
+                    newEmails, discoveredLinks, newSocialLinks, fetchError = future.result()
+                    if fetchError is not None and fetchErrors is not None:
+                        fetchErrors.append((sourceUrl, fetchError))
                     emails.update(newEmails)
                     socialLinks.update(newSocialLinks)
                     for email in newEmails:
@@ -914,6 +937,9 @@ if __name__ == "__main__":
                     log.warning("Could Not Load Prior Results For Resume: {}".format(e))
             emailCount = 0
             startTime = time.time()
+            # Per-seed outcomes for the final summary: one {"url", "status", "error"} entry
+            # per seed, so a failed seed is attributable to its site and cause afterwards.
+            seedOutcomes = []
             try:
                 for url in urlListFromTxtFile:
                     # Removing white spaces from the url
@@ -928,18 +954,57 @@ if __name__ == "__main__":
                     console.print(sSuccess + " Base Url Is Set To:  " + url)
                     log.info("Base Url Set To: " + url)
                     startTimeg = time.time()
-                    crawlUrls(
-                        outputUrl, depth, session, MAX_WORKERS, REQUEST_DELAY, REQUEST_TIMEOUT,
-                        sameDomainOnly=SAME_DOMAIN_ONLY, ignoreRobots=IGNORE_ROBOTS, userAgent=USER_AGENT,
-                        visited=scrappedUrls, emails=emails, emailSources=emailSources,
-                        socialLinks=socialLinks, robotsCache=robotsCache, maxHops=MAX_HOPS,
-                        useSitemap=USE_SITEMAP)
+                    # Each seed is isolated: a failure here (connection error, timeout, 5xx
+                    # after retries, or an unexpected exception mid-crawl) is recorded with
+                    # its reason and the loop moves on to the next seed. The shared
+                    # accumulators above keep everything collected so far either way, and
+                    # saveResults still runs after the loop.
+                    fetchErrors = []
+                    seedError = None
+                    try:
+                        crawlUrls(
+                            outputUrl, depth, session, MAX_WORKERS, REQUEST_DELAY, REQUEST_TIMEOUT,
+                            sameDomainOnly=SAME_DOMAIN_ONLY, ignoreRobots=IGNORE_ROBOTS, userAgent=USER_AGENT,
+                            visited=scrappedUrls, emails=emails, emailSources=emailSources,
+                            socialLinks=socialLinks, robotsCache=robotsCache, maxHops=MAX_HOPS,
+                            useSitemap=USE_SITEMAP, fetchErrors=fetchErrors)
+                        # Failures of pages DISCOVERED during the crawl are already tolerated
+                        # inside crawlUrls; a seed counts as failed when its own page (or the
+                        # crawl itself) failed. crawlUrls strips the fragment before queueing.
+                        seedFetchUrl = up.urldefrag(outputUrl)[0]
+                        seedError = next(
+                            (reason for failedUrl, reason in fetchErrors if failedUrl == seedFetchUrl),
+                            None)
+                    except Exception as e:
+                        seedError = "{}: {}".format(type(e).__name__, _shortErrorMessage(e))
+                    if seedError is None:
+                        seedOutcomes.append({"url": outputUrl, "status": "success", "error": None})
+                        log.info("Seed Succeeded: {}".format(outputUrl))
+                    else:
+                        seedOutcomes.append({"url": outputUrl, "status": "failed", "error": seedError})
+                        console.print(sDanger + " Seed Failed: {} ({})".format(outputUrl, seedError))
+                        log.error("Seed Failed: {} ({})".format(outputUrl, seedError))
             except KeyboardInterrupt:
                 console.print(
                     sDanger + " Closing! Because User Interrupted The Program")
                 log.error("Closing! Because User Interrupted The Program")
                 console.print(sInfo + " Keyboard Interrupt Detected")
                 log.info("Keyboard Interrupt Detected")
+            succeededSeeds = [o for o in seedOutcomes if o["status"] == "success"]
+            failedSeeds = [o for o in seedOutcomes if o["status"] == "failed"]
+            allSeedsFailed = bool(seedOutcomes) and not succeededSeeds
+            console.print(sSuccess + " Seeds Succeeded: {}/{}".format(len(succeededSeeds), len(seedOutcomes)))
+            log.info("Seeds Succeeded: {}/{}".format(len(succeededSeeds), len(seedOutcomes)))
+            if failedSeeds:
+                console.print(sDanger + " Seeds Failed: {}".format(len(failedSeeds)))
+                log.error("Seeds Failed: {}".format(len(failedSeeds)))
+                for outcome in failedSeeds:
+                    console.print(sDanger + "   Failed Seed: {} ({})".format(outcome["url"], outcome["error"]))
+                    log.error("Failed Seed: {} ({})".format(outcome["url"], outcome["error"]))
+            if allSeedsFailed:
+                console.print(
+                    sDanger + " All Seeds Failed -- Still Saving Whatever Was Collected, Exiting Non-Zero")
+                log.error("All Seeds Failed -- exiting non-zero after saving partial results")
             print("\n\n\n")
             #  Now Showing The Time Taken To Collect Emails And Urls
             try:
@@ -1112,7 +1177,7 @@ if __name__ == "__main__":
                 sInfo + " If You Have Any Suggestion Or Bug Please Contact Me At: " + __email__)
             cursor.show()
             if QUIET_MODE:
-                printQuietSummary(savedEmails, savedScrappedUrls)
+                printQuietSummary(savedEmails, savedScrappedUrls, seedOutcomes)
             if not NON_INTERACTIVE:
                 console.print(sInfo + " Press Any Key To Exit", end="")
                 input()
@@ -1120,7 +1185,9 @@ if __name__ == "__main__":
             log.info("Program Ended Successfully")
             log.info(
                 "----------------------------------------------------------------------------------------------------------------------")
-            sys.exit(1 if saveFailed else 0)
+            # Non-zero when the save failed OR every seed failed (output files above are
+            # still written first, so a script can both detect the failure and use the data)
+            sys.exit(1 if (saveFailed or allSeedsFailed) else 0)
         else:
             pass
 

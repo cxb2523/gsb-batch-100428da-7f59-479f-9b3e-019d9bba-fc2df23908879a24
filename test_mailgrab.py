@@ -13,6 +13,7 @@ import json
 import os
 import runpy
 import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -384,6 +385,89 @@ class RegressionTest(MailGrabTestCase):
 
         self.assertTrue(os.path.exists("_results.json"), "no results were saved after the interrupt")
         self.assertIn("root@acme.test", self._resultsJson()["emails"])
+
+
+class BatchSeedResilienceTest(MailGrabTestCase):
+    def _closedPortUrl(self):
+        # A port that was open a moment ago and is now closed -> connection refused, fast
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        return f"http://127.0.0.1:{port}"
+
+    def _run_batch(self, seeds, extraArgs=()):
+        with open("_inputUrls.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(seeds) + "\n")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = run_mailgrab_argv(["--depth", "1"] + list(extraArgs), expectNoPrompts=True)
+        return code, buffer.getvalue()
+
+    def test_batch_continues_past_failed_seed_and_reports_per_seed_outcomes(self):
+        RecordingHandler.pages = {
+            "/ok1": b"<html><body>one@acme.test</body></html>",
+            "/ok2": b"<html><body>two@acme.test</body></html>",
+        }
+        deadUrl = self._closedPortUrl()
+        code, output = self._run_batch([self.base + "/ok1", deadUrl, self.base + "/ok2"],
+                                       extraArgs=["--quiet"])
+
+        self.assertEqual(code, 0, "one failed seed out of three should not fail the run")
+        summary = json.loads(output.strip())
+        self.assertEqual(summary["seedCount"], 3)
+        self.assertEqual(summary["succeededSeedCount"], 2)
+        self.assertEqual(summary["failedSeedCount"], 1)
+        byUrl = {seed["url"]: seed for seed in summary["seeds"]}
+        self.assertEqual(byUrl[self.base + "/ok1"]["status"], "success")
+        self.assertIsNone(byUrl[self.base + "/ok1"]["error"])
+        self.assertEqual(byUrl[self.base + "/ok2"]["status"], "success")
+        self.assertEqual(byUrl[deadUrl]["status"], "failed")
+        self.assertTrue(byUrl[deadUrl]["error"], "failed seed must carry its failure reason")
+        # seeds after the failed one still ran, and their results were kept
+        emails = self._resultsJson()["emails"]
+        self.assertIn("one@acme.test", emails)
+        self.assertIn("two@acme.test", emails)
+
+    def test_batch_seed_returning_500_counts_as_failed_with_reason(self):
+        RecordingHandler.pages = {"/ok": b"<html><body>ok@acme.test</body></html>"}
+        RecordingHandler.statusScript = {"/bad": [500]}
+        os.environ["MAILGRAB_TIMEOUT"] = "1"  # keeps the 5xx-retry backoff short
+        code, output = self._run_batch([self.base + "/bad", self.base + "/ok"])
+
+        self.assertEqual(code, 0)
+        self.assertIn("Seeds Succeeded: 1/2", output)
+        self.assertIn("Seeds Failed: 1", output)
+        self.assertIn(self.base + "/bad", output, "failure summary must name the failing site")
+        self.assertIn("500", output, "failure summary must carry the cause")
+        self.assertIn("ok@acme.test", self._resultsJson()["emails"])
+
+    def test_batch_page_linking_to_unreachable_host_still_succeeds(self):
+        deadUrl = self._closedPortUrl()
+        RecordingHandler.pages = {
+            "/": ('<html><body>root@acme.test<a href="{}/x">x</a></body></html>'
+                  .format(deadUrl)).encode("utf-8"),
+        }
+        code, output = self._run_batch([self.base], extraArgs=["--depth", "2", "--quiet"])
+
+        self.assertEqual(code, 0)
+        summary = json.loads(output.strip())
+        self.assertEqual(summary["failedSeedCount"], 0)
+        self.assertEqual(summary["seeds"][0]["status"], "success")
+        self.assertIn("root@acme.test", self._resultsJson()["emails"])
+
+    def test_batch_all_seeds_failed_exit_nonzero_but_still_writes_outputs(self):
+        dead1, dead2 = self._closedPortUrl(), self._closedPortUrl()
+        code, output = self._run_batch([dead1, dead2], extraArgs=["--quiet"])
+
+        self.assertEqual(code, 1, "all seeds failing must exit non-zero")
+        for name in ("_results.json", "_emails.txt", "_scrappedUrls.txt", "_emails.csv"):
+            self.assertTrue(os.path.exists(name), f"{name} was not written when all seeds failed")
+        summary = json.loads(output.strip())
+        self.assertEqual(summary["seedCount"], 2)
+        self.assertEqual(summary["succeededSeedCount"], 0)
+        self.assertEqual(summary["failedSeedCount"], 2)
+        self.assertTrue(all(seed["status"] == "failed" and seed["error"] for seed in summary["seeds"]))
 
 
 class EmailQualityTest(MailGrabTestCase):
