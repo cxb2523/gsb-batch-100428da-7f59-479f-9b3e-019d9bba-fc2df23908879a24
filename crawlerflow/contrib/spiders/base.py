@@ -108,17 +108,74 @@ class WebCrawlerBase(CrawlSpider):
             kwargs['restrict_xpaths'] = (traversal.get("selector_value"),)
 
         allow_domains = traversal.get("allow_domains", [])
+        """
+        Keep "*" as is: GenericLinkExtractor treats it as "no domain
+        restriction", while an empty list means "only the current response's
+        domain".
+        """
         kwargs['allow_domains'] = allow_domains
-        if "*" in allow_domains:
-            kwargs['allow_domains'] = []
         return GenericLinkExtractor(**kwargs).extract_links(response=response)
 
     def get_traversal_max_pages(self, traversal=None):
-        return traversal.get('max_pages', 1)
+        max_pages = traversal.get('max_pages', 1)
+        if max_pages is None:
+            return 1
+        return max_pages
+
+    @staticmethod
+    def get_next_spider_allowed_domains(next_spider=None):
+        """
+        Domains a traversal may follow towards `next_spider`.
+
+        `allowed_domains` is read from the spider settings, with a fallback to
+        the top level key for older manifests. A spider without configured
+        domains restricts the traversal to the current response's domain (see
+        GenericLinkExtractor).
+        """
+        spider_settings = (next_spider or {}).get("spider_settings", {}) or {}
+        allowed_domains = spider_settings.get("allowed_domains")
+        if allowed_domains is None:
+            allowed_domains = (next_spider or {}).get("allowed_domains")
+        if allowed_domains is None:
+            return []
+        if isinstance(allowed_domains, str):
+            return [allowed_domains]
+        return list(allowed_domains)
 
     def get_current_traversal_requests_count(self, traversal_id=None):
-        return self.crawler.stats.get_value(
+        """
+        Number of pagination requests already committed for this traversal.
+
+        The counter lives in the crawler stats and is incremented as traversal
+        requests go through the downloader, so it is the number of pagination
+        requests already issued for this traversal.
+
+        A missing counter (e.g. no crawler/stats available yet) is treated as 0,
+        and the max_pages check still applies on top of it.
+        """
+        crawler = getattr(self, 'crawler', None)
+        stats = getattr(crawler, 'stats', None) if crawler is not None else None
+        if stats is None:
+            return 0
+        return stats.get_value(
             'crawlerflow-stats/traversals/{}/requests_count'.format(traversal_id)) or 0
+
+    @staticmethod
+    def get_remaining_traversal_requests(current_request_traversal_count=None, traversal_max_pages=None):
+        """
+        Number of traversal requests which can still be queued.
+
+        The decision must be based on the number of requests already committed
+        for the traversal (the stats counter), not on the links found in the
+        current page: several links of the same page would otherwise all pass
+        the check before the counter is incremented.
+
+        A missing counter is treated as 0 but still obeys `max_pages`, so a
+        traversal can never page beyond its configured limit.
+        """
+        requests_count = current_request_traversal_count or 0
+        max_pages = traversal_max_pages if traversal_max_pages is not None else 1
+        return max(0, max_pages - requests_count)
 
     def run_traversals(self, spider_config=None, response=None):
         """
@@ -142,7 +199,7 @@ class WebCrawlerBase(CrawlSpider):
             next_spider_id = traversal['next_spider_id']
             next_spider = get_spider_from_list(spider_id=next_spider_id, spiders=spiders)
 
-            traversal['allow_domains'] = next_spider.get("spider_settings", {}).get("allowed_domains", [])
+            traversal['allow_domains'] = self.get_next_spider_allowed_domains(next_spider=next_spider)
             traversal_id = traversal['traversal_id']
             current_request_traversal_count = self.get_current_traversal_requests_count(traversal_id)
             traversal_max_pages = self.get_traversal_max_pages(traversal=traversal)
@@ -180,32 +237,35 @@ class WebCrawlerBase(CrawlSpider):
                 traversal_data[traversal_id] = {"traversal_urls": traversal_links}
                 """
                 Then validate for max_pages logic if traversal_id's traversal has any!.
-                This is where the further traversal for this traversal_id  is decided 
+                This is where the further traversal for this traversal_id is decided.
+
+                The budget is computed once, from the number of requests already
+                committed for this traversal, so links of the same page cannot all
+                pass the check; at most the remaining budget is queued.
                 """
                 max_pages = self.get_traversal_max_pages(traversal=traversal)
+                remaining_requests = self.get_remaining_traversal_requests(
+                    current_request_traversal_count=current_request_traversal_count,
+                    traversal_max_pages=max_pages
+                )
 
+                queued_requests_count = 0
                 for link in traversal_links:
+                    if queued_requests_count >= remaining_requests:
+                        break
+                    to_traverse_links_list.append(
+                        {
+                            "link": link,
+                            "meta": {
+                                "spider_config": next_spider,
+                                "manifest": response.meta.get("manifest"),
+                                "current_request_traversal_id": traversal_id,
+                                "current_request_traversal_count": current_request_traversal_count + queued_requests_count,
+                                "current_traversal_max_count": max_pages,
 
-                    """
-                    we are already incrementing, the last number, so using <= might make it 6 pages when 
-                    max_pages is 5 
-                    """
-                    # print ("=============traversal_id", traversal_id)
-                    if current_request_traversal_count < max_pages:
-                        to_traverse_links_list.append(
-                            {
-                                "link": link,
-                                "meta": {
-                                    "spider_config": next_spider,
-                                    "manifest": response.meta.get("manifest"),
-                                    "current_request_traversal_id": traversal_id,
-                                    "current_request_traversal_count": current_request_traversal_count,
-                                    "current_traversal_max_count": max_pages,
-
-                                }}
-                        )
-
-                    current_request_traversal_count += 1
+                            }}
+                    )
+                    queued_requests_count += 1
 
             print("Extracted {} traversal_links for traversal_id:'{}' in url:{}".format(len(traversal_links),
                                                                                         traversal_id, response.url))
