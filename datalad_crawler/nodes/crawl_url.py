@@ -34,6 +34,7 @@ class crawl_url(object):
                  input='url',
                  failed=None,
                  cache_redirects=True,
+                 track_redirects=False,
                  output=('response', 'url')):
         """If url is None, would try to pick it up from data[input]
 
@@ -46,6 +47,18 @@ class crawl_url(object):
           What to do about failing urls. If None -- would consult (eventually) the config
         cache_redirects: bool, optional
           Either to remember redirects for subsequent invocations
+        track_redirects: bool, optional
+          Either to make the redirect chain observable to downstream nodes.
+          When enabled, every successfully produced data dict additionally
+          carries 'redirects' (the original url followed by every redirect
+          target, in the order they were encountered) and 'redirect_count'
+          (the number of redirects, 0 if the url was not redirected). A hit
+          in the redirects cache is reflected in the chain as a single
+          redirect to the cached target. When a url fails to download and
+          `failed` is None or 'skip', instead of producing nothing a record
+          marked with 'status' set to 'failed' is yielded, carrying the
+          failed 'url' and an 'error' description. By default disabled and
+          the produced data is unchanged.
         """
         self._url = url
         self._matchers = matchers
@@ -56,6 +69,7 @@ class crawl_url(object):
         # partially to overcome stuck redirect
         # https://github.com/kennethreitz/requests/issues/2997
         self._redirects_cache = {} if cache_redirects else None
+        self._track_redirects = track_redirects
         self.failed = failed
 
     def reset(self):
@@ -68,15 +82,25 @@ class crawl_url(object):
         # this is just a cruel first attempt
         lgr.debug("Visiting %s" % url)
 
+        # the chain of urls involved in this visit: starts with the original
+        # url and grows by one entry per followed redirect (or a cache hit)
+        redirect_chain = [url]
         try:
             retry = 0
             orig_url = url
             if self._redirects_cache is not None:
-                url = self._redirects_cache.get(url, url)
+                cached_url = self._redirects_cache.get(url, url)
+                if cached_url != url:
+                    lgr.debug("URL %s was previously redirected to %s",
+                              url, cached_url)
+                    url = cached_url
+                    redirect_chain.append(url)
             while True:
                 retry += 1
                 if retry > 100:
-                    raise DownloadError("We have followed 100 redirects already. Something is wrong!")
+                    raise DownloadError(
+                        "We have followed 100 redirects already. "
+                        "Something is wrong!")
                 try:
                     self._seen.add(url)
                     page = self._providers.fetch(url, allow_redirects=False)
@@ -88,16 +112,51 @@ class crawl_url(object):
                     if url == exc.url:
                         raise DownloadError("Was redirected to the same url upon %s" % exc_str(exc))
                     url = exc.url
+                    # guard against a loop back to an url we have already
+                    # visited in this chain before even attempting to fetch
+                    # it, so we never spin in an infinite redirect loop
+                    if url in redirect_chain:
+                        raise DownloadError(
+                            "Was redirected to an already visited url %s "
+                            "upon %s" % (url, exc_str(exc)))
+                    redirect_chain.append(url)
                     if self._redirects_cache is not None:
                         self._redirects_cache[orig_url] = exc.url
         except DownloadError as exc:
             lgr.warning("URL %s failed to download: %s" % (url, exc_str(exc)))
             if self.failed in {None, 'skip'}:
                 # TODO: config  -- crawl.failed='skip' should be a config option, for now always skipping
+                if self._track_redirects:
+                    # make the failure observable to downstream nodes instead
+                    # of silently dropping this url
+                    yield updated(data, {'url': orig_url,
+                                         'status': 'failed',
+                                         'error': exc_str(exc),
+                                         'redirects': redirect_chain,
+                                         'redirect_count':
+                                             len(redirect_chain) - 1})
                 return
             raise  # otherwise -- kaboom
+        except Exception as exc:
+            # e.g. a redirect to the same url, for which requests gives up
+            # with TooManyRedirects while resolving it, instead of letting
+            # us handle the redirect manually. With tracking enabled such
+            # failures must be observable; without it, preserve the
+            # original behavior and let the exception propagate
+            if not self._track_redirects or self.failed not in {None, 'skip'}:
+                raise
+            lgr.warning("URL %s failed to download: %s" % (url, exc_str(exc)))
+            yield updated(data, {'url': orig_url,
+                                 'status': 'failed',
+                                 'error': exc_str(exc),
+                                 'redirects': redirect_chain,
+                                 'redirect_count': len(redirect_chain) - 1})
+            return
 
         data_ = updated(data, zip(self._output, (page, url)))
+        if self._track_redirects:
+            data_ = updated(data_, {'redirects': redirect_chain,
+                                    'redirect_count': len(redirect_chain) - 1})
         yield data_
 
         # now recurse if matchers were provided
