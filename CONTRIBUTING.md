@@ -1,0 +1,91 @@
+# Contributing to Forage
+
+Thank you for your interest in contributing to Forage!
+
+## Development Setup
+
+1. Clone the repository:
+   ```bash
+   git clone https://github.com/jwmoss/forage.git
+   cd forage
+   ```
+
+2. Install dependencies using uv:
+   ```bash
+   uv sync --all-extras
+   ```
+
+3. Install Playwright browsers:
+   ```bash
+   uv run playwright install chromium
+   ```
+
+4. Run tests:
+   ```bash
+   make check
+   make test
+   ```
+
+5. Run type checker:
+   ```bash
+   uv run ty check src/forage/
+   ```
+
+## Code Style
+
+- Use [ruff](https://docs.astral.sh/ruff/) for linting and formatting
+- Follow PEP 8 style guidelines
+- Add type hints to all function signatures
+- Write docstrings for public functions
+
+## Commit Messages
+
+We use [Conventional Commits](https://www.conventionalcommits.org/):
+
+- `feat:` new feature
+- `fix:` bug fix
+- `docs:` documentation changes
+- `test:` adding or updating tests
+- `refactor:` code refactoring
+- `chore:` maintenance tasks
+
+Example: `feat: add SQLite export option`
+
+## Pull Request Process
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feat/my-feature`)
+3. Make your changes
+4. Run the local PR checks with a saved session:
+   ```bash
+   FORAGE_E2E_GROUP=your-group-slug FORAGE_E2E_UNTIL=YYYY-MM-DD make pre-pr
+   ```
+   Select an active group with visible reply threads and a historical window with known posts.
+   `FORAGE_E2E_UNTIL` is optional. It tests the seven days before the selected inclusive end date.
+5. Ensure type checking passes (`uv run ty check src/forage/`)
+6. Commit with a descriptive message
+7. Push and open a pull request
+
+## Testing
+
+- Verify behavior through the real CLI against Facebook.
+- Keep live checks read-only and use the existing session.
+- Do not add unit tests, mock tests, or fake-server suites.
+- Run `make test-marketplace` to check all five sort orders against Facebook's selected controls.
+- Run `FORAGE_E2E_GROUP=your-group-slug make test-group` to check posts, comments, and real-data exports.
+- Run `make pre-pr` with the group variables above before you create a PR.
+- Keep session files and private records out of commits and PR descriptions.
+- Live checks need suitable records. A passing run does not prove rare cases that the live pages do not contain.
+
+## Reporting Issues
+
+When reporting bugs, please include:
+- Python version (`python --version`)
+- Operating system
+- Steps to reproduce
+- Expected vs actual behavior
+- Any error messages
+
+## Questions?
+
+Feel free to open a GitHub issue for questions or discussions.

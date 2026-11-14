@@ -1,0 +1,104 @@
+---
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      test_pypi:
+        description: 'Publish to Test PyPI instead'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    # actionlint 1.7.12 does not yet parse the new $/ syntax. This resolves the same commit.
+    uses: ./.github/workflows/ci.yml  # zizmor: ignore[self-repository]
+  build:
+    needs: checks
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          enable-cache: false
+          version: "0.12.17"
+          python-version: "3.14"
+
+      - name: Verify release version
+        if: github.event_name == 'release'
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          uv run --no-project --no-config python -c 'import os, tomllib; from pathlib import Path; version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]; assert os.environ["RELEASE_TAG"] == "v" + version, "tag/package version mismatch"'
+
+      - name: Build package
+        run: uv build --no-config
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: dist
+          path: dist/
+
+  publish-test-pypi:
+    needs: build
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.test_pypi == 'true'
+
+    environment:
+      name: test-pypi
+      url: https://test.pypi.org/project/ForageFacebook/
+
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to Test PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+  publish-pypi:
+    needs: build
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ForageFacebook/
+
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3

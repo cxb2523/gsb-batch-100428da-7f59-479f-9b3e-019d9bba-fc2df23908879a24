@@ -1,0 +1,60 @@
+---
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          version: "0.12.17"
+          python-version: "3.14"
+      - run: uv sync --locked --all-extras --no-config
+      - name: Check source and lockfile
+        run: |
+          uv lock --check --no-config
+          uv run --locked --no-config ruff check src/ scripts/
+          uv run --locked --no-config ruff format --check src/ scripts/
+          uv run --locked --no-config ty check src/forage/
+      - name: Audit workflows and release helper
+        run: |
+          go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          uvx --no-config zizmor==1.30.1 --no-progress .github/workflows
+          shellcheck scripts/release.sh
+          go run mvdan.cc/sh/v3/cmd/shfmt@v3.14.1 -i 2 -d scripts/release.sh
+      - name: Build and install wheel
+        run: |
+          uv build --no-config
+          uv venv /tmp/forage-install-smoke
+          uv pip install --no-config --python /tmp/forage-install-smoke/bin/python dist/*.whl
+          /tmp/forage-install-smoke/bin/forage --version
+          /tmp/forage-install-smoke/bin/forage --help
+
+  check:
+    if: always()
+    needs: [quality]
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require all checks
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+        run: test "$QUALITY_RESULT" = success

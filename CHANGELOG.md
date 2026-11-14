@@ -1,0 +1,288 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [2.3.0] - 2026-11-03
+
+### Added
+
+- Add Marketplace sort choices and support more currency-symbol price formats, inspired by PR #50.
+- Add local `make pre-pr` checks for live Marketplace sorts, group comments, date windows, and saved exports.
+
+### Fixed
+
+- Preserve comment nesting and remove the fallback that treats arbitrary post text as comments.
+- Read relative comment-author links and restrict permalink comments to the requested post.
+- Continue historical searches past newer posts and include posts labeled "Just now" at the default cutoff.
+- Parse compact reaction totals and recognize `multi_permalinks` post links.
+- Skip repeated Marketplace candidates before text parsing and stop before an unnecessary final group scroll.
+- Convert the CLI's miles to Facebook's kilometer radius and use the verified nearest-first sort value.
+- Select Python 3.14 for local development, matching CI.
+
+### Thanks
+
+- Thanks to [@kha-faz](https://github.com/kha-faz) for the currency and Marketplace sort contributions in [PR #50](https://github.com/jwmoss/forage/pull/50).
+
+## [2.2.0] - 2026-10-10
+
+### Changed
+
+- Replace unit and synthetic browser tests with read-only live CLI checks.
+- Keep lint, type checks, and package build/install checks in CI.
+- Remove pytest and the Node test harness.
+- Add common `make check`, `make test`, and `make build` entry points.
+- Add `forage version` beside the existing `--version` flag.
+
+## [2.1.0] - 2026-09-20
+
+### Fixed
+
+- Preserve native comment IDs and scope fallback IDs to their post to prevent SQLite collisions.
+- Preserve full visible post text, expand supported “See more” controls, and exclude nested comments.
+- Parse compact comment counts and retain query-based post permalinks.
+- Include the full `--until` day, reject invalid date ranges before login, and preserve “Yesterday” clock times.
+- Report missing feeds and Marketplace authentication failures instead of misleading empty results or timeouts.
+- Bind Marketplace coordinates to the requested listing ID; exclude unbound locations.
+- Skip full parsing for group posts whose reliable permalink ID is already present.
+- Count accepted Marketplace listings toward `--limit`; keep a separate `--max-candidates` cost bound.
+- Store session directories and authentication state with owner-only POSIX permissions.
+- Reject missing CSV/SQLite output arguments before browser work.
+
+### Added
+
+- JSON collection diagnostics and explicit content/comment completeness indicators.
+- `forage doctor` for local setup checks without Facebook access.
+- `forage export` to reuse existing exporters with saved group JSON.
+- Network-blocked Chromium regression tests and a documented capability contract.
+
+
+## [2.0.0] - 2026-08-29
+
+### Added
+
+- The `forage marketplace` command searches Facebook Marketplace electronics
+  listings with configurable city, radius, result limit, browser, and output.
+- Marketplace JSON results include each listing's ID, URL, title, price, and
+  displayed location.
+
+### Changed
+
+- Marketplace searches verify listing coordinates against the requested radius
+  and exclude listings without a verifiable location.
+
+## [1.2.1] - 2026-08-13
+
+### Fixed
+
+- Busy group scrapes no longer time out from hovering every post's timestamp;
+  visible timestamp metadata is parsed directly without a browser interaction.
+
+### Changed
+
+- Ruff's existing lint selection is now explicit so unpinned CI upgrades cannot
+  silently redefine the repository's lint scope.
+- The build backend is constrained to Hatchling before 1.32 so release artifacts
+  use Core Metadata 2.4, which is accepted by the pinned PyPI publisher.
+
+## [1.2.0] - 2026-06-23
+
+### Fixed
+
+- Date-bounded scrapes now prefer Facebook's exact timestamp tooltip over
+  coarse relative labels like `1d`, so `--days 1` can enforce a real
+  24-hour cutoff.
+- Group scrapes now request Facebook's chronological feed ordering to avoid
+  date windows being skewed by ranked feed order.
+
+## [1.1.0] - 2026-06-10
+
+### Fixed
+
+- Parse failures are no longer silent: exceptions are logged with `-v`, and a
+  warning is printed when feed articles are found but none parse as posts
+- Permalink comment scraping no longer records the post itself as a comment
+  and drops the real comments when Facebook omits "Comment by" aria-labels
+- Yearless timestamps ("December 28") that would land in the future now roll
+  back a year instead of being filtered out of every date range
+- `--top-comments` now applies to the LLM export format (previously hardcoded
+  to 3) and JSON output files are written with explicit UTF-8 encoding
+- Release script refreshes `uv.lock` after the version bump and documents the
+  full release flow (annotated tag plus GitHub release, which triggers publish)
+
+### Added
+
+- `--min-pain-score` flag to filter LLM-format output by pain score
+
+### Removed
+
+- Dead code: unused retry decorator, mbasic.facebook.com parsers (the mbasic
+  site was discontinued), and unused auth helpers
+
+## [1.0.9] - 2026-05-24
+
+### Fixed
+
+- Tightened login detection so expired or checkpointed sessions no longer pass
+  just because the browser is on a Facebook group URL
+- Scrape post-page comments in a separate browser page to avoid invalidating
+  cached feed element handles while iterating posts
+- Attach nested replies to the comment element that contains them instead of the
+  first parsed comment
+- Strip URL fragments from Facebook group identifiers
+- Reject negative CLI values for date windows, limits, delays, and comment
+  filters
+
+### Changed
+
+- Added `ruff` to the development extra so local lint and format commands do
+  not depend on a globally installed tool
+
+## [1.0.8] - 2026-01-25
+
+### Added
+
+- Post URL field in all export formats (JSON, LLM)
+  - Each post now includes a direct Facebook permalink (e.g. `https://www.facebook.com/groups/.../posts/123/`)
+  - Makes exported data easy to cross-reference with the original posts
+
+### Changed
+
+- Updated release process documentation in CLAUDE.md and AGENTS.md
+  - Added `ruff format` step and `__init__.py` version update to release checklist
+
+## [1.0.7] - 2026-01-25
+
+### Fixed
+
+- Scraper no longer stops early when Facebook serves posts out of chronological order
+  - Previously, a single post with an older timestamp would immediately terminate the scrape
+  - Now tracks consecutive old posts and only stops after 5 in a row
+  - Before: 10 posts found; After: 57 posts found (in a 24-hour window)
+- Improved scroll logic to load more posts from the feed
+  - Scrolls to the end of the feed instead of a fixed 1000px offset
+  - Waits for new DOM elements to appear before re-scraping, instead of a blind delay
+
+## [1.0.6] - 2026-01-17
+
+### Fixed
+
+- Improve post detection by removing `aria-describedby` requirement that was too restrictive
+- Filter out empty placeholder elements (text shorter than 20 chars) that were being incorrectly detected as posts
+
+## [1.0.5] - 2026-01-13
+
+### Fixed
+
+- Honor `--skip-reactions` flag
+  - Skips reaction parsing for posts and comments when enabled
+
+### Improved
+
+- Faster comment de-duplication during scraping (avoids repeated O(n) scans)
+- Reduced Playwright DOM roundtrips by reusing `inner_text()` results
+
+## [1.0.4] - 2026-01-10
+
+### Fixed
+
+- Updated Facebook HTML selectors for post detection
+  - Facebook changed their HTML structure, old `[data-pagelet^="FeedUnit"]` selector no longer works
+  - Now uses `[role="article"]` elements within the feed
+  - Filters out comments by checking for `aria-label` starting with "Comment by"
+  - Before: 2-3 posts found; After: 15+ posts found
+- Improved author extraction to avoid capturing post titles
+  - Strong tags containing post titles were incorrectly used as author names
+  - Now only uses strong tag if inside a profile link
+  - Validates profile links contain `/user/` path
+  - Before: "Hit and Run on Carolina Beach Rd." (post title)
+  - After: "April Dawn" (actual author)
+
+## [1.0.3] - 2025-01-10
+
+### Added
+
+- New LLM-optimized output format (`-f llm`) for feeding data to LLM APIs
+  - Streamlined JSON with engagement metrics and computed signals
+  - Pain point detection with keyword matching (seeking, frustration, wishing, etc.)
+  - Question detection for posts
+  - Pain score computation for prioritizing high-signal content
+  - Top 3 comments per post (sorted by reactions)
+  - Summary statistics in metadata
+
+## [1.0.2] - 2025-01-10
+
+### Improved
+
+- Enhanced timestamp parsing with support for more formats
+  - "2 months ago", "3 years ago" relative timestamps
+  - "Yesterday at 3:00 PM" format
+  - Yearless dates like "January 15" or "Jan 15"
+- Improved reaction count parsing
+  - Compact notation support ("1.2K", "2M")
+  - Individual reaction breakdown ("42 likes and 10 loves")
+- Deterministic fallback IDs using SHA256 instead of Python's non-deterministic `hash()`
+- Better viewport handling with explicit width/height values
+
+### Changed
+
+- Use `create_browser_context()` helper for consistent browser context setup
+
+## [1.0.1] - 2025-01-10
+
+### Fixed
+
+- Fixed scraper timeout caused by login check navigating away from group page
+  - `is_logged_in_page()` was navigating to facebook.com to verify session, leaving the browser on the wrong page
+  - Added `navigate` parameter to check login status on the current page without navigating away
+  - Added group-specific login indicators for more reliable detection
+
+## [1.0.0] - 2025-01-08
+
+### Added
+
+- Initial stable release
+- `forage login` command for interactive Facebook authentication
+- `forage scrape` command for scraping posts, comments, and reactions
+- JSON output format (default)
+- SQLite export format (`-f sqlite`)
+- CSV export format (`-f csv`)
+- Date range filtering (`--days`, `--since`, `--until`)
+- Comment filtering (`--min-reactions`, `--top-comments`, `--skip-comments`)
+- Rate limiting with configurable delay (`--delay`)
+- Retry logic with exponential backoff for network errors
+- Anti-detection features (random delays, viewport rotation)
+- Stdin support for group input (`echo "group" | forage scrape -`)
+- GitHub Actions CI with tests, type checking, and linting
+- PyPI publishing workflow
+- Comprehensive test suite (96 tests)
+- Documentation (README, CONTRIBUTING, SECURITY, AGENTS, CLAUDE)
+
+### Security
+
+- Session data stored securely in `~/.config/forage/session/`
+- Sensitive files excluded via `.gitignore`
+- Security guidelines in SECURITY.md
+
+[Unreleased]: https://github.com/jwmoss/forage/compare/v2.3.0...HEAD
+[2.3.0]: https://github.com/jwmoss/forage/compare/v2.2.0...v2.3.0
+[2.2.0]: https://github.com/jwmoss/forage/compare/v2.1.0...v2.2.0
+[2.1.0]: https://github.com/jwmoss/forage/compare/v2.0.0...v2.1.0
+[2.0.0]: https://github.com/jwmoss/forage/compare/v1.2.1...v2.0.0
+[1.2.1]: https://github.com/jwmoss/forage/compare/v1.2.0...v1.2.1
+[1.2.0]: https://github.com/jwmoss/forage/compare/v1.1.0...v1.2.0
+[1.1.0]: https://github.com/jwmoss/forage/compare/v1.0.9...v1.1.0
+[1.0.9]: https://github.com/jwmoss/forage/compare/v1.0.8...v1.0.9
+[1.0.8]: https://github.com/jwmoss/forage/compare/v1.0.7...v1.0.8
+[1.0.7]: https://github.com/jwmoss/forage/compare/v1.0.6...v1.0.7
+[1.0.6]: https://github.com/jwmoss/forage/compare/v1.0.5...v1.0.6
+[1.0.5]: https://github.com/jwmoss/forage/compare/v1.0.4...v1.0.5
+[1.0.4]: https://github.com/jwmoss/forage/compare/v1.0.3...v1.0.4
+[1.0.3]: https://github.com/jwmoss/forage/compare/v1.0.2...v1.0.3
+[1.0.2]: https://github.com/jwmoss/forage/compare/v1.0.1...v1.0.2
+[1.0.1]: https://github.com/jwmoss/forage/compare/v1.0.0...v1.0.1
+[1.0.0]: https://github.com/jwmoss/forage/releases/tag/v1.0.0
