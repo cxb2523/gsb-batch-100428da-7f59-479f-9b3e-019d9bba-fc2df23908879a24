@@ -37,6 +37,7 @@ import { listPacks, pickMeme, searchMemes } from './lib/meme.js';
 
 import {
   baseUrl,
+  collectSearchVideos,
   downloadVideo,
   ensureServer,
   request,
@@ -56,7 +57,9 @@ const HELP = `douyin.mjs — 大肥鱼抖音适配层
   start                                     确保本地 HTTP API 已启动
   status                                    登录状态
   trending                                  抖音热榜
-  search <关键词> [--count N] [--sort s]     搜索视频
+  search <关键词> [--count N] [--sort s]     搜索视频（单页）
+  collect <关键词> [--target N] [--page-size N] [--max-pages N]
+                                             多页采集：链式翻页 + 合并去重
   detail <id|链接>                           视频详情
   download <id|链接>                         下载无水印视频
   frames <id|链接> [--n N]                   下载并抽帧
@@ -76,6 +79,10 @@ const HELP = `douyin.mjs — 大肥鱼抖音适配层
 
 选项：
   --count N        搜索结果条数（1–20）
+  --target N       collect 采集目标条数（默认 20）
+  --page-size N    collect 每页请求条数（1–20，默认 10）
+  --max-pages N    collect 最多请求页数（默认 10）
+  --delay MS       collect 页间停顿毫秒数（默认 1800，防触发风控）
   --sort s         综合 / 最多点赞 / 最新发布
   --n N            抽帧数量（4–12）
   --seen FILE      已看过的 aweme_id 列表（默认 data/whale/douyin/seen.json）
@@ -110,6 +117,10 @@ function parseArgs(argv) {
     else if (arg === '--count') options.count = Number(argv[++i] ?? '');
     else if (arg === '--sort') options.sort = argv[++i] ?? '';
     else if (arg === '--n') options.n = Number(argv[++i] ?? '');
+    else if (arg === '--target') options.target = Number(argv[++i] ?? '');
+    else if (arg === '--page-size') options['page-size'] = Number(argv[++i] ?? '');
+    else if (arg === '--max-pages') options['max-pages'] = Number(argv[++i] ?? '');
+    else if (arg === '--delay') options.delay = Number(argv[++i] ?? '');
     else if (arg === '--send') options.send = true;
     else if (arg.startsWith('--')) {
       const key = arg.replace(/^--/, '');
@@ -194,6 +205,32 @@ async function run() {
       const sort = ['综合', '最多点赞', '最新发布'].includes(options.sort) ? options.sort : '综合';
       const result = await searchVideos(keyword, { count, sort, base, start });
       ok({ ok: true, ...result });
+      return;
+    }
+    case 'collect': {
+      // 多页采集：关键词 + 目标条数 → 逐页链式翻页（每页带上一页 logid），
+      // 合并去重后返回条目、实际页数、停止原因和每页轨迹。
+      const keyword = args[0];
+      if (!keyword) return fail('collect 需要一个关键词');
+      const target = Number.isFinite(options.target)
+        ? Math.max(1, Math.round(options.target))
+        : (Number.isFinite(options.count) ? Math.max(1, Math.round(options.count)) : 20);
+      const pageSize = Number.isFinite(options['page-size'])
+        ? Math.max(1, Math.min(20, Math.round(options['page-size'])))
+        : 10;
+      const maxPages = Number.isFinite(options['max-pages'])
+        ? Math.max(1, Math.round(options['max-pages']))
+        : 10;
+      const sort = ['综合', '最多点赞', '最新发布'].includes(options.sort) ? options.sort : '综合';
+      const delayMs = Number.isFinite(options.delay) ? Math.max(0, options.delay) : 1800;
+      const result = await collectSearchVideos(keyword, {
+        target, count: pageSize, maxPages, sort, delayMs, base, start,
+      });
+      // 中止且一条都没拿到时 ok=false；拿到了一部分（partial）仍算 ok，
+      // 调用方看 stop_reason / partial 就知道为什么停。
+      const gotSomething = result.completed || result.count > 0;
+      ok({ ok: gotSomething, ...result });
+      if (!gotSomething) process.exitCode = 1;
       return;
     }
     case 'detail': {

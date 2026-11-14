@@ -553,6 +553,7 @@ curl -s -X POST http://127.0.0.1:7709/im/send \
 node douyin.mjs help
 node douyin.mjs health
 node douyin.mjs search "猫" --count 5
+node douyin.mjs collect "猫" --target 30 --page-size 10 --max-pages 5  # 多页采集 + 去重
 node douyin.mjs frames <aweme_id|分享链接> --n 8
 node douyin.mjs watch "猫" --count 5 --n 6   # 选一条没看过的视频并抽帧
 node douyin.mjs trending
@@ -563,6 +564,23 @@ DOUYIN_IM_ALLOW_SEND=1 node douyin.mjs share --aweme <id> --to 某位好友 --se
 ```
 
 如果不想让它自己起服务，加 `--no-start`；要指定地址，加 `--base-url`。
+
+`collect` 是多页采集入口：按关键词和目标条数一页页取，**每页把上一页的
+`logid` 带上**（只挪 `offset` 的第二页在抖音那边通常是空列表），合并后按
+`aweme_id` 去重（保留首次出现）。输出里有：
+
+- `videos` / `count`：合并去重后的条目；
+- `pages_fetched` / `stop_reason`：实际页数与停止原因
+  （`target_reached` / `no_more` / `empty_page` / `missing_logid` / `max_pages` /
+  `challenge_required` / `rate_limited` / `not_authenticated` / `parse_failed` …）；
+- `pages[]`：每页的 `offset` / `logid`（这页用了哪张凭据）/ `returned_logid`
+  （这页发回来的）/ `count` / `has_more` / `outcome` 轨迹；
+- `partial`：中止（如人机验证）时已采到条目为 `true` —— 已拿到的条目**不会丢**。
+
+达到目标条数就停，不会多请求一页。默认页间停 1.8 秒（`--delay 0` 可关）。
+
+也可以直接调库：`collectSearchVideos(keyword, { target, count, maxPages, requestFn })`，
+`requestFn` 可注入，单测里不需要真实账号或网络。
 
 ### 命令行（不经过 DSH / HTTP）
 
@@ -766,6 +784,7 @@ dsh-douyin-whale/
 │   ├── douyin_im.py             # 私信 / 群聊 / 分享卡片（dry-run 默认）
 │   ├── douyin_http.py           # HTTP API（FastAPI, :7709）
 │   ├── dy_query.py              # 搜索分页补丁
+│   ├── dy_paging.py             # 翻页结局判定（和 Node 客户端同一套词汇）
 │   ├── requirements.txt
 │   └── requirements-http.txt
 ├── tools/
@@ -779,6 +798,7 @@ dsh-douyin-whale/
 │   ├── fixture_chat.html        # 私信 DOM 仿真页
 │   ├── test_fixture.py          # dry-run / 发送 / 群名匹配 的离线测试
 │   ├── test_readback.py         # 发送回读判定
+│   ├── test_search_paging.py    # /search 的 offset+logid 链路与停止语义
 │   ├── test_send_gate.py        # 发送闸 / 冷却
 │   └── test_safety.py           # 静态安全检查（不注入伪装脚本）
 ├── start-whale.cmd / .vbs       # Windows 静默启动调度器
@@ -803,12 +823,15 @@ dsh-douyin-whale/
 npm run check      # 所有 Node 文件语法检查（含 scheduler/）
 python -m py_compile python/*.py tools/*.py tests/*.py
 
-npm test           # 不联网、不发消息：安全检查 + 回读判定 + 发送闸 + 记忆
+npm test           # 不联网、不发消息：安全检查 + 回读判定 + 发送闸 + 记忆 + 搜索翻页
 npm run test:fixture   # 在仿真 DOM 上跑 dry-run / 发送 / 群名匹配
+npm run test:search    # 多页采集：假上游注入，验 logid 链路 / 去重 / 中止保留
+npm run test:search-py # /search 的 offset+logid 参数管道与 outcome 判定
 ```
 
-`npm test` 覆盖的是最容易回归的四块：不注入伪装脚本、发送回读判定、发送闸/冷却、
-本地记忆的合并与上限。它们都不需要登录，改完直接跑。
+`npm test` 覆盖的是最容易回归的几块：不注入伪装脚本、发送回读判定、发送闸/冷却、
+本地记忆的合并与上限、搜索翻页（`logid` 链路 / 去重 / 中止保留）。它们都不需要
+登录，改完直接跑。
 
 改工具：在 `lib/tools.js` 的 `createTools()` 里加 `defineTool({...})`，然后在
 `index.js` 的 `TOOL_SWITCH`、`cordis.patch.yml` 的 `toolEnabled`、README 的工具

@@ -13,7 +13,8 @@ DSH 插件（Cordis）通过子进程调用 ``dy_cli``；但当上层是一个�
   GET  /health                       → 依赖自检（dy-cli / yt-dlp / ffmpeg / 私信驱动）
   GET  /status                       → 登录状态（dy-cli status 原样返回）
   POST /trending                     → 抖音热榜
-  POST /search   {keyword,count,sort} → 搜索视频
+  POST /search   {keyword,count,sort,offset,logid}
+                                     → 搜索视频（可逐页链式翻页）
   POST /detail   {id}                → 视频详情（aweme_id 或分享链接）
   POST /profile  {user}              → 用户主页
 
@@ -75,6 +76,16 @@ import urllib.request
 
 from fastapi import FastAPI
 from pydantic import BaseModel
+
+# 同目录的纯 Python 小模块：直接跑脚本时 sys.path[0] 已是这里；用
+# ``uvicorn python.douyin_http:app`` 从仓库根启动时还得补一下。
+_PY_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PY_DIR not in sys.path:
+    sys.path.insert(0, _PY_DIR)
+
+from dy_paging import (  # noqa: E402  (路径补齐之后再导入)
+    ABORT_OUTCOMES, classify_error, error_paging, paging_from_result,
+)
 
 # ──────────────────────────────────────────────────────────────────────
 # 路径与环境
@@ -178,6 +189,52 @@ def run_dy(args, timeout=150):
     return {"ok": False, "error": out[-600:]}
 
 
+def _run_dy_query(args, timeout=180):
+    """调 python/dy_query.py（只多出 --offset/--logid 的参数管道）。
+
+    和 run_dy 的区别只有一个：脚本位置是仓库里的 dy_query.py，而不是
+    ``python -m dy_cli.main``。签名/重试/cookie 仍然全在 dy-cli 里。
+    """
+    script = os.path.join(HERE, "dy_query.py")
+    try:
+        r = subprocess.run(
+            [PY, script, *list(args)],
+            capture_output=True, text=True, timeout=timeout,
+            env=DY_ENV, cwd=PROJECT_ROOT,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": {"code": "backend_unavailable",
+                                       "message": f"dy_query 超时（{timeout}s）"}}
+    except Exception as e:
+        return {"ok": False, "error": {"code": "backend_unavailable",
+                                       "message": f"{type(e).__name__}: {e}"}}
+
+    text = (r.stdout or "").strip()
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                return json.loads(line)
+            except Exception:
+                continue
+    i, j = text.find("{"), text.rfind("}")
+    if i != -1 and j > i:
+        try:
+            return json.loads(text[i:j + 1])
+        except Exception:
+            pass
+    detail = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()[-600:]
+    # 解释器缺 dy-cli / 脚本自己崩了：这是后端不可用，不是「上游返回体解析失败」。
+    if "ModuleNotFoundError" in detail or "ImportError" in detail:
+        return {"ok": False, "error": {"code": "backend_unavailable",
+                                       "message": f"dy_query 依赖缺失：{detail}"}}
+    if r.returncode not in (0, 1):
+        return {"ok": False, "error": {"code": "backend_unavailable",
+                                       "message": f"dy_query 退出码 {r.returncode}：{detail}"}}
+    return {"ok": False, "error": {"code": "parse_failed",
+                                   "message": f"dy_query 没输出可解析的 JSON: {detail}"}}
+
+
 # ──────────────────────────────────────────────────────────────────────
 # 请求模型
 # ──────────────────────────────────────────────────────────────────────
@@ -185,6 +242,12 @@ class SearchReq(BaseModel):
     keyword: str
     count: int = 10
     sort: str = "综合"
+    # 可选：第二页起把上一页响应里的 logid 原样传回来（抖音那边叫 search_id）。
+    # 只挪 offset 不带 logid，第二页通常直接空列表。
+    # offset 用宽松类型：坏值由路由统一回 `{"ok": false, "outcome": "invalid_args"}`，
+    # 不抛 422 —— 本服务的约定是「失败也是 HTTP 200 + ok:false」。
+    offset: int | str | float | None = 0
+    logid: str = ""
 
 
 class DetailReq(BaseModel):
@@ -246,14 +309,195 @@ def trending():
     return run_dy(["trending", "--json-output"])
 
 
+_SORT_CHOICES = ("综合", "最多点赞", "最新发布")
+
+
+def _search_paging_meta(page: dict, *, requested: int) -> dict:
+    """每页固定回传的翻页元信息（客户端靠它决定要不要继续）。
+
+    对 ``page`` 一律用 .get：上游信封是外部输入，缺字段不能让整个接口 500。
+    """
+    offset = page.get("offset")
+    items = page.get("items")
+    if items is None:
+        items = page.get("count") or 0
+    raw_count = page.get("count")
+    if raw_count is None:
+        raw_count = 0
+    return {
+        "offset": offset if isinstance(offset, int) and not isinstance(offset, bool) else 0,
+        "next_offset": page.get("next_offset"),
+        "logid": page.get("logid") or "",
+        "has_more": page.get("has_more"),
+        "outcome": page.get("outcome"),
+        "items": items,
+        "raw_count": raw_count,
+        "requested": requested,
+        "chained_with_logid": bool(page.get("search_id_used")),
+    }
+
+
 @app.post("/search")
 def search(req: SearchReq):
+    """搜索一页视频。
+
+    不传 ``logid`` 时就是原来的首屏行为（最前面那批结果）；从第二页起必须把
+    上一页返回的 ``logid`` 原样带回来，否则抖音会把「只挪 offset」的请求当成
+    新查询、直接返回空列表。响应固定带上 ``next_offset`` / ``logid`` /
+    ``has_more`` / ``outcome``，调用方据此决定继续还是停止。
+    """
     n = max(1, min(int(req.count or 10), 20))
-    sort = req.sort if req.sort in ("综合", "最多点赞", "最新发布") else "综合"
-    return run_dy(
-        ["search", req.keyword, "--count", str(n), "--sort", sort, "--json-output"],
-        timeout=180,
-    )
+
+    keyword = str(req.keyword or "").strip()
+    if not keyword:
+        page = error_paging(offset=0, count=n, outcome="invalid_args")
+        return {
+            "ok": False,
+            "keyword": req.keyword,
+            "sort": req.sort,
+            "outcome": "invalid_args",
+            "error": {"code": "invalid_args", "message": "keyword 不能为空"},
+            **_search_paging_meta(page, requested=n),
+        }
+
+    offset_raw = req.offset
+    if isinstance(offset_raw, bool):
+        offset = None
+    elif isinstance(offset_raw, int):
+        offset = offset_raw
+    elif isinstance(offset_raw, float):
+        offset = int(offset_raw) if offset_raw.is_integer() else None
+    elif offset_raw is None:
+        offset = 0
+    else:
+        text = str(offset_raw).strip()
+        offset = int(text) if text.lstrip("+-").isdigit() else None
+    if offset is None or offset < 0:
+        page = error_paging(offset=0, count=n, outcome="invalid_args")
+        return {
+            "ok": False,
+            "keyword": req.keyword,
+            "sort": req.sort,
+            "outcome": "invalid_args",
+            "error": {"code": "invalid_args",
+                      "message": f"offset 不合法：{offset_raw!r}（需要非负整数）"},
+            **_search_paging_meta(page, requested=n),
+        }
+    logid = str(req.logid or "").strip()
+    sort = req.sort if req.sort in _SORT_CHOICES else "综合"
+
+    # 有 logid 就走 dy_query：它只多一个 --logid/--offset 的参数管道，
+    # 签名、cookie、重试仍然全在 dy-cli 里；没 logid 保持原来的 dy search。
+    if logid or offset > 0:
+        args = ["search", keyword, "--count", str(n), "--offset", str(offset),
+                "--sort", sort]
+        if logid:
+            args += ["--logid", logid]
+        res = _run_dy_query(args)
+    else:
+        res = run_dy(
+            ["search", keyword, "--count", str(n), "--sort", sort, "--json-output"],
+            timeout=180,
+        )
+
+    if res.get("ok") is not True:
+        err = res.get("error") or {}
+        if isinstance(err, dict):
+            message, code = err.get("message") or "", err.get("code") or ""
+        else:
+            message, code = str(err), ""
+        # dy_query 在 verify_check 这类中止里会带 paging；有就以它为准。
+        upstream = res.get("paging") if isinstance(res.get("paging"), dict) else None
+        outcome = (upstream or {}).get("outcome") or classify_error(message, code)
+        page = dict(upstream) if upstream else error_paging(
+            offset=offset, count=n, outcome=outcome)
+        page["search_id_used"] = bool(logid)
+        page["offset"] = offset
+        page.setdefault("logid", logid)
+
+        # 中止的那一页如果其实已经解析出了条目，照样带回去，别让调用方丢数据。
+        upstream_data = res.get("data")
+        raw = None
+        if isinstance(upstream_data, dict):
+            raw = upstream_data.get("result") if "result" in upstream_data else upstream_data
+        raw = raw if isinstance(raw, dict) else {}
+        rows = raw.get("data") if isinstance(raw.get("data"), list) else []
+        if rows:
+            page["items"] = len(rows)
+        data_out = {k: v for k, v in raw.items() if k != "data"}
+        data_out["data"] = rows
+        return {
+            "ok": False,
+            "keyword": keyword,
+            "sort": sort,
+            "outcome": outcome,
+            "error": {"code": outcome, "message": message or f"搜索失败：{outcome}"},
+            "data": data_out,
+            **_search_paging_meta(page, requested=n),
+        }
+
+    data = res.get("data")
+
+    def _raw_result(envelope_data):
+        """两种上游信封：dy search 的 data 就是原始响应；dy_query 包了一层 result。
+
+        只有「有 result 键且没有 data 键」时才当成 dy_query 的信封，避免把抖音
+        原始响应里可能出现的 result 字段误当包装层。
+        """
+        if (isinstance(envelope_data, dict)
+                and "result" in envelope_data
+                and "data" not in envelope_data):
+            inner = envelope_data["result"]
+            return inner if isinstance(inner, dict) else {}
+        return envelope_data if isinstance(envelope_data, dict) else {}
+
+    raw = _raw_result(data)
+    rows = raw.get("data") if isinstance(raw.get("data"), list) else []
+    # 原样保留上游信封里的其他字段（status_code / log_pb…），只保证 data.data 是列表；
+    # 老调用方读的 payload.data.data / payload.data.has_more 保持不变。
+    data_out = {k: v for k, v in raw.items() if k != "data"}
+    data_out["data"] = rows
+
+    paging = res.get("paging") if isinstance(res.get("paging"), dict) else None
+    page = dict(paging) if paging else paging_from_result(raw, offset=offset, count=n)
+    page["items"] = page.get("items") if page.get("items") is not None else len(rows)
+    page["count"] = page.get("count") if page.get("count") is not None else len(rows)
+    page.setdefault("offset", offset)
+    page.setdefault("next_offset", offset + len(rows))
+    page.setdefault("logid", "")
+    page.setdefault("has_more", None)
+    page.setdefault("outcome", "completed")
+    # 是不是真的把上一页 logid 发下去了，以本次请求入参为准。
+    page["search_id_used"] = bool(logid)
+
+    if page["outcome"] in ABORT_OUTCOMES:
+        # 上游要求验证 / 限流 / 未登录 / 解析失败：明确报中止，绝不当成"采完了"。
+        err = res.get("error")
+        return {
+            "ok": False,
+            "keyword": keyword,
+            "sort": sort,
+            "outcome": page["outcome"],
+            "error": {
+                "code": page["outcome"],
+                "message": (err.get("message") if isinstance(err, dict) else "")
+                or f"搜索中止：{page['outcome']}",
+            },
+            # 已拿到的条目照样带回去，调用方不必为了中止而丢掉数据。
+            "data": data_out,
+            **_search_paging_meta(page, requested=n),
+        }
+
+    return {
+        "ok": True,
+        "keyword": keyword,
+        "sort": sort,
+        "outcome": page["outcome"],
+        "has_more": page["has_more"],
+        "data": data_out,
+        **_search_paging_meta(page, requested=n),
+    }
+
 
 
 @app.post("/detail")

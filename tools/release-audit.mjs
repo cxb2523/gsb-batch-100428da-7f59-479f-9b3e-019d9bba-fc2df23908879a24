@@ -43,7 +43,8 @@ const need = ['client.js', 'douyin.mjs', 'index.js',
   'scheduler/scheduler.mjs', 'scheduler/memory.mjs',
   'scheduler/tools-deny.txt', 'scheduler/agent/AGENTS.md',
   'start-whale.cmd', 'start-whale.vbs', 'python/douyin_im.py',
-  'python/douyin_http.py', 'tools/login_headless.py', 'tools/export_login_state.py'];
+  'python/douyin_http.py', 'python/dy_query.py', 'python/dy_paging.py',
+  'tools/login_headless.py', 'tools/export_login_state.py'];
 // glob → 正则：** 递归、* 单段，其余字面；`!` 开头的是排除项
 const rxOf = (pat) => new RegExp('^' + pat
   .replace(/[.+^{}()|[\]\\]/g, '\\$&')
@@ -85,9 +86,10 @@ else ok(`面板版本 = ${version}`);
 
 // ④ 测试文件
 const testFiles = ['tests/test_safety.py', 'tests/test_readback.py', 'tests/test_send_gate.py',
-  'tests/test_fixture.py', 'scheduler/memory.test.mjs', 'lib/panel.test.mjs',
-  'lib/panel_api.test.mjs', 'lib/duty_agent.test.mjs', 'lib/whale_tick.test.mjs',
-  'lib/mood.test.mjs', 'lib/pet_bridge.test.mjs', 'lib/memory_layers.test.mjs',
+  'tests/test_search_paging.py', 'tests/test_fixture.py', 'scheduler/memory.test.mjs',
+  'lib/panel.test.mjs', 'lib/panel_api.test.mjs', 'lib/duty_agent.test.mjs',
+  'lib/whale_tick.test.mjs', 'lib/search_collect.test.mjs', 'lib/mood.test.mjs',
+  'lib/pet_bridge.test.mjs', 'lib/memory_layers.test.mjs',
   'lib/memory_consolidate.test.mjs', 'lib/memory_reflect.test.mjs', 'tools/memory-eval.mjs'];
 for (const f of testFiles) {
   if (fs.existsSync(f)) ok(`测试在 ${f}`);

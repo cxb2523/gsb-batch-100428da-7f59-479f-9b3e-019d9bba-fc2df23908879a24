@@ -1,5 +1,46 @@
 # Changelog
 
+## 1.15.0 — 2026-11-15
+
+搜索翻页接成一条可连续采集的链路：本地 HTTP 服务逐页带上 `logid`，Node 客户端
+多页采集合并去重。之前只挪 `offset`、不带上一页 `logid` 时，抖音第二页常直接回
+空列表，调用方会误判「没有更多」。
+
+### 新增
+
+- **`POST /search` 支持翻页**：
+  - 请求可带可选 `offset` / `logid`；不传时保持原首屏行为（仍走 `dy search`），
+    传任一则走 `python/dy_query.py`（同一套 dy-cli 签名，只多参数管道）。
+  - 响应固定回传 `next_offset` / `logid` / `has_more` / `outcome` /
+    `chained_with_logid`；`outcome` 取值 `completed` / `no_more` /
+    `empty_page` / `challenge_required` / `rate_limited` /
+    `not_authenticated` / `parse_failed` / `backend_unavailable` / `invalid_args`。
+  - `has_more` 保持三态：上游没说就是 `null`，不猜成 `false`。
+- **`python/dy_paging.py`**：翻页结局判定（`verify_check`、空页、`has_more`
+  三态、错误分类），HTTP 服务与 `dy_query.py` 共用；`dy_query.py` 现在也回传
+  `paging`，`verify_check` 中止时保留已解析条目。
+- **Node `collectSearchVideos()`**（`lib/douyin_http_client.mjs`）：
+  - 按目标条数逐页请求，每页把上一页 `logid` 作为检索凭据传下去；
+  - 合并各页视频并按 `aweme_id` 去重（保留首次出现），返回
+    `videos` / `pages_fetched` / `stop_reason` / `pages[]` 轨迹；
+  - 达到目标条数立即停，不会多请求一页；上游 `has_more=false` 才判
+    `no_more`，空页只报 `empty_page`，缺 `logid` 报 `missing_logid` 而不硬翻；
+  - 人机验证 / 限流 / 未登录 / 解析失败立即停止并保留已采条目（`partial=true`），
+    中止页里已解析出的条目也会合并进来；
+  - `requestFn` 与 `sleepFn` 可注入，离线可测。
+- **`normalize.js`**：新增 `normalizeSearchPage()`（稀疏字段保持 `null`）。
+- **CLI `node douyin.mjs collect <关键词>`**：`--target` / `--page-size` /
+  `--max-pages` / `--delay`，输出与库函数一致。
+- 测试：`tests/test_search_paging.py`（15 项）、`lib/search_collect.test.mjs`
+  （12 项），已接入 `npm test`；新增 `npm run test:search` / `test:search-py`。
+
+### 说明
+
+- 私信发送逻辑未改动。
+- 首屏 `searchVideos()` 签名向后兼容（新增的可选参数默认不传）。
+- 假上游端到端验证：真实 uvicorn `/search` + 注入的假 `run_dy`/`_run_dy_query`，
+  两页拼接 7 条、去重 2 条，且第二页请求体确实带上了第一页的 `LOG-P1`。
+
 ## 1.14.3 — 2026-11-14
 
 周反思：把最近 7 天的情节归纳成「最近这几周」的叙事线（记忆分层 Phase 3b）。

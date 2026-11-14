@@ -11,41 +11,29 @@ dy-cli. No X-Bogus logic is reimplemented here.
 from __future__ import annotations
 
 import argparse
-import json
-import re
-import sys
 
 from dy_cli.engines.api_client import SEARCH_URL, DouyinAPIClient, DouyinAPIError
 from dy_cli.utils.signature import get_base_params
 
+from dy_paging import classify_error, emit_json, error_paging, paging_from_result
+
 SORT_MAP = {"综合": 0, "最多点赞": 1, "最新发布": 2, "general": 0, "most_like": 1, "latest": 2}
 TIME_MAP = {"不限": 0, "一天内": 1, "一周内": 7, "半年内": 182}
 
-
-def classify(message: str) -> str:
-    if re.search(r"请先登录|未登录|登录已失效", message):
-        return "not_authenticated"
-    if re.search(r"验证码|verify|challenge|安全验证", message, re.I):
-        return "challenge_required"
-    if re.search(r"429|限流|频繁|too many", message, re.I):
-        return "rate_limited"
-    if re.search(r"不存在|未找到|无数据|数据为空", message):
-        return "not_found"
-    if re.search(r"JSON|解析", message, re.I):
-        return "parse_failed"
-    return "backend_unavailable"
+# Kept for callers/tests that imported these from here before dy_paging existed.
+classify = classify_error
 
 
 def emit(data) -> None:
-    sys.stdout.write(json.dumps({"ok": True, "schema_version": "1", "data": data},
-                                ensure_ascii=False) + "\n")
+    emit_json({"ok": True, "schema_version": "1", "data": data})
 
 
-def fail(code: str, message: str) -> int:
-    sys.stdout.write(json.dumps(
-        {"ok": False, "schema_version": "1", "error": {"code": code, "message": message}},
-        ensure_ascii=False,
-    ) + "\n")
+def fail(code: str, message: str, **extra) -> int:
+    emit_json({
+        "ok": False, "schema_version": "1",
+        "error": {"code": code, "message": message},
+        **extra,
+    })
     return 1
 
 
@@ -85,13 +73,17 @@ def main() -> int:
     search.add_argument("--logid", default="")
     args = parser.parse_args()
 
+    count = max(1, min(20, int(args.count or 10)))
+    offset = max(0, int(args.offset or 0))
+
     client = DouyinAPIClient.from_config()
     try:
         if args.command != "search":
-            return fail("invalid_args", f"unknown command: {args.command}")
+            return fail("invalid_args", f"unknown command: {args.command}",
+                        paging=error_paging(offset=offset, count=count, outcome="invalid_args"))
         if args.logid:
             result = search_with_logid(
-                client, args.keyword, args.count, args.offset, args.sort,
+                client, args.keyword, count, offset, args.sort,
                 args.publish_time, args.logid,
             )
         else:
@@ -100,29 +92,36 @@ def main() -> int:
                 sort_type=SORT_MAP.get(args.sort, 0),
                 publish_time=TIME_MAP.get(args.publish_time, 0),
                 search_type=args.search_type,
-                offset=max(0, args.offset),
-                count=max(1, min(20, args.count)),
+                offset=offset,
+                count=count,
             )
-        data_list = result.get("data") or []
-        nil_info = result.get("search_nil_info") or {}
-        if nil_info.get("search_nil_type") == "verify_check":
+        page = paging_from_result(result, offset=offset, count=count)
+        if page["outcome"] == "challenge_required":
+            # 已经解析出来的条目一起带回去：中止不等于丢数据。
             return fail(
                 "challenge_required",
                 "抖音搜索返回 verify_check：当前账号需要人机验证。插件不会自动绕过；"
                 "请在专用 Edge 窗口手动完成验证后重试。",
+                paging=page,
+                data={"result": result},
             )
-        extra = result.get("extra") or {}
         emit({
             "result": result,
-            "offset": args.offset,
-            "count": args.count,
-            "has_more": bool(result.get("has_more")),
-            "next_offset": args.offset + len(data_list),
-            "logid": extra.get("logid"),
+            "offset": page["offset"],
+            "count": count,
+            "has_more": page["has_more"],
+            "next_offset": page["next_offset"],
+            "logid": page["logid"],
+            "items": page["items"],
+            "outcome": page["outcome"],
+            "search_id_used": args.logid,
+            "paging": page,
         })
         return 0
     except DouyinAPIError as exc:
-        return fail(classify(str(exc)), str(exc))
+        outcome = classify_error(str(exc))
+        return fail(outcome, str(exc),
+                    paging=error_paging(offset=offset, count=count, outcome=outcome))
     finally:
         client.close()
 
