@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Environment
+.env
+.env.local
+
+# Slidex runtime data
+browser_data/
+trajectories/
+calibration/
+debug_screenshots/
+logs/
+
+# Test artifacts
+# pytest 把 -q 输出重定向到 runN.log 这类临时文件时容易被 `git add -A` 捎进提交；
+# 历史里已出现过一次 run3.log，规则补在这里而不是只删文件。
+run*.log
+*.log
+.pytest_cache/
+
+# Playwright
+.playwright-browsers/
+
+# CLAIProxyAPI — separate project
+CLIProxyAPI/
+Cli-Proxy-API-Management-Center/
+
+# Claude
+.claude/
+trajectory_history/
+.venv/

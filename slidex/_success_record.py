@@ -1,0 +1,306 @@
+"""成功链路记录（schema v1）：每次通过风控后的完整环境快照。
+
+需求（2026-10-05）：每次成功过风控都要完整记录"指纹链路"，后续进数据库。
+哪些信息值得留：什么样的浏览器指纹（UA/brands/WebGL 渲染串/字体/时区/并发数）
+× 什么执行环境（CDP 真机 / 容器、backend、channel、出口代理）× 什么轨迹来源
+能通过当时的风控——成功样本是后续失败对照与风控策略变化检测的基线数据。
+
+成功出口（solver 五处 return True 前标记 ``_success_outcome``）：
+provider_pass / legacy_pass / voucher_harvest / manual_pass_wait / jar_landed。
+求解入口在成功返回前统一组装 success_record：
+
+- 指纹在**成功时**于活页面补采一次（只读 evaluate，页面已通过、无检测风险；
+  CDP 模式也采——真机指纹正是最宝贵的对照组）。采集失败回退 browser_init
+  时的审计快照（容器模式）。
+- 滑块/票据信息取自遥测摘要与事件（distance/provider/slide_code/x5sec 结算来源）。
+
+持久化三通道（宿主读 1，2/3 为 slidex 独立运行时的落盘与导出口）：
+1. ``solver.success_record`` 属性 —— 宿主同步读取，随 Cookie 合并结果写库
+2. telemetry 摘要 ``{run_id}.json`` 的 ``success_record`` 块
+3. ``successes.jsonl``（telemetry 目录，append-only，一行一次成功）
+
+schema 字段即未来主仓 ``slider_success_records`` 表的 ingest 契约，改动需升版本。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import platform
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+SCHEMA_VERSION = 1
+
+# 指纹审计 JS（0.6.22 引入；此处为唯一事实源，solver 引用同一常量）
+FINGERPRINT_AUDIT_JS = r"""
+(async () => {
+  const out = {};
+  out.ua = navigator.userAgent;
+  out.webdriver = navigator.webdriver;
+  out.platform = navigator.platform;
+  out.languages = (navigator.languages || []).join(',');
+  out.hwConcurrency = navigator.hardwareConcurrency;
+  out.deviceMemory = navigator.deviceMemory;
+  out.timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  out.tzOffset = new Date().getTimezoneOffset();
+  out.screen = screen.width + 'x' + screen.height + '@' + screen.colorDepth + ' dpr=' + devicePixelRatio;
+  out.viewport = innerWidth + 'x' + innerHeight;
+  out.plugins = navigator.plugins ? navigator.plugins.length : -1;
+  out.pdfViewer = !!navigator.pdfViewerEnabled;
+  out.chromeKeys = (window.chrome && typeof window.chrome === 'object') ? Object.keys(window.chrome).join('|') : '';
+  try {
+    const uad = navigator.userAgentData;
+    if (uad) {
+      out.brands = (uad.brands || []).map(b => b.brand + ' ' + b.version).join(' / ');
+      out.uadPlatform = uad.platform;
+      const he = await uad.getHighEntropyValues(['platformVersion', 'architecture', 'bitness', 'model', 'uaFullVersion']);
+      out.platformVersion = he.platformVersion;
+      out.arch = he.architecture;
+      out.bitness = he.bitness;
+      out.uaFullVersion = he.uaFullVersion;
+    }
+  } catch (e) { out.uadError = String(e).slice(0, 80); }
+  try {
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl2') || c.getContext('webgl');
+    if (gl) {
+      const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+      out.glVendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
+      out.glRenderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+    } else { out.glRenderer = '(no webgl)'; }
+  } catch (e) { out.glRenderer = 'err:' + String(e).slice(0, 60); }
+  try {
+    const probe = ['Segoe UI', 'Microsoft YaHei', 'SimSun', 'Noto Sans CJK SC', 'WenQuanYi Micro Hei', 'Arial', 'Times New Roman', 'Helvetica', 'Roboto', 'Ubuntu', 'DejaVu Sans', 'Liberation Sans'];
+    const s = document.createElement('span');
+    s.style.cssText = 'position:absolute;visibility:hidden;font-size:48px';
+    s.textContent = 'mmmmmmmmmmlli';
+    document.body.appendChild(s);
+    const base = {};
+    for (const b of ['monospace', 'serif', 'sans-serif']) { s.style.fontFamily = b; base[b] = s.offsetWidth; }
+    const found = [];
+    for (const f of probe) {
+      for (const b of ['monospace', 'serif', 'sans-serif']) {
+        s.style.fontFamily = f + ',' + b;
+        if (s.offsetWidth !== base[b]) { found.push(f); break; }
+      }
+    }
+    s.remove();
+    out.fonts = found.join('|') || '(none)';
+  } catch (e) { out.fonts = 'err:' + String(e).slice(0, 60); }
+  return out;
+})()
+"""
+
+
+async def capture_fingerprint(page: Any, timeout_s: float = 5.0) -> Optional[Dict[str, Any]]:
+    """在活页面上只读采集指纹快照；失败返回 None（绝不影响求解结果）。"""
+    if page is None:
+        return None
+    try:
+        info = await asyncio.wait_for(page.evaluate(FINGERPRINT_AUDIT_JS), timeout=timeout_s)
+    except Exception:
+        return None
+    return info if isinstance(info, dict) else None
+
+
+# 出口 IP 探针：与主仓 _check_browser_outbound_ip_consistency 同源同默认
+# （XY_OUTBOUND_IP_PROBE_URL，缺省 api.ipify.org，ipify 支持 CORS；env 置空可关）。
+# 在**页面上下文**里 fetch——CDP 真机模式得到的是用户浏览器真实出口（风控
+# 实际看到的 IP），容器模式得到的是容器出口，语义正确。仅成功后补采一次，
+# 失败返回 None，绝不影响求解。
+EGRESS_PROBE_JS = (
+    "async (u) => { try { const r = await fetch(u, {cache: 'no-store'}); "
+    "const t = await r.text(); return t.trim().slice(0, 128); } catch (e) { return null; } }"
+)
+
+
+async def capture_egress_ip(page: Any, probe_url: str, timeout_s: float = 3.0) -> Optional[str]:
+    """在活页面上下文探测出口 IP；未配置/失败返回 None。"""
+    url = str(probe_url or "").strip()
+    if not url or page is None:
+        return None
+    try:
+        text = await asyncio.wait_for(page.evaluate(EGRESS_PROBE_JS, url), timeout=timeout_s)
+    except Exception:
+        return None
+    if not isinstance(text, str) or not text.strip():
+        return None
+    text = text.strip()
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and data.get("ip"):
+            return str(data["ip"])[:64]
+    except ValueError:
+        pass
+    return text[:64]
+
+
+def _slidex_version() -> str:
+    try:
+        from importlib.metadata import version
+        return version("slidex")
+    except Exception:
+        return "unknown"
+
+
+def build_success_record(
+    solver: Any,
+    outcome: str,
+    cookies: Optional[Dict[str, Any]],
+    fingerprint: Optional[Dict[str, Any]],
+    duration_s: Optional[float] = None,
+    extra: Optional[Dict[str, Any]] = None,
+    egress_ip: Optional[str] = None,
+) -> Dict[str, Any]:
+    """组装 schema v1 成功记录。solver 需暴露遥测/环境属性（均为 getattr 容错）。"""
+    summary = dict(getattr(solver, "_telemetry_summary", {}) or {})
+    slide_keys = ("distance", "distance_source", "provider_name", "slide_code",
+                  "fallback_used", "remote_session_id")
+    settle_source = None
+    for ev in getattr(solver, "_telemetry_events", []) or []:
+        if isinstance(ev, dict) and ev.get("event") == "x5sec_settled":
+            settle_source = ev.get("source")
+    x5sec_len = 0
+    if isinstance(cookies, dict):
+        x5sec_len = len(str(cookies.get("x5sec") or ""))
+    if settle_source is None and x5sec_len:
+        # 票据在结算前已落 jar：_settle_x5sec 早退、无结算事件——显式标注语义
+        settle_source = "already_in_jar"
+    is_cdp = bool(getattr(solver, "_is_cdp_mode", False))
+    record: Dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "run_id": getattr(solver, "_telemetry_run_id", None),
+        "cookie_id": getattr(solver, "cookie_id", None),
+        "pure_user_id": getattr(solver, "pure_user_id", None),
+        "ts": time.time(),
+        "duration_s": round(duration_s, 2) if isinstance(duration_s, (int, float)) else None,
+        "outcome": outcome,
+        "slide": {k: summary.get(k) for k in slide_keys if summary.get(k) is not None},
+        "voucher": {
+            "bx_voucher_present": bool(getattr(solver, "_bx_voucher", None)),
+            "x5sec_len": x5sec_len,
+            "settle_source": settle_source,
+        },
+        "fingerprint": fingerprint or {},
+        "environment": {
+            "backend": getattr(solver, "automation_backend", None) or ("playwright" if is_cdp else None),
+            "channel": getattr(solver, "browser_channel", None) or ("bundled-chromium" if not is_cdp else None),
+            "mode": getattr(solver, "_solve_mode", None) or ("cdp" if is_cdp else "container"),
+            "egress_ip": egress_ip,
+            "headless": bool(getattr(solver, "headless", None)),
+            "proxy_enabled": bool(getattr(solver, "proxy", None)),
+            "trajectory_mode": getattr(solver, "trajectory_mode", None),
+            "slidex_version": _slidex_version(),
+            "python": platform.python_version(),
+        },
+        "extra": dict(extra or {}),
+    }
+    return record
+
+
+def build_point_select_record(
+    result: Any,
+    *,
+    challenge_context: Optional[str] = None,
+    fingerprint: Optional[Dict[str, Any]] = None,
+    egress_ip: Optional[str] = None,
+) -> Dict[str, Any]:
+    """组装点选成功记录（schema v1，点选子块）。
+
+    点选没有 slidex 的遥测/轨迹池，``build_success_record`` 依赖 solver 属性
+    不适用，故单列一个面向 ``VisualChallengeResult`` 的构建器。落盘与滑块
+    共用 ``successes.jsonl``，靠 ``outcome`` 前缀区分（``point_select_*``）。
+
+    要点：把「识别出的文案、目标序列、每字置信度、点击坐标、引擎通道」全部
+    留下——调识别准确率时对照的就是这批数据（滑块侧同类需求见 0.6.29）。
+    """
+    metadata = dict(getattr(result, "metadata", {}) or {})
+    clicks = metadata.get("clicks") or []
+    verdict = metadata.get("verdict") or {}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "ts": time.time(),
+        "outcome": f"point_select_{getattr(result, 'error_code', None) or 'unknown'}",
+        "duration_s": round((getattr(result, "duration_ms", 0.0) or 0.0) / 1000.0, 2),
+        "point_select": {
+            "provider": getattr(result, "provider", None),
+            "confidence": getattr(result, "confidence", None),
+            "context": challenge_context or metadata.get("context"),
+            "targets": list(metadata.get("targets") or []),
+            "engine_provider": metadata.get("engine_provider"),
+            "clicks": clicks,
+            "click_count": len(clicks),
+            "verdict": verdict,
+            "notes": metadata.get("notes") or [],
+        },
+        "fingerprint": fingerprint or {},
+        "environment": {
+            "egress_ip": egress_ip,
+            "slidex_version": _slidex_version(),
+            "python": platform.python_version(),
+        },
+        "extra": {},
+    }
+
+
+def build_graph_chars_record(
+    result: Any,
+    *,
+    challenge_context: Optional[str] = None,
+    fingerprint: Optional[Dict[str, Any]] = None,
+    egress_ip: Optional[str] = None,
+) -> Dict[str, Any]:
+    """组装字符图形验证码的记录（schema v1，graph_chars 子块）。
+
+    与点选同构，落盘共用 ``successes.jsonl``，靠 ``graph_chars_*`` 前缀区分。
+
+    要点：字符识别的错误是**离散**的（错一个字即全错），没有中间态可观察。
+    因此必须同时留下**识别原值**与**归一后提交值**——线上出现"填了 AE20 却
+    没过"时，只有这两者并列才能区分是模型读错（raw 就错）还是归一改错
+    （raw 对、提交值被易混字符折叠改坏，见 0.6.35 踩坑）。
+    """
+    metadata = dict(getattr(result, "metadata", {}) or {})
+    verdict = metadata.get("verdict") or {}
+    engine_meta = metadata.get("engine_meta") or {}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "ts": time.time(),
+        "outcome": f"graph_chars_{getattr(result, 'error_code', None) or 'unknown'}",
+        "duration_s": round((getattr(result, "duration_ms", 0.0) or 0.0) / 1000.0, 2),
+        "graph_chars": {
+            "provider": getattr(result, "provider", None),
+            "confidence": getattr(result, "confidence", None),
+            "context": challenge_context or metadata.get("context"),
+            "chars": metadata.get("chars"),
+            "raw_chars": metadata.get("raw_chars"),
+            "normalized_from": metadata.get("normalized_from"),
+            "recognition_only": bool(metadata.get("recognition_only")),
+            "submit_attempted": bool(metadata.get("submit_attempted")),
+            "engine_provider": metadata.get("engine_provider"),
+            "engine_meta": engine_meta,
+            "verdict": verdict,
+            "notes": metadata.get("notes") or [],
+        },
+        "fingerprint": fingerprint or {},
+        "environment": {
+            "egress_ip": egress_ip,
+            "slidex_version": _slidex_version(),
+            "python": platform.python_version(),
+        },
+        "extra": {},
+    }
+
+
+def persist_success_record(telemetry_dir: Any, record: Dict[str, Any]) -> Optional[str]:
+    """append-only 落盘 successes.jsonl；失败静默（记录永不影响求解）。"""
+    try:
+        base = Path(telemetry_dir)
+        base.mkdir(parents=True, exist_ok=True)
+        path = base / "successes.jsonl"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+        return str(path)
+    except Exception:
+        return None

@@ -1,0 +1,203 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+
+SENSITIVE_TERMS = (
+    "authorization",
+    "cookie",
+    "password",
+    "secret",
+    "token",
+    "x5sec",
+    "x5secdata",
+)
+
+
+class ChallengeType(str, Enum):
+    SLIDER_CAPTCHA = "slider_captcha"
+    OCR_TEXT = "ocr_text"
+    IMAGE_TEXT = "image_text"
+    # 0.6.34: 文字点选。区别于 OCR_TEXT —— OCR_TEXT 只**读**文字（结果里
+    # 拿到 text 即成功），POINT_SELECT 需要"按序点在图上"：识别目标字 →
+    # 换算坐标 → 依序点击 → 读判决码。承载页面交互，故只在 PLAYWRIGHT_PAGE /
+    # CDP 上下文有意义。
+    POINT_SELECT = "point_select"
+    # 0.6.35: 字符图形验证码。识别图片里的字符序列 → 填进输入框 → 提交。
+    # 与 IMAGE_TEXT 的区别在于**必须提交并读判决**——IMAGE_TEXT 只要读到字就
+    # 算成功（纯读取），GRAPH_CHARS 读到字只是中间态，不提交等于没解。
+    GRAPH_CHARS = "graph_chars"
+    # 0.7.0: hCaptcha。与滑块族完全不同：挑战在
+    # `iframe[src^="https://newassets.hcaptcha.com/captcha/v1/"]` 内，
+    # 三种交互形态（9 宫格二选 / 区域点选 / 拖放），判决走 /checkcaptcha/
+    # 的 {"pass": bool}，成功产物是 h-captcha-response token 而非 cookie。
+    # 只在 PLAYWRIGHT_PAGE / CDP（且调用方提供 page）有意义。
+    HCAPTCHA = "hcaptcha"
+    VISUAL_ELEMENT = "visual_element"
+    MANUAL_FALLBACK = "manual_fallback"
+    # HOLD — a "press-and-hold" human-presence challenge (e.g. Outlook
+    # signup's iframe[title="验证质询"]). Bridged through slidex as a
+    # CDP/Playwright-page challenge so the main register context is not
+    # restarted. The default VisualChallengeSolver returns
+    # unsupported_challenge_type for HOLD; providers that handle HOLD
+    # register a dedicated hold solver. See outlook_captcha.py.
+    HOLD = "hold"
+
+
+class VisionContext(str, Enum):
+    PLAYWRIGHT_PAGE = "playwright_page"
+    CDP = "cdp"
+    IMAGE_BYTES = "image_bytes"
+    IMAGE_PATH = "image_path"
+    ANDROID_SCREENSHOT_BYTES = "android_screenshot_bytes"
+    MANUAL = "manual"
+
+
+def redact_sensitive(value: Any) -> Any:
+    if isinstance(value, dict):
+        safe = {}
+        for key, nested in value.items():
+            lowered = str(key).lower()
+            if any(term in lowered for term in SENSITIVE_TERMS):
+                safe[key] = "[redacted]"
+            else:
+                safe[key] = redact_sensitive(nested)
+        return safe
+    if isinstance(value, list):
+        return [redact_sensitive(item) for item in value]
+    return value
+
+
+@dataclass(frozen=True)
+class VisionArtifact:
+    artifact_type: str
+    path: Path
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "artifact_type": self.artifact_type,
+            "path": str(self.path),
+            "metadata": redact_sensitive(self.metadata),
+        }
+
+
+@dataclass(frozen=True)
+class ProviderManifest:
+    name: str
+    version: str
+    challenge_types: List[ChallengeType]
+    contexts: List[VisionContext]
+    requires_network: bool = False
+    produces_artifacts: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "version": self.version,
+            "challenge_types": [item.value for item in self.challenge_types],
+            "contexts": [item.value for item in self.contexts],
+            "requires_network": self.requires_network,
+            "produces_artifacts": list(self.produces_artifacts),
+        }
+
+    def supports(self, challenge_type: ChallengeType, context: VisionContext) -> bool:
+        return challenge_type in self.challenge_types and context in self.contexts
+
+
+@dataclass(frozen=True)
+class ProviderDecision:
+    challenge_type: ChallengeType
+    context: VisionContext
+    requested_provider: str
+    selected_provider: Optional[str]
+    candidates: List[str] = field(default_factory=list)
+    reason: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "challenge_type": self.challenge_type.value,
+            "context": self.context.value,
+            "requested_provider": self.requested_provider,
+            "selected_provider": self.selected_provider,
+            "candidates": list(self.candidates),
+            "reason": self.reason,
+        }
+
+
+@dataclass
+class VisualChallengeRequest:
+    challenge_type: ChallengeType
+    context: VisionContext
+    page: Optional[Any] = None
+    cdp_endpoint: Optional[str] = None
+    page_url: str = ""
+    image_bytes: Optional[bytes] = None
+    image_path: Optional[Path] = None
+    # slider_captcha 专用：拼图块图像（可选；缺失时走无块图缺口检测）
+    piece_image_bytes: Optional[bytes] = None
+    piece_image_path: Optional[Path] = None
+    roi: Optional[Dict[str, float]] = None
+    provider: str = "auto"
+    timeout_ms: int = 30_000
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # ── point_select / graph_chars 专用（0.6.34、0.6.35）─────────────────
+    #: 承载挑战的元素（iframe / 容器）。截图与点击都以它为基准坐标系：
+    #: 截图取它的 screenshot，页面坐标取它的 bounding_box()。
+    target_element: Optional[Any] = None
+    #: 提示文案原文。给定时优先按它解析目标序列（比让模型自读提示更稳）；
+    #: 留空则由识别引擎自行给出 targets（适用于提示就在图里的形态）。
+    instruction_text: str = ""
+    # ── graph_chars 专用（0.6.35）──────────────────────────────────────
+    #: 待填输入框与提交按钮。留空则执行器不做页面交互，只回识别结果
+    #: （纯识别场景：调用方自己填，slidex 不碰页面）。
+    input_element: Optional[Any] = None
+    submit_element: Optional[Any] = None
+    #: 期望字符数。给定时严格校验长度，不符即拒判；留空则接受 4~6 位。
+    expected_char_count: Optional[int] = None
+
+    # ── hcaptcha 专用（0.7.0）────────────────────────────────────────
+    #: 挑战 iframe / 承载元素。留空则由执行器按
+    #: `iframe[src*="newassets.hcaptcha.com/captcha/v1/"]` 自行查找。
+    challenge_iframe: Optional[Any] = None
+    #: requester_question 的语言键。`auto` 时中文优先（zh/zh-cn），
+    #: 否则回退 en；显式给 `en`/`zh` 时只取该键，缺失再回退。
+    question_language: str = "auto"
+    #: 执行参数覆盖：{"max_rounds": int, "prompt": str, "engine": obj}。
+    hcaptcha: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class VisualChallengeResult:
+    success: bool
+    challenge_type: ChallengeType
+    provider: str
+    confidence: float = 0.0
+    duration_ms: float = 0.0
+    error_code: Optional[str] = None
+    retryable: bool = False
+    cookies: Optional[Dict[str, str]] = None
+    artifacts: List[VisionArtifact] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        safe_cookies = {
+            key: "[redacted]"
+            for key in (self.cookies or {})
+        }
+        return {
+            "success": self.success,
+            "challenge_type": self.challenge_type.value,
+            "provider": self.provider,
+            "confidence": self.confidence,
+            "duration_ms": self.duration_ms,
+            "error_code": self.error_code,
+            "retryable": self.retryable,
+            "cookies": safe_cookies,
+            "artifacts": [artifact.to_dict() for artifact in self.artifacts],
+            "metadata": redact_sensitive(self.metadata),
+        }

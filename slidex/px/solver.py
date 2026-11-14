@@ -1,0 +1,1458 @@
+"""PX press/silent 求解器 —— 需求单 §5 方案 (1)：headless Chromium 农场。
+
+对一个任务：按 payload 注入 UA/时区/语言/sticky proxy 与 cookies，开
+hsprotect iframe（或站点页），等 PX JS 自行产 ``_px3``，然后从 cookie
+jar 抽四件套。全程一个 context 一个出口，绝不持久化页面/cookie，日志
+只出前缀与长度（``slidex.px.cookies.redact_token``）。
+
+可测试性：``playwright_factory`` 默认走真 Playwright，测试注入 fake，
+``browser`` 对象只需要 ``new_context``；context 只需 ``new_page / cookies /
+close``；page 只需 ``goto / wait_for_timeout / close / on``。真实链路有
+tests/test_px_sim.py 用本地 Chromium + 假 PX 页兜底。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import os
+import shlex
+import time
+from collections import deque
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Tuple
+
+from loguru import logger
+
+from .cookies import extract_px_tokens, is_pass_token, redact_token
+from .models import (
+    ERR_BROWSER_LAUNCH,
+    ERR_CHALLENGE_HTTP,
+    ERR_CHALLENGE_LOAD,
+    ERR_PROXY_AUTH,
+    ERR_CHALLENGE_TIMEOUT,
+    ERR_INTERNAL,
+    ERR_SOLVER_BUSY,
+    ERR_TOKEN_BLOCKED,
+    ERR_TOKEN_TIMEOUT,
+    ERR_VID_REQUIRED,
+    PxPressRequest,
+    PxPressResult,
+)
+
+# 已打开 challenge 页但只拿到非通过级 px3 时的宽限：持续这么久仍无 :1000:
+# 就按「被拦」（px_blocked）fail，而不是把无段 token 当成功交给调用方。
+_BLOCKED_GRACE_S = 10.0
+# challenge 页首跳预算：hsprotect 首屏不该比这更慢，超过即视为没连通
+_NAV_TIMEOUT_S = 45.0
+# 宿主页（websiteURL）首跳预算：signup.live.com 首屏，同上
+_HOST_NAV_TIMEOUT_S = 30.0
+# iframe 注入后等待其文档就绪的预算（challengeUrl iframe 一般 1–2s 内出）
+_IFRAME_WAIT_S = 20.0
+# 单次 playwright RPC（context.cookies() 等）的调用级超时：driver 半死时
+# await 永不返回，必须强制收割（pxed 实测卡死全体并发任务的根因）。
+# new_page 例外——它要 fork renderer 进程，低核数 pod 上实测 >5s，给足余量
+# （0.9.5 第 6 轮实测：5s 会把「fork 慢」误判成 farm 死，触发整树重启恶性
+# 循环——每 20s 一轮完整 chrome 冷启动，B 组全灭于此）。
+_COOKIE_RPC_TIMEOUT_S = 5.0
+_NEW_PAGE_TIMEOUT_S = 15.0
+# 任务级硬顶余量：solve_timeout_s 之上再给预算内收尾（重试导航/宽限）的
+# 空间；超过即认为协程已被 playwright 桥吞了取消，强杀+重置农场
+_SOLVE_HARD_MARGIN_S = 15.0
+# Playwright 时区/语言校验失败时的兜底（映射表之外的未知值会抛）
+_FALLBACK_TIMEZONE = "America/New_York"
+_FALLBACK_LOCALE = "en-US"
+
+# iframe 插入宿主页的样式：PX 官方 challenge iframe 的可见尺寸，
+# 隐藏（display:none）会让部分传感器走不出工作分支
+_IFRAME_STYLE = "border:0;width:320px;height:110px;position:fixed;bottom:8px;left:8px;z-index:2147483647;"
+
+
+class PxPressSlots:
+    """并发/存活统计（服务层 /health 用它，纯内存计 24h 已收敛不出舱）。"""
+
+    def __init__(self, *, concurrency: int = 5) -> None:
+        self.concurrency = max(1, int(concurrency))
+        self._semaphore: Optional[asyncio.Semaphore] = None
+        self._active = 0
+        self.window_s = 24 * 3600
+
+    def ensure_semaphore(self) -> asyncio.Semaphore:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.concurrency)
+        return self._semaphore
+
+    @property
+    def active(self) -> int:
+        return self._active
+
+    def acquire(self) -> None:
+        self._active += 1
+
+    def release(self) -> None:
+        self._active = max(0, self._active - 1)
+
+
+def _is_root() -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    return bool(geteuid) and geteuid() == 0
+
+
+def _env_chromium_args() -> List[str]:
+    """``SLIDEX_PX_CHROMIUM_ARGS`` 追加启动参数（空格分隔）。
+
+    低内存宿主（如 4G 无 swap 的共享 pod）需要收窄 chromium 的进程数与
+    虚拟预留，但这类参数不宜写死在默认值里——通过环境变量按部署点注入。
+    """
+    raw = (os.environ.get("SLIDEX_PX_CHROMIUM_ARGS") or "").strip()
+    return shlex.split(raw) if raw else []
+
+
+def _pin_oom_score_adj(adj: int = -20) -> None:
+    """把本机已出现的 chrome 进程 oom_score_adj 钉到低值（默认 -20）。
+
+    低内存宿主（4G 无 swap、overcommit=1）上，宿主全局 OOM killer 专挑
+    adj 高的进程祭旗，而 chromium renderer 默认 adj=300。无
+    CAP_SYS_RESOURCE 的容器里写低于 -20 会被内核钳回 EACCES，故默认取
+    -20（与守护进程同级、可写）。外部 guard 轮询存在 fork→OOM 空档；
+    launch 刚返回 / 每任务 new_context 前自钉一次，把空档收窄到进程间。
+    只写 /proc/<pid>/oom_score_adj，失败静默（尽力而为，权限不足时由
+    外部 guard 兜底）。
+
+    注意：这是同步 /proc 全量扫描（pxed 实测 ~140ms），**阻塞式**——
+    async 调用方必须经 :func:`_pin_oom_score_adj_async` 进线程池，别在
+    事件循环里直接调用。
+    """
+    try:
+        names = os.listdir("/proc")
+    except Exception:  # pragma: no cover - 非 Linux
+        return
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/cmdline", "rb") as fh:
+                cmd = fh.read()
+        except Exception:
+            continue
+        if b"chrome-headless" not in cmd and b"chromium" not in cmd:
+            continue
+        try:
+            with open(f"/proc/{name}/oom_score_adj", "w") as fh:
+                fh.write(str(adj))
+        except Exception:  # pragma: no cover - 权限/竞态
+            continue
+
+
+async def _pin_oom_score_adj_async(adj: int = -20) -> None:
+    """``_pin_oom_score_adj`` 的线程池版本：/proc 扫描不让事件循环等。"""
+    await asyncio.to_thread(_pin_oom_score_adj, adj)
+
+
+def _is_farm_dead_exc(exc: BaseException, browser: Any = None) -> bool:
+    """异常是否意味着 browser/driver 层已死（而非单页/单 context 出事）。
+
+    Chromium 渲染进程偶发 crash（低内存宿主上 fork 失败）报 ``Target
+    crashed``；playwright node driver 被杀后所有 RPC 报 ``handler is
+    closed``。两者共同点：farm 上**后续任务必再撞**——crashed 的 target
+    可能连带 browser 半死，handler closed 则 100% 全灭。这类异常必须
+    重置农场让下个任务拿全新进程，而 ``browser.is_connected()`` 对
+    driver 死亡返回 True（它只查 CDP 连接状态），靠它检不出来。
+
+    **TimeoutError 不在此列**：调用级超时既可能是 driver 半死（真死），
+    也可能是 fork/负载慢（假死）。超时时必须探测 ``browser.is_connected()``
+    ——browser 对象还连着 CDP 就先按慢处理（0.9.5 第 6 轮实测：把 5s
+    new_page 超时当 farm 死会触发每 20s 一轮的整树重启恶性循环）。
+    ``browser`` 传 None（旧签名兼容/上下文没有）时保守按死处理。
+    """
+    text = str(exc)
+    for marker in (
+        "Target crashed",
+        "Target closed",
+        "handler is closed",
+        "Target page, context or browser has been closed",
+        "Browser closed",
+        "Connection closed",
+    ):
+        if marker in text:
+            return True
+    if isinstance(exc, asyncio.TimeoutError) or not text:
+        # 超时/空消息：CDP 连接还在就是「慢」，不是「死」
+        if browser is not None:
+            try:
+                return not bool(browser.is_connected())
+            except Exception:  # pragma: no cover
+                return True
+        return True
+    return False
+
+
+# 被 _rpc 放弃的僵尸 RPC 的死因记录（有界队列，只留最新几条做诊断观测）。
+# 无它，吞 cancel 的协程死后异常被静默收割，"Task exception was never
+# retrieved" 消失了但死因也无从查起（pxed 第 11 轮实测）。
+_REAPED_RPC_EXCS: Deque[BaseException] = deque(maxlen=16)
+
+
+class _FarmDead(Exception):
+    """farm 级死亡的内部哨兵：包装原始异常向上传播，触发 farm 重置 + 进程内重试。
+
+    pxed 第 11 轮实测（0.9.5 部署验收）：``_goto`` 把 ``Connection closed
+    while reading from the driver`` 吞成 ``challenge_load_failed`` 返回后，
+    异常进不了 ``_solve_once`` 的 except → farm 不重置，死 farm 留给同一
+    批并发任务连环撞（C5/D1/D2 同时失败的根因）。导航等中间层捕获 farm 级
+    死亡时改抛本哨兵，让最外层统一「重置 + 重试一次」。
+    """
+
+    def __init__(self, original: BaseException) -> None:
+        super().__init__(str(original))
+        self.original = original
+
+
+def _is_farm_dead_marker(exc: BaseException) -> bool:
+    """仅按消息标记判断 farm 死亡（不做 is_connected 探测）。
+
+    用于从 ``_goto`` 等中间层捕获的异常里识别 driver/browser 级死亡；
+    TimeoutError 语义由调用方的 wait_for 超时分支单独处理，不在此列。
+    """
+    text = str(exc)
+    for marker in (
+        "Target crashed",
+        "Target closed",
+        "handler is closed",
+        "Target page, context or browser has been closed",
+        "Browser closed",
+        "Connection closed",
+    ):
+        if marker in text:
+            return True
+    return False
+
+
+async def _rpc(coro: Any, timeout: float) -> Any:
+    """取消安全的 playwright RPC 包装。
+
+    替代裸 ``asyncio.wait_for(coro, timeout)``：playwright 的 greenlet 桥
+    不响应 cancel，wait_for 取消挂起协程时会跟着一起挂（pxed 实测）。这里
+    用 detach 模式——到点后放弃等待，原协程留在后台自然消亡；协程死后
+    异常就地收割，避免 "Future exception was never retrieved" 日志。
+    """
+    inner = asyncio.ensure_future(coro)
+
+    def _swallow(fut: "asyncio.Future") -> None:
+        try:
+            exc = fut.exception()
+        except asyncio.CancelledError:
+            # future 被取消时 exception() 自己抛 CancelledError（3.8+ 是
+            # BaseException），callback 内不捕会把 callback 打崩（pxed 第
+            # 13 轮日志实测 "Exception in callback _rpc._swallow"）
+            return
+        except Exception:  # pragma: no cover - future 已取消
+            return
+        if exc is not None:
+            # 收割观测点：僵尸 RPC 的死因留给诊断（有界，不涨内存）
+            _REAPED_RPC_EXCS.append(exc)
+
+    try:
+        done, _pending = await asyncio.wait({inner}, timeout=timeout)
+    except asyncio.CancelledError:
+        # _rpc 自身被取消（任务级硬顶传入 _solve_once）：inner 必须一起
+        # 取消并收割，否则它泄漏到 loop 关闭才报
+        # "unhandled exception during asyncio.run() shutdown"（实测）。
+        inner.add_done_callback(_swallow)
+        inner.cancel()
+        raise
+    if inner in done:
+        return inner.result()
+    # 到点未归：后台留一个只收割异常的旁观者，别让异常无人认领
+    inner.add_done_callback(_swallow)
+    inner.cancel()
+    raise asyncio.TimeoutError(f"RPC wait_for timeout ({timeout:.1f}s)")
+
+
+def _default_launch_args(*, is_root: bool) -> List[str]:
+    """Chromium 启动参数。
+
+    ``--no-sandbox`` 只在 root 下自动补：Chromium 以 root 运行会直接拒绝启动
+    （"Running as root without --no-sandbox is not supported"），而线上服务
+    进程通常就是 root。非 root 下不加，避免无谓地削弱沙箱。
+    """
+    args = [
+        "--disable-blink-features=AutomationControlled",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--mute-audio",
+        "--disable-dev-shm-usage",
+    ]
+    if is_root:
+        args.append("--no-sandbox")
+    return args
+
+
+class _BrowserFarm:
+    """共享一个 Chromium 进程、每任务一个独立 context（proxy 在 context 上）。"""
+
+    def __init__(self, playwright_factory, *, headless: bool, extra_args: List[str]) -> None:
+        self._playwright_factory = playwright_factory
+        self._headless = headless
+        self._extra_args = list(extra_args or ())
+        self._pw: Any = None
+        self._browser: Any = None
+        self._guard = asyncio.Lock()
+
+    async def browser(self) -> Any:
+        browser = self._browser
+        if browser is not None:
+            # Chromium 进程可能已被外部杀掉（OOM/Manually/OOM-killer）：这
+            # 时对象还在但已断连，复用只会让每个任务都挂在 TargetClosed 上。
+            try:
+                if not browser.is_connected():
+                    logger.warning("px: chromium disconnected, relaunching")
+                    await self._close_browser()
+                    browser = None
+            except Exception:  # pragma: no cover
+                await self._close_browser()
+                browser = None
+        if browser is not None:
+            return browser
+        async with self._guard:
+            if self._browser is not None:
+                return self._browser
+            try:
+                self._pw = await self._playwright_factory()
+                launch_args = (
+                    _default_launch_args(is_root=_is_root())
+                    + self._extra_args
+                    + _env_chromium_args()
+                )
+                self._browser = await self._pw.chromium.launch(
+                    headless=self._headless,
+                    args=launch_args,
+                )
+                # 主进程树此刻已完整 fork：立即钉 adj，堵 guard 轮询空档
+                #（/proc 扫描 ~百 ms，走线程池别卡事件循环）
+                await _pin_oom_score_adj_async()
+            except Exception:
+                # 启动失败要把 playwright driver（node 进程）也清掉，否则
+                # 下次 launch 会叠加泄漏 node 子进程
+                await self._close_browser()
+                raise
+            logger.info("px: chromium farm ready (headless={})", self._headless)
+            return self._browser
+
+    async def _close_browser(self) -> None:
+        browser, self._browser = self._browser, None
+        pw, self._pw = self._pw, None
+        if browser is not None:
+            try:
+                await browser.close()
+            except Exception:  # pragma: no cover - 关闭竞态
+                pass
+        if pw is not None:
+            try:
+                await pw.stop()
+            except Exception:  # pragma: no cover
+                pass
+
+    async def close(self) -> None:
+        await self._close_browser()
+
+
+# 反自动化探针的最小集合：隐藏 webdriver 标记 + 固定语言。深指纹对抗
+# （canvas/WebGL/音效）属 stealth 层选题，明确不在本版范围内。
+#
+# window.chrome 的形状有讲究：playwright 的 headless Chromium 里它是
+# undefined，0.9.2 之前这里写 ``{get: () => window.chrome || {runtime: {}}}``
+# ——getter 内引用 window.chrome 会再次触发同一个 getter，无限递归，任何
+# 碰 window.chrome 的页面脚本（含 PX 传感器）直接栈溢出静默死亡，collector
+# beacon 一个都发不出（线上 S3 断层的根因，bisect 实证：裸跑能种出
+# _pxvid/_px3/_pxde，二分到 chrome 行是唯一杀手）。改为无自引用的完整形状。
+_STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['%(locale)s']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+Object.defineProperty(window, 'chrome', {get: () => ({
+  app: {isInstalled: false, InstallState: {DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed'}, RunningState: {CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running'}},
+  runtime: {OnInstalledReason: {CHROME_UPDATE: 'chrome_update', INSTALL: 'install', SHARED_MODULE_UPDATE: 'shared_module_update', UPDATE: 'update'}, OnRestartRequiredReason: {APP_UPDATE: 'app_update', OS_UPDATE: 'os_update', PERIODIC: 'periodic'}, PlatformArch: {ARM: 'arm', ARM64: 'arm64', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64'}, PlatformNaclArch: {ARM: 'arm', MIPS: 'mips', MIPS64: 'mips64', X86_32: 'x86-32', X86_64: 'x86-64'}, PlatformOs: {ANDROID: 'android', CROS: 'cros', LINUX: 'linux', MAC: 'mac', OPENBSD: 'openbsd', WIN: 'win'}, RequestUpdateCheckStatus: {NO_UPDATE: 'no_update', THROTTLED: 'throttled', UPDATE_AVAILABLE: 'update_available'}, connect: function() {}, sendMessage: function() {}},
+  csi: function() { return {startE: Date.now(), onloadT: Date.now(), pageT: 100, tran: 15}; },
+  loadTimes: function() { return {}; },
+})});
+"""
+
+
+def _is_document_response(response: Any) -> bool:
+    """主帧响应是否为「文档」本身（而非 script/img/fetch 等子资源）。
+
+    Playwright 的子资源 ``response.frame`` 也指向 main_frame，因此 frame 相等
+    不足以区分。拿不到 ``request.resource_type`` 时（测试注入的老式假对象）
+    按文档处理，保持既有测试语义不变。
+    """
+    request = getattr(response, "request", None)
+    if request is None:
+        return True
+    try:
+        resource_type = getattr(request, "resource_type", None)
+    except Exception:
+        return False
+    # 某些绑定把 resource_type 实现为方法
+    if callable(resource_type):
+        try:
+            resource_type = resource_type()
+        except Exception:
+            return False
+    if not isinstance(resource_type, str):
+        return True
+    return resource_type == "document"
+
+
+def _is_timeout_exc(exc: BaseException) -> bool:
+    """异常是否为「超时」而非「连不上」。
+
+    Playwright 的 ``TimeoutError`` 与 ``asyncio.TimeoutError`` 不是同一个类，
+    用一个基类判断会漏；按类名后缀识别对两者都成立，且不会误吞别的东西。
+    """
+    for klass in type(exc).__mro__:
+        if klass.__name__.endswith("TimeoutError"):
+            return True
+    return False
+
+
+class _Diagnostics:
+    """一次任务的传感器执行链观测（需求单 v2 §3.3，全部脱敏）。
+
+    只记「发生了没有 / 状态码 / 名字」，绝不记 cookie 值与消息内容——
+    ``px_cookie_names_seen`` 只有名字+域，postMessage 只记类型不记负载。
+    """
+
+    def __init__(self) -> None:
+        self.iframe_loaded: bool = False
+        self.iframe_status: Optional[int] = None
+        self.captcha_js_loaded: bool = False
+        self.captcha_js_status: Optional[int] = None
+        self.main_min_js_loaded: bool = False
+        self.main_min_js_status: Optional[int] = None
+        self.collector_seen: bool = False
+        self.collector_requested: bool = False
+        self.collector_request_error: str = ""
+        self.parent_message_seen: bool = False
+        self.px_cookie_names_seen: List[str] = []
+        self.sensor_console: List[str] = []
+
+    def observe_response(self, response: Any) -> None:
+        """按 URL 特征归类一条响应（任务 context 内所有 frame 的都算）。"""
+        try:
+            url = str(getattr(response, "url", "") or "")
+            status = int(getattr(response, "status", 0) or 0)
+        except Exception:
+            return
+        low = url.lower()
+        if "captcha.js" in low:
+            self.captcha_js_loaded = True
+            self.captcha_js_status = status
+        elif "main.min.js" in low:
+            self.main_min_js_loaded = True
+            self.main_min_js_status = status
+        elif "collector-" in low and ("hsprotect.net" in low or "px-client.net" in low):
+            self.collector_seen = True
+            # 发出去又成功了：失败标记复位（重试后通了）
+            self.collector_request_error = ""
+
+    def observe_request_failed(self, request: Any) -> None:
+        """请求发出但失败（DNS/拒绝/TLS/超时）：区分「没发出」vs「发出失败」。
+
+        PX 传感器静默放弃的一个分支就是 collector beacon 发不出去；只有
+        ``requestfailed`` 能证明 beacon 到过网络层。只记 failure 文本一行，
+        不记 URL query（可能带会话参数）。
+        """
+        try:
+            url = str(getattr(request, "url", "") or "")
+        except Exception:
+            return
+        low = url.lower()
+        if not ("collector-" in low and ("hsprotect.net" in low or "px-client.net" in low)):
+            return
+        self.collector_requested = True
+        if self.collector_request_error:
+            return  # 只留第一行，避免刷屏
+        try:
+            failure = getattr(request, "failure", None)
+            text = str(getattr(failure, "errorText", None) or failure or "unknown")
+            self.collector_request_error = text[:200]
+        except Exception:
+            self.collector_request_error = "unknown"
+
+    def observe_console(self, kind: str, text: str) -> None:
+        """传感器执行链的 console/error 提示（PX 静默退出通常留痕于此）。
+
+        脱敏：只存「级别+截断文本」，且单任务上限 20 条——console 可能被
+        页面脚本刷屏，诊断不能反过来变成内存放大器。
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        if len(self.sensor_console) >= 20:
+            return
+        # 可能带 token/query 的一律按行截断到 200 字符
+        self.sensor_console.append(f"{kind}: {text[:200]}")
+
+    def note_iframe_document(self, status: int) -> None:
+        self.iframe_loaded = True
+        self.iframe_status = status
+
+    def observe_cookie_names(self, cookies: Any) -> None:
+        """轮询顺手记 jar 里出现过的 _px* 名字+域（不记值）。"""
+        try:
+            items = cookies if isinstance(cookies, (list, tuple)) else ()
+        except Exception:
+            return
+        for item in items:
+            try:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "")
+                if not name.lower().lstrip("_").startswith("px"):
+                    continue
+                entry = f"{name}({item.get('domain') or '?'})"
+                if entry not in self.px_cookie_names_seen:
+                    self.px_cookie_names_seen.append(entry)
+            except Exception:  # pragma: no cover - 单条坏数据不拖垮采集
+                continue
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "iframe_loaded": self.iframe_loaded,
+            "iframe_status": self.iframe_status,
+            "captcha_js_loaded": self.captcha_js_loaded,
+            "captcha_js_status": self.captcha_js_status,
+            "main_min_js_loaded": self.main_min_js_loaded,
+            "main_min_js_status": self.main_min_js_status,
+            "collector_seen": self.collector_seen,
+            # 冒烟报告 §3 P0-2：区分「collector 没发出」vs「发出但失败」——
+            # requested=true + seen=false + error 有值 = 网络层断；
+            # requested=false = 传感器在浏览器内就静默放弃了（执行层断）。
+            "collector_requested": self.collector_requested,
+            "collector_request_error": self.collector_request_error,
+            "parent_message_seen": self.parent_message_seen,
+            "px_cookie_names_seen": list(self.px_cookie_names_seen),
+            "sensor_console": list(self.sensor_console),
+        }
+
+
+# 注入到每个 frame 的监听脚本：iframe 收到父页 postMessage 只记「有过」，
+# 不记内容（脱敏）。服务侧通过 context.expose_binding 把 window.__pxParentSeen
+# 的变化带回 Python——sensor 的 message 事件也可能带 data，只上报布尔。
+_PARENT_MESSAGE_PROBE = """
+(() => {
+  if (window.__pxParentProbe) return;
+  window.__pxParentProbe = true;
+  window.addEventListener('message', () => {
+    try { window.__pxParentSeen = true; } catch (e) { /* ignore */ }
+    try { __slidexParentMessage__(); } catch (e) { /* binding 未就绪 */ }
+  });
+})();
+"""
+
+
+class PxPressSolver:
+    """一次调用解一道挑战；并发上限 = ``concurrency``。
+
+    ``context_factory`` 仅供测试注入（返回 context-like），默认由内部
+    ``_BrowserFarm`` 生产真实 context。
+    """
+
+    def __init__(
+        self,
+        *,
+        headless: bool = True,
+        concurrency: int = 5,
+        require_1000: bool = True,
+        poll_interval_s: float = 2.0,
+        playwright_factory: Optional[Callable[[], Awaitable[Any]]] = None,
+        context_factory: Optional[Callable[..., Awaitable[Any]]] = None,
+        slots: Optional[PxPressSlots] = None,
+        queue_timeout_s: float = 30.0,
+    ) -> None:
+        self._headless = headless
+        self._require_1000 = require_1000
+        self._poll_interval_s = max(0.25, float(poll_interval_s))
+        self._queue_timeout_s = max(0.0, float(queue_timeout_s))
+        self._playwright_factory = playwright_factory
+        self._context_factory = context_factory
+        self._slots = slots or PxPressSlots(concurrency=concurrency)
+        self._farm: Optional[_BrowserFarm] = None
+        # farm 世代号：每次重置/重建 +1。进程内重试用它区分「farm 真死过」
+        # 与「普通业务失败」——只有 epoch 前进过的 retryable 失败才重试。
+        self._farm_epoch = 0
+        # 硬顶放弃的僵尸协程：持有引用并收割死后异常，避免 asyncio 的
+        # "Task exception was never retrieved" GC 日志（pxed 第 11 轮实测）。
+        self._abandoned_futures: set = set()
+        # 最近一次收割到的僵尸异常（可观测点：单测断言收割确实发生）
+        self._last_abandoned_exc: Optional[BaseException] = None
+        self._closed = False
+        # 种子任务（vid 补种）单独限速：低并发部署点（如 concurrency=2）上，
+        # 若种子与正式求解共用一个槽，一次补种会把正式求解顶出槽最长 25s，
+        # 两个 vid 缺失的调用方就能让服务 busy 掉整个窗口。
+        self._seed_slots = PxPressSlots(concurrency=1)
+
+    # ------------------------------------------------------------------ 对外
+    @property
+    def active_tasks(self) -> int:
+        return self._slots.active
+
+    async def solve(self, request: PxPressRequest) -> PxPressResult:
+        started = time.monotonic()
+        sem = self._slots.ensure_semaphore()
+        if self._queue_timeout_s > 0:
+            try:
+                await asyncio.wait_for(sem.acquire(), timeout=self._queue_timeout_s)
+            except asyncio.TimeoutError:
+                # 排队超预算：让调用方拿到明确的 busy，而不是干等到自身超时
+                return PxPressResult(
+                    success=False, mode=request.mode, error_kind=ERR_SOLVER_BUSY,
+                    error="solver_busy: concurrency slots exhausted", retryable=True,
+                )
+        else:
+            await sem.acquire()
+        self._slots.acquire()
+        try:
+            # vid 缺失不再裸导航沉默超时（需求单 v2 §3.2）：press 先自动补种子，
+            # 拿到初始 vid 后种进 caller cookies 再求解。silent 是宿主页自证
+            # 模式，vid 本就可选（v1 契约），种子种子套娃没有意义——照常直跑。
+            if request.vid or request.mode != "press":
+                effective = request
+            else:
+                # 种子不占主槽：主槽在补种期间先放回去，种子在自己的限速槽里
+                # 跑；拿回 vid 后重新排队进主槽求解（极端情况下可能二次排队，
+                # 但种子最长 25s，比占着主槽空转 25s 对并发友好得多）。
+                sem.release()
+                self._slots.release()
+                try:
+                    seeded_vid = await self._seed_vid(request)
+                finally:
+                    if self._closed:
+                        return PxPressResult(
+                            success=False, mode=request.mode, error_kind=ERR_INTERNAL,
+                            error="solver closed during vid seeding", retryable=True,
+                            duration_ms=self._ms(started),
+                        )
+                    if self._queue_timeout_s > 0:
+                        try:
+                            await asyncio.wait_for(sem.acquire(), timeout=self._queue_timeout_s)
+                        except asyncio.TimeoutError:
+                            return PxPressResult(
+                                success=False, mode=request.mode, error_kind=ERR_SOLVER_BUSY,
+                                error="solver_busy: concurrency slots exhausted after seeding",
+                                retryable=True, duration_ms=self._ms(started),
+                            )
+                    else:
+                        await sem.acquire()
+                    self._slots.acquire()
+                if not seeded_vid:
+                    return PxPressResult(
+                        success=False, mode=request.mode, error_kind=ERR_VID_REQUIRED,
+                        error=(
+                            "vid is empty and auto-seed via bare silent failed; "
+                            "caller should send challengeDetails.deviceId"
+                        ),
+                        retryable=True, duration_ms=self._ms(started),
+                        diagnostics={"vid_seeded": False},
+                    )
+                cookies = dict(request.cookies)
+                cookies.setdefault("_pxvid", seeded_vid)
+                effective = dataclasses.replace(
+                    request, vid=seeded_vid, cookies=cookies
+                )
+            # 任务级硬顶：_solve_once 内部所有 playwright RPC 都加了调用级
+            # 超时，但 driver 半死时协程吞掉 cancel（greenlet 桥不响应取消，
+            # wait_for 在 inner 吞 cancel 时自身也挂起——实测确认），必须用
+            # 「detach + 放弃」模式：asyncio.wait 到点就返回，吞了 cancel 的
+            # 僵尸协程留在后台等它自然消亡，主流程立刻收敛。
+            # 进程内重试：farm 死亡被重置后当场再试一次（第 11 轮实测：重置
+            # 后 3s 内 farm ready、后续任务全过——死亡事件本来只需损失一个
+            # 任务，不该由调用方承担重试）。以 farm epoch 判定「确实死过一次」，
+            # 普通业务失败不重试，预算不翻倍。
+            farm_epoch_before = self._farm_epoch
+            result = await self._await_solve_capped(effective, started)
+            if (
+                result is not None
+                and not result.success
+                and result.retryable_error
+                and self._farm_epoch > farm_epoch_before
+            ):
+                logger.warning(
+                    "px: farm died during task (epoch {} -> {}), retrying once "
+                    "on fresh farm", farm_epoch_before, self._farm_epoch,
+                )
+                retried = await self._await_solve_capped(effective, started)
+                if retried is not None:
+                    return retried
+            if result is not None:
+                return result
+            return PxPressResult(
+                success=False, mode=request.mode,
+                error_kind=ERR_TOKEN_TIMEOUT,
+                error=f"solve exceeded hard deadline "
+                      f"({request.solve_timeout_s + _SOLVE_HARD_MARGIN_S:.0f}s)",
+                retryable=True, duration_ms=self._ms(started),
+            )
+        finally:
+            self._slots.release()
+            sem.release()
+
+    async def _await_solve_capped(
+        self, request: PxPressRequest, started: float
+    ) -> Optional[PxPressResult]:
+        """跑一次 _solve_once，任务级硬顶到点放弃协程并重置农场。
+
+        返回 None 表示硬顶到点（协程被放弃），调用方按 token_timeout 上报。
+        僵尸协程的 future 记进 _abandoned_futures，等它死后收割异常
+        （吞 cancel 的协程死于 driver 关闭时异常无人认领，asyncio 会刷
+        "Task exception was never retrieved"）。
+        """
+        hard_deadline = request.solve_timeout_s + _SOLVE_HARD_MARGIN_S
+        inner = asyncio.ensure_future(self._solve_once(request, started))
+        done, _pending = await asyncio.wait({inner}, timeout=hard_deadline)
+        if inner in done:
+            return inner.result()
+        inner.cancel()
+        logger.warning(
+            "px: solve hard deadline ({}s) hit, abandoning stuck coroutine "
+            "and resetting farm", hard_deadline
+        )
+        self._abandoned_futures.add(inner)
+        inner.add_done_callback(self._reap_abandoned)
+        await self._reset_farm()
+        return None
+
+    def _reap_abandoned(self, fut: "asyncio.Future") -> None:
+        """收割被放弃的僵尸协程的异常（callback 里的异常不会外泄）。"""
+        self._abandoned_futures.discard(fut)
+        try:
+            exc = fut.exception()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # pragma: no cover - future 已取消
+            return
+        if exc is not None:
+            self._last_abandoned_exc = exc
+            logger.debug(f"px: abandoned solve coroutine died: {exc}")
+
+    async def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._farm is not None:
+            await self._farm.close()
+
+    async def _reset_farm(self) -> None:
+        """进程没了时丢弃农场，下一个任务自动重建；没有农场则空操作。"""
+        farm, self._farm = self._farm, None
+        self._farm_epoch += 1
+        if farm is not None:
+            await farm.close()
+
+    @staticmethod
+    def _connected(browser: Any) -> bool:
+        """浏览器是否还活着；拿不到判断依据（测试注入）按活着处理。"""
+        if browser is None:
+            return True
+        try:
+            return bool(browser.is_connected())
+        except Exception:  # pragma: no cover
+            return False
+
+    # ------------------------------------------------------------------ 内部
+    async def _browser(self) -> Any:
+        if self._closed:
+            raise RuntimeError("solver closed")
+        if self._farm is None:
+            if self._context_factory is not None:
+                # 测试注入：不需要真浏览器农场
+                return None
+            factory = self._playwright_factory or self._default_playwright_factory()
+            self._farm = _BrowserFarm(factory, headless=self._headless, extra_args=[])
+        if self._farm is None:
+            return None
+        return await self._farm.browser()
+
+    async def _new_task_context(
+        self,
+        request: PxPressRequest,
+        diag: Optional[_Diagnostics],
+        browser: Any = None,
+        *,
+        with_parent_probe: bool = False,
+    ) -> Any:
+        """任务 context 装配（_solve_once 与 _harvest_vid 共用）。
+
+        步骤：context（测试注入或真 farm，真 farm 上 new_context 失败且浏览器
+        已断连时重置农场）→ stealth init script（locale 注入；probe 模式还挂
+        postMessage 观测）→ caller cookies 注入。返回裸 context，调用方自己
+        new_page / 挂事件 / close。
+        """
+        context_options = self._context_options(request)
+        if self._context_factory is not None:
+            context = await self._context_factory(context_options)
+        else:
+            if browser is None:  # pragma: no cover
+                raise RuntimeError("no browser")
+            for attempt in (0, 1):
+                try:
+                    context = await browser.new_context(**context_options)
+                    break
+                except Exception as exc:
+                    if not _is_farm_dead_exc(exc, browser) or attempt:
+                        raise
+                    # Target crashed / handler closed：farm 内部已死（不多是
+                    # crash 连带半死，后者 100% 全灭）。is_connected() 检不出
+                    # driver 死亡，必须按异常内容显式重置，新 farm 当场重建，
+                    # 别让这个任务以及后续任务在同一具尸体上继续撞。
+                    logger.warning(f"px: farm dead inside task, resetting: {exc}")
+                    await self._reset_farm()
+                    browser = await self._browser()
+                    if browser is None:  # pragma: no cover - 测试注入
+                        raise
+        add_init_script = getattr(context, "add_init_script", None)
+        if callable(add_init_script):
+            try:
+                await add_init_script(
+                    _STEALTH_INIT_SCRIPT
+                    % {"locale": context_options.get("locale") or _FALLBACK_LOCALE}
+                )
+                if with_parent_probe:
+                    # 父页→iframe 的 postMessage 只记「发生过」，不记内容
+                    await add_init_script(_PARENT_MESSAGE_PROBE)
+            except Exception as exc:  # pragma: no cover - 注入失败不阻断
+                logger.debug(f"px: stealth init script skipped: {exc}")
+        if with_parent_probe and diag is not None:
+            await self._expose_parent_probe(context, diag)
+        specs = self._cookie_specs(request)
+        if specs:
+            try:
+                await context.add_cookies(specs)
+                logger.info(
+                    "px: injected cookies {} (domains redacted, {} specs)",
+                    sorted({s["name"] for s in specs}), len(specs),
+                )
+            except Exception as exc:  # pragma: no cover - 坏 cookie 名/域
+                logger.warning(f"px: add_cookies skipped: {exc}")
+        return context
+
+    async def _solve_once(self, request: PxPressRequest, started: float) -> PxPressResult:
+        deadline = started + request.solve_timeout_s
+        mode = request.mode
+        diag = _Diagnostics()
+        try:
+            browser = await self._browser()
+        except Exception as exc:
+            logger.warning(f"px: browser launch failed: {exc}")
+            return PxPressResult(
+                success=False, mode=mode, error_kind=ERR_BROWSER_LAUNCH,
+                error=f"browser_launch_failed: {exc}", retryable=True,
+                duration_ms=self._ms(started),
+            )
+
+        # 必须在 try 之前初始化：_context_options / new_context 抛错时
+        # finally 仍会引用它们，否则会变成 UnboundLocalError 掩盖真实原因。
+        context = None
+        page = None
+        try:
+            # new_context 会 fork 新 renderer（默认 adj=300）：每个任务前
+            # 再钉一轮，覆盖 launch 之后新出现的进程（宿主 OOM 防祭品）。
+            if self._context_factory is None:
+                await _pin_oom_score_adj_async()
+            context = await self._new_task_context(
+                request, diag, browser, with_parent_probe=True
+            )
+
+            # new_page 用加长超时（fork renderer 慢≠死）；Target crashed
+            # （renderer fork 失败）才重置农场就地重试一次。
+            for _np_attempt in (0, 1):
+                try:
+                    page = await _rpc(context.new_page(), timeout=_NEW_PAGE_TIMEOUT_S)
+                    break
+                except Exception as exc:
+                    if not _is_farm_dead_exc(exc, browser) or _np_attempt:
+                        raise
+                    logger.warning(f"px: page fork crashed, resetting farm: {exc}")
+                    await self._reset_farm()
+                    browser = await self._browser()
+                    context = await self._new_task_context(
+                        request, diag, browser, with_parent_probe=True
+                    )
+            page_status: Dict[str, int] = {}
+
+            async def _on_response(response: Any) -> None:
+                diag.observe_response(response)
+                try:
+                    frame = response.frame
+                    if frame is not None and frame == page.main_frame:
+                        # 只认主帧的「文档」响应：子资源（script/img/fetch）的
+                        # response.frame 同样是 main_frame，若无条件记录，一个
+                        # 404 的阻塞脚本会把健康页判死，一个 200 的脚本又会
+                        # 把真 404 页从 fail-fast 拖成超时（实测两个方向都会错）。
+                        if _is_document_response(response):
+                            # 重定向链后 target 是 302，真正渲染的是最终文档
+                            # （可能是 PX 的 403 拦截页），所以留最后一条。
+                            page_status["last"] = int(response.status)
+                            # press 双页结构下 iframe 是子 frame，这里到不了；
+                            # 但 silent 单页时 target 就是主帧文档——状态码
+                            # 兼作 iframe_loaded 的观测（合成页测试同源）。
+                except Exception:  # pragma: no cover
+                    pass
+
+            page.on("response", _on_response)
+
+            # 冒烟报告 §3 P0-1/P0-2：传感器静默放弃的最后一块观测盲区。
+            # console/pageerror 抓「浏览器内执行层」退出原因；requestfailed
+            # 抓「beacon 到了网络层但发不出去」。都不改变求解流程，只进诊断。
+            def _on_console(msg: Any) -> None:
+                try:
+                    diag.observe_console(str(getattr(msg, "type", "log")), str(getattr(msg, "text", "")))
+                except Exception:  # pragma: no cover
+                    pass
+
+            def _on_pageerror(err: Any) -> None:
+                try:
+                    diag.observe_console("pageerror", str(err))
+                except Exception:  # pragma: no cover
+                    pass
+
+            def _on_requestfailed(req: Any) -> None:
+                try:
+                    diag.observe_request_failed(req)
+                except Exception:  # pragma: no cover
+                    pass
+
+            try:
+                page.on("console", _on_console)
+                page.on("pageerror", _on_pageerror)
+                page.on("requestfailed", _on_requestfailed)
+            except Exception:  # pragma: no cover - 事件注册失败不阻断
+                logger.debug("px: console/pageerror/requestfailed listeners skipped")
+
+            if mode == "press":
+                # 双页结构（需求单 v2 §3.1）：顶层页先落 websiteURL 域并做
+                # fail-fast 判死（403/404/407/5xx），通过后才注入 challenge
+                # iframe——否则一个 404 的 challengeUrl 也会白等 iframe 就绪。
+                host_kwargs = self._nav_kwargs(request, _HOST_NAV_TIMEOUT_S)
+                nav_kind, nav_reason = await self._goto(
+                    page, request.website_url, host_kwargs
+                )
+                if not nav_kind:
+                    # 首屏状态判死不分模式（0.9.1 修：silent 丢判死是线上
+                    # deep_check C5 回归的根因，407/404 烧满预算变可重试超时）
+                    fatal = self._first_paint_kill(
+                        started=started, mode=mode, diag=diag,
+                        status=self._pick_status(page_status),
+                    )
+                    if fatal is not None:
+                        return fatal
+                    nav_kind, nav_reason = await self._attach_iframe(request, page, diag)
+            else:
+                nav = await self._navigate_silent(request, page, page_status, diag)
+                nav_kind, nav_reason = nav
+                if not nav_kind:
+                    fatal = self._first_paint_kill(
+                        started=started, mode=mode, diag=diag,
+                        status=self._pick_status(page_status),
+                    )
+                    if fatal is not None:
+                        return fatal
+            # 导航失败按「超时 / 连不上」分两类上报；首屏判死已在上面做过。
+            if nav_kind == ERR_CHALLENGE_TIMEOUT:
+                return self._fail(
+                    started, mode, diag, ERR_CHALLENGE_TIMEOUT,
+                    f"challenge page did not load within budget: {nav_reason}",
+                    retryable=True,
+                )
+            if nav_kind:
+                return self._fail(
+                    started, mode, diag, ERR_CHALLENGE_LOAD,
+                    f"challenge page unreachable: {nav_reason}", retryable=True,
+                )
+
+            blocked_since: Optional[float] = None
+            read_failures = 0
+            while time.monotonic() < deadline:
+                cookies = await self._read_cookies(context, log_failure=(read_failures == 0))
+                if cookies is None:
+                    # cookie 读不出来：context/browser 多半已经死了（Chromium 被
+                    # OOM 杀、context 被关）。继续轮询只会把整个预算耗光并刷屏
+                    # 警告，必须尽快失败并把农场重置，让下一个任务拿新进程。
+                    read_failures += 1
+                    if read_failures == 1 and not self._connected(browser):
+                        logger.warning("px: chromium gone mid-task, resetting farm")
+                        await self._reset_farm()
+                    if read_failures >= 2 or not self._connected(browser):
+                        return self._fail(
+                            started, mode, diag, ERR_INTERNAL,
+                            "browser/context lost mid-task (cookie read failed)",
+                            retryable=True,
+                        )
+                    await asyncio.sleep(request.poll_interval_s or self._poll_interval_s)
+                    continue
+                read_failures = 0
+                diag.observe_cookie_names(cookies)
+                tokens = extract_px_tokens(cookies)
+                px3 = tokens.get("px3", "")
+                if px3 and is_pass_token(px3):
+                    tokens = self._fill_from_request(tokens, request)
+                    missing = [f for f in ("px3", "pxde", "pxvid", "pxcts") if not tokens.get(f)]
+                    logger.info(
+                        "px: {} pass token px3={} missing={} cookies_seen={}",
+                        mode, redact_token(px3), missing, diag.px_cookie_names_seen,
+                    )
+                    return PxPressResult(
+                        success=True, tokens=tokens, mode=mode, duration_ms=self._ms(started),
+                        missing=missing, diagnostics=diag.snapshot(),
+                    )
+                if px3 and not is_pass_token(px3):
+                    # 有非通过级 token：给 PX 一点时间升级，别急着当成功
+                    if blocked_since is None:
+                        blocked_since = time.monotonic()
+                        logger.info(f"px: {mode} px3 without :1000: px3={redact_token(px3)}")
+                    if time.monotonic() - blocked_since > _BLOCKED_GRACE_S:
+                        return self._fail(
+                            started, mode, diag, ERR_TOKEN_BLOCKED,
+                            "px3 lacks :1000: (possibly IP/appId blocked)", retryable=True,
+                        )
+                else:
+                    blocked_since = None
+                await asyncio.sleep(request.poll_interval_s or self._poll_interval_s)
+
+            return self._fail(
+                started, mode, diag, ERR_TOKEN_TIMEOUT,
+                "no pass token within budget", retryable=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except _FarmDead as exc:
+            # _goto 等中间层抛上来的 farm 级死亡：原异常按 farm 死亡处理
+            if self._farm is not None:
+                logger.warning(f"px: farm dead mid-solve, resetting: {exc.original}")
+                await self._reset_farm()
+            reason = f"{type(exc.original).__name__}: {exc.original}"[:300]
+            logger.warning(f"px: {mode} solve error: {reason}")
+            return self._fail(
+                started, mode, diag, ERR_INTERNAL,
+                f"solver_internal_error: {reason}", retryable=True,
+            )
+        except Exception as exc:
+            if _is_farm_dead_exc(exc, browser) and self._farm is not None:
+                # 渲染进程 crash / driver 死亡：browser 对象还挂着但 farm 内部
+                # 已死，is_connected() 检不出来。这里重置让**下一个任务**拿新
+                # 进程（本任务交还 retryable 给调用方重试），否则 crash 后的
+                # 连环任务会在同一半死 browser 上连环撞（pxed B 组连空根因）。
+                logger.warning(f"px: farm dead mid-solve, resetting: {exc}")
+                await self._reset_farm()
+            # 空消息（调用级超时被 playwright 重写后 str 为空）：给出可读文本
+            if isinstance(exc, asyncio.TimeoutError):
+                reason = "RPC wait_for timeout (browser slow or driver half-dead)"
+            else:
+                reason = str(exc) or f"{type(exc).__name__} (empty message)"
+            logger.warning(f"px: {mode} solve error: {reason}")
+            return self._fail(
+                started, mode, diag, ERR_INTERNAL,
+                f"solver_internal_error: {reason}", retryable=True,
+            )
+        finally:
+            # 收尾同样要限死：driver 半死时 close() 的 await 也可能永不返回
+            # （pxed 实测：卡死任务的 context 不回收 → D3 泄漏 6 个 chrome）。
+            if page is not None:
+                try:
+                    await _rpc(page.close(), timeout=_COOKIE_RPC_TIMEOUT_S)
+                except Exception:  # pragma: no cover
+                    pass
+            if context is not None:
+                try:
+                    await _rpc(context.close(), timeout=_COOKIE_RPC_TIMEOUT_S)
+                except Exception:  # pragma: no cover
+                    pass
+
+    @staticmethod
+    def _fail(
+        started: float,
+        mode: str,
+        diag: _Diagnostics,
+        kind: str,
+        message: str,
+        *,
+        retryable: bool,
+    ) -> PxPressResult:
+        """失败终态：统一把诊断观测挂上，调用方在 fail 响应里直接可见。"""
+        return PxPressResult(
+            success=False, mode=mode, error_kind=kind, error=message,
+            retryable=retryable, duration_ms=PxPressSolver._ms(started),
+            diagnostics=diag.snapshot(),
+        )
+
+    @staticmethod
+    async def _expose_parent_probe(context: Any, diag: _Diagnostics) -> None:
+        """把页面侧的 postMessage 观测接到 _Diagnostics。
+
+        ``expose_binding`` 在 context 级别生效（每个 frame 都有）；拿不到该方法
+        （测试注入的假 context）就静默跳过——诊断是尽力而为，不能因采集失败
+        拖垮求解。
+        """
+        expose = getattr(context, "expose_binding", None)
+        if not callable(expose):
+            return
+
+        async def _on_parent_message(source: Any) -> None:
+            diag.parent_message_seen = True
+
+        try:
+            # expose_binding 是 async：必须 await，否则协程从未执行、只留下
+            # "coroutine was never awaited" 警告，页面观测实际是死路。
+            await expose("__slidexParentMessage__", _on_parent_message)
+        except Exception:  # pragma: no cover - 重复绑定等竞态
+            pass
+
+    async def _navigate_silent(
+        self,
+        request: PxPressRequest,
+        page: Any,
+        page_status: Dict[str, int],
+        diag: _Diagnostics,
+    ) -> Tuple[str, str]:
+        """silent 模式：直接导航 websiteURL（宿主页本身就是传感器页）。
+
+        返回 ``(kind, reason)``：``kind == ""`` 表示成功。
+        """
+        kind, reason = await self._goto(
+            page, request.website_url, self._nav_kwargs(request, _NAV_TIMEOUT_S),
+            referer=request.referer,
+        )
+        if not kind:
+            # silent 的主帧文档就是 challenge 宿主，200 即视为 iframe_loaded
+            diag.note_iframe_document(page_status.get("last", 0))
+        return kind, reason
+
+    def _nav_kwargs(self, request: PxPressRequest, budget_s: float) -> Dict[str, Any]:
+        return {
+            "wait_until": "domcontentloaded",
+            "timeout": int(min(budget_s, request.solve_timeout_s) * 1000),
+        }
+
+    @staticmethod
+    async def _goto(
+        page: Any, url: str, kwargs: Dict[str, Any], *, referer: str = ""
+    ) -> Tuple[str, str]:
+        """单页导航；失败时区分「超时」与「连不上」（同 0.8.4 的语义）。
+
+        外层再包一道 wait_for：playwright 自身 timeout 参数靠 driver 的
+        定时器触发，driver 半死时页内超时永远不会回来——goto 挂起会把
+        整个求解预算烧光且不报错（pxed C4 31.5s 超预算的根因之一）。
+        farm 级死亡（driver/browser 进程没了）不能吞成导航失败：那会让
+        异常进不了 _solve_once 的 except，farm 不重置，同批并发任务连环
+        撞同一具尸体（pxed 第 11 轮 C5/D1/D2 齐挂的根因）——改抛
+        _FarmDead 哨兵向上传播。
+        """
+        call_kwargs = dict(kwargs)
+        if referer:
+            call_kwargs["referer"] = referer
+        # RPC 硬顶 = 页内超时 + 5s 余量（页内超时正常触发时先返回）
+        hard_top = float(call_kwargs.get("timeout", 45_000)) / 1000 + 5.0
+        try:
+            await _rpc(page.goto(url, **call_kwargs), timeout=hard_top)
+            return "", ""
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if _is_farm_dead_marker(exc):
+                raise _FarmDead(exc) from exc
+            reason = f"{type(exc).__name__}: {exc}"[:300]
+            # playwright 的 TimeoutError 与 asyncio.TimeoutError 不是同一个
+            # 类：页内超时（含 0.9.6 前 _is_timeout_exc 的判定）必须恢复，
+            # 否则 blackhole 代理被错报成 challenge_load_failed（第 13 轮
+            # C4 回归实测）。
+            kind = ERR_CHALLENGE_TIMEOUT if _is_timeout_exc(exc) else ERR_CHALLENGE_LOAD
+            logger.warning(f"px: navigate {url!r:.80} failed ({kind}): {reason}")
+            return kind, reason
+
+    async def _attach_iframe(
+        self, request: PxPressRequest, page: Any, diag: _Diagnostics
+    ) -> Tuple[str, str]:
+        """把 challengeUrl 作为 iframe 插入宿主页，等它的文档出现。
+
+        iframe 装载情况记进诊断（iframe_loaded / iframe_status）；就绪判定是
+        「challengeUrl 的 frame 拿到 document 响应」，拿不到时并不 fail——
+        只要传感器加载了（captcha.js / main.min.js 任一出现）就有解出的机会。
+        """
+        loop = asyncio.get_event_loop()
+        iframe_ready: asyncio.Future = loop.create_future()
+        challenge = request.challenge_url
+        main_frame = getattr(page, "main_frame", None)
+
+        async def _on_iframe_response(response: Any) -> None:
+            try:
+                frame = response.frame
+                if frame is None or frame == main_frame:
+                    return
+                if not _is_document_response(response):
+                    return
+                frame_url = str(getattr(frame, "url", "") or "")
+                if challenge and (frame_url.startswith(challenge) or challenge.startswith(frame_url)):
+                    diag.note_iframe_document(int(getattr(response, "status", 0) or 0))
+                    if not iframe_ready.done():
+                        iframe_ready.set_result(True)
+            except Exception:  # pragma: no cover
+                pass
+
+        try:
+            page.on("response", _on_iframe_response)
+        except Exception:  # pragma: no cover - 事件注册失败不阻断
+            pass
+
+        inject = (
+            "(src) => {"
+            "const f = document.createElement('iframe');"
+            "f.src = src; f.id = 'px-captcha-host';"
+            "f.setAttribute('style', %r);"
+            "(document.body || document.documentElement).appendChild(f);"
+            "return f.id;}" % _IFRAME_STYLE
+        )
+        # 注入是幂等操作（append 同 id 元素前先清旧）：调用级超时不判死
+        # 任务，当场重试一次——pxed 第 12 轮 B5 实测，farm 冷启动 + 连续
+        # 任务挤在 2 核上时单次 evaluate 会超 5s，重试即成。
+        last_inject_exc: Optional[Exception] = None
+        for _inject_attempt in (0, 1):
+            try:
+                # evaluate 同样限死：driver 半死时裸 await 永不返回
+                await _rpc(page.evaluate(inject, challenge),
+                           timeout=_COOKIE_RPC_TIMEOUT_S)
+                last_inject_exc = None
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_inject_exc = exc
+                if _is_farm_dead_marker(exc):
+                    raise _FarmDead(exc) from exc
+                logger.warning(
+                    f"px: iframe inject failed (attempt {_inject_attempt + 1}): "
+                    f"{type(exc).__name__}: {exc}"[:300]
+                )
+        if last_inject_exc is not None:
+            reason = f"{type(last_inject_exc).__name__}: {last_inject_exc}"[:300]
+            return ERR_CHALLENGE_LOAD, f"iframe inject failed: {reason}"
+
+        budget = min(_IFRAME_WAIT_S, max(2.0, request.solve_timeout_s / 4))
+        try:
+            await asyncio.wait_for(iframe_ready, timeout=budget)
+        except asyncio.TimeoutError:
+            # iframe 文档没等到：大概率 challengeUrl 不可达或被代理拦。
+            # 交给上层按诊断判断（若 captcha.js 都没出现，基本无解）。
+            logger.warning(f"px: iframe document not seen within {budget:.0f}s")
+        return "", ""
+
+    @staticmethod
+    def _pick_status(page_status: Dict[str, int]) -> Optional[int]:
+        """最后一条主帧状态：重定向链后这是最终文档（PX 拦截页落在最后）。"""
+        if not page_status:
+            return None
+        return page_status.get("last")
+
+    def _first_paint_kill(
+        self,
+        *,
+        started: float,
+        mode: str,
+        diag: _Diagnostics,
+        status: Optional[int],
+    ) -> Optional[PxPressResult]:
+        """首屏状态判死，press/silent 共用（与模式无关的页面层事实）。
+
+        返回 ``None`` 表示页面健康，继续求解；否则给出确定性失败结果：
+        403/429/404 是拦截/写错 URL（不重试），407 是代理要认证（不重试，
+        同 payload 重试永远不会好），>=500 是上游故障（可重试）。
+        """
+        if status in (403, 429, 404):
+            return self._fail(
+                started, mode, diag, ERR_CHALLENGE_HTTP,
+                f"host page status={status}", retryable=False,
+            )
+        if status == 407:
+            return self._fail(
+                started, mode, diag, ERR_PROXY_AUTH,
+                "proxy requires authentication (407)", retryable=False,
+            )
+        if status is not None and status >= 500:
+            return self._fail(
+                started, mode, diag, ERR_CHALLENGE_HTTP,
+                f"upstream responded {status}", retryable=True,
+            )
+        return None
+
+    async def _read_cookies(
+        self, context: Any, *, log_failure: bool = True
+    ) -> Optional[List[Dict[str, Any]]]:
+        """读整个 context cookie jar；失败/挂起时返回 None（context/browser 已死）。
+
+        必须包 wait_for：driver 半死（HTTP 连接断了但 TCP 还挂着）时
+        ``context.cookies()`` 的 await 永不返回——pxed 实测双并发任务在建完
+        context 后全体卡死，既没 pass 也没 fail，TaskRecord 悬挂成
+        active_tasks（D5）、chrome 不回收（D3）、客户端被拖到断连（D1）。
+        """
+        try:
+            return await _rpc(context.cookies(), timeout=_COOKIE_RPC_TIMEOUT_S)
+        except (Exception, asyncio.TimeoutError) as exc:
+            # 失败说明 context/browser 可能已死：返回 None 交给上层快速失败，
+            # 只在首次刷一条警告，避免每个 poll 周期都刷屏
+            if log_failure:
+                logger.warning(f"px: cookie read failed: {exc}")
+            return None
+
+    async def _seed_vid(self, request: PxPressRequest) -> Optional[str]:
+        """vid 缺失时自动补种子（需求单 v2 §3.2 策略二）。
+
+        用裸 silent 在 websiteURL 上跑一小段：PX main.min.js 会从
+        collector 领一个初始 vid 写进 jar（_pxvid）。种子只需要 vid 本身，
+        不需要通过级 px3——所以不复用 ``_solve_once``（它只把成功终态的
+        token 吐出来，press 才需要 :1000:），单独轮询 _pxvid 出现即回。
+
+        预算硬顶 25s；拿不到返回 None。
+        """
+        if not request.website_url:
+            return None
+        seeded = dataclasses.replace(
+            request, vid="", mode="silent", challenge_url="",
+            solve_timeout_s=25.0, poll_interval_s=max(0.5, request.poll_interval_s),
+        )
+        logger.info("px: vid missing, seeding via bare silent on {}", request.website_url)
+        # 种子限速：全局同时最多 1 个补种任务（种子是 best-effort 的旁路，
+        # 不该跟正式求解抢 context/内存，更不该多个种子并发叠加）。
+        seed_sem = self._seed_slots.ensure_semaphore()
+        if self._queue_timeout_s > 0:
+            try:
+                await asyncio.wait_for(
+                    seed_sem.acquire(), timeout=self._queue_timeout_s
+                )
+            except asyncio.TimeoutError:
+                logger.warning("px: vid seed queue full, giving up seeding")
+                return None
+        else:
+            await seed_sem.acquire()
+        self._seed_slots.acquire()
+        try:
+            vid = await self._harvest_vid(seeded)
+        finally:
+            self._seed_slots.release()
+            seed_sem.release()
+        if vid:
+            logger.info("px: vid seeded ok ({})", redact_token(vid))
+        else:
+            logger.warning("px: vid seed failed (no _pxvid within budget)")
+        return vid or None
+
+    async def _harvest_vid(self, request: PxPressRequest) -> str:
+        """裸 silent 跑一段，从 jar 里等 _pxvid 首次出现。只做种子，不求 token。"""
+        started = time.monotonic()
+        deadline = started + request.solve_timeout_s
+        browser = None
+        context = None
+        page = None
+        try:
+            browser = await self._browser()
+            context = await self._new_task_context(
+                request, None, browser, with_parent_probe=False
+            )
+            page = await context.new_page()
+            nav_kind, nav_reason = await self._goto(
+                page, request.website_url, self._nav_kwargs(request, _NAV_TIMEOUT_S)
+            )
+            if nav_kind:
+                logger.warning(f"px: vid seed navigate failed: {nav_reason}")
+                return ""
+            while time.monotonic() < deadline:
+                cookies = await self._read_cookies(context, log_failure=False)
+                if cookies is None:
+                    return ""
+                tokens = extract_px_tokens(cookies)
+                if tokens.get("pxvid"):
+                    return tokens["pxvid"]
+                await asyncio.sleep(request.poll_interval_s or self._poll_interval_s)
+            return ""
+        except _FarmDead as exc:
+            # 种子导航撞上 farm 死亡：重置农场（下个任务拿新进程），种子
+            # 本身按失败返回（vid 缺失时调用方走 challengeDetails.deviceId）
+            logger.warning(f"px: vid seed hit farm death, resetting: {exc.original}")
+            await self._reset_farm()
+            return ""
+        except Exception as exc:
+            logger.warning(f"px: vid seed error: {exc}")
+            return ""
+        finally:
+            # 收尾同样要限死：driver 半死时 close() 的 await 也可能永不返回
+            # （pxed 实测：卡死任务的 context 不回收 → D3 泄漏 6 个 chrome）。
+            if page is not None:
+                try:
+                    await _rpc(page.close(), timeout=_COOKIE_RPC_TIMEOUT_S)
+                except Exception:  # pragma: no cover
+                    pass
+            if context is not None:
+                try:
+                    await _rpc(context.close(), timeout=_COOKIE_RPC_TIMEOUT_S)
+                except Exception:  # pragma: no cover
+                    pass
+
+    def _fill_from_request(
+        self, tokens: Dict[str, str], request: PxPressRequest
+    ) -> Dict[str, str]:
+        out = dict(tokens)
+        if not out.get("pxvid") and request.vid:
+            # vid 就是调用方手里的 deviceId（= PX vid），缺失时补上合理
+            out["pxvid"] = request.vid
+        return out
+
+    @staticmethod
+    def _ms(started: float) -> int:
+        return int((time.monotonic() - started) * 1000)
+
+    # ----------------------------------------------------------- 选项构造
+    def _context_options(self, request: PxPressRequest) -> Dict[str, Any]:
+        options: Dict[str, Any] = {
+            "user_agent": request.user_agent,
+            "locale": request.locale or _FALLBACK_LOCALE,
+            "ignore_https_errors": True,
+            "viewport": {"width": 1280, "height": 800},
+            "color_scheme": "light",
+        }
+        if request.timezone:
+            options["timezone_id"] = request.timezone
+        if request.uses_proxy:
+            options["proxy"] = request.playwright_proxy()
+        return options
+
+    def _cookie_specs(self, request: PxPressRequest) -> List[Dict[str, Any]]:
+        specs: List[Dict[str, Any]] = []
+        site_url = self._site_url_for_cookies(request)
+        for name, value in request.cookies.items():
+            if not name or not value:
+                continue
+            base_name = str(name).lstrip("_").lower()
+            if base_name in ("px3", "pxde", "pxvid", "pxcts"):
+                # PX 同域读 cookie：同时放到站点域与 hsprotect 域
+                specs.append({"name": name, "value": value, "domain": ".hsprotect.net", "path": "/"})
+            if site_url:
+                spec: Dict[str, Any] = {"name": name, "value": value}
+                if site_url.startswith("http"):
+                    spec["url"] = site_url
+                specs.append(spec)
+        return specs
+
+    @staticmethod
+    def _site_url_for_cookies(request: PxPressRequest) -> str:
+        url = (request.website_url or "").strip()
+        if url.startswith("https://") or url.startswith("http://"):
+            return url
+        return "https://signup.live.com/"
+
+    @staticmethod
+    def _default_playwright_factory():
+        from playwright.async_api import async_playwright
+
+        async def _start():
+            return await async_playwright().start()
+
+        return _start

@@ -1,0 +1,88 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slidex"
+version = "0.12.1"
+description = "专业滑块验证码求解库 | Professional CAPTCHA Solver — Multi-provider auto-detection, CDP mode, point-select, hCaptcha, PX press-token service, plugin-extensible"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{name = "Slidex Authors"}]
+keywords = ["captcha", "slider", "point-select", "graph-chars", "hcaptcha", "perimeterx", "px", "press-token", "captcha-service", "ocr", "llm-vision", "nocaptcha", "playwright", "opencv", "automation"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+
+dependencies = [
+    "loguru>=0.7.0",
+    "opencv-python-headless>=4.8.0",
+    "numpy>=1.24.0",
+    "playwright>=1.45.0",
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+automation-kit = [
+    "automation-kit>=0.5.0,<0.7.0",
+]
+# 纯图片无块图缺口检测的可选深度学习后端（YOLO/ONNX，自带模型权重）。
+# 未安装时 SliderImageSolver 静默回退到零依赖的模板匹配 / 轮廓 / 列剖面策略。
+vision = [
+    "captcha-recognizer>=1.0.0,<2.0.0",
+    # 本地 OCR 降级后端（点选第一遍）。选 RapidOCR(onnxruntime) 而非
+    # PaddleOCR 是为了不把 paddlepaddle 拖进依赖树，保持核心轻依赖
+    # （loguru/opencv/numpy/playwright/psutil）；未安装时点选自动回落到
+    # 多模态通道，不报错。
+    "rapidocr-onnxruntime>=1.3.0,<2.0.0",
+]
+remote = [
+    "fastapi>=0.111.0,<2.0.0",
+    # fastapi 自身的范围允许 starlette 跨 major，而其 major 会改 TestClient / WS
+    # 行为（1.0 起 TestClient 改依赖 httpx2，曾让 CI 自 0.5.4 起全红），显式锁 major。
+    "starlette<2.0.0",
+    "uvicorn[standard]>=0.29.0,<1.0.0",
+    "pydantic>=2.7.0,<3.0.0",
+]
+# 自建打码站（slidex.service）：与 remote 同依赖，单独成 extra 便于只装服务端。
+# 启动：uvicorn slidex.service.app:app --host 0.0.0.0 --port 8000
+server = [
+    "fastapi>=0.111.0,<2.0.0",
+    "starlette<2.0.0",
+    "uvicorn[standard]>=0.29.0,<1.0.0",
+    "pydantic>=2.7.0,<3.0.0",
+]
+dev = [
+    "pytest>=8.0,<10.0",
+    "pytest-asyncio>=0.24,<2.0",
+    "pytest-timeout>=2.0,<3.0",
+    "pytest-mock>=3.12,<4.0",
+    # starlette>=1.0 的 TestClient 需要 httpx2（httpx 的继任包），仅测试用
+    "httpx2>=2.0.0,<3.0.0",
+]
+all = [
+    "slidex[automation-kit,remote,vision,server,dev]",
+]
+
+[tool.setuptools]
+# slidex/stealth.py（XianyuSliderStealth，闲鱼专用滑块链路）随 wheel 分发。
+# 曾经用 build_py 钩子排除它（理由"服务运行时不 import"），但 xianyu-auto-bot
+# 的 reply_server/xianyu_auth_recovery 运行时就是 `from slidex.stealth import
+# XianyuSliderStealth`——66153dc 时代 wheel 一直带着它。排除钩子在 0.9.5
+# 引入后若升级 pin，会令 xianyu 鉴权链路 ModuleNotFoundError 崩溃（其 fallback
+# 守卫只认整包缺失）。0.10.1 起移除钩子，恢复分发。
+
+[tool.setuptools.packages.find]
+include = ["slidex", "slidex.*", "demo*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+norecursedirs = ["manual"]
+addopts = "-v --tb=short"
