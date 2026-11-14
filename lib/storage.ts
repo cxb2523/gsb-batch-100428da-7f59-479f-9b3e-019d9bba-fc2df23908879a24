@@ -1,5 +1,5 @@
 const DB_NAME = "spider-archiver";
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const PAGES_STORE = "pages";
 const MAX_STORAGE_BYTES = 50 * 1024 * 1024; // 50MB
 
@@ -9,6 +9,11 @@ export interface StoredPage {
   error?: string;
   status?: number;
   domain: string;
+  /**
+   * The site URL the user entered that this page was attributed to during a
+   * multi-URL crawl. Pages from a v1 database may not have this field.
+   */
+  sourceUrl?: string;
   timestamp: number;
   contentSize: number;
 }
@@ -26,10 +31,17 @@ function openDB(): Promise<IDBDatabase> {
 
     request.onupgradeneeded = () => {
       const db = request.result;
+      let store: IDBObjectStore;
       if (!db.objectStoreNames.contains(PAGES_STORE)) {
-        const store = db.createObjectStore(PAGES_STORE, { keyPath: "url" });
+        store = db.createObjectStore(PAGES_STORE, { keyPath: "url" });
         store.createIndex("domain", "domain", { unique: false });
         store.createIndex("timestamp", "timestamp", { unique: false });
+      } else {
+        store = request.transaction?.objectStore(PAGES_STORE)!;
+      }
+      // v2: index for the user-entered source site of each page.
+      if (!store.indexNames.contains("sourceUrl")) {
+        store.createIndex("sourceUrl", "sourceUrl", { unique: false });
       }
     };
 
@@ -47,7 +59,13 @@ function getDomain(url: string): string {
 }
 
 export async function savePages(
-  pages: { url: string; content?: string; error?: string; status?: number }[]
+  pages: {
+    url: string;
+    content?: string;
+    error?: string;
+    status?: number;
+    sourceUrl?: string;
+  }[]
 ): Promise<void> {
   if (!pages?.length) return;
 
@@ -63,12 +81,15 @@ export async function savePages(
     for (const page of pages) {
       if (!page?.url) continue;
       const content = page.content || "";
+      // The store's keyPath is "url", so put() overwrites any existing
+      // record for the same page URL instead of stacking duplicates.
       store.put({
         url: page.url,
         content,
         error: page.error,
         status: page.status,
         domain: getDomain(page.url),
+        sourceUrl: page.sourceUrl || getDomain(page.url),
         timestamp: now,
         contentSize: new Blob([content]).size,
       } satisfies StoredPage);
@@ -96,6 +117,55 @@ export async function getPagesByDomain(domain: string): Promise<StoredPage[]> {
     request.onsuccess = () => {
       db.close();
       resolve(request.result);
+    };
+    request.onerror = () => {
+      db.close();
+      reject(request.error);
+    };
+  });
+}
+
+/**
+ * Return every page attributed to one of the URLs the user entered in a
+ * multi-URL crawl.
+ */
+export async function getPagesBySourceUrl(
+  sourceUrl: string
+): Promise<StoredPage[]> {
+  const db = await openDB();
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PAGES_STORE, "readonly");
+    const store = tx.objectStore(PAGES_STORE);
+    if (!store.indexNames.contains("sourceUrl")) {
+      db.close();
+      resolve([]);
+      return;
+    }
+    const request = store.index("sourceUrl").getAll(sourceUrl);
+
+    request.onsuccess = () => {
+      db.close();
+      resolve(request.result);
+    };
+    request.onerror = () => {
+      db.close();
+      reject(request.error);
+    };
+  });
+}
+
+/** Read every stored page. Mainly used by tests and maintenance code. */
+export async function getAllPages(): Promise<StoredPage[]> {
+  const db = await openDB();
+
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PAGES_STORE, "readonly");
+    const request = tx.objectStore(PAGES_STORE).getAll();
+
+    request.onsuccess = () => {
+      db.close();
+      resolve(request.result as StoredPage[]);
     };
     request.onerror = () => {
       db.close();

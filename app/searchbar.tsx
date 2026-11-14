@@ -1,7 +1,14 @@
 "use client";
 
-import React, { Dispatch, SyntheticEvent, useEffect, useRef, useState } from "react";
-import { VscLoading, VscSearch, VscSettings } from "react-icons/vsc";
+import React, { Dispatch, SyntheticEvent, useEffect, useState } from "react";
+import {
+  VscLoading,
+  VscSearch,
+  VscSettings,
+  VscCheck,
+  VscWarning,
+  VscError,
+} from "react-icons/vsc";
 import ms from "ms";
 
 import {
@@ -26,6 +33,12 @@ import {
 import AuthDropdown, { useAuthMenu } from "./auth";
 import AppSwitcher from "./app-switcher";
 import { savePages } from "@/lib/storage";
+import {
+  parseUrlList,
+  runCrawl,
+  type CrawlOutcome,
+  type CrawlPage,
+} from "@/lib/crawl";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "https://api.spider.cloud";
 
@@ -84,8 +97,15 @@ const SearchBar = ({
   const [request, setRequest] = useState<string>(loadDefaultRequest());
   const [fullResources, setFullResources] = useState<boolean>(loadDefaultFullResources());
 
-  const crawledPagesRef = useRef<any[]>([]);
-  const streamBufferRef = useRef<string>("");
+  /** Outcome of the latest crawl run, driving the status banner + retry. */
+  const [crawlStatus, setCrawlStatus] = useState<{
+    outcome: CrawlOutcome;
+    pageCount: number;
+    reason?: string;
+    durationMs?: number;
+    /** The normalized URLs of the latest run, used by Retry. */
+    urls: string[];
+  } | null>(null);
 
   const auth = useAuthMenu();
 
@@ -100,8 +120,7 @@ const SearchBar = ({
     setAPIKey(e.currentTarget.value);
   };
 
-  const onAPIEvent = async (e: SyntheticEvent<HTMLFormElement>) => {
-    e.preventDefault();
+  const startCrawl = async (inputUrls: string[]) => {
     const jwt = auth.$session?.access_token;
 
     if (!jwt) {
@@ -112,27 +131,15 @@ const SearchBar = ({
       });
     }
 
-    if (!url) {
+    if (!inputUrls.length) {
       return toast({
         title: "URL Required",
         description: "Please enter a valid website url.",
       });
     }
 
-    const urlList = url
-      ?.trim()
-      .split(",")
-      .map((item) =>
-        item.startsWith("http://") || item.startsWith("https://")
-          ? item.trim()
-          : `https://${item}`
-      )
-      .filter(Boolean);
-
-    const _url = urlList.join(",");
-
     const paramValues: Record<string, any> = {
-      url: _url,
+      url: inputUrls.join(","),
       limit: crawlLimit,
       return_format: returnFormat,
       request,
@@ -142,118 +149,110 @@ const SearchBar = ({
       paramValues.full_resources = true;
     }
 
+    // A new run (including a retry) always starts from an empty list so the
+    // previous run's pages never mix into these results.
+    setDataValues([]);
+    setCrawlStatus(null);
     setDataLoading(true);
-    crawledPagesRef.current = [];
-    streamBufferRef.current = "";
-
-    const current = performance.now();
-
-    let pages = 0;
-    let finished = false;
 
     toast({
       title: "Crawling",
-      description: `Crawling ${urlList.length} website${
-        urlList.length === 1 ? "" : "s"
-      } - ${urlList.join("\n")}.`,
+      description: `Crawling ${inputUrls.length} website${
+        inputUrls.length === 1 ? "" : "s"
+      } - ${inputUrls.join("\n")}.`,
     });
 
-    try {
-      const res = await fetch(API_URL + "/crawl", {
-        method: "POST",
-        body: JSON.stringify(paramValues),
-        headers: {
-          "content-type": "application/jsonl",
-          authorization: apiKey || jwt,
-        },
-      });
+    const result = await runCrawl({
+      apiUrl: API_URL,
+      body: paramValues,
+      headers: {
+        "content-type": "application/jsonl",
+        authorization: apiKey || jwt,
+      },
+      inputUrls,
+      onPage: (pages: CrawlPage[]) => setDataValues([...pages]),
+    });
 
-      if (res.ok) {
-        finished = true;
+    setDataLoading(false);
 
-        const reader = res.body?.getReader();
-        const decoder = new TextDecoder();
-
-        if (reader) {
-          while (true) {
-            const { done, value } = await reader.read();
-
-            if (done) {
-              // Process any remaining buffered data
-              if (streamBufferRef.current.trim()) {
-                if (processLine(streamBufferRef.current.trim())) {
-                  pages += 1;
-                }
-              }
-              streamBufferRef.current = "";
-              break;
-            }
-
-            const chunk = decoder.decode(value, { stream: true });
-
-            // Append to buffer and split by newlines to handle JSONL
-            streamBufferRef.current += chunk;
-            const lines = streamBufferRef.current.split("\n");
-
-            // Keep the last (potentially incomplete) line in the buffer
-            streamBufferRef.current = lines.pop() || "";
-
-            for (const line of lines) {
-              const trimmed = line.trim();
-              if (!trimmed) continue;
-              if (processLine(trimmed)) {
-                pages += 1;
-              }
-            }
-          }
-        }
-      }
-    } catch (e) {
-      if (e instanceof Error) {
-        console.error(e);
-      }
-    } finally {
-      setDataLoading(false);
-      streamBufferRef.current = "";
-      if (finished) {
+    // Received pages stay in the list and are persisted no matter how the
+    // stream ended — including interrupted runs.
+    setDataValues(result.pages);
+    if (result.pages.length) {
+      try {
+        await savePages(result.pages);
+        onSaveComplete?.();
+      } catch (err) {
         toast({
-          title: "Crawl finished",
-          description: `The time took was ${ms(performance.now() - current, {
-            long: true,
-          })} for ${pages} page${pages === 1 ? "" : "s"}.`,
+          title: "Save failed",
+          description:
+            err instanceof Error
+              ? `Pages kept in the list but could not be saved: ${err.message}`
+              : "Pages kept in the list but could not be saved to IndexedDB.",
+          variant: "destructive",
         });
-
-        // Persist crawled pages to IndexedDB
-        if (crawledPagesRef.current.length) {
-          savePages(crawledPagesRef.current)
-            .then(() => onSaveComplete?.())
-            .catch(console.error);
-        }
       }
-      crawledPagesRef.current = [];
+    }
+
+    const duration = ms(result.durationMs, { long: true });
+
+    if (result.outcome === "completed") {
+      setCrawlStatus({
+        outcome: "completed",
+        pageCount: result.receivedCount,
+        durationMs: result.durationMs,
+        urls: inputUrls,
+      });
+      toast({
+        title: "Crawl finished",
+        description: `The time took was ${duration} for ${result.receivedCount} page${
+          result.receivedCount === 1 ? "" : "s"
+        }.`,
+      });
+    } else if (result.outcome === "interrupted") {
+      // At least one page was received before the stream broke.
+      setCrawlStatus({
+        outcome: "interrupted",
+        pageCount: result.receivedCount,
+        reason: result.error,
+        durationMs: result.durationMs,
+        urls: inputUrls,
+      });
+      toast({
+        title: "Crawl interrupted",
+        description: `${result.receivedCount} page${
+          result.receivedCount === 1 ? "" : "s"
+        } saved before the stream stopped: ${result.error || "unknown error"}.`,
+        variant: "destructive",
+      });
+    } else {
+      // Not a single page made it through.
+      setCrawlStatus({
+        outcome: "failed",
+        pageCount: 0,
+        reason: result.error,
+        urls: inputUrls,
+      });
+      toast({
+        title: "Crawl failed",
+        description: `No pages received: ${result.error || "unknown error"}.`,
+        variant: "destructive",
+      });
     }
   };
 
-  const processLine = (line: string) => {
-    try {
-      const parsed = JSON.parse(line);
+  const onAPIEvent = async (e: SyntheticEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    await startCrawl(parseUrlList(url));
+  };
 
-      if (parsed) {
-        crawledPagesRef.current.push(parsed);
-      }
-
-      requestAnimationFrame(() => {
-        setDataValues((prevData: any) => {
-          if (prevData && Array.isArray(prevData)) {
-            return [...prevData, parsed];
-          }
-          return [parsed];
-        });
-      });
-
-      return true;
-    } catch (_error) {
-      return false;
+  const onRetryEvent = () => {
+    const urls = crawlStatus?.urls?.length
+      ? crawlStatus.urls
+      : parseUrlList(url);
+    if (urls.length) {
+      // Retry reuses the current configuration and API key as-is.
+      void startCrawl(urls);
     }
   };
 
@@ -336,6 +335,79 @@ const SearchBar = ({
           </div>
         </div>
       </nav>
+
+      {crawlStatus && (
+        <div
+          role="status"
+          className={`flex items-center gap-2 px-4 py-2 text-xs border-b ${
+            crawlStatus.outcome === "completed"
+              ? "bg-[#3bde77]/10 border-[#3bde77]/30 text-foreground"
+              : crawlStatus.outcome === "interrupted"
+              ? "bg-amber-500/10 border-amber-500/30 text-foreground"
+              : "bg-destructive/10 border-destructive/30 text-foreground"
+          }`}
+        >
+          {crawlStatus.outcome === "completed" ? (
+            <VscCheck className="w-4 h-4 text-[#3bde77] shrink-0" />
+          ) : crawlStatus.outcome === "interrupted" ? (
+            <VscWarning className="w-4 h-4 text-amber-500 shrink-0" />
+          ) : (
+            <VscError className="w-4 h-4 text-destructive shrink-0" />
+          )}
+          <div className="min-w-0 flex-1">
+            {crawlStatus.outcome === "completed" ? (
+              <span>
+                Crawl completed
+                {crawlStatus.durationMs !== undefined
+                  ? ` in ${ms(crawlStatus.durationMs, { long: true })}`
+                  : ""}{" "}
+                — {crawlStatus.pageCount} page
+                {crawlStatus.pageCount === 1 ? "" : "s"} received and saved.
+              </span>
+            ) : crawlStatus.outcome === "interrupted" ? (
+              <span>
+                Crawl interrupted — {crawlStatus.pageCount} page
+                {crawlStatus.pageCount === 1 ? "" : "s"} received and saved
+                before the stream stopped
+                {crawlStatus.reason ? `: ${crawlStatus.reason}` : "."}
+              </span>
+            ) : (
+              <span>
+                Crawl failed — no pages received
+                {crawlStatus.reason ? `: ${crawlStatus.reason}` : "."}
+              </span>
+            )}
+          </div>
+          {crawlStatus.outcome !== "completed" && (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              className="h-7 px-3 text-xs shrink-0"
+              disabled={dataLoading}
+              onClick={onRetryEvent}
+            >
+              {dataLoading ? (
+                <>
+                  <VscLoading className="motion-safe:animate-spin w-3 h-3 mr-1" />
+                  Retrying
+                </>
+              ) : (
+                "Retry"
+              )}
+            </Button>
+          )}
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="h-7 px-2 text-xs shrink-0"
+            onClick={() => setCrawlStatus(null)}
+          >
+            Dismiss
+          </Button>
+        </div>
+      )}
 
       {configModalOpen && (
         <Dialog

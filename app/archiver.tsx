@@ -96,7 +96,7 @@ export default function Archiver() {
                 const status = p.status || 200;
                 return (
                   <button
-                    key={i}
+                    key={p.url}
                     className={`w-full text-left px-3 py-2.5 border-b last:border-b-0 hover:bg-muted/30 transition-colors ${
                       selectedIdx === i
                         ? "bg-muted/50 border-l-2 border-l-[#3bde77]"
@@ -108,6 +108,11 @@ export default function Archiver() {
                     <p className="text-[10px] text-muted-foreground truncate font-mono mt-0.5">
                       {p.url}
                     </p>
+                    {p.sourceUrl ? (
+                      <p className="text-[9px] text-[#3bde77] truncate font-mono mt-0.5" title={`Source site: ${p.sourceUrl}`}>
+                        from {p.sourceUrl}
+                      </p>
+                    ) : null}
                     <div className="flex gap-2 mt-1">
                       <Badge
                         variant="outline"

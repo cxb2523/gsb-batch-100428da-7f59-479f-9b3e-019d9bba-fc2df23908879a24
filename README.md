@@ -11,7 +11,9 @@ Crawl and archive websites using [spider.cloud](https://spider.cloud). Browse cr
 ## Features
 
 - Stream-crawl websites via the Spider API and view results in real time
-- Page list sidebar with title, URL, size, and status badges
+- Multi-URL crawls attribute every page back to the site URL it came from, persisted to IndexedDB; a repeated page URL is overwritten with the newest content instead of duplicated
+- Interruption-aware streaming: pages already received stay in the list and are saved when `fetch` or the stream reader fails, with an on-screen interrupted/failed status and a Retry action that re-runs the same URLs using the current configuration
+- Page list sidebar with title, URL, source site, size, and status badges
 - Read-only Monaco editor with HTML syntax highlighting
 - Copy or download individual page source
 - Export All — download every crawled page as a single combined HTML file
@@ -47,6 +49,29 @@ bun dev
 ```
 
 Open [http://localhost:3001](http://localhost:3001) to see the result.
+
+## Testing
+
+The crawl engine (`lib/crawl.ts`) is fully decoupled from React and accepts
+an injected `fetch` implementation, so tests drive it with locally fabricated
+JSONL streams (normal lines, lines truncated across chunks, and streams that
+throw mid-read) instead of calling the real Spider API. The mock streams in
+`tests/helpers/mock-stream.ts` are test scaffolding only and are not part of
+the production request path.
+
+```bash
+npm test        # run the Vitest suite once
+npm run test:watch
+```
+
+Key coverage:
+
+- interrupted streams retain already-received pages and those pages are
+  persisted to IndexedDB (via `fake-indexeddb`), while a zero-page failure
+  persists nothing
+- pages from a multi-URL crawl are stamped with their source site and saved
+  with that attribution, retrievable through the `sourceUrl` index
+- duplicate page URLs overwrite the previous record rather than stacking
 
 ## Tech Stack
 
