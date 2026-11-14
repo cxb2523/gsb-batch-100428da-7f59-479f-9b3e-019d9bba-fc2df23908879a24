@@ -4,7 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Playwright imports
 from playwright.async_api import async_playwright, Browser
@@ -44,6 +44,10 @@ class RenderResponse(BaseModel):
     html: str
     status_code: int
     title: str
+    # Metadata describing the response the browser actually received, so
+    # callers don't have to reuse headers from an earlier plain HTTP fetch.
+    content_type: str = ""
+    headers: dict[str, str] = Field(default_factory=dict)
 
 
 @app.get("/health")
@@ -70,14 +74,25 @@ async def render_page(req: RenderRequest):
         html = await page.content()
         title = await page.title()
 
+        headers = await response.all_headers()
         return RenderResponse(
             url=req.url,
             html=html,
             status_code=response.status,
             title=title,
+            content_type=headers.get("content-type", ""),
+            headers=headers,
         )
+    except HTTPException:
+        # Status codes chosen above (502/503) already classify the failure for
+        # the crawler; don't rewrite them as generic 500s.
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Render failed: {str(e)}")
+        timeout = "TimeoutError" in type(e).__name__ or "timeout" in str(e).lower()
+        raise HTTPException(
+            status_code=504 if timeout else 500,
+            detail=f"Render failed: {str(e)}",
+        )
     finally:
         await page.close()
 

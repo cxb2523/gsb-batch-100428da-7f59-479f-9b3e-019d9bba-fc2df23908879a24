@@ -16,7 +16,7 @@ jobs:
           go-version: "1.22"
       - name: Run Go tests (unit only, no Redis)
         working-directory: crawler
-        run: go test ./internal/frontier/ ./internal/robots/ ./internal/fetcher/ -v
+        run: go test ./internal/frontier/ ./internal/robots/ ./internal/fetcher/ ./internal/renderer/ ./cmd/... -v
 
   python-intelligence-tests:
     runs-on: ubuntu-latest

@@ -64,11 +64,12 @@ func main() {
 	fetch := fetcher.NewWithOptions(cfg.UserAgent, cfg.RequestTimeout, cfg.StealthMode, cfg.ProxyURL)
 	pub := publisher.New(rdb, cfg.StreamName)
 	robo := robots.NewChecker(cfg.UserAgent)
+	renderFallback := newRenderFallback(ctx, cfg)
 
 	if *listen {
-		runServerMode(ctx, cfg, rdb, f, fetch, pub, robo)
+		runServerMode(ctx, cfg, rdb, f, fetch, pub, robo, renderFallback)
 	} else {
-		runCLIMode(ctx, cfg, *seedURLs, f, fetch, pub, robo)
+		runCLIMode(ctx, cfg, *seedURLs, f, fetch, pub, robo, renderFallback)
 	}
 }
 
@@ -81,6 +82,7 @@ func runCLIMode(
 	fetch *fetcher.Fetcher,
 	pub *publisher.Publisher,
 	robo *robots.Checker,
+	renderFallback func(context.Context, *models.CrawlResult, string),
 ) {
 	for raw := range strings.SplitSeq(seedURLs, ",") {
 		raw = strings.TrimSpace(raw)
@@ -92,7 +94,7 @@ func runCLIMode(
 	log.Printf("phantombot starting: %d seed URLs, concurrency=%d, max_depth=%d",
 		f.Len(), cfg.Concurrency, cfg.MaxDepth)
 
-	runWorkers(ctx, cfg, f, fetch, pub, robo)
+	runWorkers(ctx, cfg, f, fetch, pub, robo, renderFallback)
 	log.Println("crawl complete")
 }
 
@@ -105,6 +107,7 @@ func runServerMode(
 	fetch *fetcher.Fetcher,
 	pub *publisher.Publisher,
 	robo *robots.Checker,
+	renderFallback func(context.Context, *models.CrawlResult, string),
 ) {
 	log.Printf("phantombot listening on stream %s (concurrency=%d, max_depth=%d)",
 		cfg.CrawlRequestStream, cfg.Concurrency, cfg.MaxDepth)
@@ -120,7 +123,7 @@ func runServerMode(
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			workerLoop(ctx, workerID, cfg, f, fetch, pub, robo)
+			workerLoop(ctx, workerID, cfg, f, fetch, pub, robo, renderFallback)
 		}(i)
 	}
 
@@ -163,13 +166,14 @@ func runWorkers(
 	fetch *fetcher.Fetcher,
 	pub *publisher.Publisher,
 	robo *robots.Checker,
+	renderFallback func(context.Context, *models.CrawlResult, string),
 ) {
 	var wg sync.WaitGroup
 	for i := 0; i < cfg.Concurrency; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			workerLoop(ctx, workerID, cfg, f, fetch, pub, robo)
+			workerLoop(ctx, workerID, cfg, f, fetch, pub, robo, renderFallback)
 		}(i)
 	}
 	wg.Wait()
@@ -178,6 +182,8 @@ func runWorkers(
 // workerLoop is the shared fetch-publish loop used by both modes.
 // Smart fallback: tries HTTP first, falls back to Playwright renderer if the
 // response is blocked (403/401), has sparse content, or the URL looks JS-heavy.
+// The render outcome is always recorded on the published result; a failed
+// render keeps the first fetch's HTML and status code.
 func workerLoop(
 	ctx context.Context,
 	workerID int,
@@ -186,14 +192,8 @@ func workerLoop(
 	fetch *fetcher.Fetcher,
 	pub *publisher.Publisher,
 	robo *robots.Checker,
+	fallback func(context.Context, *models.CrawlResult, string),
 ) {
-	// Create renderer client (may not be available)
-	render := renderer.NewClient(cfg.RendererURL, cfg.RendererTimeout)
-	rendererAvailable := render.IsAvailable(ctx)
-	if rendererAvailable {
-		log.Printf("[worker %d] Playwright renderer available at %s", workerID, cfg.RendererURL)
-	}
-
 	for {
 		if ctx.Err() != nil {
 			return
@@ -214,24 +214,10 @@ func workerLoop(
 		}
 
 		log.Printf("[worker %d] fetching: %s (depth=%d)", workerID, rawURL, depth)
-		result, err := fetch.Fetch(rawURL, depth, "")
+		result, err := fetchAndRender(ctx, fetch, fallback, rawURL, depth)
 		if err != nil {
 			log.Printf("[worker %d] fetch error for %s: %v", workerID, rawURL, err)
 			continue
-		}
-
-		// Smart fallback: retry with Playwright if HTTP result is poor
-		if rendererAvailable && needsRendering(result, rawURL) {
-			log.Printf("[worker %d] sparse/blocked content, retrying with Playwright: %s", workerID, rawURL)
-			rendered, renderErr := render.Render(ctx, rawURL)
-			if renderErr == nil {
-				result.HTML = rendered.HTML
-				result.StatusCode = rendered.StatusCode
-				result.Rendered = true
-				log.Printf("[worker %d] Playwright rendered: %s (status=%d)", workerID, rawURL, rendered.StatusCode)
-			} else {
-				log.Printf("[worker %d] Playwright render failed for %s: %v", workerID, rawURL, renderErr)
-			}
 		}
 
 		if err := pub.Publish(ctx, result); err != nil {
@@ -239,7 +225,8 @@ func workerLoop(
 			continue
 		}
 
-		log.Printf("[worker %d] published: %s (status=%d, rendered=%v)", workerID, rawURL, result.StatusCode, result.Rendered)
+		log.Printf("[worker %d] published: %s (status=%d, rendered=%v, render_status=%s)",
+			workerID, rawURL, result.StatusCode, result.Rendered, result.RenderStatus)
 
 		// Extract links and add to frontier if within depth limit
 		if depth < cfg.MaxDepth {
@@ -251,21 +238,59 @@ func workerLoop(
 	}
 }
 
-// needsRendering decides if a fetch result should be retried with Playwright.
-func needsRendering(result *models.CrawlResult, rawURL string) bool {
-	// Blocked by anti-bot
-	if result.StatusCode == 403 || result.StatusCode == 401 {
-		return true
+// fetchAndRender performs the initial HTTP fetch and, when the result looks
+// blocked or sparse, applies the render fallback. The fallback records the
+// render outcome and never overwrites the first fetch's HTML/status on failure.
+func fetchAndRender(
+	ctx context.Context,
+	fetch *fetcher.Fetcher,
+	fallback func(context.Context, *models.CrawlResult, string),
+	rawURL string,
+	depth int,
+) (*models.CrawlResult, error) {
+	result, err := fetch.Fetch(rawURL, depth, "")
+	if err != nil {
+		return nil, err
 	}
-	// Very little content (likely JS-rendered page)
-	if result.StatusCode == 200 && len(result.HTML) < 1000 {
-		return true
+	if fallback != nil {
+		fallback(ctx, result, rawURL)
 	}
-	// URL heuristics suggest SPA
-	if renderer.NeedsRendering(rawURL) {
-		return true
+	return result, nil
+}
+
+// newRenderFallback builds the render fallback shared by all workers, or nil
+// when no renderer URL is configured (the plain HTTP path is then unchanged:
+// no render is attempted and no render markers are published). The renderer
+// availability is probed once here (and again only after an outage cooldown)
+// rather than per page.
+func newRenderFallback(ctx context.Context, cfg config.Config) func(context.Context, *models.CrawlResult, string) {
+	if cfg.RendererURL == "" {
+		log.Printf("no Playwright renderer configured; pages are published from the plain HTTP fetch")
+		return nil
 	}
-	return false
+
+	client := renderer.NewClient(cfg.RendererURL, cfg.RendererTimeout)
+	fb := renderer.NewFallback(client, cfg.RendererCooldown)
+
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout(cfg.RendererTimeout))
+	defer cancel()
+	if fb.ProbeAvailability(probeCtx) {
+		log.Printf("Playwright renderer available at %s", cfg.RendererURL)
+	} else {
+		log.Printf("Playwright renderer unavailable at %s; pages will be published from the plain HTTP fetch", cfg.RendererURL)
+	}
+
+	return fb.Apply
+}
+
+// probeTimeout bounds the start-up health check so an unreachable renderer
+// cannot delay crawling for longer than its own request timeout.
+func probeTimeout(rendererTimeout time.Duration) time.Duration {
+	const maxProbe = 5 * time.Second
+	if rendererTimeout <= 0 || rendererTimeout > maxProbe {
+		return maxProbe
+	}
+	return rendererTimeout
 }
 
 // extractLinks does basic <a href="..."> extraction.

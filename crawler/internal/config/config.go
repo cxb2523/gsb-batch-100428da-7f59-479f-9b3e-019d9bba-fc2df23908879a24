@@ -19,6 +19,7 @@ type Config struct {
 	ProxyURL           string
 	RendererURL        string
 	RendererTimeout    time.Duration
+	RendererCooldown   time.Duration
 }
 
 func Load() Config {
@@ -35,6 +36,7 @@ func Load() Config {
 		ProxyURL:           getEnv("CRAWLER_PROXY_URL", ""),
 		RendererURL:        getEnv("PLAYWRIGHT_URL", "http://localhost:3100"),
 		RendererTimeout:    time.Duration(getEnvInt("RENDER_TIMEOUT_MS", 15000)) * time.Millisecond,
+		RendererCooldown:   time.Duration(getEnvInt("RENDER_UNAVAILABLE_COOLDOWN_SECONDS", 60)) * time.Second,
 	}
 }
 
