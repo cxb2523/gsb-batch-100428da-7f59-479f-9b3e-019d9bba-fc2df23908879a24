@@ -1,0 +1,57 @@
+{
+  "persona": {
+    "name": "大肥鱼",
+    "ownerTitle": "主人",
+    "text": "性格：好奇、嘴硬心软，遇到喜欢的东西会兴奋，困了会变懒。\n喜欢：白饭、魔方、刷到有意思的视频、被主人摸头。\n不喜欢：被敷衍、复读、写小作文。\n说话：短句为主，偶尔吐槽，不装可爱。"
+  },
+  "owner": {
+    "nickname": "漱月鸣筝"
+  },
+  "preferences": {
+    "like": ["宠物", "AI", "日常"],
+    "dislike": []
+  },
+  "watch": {
+    "enabled": true,
+    "intervalMinutes": 30,
+    "dailyMax": 12,
+    "windows": [{ "start": "09:00", "end": "23:00" }]
+  },
+  "share": {
+    "enabled": true,
+    "dailyMax": 10
+  },
+  "meme": {
+    "enabled": true,
+    "probability": 0.3,
+    "maxPerDay": 6
+  },
+  "proactiveShare": {
+    "enabled": true,
+    "probability": 0.08,
+    "maxPerDay": 3,
+    "minIntervalMinutes": 120
+  },
+  "mood": {
+    "enabled": true,
+    "sleepWindows": [{ "start": "23:30", "end": "07:30" }]
+  },
+  "pet": {
+    "enabled": true,
+    "sleepEnabled": true,
+    "minIntervalMinutes": 15
+  },
+  "memory": {
+    "consolidate": {
+      "enabled": true,
+      "minMessages": 10,
+      "minIntervalHours": 6
+    },
+    "reflect": {
+      "enabled": true,
+      "minEpisodes": 5,
+      "minIntervalDays": 7,
+      "minIntervalHours": 6
+    }
+  }
+}
