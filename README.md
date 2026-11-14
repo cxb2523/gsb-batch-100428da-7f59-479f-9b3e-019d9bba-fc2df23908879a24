@@ -189,6 +189,8 @@ The `crawl_site` tool can kick off headless crawls via CLI. This is useful for q
 - Uses default crawl settings (no custom extraction, JavaScript rendering config, etc.)
 - You can pass a `.seospiderconfig` file to customize settings (including crawl URL limits), but the GUI is easier for complex setups
 - The crawl must finish and save before you can export data
+- Up to two crawls run at once. The limit counts crawls whose process is actually running: finished crawls are cleaned up before a new one is admitted, and a rejection reports the active count against the limit
+- A crawl still running after 2 hours is terminated. `crawl_status` then reports what it found in the logs (FATAL errors, save failures) and where the partial data landed: the database (`list_crawls` for the DB ID) or, in memory storage mode, the `.seospider` file path
 
 ### Export options
 

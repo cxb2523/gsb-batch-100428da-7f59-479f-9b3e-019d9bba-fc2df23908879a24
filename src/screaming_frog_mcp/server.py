@@ -61,6 +61,9 @@ REGEX_MATCH_TIMEOUT_SECONDS = 1.0
 FILTER_TIME_BUDGET_SECONDS = 20.0
 FILTER_BUDGET_CHECK_EVERY = 256  # rows between budget checks
 MAX_CRAWL_DURATION = 7200  # 2 hours
+# Grace period between terminate() and kill(), and the wait after kill().
+CRAWL_TERMINATE_GRACE_SECONDS = 10
+CRAWL_KILL_WAIT_SECONDS = 10
 EXPORT_TIMEOUT_SECONDS = int(os.getenv("SF_EXPORT_TIMEOUT_SECONDS", "300"))  # default 5 min
 
 # Optional domain allowlist for crawl targets (env var, comma-separated)
@@ -268,8 +271,15 @@ def _crawl_completion_guidance(
     save_failed: bool,
     fatal_error: Optional[str],
     memory_save: Optional[Path],
+    stopped_early: bool = False,
+    save_confirmed: bool = True,
 ) -> str:
-    """The closing paragraph of a completed crawl_status report."""
+    """The closing paragraph of a completed crawl_status report.
+
+    `stopped_early` marks a crawl stopped at the duration limit: the data
+    is partial, and in database mode it is only claimed as saved when
+    `save_confirmed` (the log's database shutdown line) proves it.
+    """
     if save_failed:
         return (
             "\n\nWARNING: Crawl save failed. The crawl data may not be "
@@ -282,6 +292,19 @@ def _crawl_completion_guidance(
             "Check the error above and try again."
         )
     if memory_save:
+        if stopped_early:
+            return (
+                f"\n\nThe crawl was stopped by the duration limit, so the data "
+                f"is partial. Screaming Frog is in memory storage mode, so "
+                f"what was crawled was written to a file instead of the "
+                f"internal database:\n"
+                f"  {memory_save}\n"
+                f"list_crawls and export_crawl read the internal database and "
+                f"will not see it. For the full workflow, switch SF to "
+                f"database storage mode ('File > Settings > Storage Mode' in "
+                f"the GUI; the default on current installs). The file stays on "
+                f"disk until you delete it and can be opened in the SF GUI."
+            )
         return (
             f"\n\nScreaming Frog is in memory storage mode, so this crawl was "
             f"written to a file instead of the internal database:\n"
@@ -292,6 +315,15 @@ def _crawl_completion_guidance(
             f"on current installs). The file stays on disk until you delete "
             f"it and can be opened in the SF GUI."
         )
+    if stopped_early and not save_confirmed:
+        return (
+            "\n\nThe crawl was stopped by the duration limit, so the data is "
+            "partial. The logs contain no database shutdown line, so it is "
+            "unclear whether it was saved.\n"
+            "Use list_crawls() to check for a saved crawl and get the DB ID.\n"
+            "If none appears, the partial data was not written to SF's "
+            "internal database."
+        )
     return (
         "\n\nThe crawl is saved in SF's internal database.\n"
         "Use list_crawls() to see all saved crawls and get the DB ID.\n"
@@ -299,11 +331,233 @@ def _crawl_completion_guidance(
     )
 
 
+def _non_destructive_poll(obj) -> Optional[int]:
+    """Popen-style `poll()` that never reaps a process asyncio owns.
+
+    On POSIX `Popen.poll()` calls `waitpid()`. If asyncio's child watcher
+    has not reaped the child yet, that call steals the exit status and the
+    watcher then reports returncode 255 -- turning a clean exit into a
+    fake failure. So a real Popen is only polled on Windows, where poll()
+    is a non-consuming handle wait and asyncio itself uses it.
+    """
+    poll = getattr(obj, "poll", None)
+    if not callable(poll):
+        return None
+    if isinstance(obj, subprocess.Popen) and os.name != "nt":
+        return None
+    try:
+        return poll()
+    except Exception:
+        return None
+
+
+def _proc_exit_code(proc) -> Optional[int]:
+    """Return the process's exit code if it has already exited, else None.
+
+    `asyncio.subprocess.Process.returncode` is only populated once the event
+    loop has dispatched the child's exit notification, so a process that has
+    just exited can still report None. Probe the transport and, where that is
+    safe, the underlying Popen as well.
+    """
+    if proc is None:
+        return None
+    code = getattr(proc, "returncode", None)
+    if code is not None:
+        return code
+
+    transport = getattr(proc, "_transport", None)
+    if transport is not None:
+        getter = getattr(transport, "get_returncode", None)
+        if callable(getter):
+            try:
+                code = getter()
+            except Exception:
+                code = None
+            if code is not None:
+                return code
+
+    # Non-asyncio process stand-ins expose Popen-style poll() themselves.
+    if not isinstance(proc, asyncio.subprocess.Process):
+        code = _non_destructive_poll(proc)
+        if code is not None:
+            return code
+
+    underlying = getattr(transport, "_proc", None) if transport is not None else None
+    if underlying is not None and underlying is not proc:
+        code = _non_destructive_poll(underlying)
+        if code is not None:
+            return code
+    return None
+
+
+def _pid_has_exited(pid) -> bool:
+    """Best-effort, non-destructive check that `pid` has already exited.
+
+    `os.waitid(..., WNOWAIT)` reports a child's exit state without reaping
+    it, so it cannot steal the exit status from asyncio's child watcher.
+    A zombie that asyncio has not reaped yet still counts as exited here,
+    which is exactly the case that must not hold a concurrency slot.
+    Returns False when the platform cannot answer.
+    """
+    if not pid or not hasattr(os, "waitid"):
+        return False  # Windows and non-POSIX: rely on returncode/poll only
+    try:
+        info = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+    except ChildProcessError:
+        return True  # already reaped -- definitely gone
+    except OSError:
+        return False  # not our child / cannot inspect -- assume still running
+    return info is not None
+
+
+def _crawl_is_active(info: dict) -> bool:
+    """True only while the crawl's process is actually running.
+
+    `returncode is None` alone is not proof of liveness: an entry whose
+    process has exited but has not been cleaned up yet must not keep
+    occupying a concurrency slot. A crawl we asked to terminate stays
+    active until its process really exits (terminate may need a kill).
+    """
+    proc = info.get("proc")
+    if proc is None:
+        return False
+    if _proc_exit_code(proc) is not None:
+        return False
+    return not _pid_has_exited(getattr(proc, "pid", None))
+
+
+async def _wait_for_exit(proc, timeout: float, interval: float = 0.05) -> bool:
+    """Wait up to `timeout` seconds for the process to exit.
+
+    Returns True if the process exited. Yielding to the event loop between
+    checks lets asyncio deliver its child-exit notification (the only way
+    `returncode` becomes visible on POSIX without stealing the wait status).
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        if _proc_exit_code(proc) is not None:
+            return True
+        if _pid_has_exited(getattr(proc, "pid", None)):
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(interval, remaining))
+
+
+async def _settle_exit_code(proc, timeout: float = 0.5) -> Optional[int]:
+    """Return the exit code, briefly yielding so asyncio can deliver it.
+
+    A process can be observably gone (see `_pid_has_exited`) a moment before
+    the event loop dispatches its exit notification. Without this short
+    wait the completion report would show "failed (exit code None)" for a
+    crawl that in fact exited cleanly.
+    """
+    code = _proc_exit_code(proc)
+    if code is not None:
+        return code
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+        code = _proc_exit_code(proc)
+        if code is not None:
+            return code
+    return _proc_exit_code(proc)
+
+
+async def _refresh_exited_crawls(timeout: float = 0.1) -> None:
+    """Give asyncio a moment to deliver pending child-exit notifications.
+
+    On POSIX, `returncode` stays None until the child watcher's waitpid
+    thread reports back to the event loop. Without this nudge a process
+    that exited a moment ago can still look alive when the concurrency
+    gate is evaluated. Requests run concurrently, so the total delay is
+    bounded by a single `timeout`; the wait only observes and never reaps
+    a process asyncio owns.
+    """
+    pending = [
+        info["proc"] for info in list(_running_crawls.values())
+        if info.get("proc") is not None and _crawl_is_active(info)
+    ]
+    if not pending:
+        return
+    await asyncio.gather(
+        *(_wait_for_exit(proc, timeout=timeout) for proc in pending),
+        return_exceptions=True,
+    )
+
+
+async def _terminate_crawl(info: dict) -> bool:
+    """Stop a crawl that exceeded MAX_CRAWL_DURATION and reap its process.
+
+    Returns True when a termination was issued. If the process exited on
+    its own just before the deadline it is left to the normal completion
+    path instead. On a first attempt the process gets a grace period to
+    shut down cleanly before it is killed; repeat calls skip the grace and
+    go straight to kill. `terminated` is recorded so a later crawl_status
+    reports the stop instead of treating it as an unexpected exit, and no
+    .seospider file is ever deleted here.
+    """
+    proc = info["proc"]
+    if _proc_exit_code(proc) is not None:
+        return False  # finished on its own -- report it as a normal exit
+    first_attempt = not info.get("terminated")
+    info["terminated"] = True
+    info["termination_reason"] = f"exceeded {MAX_CRAWL_DURATION // 3600}h limit"
+
+    if first_attempt:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        if await _wait_for_exit(proc, timeout=CRAWL_TERMINATE_GRACE_SECONDS):
+            return True
+
+    try:
+        proc.kill()
+    except Exception:
+        pass
+    await _wait_for_exit(proc, timeout=CRAWL_KILL_WAIT_SECONDS)
+    return True
+
+
+def _parse_crawl_logs(log_output: str) -> dict:
+    """Extract outcome details from SF CLI output."""
+    urls_crawled = "unknown"
+    save_failed = False
+    db_shutdown_seen = False
+    fatal_error = None
+    for line in log_output.splitlines():
+        # SF logs: "Completed the spider of ... crawled N urls"
+        if "crawled" in line.lower() and "urls" in line.lower():
+            match = re.search(r"crawled\s+(\d+)\s+urls", line, re.IGNORECASE)
+            urls_crawled = match.group(1) if match else line.strip()
+        if "crawl save failed" in line.lower():
+            save_failed = True
+        if "shutdown database" in line.lower() and "projectinstancedata" in line.lower():
+            db_shutdown_seen = True
+        if "FATAL" in line and fatal_error is None:
+            fatal_error = line.strip()
+
+    # SF 23.2 logs "Crawl save failed {}" even when the crawl is saved
+    # successfully. Detect this false positive by checking for the database
+    # shutdown line that proves the data was written to disk.
+    if save_failed and db_shutdown_seen:
+        save_failed = False
+
+    return {
+        "urls_crawled": urls_crawled,
+        "save_failed": save_failed,
+        "db_shutdown_seen": db_shutdown_seen,
+        "fatal_error": fatal_error,
+    }
+
+
 def _cleanup_completed_crawls():
     """Remove completed crawl entries from memory and clean up log files."""
     completed = [
         cid for cid, info in _running_crawls.items()
-        if info["proc"].returncode is not None
+        if not _crawl_is_active(info)
     ]
     for cid in completed:
         info = _running_crawls[cid]
@@ -453,12 +707,19 @@ async def crawl_site(
     if _sf_gui_is_running():
         return SF_GUI_WARNING
 
-    # Enforce concurrent crawl limit
+    # Enforce concurrent crawl limit. Clean up first so entries whose process
+    # already exited (but were not reaped yet) free their slot before the
+    # liveness count below decides whether a new crawl may start.
+    await _refresh_exited_crawls()
     _cleanup_completed_crawls()
-    active = sum(1 for info in _running_crawls.values()
-                 if info["proc"].returncode is None)
-    if active >= MAX_CONCURRENT_CRAWLS:
-        return f"ERROR: Maximum {MAX_CONCURRENT_CRAWLS} concurrent crawls. Wait for running crawls to finish."
+    active_crawls = [cid for cid, info in _running_crawls.items()
+                     if _crawl_is_active(info)]
+    if len(active_crawls) >= MAX_CONCURRENT_CRAWLS:
+        return (
+            f"ERROR: Maximum {MAX_CONCURRENT_CRAWLS} concurrent crawls reached "
+            f"(active: {len(active_crawls)}, limit: {MAX_CONCURRENT_CRAWLS}). "
+            f"Wait for a running crawl to finish, then retry."
+        )
 
     crawl_id = f"crawl-{uuid.uuid4().hex[:8]}"
 
@@ -504,7 +765,8 @@ async def crawl_site(
         except asyncio.TimeoutError:
             pass  # still running -- that's the normal case
 
-        if proc.returncode is not None:
+        early_exit_code = _proc_exit_code(proc)
+        if early_exit_code is not None:
             # Process already exited -- check for FATAL
             stdout_log.close()
             stderr_log.close()
@@ -527,7 +789,7 @@ async def crawl_site(
             if fatal_line:
                 return f"ERROR: Crawl failed to start.\n{fatal_line}"
             return (
-                f"ERROR: Crawl exited immediately (exit code {proc.returncode}). "
+                f"ERROR: Crawl exited immediately (exit code {early_exit_code}). "
                 f"Check SF installation and license."
             )
 
@@ -554,6 +816,58 @@ async def crawl_site(
         return f"ERROR: Failed to start crawl: {type(exc).__name__}: {exc}"
 
 
+def _build_crawl_report(
+    crawl_id: str,
+    info: dict,
+    elapsed_str: str,
+    status: str,
+    exit_code: Optional[int],
+    log_output: str,
+    parsed: Optional[dict] = None,
+    stopped_early: bool = False,
+) -> str:
+    """Format the final report for a finished (or forcibly stopped) crawl.
+
+    Shared by the normal-completion and timeout-termination paths so both
+    reach the same conclusion about saved data, FATAL errors, and where the
+    data can be retrieved from.
+    """
+    if parsed is None:
+        parsed = _parse_crawl_logs(log_output)
+    urls_crawled = parsed["urls_crawled"]
+    save_failed = parsed["save_failed"]
+    fatal_error = parsed["fatal_error"]
+
+    result = (
+        f"Crawl {crawl_id} {status}.\n"
+        f"URL: {info['url']}\n"
+        f"Label: {info['label']}\n"
+        f"Elapsed: {elapsed_str}\n"
+        f"URLs crawled: {urls_crawled}\n"
+    )
+
+    if fatal_error:
+        result += f"\nFATAL: {fatal_error}\n"
+
+    if exit_code != 0 or fatal_error:
+        # Show last 20 lines of filtered output for debugging
+        filtered = _sanitize_sf_output(log_output)
+        tail = "\n".join(filtered.strip().splitlines()[-20:])
+        if tail:
+            result += f"\nLast output:\n{tail}"
+
+    memory_save = _find_memory_mode_save(info.get("output_dir"))
+    result += _crawl_completion_guidance(
+        save_failed,
+        fatal_error,
+        memory_save,
+        stopped_early=stopped_early,
+        save_confirmed=bool(parsed.get("db_shutdown_seen")),
+    )
+
+    return result
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def crawl_status(crawl_id: str) -> str:
     """
@@ -571,29 +885,39 @@ async def crawl_status(crawl_id: str) -> str:
     elapsed = time.time() - info["started"]
     elapsed_str = f"{int(elapsed // 60)}m {int(elapsed % 60)}s"
 
-    if proc.returncode is None:
-        # Still running - check without blocking
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=0.1)
-        except asyncio.TimeoutError:
-            pass
+    if _crawl_is_active(info) and not info.get("terminated"):
+        # Still running - check without blocking. If it exited on its own
+        # during this call, fall through to the normal completion report.
+        await _wait_for_exit(proc, timeout=0.1)
 
-    # Enforce max crawl duration
-    if proc.returncode is None and elapsed > MAX_CRAWL_DURATION:
-        proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=10)
-        except asyncio.TimeoutError:
-            proc.kill()
-        _close_crawl_logs(info)
-        return (
-            f"Crawl {crawl_id} terminated (exceeded {MAX_CRAWL_DURATION // 3600}h limit).\n"
-            f"URL: {info['url']}\n"
-            f"Elapsed: {elapsed_str}\n"
-            f"The partial crawl may be saved. Use list_crawls() to check."
-        )
+    # Enforce max crawl duration. Once a crawl has been stopped (here or in
+    # an earlier poll), retries escalate straight to kill if it somehow
+    # survived. The report then reuses the normal completion checks so the
+    # caller can tell whether partial data landed anywhere.
+    if _crawl_is_active(info) and (
+        info.get("terminated") or elapsed > MAX_CRAWL_DURATION
+    ):
+        if await _terminate_crawl(info):
+            _close_crawl_logs(info)
+            report = _build_crawl_report(
+                crawl_id,
+                info,
+                elapsed_str,
+                status=f"terminated ({info['termination_reason']})",
+                exit_code=await _settle_exit_code(proc),
+                log_output=_read_crawl_logs(info),
+                stopped_early=True,
+            )
+            if _crawl_is_active(info):
+                report = (
+                    f"WARNING: Crawl {crawl_id} did not exit after "
+                    f"terminate/kill. The process may still be running.\n"
+                    + report
+                )
+            return report
+        # It exited on its own just before the deadline: report it normally.
 
-    if proc.returncode is None:
+    if _crawl_is_active(info):
         return (
             f"Crawl {crawl_id} is still running.\n"
             f"URL: {info['url']}\n"
@@ -602,62 +926,35 @@ async def crawl_status(crawl_id: str) -> str:
             f"Use crawl_status(crawl_id='{crawl_id}') to check again."
         )
 
-    # Process completed -- read logs from files
+    # Process completed (or was terminated earlier) -- read logs from files
     _close_crawl_logs(info)
     log_output = _read_crawl_logs(info)
+    parsed = _parse_crawl_logs(log_output)
+    exit_code = await _settle_exit_code(proc)
 
-    # Extract useful info from logs
-    urls_crawled = "unknown"
-    save_failed = False
-    db_shutdown_seen = False
-    fatal_error = None
-    for line in log_output.splitlines():
-        # SF logs: "Completed the spider of ... crawled N urls"
-        if "crawled" in line.lower() and "urls" in line.lower():
-            match = re.search(r"crawled\s+(\d+)\s+urls", line, re.IGNORECASE)
-            urls_crawled = match.group(1) if match else line.strip()
-        if "crawl save failed" in line.lower():
-            save_failed = True
-        if "shutdown database" in line.lower() and "projectinstancedata" in line.lower():
-            db_shutdown_seen = True
-        if "FATAL" in line and fatal_error is None:
-            fatal_error = line.strip()
-
-    # SF 23.2 logs "Crawl save failed {}" even when the crawl is saved
-    # successfully. Detect this false positive by checking for the database
-    # shutdown line that proves the data was written to disk.
-    if save_failed and db_shutdown_seen:
-        save_failed = False
-
-    # Determine actual status -- SF can exit 0 even on FATAL errors
-    if fatal_error and proc.returncode == 0:
+    if info.get("terminated"):
+        status = f"terminated ({info.get('termination_reason', 'stopped')})"
+    # SF can exit 0 even on FATAL errors
+    elif parsed["fatal_error"] and exit_code == 0:
         status = "failed"
-    elif proc.returncode == 0:
+    elif exit_code == 0:
         status = "completed"
+    elif exit_code is None:
+        # Exited, but the exit status was never delivered to the event loop.
+        status = "finished (exit code unavailable)"
     else:
-        status = f"failed (exit code {proc.returncode})"
+        status = f"failed (exit code {exit_code})"
 
-    result = (
-        f"Crawl {crawl_id} {status}.\n"
-        f"URL: {info['url']}\n"
-        f"Label: {info['label']}\n"
-        f"Elapsed: {elapsed_str}\n"
-        f"URLs crawled: {urls_crawled}\n"
+    return _build_crawl_report(
+        crawl_id,
+        info,
+        elapsed_str,
+        status,
+        exit_code,
+        log_output,
+        parsed,
+        stopped_early=bool(info.get("terminated")),
     )
-
-    if fatal_error:
-        result += f"\nFATAL: {fatal_error}\n"
-
-    if proc.returncode != 0 or fatal_error:
-        # Show last 20 lines of filtered output for debugging
-        filtered = _sanitize_sf_output(log_output)
-        tail = "\n".join(filtered.strip().splitlines()[-20:])
-        result += f"\nLast output:\n{tail}"
-
-    memory_save = _find_memory_mode_save(info.get("output_dir"))
-    result += _crawl_completion_guidance(save_failed, fatal_error, memory_save)
-
-    return result
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))

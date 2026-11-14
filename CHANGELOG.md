@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- **Concurrency slots are now decided by whether the crawl process is actually running, not by `returncode is None`.** A crawl whose process had exited but was not cleaned up yet kept occupying one of the two slots, so `crawl_site` reported the limit even though nothing was crawling. Stale entries are now cleaned up (log handles closed, empty output folder removed, memory-mode `.seospider` files kept) before the gate admits a new crawl. The rejection message now reports the active count and the limit so callers know how close to the cap they are and when to retry.
+- **The 2-hour timeout report now says where the partial data went.** After terminating a crawl, `crawl_status` reuses the same completion checks as a normal exit: it reads the logs for FATAL errors and save failures, and looks for a memory-mode `.seospider` file in the crawl's output folder. A database-mode crawl is reported with the `list_crawls`/`export_crawl` guidance — but only when the log contains the database shutdown line that proves the save; otherwise the report says the save is unconfirmed. A memory-mode crawl reports the file path and that the database tools cannot see it. A terminated crawl keeps reporting that outcome on later polls instead of reverting to "still running", and its log handles are closed. No `.seospider` file is ever deleted.
+
 ## 0.4.4 (2026-11-14)
 
 ### Security
