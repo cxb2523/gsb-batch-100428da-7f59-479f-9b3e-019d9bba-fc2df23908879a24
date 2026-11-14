@@ -1,0 +1,34 @@
+**/proxies/
+**/__pycache__
+**/logs/
+
+**/.DS_Store
+
+# Python缓存
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# VSCode
+.vscode/
+
+# OS
+Thumbs.db
+
+# 项目运行/缓存/日志
+.runtime/
+logs/
+proxies/raw_nodes.*
+proxies/proxy_test_results.json
+proxies/clash_profile.yaml
+
+# 内核二进制
+bin/mihomo/
+
+# 敏感配置
+src/fetch_proxies.py  # 建议只提交模板，不提交真实订阅
+.env
+
+# 其他
+*.log
