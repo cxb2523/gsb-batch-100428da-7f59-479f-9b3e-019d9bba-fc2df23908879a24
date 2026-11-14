@@ -1,0 +1,135 @@
+<!-- Actor Edit Modal - Shared between index.html and actors.html -->
+<div id="actorEditModal" class="modal">
+  <div class="modal-content" style="max-width: 700px;">
+    <div class="modal-header">
+      <h2 id="actorEditModalTitle" data-i18n="actorModal.title">Edit Actor</h2>
+      <button class="close-btn" id="actorEditModalClose">&times;</button>
+    </div>
+
+    <!-- Main Content Grid: Form on left, Preview on right -->
+    <div style="display: grid; grid-template-columns: 1fr 180px; gap: 20px; margin-bottom: 15px;">
+      <!-- Left column: Form fields -->
+      <div>
+        <!-- Name (full width) -->
+        <div class="form-group">
+          <label class="form-label" data-i18n="actorModal.name">Name</label>
+          <input type="text" id="actorEditName" class="form-input"
+            data-i18n="[placeholder]placeholders.actorNamePlaceholder">
+        </div>
+
+        <!-- Alternate Name / aliases (full width) -->
+        <div class="form-group">
+          <label class="form-label" data-i18n="actorModal.altName">Alternate Names / Aliases</label>
+          <input type="text" id="actorEditAltName" class="form-input"
+            data-i18n="[placeholder]placeholders.altNamePlaceholder">
+          <div class="info-text" data-i18n="actorModal.altNameHelp">
+            Comma-separated. Japanese name, former stage names, anything a scraper found — remove one here if it's causing a false duplicate-name warning with another actor.
+          </div>
+        </div>
+
+        <!-- Role (full width) -->
+        <div class="form-group">
+          <label class="form-label" data-i18n="actorModal.role">Role</label>
+          <input type="text" id="actorEditRole" class="form-input" data-i18n="[placeholder]placeholders.role"
+            value="Actress">
+        </div>
+
+        <!-- Thumb URL (full width) -->
+        <div class="form-group">
+          <label class="form-label" data-i18n="actorModal.thumbUrl">Thumb URL</label>
+          <input type="url" id="actorEditThumb" class="form-input" placeholder="https://...">
+        </div>
+
+        <!-- Upload Image -->
+        <div class="form-group">
+          <label class="form-label" data-i18n="actorModal.uploadImage">Or Upload Image</label>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <input type="file" id="actorEditUpload" accept="image/*" style="flex: 1;">
+            <button type="button" id="actorEditUploadBtn" class="btn btn-secondary"
+              style="padding: 8px 16px; white-space: nowrap;">
+              <span>📤</span>
+              <span data-i18n="buttons.upload">Upload</span>
+            </button>
+          </div>
+          <div id="actorEditUploadStatus" style="margin-top: 4px; font-size: 12px; display: none;"></div>
+        </div>
+
+        <!-- Two columns: Birthdate, Height -->
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+          <div class="form-group">
+            <label class="form-label" data-i18n="fields.birthdate">Birthdate</label>
+            <input type="text" id="actorEditBirthdate" class="form-input" pattern="\d{4}(-\d{2}-\d{2})?"
+              data-i18n="[placeholder]placeholders.birthdatePlaceholder">
+          </div>
+          <div class="form-group">
+            <label class="form-label" data-i18n="fields.height">Height (cm)</label>
+            <input type="number" id="actorEditHeight" class="form-input" min="0">
+          </div>
+        </div>
+
+        <!-- Three columns: Bust, Waist, Hips -->
+        <div class="form-grid">
+          <div class="form-group">
+            <label class="form-label" data-i18n="fields.bust">Bust (cm)</label>
+            <input type="number" id="actorEditBust" class="form-input" min="0">
+          </div>
+          <div class="form-group">
+            <label class="form-label" data-i18n="fields.waist">Waist (cm)</label>
+            <input type="number" id="actorEditWaist" class="form-input" min="0">
+          </div>
+          <div class="form-group">
+            <label class="form-label" data-i18n="fields.hips">Hips (cm)</label>
+            <input type="number" id="actorEditHips" class="form-input" min="0">
+          </div>
+        </div>
+      </div>
+
+      <!-- Right column: Preview thumbnail -->
+      <div class="preview-container">
+        <label class="form-label" data-i18n="actorModal.preview">Preview</label>
+        <div class="preview-box">
+          <img id="actorEditPreviewImg" src="" alt="Preview" style="display: none;">
+          <span id="actorEditPreviewPlaceholder" class="preview-placeholder">👤</span>
+        </div>
+        <button type="button" id="actorEditDeletePhoto" class="btn btn-sm btn-danger"
+          style="margin-top: 5px; width: 100%; display: none;">
+          <span data-i18n="buttons.deleteLocalPhoto">Delete Local Photo</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- Data source info (read-only) -->
+    <div id="actorEditSourceInfo" class="source-info" style="display: none;">
+      <strong data-i18n="messages.dataSource">Data source:</strong> <span id="actorEditSource"></span>
+    </div>
+
+    <!-- Movies this actor appears in (read-only, loaded async) -->
+    <div id="actorEditMoviesInfo" class="source-info" style="display: none;">
+      <a href="#" id="actorEditMoviesLink" class="movies-link"><span class="movies-icon">🎬</span><span id="actorEditMoviesCount"></span></a>
+    </div>
+
+    <!-- Search Actor Button -->
+    <div class="form-group">
+      <button type="button" id="actorEditSearch" class="btn btn-success" style="width: 100%;">
+        <span>🔍</span>
+        <span id="actorEditSearchText" data-i18n="actorModal.searchActor">Search Actor</span>
+      </button>
+      <div style="margin-top: 10px; display: flex; align-items: center; gap: 8px;">
+        <input type="checkbox" id="actorEditOverwriteLocal" style="width: auto; cursor: pointer;">
+        <label for="actorEditOverwriteLocal" style="margin: 0; cursor: pointer; font-size: 13px;" data-i18n="actorModal.overwriteLocalData">
+          Overwrite local data (including photo)
+        </label>
+      </div>
+      <div id="actorEditSearchStatus"
+        style="margin-top: 8px; font-size: 12px; color: #666; text-align: center; display: none;"></div>
+    </div>
+
+    <!-- Footer buttons -->
+    <div class="modal-footer">
+      <button type="button" class="btn btn-secondary" id="actorEditCancel" data-i18n="buttons.cancel">Cancel</button>
+      <button type="button" class="btn btn-danger" id="actorEditRemove" style="display: none;"
+        data-i18n="buttons.remove">Remove</button>
+      <button type="button" class="btn btn-primary" id="actorEditSave" data-i18n="buttons.save">Save</button>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,666 @@
+# Release Notes
+
+## v2.7.0 (2026-11-14)
+
+### ✨ New Features
+
+- New movie scraper: **avwiki**
+- The date a movie was added (`<dateadded>`) is stored in the NFO on the first scrape, kept on rescrape, and shown in the movie form
+
+### 🐛 Fixes
+
+- JavLibrary / JavLibrary-FS: no more Cloudflare 1015 rate limit after ~10 movies. Every page load now waits at least 3s (plus a small random delay) after the previous one, including between the English and Japanese pages of the same movie. On a 1015 the page is retried once after 10s; if it fails again the batch stops. JavLibrary-FS now detects the 1015 page too instead of marking every remaining movie as "not found"
+- Movie ID detection from file names: names like `Crpd-299_restored`, `Sma751_restored` or `TUE-053-720p` are recognised correctly
+
+## v2.6.5 (2026-10-31)
+
+### ⚡ Improvements
+
+- Search no longer freezes the app on a cold disk: the search index is built in the background and cached on disk (`data/search-index-cache.json`), so after a restart search is ready almost immediately. Search boxes show the indexing progress until it is ready
+
+### 🐛 Fixes
+
+- macOS: the video player can be a `.app` bundle (e.g. `VLC.app`) and can live outside `/Applications` (e.g. on `/Volumes/...`). The file picker path is now editable and `.app` folders have a "Use this app" button (#11)
+- A video player that fails to start returns an error instead of crashing the server
+
+## v2.6.4 (2026-10-26)
+
+### 🐛 Fixes
+
+- Actor photos: a scraper could overwrite another actress's photo (when an alias matched her id) or leave a second photo for the same actress. Scraped photos are now staged and only the chosen one is kept as `{id}.{ext}`; leftovers are cleaned up
+- An alias removed by hand from an actor ("not the same person") is remembered and never added back by later scrapes
+- JavLibrary: when the site rate-limits (Cloudflare 1015) the batch stops instead of marking every remaining movie as "not found"; longer pause between movies (4s) to avoid it
+- R18.dev: longer pause between movies (3s)
+- Adding or removing a library folder keeps the item being shown, unless it was in the removed folder
+
+## v2.6.3 (2026-10-24)
+
+### ⚡ Improvements
+
+- Actors from several scrapers are merged more reliably: the same actress under different spellings (e.g. `Ohara Tomomi` / `Yumi Ohara` / `大原友美`, `Kudou Rara` / `Lala Kudo`) is recognised through the central actor database and common romanization variants
+- Actor scrapers are no longer asked again and again for the same missing fields (birthdate, measurements...): each scraper is retried for an actor only after a set number of days, 30 by default, set in the Config page ("Missing-field retry"). Editing an actor by hand resets it
+
+### 🐛 Fixes
+
+- Re-scraping a movie no longer piles up duplicate actors: the new cast replaces the old one, and an old actor is kept only if the actor database knows it
+- xslist: "Age N" is no longer saved as an actor name or alias (it made unrelated actresses of the same age look like the same person); existing ones are cleaned up automatically
+
+## v2.6.2 (2026-10-24)
+
+### ⚡ Improvements
+
+- JavLibrary / JavLibrary-FS: each actor now also gets the Japanese name (and Japanese aliases) as alt names, read from the Japanese version of the movie page. This helps match the same actress across scrapers and sites. Each movie now loads two JavLibrary pages instead of one
+
+### 🐛 Fixes
+
+- R18.dev: no more empty results when the site is slow (longer timeouts, one retry); movies not on R18.dev are skipped right away instead of waiting for a timeout
+
+## v2.6.1 (2026-10-23)
+
+### 🐛 Fixes
+
+- JavLibrary and R18.dev scrapers returned no data: both sites now keep a network connection open, so every page load timed out even after Cloudflare was passed. Pages are now read as soon as they are usable
+- Movie actor modal: shows the full actor data from the central actor database
+
+## v2.6.0 (2026-10-10)
+
+### 🎭 New actor scraper: Jav Guru
+
+- New `javguru` actor scraper for [jav.guru](https://jav.guru), which knows many actresses the other scrapers can't find: name, aliases (Japanese name included), height and photo
+- jav.guru only publishes the age, so the birth year alone is stored (e.g. `2003`, may be off by one); a full birthdate from any other scraper always replaces it, whatever the scraper order
+- New installs have it enabled, last in the actor scrapers list. Existing installs: add `javguru` to the actor scrapers in the Config page (e.g. `local, javdb, xcity, javguru`)
+- The birthdate field in the actor editor now accepts either `YYYY-MM-DD` or just the year `YYYY`
+
+### 🎬 Actors summed across scrapers
+
+- When several video scrapers are used, the cast is now the union of all of them instead of only the primary scraper's: one site often lists actresses another one misses. Entries that are the same actress under different spellings or alt names are merged into one
+- Re-scraping a movie (scrape or edit mode) keeps the actors already in the movie that the new scrape didn't find
+- The favorite star of an actor is lit right after scraping, without reloading the movie
+
+### ⚡ Improvements
+
+- JavLibrary: after solving the Cloudflare challenge in the browser window, scraping continues by itself as soon as the JavLibrary page is visible, no need to click Continue
+- Actors page: actors are rendered in batches while scrolling, so "All" mode no longer freezes the page with large libraries
+
+## v2.5.2 (2026-10-04)
+
+### 🎞️ Movie ID anywhere in the filename
+
+- Scrape mode now recognizes the movie ID even when it isn't at the start of the video filename, like the original Javinizer: `[site] ABP-420 1080p.mkv`, `site.com@ABP-420.mp4`, `[site] abp420.mp4` → `ABP-420`
+- Filenames that already start with the ID work exactly as before, so any ID format is still supported there (`IBW-1010Z`, `T28-587`, `010214-514`...)
+- Files with no recognizable ID are skipped and logged
+- README: new "From Unsorted Files to an Organized Library" section describing the whole workflow, from a folder of loose files to one folder per movie
+
+### 🐛 Fixes
+
+- Windows: the automatic Node.js download introduced in v2.5.1 failed with an HTTP 400 error on Windows PowerShell 5.1 (the one preinstalled on Windows)
+- Linux/macOS: `start.sh` also works when launched as `sh start.sh`, downloads Node.js inside `data/runtime` instead of `/tmp`, reports a clear error when the downloaded Node.js can't run on an old system (glibc < 2.28), and cleans up interrupted downloads
+
+## v2.5.1 (2026-10-03)
+
+### 🟢 Automatic Node.js setup
+
+- `start.bat` and `start.sh` no longer require Node.js to be installed: if it's missing or older than the minimum version, the first start downloads the latest Node.js LTS from nodejs.org (checksum verified) into `data/runtime/node` — a private copy used only by Javinizer-js, no admin rights or `sudo` needed, kept across in-app updates
+- The minimum Node.js version lives in one place, `engines.node` in `package.json` (currently 22.13.0, required by `node:sqlite`): when a release raises it, the private copy is downloaded again automatically
+- The server checks it at startup too, with a clear message instead of a crash on a too old Node.js
+- Windows: x64 and ARM64; Linux and macOS: x64 and ARM64; Alpine Linux (musl): x64 only, see the README
+- `start.sh` no longer installs Node.js with the system package manager (often too old a version), works on macOS, and no longer opens the browser twice when the server is already running
+
+### 🐛 Fixes
+
+- "Copy actors to movie folder" removes orphan files from the movie's `actors` folder (actors no longer in the cast, renamed, other tools' files), while keeping the existing copy of a current actor whose new copy failed
+- Actor/movie links created by the actor copy and by scrape-mode saves used the folder name instead of the folder path introduced in v2.5.0, leaving actor movie counts wrong until the next restart
+
+## v2.5.0 (2026-10-03)
+
+### 📁 Multiple library folders
+
+- The library can now span several folders (e.g. one per genre), like Jellyfin or Kodi: add or remove them from the Library Folders list on the main page — their contents form a single library
+- The same movie can live in more than one folder: every copy is shown, and grid cards and search results carry a badge with the name of the folder it comes from
+- Scrape mode reads the videos to scrape from every library folder, and each movie is saved in the folder its video came from
+- Existing configs are migrated automatically (`libraryPath` → `libraryPaths`), and the library cache is reused, so the first start after the update doesn't rescan everything
+
+### 🔎 Boolean search
+
+- Search (navbar, grid, Next/Previous filter) supports `AND`, `OR`, `NOT` / `!`, parentheses and quoted terms — e.g. `solowork AND !planning`, `(solowork OR vr) AND !planning`, `"big tits" AND "yua mikami"`
+- Operators are uppercase; a query without operators works exactly as before
+- Edited genres, titles and actors are searchable right after saving, without a restart
+
+### 🎭 Actors and scrapers
+
+- javlibrary: keeps a browser open between scrapes and asks for the Cloudflare check only when actually blocked; cast aliases are parsed
+- A warning is shown when a scraper returns no data for a code
+- Actor movie counts are rebuilt in the background on every start
+- Placeholder photos are never stored, so online scrapers keep looking for a real one
+- "Name (Alias)" cast names are split into name and aliases; existing alt names are no longer wiped by movie saves
+
+### 🐛 Fixes
+
+- Re-scraping a movie already in the library no longer moves the old video into a folder nested inside the existing one
+- Deleting a library item never overwrites a video with the same name in the library folder
+- Actor updates in Edit mode reload the current movie correctly
+
+## v2.4.3 (2026-09-12)
+
+### 🔀 Re-scrape with all configured scrapers
+
+- The "Re-scrape" dropdown (Edit and Scrape mode) has a new "All Configured Scrapers" option that runs every scraper listed in `scrapers.video`, in priority order, and merges the results with the same field-priority logic as a normal multi-scraper scrape — previously a re-scrape could only use one named scraper at a time
+- The saved data's source list now records every scraper that actually contributed to the merge, not just the one selected
+
+### ⭐ Star rating in Edit mode
+
+- A 5-star control now sits under the Play/Open Folder buttons in Edit mode, mapped to the Kodi NFO's 0-10 rating scale in half-star steps, with a hover preview and click-to-set — kept in sync with the existing numeric Rating field
+- Uses the standard `<rating>` NFO tag, so it sorts correctly in both Kodi and Jellyfin with no schema change needed
+
+### 🏷️ Actor display name normalization
+
+- An actor's name and alt names are now title-cased before being written into a movie's own NFO (on actor save, scrape save, edit-rescrape save, actors/rescan, actors/save) — the actor cache already did this on its own saves, so a movie's NFO could drift out of step with the cache's casing
+- Actor thumbnails now prefer the already-resolved actor id over re-normalizing the display name, closing a gap where an inverted-order id (e.g. `ogasawara-ai` for "Ai Ogasawara") could hide an existing photo
+
+## v2.4.2 (2026-09-05)
+
+### 🔍 Actor search no longer overwrites the Name field
+
+- A plain online-scraper search result can no longer silently replace what's typed in Name — a different found name is filed into Alternate Names instead. A pure local-cache hit or an explicit "Overwrite local data" search may still update Name, since those are a confirmed identity, not a fresh guess
+- "Overwrite local data" (forceOverwrite) no longer re-derives identity from a name-based local lookup that could be fooled by data already mis-recorded elsewhere (e.g. one actor's name wrongly saved as another's alt) — it uses the id the actor card was already opened with, if any, instead of silently redirecting onto whatever existing record that name happens to match
+- Alt-name dedup (both client and server) now also catches word-order-inverted duplicates of the primary name ("Family Given" vs "Given Family"), not just case/whitespace ones
+
+### 🛡️ Movie-context saves protect the actor's real identity
+
+- Saving an actor from inside a movie's own cast list can no longer demote their established primary name just because that movie's own NFO happens to display an alt spelling — applies across every save/scrape-save path, skipped only with "Overwrite local data" explicitly checked
+- `mergeActors()` now reconciles the actual photo file on disk, not just the database pointer: deletes an orphaned stray photo if the surviving actor already had one of their own, or renames it to match if not — closes a gap (including from the automatic merge added in v2.4.1) that could leave a wrongly-named, unreferenced image file behind
+
+### 🚫 "Unknown" is never a real actor
+
+- A cast entry named "Unknown", "N/A", or blank is never searched or saved to the actor cache, and is now actively dropped from a movie's own cast list on every save, on scrape-save, and on "Rescan Actors" — previously just skipped, not removed
+
+## v2.4.1 (2026-08-23)
+
+### 🎬 "N movies" — a real filter, everywhere
+
+- The actor detail modal, the actor card, and every actor name on a Grid View movie card now show/link "N movies" — built from a proper `actor_movies` index instead of the old opportunistic, always-wrong-count one
+- `actor_movies` is now rebuilt from scratch whenever the library path changes (the only event that already invalidates the library cache — no extra button needed) and kept in sync on every movie save
+- Clicking "N movies" sets a real filter: constrains Next/Previous in Edit mode, persists across Grid View ↔ Edit mode navigation, and shows a badge (now on Grid View too) naming the actor and count — the URL carries just the actor id, not the whole movie list, and the lookup goes over POST, so a prolific actor's filmography can't hit a URL-length wall
+- Fixed a Grid View race where the infinite-scroll observer could fire before the page decided browse vs. filtered, leaving unrelated alphabetical movies appended after an actor's filtered results
+
+### 🐛 More actor duplicate fixes
+
+- `setPrimaryName()` now merges automatically when the name being set already belongs to a different actor (primary or alt) — closes a gap where two records, each already trusting its own id, could never be reconciled by name lookups alone once neither side's save path re-derived its id from scratch
+- `POST /api/actors/save` (manual actor save) now resolves through the same name/alt-name lookup as `/item/save` before minting a new id — it was creating a duplicate for any actor whose id hadn't been resolved client-side yet (e.g. one an online scrape had just created moments earlier in the same movie-save flow)
+
+### 🎨 Fixes
+
+- The movies-link icon is a plain emoji now instead of Font Awesome, which the actor modal's host page (index.html) doesn't load — it was silently invisible there
+
+## v2.4.0 (2026-08-22)
+
+### 🖼️ Actor photo replacement
+
+- Replacing an actor's photo with a different file format (e.g. `.gif` → `.webp`) could leave the old file behind in a movie's own `actors/` folder — different pages could then each pick a different leftover file, showing inconsistent photos between the actor card, the movie page, and the Actors list
+- `copyActorsToFolder` now cleans up every stale extension in every code path, not just the first one; if duplicates still exist from before, the movie page now picks the most recently written file instead of a non-deterministic filesystem order
+
+### 🔄 Rescan Actors
+
+- New "Rescan Actors" button in Edit mode, next to Add Actor — re-syncs every actor of the current movie against the local-cache-vs-online rules below, without having to remove and re-add them one by one
+- A local actor record now needs a name **and** an image to be trusted as-is; a bare name-only reference (e.g. one saved by "Copy actors in movie folder") no longer blocks online scrapers from filling it in
+
+### 🔀 Merge-duplicates panel: inspect before deciding
+
+- Each candidate in the duplicate-actor merge panel (`actors.html`) now has a "View details" button that opens the normal actor detail modal, so you can check full info before picking which one to keep
+- The panel refreshes itself if you edit a candidate from that detail view
+
+### 🏷️ Primary name leaking into Alt Names
+
+- Two scrapers disagreeing on which field holds a name (or differing only in case/spacing) could leave the primary name duplicated inside its own Alt Names — deduped at the merge, cache-fold, database, and actor-form layers, and self-heals the next time an already-affected actor is touched (opened, searched, or rescanned)
+
+### 🎭 Movie-context actor edits sync immediately
+
+- Saving an actor from inside a movie's own actor card now syncs to the central actor cache right away, instead of only on the next full movie save — a rename or alt-name edit no longer sits unsynced (and invisible to search/other movies) if the movie itself was never separately saved afterward
+
+## v2.3.0 (2026-08-21)
+
+### 🔄 In-app update system
+
+- New "Update available" badge in the navbar: the server checks GitHub Releases once per startup, and a click downloads the new release, swaps application files, reinstalls dependencies, runs any pending SQLite migrations, and restarts automatically
+- User data is never touched by an update: `config.json`, `data/`, `.env`, `scrapers-dev/`, `.claude/`, and `node_modules` are always preserved
+- Current version now shown on the About page
+
+### 🐛 Actor photo bugs
+
+- Searching for an actor could leave the wrong photo in place after a homonym mismatch even though the search itself found the right actor — the found photo now always replaces whatever was already in the field, same as name/alt name already did
+- Fixed the "Copy favorite actors to" mirror only syncing a new photo when none already existed there, and never removing a same-actor photo left over under a different extension — either could make the mirror keep showing a stale photo indefinitely, even after uploading a fresh one
+- "Delete local photo" now actually clears the photo everywhere (NFO, index, and favorite mirror) instead of only deleting the cached file and leaving stale references behind
+
+### 🧭 Simpler actor matching
+
+- An actor already known locally is now used as-is — online scrapers are no longer consulted to fill in missing fields (birthdate/measurements are often genuinely unavailable), removing a source of homonym mix-ups where looking up an "incomplete" local actor online could pull in the wrong identity/photo
+- Same behavior for interactive actor search and for automatic actor scraping during movie save
+- "Overwrite local data" remains the only way to force a fresh online lookup
+
+## v2.2.0 (2026-08-21)
+
+### ⭐ Real actor favorites
+
+- Actors now have an actual `favorite` flag (persisted in the NFO and in the SQLite actor index), replacing the old "add to library" concept
+- Star toggle on every actor card, both on the movie edit/scrape page (replaces the old "+" button) and on `actors.html`
+- New All/Favorites filter on `actors.html`
+- A scraper can never clear this flag: `actorDb.upsertActor()` deliberately never touches the `favorite` column
+
+### 🔀 Duplicate actor merge
+
+- `actors.html` now surfaces the same duplicate-name check already logged at startup (`[actorDb] N name(s) shared by multiple actor records`) as a review banner
+- Review modal shows each candidate pair side by side (photo, name, movie count) — pick which one to keep, the other is merged into it and removed
+- Same engine as `node bin/merge-actors.js` (`actorDb.findDuplicateNames()` / `mergeActors()`), now with a `findDuplicateGroups()` helper reused by both
+- Not every match is really the same person: the review banner also offers "Not the same person — remove from: X / Y" per shared name, dropping just that alias from one record instead of merging (`POST /actors/remove-name`)
+
+### 👤 Single "Alt Names" field
+
+- Merged `altName` and `otherNames` into one field — an actor's names are now just **Primary** + **Alt Names** (comma-separated), both in the NFO (`<altname>`, no more `<othername>`) and in the SQLite index (`actor_names.kind` is now only `primary`/`alt`)
+- `otherNames` had no field of its own in the actor edit form, so aliases scrapers found (often the exact string causing a false duplicate-name warning) were invisible and impossible to remove — they're now all in the same visible, editable Alt Names field
+- Fixed a real bug in the process: saving an actor from `actors.html` could never actually remove an alt name once added — the index only ever appended, never replaced
+- All existing actors (NFOs + SQLite index) were migrated automatically; scrapers that still separate out aliases internally (`xcity`, `xslist-fs`) are unaffected — their output is folded into Alt Names at save time
+
+### 📁 `data/actors` is now the single actor library
+
+- `GET /actors` (the `actors.html` grid) and every scraper — `local` included — now read only from the internal cache (`data/actors`); confirmed via audit that `local` never actually depended on the external path to begin with
+- "External Actors Path" is renamed **"Copy favorite actors to"**: it's no longer a library location, only an optional mirror (NFO + photo) for actors marked favorite — written when favorited, kept in sync on edit, removed when unfavorited
+- Existing external-path actors were migrated to favorites automatically when this shipped, including a few that only existed there and not yet in `data/actors`
+
+### 🏷️ Configurable title pattern + badge visibility
+
+- New "Title Field Pattern" setting (Config → General), alongside the existing folder pattern — same placeholders (`{id}`, `{contentid}`, `{title}`, `{alternatetitle}`, `{label}`, `{maker}`, `{year}`), applied after merge so it's independent of which scraper provided the title
+- New checkboxes to individually show/hide the Uncensored / Decensored / Leaked cover badges
+
+### 📄 Paginated Grid View
+
+- `grid.js` no longer loads the whole library up front: `GET /item/library-list` now serves it in pages (60 items at a time, `offset`/`limit`), fetching more as you scroll
+- New `GET /item/library-search` endpoint runs search server-side against the lightweight search index instead of scanning everything client-side
+- Fixes Grid View getting stuck on "Loading" for minutes on a cold cache with a large library — the previous `loadAll()`-based endpoint blocked the single Node thread until the entire library was scanned
+- Along the way, fixed N+1 SQLite lookup patterns in actor-alias resolution (`resolveActorSearchNames`) and local actor matching (`findActorByName`), both now memoized per request
+
+### 🔎 Search filter persists across navigation
+
+- An active search/filter query now survives moving between Grid View and Edit mode (`sessionStorage`), instead of resetting on every navigation
+- Removed the redundant search box the navbar showed on top of Grid View's own — Grid View already has one right above the grid
+
+### ⭐ Actors page opens on Favorites
+
+- The Actors page now defaults to the Favorites filter instead of All, matching how the page is used day to day
+
+### 🏗️ Fresh-install defaults
+
+- A new install (no existing `config.json`) now comes pre-configured with sensible defaults: `{id} - ({year})` folder pattern, `{title}` title pattern, cover badges off, `javlibrary`/`r18dev` video scrapers, and `local`/`javdb`/`xcity`/`xslist-fs` actor scrapers with actor scraping enabled
+- Existing installs are unaffected — only applies when `config.json` doesn't exist yet
+
+### 🐛 Fixes
+
+- Library position (last-viewed item in Edit mode) now survives a server restart again — `/item/current` and `/item/by-id/:id` were giving up before a pending restore had a chance to be found in later scan batches
+- Fixed a race where the restored filter badge could briefly show the raw `nav.filterActive` translation key instead of its text, if the badge rendered before this page's own i18n init finished loading translations
+
+### 📚 Documentation
+
+- About page now covers the actor favorites/duplicate-merge system, Grid View, and the `xslist-fs` scraper
+- README's scraper list updated to match what's actually shipped (`javlibrary-fs`, `libredmm`, `local`, `xcity`, `xslist-fs` were missing; `javdatabase` renamed to `javdb`)
+
+## v2.0.0 (2026-08-18)
+
+### 🔍 Library search-as-filter
+
+- The navbar search (edit mode) can now either jump to a single result (click on it, or Enter — unchanged) or, via the new "Filter results (N)" option, constrain Next/Previous navigation to only the matching movies
+- Matches on ID, title, actor name and genre (partial, case-insensitive)
+- A filter badge shows the active query and result count, with a one-click clear
+- No new dependency: reuses the existing in-memory search index, extended with actor/genre extraction
+
+### 🎭 Local actor scraper: library fallback + richer "Copy actors to movie folder"
+
+- New third fallback tier for the `local` actor scraper: when preferiti (`externalPath`) and cache both miss, and "Copy actors to movie folder" is enabled, it now also searches every library movie folder's `actors/` subfolder
+- `copyActorsToFolder` now writes a full actor `.nfo` (javinizer-js's own actor schema, not Kodi's movie-actor tag) alongside the photo, so this fallback can recover complete actor data even after a cache reset — not just a name
+- Correctly bypassed when "Overwrite local data" is checked in the actor modal: the library-folder scan is skipped there so a stale photo can't be self-healed back into the cache while the user is deliberately forcing a fresh remote fetch
+
+### 🖼️ Actor photo serving fixes
+
+- `/actors/*` now searches `externalPath` (preferiti) fully — exact name, then any known extension — before falling back to the internal cache, instead of mixing the two per-extension
+- Actor thumbnail resolution self-heals when the cached file's extension no longer matches (e.g. after a re-upload) by locating the actual file for that actor ID instead of falling back to the remote URL
+
+### 🎬 New scrapers
+
+- **XCITY** (actor scraper, `xxx.xcity.jp`) replaces `xslist-fs` — same data (name, birthdate, height, measurements, photo), no FlareSolverr/Cloudflare workaround needed (plain `fetch` + `cheerio`)
+- **LibreDMM** (movie scraper, `libredmm.com`) — new JSON API-based source
+
+### 🔠 ID field always uppercase
+
+- The ID field in edit/scrape mode now normalizes to uppercase on load and as you type
+
+### ⛔ Cancel scraping button
+
+- The scraping modal now has a Cancel button while a scrape is in progress — closes the WebSocket and hides the modal immediately, instead of only being dismissible after completion
+
+### 🌐 Configurable browser path
+
+- New "Browser path" field in Config → General Settings, with a folder/file browser, for pointing Puppeteer at a specific Chromium/Chrome binary
+- Takes priority over the `PUPPETEER_EXECUTABLE_PATH` env var
+
+### 🏷️ Leaked / Decensored / Uncensored badges
+
+- Movies tagged with these genres now show a small badge overlay on the cover, in both grid view and the edit-mode detail panel
+- Fixed a collateral bug in `/scrape-list` and `/library-list` that read the wrong field name (`genre` instead of `genres`), which had also been silently breaking the existing genre tags
+
+### 📁 "Open folder" button (edit mode)
+
+- New button next to Play opens the movie's folder in the OS file manager
+- Path is validated to be inside the configured library path before opening
+
+### 🎭 Actor modal unification
+
+- Single actor modal implementation shared between the home/scrape view and the actors (preferiti) page, replacing two divergent code paths
+- Uploading a new actor photo now soft-deletes the previous one (moved to `old-pics/`) instead of leaving orphaned files behind
+
+---
+
+## v1.7.0 (2026-05-29)
+
+### 🔄 Edit Mode Re-scrape
+
+- New re-scrape capability in edit/library mode: re-scrape any title already in your library using a specific scraper of your choice
+- Scraped data is loaded into the form for review — nothing is written until you click Save
+- Navigating away or switching mode discards the temporary data (existing dirty-field confirmation dialog)
+- Actor scraping runs automatically during edit-mode re-scrape if enabled in config
+- Auto copy actors to movie folder on save when `copyToMovieFolder` is enabled (works in both scrape and edit mode)
+
+### 🖥️ UI Rationalization
+
+- Unified scraper panel: single panel works in both modes
+- In edit mode, scrape-only controls (Scrape Now, Clear Cache, Delete) are hidden automatically
+- Removed duplicate re-scrape dropdown that appeared only in edit mode
+
+---
+
+## v0.9.6 (2026-04-01)
+
+### 🎭 New Actor Scraper: xslist-fs
+
+- New scraper `xslist-fs` for [xslist.org](https://xslist.org/en)
+- Extracts: English name, Japanese altName, birthdate, bust/waist/hips, photo
+- Uses FlareSolverr to bypass Cloudflare protection
+- Requires `FLARESOLVERR_URL` env variable (default: `http://localhost:8191`)
+- Enable via config: add `xslist-fs` to actor scrapers list (e.g. `local, xslist-fs, javdb`)
+
+### 📝 NFO title-case formatting
+
+- Genres, tags (movie NFO) now written with initial capitals on each word (ucFirst)
+- Actor `name` and `altName` now written with initial capitals in actor NFO
+
+### 📖 Documentation
+
+- Scrapers with names ending in `-fs` require FlareSolverr — documented in `scrapers/actors/README.md`
+
+---
+
+## v0.9.5 (2026-03-29)
+
+### 🎭 Actor System — Major Overhaul
+
+#### Index-free actor lookup
+- Removed `actors-index.json` entirely from both `data/actors/` and `externalPath`
+- All actor lookups now scan `.nfo` files directly — simpler and always accurate
+- Removed "Rebuild Actors Index" button (no longer needed)
+- `actorIndexManager.js` is now unused (kept for reference, not called)
+
+#### Smarter local scraper (`scrapers/actors/local/run.js`)
+- Searches `externalPath` first, then `data/actors` as fallback
+- Fixed `matchesActor`: now correctly tries both `actor.name` and `invertName(actor.name)` plus all altnames and their inverted forms — previously only inverted the search term, not the stored name
+- `searchInDirectory` exported for reuse
+
+#### Actor scraping flow improvements
+- Batch scrape (`processSingleMovieActors`, `processMultipleMoviesActors`, `batchScrapeActors`): now checks local NFOs (including externalPath) before going online
+- If local data is complete → skip online scrapers entirely
+- If local data is incomplete → continue online but only fill missing fields (local values preserved)
+- `scrapeActor`: pre-loads all known name variants (name + altnames) from local NFO before running online scrapers, so javdb etc. try all name forms
+- `resolveActorThumb`: local file (`thumbLocal`) now takes priority over online URL (`thumbUrl`)
+
+#### Save to library fixes
+- `POST /actors/save-to-library`: now searches `data/actors` only (not externalPath) when looking up the cached actor to copy
+- Duplicate check now scans externalPath NFOs for both `name` and all `altName` values of the incoming actor
+- Fixed stale closure bug: "+" button on actor cards now reads `currentItem.actor[index]` at click time instead of capturing the object reference at render time
+
+#### Config: "Copy actors to movie folder"
+- New checkbox in configuration page under Actor Scrapers section
+- When enabled, actor thumbnails are automatically copied to `<movie_folder>/actors/` on every movie save
+- i18n keys added: `config.copyActorsToMovieFolder`, `config.copyActorsToMovieFolderHelp`
+
+#### "Clear Scrapers Cache"
+- Already cleared `data/actors/` — confirmed working
+
+---
+
+## v0.9.0 Beta (2024-12-28)
+
+### 🎉 First Beta Release
+
+Javinizer-js is now ready for beta testing! This release includes a complete rewrite with modern architecture, comprehensive internationalization, and a powerful plugin-based scraping system.
+
+### ✨ Major Features
+
+#### Multi-language Support
+- 🇬🇧 **English** - Complete interface translation
+- 🇮🇹 **Italiano** - Full Italian translation
+- 🇯🇵 **日本語** - Complete Japanese translation
+- Language selector in navigation bar for instant switching
+- Extensible i18n system with 150+ translation keys
+- Support for template variables in translations ({name}, {count})
+
+#### Actor Management System
+- **Dedicated Actors Page** - Manage your actor library separately
+- **Actor Cards** - Grid-based layout with thumbnails and metadata
+- **Search & Scrape** - Built-in actor search with online scraping
+- **Data Caching** - Local cache for faster access and offline support
+- **External Path Support** - Share actor data across multiple instances or with media servers
+- **Edit Modal** - Comprehensive actor editing with all metadata fields
+
+#### Scraper System Enhancements
+- **Plugin Architecture** - Add new scrapers without modifying core code
+- **Actor Scrapers** - Automatic actor data retrieval and caching
+  - `local` - Use cached actor data
+  - `javdatabase` - Scrape JavDatabase for actor information
+- **Per-field Priorities** - Configure which scraper to prefer for specific metadata fields
+- **WebSocket Integration** - Real-time scraping progress in the web UI
+- **Interactive Protocol** - Handle CAPTCHA, Cloudflare, and user interactions seamlessly
+
+#### Web UI Improvements
+- **Modernized Layout** - Consistent styling across all pages (Home, Actors, Configuration)
+- **Shared Components** - Unified modal system for actors across pages
+- **Modular CSS** - Separate stylesheets for better organization and maintainability
+- **Responsive Design** - Works on desktop, tablet, and mobile devices
+- **Real-time Updates** - WebSocket-based progress tracking during scraping
+
+#### Deployment & Infrastructure
+- 🐳 **Docker Ready** - Pre-configured Dockerfile with Chromium support
+- 📦 **docker-compose.yml** - Easy deployment with volume mounting
+- 🏥 **Health Checks** - Built-in health monitoring for containers
+- 🔧 **Simple Configuration** - Single JSON file for all settings
+- 📊 **Resource Limits** - Optimized memory and CPU usage
+
+### 🔧 Technical Improvements
+
+#### Architecture
+- **Modular CSS** - actors.css, modal.css for separate concerns
+- **Shared Modal Component** - actor-modal.html loaded dynamically
+- **Event-Driven System** - Custom events for component coordination
+- **Retry Mechanism** - Exponential backoff for network requests
+- **Error Boundaries** - Graceful error handling throughout the app
+
+#### Bug Fixes
+- Fixed critical bug with dirty field detection (Set vs Object.keys)
+- Fixed modal not opening in edit/scrape mode
+- Fixed network timing issues on page load/refresh
+- Fixed console.error misuse in actorScraperManager (24 instances)
+- Fixed null element access in actor modal
+- Fixed thumbnail preview not updating correctly
+- Fixed navbar positioning on actors page
+
+#### Code Quality
+- Removed duplicate functions and redundant code
+- Cleaned up debug console.log statements (12+ instances)
+- Removed unused variables and imports
+- Improved error messages and logging
+- Standardized code formatting
+
+### 📚 Documentation
+
+#### New Documentation
+- **SCRAPER_DEVELOPMENT.md** - Quick start guide for creating scrapers
+- **Updated README.md** - Comprehensive beta release documentation
+- **Docker Documentation** - Deployment guides and resource requirements
+- **API Documentation** - Complete endpoint reference
+- **Changelog** - Version history in README.md
+
+#### Existing Documentation (Enhanced)
+- SCRAPER_IMPLEMENTATION_GUIDE.md - Complete implementation details
+- SCRAPER_MANAGER.md - Technical details of the scraper system
+- ARCHITECTURE.md - System design and philosophy
+- ACTOR_WORKFLOW.md - Actor scraping workflow
+- PROJECT_STRUCTURE.md - Codebase organization
+
+### 🔄 Migration Guide
+
+#### From Previous Versions
+
+If you're upgrading from an earlier version:
+
+1. **Update config.json structure**:
+```json
+{
+  "libraryPath": "/path/to/library",
+  "mode": "scrape",
+  "language": "en",
+  "scrapers": {
+    "video": ["javlibrary", "r18dev"],
+    "actors": {
+      "enabled": true,
+      "scrapers": ["local", "javdatabase"],
+      "externalPath": ""
+    }
+  },
+  "fieldPriorities": {}
+}
+```
+
+2. **Install new dependencies**:
+```bash
+npm install
+```
+
+3. **Update Docker setup** (if using Docker):
+```bash
+docker-compose down
+docker-compose build
+docker-compose up -d
+```
+
+### 🎯 Breaking Changes
+
+- **Config structure changed**: `scrapers` is now an object with `video` and `actors` properties
+- **Actor data location**: Actors moved from `data/scrape/actors/` to `data/actors/`
+- **Language codes**: Use `ja` instead of `jp` for Japanese
+- **API changes**: New endpoints for actors (`/actors`, `/actors/search`)
+
+### 📋 Known Issues
+
+- Fanart display not yet implemented (planned for next release)
+- Batch operations not available yet (planned)
+- Image management UI needs enhancement
+- Some scrapers may require CAPTCHA solving manually
+
+### 🚀 Getting Started
+
+#### Quick Start with Docker
+
+```bash
+# Clone repository
+git clone <repository-url>
+cd javinizer-js
+
+# Configure docker-compose.yml
+nano docker-compose.yml  # Set your library path
+
+# Start container
+docker-compose up -d
+
+# Access web UI
+open http://localhost:4004
+```
+
+#### Quick Start (Native)
+
+```bash
+# Clone repository
+git clone <repository-url>
+cd javinizer-js
+
+# Install dependencies
+npm install
+
+# Configure
+cp config.example.json config.json
+nano config.json  # Set your library path
+
+# Start server
+npm start
+
+# Access web UI
+open http://localhost:4004
+```
+
+### 🤝 Contributing
+
+We welcome contributions! Areas where help is appreciated:
+
+- **New Scrapers** - Add support for additional JAV sites
+- **Translations** - Add new language translations (Korean, Chinese, etc.)
+- **Bug Reports** - Report issues via GitHub Issues
+- **Feature Requests** - Suggest new features
+- **Documentation** - Improve docs and guides
+
+See SCRAPER_DEVELOPMENT.md for creating new scrapers - it's easy!
+
+### 🙏 Acknowledgments
+
+Special thanks to:
+- jvlflame for the original [Javinizer](https://github.com/jvlflame/Javinizer) that inspired this project
+- All beta testers who provided feedback
+- Contributors to the scraper ecosystem
+
+### 📞 Support
+
+- **Issues**: [GitHub Issue Tracker](https://github.com/yourusername/javinizer-js/issues)
+- **Documentation**: See README.md and docs folder
+- **Discussions**: [GitHub Discussions](https://github.com/yourusername/javinizer-js/discussions)
+
+### 🔮 What's Next?
+
+#### v1.0.0 Roadmap
+- Fanart display and management
+- Batch operations (multi-select, bulk edit)
+- Enhanced image management
+- Advanced search and filtering
+- API authentication
+- Performance optimizations
+- Additional scrapers
+
+#### Future Plans
+- Plugin marketplace for scrapers
+- Custom field mapping
+- Export/Import functionality
+- Mobile app
+- Video player integration
+- AI-powered metadata enhancement
+
+---
+
+**Download**: [GitHub Releases](https://github.com/yourusername/javinizer-js/releases/tag/v0.9.0)
+
+**Docker Image**: `docker pull javinizer-js:0.9.0` (coming soon)
+
+**Upgrade**: See Migration Guide above
+
+Thank you for trying Javinizer-js Beta! Please report any issues or feedback.

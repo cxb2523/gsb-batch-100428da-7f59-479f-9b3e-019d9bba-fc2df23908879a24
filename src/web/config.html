@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title data-i18n="config.pageTitle">Configuration</title>
+    <link rel="apple-touch-icon" sizes="180x180" href="favicon/apple-touch-icon.png">
+    <link rel="icon" type="image/png" sizes="32x32" href="favicon/favicon-32x32.png">
+    <link rel="icon" type="image/png" sizes="16x16" href="favicon/favicon-16x16.png">
+    <link rel="manifest" href="favicon/site.webmanifest">
+    <link rel="stylesheet" href="navbar.css">
+    <link rel="stylesheet" href="config.css">
+    <script src="i18n.js"></script>
+    <script src="navbar-loader.js"></script>
+</head>
+<body>
+    <!-- Navbar will be loaded here by navbar-loader.js -->
+
+    <div class="container">
+        <div class="header">
+            <h1 data-i18n="config.pageTitle">⚙️ Configuration</h1>
+            <p data-i18n="config.pageSubtitle">Manage your Javinizer-js settings</p>
+        </div>
+
+        <div class="content">
+            <div id="statusMessage" class="status-message"></div>
+
+            <form id="configForm">
+                <!-- General Settings -->
+                <div class="section">
+                    <div class="section-title" data-i18n="config.generalSettings">General Settings</div>
+                    <div class="info-text" style="margin-bottom: 20px;" data-i18n="config.libraryPathInfo">
+                        Library path is now configured from the main interface and saved automatically.
+                    </div>
+
+                    <div class="form-group">
+                        <label for="videoPlayerPath" data-i18n="config.videoPlayerPath">Video Player Path</label>
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <input type="text" id="videoPlayerPath" name="videoPlayerPath" placeholder="e.g. mpv, vlc, or full path to executable" style="flex: 1;">
+                            <button type="button" id="browseVideoPlayerPath" style="white-space: nowrap;">📁 <span data-i18n="buttons.browse">Browse</span></button>
+                        </div>
+                        <div class="info-text" data-i18n="config.videoPlayerPathHelp">
+                            Path to your video player executable. Leave empty to disable video playback feature.
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="browserPath" data-i18n="config.browserPath">Browser Path (JavLibrary)</label>
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <input type="text" id="browserPath" name="browserPath" placeholder="e.g. /usr/bin/chromium-browser" style="flex: 1;">
+                            <button type="button" id="browseBrowserPath" style="white-space: nowrap;">📁 <span data-i18n="buttons.browse">Browse</span></button>
+                        </div>
+                        <div class="info-text" data-i18n="config.browserPathHelp">
+                            Path to the browser executable used by the JavLibrary scraper. Leave empty to use the Puppeteer bundled browser.
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="scrapeFolderPattern" data-i18n="config.scrapeFolderPattern">Scrape Mode Folder Pattern</label>
+                        <input type="text" id="scrapeFolderPattern" name="scrapeFolderPattern" data-i18n-placeholder="config.scrapeFolderPatternPlaceholder">
+                        <div class="info-text" data-i18n="config.scrapeFolderPatternHelp">
+                            Customize the folder name pattern for scraped videos. Use placeholders: {id}, {contentid}, {title}, {alternatetitle}, {label}, {maker}, {year}. Example: {id} - {title} ({maker} - {year})
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="scrapeTitlePattern" data-i18n="config.scrapeTitlePattern">Title Field Pattern</label>
+                        <input type="text" id="scrapeTitlePattern" name="scrapeTitlePattern" data-i18n-placeholder="config.scrapeTitlePatternPlaceholder">
+                        <div class="info-text" data-i18n="config.scrapeTitlePatternHelp">
+                            Customize how the title field is composed after scraping, independent of the scraper used. Use placeholders: {id}, {contentid}, {title}, {alternatetitle}, {label}, {maker}, {year}. Example: {id} {title}
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label data-i18n="config.badgesLabel">Cover Badges</label>
+                        <div class="info-text" data-i18n="config.badgesHelp">
+                            Choose which badges to display on covers when the corresponding genre is present.
+                        </div>
+                        <label style="display:block; font-weight:normal;">
+                            <input type="checkbox" id="badgeUncensored" name="badgeUncensored">
+                            <span data-i18n="config.badgeUncensored">Uncensored</span>
+                        </label>
+                        <label style="display:block; font-weight:normal;">
+                            <input type="checkbox" id="badgeDecensored" name="badgeDecensored">
+                            <span data-i18n="config.badgeDecensored">Decensored</span>
+                        </label>
+                        <label style="display:block; font-weight:normal;">
+                            <input type="checkbox" id="badgeLeaked" name="badgeLeaked">
+                            <span data-i18n="config.badgeLeaked">Leaked</span>
+                        </label>
+                    </div>
+                </div>
+
+
+                <!-- Video Scrapers -->
+                <div class="section">
+                    <div class="section-title" data-i18n="config.videoScrapers">Video Scrapers</div>
+
+                    <div class="form-group">
+                        <label for="scrapers" data-i18n="config.scraperNames">Scraper Names (comma-separated)</label>
+                        <input type="text" id="scrapers" name="scrapers" placeholder="e.g. javlibrary, r18dev">
+                        <div class="info-text">
+                            <span data-i18n="config.scraperHelp">List of enabled scrapers in priority order (first = highest priority).</span><br>
+                            <span data-i18n="config.availableScrapers">Available scrapers:</span> <strong id="availableMovieScrapers">Loading...</strong>
+                        </div>
+                        <div class="info-text" data-i18n="config.fsScraperNote"></div>
+                    </div>
+                </div>
+
+                <!-- Actor Scrapers -->
+                <div class="section">
+                    <div class="section-title" data-i18n="config.actorScrapers">👤 Actor Scrapers</div>
+
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="actorsEnabled" name="actorsEnabled">
+                            <span data-i18n="config.enableActorScraping">Enable Actor Scraping</span>
+                        </label>
+                        <div class="info-text" data-i18n="config.actorScrapingHelp">
+                            When enabled, actor data will be scraped and cached during movie save.
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="actorsPath" data-i18n="config.externalActorsPath">Copy favorite actors to (optional)</label>
+                        <input type="text" id="actorsPath" name="actorsPath" placeholder="Leave empty to keep favorites internal only">
+                        <div class="info-text" data-i18n="config.externalActorsPathHelp">
+                            Actors are always stored in **./data/actors**. When set, actors marked as favorite are additionally copied (NFO + photo) to this path — updated on edit, removed if unfavorited. Useful for sharing favorite actors with other media servers (e.g., Jellyfin, Plex) or other Javinizer-JS instances.
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="copyActorsToMovieFolder" name="copyActorsToMovieFolder">
+                            <span data-i18n="config.copyActorsToMovieFolder"></span>
+                        </label>
+                        <div class="info-text" data-i18n="config.copyActorsToMovieFolderHelp"></div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="missingFieldsRetryDays" data-i18n="config.missingFieldsRetryDays"></label>
+                        <input type="number" id="missingFieldsRetryDays" name="missingFieldsRetryDays" min="0" step="1">
+                        <div class="info-text" data-i18n="config.missingFieldsRetryDaysHelp"></div>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="actorsScrapers" data-i18n="config.actorScraperNames">Actor Scraper Names (comma-separated)</label>
+                        <input type="text" id="actorsScrapers" name="actorsScrapers" placeholder="e.g. javdb">
+                        <div class="info-text">
+                            <span data-i18n="config.actorScraperHelp">List of enabled actor scrapers in priority order (first = highest priority).</span><br>
+                            <span data-i18n="config.availableScrapers">Available scrapers:</span> <strong id="availableActorScrapers">Loading...</strong>
+                        </div>
+                        <div class="info-text" data-i18n="config.fsScraperNote"></div>
+                    </div>
+                </div>
+
+                <!-- Genre Management -->
+                <div class="section">
+                    <div class="section-title" data-i18n="config.genreManagement">🎭 Genre Management</div>
+                    <div class="form-group">
+                        <label for="genreRules" data-i18n="config.genreRules">Genre Rules</label>
+                        <textarea id="genreRules" name="genreRules" rows="8"></textarea>
+                        <div class="info-text" data-i18n="config.genreRulesHelp">
+                            One rule per line. Prefix with - to remove, + to add. Use -&gt; to replace. Lines starting with # are ignored.
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: 10px; margin-top: 10px;">
+                        <button type="button" id="applyGenreRulesBtn" class="save-button" data-i18n="config.genreRulesApply">Apply to scraped files</button>
+                        <button type="button" id="applyGenreRulesLibraryBtn" class="save-button" data-i18n="config.genreRulesApplyLibrary">Apply to library (NFO)</button>
+                    </div>
+                    <div id="genreRulesApplyResult" style="margin-top: 8px; display: none;"></div>
+                </div>
+
+                <!-- Metadata Priorities -->
+                <div class="section">
+                    <div class="section-title" data-i18n="config.metadataFieldPriorities">🎯 Metadata Field Priorities</div>
+                    <div class="info-text" style="margin-bottom: 20px;" data-i18n="config.metadataFieldHelp">
+                        Configure scraper priority for specific fields. Leave blank to use default order. This allows fine-tuning which scrapers are preferred for individual metadata fields.
+                    </div>
+
+                    <div class="priority-fields" id="fieldPrioritiesContainer"></div>
+                </div>
+
+                <!-- Save Button -->
+                <button type="submit" class="save-button" data-i18n="config.saveConfig">💾 Save Configuration</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- File Browser Modal -->
+    <div id="fileBrowserModal" style="display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.5); z-index:1000; align-items:center; justify-content:center;">
+        <div style="background:white; padding:20px; border-radius:8px; max-width:600px; width:90%; max-height:80vh; display:flex; flex-direction:column;">
+            <h3 style="margin-top:0;" data-i18n="messages.selectFile">Select Executable</h3>
+            <div style="display:flex; gap:10px; margin-bottom:15px; align-items:center;">
+                <button id="fileBrowserUp" type="button">⬆ Up</button>
+                <input id="fileBrowserPath" type="text" style="flex:1;">
+                <button id="fileBrowserGo" type="button" data-i18n="buttons.go">Go</button>
+            </div>
+            <div id="fileBrowserList" style="flex:1; overflow-y:auto; border:1px solid #ddd; padding:10px; border-radius:4px; margin-bottom:15px; max-height:400px;"></div>
+            <div style="display:flex; gap:10px; justify-content:flex-end;">
+                <button id="fileBrowserCancel" type="button" style="background-color:#6c757d;">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let config = {};
+
+        // Fields from WebUI
+        const METADATA_FIELDS = [
+            { key: 'title', label: 'Title' },
+            { key: 'alternateTitle', label: 'Alternate Title' },
+            { key: 'description', label: 'Description' },
+            { key: 'director', label: 'Director' },
+            { key: 'releaseDate', label: 'Release Date' },
+            { key: 'runtime', label: 'Runtime' },
+            { key: 'series', label: 'Series' },
+            { key: 'maker', label: 'Maker' },
+            { key: 'label', label: 'Label' },
+            { key: 'rating', label: 'Rating' },
+            { key: 'contentRating', label: 'Content Rating' },
+            { key: 'genres', label: 'Genres' },
+            { key: 'tags', label: 'Tags' },
+            { key: 'actor', label: 'Actors' },
+            { key: 'coverUrl', label: 'Cover URL' },
+            { key: 'screenshotUrl', label: 'Screenshot URL' },
+            { key: 'trailerUrl', label: 'Trailer URL' }
+        ];
+
+
+        // Render field priority inputs
+        function renderFieldPriorities() {
+            const container = document.getElementById('fieldPrioritiesContainer');
+            container.innerHTML = '';
+
+            METADATA_FIELDS.forEach(field => {
+                const row = document.createElement('div');
+                row.className = 'priority-field-row';
+
+                const label = document.createElement('div');
+                label.className = 'priority-field-label';
+                label.textContent = field.label;
+
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.className = 'priority-field-input';
+                input.dataset.field = field.key;
+                input.placeholder = 'e.g. javlibrary, r18dev (leave empty for default)';
+
+                // Load existing priority
+                const fieldPriorities = config.fieldPriorities || {};
+                if (fieldPriorities[field.key]) {
+                    input.value = fieldPriorities[field.key].join(', ');
+                }
+
+                row.appendChild(label);
+                row.appendChild(input);
+                container.appendChild(row);
+            });
+        }
+
+        // Collect field priorities from inputs
+        function collectFieldPriorities() {
+            const fieldPriorities = {};
+            const inputs = document.querySelectorAll('.priority-field-input');
+
+            inputs.forEach(input => {
+                const fieldKey = input.dataset.field;
+                const value = input.value.trim();
+
+                if (value) {
+                    // Parse CSV
+                    const scrapers = value.split(',').map(s => s.trim()).filter(s => s);
+                    if (scrapers.length > 0) {
+                        fieldPriorities[fieldKey] = scrapers;
+                    }
+                }
+            });
+
+            return fieldPriorities;
+        }
+
+        // Form submission
+        document.getElementById('configForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+
+            const formData = new FormData(e.target);
+
+            // Parse scrapers from comma-separated string
+            const scrapersInput = formData.get('scrapers');
+            const scrapers = scrapersInput
+                .split(',')
+                .map(s => s.trim())
+                .filter(s => s.length > 0);
+
+            // Collect field priorities
+            const fieldPriorities = collectFieldPriorities();
+
+            // Get current config to preserve libraryPaths and mode
+            const currentConfigResponse = await fetch('/item/config');
+            const currentConfigData = await currentConfigResponse.json();
+            const currentConfig = currentConfigData.config || currentConfigData;
+
+            // Collect actors configuration
+            const actorsEnabled = document.getElementById('actorsEnabled').checked;
+            const actorsPath = document.getElementById('actorsPath').value.trim();
+            const actorsScrapersInput = document.getElementById('actorsScrapers').value.trim();
+            const actorsScrapers = actorsScrapersInput ? actorsScrapersInput.split(',').map(s => s.trim()).filter(Boolean) : ['javdb'];
+            const copyActorsToMovieFolder = document.getElementById('copyActorsToMovieFolder').checked;
+            const retryDaysInput = parseInt(document.getElementById('missingFieldsRetryDays').value, 10);
+            const missingFieldsRetryDays = Number.isNaN(retryDaysInput) || retryDaysInput < 0 ? 30 : retryDaysInput;
+
+            // Collect video player path
+            const videoPlayerPath = document.getElementById('videoPlayerPath').value.trim();
+
+            // Collect browser path
+            const browserPath = document.getElementById('browserPath').value.trim();
+
+            // Collect scrape folder pattern
+            const scrapeFolderPattern = document.getElementById('scrapeFolderPattern').value.trim();
+
+            // Collect scrape title pattern
+            const scrapeTitlePattern = document.getElementById('scrapeTitlePattern').value.trim();
+
+            // Collect badge visibility
+            const badges = {
+                uncensored: document.getElementById('badgeUncensored').checked,
+                decensored: document.getElementById('badgeDecensored').checked,
+                leaked: document.getElementById('badgeLeaked').checked
+            };
+
+            // Collect genre rules
+            const genreRules = document.getElementById('genreRules').value;
+
+            const newConfig = {
+                libraryPaths: currentConfig.libraryPaths || [],  // Preserve existing library roots
+                mode: currentConfig.mode || 'scrape',  // Preserve current mode
+                language: currentConfig.language || 'en',  // Preserve language
+                videoPlayerPath: videoPlayerPath || '',
+                browserPath: browserPath || '',
+                scrapeFolderPattern: scrapeFolderPattern || '{id}',  // Folder pattern for scrape mode
+                scrapeTitlePattern: scrapeTitlePattern || '{title}',  // Title field pattern
+                badges: badges,
+                genreRules: genreRules,
+                scrapers: {
+                    video: scrapers,
+                    actors: {
+                        enabled: actorsEnabled,
+                        scrapers: actorsScrapers,
+                        externalPath: actorsPath || '',
+                        copyToMovieFolder: copyActorsToMovieFolder,
+                        missingFieldsRetryDays: missingFieldsRetryDays
+                    }
+                },
+                fieldPriorities: fieldPriorities
+            };
+
+            try {
+                const response = await fetch('/item/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(newConfig)
+                });
+
+                if (response.ok) {
+                    showMessage(i18n.t('config.saveSuccess'), 'success');
+                } else {
+                    showMessage(i18n.t('config.saveFailed'), 'error');
+                }
+            } catch (error) {
+                showMessage(i18n.t('config.saveFailed'), 'error');
+            }
+        });
+
+        // Show status message
+        function showMessage(message, type) {
+            const statusEl = document.getElementById('statusMessage');
+            statusEl.textContent = message;
+            statusEl.className = `status-message ${type}`;
+            statusEl.style.display = 'block';
+
+            setTimeout(() => {
+                statusEl.style.display = 'none';
+            }, 5000);
+        }
+
+        // Initialize i18n and load config
+        async function init() {
+            try {
+                // Load config first to get the language
+                const response = await fetch('/item/config');
+                const cfgData = await response.json();
+                const cfg = cfgData.config || cfgData;
+
+                // Get language from config.json
+                const savedLang = cfg.language || 'en';
+                console.log('Loading language from config:', savedLang);
+
+                await i18n.changeLanguage(savedLang);
+                console.log('Language changed to:', savedLang);
+
+                // Apply translations
+                i18n.applyTranslations();
+                console.log('Translations applied');
+
+                // Now populate the form with config data
+                config = cfg;
+
+                // Display available scrapers
+                if (cfgData.availableScrapers) {
+                    // Movie scrapers
+                    const movieScrapers = cfgData.availableScrapers.movies || [];
+                    document.getElementById('availableMovieScrapers').textContent = movieScrapers.join(', ') || 'None';
+
+                    // Actor scrapers
+                    const actorScrapers = cfgData.availableScrapers.actors || [];
+                    document.getElementById('availableActorScrapers').textContent = actorScrapers.join(', ') || 'None';
+                }
+
+                // Set scrapers (new structure only)
+                const scrapersArray = (config.scrapers && config.scrapers.video) ? config.scrapers.video : [];
+                document.getElementById('scrapers').value = scrapersArray.join(', ');
+
+                // Load actors configuration (new structure only)
+                const actorsEnabled = (config.scrapers && config.scrapers.actors) ? config.scrapers.actors.enabled : false;
+                const actorsPath = (config.scrapers && config.scrapers.actors) ? config.scrapers.actors.externalPath || '' : '';
+                const actorsScrapersArray = (config.scrapers && config.scrapers.actors) ? config.scrapers.actors.scrapers : ['javdb'];
+                const copyActorsToMovieFolderValue = (config.scrapers && config.scrapers.actors) ? !!config.scrapers.actors.copyToMovieFolder : false;
+
+                // Load video player path
+                const videoPlayerPath = config.videoPlayerPath || '';
+
+                // Load browser path
+                const browserPath = config.browserPath || '';
+
+                // Load scrape folder pattern
+                const scrapeFolderPattern = config.scrapeFolderPattern || '{id}';
+
+                // Load scrape title pattern
+                const scrapeTitlePattern = config.scrapeTitlePattern || '{title}';
+
+                // Load badge visibility (default: all shown)
+                const badges = config.badges || {};
+
+                // Load genre rules
+                const genreRules = config.genreRules || '';
+
+                document.getElementById('actorsEnabled').checked = actorsEnabled;
+                document.getElementById('actorsPath').value = actorsPath;
+                document.getElementById('actorsScrapers').value = actorsScrapersArray.join(', ');
+                document.getElementById('copyActorsToMovieFolder').checked = copyActorsToMovieFolderValue;
+                document.getElementById('missingFieldsRetryDays').value =
+                    (config.scrapers && config.scrapers.actors && config.scrapers.actors.missingFieldsRetryDays != null)
+                        ? config.scrapers.actors.missingFieldsRetryDays : 30;
+                document.getElementById('videoPlayerPath').value = videoPlayerPath;
+                document.getElementById('browserPath').value = browserPath;
+                document.getElementById('scrapeFolderPattern').value = scrapeFolderPattern;
+                document.getElementById('scrapeTitlePattern').value = scrapeTitlePattern;
+                document.getElementById('badgeUncensored').checked = badges.uncensored !== false;
+                document.getElementById('badgeDecensored').checked = badges.decensored !== false;
+                document.getElementById('badgeLeaked').checked = badges.leaked !== false;
+                document.getElementById('genreRules').value = genreRules;
+
+                // Render field priorities
+                renderFieldPriorities();
+            } catch (error) {
+                console.error('Init failed:', error);
+                showMessage(i18n.t('config.loadFailed'), 'error');
+            }
+        }
+
+        async function applyGenreRules(endpoint, successKey) {
+            const resultEl = document.getElementById('genreRulesApplyResult');
+            const btns = ['applyGenreRulesBtn', 'applyGenreRulesLibraryBtn'].map(id => document.getElementById(id));
+            btns.forEach(b => b.disabled = true);
+            resultEl.style.display = 'none';
+
+            try {
+                const res = await fetch(endpoint, { method: 'POST' });
+                const data = await res.json();
+                resultEl.style.display = 'block';
+                if (data.ok) {
+                    resultEl.className = 'status-message success';
+                    resultEl.textContent = i18n.t(successKey, { updated: data.updated, total: data.total });
+                } else {
+                    resultEl.className = 'status-message error';
+                    resultEl.textContent = data.error || i18n.t('config.genreRulesApplyError');
+                }
+            } catch (err) {
+                resultEl.style.display = 'block';
+                resultEl.className = 'status-message error';
+                resultEl.textContent = i18n.t('config.genreRulesApplyError');
+            } finally {
+                btns.forEach(b => b.disabled = false);
+            }
+        }
+
+        document.getElementById('applyGenreRulesBtn').addEventListener('click', () =>
+            applyGenreRules('/item/genre-rules/apply', 'config.genreRulesApplySuccess'));
+
+        document.getElementById('applyGenreRulesLibraryBtn').addEventListener('click', () =>
+            applyGenreRules('/item/genre-rules/apply-library', 'config.genreRulesApplyLibrarySuccess'));
+
+        // Make sure i18n is loaded
+        if (typeof i18n === 'undefined') {
+            console.error('i18n is not loaded!');
+        } else {
+            init();
+        }
+
+        // ── File Browser (for browser executable path) ──
+        let fileBrowserCurrentPath = '';
+        let fileBrowserCallback = null;
+        let fileBrowserAllowApp = false; // macOS: allow selecting .app bundles (video player only)
+
+        async function openFileBrowser(initialPath, callback, allowApp = false) {
+            fileBrowserCallback = callback;
+            fileBrowserAllowApp = allowApp;
+            document.getElementById('fileBrowserModal').style.display = 'flex';
+            await loadFileBrowserDir(initialPath || '');
+        }
+
+        async function loadFileBrowserDir(dirPath) {
+            const res = await fetch(`/item/browse?path=${encodeURIComponent(dirPath)}&files=1`);
+            const data = await res.json();
+            if (!data.ok) { alert(data.error); return; }
+
+            fileBrowserCurrentPath = data.current;
+            document.getElementById('fileBrowserPath').value = data.current;
+            document.getElementById('fileBrowserUp').disabled = data.parent === null;
+
+            const list = document.getElementById('fileBrowserList');
+            list.innerHTML = '';
+
+            data.directories.forEach(dir => {
+                const div = document.createElement('div');
+                div.style.cssText = 'padding: 8px 10px; cursor: pointer; border-bottom: 1px solid #eee;';
+                div.innerHTML = `📁 ${dir.name}`;
+                div.onmouseover = () => div.style.backgroundColor = '#e9ecef';
+                div.onmouseout = () => div.style.backgroundColor = 'transparent';
+                div.onclick = () => loadFileBrowserDir(dir.path);
+                if (fileBrowserAllowApp && dir.name.toLowerCase().endsWith('.app')) {
+                    const useBtn = document.createElement('button');
+                    useBtn.type = 'button';
+                    useBtn.textContent = i18n.t('buttons.useApp');
+                    useBtn.style.cssText = 'float: right; padding: 2px 8px;';
+                    useBtn.onclick = (e) => {
+                        e.stopPropagation();
+                        if (fileBrowserCallback) fileBrowserCallback(dir.path);
+                        document.getElementById('fileBrowserModal').style.display = 'none';
+                    };
+                    div.appendChild(useBtn);
+                }
+                list.appendChild(div);
+            });
+
+            data.files.forEach(file => {
+                const div = document.createElement('div');
+                div.style.cssText = 'padding: 8px 10px; cursor: pointer; border-bottom: 1px solid #eee; color: #333;';
+                div.innerHTML = `⚙️ ${file.name}`;
+                div.onmouseover = () => div.style.backgroundColor = '#dff0d8';
+                div.onmouseout = () => div.style.backgroundColor = 'transparent';
+                div.onclick = () => {
+                    if (fileBrowserCallback) fileBrowserCallback(file.path);
+                    document.getElementById('fileBrowserModal').style.display = 'none';
+                };
+                list.appendChild(div);
+            });
+
+            if (data.directories.length === 0 && data.files.length === 0) {
+                list.innerHTML = '<div style="color:#999;text-align:center;padding:20px;">Empty folder</div>';
+            }
+        }
+
+        document.getElementById('fileBrowserUp').addEventListener('click', async () => {
+            const res = await fetch(`/item/browse?path=${encodeURIComponent(fileBrowserCurrentPath)}&files=1`);
+            const data = await res.json();
+            if (data.ok && data.parent) await loadFileBrowserDir(data.parent);
+        });
+
+        document.getElementById('fileBrowserGo').addEventListener('click', () => {
+            loadFileBrowserDir(document.getElementById('fileBrowserPath').value.trim());
+        });
+        document.getElementById('fileBrowserPath').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                loadFileBrowserDir(e.target.value.trim());
+            }
+        });
+
+        document.getElementById('fileBrowserCancel').addEventListener('click', () => {
+            document.getElementById('fileBrowserModal').style.display = 'none';
+        });
+
+        // Extracts the containing directory from a path, cross-platform (/ or \).
+        function dirnameOf(pathValue) {
+            if (!pathValue) return '';
+            const lastSlash = Math.max(pathValue.lastIndexOf('/'), pathValue.lastIndexOf('\\'));
+            return lastSlash > -1 ? pathValue.substring(0, lastSlash) : '';
+        }
+
+        document.getElementById('browseBrowserPath').addEventListener('click', () => {
+            openFileBrowser(dirnameOf(document.getElementById('browserPath').value), (selectedPath) => {
+                document.getElementById('browserPath').value = selectedPath;
+            });
+        });
+
+        document.getElementById('browseVideoPlayerPath').addEventListener('click', () => {
+            openFileBrowser(dirnameOf(document.getElementById('videoPlayerPath').value), (selectedPath) => {
+                document.getElementById('videoPlayerPath').value = selectedPath;
+            }, true);
+        });
+    </script>
+</body>
+</html>

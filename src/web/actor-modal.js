@@ -1,0 +1,664 @@
+// ============================================
+// Unified Actor Modal System
+// Shared between index.html and actors.html
+// ============================================
+
+let unifiedCurrentActor = null;
+let unifiedIsNewActor = false;
+let modalMode = 'movie'; // 'movie' for index.html, 'library' for actors.html
+let lastSearchForceOverwrite = false;
+
+// Callbacks registered by movie context (app.js)
+let _movieContextSave = null;
+let _movieContextDelete = null;
+
+function registerMovieContextHandlers(onSave, onDelete) {
+  _movieContextSave = onSave;
+  _movieContextDelete = onDelete;
+}
+
+function setActorModalMode(mode) {
+  modalMode = mode;
+}
+
+// Mirrors isPlaceholderActorName() in scrapers/actors/schema.js — a name
+// that isn't real actor data should never be searched.
+const _PLACEHOLDER_ACTOR_NAMES = new Set(['unknown', 'n/a', 'na']);
+function _isPlaceholderActorName(name) {
+  const key = (name || '').trim().toLowerCase();
+  return !key || _PLACEHOLDER_ACTOR_NAMES.has(key);
+}
+
+// Remove any alt-name entry that's just the primary name again — case-,
+// whitespace-, and word-order-insensitive (a 2-word name given as
+// "Family Given" instead of "Given Family" is still the same name) — and
+// dedupe the rest the same way. Mirrors dedupeAltNames() in
+// scrapers/actors/schema.js — duplicated here since this runs in the
+// browser and can't require that module.
+function _dedupeAltNames(name, altNames) {
+  const normalize = s => (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
+  const invert = s => {
+    const parts = normalize(s).split(' ');
+    return parts.length === 2 ? `${parts[1]} ${parts[0]}` : normalize(s);
+  };
+  const primaryKey = normalize(name);
+  const primaryInverted = invert(name);
+  const seen = new Set();
+  return (altNames || []).filter(n => {
+    const key = normalize(n);
+    const keyInverted = invert(n);
+    if (!key || key === primaryKey || key === primaryInverted || seen.has(key) || seen.has(keyInverted)) return false;
+    seen.add(key);
+    seen.add(keyInverted);
+    return true;
+  });
+}
+
+// Open actor modal — unified for both movie and library contexts
+function openActorModal(actor) {
+  unifiedCurrentActor = actor || null;
+  unifiedIsNewActor = !actor;
+
+  const modal = document.getElementById('actorEditModal');
+  if (!modal) return;
+
+  const modalTitle = document.getElementById('actorEditModalTitle');
+  const removeBtn = document.getElementById('actorEditRemove');
+  const deletePhotoBtn = document.getElementById('actorEditDeletePhoto');
+  const sourceInfo = document.getElementById('actorEditSourceInfo');
+  const sourceSpan = document.getElementById('actorEditSource');
+
+  // Title
+  if (modalTitle) {
+    modalTitle.textContent = window.i18n
+      ? window.i18n.t(unifiedIsNewActor ? 'actorModal.titleAdd' : 'actorModal.title')
+      : (unifiedIsNewActor ? 'Add Actor' : 'Edit Actor');
+  }
+
+  // Remove/Delete actor button
+  if (removeBtn) removeBtn.style.display = unifiedIsNewActor ? 'none' : 'block';
+
+  // Delete photo button: only in library mode with existing actor
+  if (deletePhotoBtn) {
+    if (modalMode === 'library' && actor && actor.id) {
+      deletePhotoBtn.style.display = 'block';
+      deletePhotoBtn.onclick = deleteActorImage;
+    } else {
+      deletePhotoBtn.style.display = 'none';
+    }
+  }
+
+  // Clear any previous uploaded file data
+  const thumbField = document.getElementById('actorEditThumb');
+  if (thumbField) delete thumbField.dataset.uploadedFile;
+
+  // Populate form fields
+  const a = actor || {};
+  _setField('actorEditName', a.name || '');
+  _setField('actorEditAltName', _dedupeAltNames(a.name, (a.altName || '').split(',').map(s => s.trim())).join(', '));
+  _setField('actorEditRole', a.role || 'Actress');
+  _setField('actorEditThumb', a.thumb || '');
+  _setField('actorEditBirthdate', a.birthdate || '');
+  _setField('actorEditHeight', a.height || '');
+  _setField('actorEditBust', a.bust || '');
+  _setField('actorEditWaist', a.waist || '');
+  _setField('actorEditHips', a.hips || '');
+
+  // Source info
+  if (!unifiedIsNewActor && a.meta && a.meta.sources && a.meta.sources.length > 0) {
+    if (sourceSpan) sourceSpan.textContent = a.meta.sources.join(', ');
+    if (sourceInfo) sourceInfo.style.display = 'block';
+  } else {
+    if (sourceInfo) sourceInfo.style.display = 'none';
+  }
+
+  // Movies this actor appears in — fetched async so opening the modal is
+  // never blocked on it; hidden until (if) it resolves to at least one.
+  const moviesInfo = document.getElementById('actorEditMoviesInfo');
+  if (moviesInfo) moviesInfo.style.display = 'none';
+  if (!unifiedIsNewActor && a.id) {
+    loadActorMoviesInfo(a.id);
+  }
+
+  // Reset overwrite checkbox
+  const overwriteCheckbox = document.getElementById('actorEditOverwriteLocal');
+  if (overwriteCheckbox) overwriteCheckbox.checked = false;
+  lastSearchForceOverwrite = false;
+
+  // Update preview — this movie's own actors/ folder copy (ground truth for
+  // this specific movie) wins if present; falls back to the centralized
+  // store / remote URL via updateActorPreview() otherwise. A rescrape
+  // (searchActor()) intentionally bypasses this and always shows the fresh
+  // centralized result instead, since that's the point of rescraping.
+  if (a.localThumb) {
+    const previewImg = document.getElementById('actorEditPreviewImg');
+    const placeholder = document.getElementById('actorEditPreviewPlaceholder');
+    if (previewImg && placeholder) {
+      previewImg.src = `/media/${encodeURIComponent(a.localThumb)}?t=${Date.now()}`;
+      previewImg.style.display = 'block';
+      placeholder.style.display = 'none';
+      previewImg.onload = () => { previewImg.style.display = 'block'; placeholder.style.display = 'none'; };
+      previewImg.onerror = () => updateActorPreview(a.thumb || '');
+    } else {
+      updateActorPreview(a.thumb || '');
+    }
+  } else {
+    updateActorPreview(a.thumb || '');
+  }
+
+  // Show modal
+  modal.classList.add('active');
+}
+
+/**
+ * Fetch and show "N movies" for the actor currently in the modal — real
+ * ids from actor_movies (self-healed against the current library as it
+ * goes, see GET /actors/:id/movies), not a name text-match. Never blocks
+ * opening the modal; silently does nothing if it comes back empty/late
+ * (e.g. the user already closed/switched actors).
+ */
+async function loadActorMoviesInfo(actorId) {
+  try {
+    const res = await fetch(`/api/actors/${encodeURIComponent(actorId)}/movies`);
+    const data = await res.json();
+    if (!data.ok || !Array.isArray(data.movieIds) || data.movieIds.length === 0) return;
+
+    // The modal may have moved on to a different actor (or closed) by the
+    // time this resolves — don't stomp on whatever's showing now.
+    if (!unifiedCurrentActor || unifiedCurrentActor.id !== actorId) return;
+
+    const moviesInfo = document.getElementById('actorEditMoviesInfo');
+    const moviesLink = document.getElementById('actorEditMoviesLink');
+    const moviesCount = document.getElementById('actorEditMoviesCount');
+    if (!moviesInfo || !moviesLink || !moviesCount) return;
+
+    const count = data.movieIds.length;
+    const actorName = unifiedCurrentActor.name || unifiedCurrentActor.altName || '';
+    moviesCount.textContent = window.i18n
+      ? window.i18n.t('actorModal.moviesCount', { count })
+      : `${count} movie${count === 1 ? '' : 's'}`;
+    // Fallback href only (middle-click/no-JS) — the onclick handler below
+    // is what normally fires, going through applyActorMoviesFilter.
+    moviesLink.href = `grid.html?actorId=${encodeURIComponent(actorId)}`;
+    moviesLink.onclick = (e) => {
+      e.preventDefault();
+      // Close first — otherwise the resulting page change (a new movie
+      // loaded in edit mode, or a jump to grid.html) happens invisibly
+      // behind the still-open modal.
+      closeActorModal();
+      if (window.applyActorMoviesFilter) window.applyActorMoviesFilter(actorId, actorName);
+    };
+    moviesInfo.style.display = 'block';
+  } catch (err) {
+    console.error('[ActorModal] Failed to load actor movies:', err);
+  }
+}
+
+function _setField(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.value = value;
+}
+
+// Close actor modal
+function closeActorModal() {
+  const modal = document.getElementById('actorEditModal');
+  if (modal) modal.classList.remove('active');
+
+  unifiedCurrentActor = null;
+  unifiedIsNewActor = false;
+
+  const previewImg = document.getElementById('actorEditPreviewImg');
+  const placeholder = document.getElementById('actorEditPreviewPlaceholder');
+  if (previewImg) { previewImg.src = ''; previewImg.style.display = 'none'; }
+  if (placeholder) placeholder.style.display = 'block';
+}
+
+// Update actor preview image
+// Tries local cache first (/actors/{id}.ext), then remote URL
+function updateActorPreview(url, forceRemote = false) {
+  const previewImg = document.getElementById('actorEditPreviewImg');
+  const placeholder = document.getElementById('actorEditPreviewPlaceholder');
+  if (!previewImg || !placeholder) return;
+
+  if (forceRemote && url && url.trim() !== '') {
+    previewImg.src = url;
+    previewImg.style.display = 'block';
+    placeholder.style.display = 'none';
+    previewImg.onerror = () => { previewImg.style.display = 'none'; placeholder.style.display = 'block'; };
+    previewImg.onload = () => { previewImg.style.display = 'block'; placeholder.style.display = 'none'; };
+    return;
+  }
+
+  // Try local file by actor ID, then fall back to URL
+  if (unifiedCurrentActor && (unifiedCurrentActor.id || unifiedCurrentActor.name)) {
+    const actorId = unifiedCurrentActor.id || _normalizeActorId(unifiedCurrentActor.name);
+    const extensions = ['webp', 'jpg', 'jpeg', 'png', 'gif'];
+    // The cache file given/recorded for the actor wins over guessing "{id}.{ext}"
+    const { thumbLocal } = unifiedCurrentActor;
+    const candidates = [
+      ...(url && url.startsWith('/actors/') ? [url.split('?')[0]] : []),
+      ...(thumbLocal ? [`/actors/${thumbLocal}`] : []),
+      ...extensions.map(ext => `/actors/${actorId}.${ext}`)
+    ];
+    const ts = Date.now();
+    let extIndex = 0;
+
+    const tryNext = () => {
+      if (extIndex < candidates.length) {
+        previewImg.src = `${candidates[extIndex++]}?t=${ts}`;
+      } else if (url && url.trim() !== '') {
+        previewImg.src = url;
+        previewImg.onerror = () => { previewImg.style.display = 'none'; placeholder.style.display = 'block'; };
+        previewImg.onload = () => { previewImg.style.display = 'block'; placeholder.style.display = 'none'; };
+      } else {
+        previewImg.style.display = 'none';
+        placeholder.style.display = 'block';
+      }
+    };
+
+    previewImg.onerror = tryNext;
+    previewImg.onload = () => { previewImg.style.display = 'block'; placeholder.style.display = 'none'; };
+    tryNext();
+    return;
+  }
+
+  if (url && url.trim() !== '') {
+    previewImg.src = url;
+    previewImg.style.display = 'block';
+    placeholder.style.display = 'none';
+    previewImg.onerror = () => { previewImg.style.display = 'none'; placeholder.style.display = 'block'; };
+    return;
+  }
+
+  previewImg.style.display = 'none';
+  placeholder.style.display = 'block';
+}
+
+function _normalizeActorId(name) {
+  if (!name) return '';
+  let n = name.toLowerCase().replace(/[^a-z0-9\s]/g, ' ').trim().replace(/\s+/g, '-');
+  if (!n) {
+    let h = 5381;
+    for (let i = 0; i < name.length; i++) h = (((h << 5) + h) ^ name.charCodeAt(i)) >>> 0;
+    n = 'actor-' + h.toString(16).padStart(8, '0');
+  }
+  return n;
+}
+
+// Get current form data
+function _getFormData() {
+  const thumbField = document.getElementById('actorEditThumb');
+  return {
+    ...unifiedCurrentActor,
+    id: unifiedCurrentActor?.id || null,
+    name: (document.getElementById('actorEditName')?.value || '').trim(),
+    altName: (document.getElementById('actorEditAltName')?.value || '').trim(),
+    role: (document.getElementById('actorEditRole')?.value || '').trim(),
+    thumb: thumbField?.value.trim() || '',
+    uploadedFile: thumbField?.dataset.uploadedFile || null,
+    // YYYY-MM-DD, or YYYY when only the year is known (javguru)
+    birthdate: (v => /^\d{4}(-\d{2}-\d{2})?$/.test(v) ? v : '')((document.getElementById('actorEditBirthdate')?.value || '').trim()),
+    height: parseInt(document.getElementById('actorEditHeight')?.value) || 0,
+    bust: parseInt(document.getElementById('actorEditBust')?.value) || 0,
+    waist: parseInt(document.getElementById('actorEditWaist')?.value) || 0,
+    hips: parseInt(document.getElementById('actorEditHips')?.value) || 0,
+    forceOverwrite: lastSearchForceOverwrite,
+  };
+}
+
+// Save actor — dispatches to movie context callback or library API
+async function saveActor() {
+  const nameBeingSaved = (document.getElementById('actorEditName')?.value || '').trim();
+  if (_isPlaceholderActorName(nameBeingSaved)) {
+    alert(window.i18n ? window.i18n.t('messages.invalidActorName') : "This isn't a real actor name — enter the actual name before saving");
+    return;
+  }
+
+  if (modalMode === 'movie') {
+    if (_movieContextSave) _movieContextSave(_getFormData());
+    return;
+  }
+
+  // Library context: save via API
+  const name = nameBeingSaved;
+  if (!name) {
+    alert(window.i18n ? window.i18n.t('messages.enterActorNameFirstAlert') : 'Please enter actor name');
+    return;
+  }
+
+  const actorData = _getFormData();
+
+  try {
+    const response = await fetch('/api/actors/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...actorData, context: 'library' })
+    });
+    const result = await response.json();
+
+    if (!result.ok) throw new Error(result.error || 'Failed to save actor');
+
+    const thumbField = document.getElementById('actorEditThumb');
+    if (thumbField) delete thumbField.dataset.uploadedFile;
+
+    if (typeof loadActors === 'function') await loadActors();
+    closeActorModal();
+  } catch (error) {
+    console.error('Failed to save actor:', error);
+    alert('Failed to save actor: ' + error.message);
+  }
+}
+
+// Delete actor — dispatches to movie context callback or library API
+async function deleteActor() {
+  if (modalMode === 'movie') {
+    if (_movieContextDelete) _movieContextDelete();
+    return;
+  }
+
+  // Library context: delete via API
+  if (!unifiedCurrentActor || !unifiedCurrentActor.id) return;
+
+  const msg = window.i18n
+    ? window.i18n.t('messages.confirmDeleteActor', { name: unifiedCurrentActor.name })
+    : `Are you sure you want to delete ${unifiedCurrentActor.name}?`;
+
+  if (!confirm(msg)) return;
+
+  try {
+    const response = await fetch('/api/actors/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: unifiedCurrentActor.id })
+    });
+    const result = await response.json();
+    if (!result.ok) throw new Error(result.error || 'Failed to delete actor');
+
+    if (typeof loadActors === 'function') await loadActors();
+    closeActorModal();
+  } catch (error) {
+    console.error('Failed to delete actor:', error);
+    alert('Failed to delete actor: ' + error.message);
+  }
+}
+
+// Search actor (unified for both contexts)
+async function searchActor() {
+  const actorName = (document.getElementById('actorEditName')?.value || '').trim();
+  if (!actorName) {
+    alert(window.i18n ? window.i18n.t('messages.enterActorNameFirstAlert') : "Enter actor name before searching");
+    return;
+  }
+  if (_isPlaceholderActorName(actorName)) {
+    alert(window.i18n ? window.i18n.t('messages.invalidActorName') : "This isn't a real actor name — enter the actual name before searching");
+    return;
+  }
+  const altName = (document.getElementById('actorEditAltName')?.value || '').trim();
+
+  const searchBtn = document.getElementById('actorEditSearch');
+  const searchText = document.getElementById('actorEditSearchText');
+  const searchStatus = document.getElementById('actorEditSearchStatus');
+  const overwriteCheckbox = document.getElementById('actorEditOverwriteLocal');
+  const forceOverwrite = overwriteCheckbox ? overwriteCheckbox.checked : false;
+
+  lastSearchForceOverwrite = forceOverwrite;
+
+  searchBtn.disabled = true;
+  if (searchText) searchText.textContent = window.i18n ? window.i18n.t('messages.searchingActor') : 'Searching...';
+  if (searchStatus) { searchStatus.style.display = 'block'; searchStatus.style.color = '#666'; searchStatus.textContent = window.i18n ? window.i18n.t('messages.searchingActorData') : 'Searching actor data...'; }
+
+  try {
+    // id: whatever this actor card was already opened with (if any) — see
+    // scrapeActorExcludingLocal(), used only for forceOverwrite so a name
+    // accidentally recorded as an alt of a different actor can't silently
+    // redirect a "force overwrite" search onto that wrong existing record.
+    const knownActorId = unifiedCurrentActor?.id || null;
+    const response = await fetch('/item/actors/search', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: actorName, altName, forceOverwrite, id: knownActorId })
+    });
+    const result = await response.json();
+
+    if (result.ok && result.actor) {
+      const shouldOverwrite = (currentValue, newValue) => {
+        if (forceOverwrite) return newValue !== undefined && newValue !== null && newValue !== '';
+        return (!currentValue || currentValue === '') && (newValue !== undefined && newValue !== null);
+      };
+
+      const fill = (id, val) => { if (shouldOverwrite(document.getElementById(id)?.value, val)) _setField(id, val); };
+
+      // A pure local-cache hit (fromLocal) IS this actor's already-established
+      // identity in our own index — e.g. the movie's own NFO happens to list
+      // them under an alt spelling, but the index already knows their real
+      // primary name — so syncing Name to it is safe and correct (and
+      // matters: saving with Name left on the alt spelling would demote the
+      // real primary to an alt in the index). Explicit forceOverwrite is the
+      // other case that may update Name: the user has deliberately said "I
+      // don't trust what's there, use what's found." Otherwise (a plain
+      // online-scraper result) Name is never touched — that's a fresh, less
+      // certain discovery — a differently-worded found name from it is
+      // filed into Alternate Names instead, alongside altName/otherNames,
+      // deduped against Name and each other (case-, whitespace-, and
+      // word-order-insensitive; also absorbs a name the user just typed
+      // echoed back inside otherNames by the server's own foldNameVariants()).
+      const nameIsAuthoritative = result.fromLocal || forceOverwrite;
+      if (nameIsAuthoritative && result.actor.name) _setField('actorEditName', result.actor.name);
+
+      const currentName = document.getElementById('actorEditName')?.value || '';
+      const foundNameAsAlt = nameIsAuthoritative ? null : result.actor.name;
+      const combinedAltName = _dedupeAltNames(
+        currentName,
+        [foundNameAsAlt, result.actor.altName, ...(result.actor.otherNames || [])].flatMap(v => (v || '').split(',')).map(v => v.trim())
+      ).join(', ');
+      if (combinedAltName) _setField('actorEditAltName', combinedAltName);
+      // A year-only birthdate (javguru) is upgraded by any full date found.
+      const curBirthdate = document.getElementById('actorEditBirthdate')?.value || '';
+      if (/^\d{4}$/.test(curBirthdate) && /^\d{4}-\d{2}-\d{2}$/.test(result.actor.birthdate || '')) _setField('actorEditBirthdate', result.actor.birthdate);
+      else fill('actorEditBirthdate', result.actor.birthdate);
+      if (shouldOverwrite(document.getElementById('actorEditHeight')?.value, result.actor.height) && result.actor.height > 0) _setField('actorEditHeight', result.actor.height);
+      if (shouldOverwrite(document.getElementById('actorEditBust')?.value, result.actor.bust) && result.actor.bust > 0) _setField('actorEditBust', result.actor.bust);
+      if (shouldOverwrite(document.getElementById('actorEditWaist')?.value, result.actor.waist) && result.actor.waist > 0) _setField('actorEditWaist', result.actor.waist);
+      if (shouldOverwrite(document.getElementById('actorEditHips')?.value, result.actor.hips) && result.actor.hips > 0) _setField('actorEditHips', result.actor.hips);
+      // Thumb follows name/altName, not the shouldOverwrite gate below: a
+      // match means we now know the actor's real identity, so the photo that
+      // comes with that identity always wins over whatever stale thumb (e.g.
+      // an earlier mis-identified homonym) was already in the field — same
+      // reasoning as the name/altName block above. Also drop any leftover
+      // manually-uploaded-file reference from before this search, so the
+      // fresh thumb we just set is actually what gets saved.
+      if (result.actor.thumb) {
+        _setField('actorEditThumb', result.actor.thumb);
+        const thumbFieldEl = document.getElementById('actorEditThumb');
+        if (thumbFieldEl) delete thumbFieldEl.dataset.uploadedFile;
+      }
+
+      if (result.actor.thumb) updateActorPreview(result.actor.thumb, forceOverwrite);
+
+      const sourceInfo = document.getElementById('actorEditSourceInfo');
+      const sourceSpan = document.getElementById('actorEditSource');
+      if (result.actor.meta && result.actor.meta.sources && result.actor.meta.sources.length > 0) {
+        if (sourceSpan) sourceSpan.textContent = result.actor.meta.sources.join(', ');
+        if (sourceInfo) sourceInfo.style.display = 'block';
+      }
+
+      if (searchStatus) {
+        searchStatus.style.color = '#28a745';
+        searchStatus.textContent = window.i18n ? window.i18n.t('messages.actorDataFound') : '✓ Data found!';
+        setTimeout(() => { searchStatus.style.display = 'none'; }, 3000);
+      }
+    } else {
+      if (searchStatus) {
+        searchStatus.style.color = '#dc3545';
+        searchStatus.textContent = result.error || (window.i18n ? window.i18n.t('messages.actorNotFound') : 'Actor not found');
+        setTimeout(() => { searchStatus.style.display = 'none'; }, 5000);
+      }
+    }
+  } catch (error) {
+    console.error('Error searching actor:', error);
+    if (searchStatus) {
+      searchStatus.style.color = '#dc3545';
+      searchStatus.textContent = window.i18n ? window.i18n.t('messages.errorSearchingActor') : 'Error searching actor';
+      setTimeout(() => { searchStatus.style.display = 'none'; }, 5000);
+    }
+  } finally {
+    searchBtn.disabled = false;
+    if (searchText) searchText.textContent = window.i18n ? window.i18n.t('actorModal.searchActor') : 'Search Actor';
+  }
+}
+
+// Delete local actor image (library context only)
+async function deleteActorImage() {
+  if (!unifiedCurrentActor || !unifiedCurrentActor.id) return;
+
+  const msg = window.i18n ? window.i18n.t('messages.confirmDeletePhoto') : 'Delete the local photo?';
+  if (!confirm(msg)) return;
+
+  try {
+    const response = await fetch('/api/actors/delete-image', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: unifiedCurrentActor.id })
+    });
+    const result = await response.json();
+    if (!result.ok) { alert('Failed to delete image: ' + (result.error || 'Unknown error')); return; }
+
+    const thumbField = document.getElementById('actorEditThumb');
+    updateActorPreview(thumbField?.value.trim() || '');
+
+    if (typeof loadActors === 'function') await loadActors();
+
+    const deletePhotoBtn = document.getElementById('actorEditDeletePhoto');
+    if (deletePhotoBtn) deletePhotoBtn.style.display = 'none';
+  } catch (error) {
+    console.error('Failed to delete image:', error);
+    alert('Error deleting image');
+  }
+}
+
+// Upload actor image (unified for both contexts)
+// If actor name is available, passes it to the server for direct cache save
+async function uploadActorImage() {
+  const fileInput = document.getElementById('actorEditUpload');
+  const uploadStatus = document.getElementById('actorEditUploadStatus');
+
+  if (!fileInput.files || fileInput.files.length === 0) {
+    if (uploadStatus) { uploadStatus.style.display = 'block'; uploadStatus.style.color = '#dc3545'; uploadStatus.textContent = window.i18n ? window.i18n.t('messages.selectFileFirst') : 'Please select a file first'; setTimeout(() => { uploadStatus.style.display = 'none'; }, 3000); }
+    return;
+  }
+
+  const file = fileInput.files[0];
+  if (file.size > 5 * 1024 * 1024) {
+    if (uploadStatus) { uploadStatus.style.display = 'block'; uploadStatus.style.color = '#dc3545'; uploadStatus.textContent = window.i18n ? window.i18n.t('messages.fileTooLarge') : 'File too large (max 5MB)'; setTimeout(() => { uploadStatus.style.display = 'none'; }, 3000); }
+    return;
+  }
+
+  const uploadBtn = document.getElementById('actorEditUploadBtn');
+  if (uploadBtn) uploadBtn.disabled = true;
+  if (uploadStatus) { uploadStatus.style.display = 'block'; uploadStatus.style.color = '#667eea'; uploadStatus.textContent = window.i18n ? window.i18n.t('messages.uploading') : 'Uploading...'; }
+
+  try {
+    const formData = new FormData();
+    formData.append('image', file);
+
+    // Include actor name so server can save directly to cache
+    const actorName = (document.getElementById('actorEditName')?.value || '').trim();
+    if (actorName) formData.append('actorName', actorName);
+
+    const response = await fetch('/item/actors/upload-image', { method: 'POST', body: formData });
+    const result = await response.json();
+
+    if (result.ok && result.url) {
+      const thumbField = document.getElementById('actorEditThumb');
+      if (thumbField) {
+        thumbField.value = result.url;
+        // Mark as uploaded file so save handler knows to finalize it
+        thumbField.dataset.uploadedFile = result.url;
+      }
+
+      // Show preview directly (temp or final URL)
+      const previewImg = document.getElementById('actorEditPreviewImg');
+      const placeholder = document.getElementById('actorEditPreviewPlaceholder');
+      if (previewImg && placeholder) {
+        previewImg.src = result.url + '?t=' + Date.now();
+        previewImg.style.display = 'block';
+        placeholder.style.display = 'none';
+      }
+
+      fileInput.value = '';
+
+      if (uploadStatus) {
+        uploadStatus.style.color = '#28a745';
+        uploadStatus.textContent = window.i18n ? window.i18n.t('messages.imageUploadedSuccess') : '✓ Image uploaded!';
+        setTimeout(() => { uploadStatus.style.display = 'none'; }, 3000);
+      }
+    } else {
+      throw new Error(result.error || 'Upload failed');
+    }
+  } catch (error) {
+    console.error('Error uploading image:', error);
+    if (uploadStatus) {
+      uploadStatus.style.color = '#dc3545';
+      uploadStatus.textContent = error.message || 'Upload failed';
+      setTimeout(() => { uploadStatus.style.display = 'none'; }, 5000);
+    }
+  } finally {
+    if (uploadBtn) uploadBtn.disabled = false;
+  }
+}
+
+// Setup event listeners — works for both contexts
+function setupActorModalEventListeners() {
+  if (!document.getElementById('actorEditModal')) {
+    window.addEventListener('actorModalLoaded', () => setupActorModalEventListeners(), { once: true });
+    return;
+  }
+
+  const get = (id) => document.getElementById(id);
+
+  get('actorEditCancel').onclick = closeActorModal;
+
+  const closeBtn = get('actorEditModalClose');
+  if (closeBtn) closeBtn.onclick = closeActorModal;
+
+  get('actorEditSave').onclick = saveActor;
+  get('actorEditRemove').onclick = deleteActor;
+
+  // Close only on a genuine click on the backdrop: both mousedown and mouseup
+  // must start/end on the backdrop itself, so selecting text inside the modal
+  // and releasing the mouse outside its perimeter doesn't close it.
+  const modal = get('actorEditModal');
+  if (modal) {
+    let mouseDownOnBackdrop = false;
+    modal.onmousedown = (e) => { mouseDownOnBackdrop = (e.target === modal); };
+    modal.onmouseup = (e) => {
+      if (mouseDownOnBackdrop && e.target === modal) closeActorModal();
+      mouseDownOnBackdrop = false;
+    };
+  }
+
+  get('actorEditThumb').oninput = (e) => updateActorPreview(e.target.value);
+
+  get('actorEditSearch').onclick = searchActor;
+
+  const uploadBtn = get('actorEditUploadBtn');
+  if (uploadBtn) uploadBtn.onclick = uploadActorImage;
+
+  const deletePhotoBtn = get('actorEditDeletePhoto');
+  if (deletePhotoBtn) deletePhotoBtn.onclick = deleteActorImage;
+}
+
+window.ActorModal = {
+  setActorModalMode,
+  registerMovieContextHandlers,
+  openActorModal,
+  closeActorModal,
+  updateActorPreview,
+  saveActor,
+  deleteActor,
+  searchActor,
+  deleteActorImage,
+  uploadActorImage,
+  setupActorModalEventListeners,
+  get unifiedCurrentActor() { return unifiedCurrentActor; }
+};

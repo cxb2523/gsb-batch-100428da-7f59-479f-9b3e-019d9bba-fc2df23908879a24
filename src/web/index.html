@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <title>Javinizer-JS</title>
+  <link rel="apple-touch-icon" sizes="180x180" href="favicon/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="favicon/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="16x16" href="favicon/favicon-16x16.png">
+  <link rel="manifest" href="favicon/site.webmanifest">
+  <link rel="stylesheet" href="navbar.css">
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="modal.css">
+  <script src="i18n.js?v=5"></script>
+  <script src="navbar-loader.js?v=11"></script>
+  <script src="i18n-bindings.js?v=4"></script>
+  <script src="actor-modal.js?v=14"></script>
+  <script src="actor-modal-loader.js?v=9"></script>
+  <script defer src="app.js?v=15"></script>
+</head>
+<body>
+
+<!-- Navbar will be loaded here by navbar-loader.js -->
+
+<!-- Main Container -->
+<div class="main-container">
+
+  <!-- Left Column -->
+  <div class="left-column">
+
+    <!-- Navigation Panel -->
+    <div class="navigation-panel">
+      <div class="nav-controls">
+        <button id="prev"><img src="images/caret-left-square-fill.svg" alt="Previous"></button>
+        <h2 id="current-id">---</h2>
+        <button id="next"><img src="images/caret-right-square-fill.svg" alt="Next"></button>
+      </div>
+    </div>
+
+    <!-- Fanart Container -->
+    <div class="fanart-container">
+      <h3 data-i18n="sections.fanart">Fanart</h3>
+      <div class="fanart-image">
+        <img id="fanartImage" src="" alt="Fanart" style="display: none;">
+        <span id="fanartPlaceholder" data-i18n="placeholders.noImage">No image</span>
+        <div class="fanart-badges">
+          <img id="fanartBadgeLeaked" src="images/lk.png" alt="Leaked" title="Leaked" style="display: none;">
+          <img id="fanartBadgeDecensored" src="images/dc.png" alt="Decensored" title="Decensored" style="display: none;">
+          <img id="fanartBadgeUncensored" src="images/unc.png" alt="Uncensored" title="Uncensored" style="display: none;">
+        </div>
+      </div>
+      <div class="play-button-container" style="margin-top: 10px; display: none;">
+        <button id="playVideo" class="play-button" data-i18n="buttons.play">▶ Play</button>
+        <button id="openFolder" class="open-folder-button" data-i18n="buttons.openFolder" style="display: none;">📁 Open Folder</button>
+      </div>
+      <div class="rating-stars-container" id="ratingStarsContainer">
+        <div class="rating-stars" id="ratingStars">
+          <span class="star" data-star="1">★</span>
+          <span class="star" data-star="2">★</span>
+          <span class="star" data-star="3">★</span>
+          <span class="star" data-star="4">★</span>
+          <span class="star" data-star="5">★</span>
+        </div>
+        <span class="rating-value" id="ratingValueLabel"></span>
+      </div>
+    </div>
+
+    <!-- Config Panel -->
+    <div class="config-panel">
+      <h3 data-i18n="sections.libraryPath">Library Path</h3>
+      <div id="libraryPathsList"></div>
+      <button id="browseLibrary" type="button" class="add-library-path" data-i18n="buttons.addLibraryPath">📁 + Add folder</button>
+      <small data-i18n="messages.libraryPathHelp">Click the button to select the library folder</small>
+      <p id="libraryStatus" style="margin-top: 10px; font-size: 12px; color: #666;">Loading...</p>
+
+      <!-- Mode Toggle -->
+      <h3 style="margin-top: 20px;" data-i18n="sections.mode">Mode</h3>
+      <div class="mode-toggle">
+        <button id="modeEdit" class="mode-btn" data-i18n="buttons.edit">EDIT</button>
+        <button id="modeScrape" class="mode-btn active" data-i18n="buttons.scrape">SCRAPE</button>
+      </div>
+
+    </div>
+
+    <!-- Scraper Panel -->
+    <div id="mainScraperPanel" class="scraper-panel">
+      <h3 data-i18n="sections.scraperPanel">Scraper Panel</h3>
+      <p id="scrapeStatus" style="margin-top: 10px; font-size: 12px; color: #666;">No items available</p>
+      <button id="scrapeNow" class="scrape-now-btn" style="margin-top: 10px; width: 100%;" data-i18n="buttons.scrapeNow">🔍 Scrape Now!</button>
+      <div style="margin-top: 10px; width: 100%;">
+        <label for="rescrapeDropdown" style="display: block; margin-bottom: 5px; font-size: 12px; color: #666; font-weight: normal;" data-i18n="sections.rescrapeCurrentMovie">Re-scrape Current Movie:</label>
+        <select id="rescrapeDropdown" class="rescrape-dropdown" style="width: 100%; padding: 8px; border-radius: 4px; border: 1px solid #ccc; background: white; cursor: pointer; font-weight: normal;">
+          <option value="" data-i18n="buttons.selectScraper">-- Select Scraper --</option>
+          <option value="__all__" data-i18n="buttons.allConfiguredScrapers">⚙️ All Configured Scrapers (priority order)</option>
+        </select>
+      </div>
+      <button id="clearCache" class="clear-cache-btn" style="margin-top: 10px; width: 100%; background: #6c757d;" data-i18n="buttons.clearCache">🗑️ Clear Scrapers Cache</button>
+      <div class="delete-buttons-row">
+        <button id="deleteItem" class="delete-item-btn" data-i18n="buttons.deleteItem">🗑️ Delete Item</button>
+        <button id="deleteAllItems" class="delete-all-items-btn" data-i18n="buttons.deleteAllItems">🗑️ Delete All Items</button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Right Column -->
+  <div class="right-column">
+
+    <!-- Basic Info Section -->
+    <div class="form-section">
+      <h3 data-i18n="sections.basicInfo">Basic Information</h3>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label data-i18n="fields.id">ID</label>
+          <input id="id">
+        </div>
+        <div class="form-group">
+          <label data-i18n="fields.contentId">Content ID</label>
+          <input id="contentId">
+        </div>
+      </div>
+
+      <div class="form-row single">
+        <div class="form-group">
+          <label data-i18n="fields.title">Title</label>
+          <input id="title">
+        </div>
+      </div>
+
+      <div class="form-row single">
+        <div class="form-group">
+          <label data-i18n="fields.alternateTitle">Alternate Title</label>
+          <input id="alternateTitle">
+        </div>
+      </div>
+
+      <div class="form-row single">
+        <div class="form-group">
+          <label data-i18n="fields.description">Description</label>
+          <input id="description">
+        </div>
+      </div>
+    </div>
+
+    <!-- Production Section -->
+    <div class="form-section">
+      <h3 data-i18n="sections.production">Production</h3>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label data-i18n="fields.director">Director</label>
+          <input id="director">
+        </div>
+        <div class="form-group">
+          <label data-i18n="fields.releaseDate">Release Date</label>
+          <input id="releaseDate" type="date">
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label data-i18n="fields.runtime">Runtime (minutes)</label>
+          <input id="runtime" type="number">
+        </div>
+        <div class="form-group">
+          <label data-i18n="fields.series">Series</label>
+          <input id="series">
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label data-i18n="fields.maker">Maker</label>
+          <input id="maker">
+        </div>
+        <div class="form-group">
+          <label data-i18n="fields.label">Label</label>
+          <input id="label">
+        </div>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label data-i18n="fields.dateAdded">Date Added</label>
+          <input id="dateAdded" type="datetime-local" step="1">
+        </div>
+      </div>
+    </div>
+
+    <!-- Rating Section -->
+    <div class="form-section">
+      <h3 data-i18n="sections.rating">Rating & Classification</h3>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label data-i18n="fields.rating">Rating</label>
+          <input id="rating" type="number" step="0.1" min="0" max="10">
+        </div>
+        <div class="form-group">
+          <label data-i18n="fields.contentRating">Content Rating</label>
+          <input id="contentRating">
+        </div>
+      </div>
+    </div>
+
+    <!-- Categories Section -->
+    <div class="form-section">
+      <h3 data-i18n="sections.categories">Categories</h3>
+
+      <div class="form-row">
+        <div class="form-group">
+          <label data-i18n="fields.genres">Genres (comma separated)</label>
+          <input id="genres">
+        </div>
+        <div class="form-group">
+          <label data-i18n="fields.tags">Tags (comma separated)</label>
+          <input id="tags">
+        </div>
+      </div>
+    </div>
+
+    <!-- Media URLs Section -->
+    <div class="form-section">
+      <h3 data-i18n="sections.mediaUrls">Media URLs</h3>
+
+      <div class="form-row single">
+        <div class="form-group">
+          <label data-i18n="fields.coverUrl">Cover URL</label>
+          <input id="coverUrl" type="url">
+        </div>
+      </div>
+
+      <div class="form-row single">
+        <div class="form-group">
+          <label data-i18n="fields.screenshotUrl">Screenshot URL</label>
+          <input id="screenshotUrl" type="url">
+        </div>
+      </div>
+
+      <div class="form-row single">
+        <div class="form-group">
+          <label data-i18n="fields.trailerUrl">Trailer URL</label>
+          <input id="trailerUrl" type="url">
+        </div>
+      </div>
+    </div>
+
+    <!-- Actors Section -->
+    <div class="actors-section">
+      <h3 data-i18n="sections.actors">Actors</h3>
+      <div class="actors-grid" id="actors-grid">
+        <!-- Actor cards will be inserted here by JS -->
+      </div>
+      <div class="actors-actions-row">
+        <button class="add-actor-btn" id="addActor" type="button" data-i18n="buttons.addActor">+ Add Actor</button>
+        <button class="rescan-actors-btn" id="rescanActors" type="button" data-i18n="buttons.rescanActors">🔄 Rescan Actors</button>
+      </div>
+      <button class="copy-actors-btn" id="copyActorsToFolder" type="button" data-i18n="buttons.copyActorsToFolder">Copy actors in movie folder</button>
+    </div>
+
+    <!-- Save Panel -->
+    <div class="save-panel">
+      <button id="saveItem">
+        <span id="saveItemText" data-i18n="buttons.save">💾 Save Changes</span>
+        <span id="changesBadge" class="changes-badge" style="display: none;">0</span>
+      </button>
+    </div>
+
+  </div>
+
+</div>
+
+<!-- Actor Edit Modal loaded by actor-modal-loader.js -->
+
+<!-- Directory Browser Modal -->
+<div id="dirBrowserModal" style="display: none;">
+  <div id="dirBrowserOverlay" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); z-index: 1000; display: flex; align-items: center; justify-content: center;">
+    <div id="dirBrowserContent" style="background: white; padding: 20px; border-radius: 8px; max-width: 600px; width: 90%; max-height: 80vh; display: flex; flex-direction: column;">
+      <h3 style="margin-top: 0;" data-i18n="messages.selectDirectory">Select Directory</h3>
+      <div style="display: flex; gap: 10px; margin-bottom: 15px; align-items: center;">
+        <button id="dirBrowserUp" type="button" data-i18n="messages.upDirectory">⬆ Up</button>
+        <input id="dirBrowserPath" type="text" readonly style="flex: 1; background: #f0f0f0;">
+      </div>
+      <div id="dirBrowserList" style="flex: 1; overflow-y: auto; border: 1px solid #ddd; padding: 10px; border-radius: 4px; margin-bottom: 15px;">
+        <!-- Directory list -->
+      </div>
+      <div style="display: flex; gap: 10px; justify-content: flex-end;">
+        <button id="dirBrowserCancel" type="button" style="background-color: #6c757d;" data-i18n="buttons.cancel">Cancel</button>
+        <button id="dirBrowserSelect" type="button" style="background-color: #28a745;" data-i18n="messages.selectThisFolder">Select this folder</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Scraping Progress Modal -->
+<div id="scrapingModal" style="display: none;">
+  <div style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 2000; display: flex; align-items: center; justify-content: center;">
+    <div style="background: white; padding: 30px; border-radius: 12px; max-width: 600px; width: 90%; max-height: 80vh; display: flex; flex-direction: column;">
+      <h2 style="margin-top: 0; margin-bottom: 20px; color: #667eea; font-size: 24px;" data-i18n="messages.scrapingProgress">
+        🔍 Scraping in Progress
+      </h2>
+
+      <div id="scrapingProgress" style="flex: 1; overflow-y: auto; background: #f5f5f5; padding: 15px; border-radius: 8px; font-family: monospace; font-size: 12px; line-height: 1.6; margin-bottom: 20px; max-height: 400px;">
+        <div style="color: #666;" data-i18n="messages.initializing">Initializing...</div>
+      </div>
+
+      <div style="display: flex; gap: 10px; justify-content: flex-end;">
+        <button id="scrapingCancel" type="button" style="background-color: #dc3545; color: white; border: none; padding: 10px 20px; border-radius: 6px; cursor: pointer; font-size: 14px;" data-i18n="buttons.cancel">
+          Cancel
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Scrape Queue Dropdown (body-level to avoid overflow clipping) -->
+<div id="scrapeQueueDropdown" class="scrape-queue-dropdown" style="display:none;"></div>
+
+</body>
+</html>

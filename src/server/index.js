@@ -1,0 +1,387 @@
+// Fail with a clear message on a too old Node.js (e.g. after an in-app update
+// that raised engines.node) instead of crashing later on node:sqlite
+const nodeVersion = require("../../bin/check-node-version");
+if (!nodeVersion.isSupported(process.versions.node)) {
+  console.error(`[ERROR] Node.js ${nodeVersion.requiredVersion()} or newer is required (running ${process.version}). Restart with start.sh / start.bat to download it.`);
+  process.exit(1);
+}
+
+const express = require("express");
+const path = require("path");
+const http = require("http");
+const WebSocket = require("ws");
+
+const itemRoutes = require("./routes");
+
+const app = express();
+const PORT = 4004;
+
+// Create HTTP server (needed for WebSocket)
+const server = http.createServer(app);
+
+// Create WebSocket server
+const wss = new WebSocket.Server({ server });
+
+// ─────────────────────────────
+// Base middleware
+// ─────────────────────────────
+app.use(express.json());
+
+// ─────────────────────────────
+// Static files (WebUI)
+// ─────────────────────────────
+app.use("/", express.static(
+  path.join(__dirname, "../web")
+));
+
+// ─────────────────────────────
+// Serve media files - looks in multiple locations
+// First checks temp directory (for uploaded images), then actors cache, then checks absolute paths in library, then relative paths in library
+// ─────────────────────────────
+app.use("/media", (req, res) => {
+  const fs = require("fs");
+
+  // Remove /media/ prefix from URL
+  const requestedFile = decodeURIComponent(req.url.substring(1));
+
+  // First, try to find the file in temp directory (for newly uploaded images)
+  const tempPath = path.join(process.cwd(), 'data/temp');
+  const tempFilePath = path.join(tempPath, requestedFile);
+  if (fs.existsSync(tempFilePath)) {
+    // File found in temp directory
+    const ext = path.extname(requestedFile).toLowerCase();
+    const contentTypes = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.webp': 'image/webp',
+      '.gif': 'image/gif'
+    };
+    const contentType = contentTypes[ext] || 'application/octet-stream';
+
+    // Set headers
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    // Read file and send as stream instead of using sendFile
+    const readStream = fs.createReadStream(tempFilePath);
+
+    readStream.on('error', (err) => {
+      console.error(`[Media] Error reading temp file:`, err.message);
+      if (!res.headersSent) {
+        res.status(500).send("Error reading file");
+      }
+    });
+
+    return readStream.pipe(res);
+  }
+
+  // Second, try to find the file in actors cache
+  const { getActorsCachePath } = require('../../scrapers/actors/cache-helper');
+  const actorsPath = getActorsCachePath();
+  const actorFilePath = path.join(actorsPath, requestedFile);
+  if (fs.existsSync(actorFilePath)) {
+    // File found in actors cache
+    const ext = path.extname(requestedFile).toLowerCase();
+    const contentTypes = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.webp': 'image/webp',
+      '.gif': 'image/gif'
+    };
+    const contentType = contentTypes[ext] || 'application/octet-stream';
+
+    // Set headers
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    // Read file and send as stream instead of using sendFile
+    const readStream = fs.createReadStream(actorFilePath);
+
+    readStream.on('error', (err) => {
+      console.error(`[Media] Error reading actor file:`, err.message);
+      if (!res.headersSent) {
+        res.status(500).send("Error reading file");
+      }
+    });
+
+    return readStream.pipe(res);
+  }
+
+  // Library files: absolute paths inside a root, or relative paths resolved against each root
+  const config = require('../core/config');
+  const cfg = config.loadConfig();
+  const candidates = path.isAbsolute(requestedFile)
+    ? [requestedFile]
+    : config.getLibraryPaths(cfg).map(root => path.join(root, requestedFile));
+  const libraryFilePath = candidates.find(p => config.isInsideLibrary(cfg, p) && fs.existsSync(p));
+
+  if (libraryFilePath) {
+    const ext = path.extname(requestedFile).toLowerCase();
+    const contentTypes = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.webp': 'image/webp',
+      '.gif': 'image/gif'
+    };
+    const contentType = contentTypes[ext] || 'application/octet-stream';
+
+    // Set headers
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    // Read file and send as stream instead of using sendFile
+    const readStream = fs.createReadStream(libraryFilePath);
+
+    readStream.on('error', (err) => {
+      console.error(`[Media] Error reading library file:`, err.message);
+      if (!res.headersSent) {
+        res.status(500).send("Error reading file");
+      }
+    });
+
+    return readStream.pipe(res);
+  }
+
+  // File not found in any location
+  return res.status(404).send("File not found");
+});
+
+// ─────────────────────────────
+// Serve actor thumbnails
+// ─────────────────────────────
+app.use("/actors", (req, res) => {
+  try {
+    const fs = require("fs");
+    const path = require("path");
+
+    const internalActorsPath = path.join(process.cwd(), 'data/actors');
+
+    let externalActorsPath = null;
+    try {
+      const configPath = path.join(process.cwd(), 'config.json');
+      if (fs.existsSync(configPath)) {
+        const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+        if (config.scrapers && config.scrapers.actors && config.scrapers.actors.externalPath &&
+            config.scrapers.actors.externalPath.trim() !== '') {
+          externalActorsPath = config.scrapers.actors.externalPath;
+        }
+      }
+    } catch (configErr) {
+      console.error('[Server] Error loading config for actors path:', configErr.message);
+    }
+
+    // Get filename from URL — strip query parameters
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    let filename = decodeURIComponent(url.pathname.substring(1));
+
+    // /actors/external/file.jpg → serve from externalPath explicitly
+    let filePath;
+    if (filename.startsWith('external/') && externalActorsPath) {
+      const extFilename = filename.slice('external/'.length);
+      filePath = path.join(externalActorsPath, extFilename);
+      if (!fs.existsSync(filePath)) {
+        return res.status(404).send("Actor thumbnail not found");
+      }
+      filename = extFilename;
+    } else {
+      // Priority: internal cache first (single source of truth, every
+      // upload/scrape writes there), then externalPath as a fallback. Search
+      // each directory fully (exact filename, then any known extension for
+      // the same actor id) before moving to the next — externalPath is only a
+      // copy of favorites and can hold an older photo under another extension.
+      const nameWithoutExt = path.basename(filename, path.extname(filename));
+      const requestedExt = path.extname(filename);
+      const exts = ['.webp', '.jpg', '.jpeg', '.png', '.gif'];
+      const orderedExts = requestedExt
+        ? [requestedExt, ...exts.filter(e => e !== requestedExt)]
+        : exts;
+
+      const parts = nameWithoutExt.split('-');
+      const invertedId = parts.length >= 2
+        ? [...parts.slice(Math.ceil(parts.length / 2)), ...parts.slice(0, Math.ceil(parts.length / 2))].join('-')
+        : null;
+
+      const idsToTry = [nameWithoutExt];
+      if (invertedId && invertedId !== nameWithoutExt) idsToTry.push(invertedId);
+
+      const searchDirs = externalActorsPath
+        ? [internalActorsPath, externalActorsPath]
+        : [internalActorsPath];
+
+      outer: for (const dir of searchDirs) {
+        for (const id of idsToTry) {
+          for (const e of orderedExts) {
+            const candidate = path.join(dir, `${id}${e}`);
+            if (fs.existsSync(candidate)) {
+              filePath = candidate;
+              filename = `${id}${e}`;
+              break outer;
+            }
+          }
+        }
+      }
+    }
+
+    if (!filePath || !fs.existsSync(filePath)) {
+      return res.status(404).send("Actor thumbnail not found");
+    }
+
+    // Determine content type from extension
+    const ext = path.extname(filename).toLowerCase();
+    const contentTypes = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.webp': 'image/webp',
+      '.gif': 'image/gif'
+    };
+    const contentType = contentTypes[ext] || 'application/octet-stream';
+
+    // Set headers
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+
+    // Read file and send as stream instead of using sendFile
+    const readStream = fs.createReadStream(filePath);
+
+    readStream.on('error', (err) => {
+      console.error(`[Server] Error reading actor file:`, err.message);
+      if (!res.headersSent) {
+        res.status(500).send("Error reading file");
+      }
+    });
+
+    readStream.pipe(res);
+  } catch (error) {
+    console.error('[Server] Error in /actors endpoint:', error.message);
+    res.status(500).send("Internal server error");
+  }
+});
+
+
+// ─────────────────────────────
+// API routes
+// ─────────────────────────────
+// Pass WebSocket server to routes for scraping
+app.use("/item", (req, res, next) => {
+  req.wss = wss;
+  next();
+}, itemRoutes);
+
+// Mount API routes (also need WebSocket for actor scraping)
+app.use("/api", (req, res, next) => {
+  req.wss = wss;
+  next();
+}, itemRoutes);
+
+// ─────────────────────────────
+// WebSocket connection handling
+// ─────────────────────────────
+wss.on('connection', (ws) => {
+  console.log('[WebSocket] Client connected');
+
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message);
+      console.log('[WebSocket] Received:', data);
+
+      // Handle prompt responses
+      if (data.type === 'promptResponse' && data.promptId) {
+        if (ws.pendingPrompts && ws.pendingPrompts[data.promptId]) {
+          // Call the callback with the user's response
+          ws.pendingPrompts[data.promptId](data.response);
+          delete ws.pendingPrompts[data.promptId];
+        }
+      }
+
+      // Handle scraper error responses
+      if (data.type === 'scraperErrorResponse') {
+        if (ws.pendingScraperError) {
+          // Call the callback with the user's response (true = continue, false = stop)
+          ws.pendingScraperError(data.continue);
+          ws.pendingScraperError = null;
+        }
+      }
+
+      // Handle legacy responses (for backwards compatibility)
+      if (data.type === 'response' && ws.pendingPromptResolve) {
+        ws.pendingPromptResolve(data.value);
+        ws.pendingPromptResolve = null;
+      }
+    } catch (error) {
+      console.error('[WebSocket] Error parsing message:', error);
+    }
+  });
+
+  ws.on('close', () => {
+    console.log('[WebSocket] Client disconnected');
+  });
+
+  ws.on('error', (error) => {
+    console.error('[WebSocket] Error:', error);
+  });
+});
+
+// ─────────────────────────────
+// Cleanup temp directory on startup
+// ─────────────────────────────
+const { cleanupTempDirectory } = require('../core/utils');
+cleanupTempDirectory();
+
+// ─────────────────────────────
+// Start server
+// ─────────────────────────────
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[Server] Port ${PORT} already in use. Kill the existing process and retry.`);
+    process.exit(1);
+  } else {
+    throw err;
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`WebUI active on http://localhost:${PORT}`);
+
+  // Non-blocking data-quality check: names shared by more than one actor
+  // record (likely duplicate identities, or a name collision) — detection
+  // only, never auto-merged, since telling them apart needs human judgement.
+  try {
+    const { findDuplicateNames } = require('../../scrapers/actors/actorDb');
+    const duplicates = findDuplicateNames();
+    if (duplicates.length > 0) {
+      console.warn(`[actorDb] ${duplicates.length} name(s) shared by multiple actor records — review recommended:`);
+      duplicates.forEach(d => console.warn(`  "${d.name}" -> ${d.actorIds.join(', ')}`));
+    }
+  } catch (err) {
+    console.error('[actorDb] Duplicate-name check failed:', err.message);
+  }
+
+  // actor_movies is otherwise only kept up to date by saves made in the app:
+  // NFOs edited elsewhere, or movies whose actor record didn't exist yet when
+  // they were indexed, leave it with missing links (wrong "N movies" counts).
+  // Rebuild it on every boot, delayed so it doesn't compete for disk I/O with
+  // the initial library load.
+  setTimeout(() => {
+    try {
+      require('../core/actorMoviesIndexer').spawnActorMoviesRebuild();
+    } catch (err) {
+      console.error('[actor-movies] Failed to start rebuild:', err.message);
+    }
+  }, 60000).unref();
+
+  // Non-blocking: checks GitHub Releases once per server run, cached for
+  // GET /item/update/check to serve without hitting the API again.
+  require('../core/updateManager').initUpdateCheck();
+});
