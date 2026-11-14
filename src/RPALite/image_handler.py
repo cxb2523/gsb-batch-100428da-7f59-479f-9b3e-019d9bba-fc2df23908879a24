@@ -7,6 +7,10 @@ from difflib import SequenceMatcher
 
 logger = logging.getLogger(__name__)
 
+# Match types used in text matching results
+MATCH_TYPE_EXACT = "exact"  # The target text is exactly contained in the OCR recognized text
+MATCH_TYPE_FUZZY = "fuzzy"  # The target text only matches the OCR recognized text fuzzily
+
 class ImageHandler:
     def __init__(self, debug_mode: bool = False, ocr_engine: str = "paddleocr", languages: List[str] = ['en'], debug_image_show_seconds=5):
         '''
@@ -157,7 +161,8 @@ class ImageHandler:
 
     def find_texts_in_rects(self, image, text, filter_args_in_parent=None, rects=None):
         '''
-        Returns the location information list, format is ((top_x, top_y, width, height), text) of the text in the image.
+        Returns the location information list. Each item is a tuple of
+        ((top_x, top_y, width, height), text, similarity, match_type).
         '''
         if rects == None:
             return self.find_texts_in_image(image, text, filter_args_in_parent)
@@ -177,31 +182,32 @@ class ImageHandler:
         
     def find_texts_in_array_and_rect(self, text, text_arr, image, filter_args_in_parent=None, rect = None):
         '''
-        Returns the location information, format is (top_x, top_y, width, height, ratio) of the text in the image.
+        Returns the location information of the text in the image. Each result is a tuple of
+        (location, target_text, similarity, match_type), where location is (top_x, top_y, width, height),
+        target_text is the OCR recognized text, similarity is the matching score (1.0 for exact
+        containment matches) and match_type is MATCH_TYPE_EXACT (exact containment) or
+        MATCH_TYPE_FUZZY (fuzzy match). Returns None if no match is found.
         '''
         if text_arr is None:
             return None
-            
+
         results = []
-        (position, target_text, best_ratio) = None, None, 0
-        for r in text_arr:  
+        for r in text_arr:
             ratio = SequenceMatcher(None, r[1], text).ratio()
-            if  text in r[1]: 
-                if ((rect is not None and self.check_point_inide_rect(r[0][0], rect)) or rect is None) and self.check_text_and_filter_in_window(image, text_arr, r[0], r[1], filter_args_in_parent, rect): 
-                    position = r[0]
-                    target_text = r[1]
-                    location = position[0][0], position[0][1], position[1][0]-position[0][0], position[3][1]-position[0][1]
+            if text in r[1]:
+                match_type = MATCH_TYPE_EXACT
+                similarity = 1.0
+            elif ratio > 0.75:
+                match_type = MATCH_TYPE_FUZZY
+                similarity = ratio
+            else:
+                continue
 
-                    results.append( (location, target_text, 1))
-
-            elif ratio > best_ratio and ratio > 0.75 and ((rect is not None and self.check_point_inide_rect(r[0][0], rect)) or rect is None) and self.check_text_and_filter_in_window(image, text_arr, r[0], r[1], filter_args_in_parent, rect):
-                best_ratio = ratio
-                target_text = r[1]
+            if ((rect is not None and self.check_point_inide_rect(r[0][0], rect)) or rect is None) and self.check_text_and_filter_in_window(image, text_arr, r[0], r[1], filter_args_in_parent, rect):
                 position = r[0]
-                
                 location = position[0][0], position[0][1], position[1][0]-position[0][0], position[3][1]-position[0][1]
 
-                results.append((location, target_text, ratio))
+                results.append((location, r[1], similarity, match_type))
 
         if len(results) == 0:
             return None
@@ -211,7 +217,8 @@ class ImageHandler:
 
     def find_texts_in_image(self, image, text, filter_args_in_parent=None, rect=None):
         '''
-        Returns the location information, format is (top_x, top_y, width, height) of the text in the image.
+        Returns the location information list. Each item is a tuple of
+        ((top_x, top_y, width, height), text, similarity, match_type).
         If the text is not found, returns None.
         '''
         

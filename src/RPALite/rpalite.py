@@ -801,56 +801,80 @@ class RPALite:
             raise AssertionError('Text not found: ' + text)
         return position
     
-    def find_text_positions(self, text, filter_args_in_parent=None, parent_control = None, img = None, exact_match=False):
+    @not_keyword
+    def _build_text_match_detail(self, location_result):
+        '''Build a match detail dict from a text matching result of ImageHandler.
+        The result tuple is (location, target_text, similarity, match_type). Older 3-element
+        results without match_type are tolerated.
+        '''
+        return {
+            'location': location_result[0],
+            'text': location_result[1] if len(location_result) > 1 else None,
+            'similarity': location_result[2] if len(location_result) > 2 else None,
+            'match_type': location_result[3] if len(location_result) > 3 else None,
+        }
+
+    def find_text_positions(self, text, filter_args_in_parent=None, parent_control = None, img = None, exact_match=False, return_match_details=False):
         '''Find a text in the current screen. This function will return the location if the text exists, otherwise it will return None.
-        
+
         Parameters
         ----------
         text : str
             The text to search for.
-        
+
         filter_args_in_parent : dict
             The filter arguments to filter the parent control. This is used to find the parent control of the text. If not specified, the parent control will be considered during search.
-        
+
         parent_control : uiautomation control
             The parent control to search in. If not specified, the function will search all controls.
 
         img : PIL.Image
             The image to search in. If not specified, the function will take a screenshot and search in the screenshot.
-        
+
+        exact_match : bool
+            Whether to filter the results with exact match criterias. Default is False.
+
+        return_match_details : bool
+            Whether to return the matching details (match type and similarity) together with the locations. Default is False, in which case only a list of location tuples is returned.
+
         Returns
         -------
-        tuple
-            The location of the text in the screen. The location is a tuple of (x, y, width, height).
+        list
+            If return_match_details is False (default), a list of location tuples (x, y, width, height).
+            If return_match_details is True, a list of dicts, each with keys:
+            'location' (the (x, y, width, height) tuple), 'text' (the OCR recognized text),
+            'similarity' (the matching score, 1.0 for exact containment matches) and
+            'match_type' ('exact' for exact containment matches, 'fuzzy' for fuzzy matches).
+            Returns None if the text is not found.
         '''
         if img is None:
             img = self.take_screenshot()
-        
+
         locations = self.image_handler.find_texts_in_rects(img, text, filter_args_in_parent, parent_control)
         if(locations is None or len(locations) == 0):
             return None
-        elif exact_match: 
+        elif exact_match:
             filtered_locations = []
             for loc in locations:
                 target_text = loc[1]
                 # Condition 1: Check for text mutual inclusion
                 if text not in target_text and target_text not in text:
                     continue
-                
+
                 # Condition 2: Check text length ratio
                 len_ratio = len(text) / len(target_text) if len(target_text) > 0 else 0
                 if not (0.75 <= len_ratio <= 1.3):
                     continue
-                
+
                 filtered_locations.append(loc)
-            
-            if filtered_locations:
-                return [loc[0] for loc in filtered_locations]
 
-            return None
-        else:
-            return [loc[0] for loc in locations]
+            if not filtered_locations:
+                return None
+            locations = filtered_locations
 
+        if return_match_details:
+            return [self._build_text_match_detail(loc) for loc in locations]
+        return [loc[0] for loc in locations]
 
     def find_application(self, title=None, class_name=None):
         '''Find an application by its title or ClassName.'''
@@ -1136,13 +1160,12 @@ class RPALite:
             The image to search from. This can be the path of image or PIL image.
             
         timeout: int
-            Maximum time to wait in seconds.
-            
+            Maximum time to wait in seconds. If the image is not found within the timeout, an AssertionError will be raised.
+
         Returns
         -------
         tuple
             The location of the image in the screen. The location is a tuple of (x, y, width, height).
-            None if the image is not found within the timeout period.
         '''
         start_time = datetime.now()
         while True:
@@ -1154,7 +1177,6 @@ class RPALite:
                 if(diff.seconds > timeout):
                     raise AssertionError('Timeout waiting for image')
                 self.sleep(1)
-                return location
 
     def click_by_text_inside_window(self, text, window_title, button='left', double_click= False):
         '''Click the positon of a string on screen. '''
