@@ -23,6 +23,10 @@ How the Solana flow differs from Robinhood (the engine gets everything via token
 - excluded_addresses/market_addresses are extended with PDAs found during the scan
   (pools, vaults, lockers), so they are called after supply_base/get_token_transfers;
 - classify_entries returns kind=None, unread=True for a wallet with no entry found;
+- get_token_transfers returns (transfers, skipped): token accounts whose history could not be read
+  in full are listed in skipped (address, owner, reason) instead of being dropped silently — they
+  produce no transfers at all, so the caller must not treat them as wallets without history;
+  token_facts passes the list on to the engine (facts["skipped"]);
 - wallet_distinct_tokens returns None if it did not fit in the read limit (we do not guess);
 - a pack is buys within PACK_WINDOW slots, not within one block.
 Funding is not implemented (USE_FUNDING = False): eth_inflows/outgoing_count — NotImplementedError.
@@ -102,6 +106,11 @@ EARLY_OUT_CAP = 20         # transactions of a buyer's token account (newest) fo
 TX_CACHE_MAX = 50_000      # transactions in the process cache
 BUY_MATCH = 0.06           # matching tolerance: market sent ≈ wallet received (fees, tax)
 TXOPT = {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 1, "commitment": "confirmed"}
+
+# Why a token account is listed in get_token_transfers' skipped list (its history was not read in full:
+# no transfers of such an account are returned, so it must not be taken for a wallet without history)
+SKIP_TOO_LONG = "history truncated: page cap reached ({pages} × {limit} signatures, more may follow)"
+SKIP_UNAVAILABLE = "history unavailable: getSignaturesForAddress failed"
 
 # ---------------------------------------------------------------------------
 # base58, ed25519, PDA
@@ -511,15 +520,17 @@ def is_pool_owner(owner):
 
 def token_facts(token, launch):
     """Token facts for the engine (shared chain contract): {"supply", "transfers", "excluded",
-    "market", "reserve", "reserve_ok", "base"}. base — top 20 balances (detect.supply_base shape); transfers — only
+    "market", "reserve", "reserve_ok", "base", "skipped"}. base — top 20 balances (detect.supply_base shape); transfers — only
     over the top 20 holders' token accounts (sells, distributors, direct transfers, entries).
+    skipped — token accounts whose history was not read in full ({"account", "owner", "reason"}, see
+    get_token_transfers): their transfers are missing from "transfers", so they are not wallets without history.
     reserve — liquidity tokens for dump_impact: on the curve — its virtual_token_reserves (the curve
     prices off them; no field — the curve's real balance), after migration (complete) — the real
     balance of the pools: top 20 accounts whose owner is a DEX pool (is_pool_owner: a DEX program PDA or
     a Raydium/Meteora vault authority). reserve_ok — the reserve is reliably known: always on the curve,
     after migration — only if a pool was found (reserve > 0; 0 means "not found", not "no liquidity")."""
     base = supply_base(token, launch)
-    transfers = get_token_transfers(token, launch["block"])
+    transfers, skipped = get_token_transfers(token, launch["block"])
     rows = top_accounts(token)
     if launch.get("complete"):
         reserve = sum(r["amount"] for r in rows if r["owner"] != launch["curve"] and is_pool_owner(r["owner"]))
@@ -529,7 +540,8 @@ def token_facts(token, launch):
     else:
         reserve, ok = sum(r["amount"] for r in rows if r["owner"] == launch["curve"]), True
     return {"supply": base["supply"], "transfers": transfers, "excluded": excluded_addresses(launch["curve"]),
-            "market": market_addresses(launch["curve"]), "reserve": reserve, "reserve_ok": ok, "base": base}
+            "market": market_addresses(launch["curve"]), "reserve": reserve, "reserve_ok": ok, "base": base,
+            "skipped": skipped}
 
 
 def market_addresses(curve):
@@ -550,7 +562,8 @@ _ACC_HIST = {}  # (token, account) -> (signatures old → new, truncated)
 
 
 def _account_history(token, accounts):
-    """History of holders' token accounts: one getSignaturesForAddress batch for all of them."""
+    """History of holders' token accounts: one getSignaturesForAddress batch for all of them.
+    {account: (signatures old → new, truncated)}; a failed page is not cached and is absent here."""
     need = [a for a in accounts if (token, a) not in _ACC_HIST]
     res = rpc_batch([("getSignaturesForAddress", [a, {"limit": SIG_PAGE}]) for a in need], chunk=20)
     for a, page in zip(need, res):
@@ -564,19 +577,33 @@ def _account_history(token, accounts):
     return {a: _ACC_HIST.get((token, a)) for a in accounts}
 
 
+def _skip_reason(h):
+    """Why a token account's history was not read in full (None — it was read)."""
+    if h is None:   # getSignaturesForAddress failed: nothing is known about the account
+        return SKIP_UNAVAILABLE
+    if h[1]:
+        return SKIP_TOO_LONG.format(pages=HOLDER_MAX_PAGES, limit=SIG_PAGE)
+    return None
+
+
 def get_token_transfers(token, from_block=0, wallets=None):
     """Token transfers over the token accounts of wallets in wallets (default — top 20 owners),
-    starting from slot from_block: [{"frm", "to", "amount", "tx", "block" (slot), "log_index"}],
+    starting from slot from_block: ([{"frm", "to", "amount", "tx", "block" (slot), "log_index"}], skipped),
     in chain order. HOLDER_TX_CAP transactions are read per account: the oldest (entry) and the
-    newest (sells, transfers); history longer than HOLDER_MAX_PAGES pages — the account is skipped."""
+    newest (sells, transfers). An account whose history is longer than HOLDER_MAX_PAGES pages is not read
+    at all: its transfers are absent from the list, so it goes to skipped ({"account", "owner", "reason"}) —
+    the caller must not take such an account for one without history."""
     rows = top_accounts(token)
     want = set(wallets) if wallets is not None else {r["owner"] for r in rows if not r["pda"] and r["owner"]}
     accs = [r["account"] for r in rows if r["owner"] in want]
+    owner_of = {r["account"]: r["owner"] for r in rows}
     hist = _account_history(token, accs)
-    pick = {}
+    pick, skipped = {}, []
     for a in accs:
         h = hist.get(a)
-        if not h or h[1]:
+        reason = _skip_reason(h)
+        if reason:
+            skipped.append({"account": a, "owner": owner_of.get(a), "reason": reason})
             continue
         sigs = h[0]
         chosen = sigs if len(sigs) <= HOLDER_TX_CAP else sigs[:10] + sigs[-(HOLDER_TX_CAP - 10):]
@@ -598,7 +625,7 @@ def get_token_transfers(token, from_block=0, wallets=None):
                 out.append({"frm": frm, "to": to, "amount": amt, "tx": sig, "block": tx["slot"],
                             "log_index": i, "_ti": s.get("transactionIndex") or 0})
     out.sort(key=lambda t: (t["block"], t.pop("_ti"), t["tx"], t["log_index"]))
-    return out
+    return out, skipped
 
 
 def _buy_lamports(tx, token, wallet, market):

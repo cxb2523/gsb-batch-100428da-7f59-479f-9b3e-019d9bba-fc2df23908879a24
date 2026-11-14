@@ -25,6 +25,7 @@ class TestScan(unittest.TestCase):
         self.assertIsInstance(res["score"], int)
         self.assertIn(res["band"], ("CLEAN", "OK", "RISKY", "DANGER"))
         self.assertEqual(res["unread"], [])
+        self.assertEqual(res["skipped"], [])                             # every token account was read in full
         self.assertTrue(res["headline"].startswith(f"{fakes.N_WALLETS} wallets → "))
         self.assertEqual(res["header"]["ticker"], "SYN")               # GT empty -> name and ticker from the contract
         # bundle in one transaction -> proven operator from BUNDLE wallets

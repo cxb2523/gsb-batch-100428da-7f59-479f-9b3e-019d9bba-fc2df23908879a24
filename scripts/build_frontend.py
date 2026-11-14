@@ -71,7 +71,9 @@ Patches:
     vertical with the text under the dot; header item «timeline» (#timeline).
   - Bankr (only with /api/config → bankr and only for Bankr tokens): badge and pair in the header, pool fact, dev vesting
     on the operator criterion, partial scan message and rescan once the index is ready (/api/index), badge in the feed,
-    Bankr in the launchpad text and a roadmap card.
+    Bankr in the launchpad text and a roadmap card;
+  - Solana coverage note: holders whose token account history was not read in full (result "skipped") — a note under
+    the headline saying how many accounts are missing and why.
 
 If the design changed so that a patch anchor is not found, the script fails with a clear error
 and does not overwrite index.html.
@@ -1847,7 +1849,16 @@ rep("background:rgba(244,114,182,0.08)\">Flap</span></sc-if>\n            </div>
     f'            <sc-if value="{{{{bankrOn}}}}" hint-placeholder-val="{{{{false}}}}"><div data-bankr-info="1" style="display:flex;flex-wrap:wrap;align-items:center;gap:6px 8px;min-width:0">'
     f'<span style="{FPILL};color:#c9d1d6;border:1px solid #2c353b;background:#0b1013">{{{{bankrPair}}}}</span></div></sc-if>\n')
 HEADLINE_P = '<p data-grip="1" style="margin:0;font-size:19px;line-height:1.35;color:#eef1f3;letter-spacing:-0.01em;text-wrap:pretty">{{headline}}</p>\n'
-rep(HEADLINE_P, HEADLINE_P + f'              <sc-if value="{{{{partialOn}}}}" hint-placeholder-val="{{{{false}}}}"><span data-partial="1" style="{MONO};font-size:12.5px;line-height:1.5;color:#f5a623;padding:10px 12px;border:1px solid rgba(245,166,35,0.45);border-radius:8px;background:rgba(245,166,35,0.08);text-wrap:pretty">{{{{partialText}}}}</span></sc-if>\n')
+rep(HEADLINE_P, HEADLINE_P + f'              <sc-if value="{{{{partialOn}}}}" hint-placeholder-val="{{{{false}}}}"><span data-partial="1" style="{MONO};font-size:12.5px;line-height:1.5;color:#f5a623;padding:10px 12px;border:1px solid rgba(245,166,35,0.45);border-radius:8px;background:rgba(245,166,35,0.08);text-wrap:pretty">{{{{partialText}}}}</span></sc-if>\n'
+    + f'              <sc-if value="{{{{skipOn}}}}" hint-placeholder-val="{{{{false}}}}"><span data-skipped="1" style="{MONO};font-size:12.5px;line-height:1.5;color:#c0cbd1;padding:10px 12px;border:1px solid rgba(95,107,114,0.5);border-radius:8px;background:rgba(95,107,114,0.08);text-wrap:pretty">{{{{skipText}}}}</span></sc-if>\n')
+# Solana truncated holder history (engine result "skipped"): the scan says its coverage is incomplete
+rep("  blank(ca){return {", """  skipVals(){   // token accounts not read in full (Solana: history longer than the page cap): say so
+    const raw=this.m&&this.m.result&&this.m.result.raw, sk=raw&&this.m.done?raw.skipped:null;
+    const n=Array.isArray(sk)?sk.length:0, reason=n?(sk[0].reason||'history truncated'):'';
+    return {skipOn:n>0, skipText:n?`Coverage incomplete: ${n} token account${n>1?'s':''} not read in full (${reason})${n>1?` and ${n-1} more`:''}. Their transfers are missing from this scan.`:''};
+  }
+  blank(ca){return {""")
+rep("      ...this.bankrVals(),\n", "      ...this.bankrVals(),\n      ...this.skipVals(),\n")
 # operator criterion: dev vesting next to it
 rep("+(done&&imp?` · dump ${imp}`:''):null,",
     "+(done&&imp?` · dump ${imp}`:'')+(done&&this.state.bankrOn&&bankrVesting(bankrOf(res&&res.raw))?' · '+bankrVesting(bankrOf(res.raw)):''):null,")

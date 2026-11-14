@@ -147,6 +147,7 @@ def established_result(token, chain, gt, limits, ev, t0, rpc_requests=0):
             "score": None, "band": d.TOO_ESTABLISHED, "headline": d.ESTABLISHED_HEADLINE,
             "reason": d.ESTABLISHED_TEXT, "parts": {}, "gates": [], "metrics": {}, "rug": None,
             "holders": [], "holders_total": None, "operators": [], "links": [], "packs": [], "unread": [],
+            "skipped": [],
             "established": {"liquidity_usd": gt.get("liquidity_usd"), "mcap_usd": gt.get("mcap_usd"),
                             "age_days": age, "limits": limits},
             "market_source": gt.get("source"), "market_pool": gt.get("pool"),
@@ -163,6 +164,7 @@ def active_result(token, chain, gt, launch, info, est_logs, ev, t0, rpc_requests
             "launch": launch, "score": None, "band": d.TOO_ACTIVE, "headline": d.ACTIVE_HEADLINE,
             "reason": d.ACTIVE_TEXT, "parts": {}, "gates": [], "metrics": {}, "rug": None,
             "holders": [], "holders_total": None, "operators": [], "links": [], "packs": [], "unread": [],
+            "skipped": [],
             "too_active": {"est_logs": est_logs}, "partial_scan": None, "limited": False,
             "market_source": gt.get("source"), "market_pool": gt.get("pool"),
             "elapsed_s": round(time.time() - t0, 1), "rpc_requests": rpc_requests}
@@ -352,6 +354,14 @@ def scan(token, emit=lambda e: None):
         ts0 = a.block_timestamps([launch["block"]]).get(launch["block"])
         return active_result(token, chain, gt, launch | {"ts": ts0}, info, e.est_logs, ev, t0, a.REQUESTS[0] - r0)
     transfers, supply, excluded, mkt = facts["transfers"], facts["supply"], facts["excluded"], facts["market"]
+    # Token accounts whose history the adapter could not read in full (Solana: get_token_transfers.skipped).
+    # Their owner's own transfers are missing, so such a wallet is unread — not a wallet without history —
+    # and it must not become evidence for links: even the legs that did surface from the other side of a
+    # transfer are a one-sided picture of an account we did not read.
+    skipped = facts.get("skipped") or []
+    skipped_owners = {s.get("owner") for s in skipped if s.get("owner")}
+    linked_trs = ([t for t in transfers if t["frm"] not in skipped_owners and t["to"] not in skipped_owners]
+                  if skipped_owners else transfers)
     base = facts["base"] or d.supply_base(transfers, supply, excluded)
     holders = d.top_holders(base)
     hs = [w for w, _, _ in holders]
@@ -364,9 +374,13 @@ def scan(token, emit=lambda e: None):
     entries = a.classify_entries(token, transfers, hs)
     ts = a.block_timestamps([launch["block"]] + [e["block"] for e in entries.values() if e["block"] is not None])
     sold = d.sellers(transfers, mkt)
-    # entry not found (Solana: kind None) -- no entry time and no history read: unread, not virgin
-    data = {w: entries[w] | {"entry_ts": ts.get(entries[w]["block"]), "inflows": [], "sold": w in sold,
-                             "distinct_tokens": None} for w in hs}
+    # entry not found (Solana: kind None) -- no entry time and no history read: unread, not virgin;
+    # a wallet whose account history was truncated is unread as well: its entry was not read, not missing
+    # (sold stays as seen from the counterparties' transfers: that is a fact, not a signal of this wallet)
+    data = {w: ({**entries[w], "entry_ts": ts.get(entries[w]["block"]), "inflows": [], "sold": w in sold,
+                 "distinct_tokens": None} if w not in skipped_owners else
+                {"kind": None, "tx": None, "block": None, "via": None, "eth_in": None, "unread": True,
+                 "entry_ts": None, "inflows": [], "sold": w in sold, "distinct_tokens": None}) for w in hs}
     unit, scale = NATIVE[chain]
 
     if est := late_established():
@@ -380,7 +394,7 @@ def scan(token, emit=lambda e: None):
     # alerts recheck pool -- also background (chains.priority: yields to live scans in the RPS limiter)
     ex = ThreadPoolExecutor(max_workers=WORKERS,
                             thread_name_prefix=f"{priority.BG}-pool" if priority.is_background() else "")
-    order = [w for w in hs if entries[w]["kind"] is not None]   # hs -- by descending share: largest first
+    order = [w for w in hs if entries[w]["kind"] is not None and w not in skipped_owners]   # by descending share
     width = getattr(a, "HISTORY_PARALLEL", WORKERS)
     left = max(0.05, deadline - DETECT_RESERVE - time.time())
     # time share per wallet: if each fits into it, all make it; whoever takes longer yields the slot to the next
@@ -392,7 +406,8 @@ def scan(token, emit=lambda e: None):
                              launch["block"], a.BUNDLE_WINDOW)[w]
         eth = "" if s["eth_in"] is None else f" {s['eth_in'] / scale:.4f} {unit}"
         fl = _flags(s)
-        when = "entry not found" if data[w]["entry_ts"] is None else f"+{data[w]['entry_ts'] - ts[launch['block']]}s"
+        when = ("token account history truncated" if w in skipped_owners else
+                "entry not found" if data[w]["entry_ts"] is None else f"+{data[w]['entry_ts'] - ts[launch['block']]}s")
         ev("wallet_flag", f"{s['kind'] or 'unknown'}{eth}, {when}"
            + (", " + ", ".join(fl) if fl else ""), wallet=w, spider=spider[w],
            flags=fl, kind=s["kind"], share=share[w], share_supply=share[w] * ratio)
@@ -419,15 +434,16 @@ def scan(token, emit=lambda e: None):
     sig = d.wallet_signals(data, ts[launch["block"]], launch["deployer"], launch["block"], a.BUNDLE_WINDOW)
     packs = d.find_packs(sig, window=a.PACK_WINDOW)
     # token distributors shared by >= 2 holders: only check whether it is a contract
+    # (linked_trs: an account we did not read in full is not evidence for a link, so its transfers are left out)
     hset, by_src = set(hs), {}
-    for t in transfers:
+    for t in linked_trs:
         if t["to"] in hset and t["frm"] not in hset and t["frm"] not in excluded:
             by_src.setdefault(t["frm"], set()).add(t["to"])
     cand = {a for a, ws in by_src.items() if len(ws) > 1}
     contracts = {x for x, c in a.is_contract(cand).items() if c} if cand else set()
     # without funding we do not know outgoing ETH: a distributor wallet (not a contract) is not considered a hub
     outgoing = {a: 0 for a in cand - contracts}
-    links = d.find_links(hs, transfers, sig, {}, outgoing, contracts, excluded, packs)
+    links = d.find_links(hs, linked_trs, sig, {}, outgoing, contracts, excluded, packs)
     ops = d.operators(holders, links, packs, ratio)
     for l in links:
         ev("link", l["kind"], wallet=l["a"], b=l["b"], level=l["level"], kind=l["kind"], via=l["via"])
@@ -512,5 +528,8 @@ def scan(token, emit=lambda e: None):
         "market_pool": gt.get("pool"),
         "rug": rug, "partial_scan": partial_scan,
         "unread": unread, "use_funding": USE_FUNDING,
+        # token accounts whose history was not read in full (address, owner, reason): their transfers are
+        # missing from the analysis, so the coverage of this scan is incomplete (Solana: history too long)
+        "skipped": skipped,
         "elapsed_s": elapsed, "rpc_requests": a.REQUESTS[0] - r0,
     }

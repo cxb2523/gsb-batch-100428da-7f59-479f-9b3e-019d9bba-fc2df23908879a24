@@ -22,6 +22,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Solana scans no longer hide truncated holder history. A top holder's token account whose history does not fit `HOLDER_MAX_PAGES` pages of `SIG_PAGE` signatures used to be skipped silently: its transfers were missing from the scan and nothing said so. The adapter now returns the not-fully-read accounts separately (`get_token_transfers` → `(transfers, skipped)`, `token_facts` puts them in `skipped` as account, owner and reason) and the scan result carries the same `skipped` list for the site and the API. Such a wallet is marked **unread** instead of being taken for a wallet without history: its entry and sold state are unknown (no virgin, sniper or launch-bundle signal), and its transfers are left out of distributor and operator links. Accounts whose history was read are parsed exactly as before, and tokens held entirely by the curve still return TOO EARLY.
 - Background work (reward checks, alert rechecks, early buyers without a fresh scan) has its own request rate (`BACKGROUND_RPS`) and always waits for live scans.
 - The RPC rate limiter no longer holds its lock while waiting.
 

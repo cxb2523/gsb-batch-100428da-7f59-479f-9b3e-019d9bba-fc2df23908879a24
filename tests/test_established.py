@@ -558,7 +558,7 @@ class TestSolanaPools(unittest.TestCase):
             p = lambda name, **kw: st.enter_context(mock.patch.object(sol, name, **kw))
             p("_post", side_effect=fakes._no_network)
             p("supply_base", return_value=base)
-            p("get_token_transfers", return_value=[])
+            p("get_token_transfers", return_value=([], []))
             p("top_accounts", return_value=rows)
             st.enter_context(mock.patch.dict(sol._OWNER_PROG, {owner: prog, ts.SOL_CURVE: sol.PUMP}))
             return sol.token_facts(ts.SOL_TOKEN, launch)
