@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""real_input.py — UIA-based real-input rung for WebSense v4.4.
+
+Subcommands: activate-tab, click-xy, paste-text
+All gate on the Chrome window title matching the expected active tab, and
+auto-measure the page Document origin (Chrome UIA Document control) so
+callers pass VIEWPORT coordinates (same space as WebSense inspect geometry).
+
+Usage:
+  python real_input.py activate-tab --match "Submit to r/mcp" [--gate "expected title"]
+  python real_input.py click-xy   --x 1442 --y 1098 --gate "expected title" [--origin 121]
+  python real_input.py paste-text --x 1255 --y 1273 --gate "expected title" --text "..."
+  python real_input.py paste-text --x 1255 --y 1273 --gate "expected title" --from-stdin
+
+Each subcommand returns JSON: {"success":true/false, "title":"...", "error":"..."}
+"""
+import sys, json, time, subprocess, argparse
+import ctypes
+
+_user32 = ctypes.windll.user32
+
+def _fg_hwnd():
+    return _user32.GetForegroundWindow()
+
+def _restore_focus(hwnd):
+    """Best-effort focus restore after a real-input op (co-work politeness).
+    SetForegroundWindow is blocked for background PIDs (Windows foreground
+    lock) — the AttachThreadInput trick bypasses it: attach our thread to the
+    CURRENT foreground thread (Chrome, post-input), then restore is allowed."""
+    if not hwnd:
+        return
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        # 1. AttachThreadInput to the current foreground thread
+        fg = user32.GetForegroundWindow()
+        fg_thread = user32.GetWindowThreadProcessId(fg, None)
+        this_thread = kernel32.GetCurrentThreadId()
+        attached = False
+        if fg_thread and fg_thread != this_thread:
+            attached = bool(user32.AttachThreadInput(this_thread, fg_thread, True))
+        try:
+            # 2. ALT-key trick: a synthetic ALT press grants foreground rights
+            user32.keybd_event(0x12, 0, 0, 0)   # ALT down
+            ok = bool(user32.SetForegroundWindow(hwnd))
+            user32.keybd_event(0x12, 0, 2, 0)   # ALT up
+            # 3. fallback: SwitchToThisWindow (force)
+            if not ok:
+                user32.SwitchToThisWindow(hwnd, True)
+            # 4. fallback: AppActivate via WScript.Shell — Explorer owns
+            #    foreground rights, so delegation succeeds where direct
+            #    SetForegroundWindow from a background PID is locked out
+            if not ok or user32.GetForegroundWindow() != hwnd:
+                try:
+                    import win32gui  # optional
+                except ImportError:
+                    pass
+                try:
+                    pid = ctypes.c_ulong()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    ps = ["powershell", "-NoProfile", "-Command",
+                          f"(New-Object -ComObject WScript.Shell).AppActivate({pid.value})"]
+                    subprocess.run(ps, check=False, timeout=5,
+                                   creationflags=subprocess.CREATE_NO_WINDOW)
+                except Exception:
+                    pass
+        finally:
+            if attached:
+                user32.AttachThreadInput(this_thread, fg_thread, False)
+        # honesty: report ACTUAL restore result, not intent
+        try:
+            return user32.GetForegroundWindow() == hwnd
+        except Exception:
+            return False
+    except Exception:
+        return False  # restore is best-effort; the input already landed
+
+def _find_chrome(gate=None):
+    """Chrome window whose active-tab title contains `gate`. Returns pywinauto window or None."""
+    from pywinauto import Desktop
+    for w in Desktop(backend='uia').windows():
+        t = w.window_text()
+        if not t.endswith('Google Chrome'):
+            continue
+        if gate and gate not in t:
+            continue
+        return w
+    return None
+
+def _doc_origin(chrome):
+    """Page Document origin in screen coords via the Chrome UIA Document control.
+    Falls back to window top + 121 (measured chrome UI height) if UIA tree is empty."""
+    try:
+        for d in chrome.descendants(control_type="Document"):
+            r = d.rectangle()
+            return (r.left, r.top)
+    except Exception:
+        pass
+    r = chrome.rectangle()
+    return (r.left, r.top + 121)
+
+def cmd_activate_tab(args):
+    """Activate a Chrome tab by matching its title substring; gate after.
+
+    FINDING vs GATING (fixed 2026-09-11): this used to require `gate` to already be
+    in the window title in order to FIND the window — which is circular, because the
+    gate only matches AFTER the tab is activated. That made the tool unable to
+    activate the very tab it was asked for: e.g.
+    `activate-tab --match popup.html --gate popup.html` always failed with
+    "Chrome window not found (gate: popup.html)" while the tab was sitting there
+    backgrounded. Now: prefer a window that already satisfies the gate, else fall
+    back to any Chrome window, then activate, then VERIFY the gate (as documented).
+
+    TITLE COLLISIONS (fixed 2026-09-30): SPA tabs do not have unique titles. Measured
+    on x.com: three open tabs all reported "Home / X" through UIA, so `--match
+    "Home / X"` could only ever activate the first one, and a `--match` naming the
+    URL ("x.com/compose/post") — which the websense `tabs{action:"list"}` view DOES
+    report as a URL-as-title placeholder — matched nothing at all and returned the
+    bare "Tab not found" with no hint that the title simply is not unique.
+
+    Two ways out, both now supported:
+      * `--index N` targets a tab by POSITION among the TabItems (0-based). This is
+        the reliable address for same-titled tabs; pair it with `tabs{action:"list"}`,
+        which enumerates tabs in the same order.
+      * when several tabs match and no --index was given, the error now NAMES the
+        collision and lists the titles with their indexes, instead of silently
+        activating the wrong one or failing opaquely.
+    """
+    from pywinauto import Desktop
+    windows = [w for w in Desktop(backend='uia').windows()
+               if w.window_text().endswith('Google Chrome')]
+    gated = [w for w in windows if args.gate and args.gate in w.window_text()]
+    chrome = (gated or windows or [None])[0]
+    if not chrome:
+        return {"success": False, "error": f"Chrome window not found (gate: {args.gate})"}
+    tabs = chrome.descendants(control_type="TabItem")
+    idx = getattr(args, 'index', None)
+    if idx is not None:
+        try:
+            i = int(idx)
+        except (TypeError, ValueError):
+            return {"success": False, "error": f"--index must be an integer, got {idx!r}"}
+        if i < 0 or i >= len(tabs):
+            return {"success": False,
+                    "error": f"--index {i} out of range ({len(tabs)} tabs open)",
+                    "tabs": [{"index": n, "title": t.window_text()} for n, t in enumerate(tabs)]}
+        target = tabs[i]
+    else:
+        matches = [t for t in tabs if args.match in t.window_text()]
+        if not matches:
+            return {"success": False, "error": f"Tab not found: {args.match}",
+                    "tabs": [{"index": n, "title": t.window_text()} for n, t in enumerate(tabs)]}
+        if len(matches) > 1:
+            return {"success": False,
+                    "error": (f"{len(matches)} tabs match {args.match!r} — titles are not unique. "
+                              "Re-run with --index N."),
+                    "tabs": [{"index": n, "title": t.window_text()} for n, t in enumerate(tabs)]}
+        target = matches[0]
+    # click_input() silently no-ops on Chrome TabItems (UIA Invoke) and STILL
+    # exits 0 with {"success": true} — a lie the caller cannot detect. A/B tested
+    # 2026-09-25 against real Chrome: click_input left the active tab unchanged
+    # while reporting success; select() (SelectionItemPattern) actually switched
+    # it (confirmed by the Chrome window title AND websense tabs{action:"list"}
+    # active:true — note pywinauto's is_selected() can return a STALE cache, so
+    # do not use it as the verification oracle).
+    if hasattr(target, "select"):
+        target.select()
+    else:
+        target.click_input()
+    time.sleep(2.0)
+    title = chrome.window_text()
+    # VERIFY what we were asked to do. Before this, success only meant "found a
+    # tab whose text matched" — never "that tab is now active".
+    #
+    # With --index the positional address IS the request, and the post-activation
+    # window title cannot confirm it (every SPA tab on x.com reads "Home / X").
+    # Re-reading the TabItem list and asking the SELECTED item is the only honest
+    # oracle — pywinauto's is_selected() can be a stale cache, but after the 2s
+    # settle a re-read of the UIA element is fresh. If that is unavailable we report
+    # the title and say the activation could not be confirmed, rather than
+    # claiming success off a title that proves nothing.
+    if idx is not None:
+        try:
+            now = chrome.descendants(control_type="TabItem")[i]
+            is_sel = bool(now.is_selected())
+        except Exception:
+            is_sel = None
+        if is_sel:
+            return {"success": True, "title": title, "index": i, "verifiedBy": "selected-tabitem"}
+        return {"success": False,
+                "error": (f"--index {i} activated but selection could not be confirmed "
+                          f"(window title: {title})"),
+                "index": i, "title": title}
+    if args.match and args.match.lower() not in title.lower():
+        return {"success": False, "error": f"Tab not activated (window title: {title})",
+                "matched": args.match, "title": title}
+    if args.gate and args.gate not in title:
+        return {"success": False, "error": f"Tab activated but gate failed: {title}"}
+    return {"success": True, "title": title}
+
+def cmd_click_xy(args):
+    """Real OS click at VIEWPORT coords (x,y), title-gated, doc-origin offset."""
+    import pyautogui
+    pyautogui.FAILSAFE = False  # headless helper: explicit move-to-coords; the title gate is the safety
+    chrome = _find_chrome(args.gate)
+    if args.gate and not chrome:
+        return {"success": False, "error": f"Gate failed: no Chrome window containing '{args.gate}'"}
+    # SendInput only reaches the FOREGROUND window — raise Chrome first
+    if chrome:
+        try: chrome.set_focus()
+        except Exception: pass
+        time.sleep(0.4)
+    ox, oy = (args.origin, 121) if args.origin is not None else (_doc_origin(chrome) if chrome else (0, 121))
+    if args.origin is not None:
+        ox, oy = 0, args.origin
+    sx, sy = ox + args.x, oy + args.y
+    saved = None if args.no_restore else _fg_hwnd()
+    pyautogui.moveTo(sx, sy, duration=0.25)
+    time.sleep(0.3)
+    pyautogui.click(sx, sy)
+    restored = _restore_focus(saved) if saved else False
+    return {"success": True, "clicked_at": [sx, sy], "viewport": [args.x, args.y], "focus_restored": bool(restored)}
+
+def cmd_paste_text(args):
+    """Click into the editor at VIEWPORT (x,y), set clipboard, real Ctrl+V."""
+    import pyautogui
+    pyautogui.FAILSAFE = False  # headless helper: explicit move-to-coords; the title gate is the safety
+    chrome = _find_chrome(args.gate)
+    if args.gate and not chrome:
+        return {"success": False, "error": f"Gate failed: no Chrome window containing '{args.gate}'"}
+    # SendInput only reaches the FOREGROUND window — raise Chrome first
+    if chrome:
+        try: chrome.set_focus()
+        except Exception: pass
+        time.sleep(0.4)
+    ox, oy = _doc_origin(chrome) if chrome else (0, 121)
+    sx, sy = ox + args.x, oy + args.y
+    saved = None if args.no_restore else _fg_hwnd()
+    # 1. click into the editor
+    pyautogui.moveTo(sx, sy, duration=0.25)
+    time.sleep(0.3)
+    pyautogui.click(sx, sy)
+    time.sleep(0.6)
+    # 2. set clipboard (stdin-piped Set-Clipboard — robust, no arg quoting issues)
+    text = args.text or sys.stdin.read()
+    ps = ["powershell", "-NoProfile", "-Command", "$input | Set-Clipboard"]
+    subprocess.run(ps, input=text, check=True, text=True,
+                   creationflags=subprocess.CREATE_NO_WINDOW)
+    time.sleep(0.5)
+    # 3. real Ctrl+V (SendInput — trusted paste)
+    pyautogui.hotkey('ctrl', 'v')
+    time.sleep(1.0)
+    if saved:
+        restored = _restore_focus(saved)
+    else:
+        restored = False
+    return {"success": True, "pasted_len": len(text), "target": [sx, sy], "focus_restored": bool(restored)}
+
+def cmd_paste_file(args):
+    """Click into the target at VIEWPORT (x,y), put a FILE on the clipboard, real Ctrl+V.
+
+    WHY THIS EXISTS (2026-09-11): setting `input.files` from the content script's
+    ISOLATED world produces an EMPTY FileList on strict-CSP pages (the x.com
+    composer) — the DataTransfer/File are realm-local and Chrome silently filters
+    them, so `upload_file` returns `fileCount:0` / "Input rejected the file" while
+    looking like a site problem. This escalates to the genuine-input rung: copy
+    the file to the OS clipboard as CF_HDROP (exactly what Explorer's Copy does)
+    and send a real Ctrl+V, so the page receives a normal `paste` event whose
+    clipboardData.files carries the file — indistinguishable from a human paste.
+
+    `Set-Clipboard -Path` is the CF_HDROP putter. Verified working on x.com's
+    composer, which is the case the synthetic strategies cannot do.
+    """
+    import os
+    import pyautogui
+    pyautogui.FAILSAFE = False  # headless helper: explicit coords; the title gate is the safety
+    path = os.path.abspath(args.file)
+    if not os.path.isfile(path):
+        return {"success": False, "error": f"file not found: {path}"}
+    chrome = _find_chrome(args.gate)
+    if args.gate and not chrome:
+        return {"success": False, "error": f"Gate failed: no Chrome window containing '{args.gate}'"}
+    # SendInput only reaches the FOREGROUND window — raise Chrome first
+    if chrome:
+        try: chrome.set_focus()
+        except Exception: pass
+        time.sleep(0.4)
+    ox, oy = _doc_origin(chrome) if chrome else (0, 121)
+    sx, sy = ox + args.x, oy + args.y
+    saved = None if args.no_restore else _fg_hwnd()
+    # 1. focus the drop target
+    pyautogui.moveTo(sx, sy, duration=0.25)
+    time.sleep(0.3)
+    pyautogui.click(sx, sy)
+    time.sleep(0.7)
+    # 2. put the FILE on the clipboard as CF_HDROP (PS5.1: single-quote, '' escapes)
+    ps_path = "'" + path.replace("'", "''") + "'"
+    ps = ["powershell", "-NoProfile", "-Command", f"Set-Clipboard -Path {ps_path}"]
+    proc = subprocess.run(ps, capture_output=True, text=True,
+                          creationflags=subprocess.CREATE_NO_WINDOW)
+    if proc.returncode != 0:
+        return {"success": False, "error": "Set-Clipboard failed: " + (proc.stderr or "").strip()[:200]}
+    time.sleep(0.7)
+    # 3. real Ctrl+V (SendInput — trusted paste)
+    pyautogui.hotkey('ctrl', 'v')
+    time.sleep(float(args.wait))
+    restored = _restore_focus(saved) if saved else False
+    return {"success": True, "file": path, "size": os.path.getsize(path),
+            "target": [sx, sy], "focus_restored": bool(restored),
+            "note": "Real Ctrl+V sent. VERIFY the attachment appeared — do not assume."}
+
+def main():
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest='command')
+    # activate-tab
+    at = sub.add_parser('activate-tab')
+    at.add_argument('--match', default='', help='Tab title substring to match (omit when using --index)')
+    at.add_argument('--index', type=int, default=None,
+                    help='Activate the Nth open tab (0-based) — the reliable address when several tabs share a title')
+    at.add_argument('--gate', default=None)
+    at.set_defaults(func=cmd_activate_tab)
+    # click-xy (viewport coords)
+    cx = sub.add_parser('click-xy')
+    cx.add_argument('--x', type=int, required=True)
+    cx.add_argument('--y', type=int, required=True)
+    cx.add_argument('--gate', default=None)
+    cx.add_argument('--origin', type=int, default=None, help='Override doc origin Y (default: measured)')
+    cx.add_argument('--no-restore', action='store_true', help='Skip focus restore after input')
+    cx.set_defaults(func=cmd_click_xy)
+    # paste-text (viewport coords)
+    pt = sub.add_parser('paste-text')
+    pt.add_argument('--x', type=int, required=True)
+    pt.add_argument('--y', type=int, required=True)
+    pt.add_argument('--gate', default=None)
+    pt.add_argument('--text', default=None)
+    pt.add_argument('--from-stdin', action='store_true')
+    pt.add_argument('--no-restore', action='store_true', help='Skip focus restore after input')
+    pt.set_defaults(func=cmd_paste_text)
+    # paste-file (viewport coords) — genuine CF_HDROP file paste for strict-CSP pages
+    pf = sub.add_parser('paste-file')
+    pf.add_argument('--file', required=True, help='absolute path of the file to paste')
+    pf.add_argument('--x', type=int, required=True, help='viewport x of the drop target')
+    pf.add_argument('--y', type=int, required=True, help='viewport y of the drop target')
+    pf.add_argument('--gate', default=None, help='Chrome window title substring gate')
+    pf.add_argument('--wait', type=float, default=8.0, help='seconds to wait after the paste')
+    pf.add_argument('--no-restore', action='store_true', help='Skip focus restore after input')
+    pf.set_defaults(func=cmd_paste_file)
+    args = p.parse_args()
+    if not args.command:
+        p.print_help(); sys.exit(1)
+    result = args.func(args)
+    print(json.dumps(result))
+    sys.exit(0 if result.get('success') else 1)
+
+if __name__ == '__main__':
+    main()

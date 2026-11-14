@@ -1,0 +1,4334 @@
+/**
+ * WebSense MCP — Enhanced Content Script
+ * Runs in Chrome's isolated world (NOT subject to page CSP).
+ * All operations are native DOM manipulation — NO eval, NO string-to-code.
+ */
+(function () {
+  'use strict';
+
+/* Bridge + transport: page events, wsLog, WS connect/backoff, dispatch
+ * Part 00 of 9 — source of truth for extension/websense-cs.js.
+ * DO NOT edit the built file; edit here and run `node tools/build-cs.mjs`.
+ * Split out 2026-09-11 (was one 3,7xx-line file). The code below is copied
+ * VERBATIM from the pre-split file; only this banner is added.
+ */
+
+  // ═══ Native dialog capture (alert / confirm / prompt) ═══
+  // These become JS-controlled so the model can see + resolve them
+  // without the page blocking on a native OS dialog.
+  var WS_DIALOGS = [];
+  var WS_HAS_BEFOREUNLOAD = false;
+  try { window.addEventListener('beforeunload', function () { WS_HAS_BEFOREUNLOAD = true; }); } catch (_) {}
+  try {
+    window.alert = function (msg) { WS_DIALOGS.push({ type: 'alert', message: String(msg == null ? '' : msg), ts: Date.now() }); pushPageEvent('dialog_open', { type: 'alert', message: String(msg == null ? '' : msg) }); return undefined; };
+    window.confirm = function (msg) {
+      var d = { type: 'confirm', message: String(msg == null ? '' : msg), ts: Date.now(), _res: null, _auto: false };
+      var p = new Promise(function (r) { d._res = r; });
+      // Phase 3 (2026-08-15): auto-resolve fallback. A confirm() blocked on the
+      // agent resolving WS_DIALOGS would hang the PAGE THREAD forever if the
+      // agent isn't watching (e.g. normal interaction flow, no handle_dialog
+      // call). After 30s with no agent response, resolve `true` (proceed) so the
+      // page never deadlocks. The agent can still resolve earlier via
+      // handle_dialog. A timed-out dialog is marked _auto so page_state reports
+      // it was auto-answered.
+      var autoTimer = setTimeout(function () {
+        if (d._res) { d._auto = true; d._res(true); WS_DIALOGS = WS_DIALOGS.filter(function (x) { return x !== d; }); }
+      }, 30000);
+      d._timer = autoTimer;
+      WS_DIALOGS.push(d); pushPageEvent('dialog_open', { type: 'confirm', message: String(msg == null ? '' : msg) }); return p;
+    };
+    window.prompt = function (msg, def) {
+      var d = { type: 'prompt', message: String(msg == null ? '' : msg), defaultValue: (def == null ? '' : String(def)), ts: Date.now(), _res: null, _auto: false };
+      var p = new Promise(function (r) { d._res = r; });
+      // Phase 3 (2026-08-15): same auto-resolve fallback as confirm — never
+      // block the page thread. Auto-answer with the default value after 30s.
+      var autoTimer = setTimeout(function () {
+        if (d._res) { d._auto = true; d._res((def == null ? '' : String(def))); WS_DIALOGS = WS_DIALOGS.filter(function (x) { return x !== d; }); }
+      }, 30000);
+      d._timer = autoTimer;
+      WS_DIALOGS.push(d); pushPageEvent('dialog_open', { type: 'prompt', message: String(msg == null ? '' : msg) }); return p;
+    };
+  } catch (_) {}
+
+  // P1#1 (2026-08-31): event-push supervisor — push page events (dialog_open,
+  // navigation) to the hub as they happen so the server's wait{event:…} can
+  // respond instantly instead of polling page_state after every action. The
+  // hub stores a small ring buffer per client; the server drains it.
+  function pushPageEvent(event, data) {
+    try {
+      if (wsReady && ws && ws.readyState === 1) {
+        wsSendRaw({ type: 'page_event', event: event, tabId: null, data: data || {}, ts: Date.now() });
+      }
+    } catch (_) { /* hub not connected — events captured in WS_DIALOGS anyway */ }
+  }
+  // Navigation events: hashchange (SPA) + a light beforeunload hook. Full
+  // navigations also surface via the hub's tab_event + tab_identified paths.
+  try {
+    window.addEventListener('hashchange', function () { pushPageEvent('navigation', { url: location.href, kind: 'hashchange' }); });
+  } catch (_) {}
+  try {
+    window.addEventListener('popstate', function () { pushPageEvent('navigation', { url: location.href, kind: 'popstate' }); });
+  } catch (_) {}
+
+  // ═══ Debug Logging (root-cause investigation) ═══
+  const WS_DEBUG = [];
+  function wsLog(...args) { try { const m = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' '); WS_DEBUG.push(m); console.log('[WEBSENSE] ' + m); } catch (_) {} }
+  window.__WEBSENSE_DEBUG__ = WS_DEBUG;
+  window.addEventListener('error', function (e) { wsLog('GLOBAL_ERROR:', e.message, '| stack:', (e.error && e.error.stack) ? e.error.stack.slice(0, 800) : 'no-stack'); });
+  window.addEventListener('unhandledrejection', function (e) { wsLog('UNHANDLED_REJECTION:', e.reason && (e.reason.message || e.reason)); });
+
+  // ═══ Direct WebSocket bridge to the WebSense MCP hub (SW-independent) ═══
+  // Connects via ws://127.0.0.1:38401. Chrome exempts 127.0.0.1 from
+  // mixed-content blocking, so ws:// works from HTTPS pages (lemonsqueezy etc.)
+  // without cert errors. Runs in the content script's isolated world and lives as
+  // long as the page is open — independent of the MV3 service-worker lifecycle,
+  // so the bridge stays up even when the SW is killed after idle. Tab-level ops
+  // that need the SW (navigate/list_tabs/...) are relayed on demand via
+  // chrome.runtime.sendMessage, which wakes the SW only when needed.
+  var WS_PORT = 38401; // ws:// — 127.0.0.1 is mixed-content exempt
+  var WS_PROTO = 'ws://'; // force plain ws (localhost-exempt; wss:// self-signed cert is rejected by Chrome)
+  var ws = null;
+  var wsReady = false;
+  var wsReconnectTimer = null;
+
+  function wsSendRaw(obj) {
+    if (ws && ws.readyState === 1) { try { ws.send(JSON.stringify(obj)); return true; } catch (_) {} }
+    return false;
+  }
+
+  // Tab control relay — only used for ops the content script can't do itself.
+  function relayTabControl(action, payload) {
+    return new Promise(function (resolve) {
+      try {
+        chrome.runtime.sendMessage({ type: 'TAB_CONTROL', action: action, payload: payload || {} }, function (resp) {
+          resolve(resp || { error: 'No response from background' });
+        });
+      } catch (e) { resolve({ error: String(e) }); }
+    });
+  }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ★ MAIN-WORLD DIALOG READERS — DEFINED HERE, AT THE TOP OF THE CONCATENATION (2026-10-01)
+//
+// WHY THEY MOVED. These lived in 70-capture-and-readers.js. They are declared with
+// `function`, so within one IIFE they should hoist and be callable from anywhere — and 70's
+// own code called them fine. But 00's `handle_dialog` and `get_status` could NOT see them,
+// and the failure was nearly invisible:
+//   - handle_dialog surfaced it as {"success":false,"error":"readMainWorldDialogs is not defined"}
+//   - get_status called it inside `try { ... } catch (_) {}` and therefore SILENTLY reported
+//     pendingDialogs: [] — a wrong answer that looks exactly like "no dialogs", which is the
+//     silent-wrong-outcome shape this project keeps having to kill.
+//
+// These three only read/write DOM attributes, so position is irrelevant to them; being FIRST
+// in the concatenation is what makes them unambiguously visible to every dispatcher. One
+// definition, earliest scope, no duplication.
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The isolated-world WS_DIALOGS queue only ever saw dialogs raised by other isolated-world
+// code, never the PAGE's own alert/confirm/prompt. The MAIN world hook
+// (extension/dialog-hook.js) publishes them to a DOM attribute; read it here so status/dialog
+// see what the page actually raised.
+function readMainWorldDialogs() {
+  var out = [];
+  try {
+    var raw = document.documentElement.getAttribute('data-ws-dialogs');
+    if (!raw) return out;
+    var arr = JSON.parse(raw);
+    if (Array.isArray(arr)) out = arr;
+  } catch (_) { /* never let a parse break page state */ }
+  return out;
+}
+// Dialogs that already fired and were auto-answered. alert() is synchronous, so the page
+// continues the moment it is raised — the dialog can never still be "pending" when an agent
+// looks. Without this history the agent had no way to know a confirmation prompt had appeared
+// and been waved through, which is a silent-wrong-outcome, not just a missing feature.
+function readRecentMainWorldDialogs() {
+  var out = [];
+  try {
+    var raw = document.documentElement.getAttribute('data-ws-dialogs-recent');
+    if (!raw) return out;
+    var arr = JSON.parse(raw);
+    if (Array.isArray(arr)) out = arr;
+  } catch (_) { /* never let a parse break page state */ }
+  return out;
+}
+// Ask the MAIN-world hook to resolve one of its dialogs. It exposes __wsResolveDialog on
+// window, but from the isolated world that is a DIFFERENT global — so go through a
+// CustomEvent the hook listens for.
+function resolveMainWorldDialog(id, action, value) {
+  return new Promise(function (resolve) {
+    try {
+      var h = '__wsMainWorldDialogReply';
+      document.documentElement.setAttribute(h, '');
+      var ev = new CustomEvent('__wsResolveDialog', {
+        detail: { id: id, action: action, value: value, replyAttr: h },
+      });
+      document.dispatchEvent(ev);
+      // The hook writes the outcome back to the attribute; a microtask + short poll is
+      // enough because its work is synchronous.
+      var tries = 0;
+      var iv = setInterval(function () {
+        tries++;
+        var v = document.documentElement.getAttribute(h);
+        if (v) { clearInterval(iv); try { resolve(JSON.parse(v)); } catch (_) { resolve({ success: true }); } }
+        else if (tries > 20) { clearInterval(iv); resolve({ success: false, error: 'dialog hook did not answer' }); }
+      }, 25);
+    } catch (e) {
+      resolve({ success: false, error: String((e && e.message) || e) });
+    }
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ★ handleReadClipboard — THE ONE implementation, hoisted next to the dialog readers (2026-10-01)
+//
+// WHY IT LIVES HERE. It used to be declared INSIDE the switch block of 70's
+// handleMessageAsync. A `function` declaration in a block is BLOCK-SCOPED under
+// 'use strict' (which the built artifact uses), so it was visible only to the case that
+// sat in the same block — exactly the trap that made readMainWorldDialogs invisible to 00.
+// Now that the shared dispatcher in 00 owns the read_clipboard op, the definition has to be
+// in the earliest scope of the concatenation, like the dialog readers above.
+//
+// WHAT IT DOES: navigator.clipboard.readText() needs the document focused AND the
+// clipboardRead permission; in a backgrounded tab it silently returns '' or throws
+// NotAllowedError. Fall back to execCommand('paste') into a hidden textarea, which the
+// extension's clipboardWrite permission allows without document focus. The direct-WS path
+// used to carry an execCommand-only inline duplicate of this; it is gone — one copy.
+function handleReadClipboard() {
+  return (async () => {
+    let txt = null;
+    try {
+      if (navigator.clipboard && navigator.clipboard.readText) {
+        txt = await navigator.clipboard.readText();
+      }
+    } catch (e) { /* fall through to execCommand path */ }
+    if (!txt) {
+      try {
+        const ta = document.createElement('textarea');
+        ta.style.cssText = 'position:fixed;left:-9999px;top:0;width:2px;height:2px;opacity:0;';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        const ok = document.execCommand('paste');
+        txt = ok ? ta.value : '';
+        ta.remove();
+      } catch (e2) { txt = ''; }
+    }
+    return { success: true, text: txt || '' };
+  })();
+}
+
+  // ═══ Ad-frame detection — skip the WS bridge entirely in ad iframes ═══
+  // Content scripts with all_frames:true run inside Google SafeFrame / ad
+  // iframes too. Those must NOT connect to the hub — they'd hijack page ops.
+  var WS_IS_AD_FRAME = false;
+  (function () {
+    try {
+      if (window.self === window.top) return; // main frame is never an ad
+      var u = location.href || '';
+      var AD_PATTERNS = [
+        'googleads', 'googlesyndication', 'doubleclick', 'adservice',
+        'adzerk', 'amazon-adsystem', 'criteo', 'taboola', 'outbrain',
+        'adnxs', 'rubiconproject', 'openx', 'pubmatic', 'casalemedia',
+        'lijit', 'sonobi', 'indexexchange', 'spotxchange', 'gumgum',
+        'amazon-adsystem', 'bidswitch', 'contextweb', 'districtm',
+        'media.net', 'sharethrough', 'teads', 'triplelift', 'undertone',
+        '/ads/', '/adserver', 'safeframe', 'g.doubleclick'
+      ];
+      for (var i = 0; i < AD_PATTERNS.length; i++) {
+        if (u.indexOf(AD_PATTERNS[i]) !== -1) { WS_IS_AD_FRAME = true; break; }
+      }
+    } catch (_) { WS_IS_AD_FRAME = false; }
+  })();
+
+  // ═══ Direct-bridge viability gate (2026-09-11) ═══
+  // At most ONE direct WS client per TAB, and only where it can be used:
+  //
+  //  1. AD FRAMES — pre-existing guard (SafeFrame / ad iframes must never hold a
+  //     hub slot; they answered broadcast relays with garbage — PITFALL 25).
+  //
+  //  2. SUBFRAMES ARE POINTLESS. Verified against the hub's own routing:
+  //     hub.handleMessage only writes the routing table on
+  //     `if (msg.tabId && msg.isMainFrame)` → contentByTab, so a subframe client
+  //     can NEVER be selected for a page op; frame-targeted delivery is done by
+  //     the SW via chrome.tabs.sendMessage(tabId, msg, {frameId}). A subframe
+  //     socket therefore only inflates hub membership (measured peak: 24
+  //     concurrent clients, 664 disconnects in one log) and widens the
+  //     wrong-client / hijack surface that PITFALL 16/25/26 describe.
+  //
+  // NOT gated on https. An earlier draft of this fix assumed Chrome's
+  // mixed-content rule blocks plain ws:// from every https page. That is FALSE —
+  // measured live 2026-09-11: content-script clients connected as MAIN on
+  // https://hackerone.com tabs immediately after an extension reload. What
+  // actually blocks the socket is the SITE's own CSP connect-src (x.com and
+  // LinkedIn are strict; hackerone is not). Since a content script cannot know
+  // its page's effective connect-src up front, that case is handled by the
+  // backoff + give-up below instead of by a protocol guess.
+  var WS_IS_MAIN_FRAME = false;
+  try { WS_IS_MAIN_FRAME = (window.self === window.top); } catch (_) { WS_IS_MAIN_FRAME = false; }
+  var WS_BRIDGE_UNUSABLE = WS_IS_AD_FRAME || !WS_IS_MAIN_FRAME;
+
+  if (WS_BRIDGE_UNUSABLE) {
+    wsLog('WS_SKIP: direct bridge not used here (' +
+      (WS_IS_AD_FRAME ? 'ad frame' : 'subframe — hub only routes to main-frame clients') +
+      ') — offscreen relay handles this tab');
+  }
+
+  // Exponential backoff with give-up. The old flat 3s retry re-attempted a
+  // doomed socket forever (no backoff, no ceiling), which is what produced the
+  // endless WS_CLOSE 1006 stream. A genuine state change (tab activated)
+  // resets the streak and retries once — see bindVisibilityActivationReport.
+  var wsFailStreak = 0;
+  var WS_MAX_FAIL_STREAK = 4;
+  var WS_BACKOFF_MIN_MS = 3000;
+  var WS_BACKOFF_MAX_MS = 60000;
+
+  // ═══ Extraction budget (2026-09-11) ═══
+  // Measured baseline before these existed: explore_page's DEFAULT call (no
+  // maxActions) walked the entire DOM, cost ~5ms per element, and hard-stalled
+  // at the 90s hub timeout on pages over ~5,000 elements. 556 els = 0.44s,
+  // 2,206 els = 11s, 11,006 els = TIMEOUT. The three constants below are the
+  // difference between "unbounded walk" and "bounded, useful answer".
+  //
+  // A cap on RETURNED actions (what maxActions always was) is not a cap on WORK:
+  // the old loop only broke once it had ACCEPTED N actions, so on a page with
+  // few in-viewport interactives it never broke and walked everything. PROVEN:
+  // maxActions=5 and maxActions=200 both cost 11.0s on the same 2,206-el page.
+  // ★ NO CAPS (2026-10-01, Ali: "I said remove all caps and filters and hardcoded
+  // values"). DEFAULT_MAX_ACTIONS (200), SCAN_CEILING (8000),
+  // CURSOR_SWEEP_MAX_ELEMENTS (1800) and CONTENT_MAX_CHARS (6000) are all REMOVED.
+  //
+  // The cap was never the real fix. Cost scaled with the DOCUMENT because the old loop
+  // did a getBoundingClientRect AND a getComputedStyle per element in document order —
+  // measured ~5ms/element (556 els = 0.44s, 2,206 = 11.0s, 11,006 = 90s timeout). What
+  // makes an UNCAPPED, UNFILTERED scan affordable is making it cheap PER ELEMENT:
+  // candidates are now found by a platform-state test with no style resolution, and
+  // geometry is read only for the elements that pass. Cap removed, cost addressed.
+  var SETTLE_SKIP_IF_QUIET_MS = 150;    // skip waitForSettle if DOM has been quiet
+  var SAG_CACHE_TTL_MS = 1500;          // reuse a SAG when DOM is provably unchanged
+
+  function wsConnect() {
+    if (WS_BRIDGE_UNUSABLE) return;
+    if (wsFailStreak >= WS_MAX_FAIL_STREAK) {
+      wsLog('WS_GIVEUP: ' + wsFailStreak + ' consecutive failures — retry deferred to next tab activation');
+      return;
+    }
+    try { ws = new WebSocket(WS_PROTO + '127.0.0.1:' + WS_PORT); }
+    catch (e) { wsLog('WS_CREATE_FAIL: ' + (e && e.message ? e.message : String(e))); wsFailStreak++; wsScheduleReconnect(); return; }
+
+    ws.onopen = function () {
+      wsReady = true;
+      wsFailStreak = 0; // healthy socket — clear the backoff streak
+      // Detect if we're in the main frame (not inside an iframe)
+      var isMainFrame = false;
+      try { isMainFrame = (window.self === window.top); } catch (_) { isMainFrame = false; }
+      wsLog('WS_OPEN: bridge connected mainFrame=' + isMainFrame);
+      wsSendRaw({ type: 'ready', version: '2.0.0', source: 'content-script', url: location.href, isMainFrame: isMainFrame, frameTitle: document.title || '' });
+      // Ask the SW which tab we live in — the hub uses this to route page ops
+      // DIRECTLY to the selected tab's content script (no offscreen round-trip).
+      try {
+        chrome.runtime.sendMessage({ type: 'GET_MY_TAB_ID' }, function (resp) {
+          wsLog('TAB_ID_RESP: ' + JSON.stringify(resp));
+          if (resp && resp.tabId) {
+            wsSendRaw({ type: 'tab_identified', tabId: resp.tabId, isMainFrame: isMainFrame });
+            // P0#2 (2026-08-31): also broadcast activation so the hub
+            // immediately routes page ops to this tab — kills the cold-tab
+            // wedge for CS reconnects.
+            wsSendRaw({ type: 'tab_activated', tabId: resp.tabId });
+            wsLog('TAB_IDENTIFIED_SENT: tabId=' + resp.tabId);
+          } else {
+            wsLog('TAB_ID_NONE: no tabId in response');
+            // P0#2 retry — SW may have been cold; retry once after 1s
+            setTimeout(function () {
+              try {
+                chrome.runtime.sendMessage({ type: 'GET_MY_TAB_ID' }, function (resp2) {
+                  if (resp2 && resp2.tabId) {
+                    wsSendRaw({ type: 'tab_identified', tabId: resp2.tabId, isMainFrame: isMainFrame });
+                    wsSendRaw({ type: 'tab_activated', tabId: resp2.tabId });
+                    wsLog('TAB_ID_RETRY_OK: tabId=' + resp2.tabId);
+                  }
+                });
+              } catch (_e) { wsLog('TAB_ID_RETRY_ERR'); }
+            }, 1000);
+          }
+        });
+      } catch (e) { wsLog('TAB_ID_ERR: ' + (e && e.message ? e.message : String(e))); }
+    };
+    ws.onmessage = function (ev) {
+      var msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
+      if (msg.type === 'ready' || msg.type === 'pong') return;
+      wsHandle(msg);
+    };
+    ws.onclose = function (ev) { wsLog('WS_CLOSE: code=' + (ev && ev.code) + ' reason=' + (ev && ev.reason ? ev.reason : '')); wsReady = false; ws = null; wsFailStreak++; wsScheduleReconnect(); };
+    ws.onerror = function (ev) { wsLog('WS_ERROR: ' + ((ev && ev.message) || 'unknown')); };
+  }
+
+  function wsScheduleReconnect() {
+    if (WS_BRIDGE_UNUSABLE || wsReconnectTimer) return;
+    if (wsFailStreak >= WS_MAX_FAIL_STREAK) {
+      wsLog('WS_GIVEUP: ' + wsFailStreak + ' consecutive failures — not retrying until the tab is activated again');
+      return;
+    }
+    // 3s, 6s, 12s, 24s … capped at 60s (was a flat 3s forever).
+    var delay = Math.min(WS_BACKOFF_MIN_MS * Math.pow(2, Math.max(0, wsFailStreak - 1)), WS_BACKOFF_MAX_MS);
+    wsLog('WS_RETRY_IN: ' + delay + 'ms (streak ' + wsFailStreak + ')');
+    wsReconnectTimer = setTimeout(function () { wsReconnectTimer = null; wsConnect(); }, delay);
+  }
+
+  // A real state change is the one honest reason to retry after give-up: the
+  // tab is being foregrounded, so the hub may now be reachable. Reset the
+  // streak and make one fresh attempt (used by the visibility handler below).
+  function wsResetAndRetry() {
+    if (WS_BRIDGE_UNUSABLE) return;
+    if (wsReady && ws && ws.readyState === 1) return;
+    if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+    wsFailStreak = 0;
+    wsConnect();
+  }
+
+  // P0#2 (2026-08-31, cold-tab wedge A1): when THIS tab becomes visible (the
+  // user/worker actually activates it), re-broadcast tab_activated so the hub
+  // routes page ops here even if the SW missed the onActivated event (cold SW
+  // at tab-open time) or the initial GET_MY_TAB_ID round-trip failed. This is
+  // the CS-side half of the wedge fix: the CS is by definition alive and
+  // injected when the tab is foregrounded, so this is the freshest liveness
+  // signal the hub can get.
+  function bindVisibilityActivationReport() {
+    try {
+      document.addEventListener('visibilitychange', function () {
+        if (document.visibilityState !== 'visible') return;
+        if (wsReady && ws && ws.readyState === 1) {
+          wsLog('TAB_VISIBLE: re-broadcasting tab_activated');
+          try {
+            chrome.runtime.sendMessage({ type: 'GET_MY_TAB_ID' }, function (resp) {
+              if (resp && resp.tabId) {
+                wsSendRaw({ type: 'tab_identified', tabId: resp.tabId, isMainFrame: WS_IS_MAIN_FRAME });
+                wsSendRaw({ type: 'tab_activated', tabId: resp.tabId });
+                wsLog('TAB_VISIBLE_ACTIVATED: tabId=' + resp.tabId);
+              }
+            });
+          } catch (_e) { wsLog('TAB_VISIBLE_ERR'); }
+        } else {
+          // Bridge is down (or gave up on backoff) and this tab is now the one
+          // being looked at — the honest moment to retry once (2026-09-11).
+          wsLog('TAB_VISIBLE: bridge down — resetting retry streak and reconnecting');
+          wsResetAndRetry();
+        }
+      });
+    } catch (_e) { /* visibilitychange may not exist — harmless */ }
+  }
+  bindVisibilityActivationReport();
+
+  async function wsHandle(msg) {
+    var id = msg.id;
+    try {
+      var result;
+      // Tab-level ops that need the background SW (woken on demand).
+      if (msg.type === 'navigate' || msg.type === 'list_tabs' || msg.type === 'switch_tab' ||
+          msg.type === 'close_tab' || msg.type === 'list_frames' || msg.type === 'download_state' ||
+          msg.type === 'tab_contents' || msg.type === 'get_active_tab' ||
+          msg.type === 'cookie_op' || msg.type === 'download_op' || msg.type === 'respawn_offscreen') {
+        if (msg.type === 'list_tabs') {
+          result = await relayTabControl('get_window_tabs', {});
+        } else if (msg.type === 'navigate') {
+          if (msg.newTab) {
+            // BACKGROUND-ONLY (2026-08-13, Ali directive): never activate —
+            // activation raises the Chrome window (foreground hijack).
+            result = await relayTabControl('open_new_tab', { url: msg.url, active: false });
+            result = { success: true, tabId: (result && result.tabId) || null, reused: false, background: true };
+          } else {
+            result = await relayTabControl('navigate_current_tab', { url: msg.url });
+            result = { success: true, tabId: (result && result.tabId) || null, reused: !!(result && result.reused) };
+          }
+        } else if (msg.type === 'switch_tab') {
+          // Accept both tab_id (snake from MCP) and tabId (camel) — coerce to int
+          var tid = msg.tab_id || msg.tabId;
+          result = await relayTabControl('switch_to_tab', { tabId: parseInt(tid, 10) });
+        } else if (msg.type === 'close_tab') {
+          var cid = msg.tab_id || msg.tabId;
+          result = await relayTabControl('close_tab', { tabId: parseInt(cid, 10) });
+        } else if (msg.type === 'list_frames') {
+          result = await relayTabControl('list_frames', {});
+        } else if (msg.type === 'download_state') {
+          result = await relayTabControl('download_state', {});
+        } else if (msg.type === 'get_active_tab') {
+          // P0#3 (2026-08-31): pass through to SW's get_active_tab handler
+          result = await relayTabControl('get_active_tab', {});
+        } else {
+          result = await relayTabControl(msg.type, msg);
+        }
+      } else if (msg.type === 'get_status') {
+        result = { hubConnected: true, pageConnected: true, currentUrl: location.href, currentTitle: document.title, source: 'content-script' };
+      } else {
+        // Page-level ops handled directly in the isolated world.
+        result = await wsDispatchPage(msg);
+      }
+      wsSendRaw({ type: msg.type + '_result', id: id, success: !result || !result.error, data: result || {} });
+    } catch (err) {
+      wsSendRaw({ type: msg.type + '_result', id: id, success: false, data: { error: err.message || String(err) } });
+    }
+  }
+
+  // ═══ THE ONE PAGE-OP DISPATCHER (2026-10-01) ═══
+  // Every shared page op has EXACTLY ONE implementation — this switch — and the other
+  // routing path (the offscreen relay: 70-capture-and-readers.handleMessageAsync) now
+  // DELEGATES here instead of carrying a second copy. Before this, 48 ops existed in
+  // BOTH switches and had already drifted, e.g.:
+  //   · action_preview called `getActionPreview` — a function defined NOWHERE, so that op
+  //     threw a ReferenceError on every direct-WS call,
+  //   · extract_text returned {text} here but a bare string on the relay,
+  //   · ping answered {pong,ts} here and {pong,url} on the relay,
+  //   · get_status answered a rich union here and a thin object with a stale hardcoded
+  //     wsVersion on the relay.
+  // One copy cannot drift from itself. `ctx` carries ONLY what each path alone can know
+  // (the relay's sender identity) — it is never a second copy of an op body.
+  async function wsDispatchPage(msg, ctx) {
+    var params = msg;
+    ctx = ctx || {};
+    switch (msg.type) {
+      case 'explore_page': return await extractActionGraph({ full: !!params.full, includeContent: params.includeContent !== false, includeHidden: !!params.includeHidden, frameId: params.frameId, incremental: !!params.incremental, maxActions: params.maxActions, contentMaxLen: params.contentMaxLen, settle: params.settle, quietMs: params.quietMs, fresh: params.fresh });
+      // Only reached when the hub routes here (a live direct bridge). Relay to the
+      // SW, which performs chrome.runtime.reload(). Fire-and-forget on purpose:
+      // the SW dies mid-call, so awaiting its response would hang. 2026-09-11.
+      case 'extension_reload': { setTimeout(function () { try { chrome.runtime.sendMessage({ type: 'TAB_CONTROL', action: 'extension_reload', payload: {} }); } catch (_) {} }, 100); return { success: true, message: 'extension_reload relayed to the service worker (reload in ~100ms)' }; }
+      // ★ maxActions 0 = UNBOUNDED (2026-10-01, no caps). The cap used to be the load
+      // bearer here, but the cap was never what made this affordable — the per-element
+      // style/geometry reads were, and those are gone (candidates come from platform
+      // state with no style resolution). See the constants block.
+      case 'discover_actions': { const sag = await extractActionGraph({ includeContent: false, full: false, includeHidden: false, maxActions: params.maxActions || 0, frameId: params.frameId }); return sag.actions; }
+      case 'click': { var b = getQuickState(); const cr = await nativeClick(await resolveRefHealed(params.ref)); return { success: true, ref: params.ref, ...(cr && typeof cr === 'object' ? cr : {}), beforeState: b, afterState: getQuickState() }; }
+      case 'type_text': { var r = await nativeType(await resolveRefHealed(params.ref), params.text, params.clearFirst !== false); r.ref = params.ref; return r; }
+      case 'select_option': { var s = nativeSelect(await resolveRefHealed(params.ref), params.value, params.clearAll); s.ref = params.ref; return s; }
+      case 'form_special': { var fs = await nativeSetSpecial(await resolveRefHealed(params.ref), params.value); fs.ref = params.ref; return fs; }
+      case 'toggle': { var t = nativeToggle(await resolveRefHealed(params.ref)); t.ref = params.ref; return t; }
+      case 'scroll': return nativeScroll(params.direction, params.amount || 1, params.ref);
+      case 'scroll_to': return nativeScrollTo(params.y);
+      case 'scroll_into_view': return nativeScrollIntoView(await resolveRefHealed(params.ref));
+      case 'press_key': return nativePressKeyEnhanced(params.key, params.ref, params.modifiers);
+      case 'evaluate': return nativeEvaluate(params.script);
+      case 'evaluate_safe': return nativeEvaluateSafe(params.query || {});
+      case 'type_many': return await nativeTypeMany(params.fields);
+      case 'hover': return nativeHover(await resolveRefHealed(params.ref));
+      case 'right_click': return nativeRightClick(await resolveRefHealed(params.ref));
+      case 'drag_drop': return nativeDragDrop(await resolveRefHealed(params.fromRef), await resolveRefHealed(params.toRef));   // ★ 2026-10-01: was the SYNC resolveRef; the relay copy uses the HEALED one, which is the whole point of the healer (a stale ref otherwise fails silently mid-drag)
+      case 'click_xy': return nativeClickXY(params.x, params.y, params.ref, params.button);
+      case 'console_log': if (!consoleCapturing) startConsoleCapture(); return getConsoleLog(params.clear !== false, params.maxEntries || 100);
+      case 'copy_to_clipboard': return nativeCopyToClipboard(params.text);
+      case 'form_state': return getFormState(params.formRef, params.frameId);
+      case 'action_preview': return previewAction(params.ref);   // ★ 2026-10-01: was getActionPreview — a function that exists NOWHERE in the bundle, so action_preview threw a ReferenceError on this path while the relay path worked. Found by the dispatcher-unification audit; pin it in the test.
+      // Pass the RAW ref — these readers resolve internally (70-capture).
+      // Pre-resolving here made them re-resolve an Element via the string-keyed
+      // ref map → always null → "Element not found" on this direct-WS path.
+      case 'dropdown_options': return getDropdownOptions(params.ref);
+      case 'tab_contents': return getTabContents(params.ref);
+      case 'accordion_contents': return getAccordionContents(params.ref);
+      case 'page_state': {
+        // ★ ONE implementation — the canonical getPageState() in 70-capture. ctx adds ONLY
+        // the relay path's routing identity (its sender tab/frame), which no other
+        // dispatcher can know. It is NOT a second copy of the reader: before this the relay
+        // carried a 977-char inline copy that had already drifted (stale wsVersion, narrower
+        // hasCaptcha/isLoading selectors) and the 2026-09-25 MAIN-world dialog fix landed in
+        // getPageState() only — which is exactly how two copies of one op end up disagreeing
+        // about pendingDialogs.
+        const ps = getPageState(params.frameId);
+        if (ctx.sender) {
+          ps.answerTabId = (ctx.sender.tab && ctx.sender.tab.id) || null;
+          ps.answerFrameId = ctx.sender.frameId || null;
+        }
+        return ps;
+      }
+      case 'extract_text': { const sel=params.selector||'body'; const ml=(params.maxLen!==undefined?params.maxLen:(params.max_len!==undefined?params.max_len:4000)); const off=params.offset||0; const el=document.querySelector(sel); const txt=el?fullText(el):''; let et=el?txt.slice(off, off+ml):'Element not found for selector: '+sel; et+=(off+ml < txt.length)?'\n...[TRUNCATED — call extract_text again with offset='+(off+ml)+' for the next window]':''; return et; }   // bare string, NOT {text}: the server's read handler tests `typeof raw.data === 'string'` to run goal-summarization, and the relay copy always returned a string
+      case 'read_content': return readContent(params);
+      case 'dump_markdown': return nativeDumpMarkdown(params);
+      case 'resolve_ref': {
+        const el = resolveRef(params.ref);
+        if (!el) return { success: false, error: 'ref not found: ' + params.ref };
+        const loc = buildLocator(el);
+        return { success: true, found: true, ref: params.ref, tag: el.tagName.toLowerCase(),
+          text: (el.innerText || el.textContent || '').trim().slice(0, 80),
+          value: (el.value != null ? el.value : '').toString().slice(0, 80),
+          locator: loc && loc.length ? loc[0] : null, connected: el.isConnected };
+      }
+      case 'page_diff': return getPageDiff();
+      case 'find_intent': return findIntent(params.intent || '');
+      case 'geometry': return getGeometry(params.ref || params.selector || '');
+      case 'screen_center': return screenCenter(params.ref || params.selector || '');
+      case 'layout_relation': return layoutRelation(params.refA || '', params.refB || '');
+      case 'get_events': return getEvents(params.since);
+      case 'ping': return { pong: true, ts: Date.now(), url: location.href };   // union: the relay reported url, the direct path reported ts — now one shape
+      case 'get_status': {
+        // ★ 2026-10-01: this was a STATIC STUB — hubConnected:true, pageConnected:true,
+        // hardcoded. It claimed a healthy bridge regardless of reality, and it carried none
+        // of the dialog truth. The relay copy reported `connected`/`pendingDialogs` instead,
+        // so the two copies answered DIFFERENT SHAPES for one op. The server tolerates both
+        // (it tests `st.hubConnected || st.connected || st.ok`), which is exactly why the
+        // divergence went unnoticed. Now both report the union, and the dialog count is real.
+        let pd = 0;
+        try { pd = WS_DIALOGS.length + readMainWorldDialogs().length; } catch (_) {}
+        return { ok: true, connected: true, hubConnected: true, pageConnected: true,
+                 url: location.href, title: document.title, pendingDialogs: pd,
+                 source: 'content-script', isMainFrame: (function(){ try { return window.self === window.top; } catch (_) { return false; } })() };
+      }
+      case 'handle_dialog': {
+        // ★ 2026-10-01: this copy handled ONLY the isolated-world queue, so a dialog the
+        // PAGE itself raised (alert/confirm/prompt from page JS — the common case) was
+        // invisible here while the relay copy resolved it. That is the exact 2026-09-25
+        // divergence: the MAIN-world hook (extension/dialog-hook.js) publishes the page's
+        // own dialogs to a DOM attribute, and only one of the two copies read it. Now both
+        // try the MAIN world FIRST (where the page's dialogs land) and fall back to the
+        // isolated queue (dialogs raised by other extension-injected code).
+        const act0 = params.action || 'accept';
+        const mwList = readMainWorldDialogs();
+        if (mwList.length) {
+          const mIdx = (params.index !== undefined && params.index !== null) ? params.index : (mwList.length - 1);
+          const mw = mwList[mIdx];
+          if (!mw) return { success: false, error: 'No pending MAIN-world dialog at index ' + mIdx };
+          const mwReply = await resolveMainWorldDialog(mw.id, act0, params.value);
+          return {
+            success: true, handled: mw.type, source: 'main_world', id: mw.id,
+            message: mw.message,
+            value: (mw.type === 'confirm') ? (act0 === 'dismiss' ? false : true)
+              : (mw.type === 'prompt' ? (params.value != null ? params.value : mw.defaultValue) : undefined),
+            hookReply: mwReply,
+          };
+        }
+        const idx = (params.index !== undefined && params.index !== null) ? params.index : (WS_DIALOGS.length - 1);
+        const dlg = WS_DIALOGS[idx];
+        if (!dlg) return { success: false, error: 'No pending dialog (none in the MAIN world or the isolated world)' };
+        const act = params.action || 'accept';
+        if (dlg._timer) { try { clearTimeout(dlg._timer); } catch (_) {} }
+        if (dlg.type === 'alert') { WS_DIALOGS.splice(idx, 1); return { success: true, handled: 'alert' }; }
+        else if (dlg.type === 'confirm') { const cv = (act === 'dismiss') ? false : true; if (dlg._res) dlg._res(cv); WS_DIALOGS.splice(idx, 1); return { success: true, handled: 'confirm', value: cv }; }
+        else if (dlg.type === 'prompt') { const pv = (act === 'dismiss') ? null : (params.value !== undefined && params.value !== null ? params.value : dlg.defaultValue); if (dlg._res) dlg._res(pv); WS_DIALOGS.splice(idx, 1); return { success: true, handled: 'prompt', value: pv }; }
+        return { success: false, error: 'Unknown dialog type: ' + dlg.type };
+      }
+      case 'explore_intent': return exploreIntent(params.goal || '');
+      case 'read_selector': {
+        // B2 helper: read text/value from a selector (used by SW compound ops)
+        try {
+          const el = deepQuery(params.selector);
+          if (!el) return { success: false, error: 'selector not found: ' + params.selector };
+          return { success: true, selector: params.selector, text: (el.innerText || el.textContent || '').trim().slice(0, 2000), value: (el.value != null ? el.value : null) };
+        } catch (e) { return { success: false, error: e.message }; }
+      }
+      case 'write_selector': {
+        // B2 helper: set value + dispatch input events (used by SW compound ops)
+        try {
+          const el = deepQuery(params.selector);
+          if (!el) return { success: false, error: 'selector not found: ' + params.selector };
+          const v = String(params.value == null ? '' : params.value);
+          const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : (el instanceof HTMLSelectElement ? HTMLSelectElement.prototype : HTMLInputElement.prototype);
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value') && Object.getOwnPropertyDescriptor(proto, 'value').set;
+          if (setter) setter.call(el, v); else el.value = v;
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+          return { success: true, selector: params.selector, set: v, actual: el.value };
+        } catch (e) { return { success: false, error: e.message }; }
+      }
+      case 'scroll_and_extract': return await scrollAndExtract(params);
+      case 'preload_content': return await preloadPage(params);
+      case 'doctor_content': return doctorContent();
+      case 'network_log': {
+        // ★ 2026-10-01: this used to return "not available from content bridge" — a FALSE
+        // capability claim, the same class as upload_file's. startNetworkCapture and
+        // getNetworkLog are defined in this same content-script world (70-capture-and-readers),
+        // so the capability was always here; this copy just refused. Same op, and one routing
+        // path silently returned nothing.
+        if (!networkCapturing) startNetworkCapture();
+        return getNetworkLog(params.clear !== false, params.maxEntries || 50);
+      }
+      case 'mermaid_export': return { note: 'mermaid_export handled by server' };
+      case 'wait_for': return { note: 'wait_for not available from content bridge' };
+      case 'upload_file': {
+        // ★ 2026-10-01: this used to RETURN AN ERROR — "requires the background SW
+        // (drag-and-drop DataTransfer unavailable in content world)". That claim was WRONG,
+        // and it made upload_file fail outright whenever the hub routed it here: the relay
+        // path (70) implements exactly this from the SAME content-script world, which proves
+        // the capability is available. Two dispatchers, one op, one of them always erroring.
+        // ★ AWAIT IS LOAD-BEARING (the bug fixed on the other copy 2026-09-21):
+        // resolveRefHealed is ASYNC; without await, upEl is a PROMISE with no tagName /
+        // querySelector / parentElement, so locateFileInput falls through every structural
+        // branch to the proximity last resort where domCloseness(promise, candidate) scores
+        // 0 for every candidate — `best` never moves off all[0], the FIRST file input on the
+        // page. Measured on LemonSqueezy: a .zip attached to the product IMAGE input while
+        // the real files input stayed empty, reported as success:true / fileCount:1.
+        const upEl = await resolveRefHealed(params.ref);
+        const upDet = detectEditor(upEl);
+        if (upDet.kind === 'editor') {
+          return await nativeUploadPasteIntoEditor(upEl, params.fileContent, params.fileName, params.mimeType);
+        }
+        return await nativeUploadFromBase64(upEl, params.fileContent, params.fileName, params.mimeType);
+      }
+      case 'read_clipboard': return await handleReadClipboard();   // ★ 2026-10-01: was an execCommand-only inline copy; handleReadClipboard tries navigator.clipboard.readText() FIRST then falls back, and is now the ONE implementation for both paths
+      case 'reset_session': wsReady = true; return { success: true };
+      default: return { error: 'Unknown content action: ' + msg.type };
+    }
+  }
+
+  wsConnect();
+
+  // ═══ Ref System ═══
+/* ═══ SHADOW-DOM PIERCING (2026-09-11d) ═══
+ * document.querySelector() cannot see into a shadow root, so any control a site
+ * builds as a web component (Lit / Stencil / FAST / faceplate — Reddit's composer,
+ * shoelace widgets) is invisible to selector resolution even though the candidate
+ * scan ALREADY pierces shadow roots (_collectShadowHits). That mismatch is what
+ * forced a fallback to pixel guessing: `inspect kind:"geometry"` answered
+ * "element not found" for Reddit's Post button, which lives in a shadow root, so
+ * the caller had nothing to click and had to estimate coordinates from a picture.
+ * These walk OPEN shadow roots only. A CLOSED root is unreachable by design from
+ * any script, so it is skipped rather than faked.
+ */
+  function deepQueryAll(selector, root) {
+    const start = root || document;
+    const out = [];
+    const queue = [start];
+    while (queue.length) {
+      const node = queue.shift();
+      try {
+        const hits = node.querySelectorAll(selector);
+        for (let i = 0; i < hits.length; i++) out.push(hits[i]);
+      } catch (_) { /* selector invalid for this root */ }
+      let all = null;
+      try { all = node.querySelectorAll('*'); } catch (_) {}
+      if (all) {
+        for (let j = 0; j < all.length; j++) {
+          const sr = all[j] && all[j].shadowRoot;
+          if (sr) queue.push(sr);
+        }
+      }
+    }
+    return out;
+  }
+
+  function deepQuery(selector, root) {
+    if (!selector) return null;
+    // Light-DOM fast path: identical behaviour on pages with no shadow roots, so
+    // this cannot regress the common case; the walk only runs on a miss.
+    try { const hit = (root || document).querySelector(selector); if (hit) return hit; } catch (_) {}
+    const all = deepQueryAll(selector, root);
+    return all.length ? all[0] : null;
+  }
+
+  function isInShadow(el) {
+    try { return !!(el && el.getRootNode && el.getRootNode() !== document); } catch (_) { return false; }
+  }
+
+/* Ref/locator system: assign, resolve, heal, locator build
+ * Part 01 of 9 — source of truth for extension/websense-cs.js.
+ * DO NOT edit the built file; edit here and run `node tools/build-cs.mjs`.
+ * Split out 2026-09-11 (was one 3,7xx-line file). The code below is copied
+ * VERBATIM from the pre-split file; only this banner is added.
+ */
+  const REF_ATTR = 'data-websense-ref';
+  let refMap = new Map();
+  const elementSignatures = new WeakMap();
+  // A2: ref → locator chain (a plain Map — WeakMap is not iterable, so the
+  // resolveRef fallback can't scan elementSignatures; keep the locator
+  // indexed by ref for O(1) re-resolution after re-render).
+  const locatorByRef = new Map();
+  let refCounter = 0;
+
+  function elementSignature(el) {
+    const tag = el.tagName.toLowerCase();
+    const id = el.id || '';
+    const name = el.getAttribute('name') || '';
+    const role = el.getAttribute('role') || '';
+    const type = el.getAttribute('type') || '';
+    const cls = (el.className || '').toString().slice(0, 50);
+    let posIdx = -1;
+    if (el.parentElement) {
+      const siblings = Array.from(el.parentElement.children).filter((c) => c.tagName === el.tagName);
+      posIdx = siblings.indexOf(el);
+    }
+    return [tag, id, name, role, type, cls, posIdx].join('|');
+  }
+
+  // A2 (2026-08-10): semantic locator chain — a STABLE address that survives
+  // re-render. Priority: data-testid → id → aria-label → name → stable CSS
+  // path → role+text. `resolveRef` falls back through this when the element
+  // is removed from the DOM (React/Angular re-renders kill the REF_ATTR node).
+  function buildLocator(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return null;
+    const chain = [];
+    const testid = el.getAttribute('data-testid') || el.getAttribute('data-test-id');
+    if (testid) chain.push('[data-testid="' + CSS.escape(testid) + '"]');
+    if (el.id) chain.push('#' + CSS.escape(el.id));
+    const aria = el.getAttribute('aria-label');
+    if (aria) chain.push('[aria-label="' + CSS.escape(aria) + '"]');
+    const name = el.getAttribute('name');
+    if (name) chain.push('[name="' + CSS.escape(name) + '"]');
+    // Stable CSS path: climb to a stable ancestor (id/testid/body), record
+    // :nth-of-type indices — survives shallow re-renders.
+    let css = '';
+    let node = el;
+    let guard = 0;
+    while (node && node.nodeType === Node.ELEMENT_NODE && guard++ < 8) {
+      const tag = node.tagName.toLowerCase();
+      if (node.id) { css = '#' + CSS.escape(node.id) + ' ' + css; break; }
+      if (node.getAttribute('data-testid')) { css = '[data-testid="' + CSS.escape(node.getAttribute('data-testid')) + '"] ' + css; break; }
+      const parent = node.parentElement;
+      if (parent) {
+        const sameTag = Array.from(parent.children).filter((c) => c.tagName === node.tagName);
+        const idx = sameTag.indexOf(node);
+        css = tag + (sameTag.length > 1 ? ':nth-of-type(' + (idx + 1) + ')' : '') + (css ? ' > ' + css : '');
+      } else { css = tag + (css ? ' > ' + css : ''); }
+      node = parent;
+    }
+    if (css) chain.push(css);
+    // role+text — the most semantic, last resort
+    const role2 = el.getAttribute('role');
+    const txt = (el.innerText || el.textContent || '').trim().slice(0, 40);
+    if (role2 && txt) chain.push('[role="' + CSS.escape(role2) + '"][aria-label="' + CSS.escape(txt) + '"]');
+    else if (txt) chain.push('//' + el.tagName.toLowerCase() + '[normalize-space(.)="' + txt.replace(/"/g, '\\"') + '"]');
+    return chain.length ? chain : null;
+  }
+
+  // Resolve a locator chain against the live DOM (CSP-safe, no eval).
+  function resolveLocator(chain) {
+    if (!Array.isArray(chain)) return null;
+    for (const sel of chain) {
+      try {
+        if (sel.startsWith('//')) {
+          // XPath-ish fallback (text match) — querySelector can't do text.
+          const m = sel.match(/^\/([a-z]+)\[normalize-space\(\.\)="([^"]*)"\]$/);
+          if (m) {
+            const els = Array.from(document.getElementsByTagName(m[1]));
+            for (const e of els) {
+              if ((e.innerText || e.textContent || '').trim().slice(0, 40) === m[2]) return e;
+            }
+          }
+          continue;
+        }
+        // deepQuery: the locator chain is the SELF-HEAL path, so it must pierce
+        // shadow roots too — otherwise a re-rendered web-component never rebinds.
+        const el = deepQuery(sel);
+        if (el) return el;
+      } catch (_) { /* try next */ }
+    }
+    return null;
+  }
+
+  function assignRef(el) {
+    if (elementSignatures.has(el)) return elementSignatures.get(el).ref;
+    const ref = 'E' + refCounter++;
+    const loc = buildLocator(el);
+    elementSignatures.set(el, { ref, sig: elementSignature(el), locator: loc });
+    refMap.set(ref, el);
+    if (loc && loc.length) locatorByRef.set(ref, loc);
+    try { el.setAttribute(REF_ATTR, ref); } catch (_) {}
+    return ref;
+  }
+
+  // v4 (2026-08-31): quote-safe [data-websense-ref="<ref>"] lookup + selector
+  // fast-path. Escapes backslashes and double quotes before embedding the ref
+  // into an attribute selector, so refs containing quotes can never crash
+  // querySelector again.
+  function resolveAttrRef(ref) {
+    if (typeof ref !== 'string' || !ref) return null;
+    try {
+      const esc = ref.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+      // deepQuery: a REF assigned to a shadow-hosted control (createElement/refs
+      // on web components) is unreachable via document.querySelector, so
+      // resolveRef returned null and every tool answered "Element not found"
+      // for an element the candidate scan had ALREADY found and ref'd.
+      return deepQuery('[' + REF_ATTR + '="' + esc + '"]') || null;
+    } catch (_) { return null; }
+  }
+
+  // SELECTOR-REF fast path (v4): if the ref looks like a CSS selector, try it
+  // directly before falling back to the locator chain.
+  function resolveSelectorRef(ref) {
+    if (typeof ref !== 'string') return null;
+    // ★ NO WHITELIST (2026-10-01): the old one omitted '/', so every href/src locator and x.com's
+    // file input returned null before querySelector ran. Full record: the cs: test for this.
+    if (!(ref.startsWith('[') || ref.startsWith('#') || ref.startsWith('.') || ref.includes(' > ') || ref.includes('>') || ref.includes('~') || /^[a-zA-Z][\w-]*([\[.:])/.test(ref))) return null;
+    try {
+      // deepQuery: accept a shadow-hosted selector as a ref (Reddit's Post button,
+      // any Lit/FAST widget) instead of failing and forcing coordinate guessing.
+      return deepQuery(ref) || null;
+    } catch (_) { return null; }
+  }
+
+  function resolveRef(ref) {
+    if (refMap.has(ref)) {
+      const el = refMap.get(ref);
+      if (el && el.isConnected) return el;
+      refMap.delete(ref);
+    }
+    // v4 (2026-08-31): attribute-lookup with QUOTE-SAFE escaping. A ref/selector
+    // containing double quotes (e.g. [data-testid="tweetTextarea_0"]) crashed
+    // the naive string concat with "not a valid selector". Also fast-path:
+    // a well-formed selector ref goes straight to querySelector.
+    const el = resolveAttrRef(ref);
+    if (el) { refMap.set(ref, el); return el; }
+    // SELECTOR REFS (2026-08-13): accept CSS selectors directly
+    // so tools like geometry()'s returned refs ("[aria-label='X']", "#id",
+    // ".class > span") can be clicked without an E# SAG entry. v4 (2026-08-31):
+    // wrapped in resolveAttrRef() which QUOTE-ESCAPES the attribute value —
+    // selectors containing double quotes (e.g. [data-testid="tweetTextarea_0"])
+    // previously crashed querySelector with "not a valid selector".
+    {
+      const selEl = resolveSelectorRef(ref);
+      if (selEl) { refMap.set(ref, selEl); return selEl; }
+    }
+    // A2 (2026-08-10): the ref node died (re-render). Re-resolve via the
+    // semantic locator chain — data-testid → id → aria-label → name → CSS
+    // path → role+text. Re-binds the ref to the re-rendered element.
+    const loc = locatorByRef.get(ref);
+    if (loc) {
+      const found = resolveLocator(loc);
+      if (found) {
+        refMap.set(ref, found);
+        try { found.setAttribute(REF_ATTR, ref); } catch (_) {}
+        return found;
+      }
+    }
+    return null;
+  }
+
+  // SELF-HEAL RESOLVE (2026-08-31, OSS smoke-test finding): async wrapper —
+  // ref was assigned in a scan BEFORE a full/compact explore rebuilt refMap,
+  // or the element is below fold / viewport-filtered / slow-render, and the
+  // sync DOM-walk resolution missed. Rebuild the graph ONCE, then retry —
+  // beats a hard "Element not found" and lets callers climb honestly.
+  // Guarded against recursion (extractActionGraph itself never calls this).
+  async function resolveRefHealed(ref) {
+    const first = resolveRef(ref);
+    if (first) return first;
+    if (resolveRefHealed._healing) return null;
+    try {
+      resolveRefHealed._healing = true;
+      await extractActionGraph({ includeContent: false, full: false, includeHidden: false });
+    } catch (_) { /* heal failed — return null below */ }
+    finally { resolveRefHealed._healing = false; }
+    return resolveRef(ref);
+  }
+
+  // ═══ Framework Detection ═══
+/* Framework detect, visibility, interactivity, labels, classify, intent
+ * Part 02 of 9 — source of truth for extension/websense-cs.js.
+ * DO NOT edit the built file; edit here and run `node tools/build-cs.mjs`.
+ * Split out 2026-09-11 (was one 3,7xx-line file). The code below is copied
+ * VERBATIM from the pre-split file; only this banner is added.
+ */
+  let _framework = null;
+  function detectFramework() {
+    if (_framework) return _framework;
+    try {
+      if (window.__REACT_DEVTOOLS_GLOBAL_HOOK__) _framework = 'react';
+      else if (document.querySelector('[data-reactroot], [data-reactid], div[id^="__next"]')) _framework = 'react';
+      else if (window.__VUE_DEVTOOLS_GLOBAL_HOOK__) _framework = 'vue';
+      else if (window.ng || document.querySelector('[ng-version]')) _framework = 'angular';
+      else if (document.querySelector('[data-svelte]')) _framework = 'svelte';
+      else _framework = 'vanilla';
+    } catch (_) { _framework = 'vanilla'; }
+    return _framework;
+  }
+
+  // ═══ Visibility Helpers ═══
+  function isVisible(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    const style = cachedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    if (style.opacity === '0') return false;
+    if (el.getAttribute('aria-hidden') === 'true') return false;
+    if (el.hidden) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 && rect.height === 0) return false;
+    return true;
+  }
+
+  function isInViewport(el) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    const rect = el.getBoundingClientRect();
+    const vw = window.innerWidth || document.documentElement.clientWidth;
+    const vh = window.innerHeight || document.documentElement.clientHeight;
+    // Element is "in viewport" if any part intersects the viewport
+    const inView = rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
+    // Also treat zero-size interactive elements (inputs hidden by CSS but present) as in-viewport
+    // so they aren't dropped from the graph when offscreen scan is off.
+    return inView || (rect.width === 0 && rect.height === 0 && isVisible(el));
+  }
+
+
+  // ═══ Interactive Element Detection ═══
+  // ★ NO HARDCODED VOCABULARIES (2026-10-01, Ali: "any value or names should be
+  // dynamically parsed by the script"). Three declared tables lived here — a tag set,
+  // an ARIA widget-role set, and a 12-value cursor set — plus four hardcoded attribute
+  // names (aria-haspopup / data-toggle / data-bs-toggle / .dropdown-toggle, the last two
+  // being Bootstrap conventions). All of it is gone. Interactivity is now read off the
+  // element's own PLATFORM state and the page's own assertions:
+  //   el.tabIndex >= 0        THE key one: the browser's focusability computation, which
+  //                           already returns 0 for a, button, input, select, textarea,
+  //                           summary and anything with tabindex — i.e. the platform's
+  //                           own answer to "is this a control", no list required
+  //   isContentEditable       platform-editable
+  //   onclick / onkeydown     a handler the page attached
+  //   role / any aria-*       the page asserting a semantics (whatever it chose to write)
+  //   a non-default cursor    the page declaring "this is interactive" in CSS
+  function isInteractive(el, pre) {
+    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
+    // `pre` may carry visibility already computed by the caller's single geometry
+    // pass (2026-09-11). Without it we would force layout again here — the old
+    // code read getBoundingClientRect twice per element (once in isVisible, once
+    // in isInViewport) which is a large part of the ~5ms/element cost.
+    if (pre && pre.vis !== undefined) { if (!pre.vis) return false; }
+    else if (!isVisible(el)) return false;
+    if (el.disabled) return false;
+    if (el.getAttribute('aria-disabled') === 'true') return false;
+    if (el.getAttribute('inert') !== null) return false;
+    if (el.isContentEditable) return true;
+    try { if (el.tabIndex >= 0) return true; } catch (_) {}
+    try {
+      if (typeof el.onclick === 'function' || typeof el.onkeydown === 'function') return true;
+    } catch (_) {}
+    const at = el.attributes;
+    if (at) {
+      for (let i = 0; i < at.length; i++) {
+        const n = at[i].name;
+        if (n === 'role') return true;
+        if (n.length > 5 && n.lastIndexOf('aria-', 0) === 0) return true;
+      }
+    }
+    const style = cachedStyle(el);
+    if (style.cursor && style.cursor !== 'auto' && style.cursor !== 'default') return true;
+    return false;
+  }
+
+  // ═══ Element Classification ═══
+  function getLabel(el) {
+    if (el.getAttribute('aria-label')) return el.getAttribute('aria-label').trim();
+    if (el.id) { const l = document.querySelector('label[for="' + CSS.escape(el.id) + '"]'); if (l) return (l.innerText||l.textContent||'').trim(); }
+    if (el.getAttribute('placeholder')) return el.getAttribute('placeholder').trim();
+    if (el.getAttribute('title')) return el.getAttribute('title').trim();
+    if (el.getAttribute('alt')) return el.getAttribute('alt').trim();
+    const text = fullText(el);
+    if (text) return text.slice(0, 100);
+    // 2026-09-25 PRIVACY FIX: never surface a password field's value as its
+    // label. This fallback put the live secret into EVERY surface that prints a
+    // label — explore_page actions, read diffs, DELTA diffs, dialog/tab readers
+    // — so a typed password leaked into tool output, the session map, and the
+    // per-action diffs. Passwords are write-only from the agent's side: they
+    // get filled, never echoed back.
+    if (el.value && el.tagName !== 'SELECT' && !isSensitiveValueField(el)) return String(el.value).slice(0, 50);
+    return '';
+  }
+  // Single source of truth for "this field's value must never be printed".
+  // Covers type=password plus the two autocomplete spellings apps use for
+  // masked fields and one-time codes.
+  function isSensitiveValueField(el) {
+    if (!el || el.tagName !== 'INPUT') return false;
+    const type = (el.getAttribute('type') || '').toLowerCase();
+    if (type === 'password') return true;
+    const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
+    return ac === 'current-password' || ac === 'new-password' || ac === 'one-time-code';
+  }
+  // Value + a "there is something here" flag, with the secret stripped. Readers
+  // that dump every field's value use this so a filled password never comes
+  // back in a tool result.
+  function maskedValue(el) {
+    var v = (el && el.value != null) ? el.value : '';
+    return { value: isSensitiveValueField(el) ? '' : v, hasValue: !!v };
+  }
+
+  // ═══ Pseudo-element / CSS content text (innerText misses ::before/::after) ═══
+  function pseudoContent(el) {
+    try {
+      var parts = [];
+      ['::before', '::after'].forEach(function (p) {
+        var c = window.getComputedStyle(el, p).content;
+        if (c && c !== 'none' && c !== 'normal' && c !== '""' && c !== "''") parts.push(String(c).replace(/^["']|["']$/g, ''));
+      });
+      return parts.join(' ');
+    } catch (_) { return ''; }
+  }
+  function fullText(el) {
+    var t = (el.innerText || el.textContent || '').trim();
+    var p = pseudoContent(el);
+    if (p && t.indexOf(p) === -1) t = (t + ' ' + p).trim();
+    return t;
+  }
+
+  function getAttrs(el) {
+    const attrs = {};
+    const names = el.getAttributeNames ? el.getAttributeNames() : [];
+    for (const name of names) { const v = el.getAttribute(name); if (v !== null) attrs[name] = v; }
+    return attrs;
+  }
+
+  function classifyAction(el) {
+    const tag = el.tagName.toLowerCase();
+    const attrs = getAttrs(el);
+    const role = attrs.role || '';
+    const type = attrs.type || '';
+    const style = window.getComputedStyle(el);
+
+    if (tag === 'a' && attrs.href) return { type:'navigation', subtype:'link', href:attrs.href, target:attrs.target||'_self' };
+    if (tag === 'a') return { type:'action', subtype:'anchor_button' };
+    if (tag === 'input' || tag === 'textarea') {
+      if (type === 'checkbox') return { type:'toggle', subtype:'checkbox' };
+      if (type === 'radio') return { type:'toggle', subtype:'radio' };
+      if (type === 'submit' || type === 'image') { const f = el.closest('form'); return { type:'form_submit', subtype:'input_submit', formRef: f?assignRef(f):null }; }
+      if (type === 'file') return { type:'file_upload', subtype:'file' };
+      if (type === 'button') return { type:'action', subtype:'input_button' };
+      return { type:'form_input', subtype: type||'text' };
+    }
+    if (tag === 'select') return { type:'form_input', subtype:'select' };
+    if (el.isContentEditable || attrs.contenteditable === 'true') return { type:'form_input', subtype:'contenteditable' };
+    if (attrs['aria-haspopup'] === 'dialog' || attrs['aria-haspopup'] === 'true' || attrs['data-toggle'] === 'modal' || attrs['data-bs-toggle'] === 'modal')
+      return { type:'modal_trigger', subtype: tag==='button'?'button':role||'element', target: attrs['aria-controls']||(attrs['data-target']||'').replace('#','') };
+    if (attrs['aria-haspopup'] === 'menu' || attrs['data-toggle'] === 'dropdown' || attrs['data-bs-toggle'] === 'dropdown' || el.classList.contains('dropdown-toggle'))
+      return { type:'dropdown_trigger', subtype: tag==='button'?'button':role||'element', target: attrs['aria-controls']||'' };
+    if (role === 'tab' || attrs['data-toggle'] === 'tab' || attrs['data-bs-toggle'] === 'tab')
+      return { type:'tab_trigger', subtype:'tab', target: attrs['aria-controls']||'', selected: attrs['aria-selected']==='true' };
+    if (tag === 'summary' || (role === 'button' && attrs['aria-expanded'] !== undefined))
+      return { type:'expand_collapse', subtype:'button', expanded: attrs['aria-expanded']==='true' };
+    if (tag === 'details') return { type:'expand_collapse', subtype:'details', expanded: el.open };
+    if (role === 'switch' || attrs['aria-pressed'] !== undefined)
+      return { type:'toggle', subtype: role==='switch'?'switch':'button', pressed: attrs['aria-pressed']==='true' };
+    if (tag === 'button') {
+      if (type === 'submit') { const f = el.closest('form'); return { type:'form_submit', subtype:'button', formRef: f?assignRef(f):null }; }
+      const f = el.closest('form');
+      if (f) { const btns = f.querySelectorAll('button[type="submit"], button:not([type])'); if (btns.length === 1 && btns[0] === el) return { type:'form_submit', subtype:'button', formRef: assignRef(f) }; }
+      return { type:'action', subtype:'button' };
+    }
+    // ★ NO HARDCODED ROLE TABLE (2026-10-01): was INTERACTIVE_ROLES.has(role). If the
+    // PAGE wrote a role, it is asserting a semantics — report it verbatim. The subtype
+    // is the page's own word, so an unfamiliar role still classifies honestly.
+    if (role) return { type: 'action', subtype: role };
+    if (style.cursor === 'pointer') return { type:'action', subtype:'clickable' };
+    return { type:'unknown', subtype:tag };
+  }
+
+  // ═══ A3 (2026-08-10): INTENT DETECTION ═══
+  // Pure-JS heuristics that tag an element with its SEMANTIC PURPOSE —
+  // "submit login form", "enter password", "search", "cancel modal". No LLM on
+  // the page. The agent can then find elements by INTENT, not just by type.
+  const INTENT_BUTTON_TEXT = {
+    'submit': ['submit','send','save','ok','confirm','create','add','update','continue','next','done','apply','register','sign up','signup','get started'],
+    'login': ['login','log in','sign in','signin','enter','authenticate'],
+    'search': ['search','find','lookup','query','go'],
+    'cancel': ['cancel','close','dismiss','back','never mind','x'],
+    'delete': ['delete','remove','trash','discard','clear'],
+    'logout': ['logout','log out','sign out','signout'],
+    'accept': ['accept','agree','allow','yes','approve'],
+    'reject': ['reject','deny','decline','no thanks','no'],
+  };
+  const INTENT_INPUT_TYPE = { 'password':'enter password', 'email':'enter email', 'search':'search', 'tel':'enter phone', 'number':'enter number', 'url':'enter url', 'date':'pick date', 'file':'attach file' };
+  const INTENT_AUTOCOMPLETE = { 'current-password':'enter password', 'new-password':'set password', 'email':'enter email', 'username':'enter username', 'tel':'enter phone', 'one-time-code':'enter OTP' };
+  const INTENT_PLACEHOLDER = { 'password':'enter password', 'email':'enter email', 'search':'search', 'username':'enter username', 'phone':'enter phone', 'otp':'enter OTP', 'code':'enter code' };
+
+  function detectIntent(el, c) {
+    try {
+      const tag = el.tagName.toLowerCase();
+      const attrs = getAttrs(el);
+      const label = (getLabel(el) || '').toLowerCase().trim();
+      const ph = (attrs.placeholder || '').toLowerCase().trim();
+      const auto = (attrs.autocomplete || '').toLowerCase().trim();
+      const txt = (el.innerText || el.textContent || '').toLowerCase().trim().slice(0, 30);
+
+      // Inputs: type > autocomplete > placeholder > label
+      if (tag === 'input' || tag === 'textarea') {
+        const t = (attrs.type || 'text').toLowerCase();
+        if (INTENT_INPUT_TYPE[t]) return INTENT_INPUT_TYPE[t];
+        if (INTENT_AUTOCOMPLETE[auto]) return INTENT_AUTOCOMPLETE[auto];
+        if (INTENT_PLACEHOLDER[ph]) return INTENT_PLACEHOLDER[ph];
+        for (const [kw, intent] of Object.entries(INTENT_PLACEHOLDER)) { if (label.includes(kw)) return intent; }
+        if (c && c.type === 'form_input') return 'enter ' + (label || t || 'value');
+        return 'enter text';
+      }
+      // Buttons/links: text match against intent tables
+      if (tag === 'button' || tag === 'a' || (c && (c.type === 'form_submit' || c.type === 'action'))) {
+        const hay = txt + ' ' + label;
+        for (const [intent, kws] of Object.entries(INTENT_BUTTON_TEXT)) {
+          for (const kw of kws) { if (hay.includes(kw)) return intent; }
+        }
+        if (c && c.type === 'form_submit') return 'submit';
+        return 'action';
+      }
+      if (c && c.type === 'modal_trigger') return 'open dialog';
+      if (c && c.type === 'dropdown_trigger') return 'open menu';
+      if (c && c.type === 'tab_trigger') return 'switch view';
+      if (c && c.type === 'expand_collapse') return (c.expanded ? 'collapse' : 'expand');
+      if (c && c.type === 'toggle') return 'toggle';
+      if (c && c.type === 'file_upload') return 'attach file';
+      if (c && c.type === 'navigation') return 'navigate';
+      return 'unknown';
+    } catch (_) { return 'unknown'; }
+  }
+
+  // A3: find elements by intent — returns refs matching a semantic intent.
+  function findIntent(intentQuery) {
+    const q = (intentQuery || '').toLowerCase().trim();
+    if (!q) return { success: false, error: 'intent required (e.g. "submit", "password", "search")' };
+    const all = Array.from(deepQueryAll('button, a, input, textarea, select, [role="button"], [role="tab"], [role="dialog"]'));
+    const matches = [];
+    for (const el of all) {
+      if (!isVisible(el)) continue;
+      const c = classifyAction(el);
+      const intent = detectIntent(el, c);
+      const labelText = (getLabel(el) || '').toLowerCase();
+      const hrefText = ((c.href || '') + '').toLowerCase();
+      if (intent.includes(q) || q.includes(intent) || (el.getAttribute('name')||'').toLowerCase().includes(q) || (el.getAttribute('id')||'').toLowerCase().includes(q) || labelText.includes(q) || hrefText.includes(q)) {
+        matches.push({ ref: assignRef(el), intent, type: c.type, subtype: c.subtype, label: getLabel(el).slice(0, 60), locator: (buildLocator(el)||[])[0] || null });
+      }
+    }
+    return { success: true, query: q, count: matches.length, matches: matches.slice(0, 15) };
+  }
+
+  // ═══ A7 (2026-08-10): NO-DUMP CONTRACT ═══
+  // explore_intent(goal): given a natural-language goal, return ONLY the
+  // elements relevant to that goal — filtered in the content script, not in
+  // the agent's context. Combines A3 intent tags with goal-keyword matching.
+  // This is the anti-explore_page: no 125KB dump, just the handful of elements
+  // that matter for the task at hand.
+  const GOAL_ALIASES = {
+    'submit': ['submit','send','save','confirm','ok','done','apply','continue','next','create','add','update','register','sign up'],
+    'login': ['login','log in','sign in','signin','authenticate','password','username','email'],
+    'search': ['search','find','lookup','query'],
+    'password': ['password','pass','secret'],
+    'email': ['email','mail','e-mail'],
+    'cancel': ['cancel','close','dismiss','back'],
+    'delete': ['delete','remove','trash','discard'],
+    'upload': ['upload','attach','file','choose file'],
+    'download': ['download','export','save as'],
+    'filter': ['filter','sort','category'],
+    'chat': ['chat','message','send','composer','reply','dm'],
+    'comment': ['comment','reply','post'],
+    'settings': ['settings','preferences','options','config'],
+  };
+
+  function exploreIntent(goal) {
+    const g = (goal || '').toLowerCase().trim();
+    if (!g) return { success: false, error: 'goal required (e.g. "submit the form", "log in", "search")' };
+    // Expand the goal into keywords: goal words + aliases for matched intents
+    const keywords = new Set(g.split(/\s+/).filter((w) => w.length > 2));
+    for (const [intent, aliases] of Object.entries(GOAL_ALIASES)) {
+      if (g.includes(intent)) { for (const a of aliases) keywords.add(a); }
+      else { for (const a of aliases) { if (g.includes(a)) { for (const a2 of aliases) keywords.add(a2); break; } } }
+    }
+    const all = Array.from(deepQueryAll('button, a, input, textarea, select, [role="button"], [role="tab"], [role="dialog"], form'));
+    const relevant = [];
+    for (const el of all) {
+      if (!isVisible(el)) continue;
+      const c = classifyAction(el);
+      const intent = detectIntent(el, c);
+      const label = (getLabel(el) || '').toLowerCase();
+      const name = (el.getAttribute('name') || '').toLowerCase();
+      const id = (el.getAttribute('id') || '').toLowerCase();
+      const ph = (el.getAttribute('placeholder') || '').toLowerCase();
+      const hay = intent + ' ' + label + ' ' + name + ' ' + id + ' ' + ph;
+      // Score: how many goal keywords does this element touch?
+      let score = 0;
+      for (const kw of keywords) { if (hay.includes(kw)) score++; }
+      // An intent match on a goal keyword is the strongest signal
+      if (score > 0 || Array.from(keywords).some((kw) => intent.includes(kw))) {
+        relevant.push({ ref: assignRef(el), intent, type: c.type, subtype: c.subtype, label: getLabel(el).slice(0, 60), score, locator: (buildLocator(el)||[])[0] || null });
+      }
+    }
+    relevant.sort((a, b) => b.score - a.score);
+    return { success: true, goal: g, keywords: Array.from(keywords), count: relevant.length, matches: relevant.slice(0, 12),
+      hint: relevant.length ? relevant.slice(0, 5).map((m) => m.intent + ' (' + m.label + ')').join(' | ') : 'no goal-relevant elements found' };
+  }
+
+  // ═══ State Detection ═══
+  function detectDisabledReason(el) {
+    if (!el.disabled && el.getAttribute('aria-disabled') !== 'true') return null;
+    const form = el.closest('form');
+    if (form) { const req = form.querySelectorAll('input[required],textarea[required],select[required]'); for (const f of req) { if (!f.value && f.type!=='checkbox' && f.type!=='radio') return 'required_fields_empty'; } }
+    if (el.getAttribute('aria-disabled') === 'true') return 'aria_disabled';
+    return 'disabled';
+  }
+
+  function extractState(el) {
+    const a = getAttrs(el);
+    return {
+      disabled: el.disabled||a['aria-disabled']==='true', disabledReason: detectDisabledReason(el),
+      checked: el.checked||a['aria-checked']==='true', expanded: a['aria-expanded']==='true',
+      selected: a['aria-selected']==='true', pressed: a['aria-pressed']==='true',
+      required: el.required||a.required!==undefined, readOnly: el.readOnly||a.readonly!==undefined,
+      valid: el.validity?el.validity.valid:null, error: el.validationMessage||null,
+      value: el.value!==undefined?el.value:null, visible: isVisible(el), inViewport: isInViewport(el),
+    };
+  }
+
+  function resolveUrl(href) { try { return new URL(href, window.location.href).href; } catch(_) { return href; } }
+
+  function predictEffect(el, c, attrs) {
+    switch (c.type) {
+      case 'navigation': return 'navigate_to:'+resolveUrl(c.href);
+      case 'form_submit': { const f=el.closest('form'); return 'submit_form:'+(f?(f.getAttribute(REF_ATTR)||'?'):'?')+' -> '+(f?(f.method||'GET').toUpperCase():'GET')+' '+(f?f.action:'current'); }
+      case 'modal_trigger': return 'open_modal:#'+(c.target||'unknown');
+      case 'dropdown_trigger': return 'open_dropdown:#'+(c.target||'unknown');
+      case 'tab_trigger': return 'switch_tab:#'+(c.target||'unknown');
+      case 'toggle': return 'toggle:'+(attrs.name||'state')+' -> '+(c.pressed||attrs['aria-checked']==='true'?'off':'on');
+      case 'expand_collapse': return (c.expanded?'collapse':'expand')+':'+getLabel(el).slice(0,30);
+      case 'file_upload': return 'file_upload:open_file_dialog';
+      default: return 'click:unknown_effect';
+    }
+  }
+
+  // ═══ Form Extraction ═══
+  function findFieldLabel(input) {
+    if (input.id) { const l = document.querySelector('label[for="'+CSS.escape(input.id)+'"]'); if (l) return (l.innerText||l.textContent||'').trim(); }
+    if (input.getAttribute('aria-label')) return input.getAttribute('aria-label').trim();
+    const lb = input.getAttribute('aria-labelledby'); if (lb) { const el = document.getElementById(lb); if (el) return (el.innerText||el.textContent||'').trim(); }
+    if (input.placeholder) return input.placeholder.trim();
+    const pl = input.closest('label'); if (pl) { const t = (pl.innerText||pl.textContent||'').trim(); if (t && t !== input.value) return t.slice(0,100); }
+    if (input.getAttribute('title')) return input.getAttribute('title').trim();
+    return '';
+  }
+  function findSubmitButton(form) {
+    const s = form.querySelector('button[type="submit"],input[type="submit"]'); if (s) return s;
+    const btns = form.querySelectorAll('button,input[type="button"]');
+    for (const b of btns) { const t=(b.innerText||b.value||b.textContent||'').toLowerCase(); if (t.includes('submit')||t.includes('apply')||t.includes('send')||t.includes('save')||t.includes('next')) return b; }
+    return null;
+  }
+  function isFormSubmittable(form) {
+    const req = form.querySelectorAll('[required]');
+    for (const f of req) { if (f.type==='checkbox'&&!f.checked) return false; if (f.type==='radio') { if (!form.querySelector('input[type="radio"][name="'+CSS.escape(f.name)+'"]:checked')) return false; continue; } if (!f.value||!f.value.trim()) return false; }
+    return true;
+  }
+  function extractSelectOptions(sel) { return Array.from(sel.options).map((o)=>({value:o.value,text:(o.textContent||'').trim(),selected:o.selected})); }
+  function extractForms() {
+    return Array.from(document.querySelectorAll('form')).filter(isVisible).map((form) => {
+      const formRef = assignRef(form);
+      const fields = Array.from(form.querySelectorAll('input,select,textarea')).filter((el)=>el.type!=='hidden').map((input) => {
+        const tag = input.tagName.toLowerCase();
+        // 2026-09-25 PRIVACY: the forms section echoed every field's value, so
+        // explore_page's form map and form{action:"state"} both printed a
+        // filled password in cleartext. Mask sensitive values here too.
+        const mv = maskedValue(input);
+        return { ref:assignRef(input), tag, type:input.type||(tag==='select'?'select':tag), name:input.name||'', label:findFieldLabel(input), placeholder:input.placeholder||'', value:mv.value, hasValue:mv.hasValue, required:input.required, valid:input.validity?input.validity.valid:null, error:input.validationMessage||null, checked:input.checked||false, disabled:input.disabled, options:tag==='select'?extractSelectOptions(input):undefined };
+      });
+      const sb = findSubmitButton(form); const sub = isFormSubmittable(form);
+      return { ref:formRef, id:form.id||'', method:(form.method||'get').toLowerCase(), action:form.action||'', fields, submitRef:sb?assignRef(sb):null, submitLabel:sb?getLabel(sb):'', submitEnabled:sb?!sb.disabled&&sub:false, submitDisabledReason:sb?(sb.disabled?detectDisabledReason(sb):(!sub?'required_fields_not_met':null)):null };
+    });
+  }
+
+  // getFormState (2026-08-31 full-tool sweep): the form{action:"state"} tool
+  // hit "getFormState is not defined" — the function was referenced in the
+  // message switch but NEVER implemented (dead tool since the 65→20 merge).
+  // One-form variant of extractForms: resolves the formRef (E# or selector),
+  // returns the SAME shape as a form entry in the SAG so agents can diff
+  // form{state} against explore_page output directly.
+  function getFormState(formRef, frameId) {
+    const el = formRef ? resolveRef(formRef) : null;
+    if (!el || el.tagName !== 'FORM') return { success: false, error: el ? 'ref ' + formRef + ' is not a <form> (got ' + el.tagName + ')' : 'form ref not found: ' + (formRef || '(none)') };
+    const all = extractForms();
+    const found = all.find((f) => f.ref === formRef) || extractForms().find((f) => f.id === (formRef||'').replace(/^#/,''));
+    if (found) return { success: true, form: found };
+    // Fallback: rebuild for just this form (extractForms may skip hidden forms)
+    const fields = Array.from(el.querySelectorAll('input,select,textarea')).filter((i)=>i.type!=='hidden').map((input) => {
+      const tag = input.tagName.toLowerCase();
+      // 2026-09-25 PRIVACY: same masking as extractForms above.
+      const mv = maskedValue(input);
+      return { ref:assignRef(input), tag, type:input.type||(tag==='select'?'select':tag), name:input.name||'', label:findFieldLabel(input), placeholder:input.placeholder||'', value:mv.value, hasValue:mv.hasValue, required:input.required, valid:input.validity?input.validity.valid:null, error:input.validationMessage||null, checked:input.checked||false, disabled:input.disabled, options:tag==='select'?extractSelectOptions(input):undefined };
+    });
+    const sb = findSubmitButton(el); const sub = isFormSubmittable(el);
+    return { success: true, form: { ref: formRef, id: el.id||'', method:(el.method||'get').toLowerCase(), action:el.action||'', fields, submitRef:sb?assignRef(sb):null, submitLabel:sb?getLabel(sb):'', submitEnabled:sb?!sb.disabled&&sub:false, submitDisabledReason:sb?(sb.disabled?detectDisabledReason(sb):(!sub?'required_fields_not_met':null)):null } };
+  }
+
+  // ═══ Content Intelligence: read_content + scroll_and_extract ═══
+
+  function readContent(params) {
+    // Smart content extraction for heavy SPA pages.
+    // Tries multiple heuristics to find the main content, skipping nav/ads/sidebar.
+    var maxLen = (params && params.maxLen) || 12000;
+    var selector = params && params.selector;
+    var result = { text: '', method: '', elements: 0, url: location.href, title: document.title };
+
+    // Method 1: Explicit selector
+    if (selector) {
+      var els = document.querySelectorAll(selector);
+      var texts = [];
+      els.forEach(function (el) { var t = (el.innerText || el.textContent || '').trim(); if (t) texts.push(t); });
+      result.text = texts.join('\n\n').slice(0, maxLen);
+      result.method = 'selector:' + selector;
+      result.elements = els.length;
+      if (result.text.length > 0) return result;
+    }
+
+    // Method 2: Main content containers (high priority) — site quirks first, then generic
+    var mainSelectors = siteContentSelectors().concat([
+      'article', 'main', '[role="main"]',
+      '.post-content', '.entry-content', '.article-content',
+      '.product-description', '.description',
+      '.markdown-body', '.prose',
+      '[data-testid="tweetText"]', // x.com tweets
+      '[data-testid="cellInnerDiv"]', // x.com timeline
+    ]);
+    for (var i = 0; i < mainSelectors.length && result.text.length < 200; i++) {
+      var elements = document.querySelectorAll(mainSelectors[i]);
+      result.elements += elements.length;
+      var parts = [];
+      elements.forEach(function (el) {
+        var t = (el.innerText || el.textContent || '').trim();
+        if (t.length > 30) parts.push(t);
+      });
+      if (parts.length > 0) {
+        result.text = parts.join('\n\n').slice(0, maxLen);
+        result.method = 'main:' + mainSelectors[i];
+      }
+    }
+    if (result.text.length > 200) return result;
+
+    // Method 3:段落 and list items extraction (good for structured content)
+    var paraTexts = [];
+    var paras = document.querySelectorAll('p, li, h1, h2, h3, blockquote, td, [role="text"], [data-testid]');
+    paras.forEach(function (el) {
+      if (!isVisible(el)) return;
+      var t = (el.innerText || el.textContent || '').trim();
+      if (t.length > 10 && t.length < 2000) paraTexts.push(t);
+    });
+    if (paraTexts.length > 5) {
+      result.text = paraTexts.join('\n').slice(0, maxLen);
+      result.method = 'paragraphs';
+      result.elements = paraTexts.length;
+      if (result.text.length > 200) return result;
+    }
+
+    // Method 4: Full body text via smarter walk (including span, a, button text)
+    result.text = extractBodyText(maxLen);
+    result.method = 'body-walk';
+    return result;
+  }
+
+  // ── dump_markdown (borrowed from Lightpanda's --dump markdown, 2026-08-10) ──
+  // Convert a page (or a selector's subtree) to clean Markdown. CSP-safe: pure
+  // DOM walk, no eval. Reuses readContent's container detection for the default.
+/* Markdown dump, scroll+extract, geometry, preload, eager
+ * Part 03 of 9 — source of truth for extension/websense-cs.js.
+ * DO NOT edit the built file; edit here and run `node tools/build-cs.mjs`.
+ * Split out 2026-09-11 (was one 3,7xx-line file). The code below is copied
+ * VERBATIM from the pre-split file; only this banner is added.
+ */
+  function nativeDumpMarkdown(params) {
+    var maxLen = (params && params.maxLen) || 20000;
+    var selector = params && params.selector;
+    var root = null;
+    var method = '';
+
+    if (selector) {
+      root = deepQuery(selector);
+      method = 'selector:' + selector;
+      if (!root) return { success: true, markdown: '', title: document.title, url: location.href, elements: 0, method: method + ' (no match)' };
+    } else {
+      // Reuse readContent's main-container detection.
+      var mainSelectors = siteContentSelectors().concat([
+        'article', 'main', '[role="main"]',
+        '.post-content', '.entry-content', '.article-content',
+        '.markdown-body', '.prose',
+        '[data-testid="tweetText"]',
+      ]);
+      for (var i = 0; i < mainSelectors.length; i++) {
+        var els = document.querySelectorAll(mainSelectors[i]);
+        if (els.length) {
+          var best = null, bestLen = 0;
+          for (var j = 0; j < els.length; j++) {
+            var t = (els[j].innerText || els[j].textContent || '').trim();
+            if (t.length > bestLen) { bestLen = t.length; best = els[j]; }
+          }
+          if (best && bestLen > 30) { root = best; method = 'main:' + mainSelectors[i]; break; }
+        }
+      }
+      if (!root) { root = document.body; method = 'body'; }
+    }
+
+    var parts = [];
+    var st = { count: 0 };
+    var elementCount = 0;
+    walkMarkdown(root, parts, 0, st);
+    elementCount = st.count;
+    var md = parts.join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .replace(/[ \t]+\n/g, '\n')
+      .trim();
+    if (md.length > maxLen) md = md.slice(0, maxLen) + '\n\n...[TRUNCATED — raise maxLen or pass a narrower selector]';
+
+    return {
+      success: true,
+      markdown: md,
+      title: document.title,
+      url: location.href,
+      elements: elementCount,
+      method: method,
+    };
+
+    function walkMarkdown(node, out, depth, st) {
+      if (!node || !node.tagName) return;
+      var tag = node.tagName.toLowerCase();
+      if (node.nodeType === 3) { // text node
+        var tx = (node.textContent || '').replace(/\s+/g, ' ').trim();
+        if (tx) out[out.length - 1] = (out[out.length - 1] || '') + tx;
+        return;
+      }
+      if (tag === 'script' || tag === 'style' || tag === 'noscript' || tag === 'iframe' || tag === 'svg' || tag === 'canvas' || tag === 'template' || tag === 'nav' || tag === 'header' || tag === 'footer' || tag === 'form' || tag === 'button' || tag === 'input' || tag === 'textarea' || tag === 'select' || tag === 'label' || tag === 'aside' || tag === 'figure') return;
+      if (!isVisible(node)) return;
+
+      // Skip empty containers quickly.
+      var ownText = (node.innerText || node.textContent || '').trim();
+      if (!ownText && tag !== 'img' && tag !== 'br' && tag !== 'hr' && tag !== 'table') return;
+
+      var block = ['p','div','section','article','li','blockquote','pre','td','th','tr','table','ul','ol','h1','h2','h3','h4','h5','h6','dl','dt','dd','hr','br'].indexOf(tag) >= 0;
+      if (block) {
+        var prev = out.length ? out[out.length - 1] : '';
+        if (prev !== '' && !/^\n+$/.test(prev)) out.push('');
+      }
+
+      switch (tag) {
+        case 'h1': case 'h2': case 'h3': case 'h4': case 'h5': case 'h6': {
+          var lvl = parseInt(tag[1], 10);
+          var ht = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+          if (ht) { out.push(Array(lvl + 1).join('#') + ' ' + ht); st.count++; }
+          return;
+        }
+        case 'img': {
+          var src = node.getAttribute('src') || '';
+          var alt = node.getAttribute('alt') || '';
+          if (src) { out.push('![' + alt + '](' + src + ')'); st.count++; }
+          return;
+        }
+        case 'a': {
+          var href = node.getAttribute('href') || '';
+          var at = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+          if (at && href && href.indexOf('javascript:') !== 0) { out.push('[' + at + '](' + href + ')'); st.count++; return; }
+          if (at) { out.push(at); st.count++; return; }
+          break;
+        }
+        case 'br': out.push(''); return;
+        case 'hr': out.push('---'); return;
+        case 'ul': case 'ol': {
+          var items = node.children;
+          for (var i2 = 0; i2 < items.length; i2++) {
+            var li = items[i2];
+            if (li.tagName && li.tagName.toLowerCase() === 'li') {
+              var lt = (li.innerText || li.textContent || '').replace(/\s+/g, ' ').trim();
+              if (lt) { out.push((tag === 'ol' ? (i2 + 1) + '. ' : '- ') + lt); st.count++; }
+            }
+          }
+          return;
+        }
+        case 'blockquote': {
+          var qt = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+          if (qt) { out.push('> ' + qt); st.count++; }
+          return;
+        }
+        case 'pre': case 'code': {
+          var ct = (node.innerText || node.textContent || '');
+          if (ct.trim()) { out.push('```\n' + ct.replace(/\n{3,}/g, '\n\n').trim() + '\n```'); st.count++; }
+          return;
+        }
+        case 'table': {
+          var rows = node.querySelectorAll('tr');
+          for (var r = 0; r < rows.length; r++) {
+            var cells = rows[r].querySelectorAll('th, td');
+            var rowMd = [];
+            for (var c = 0; c < cells.length; c++) rowMd.push(' ' + (cells[c].innerText || '').replace(/\s+/g, ' ').trim() + ' ');
+            if (rowMd.length) out.push('|' + rowMd.join('|') + '|');
+          }
+          if (rows.length > 1) {
+            var headerCells = rows[0].querySelectorAll('th, td');
+            out.push('|' + Array(headerCells.length + 1).join(' --- |'));
+          }
+          st.count += rows.length;
+          return;
+        }
+      }
+
+      // Recurse into children for generic containers.
+      var kids = node.children || [];
+      for (var k = 0; k < kids.length; k++) walkMarkdown(kids[k], out, depth + 1, st);
+    }
+  }
+
+  async function scrollAndExtract(params) {
+    // Scroll the page N times, collecting new content after each scroll.
+    // Great for infinite scroll pages (x.com timeline, lemonsqueezy product grids).
+    var scrolls = (params && params.scrolls) || 5;
+    var scrollDelay = (params && params.scrollDelay) || 1500; // ms between scrolls
+    var maxLen = (params && params.maxLen) || 20000;
+    var direction = (params && params.direction) || 'down';
+    var selector = params && params.selector;
+    var seenText = new Set();
+    var allChunks = [];
+    var result = { chunks: [], totalText: '', scrollCount: 0, url: location.href, title: document.title, finalScrollY: 0 };
+
+    for (var s = 0; s < scrolls; s++) {
+      // Scroll
+      nativeScroll(direction, 500, null);
+      result.scrollCount++;
+
+      // Wait for lazy content to load
+      await new Promise(function (r) { setTimeout(r, scrollDelay); });
+
+      // Extract visible content
+      var content = readContent({ selector: selector, maxLen: maxLen });
+      var text = content.text || '';
+
+      // Only keep new content we haven't seen before
+      var lines = text.split('\n').filter(function (l) {
+        var lt = l.trim();
+        if (lt.length < 5) return false;
+        if (seenText.has(lt)) return false;
+        seenText.add(lt);
+        return true;
+      });
+
+      if (lines.length > 0) {
+        var chunk = lines.join('\n');
+        allChunks.push({ scroll: s + 1, lines: lines.length, preview: chunk.slice(0, 200) });
+        result.chunks.push({ scroll: s + 1, text: chunk });
+      }
+    }
+
+    result.totalText = result.chunks.map(function (c) { return c.text; }).join('\n\n').slice(0, maxLen);
+    result.finalScrollY = window.scrollY;
+    result.totalLines = result.totalText.split('\n').length;
+    return result;
+  }
+
+  // ═══ Lazy-load defeat + real scroll container ═══
+  // Research-verified: x.com scrolls an INNER div — window.scrollTo is a silent
+  // no-op there. Find the real scroll container, then force-eager every lazy
+  // resource so explore/read see everything without manual scrolling.
+
+  function findScrollContainer() {
+    // 1. The documentElement if IT scrolls
+    var de = document.documentElement;
+    if (de.scrollHeight > de.clientHeight + 50) return de;
+    // 2. Walk body ancestors for the tallest overflow-auto/scroll container
+    var candidates = [];
+    var el = document.body;
+    while (el && el !== document.documentElement) {
+      try {
+        var st = window.getComputedStyle(el);
+        var oy = st.overflowY;
+        if (/(auto|scroll|overlay)/.test(oy) && el.scrollHeight > el.clientHeight + 50) {
+          candidates.push({ el: el, h: el.scrollHeight - el.clientHeight });
+        }
+      } catch (_) {}
+      el = el.parentElement;
+    }
+    if (candidates.length) {
+      candidates.sort(function (a, b) { return b.h - a.h; });
+      return candidates[0].el;
+    }
+    // 3. Fallback: any element with a big scrollHeight
+    var all = document.querySelectorAll('div, main, section');
+    var best = null, bestH = 0;
+    for (var i = 0; i < all.length && i < 2000; i++) {
+      var e = all[i];
+      var h = e.scrollHeight - e.clientHeight;
+      if (h > bestH) { bestH = h; best = e; }
+    }
+    return best || de;
+  }
+
+  function scrollContainerY(container) {
+    if (!container) return 0;
+    return (container === document.documentElement) ? window.scrollY : container.scrollTop;
+  }
+
+  // ═══ A5 (2026-08-10): GEOMETRY ANSWERS ═══
+  // Spatial reasoning without vision: bounding boxes, z-order, and layout
+  // relations computed against the REAL scroll container (PITFALL 31 —
+  // x.com scrolls an inner div, not window). Answers "is the modal over the
+  // form?", "what's above X?" from data, not pixels.
+  // P0#3 (2026-08-31): convert a ref's viewport center to PHYSICAL SCREEN
+  // coordinates for a genuine OS-level click. A real OS click needs screen
+  // pixels, not viewport CSS pixels. Formula:
+  //   screenX = window.screenX + chromeLeftX + viewportCenterX
+  //   screenY = window.screenY + chromeTopY + viewportCenterY
+  // where the chrome offsets are the difference between window and inner
+  // (viewport) edges — tab strip + toolbar on top, scrollbar/rounding on
+  // left. devicePixelRatio converts CSS px to physical px on HiDPI (the
+  // caller sends these coords to the OS, which thinks in physical pixels).
+  function screenCenter(refOrSelector) {
+    let el = null;
+    if (refOrSelector && /^E\d+$/.test(refOrSelector)) el = resolveRef(refOrSelector);
+    // deepQuery: a shadow-hosted target (any Lit/FAST-style widget) must resolve
+    // here, otherwise the caller is pushed into estimating coordinates from a
+    // screenshot — exactly the pixel-guessing this tool exists to remove.
+    if (!el && refOrSelector) { try { el = deepQuery(refOrSelector); } catch (_) {} }
+    if (!el) return { success: false, error: 'element not found: ' + (refOrSelector || '?') };
+    const rect = el.getBoundingClientRect();
+    // viewport center (CSS px)
+    const vx = rect.left + rect.width / 2;
+    const vy = rect.top + rect.height / 2;
+    // window chrome offsets: window outer edge vs inner viewport edge
+    const chromeLeft = (window.outerWidth - window.innerWidth) / 2 || 0;
+    const chromeTop = (window.outerHeight - window.innerHeight) || 0;
+    const screenX = (window.screenX || 0) + chromeLeft + vx;
+    const screenY = (window.screenY || 0) + chromeTop + vy;
+    const dpr = window.devicePixelRatio || 1;
+    return {
+      success: true,
+      ref: refOrSelector,
+      tag: el.tagName.toLowerCase(),
+      inShadow: isInShadow(el),
+      visible: isVisible(el),
+      // viewport CSS px center (what the CS/nativeClickXY uses)
+      viewport: { x: Math.round(vx), y: Math.round(vy) },
+      // physical screen px center (what a real OS click needs)
+      screen: { x: Math.round(screenX * dpr), y: Math.round(screenY * dpr) },
+      dpr: dpr,
+      chrome: { left: Math.round(chromeLeft), top: Math.round(chromeTop) },
+      text: (el.innerText || el.textContent || '').trim().slice(0, 60),
+    };
+  }
+
+  function getGeometry(refOrSelector) {
+    let el = null;
+    if (refOrSelector && /^E\d+$/.test(refOrSelector)) el = resolveRef(refOrSelector);
+    // deepQuery: a shadow-hosted target (any Lit/FAST-style widget) must resolve
+    // here, otherwise the caller is pushed into estimating coordinates from a
+    // screenshot — exactly the pixel-guessing this tool exists to remove.
+    if (!el && refOrSelector) { try { el = deepQuery(refOrSelector); } catch (_) {} }
+    if (!el) return { success: false, error: 'element not found: ' + (refOrSelector || '?') };
+    const sc = findScrollContainer();
+    const rect = el.getBoundingClientRect();
+    const srect = sc.getBoundingClientRect();
+    // z-order: walk ancestors counting positioned elements
+    let z = 0, node = el;
+    while (node && node !== document.body) {
+      try { const st = window.getComputedStyle(node); if (st.position !== 'static') z++; } catch (_) {}
+      node = node.parentElement;
+    }
+    const st = window.getComputedStyle(el);
+    return {
+      success: true,
+      ref: refOrSelector,
+      tag: el.tagName.toLowerCase(),
+      visible: isVisible(el),
+      viewport: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) },
+      // Coordinates relative to the REAL scroll container (x.com inner div)
+      container: { tag: sc.tagName ? sc.tagName.toLowerCase() : 'window', id: sc.id || '', cls: (sc.className || '').toString().slice(0, 40) },
+      containerPos: { x: Math.round(rect.x - srect.x), y: Math.round(rect.y - srect.y + scrollContainerY(sc)), w: Math.round(rect.width), h: Math.round(rect.height) },
+      scroll: { containerY: Math.round(scrollContainerY(sc)), containerMaxY: Math.round((sc.scrollHeight || 0) - (sc.clientHeight || 0)) },
+      zDepth: z,
+      position: st.position,
+      zIndex: st.zIndex && st.zIndex !== 'auto' ? st.zIndex : null,
+      text: (el.innerText || el.textContent || '').trim().slice(0, 60),
+    };
+  }
+
+  // A5: layout relations — above / below / covers / overlaps
+  function layoutRelation(refA, refB) {
+    const a = getGeometry(refA);
+    const b = getGeometry(refB);
+    if (!a.success || !b.success) return { success: false, error: 'one or both elements not found' };
+    const ar = a.viewport, br = b.viewport;
+    const aBottom = ar.y + ar.h, bBottom = br.y + br.h;
+    let relation = 'separate';
+    if (ar.x < br.x + br.w && ar.x + ar.w > br.x && ar.y < bBottom && aBottom > br.y) {
+      relation = 'overlaps';
+      // covers: A fully contains B in both axes AND is on top (later DOM/z)
+      if (ar.x <= br.x && ar.x + ar.w >= br.x + br.w && ar.y <= br.y && aBottom >= bBottom) {
+        relation = (a.zDepth >= b.zDepth) ? 'covers' : 'covered_by';
+      }
+    } else if (aBottom <= br.y) relation = 'above';
+    else if (ar.y >= bBottom) relation = 'below';
+    return { success: true, relation, a: a.ref || a.tag, b: b.ref || b.tag,
+      aBox: ar, bBox: br, hint: relation === 'above' ? a.tag + ' is above ' + b.tag : relation === 'covers' ? a.tag + ' covers ' + b.tag + ' (modal?)' : relation };
+  }
+
+  function forceEagerAll() {
+    // (a) Native lazy loading: attribute rewrite re-triggers fetch immediately.
+    var imgs = document.querySelectorAll('img[loading="lazy"]');
+    var lazyCount = 0;
+    for (var i = 0; i < imgs.length; i++) { imgs[i].loading = 'eager'; lazyCount++; }
+    // (b) data-src / data-srcset framework loaders (lozad, vanilla-lazyload...)
+    var ds = document.querySelectorAll('[data-src], [data-srcset], [data-original]');
+    var dataCount = 0;
+    for (var j = 0; j < ds.length; j++) {
+      var d = ds[j];
+      if (d.getAttribute('data-src') && !d.getAttribute('src')) { d.setAttribute('src', d.getAttribute('data-src')); dataCount++; }
+      if (d.getAttribute('data-srcset') && !d.getAttribute('srcset')) { d.setAttribute('srcset', d.getAttribute('data-srcset')); }
+      if (d.getAttribute('data-original') && !d.getAttribute('src')) { d.setAttribute('src', d.getAttribute('data-original')); dataCount++; }
+    }
+    // (c) content-visibility:auto subtrees render lazily — force visible.
+    var cv = document.querySelectorAll('[style*="content-visibility"], [style*="content-visibility"]');
+    var cvCount = 0;
+    var cvAll = document.querySelectorAll('*');
+    for (var k = 0; k < cvAll.length && k < 5000; k++) {
+      try {
+        var cvs = window.getComputedStyle(cvAll[k]).contentVisibility;
+        if (cvs === 'auto') { cvAll[k].style.contentVisibility = 'visible'; cvCount++; }
+      } catch (_) {}
+    }
+    // (d) synthetic resize + scroll nudge to trigger IO callbacks
+    try {
+      window.dispatchEvent(new Event('resize'));
+      window.dispatchEvent(new Event('scroll'));
+    } catch (_) {}
+    return { lazy: lazyCount, dataSrc: dataCount, contentVisibility: cvCount };
+  }
+
+  async function preloadPage(params) {
+    // Combined lazy-load defeat: attribute pass → scroll sweep (real container)
+    // → straggler prefetch → restore scroll. Returns stats + per-step notes.
+    var maxSteps = (params && params.maxSteps) || 25;
+    var settleMs = (params && params.settleMs) || 250;
+    var restore = (params && params.restore) !== false;
+    var stats = { eager: null, steps: 0, loadedNew: 0, finalY: 0, restored: false, container: 'window' };
+    var startY = window.scrollY;
+
+    // 1. Attribute pass — free, no scroll
+    stats.eager = forceEagerAll();
+
+    // 2. Scroll sweep on the REAL container
+    var container = findScrollContainer();
+    if (container !== document.documentElement) stats.container = 'inner';
+    var lastH = container.scrollHeight || 0;
+    var plateau = 0;
+    for (var s = 0; s < maxSteps; s++) {
+      var before = (container.scrollHeight || 0);
+      if (container === document.documentElement) window.scrollBy(0, window.innerHeight * 0.8);
+      else container.scrollTop += window.innerHeight * 0.8;
+      stats.steps++;
+      await new Promise(function (r) { setTimeout(r, settleMs); });
+      // Re-run attribute pass each step (new lazy items appear)
+      var st = forceEagerAll();
+      stats.loadedNew += st.lazy + st.dataSrc;
+      var now = container.scrollHeight || 0;
+      if (now <= lastH + 5) { plateau++; if (plateau >= 3) break; } else plateau = 0;
+      lastH = now;
+      if (before === now && s > 2) { /* content stopped growing; one more try then bail */ if (plateau >= 2) break; }
+    }
+
+    // 3. Straggler prefetch (safe: new Image() uses <img> creds, no CORS issue)
+    var pending = [];
+    var allImgs = document.querySelectorAll('img');
+    for (var p = 0; p < allImgs.length && p < 500; p++) {
+      var im = allImgs[p];
+      if (im.complete && im.naturalWidth === 0) continue; // broken/blocked — skip
+      if (!im.src && im.getAttribute('data-src')) continue; // already handled
+      if (im.src && im.complete) continue;
+      if (im.src) pending.push(im.src);
+    }
+    var prefetched = 0;
+    for (var q = 0; q < pending.length && q < 100; q++) {
+      try { var img = new Image(); img.fetchPriority = 'low'; img.src = pending[q]; prefetched++; } catch (_) {}
+    }
+    stats.prefetched = prefetched;
+
+    // 4. Restore scroll
+    if (restore) {
+      if (container === document.documentElement) window.scrollTo(0, startY);
+      else { container.scrollTop = startY; window.scrollTo(0, startY); }
+      stats.restored = true;
+    }
+    stats.finalY = container === document.documentElement ? window.scrollY : container.scrollTop;
+    return stats;
+  }
+
+  // ═══ Site-quirks registry (borrowed from agentreach driver-per-platform) ═══
+  // Per-site tuning without code changes: content selectors, scroll behavior,
+  // label priorities. Matching is by hostname regex.
+/* Per-site quirks, section/heading/bodyText/pageType extraction
+ * Part 04 of 9 — source of truth for extension/websense-cs.js.
+ * DO NOT edit the built file; edit here and run `node tools/build-cs.mjs`.
+ * Split out 2026-09-11 (was one 3,7xx-line file). The code below is copied
+ * VERBATIM from the pre-split file; only this banner is added.
+ */
+  var WS_SITE_QUIRKS = [
+    { host: /(^|\.)x\.com$/, quirks: { name: 'x.com', scrollMode: 'auto', contentSelectors: ['[data-testid="tweetText"]', '[data-testid="cellInnerDiv"]', 'article'] } },
+    { host: /(^|\.)twitter\.com$/, quirks: { name: 'twitter', scrollMode: 'auto', contentSelectors: ['[data-testid="tweetText"]', '[data-testid="cellInnerDiv"]', 'article'] } },
+    { host: /(^|\.)lemonsqueezy\.com$/, quirks: { name: 'lemonsqueezy', scrollMode: 'auto', contentSelectors: ['.product-description', '.description', 'main', 'article'] } },
+    { host: /(^|\.)youtube\.com$/, quirks: { name: 'youtube', scrollMode: 'window', contentSelectors: ['#description', '#comments', 'ytd-watch-metadata'] } },
+    { host: /(^|\.)github\.com$/, quirks: { name: 'github', scrollMode: 'auto', contentSelectors: ['article.markdown-body', '.comment-body', 'main'] } },
+    { host: /(^|\.)linkedin\.com$/, quirks: { name: 'linkedin', scrollMode: 'auto', contentSelectors: ['.feed-shared-update-v2', '.jobs-description__content', 'main'] } },
+    { host: /(^|\.)reddit\.com$/, quirks: { name: 'reddit', scrollMode: 'auto', contentSelectors: ['shreddit-post', '[data-testid="post-container"]', 'main'] } },
+  ];
+  function getSiteQuirks() {
+    var h = location.hostname || '';
+    for (var i = 0; i < WS_SITE_QUIRKS.length; i++) {
+      if (WS_SITE_QUIRKS[i].host.test(h)) return WS_SITE_QUIRKS[i].quirks;
+    }
+    return { name: h, scrollMode: 'auto', contentSelectors: [] };
+  }
+  function siteContentSelectors() {
+    return getSiteQuirks().contentSelectors || [];
+  }
+
+  // ═══ End Content Intelligence ═══
+  function detectSections(actions) {
+    const sections = []; const sectionMap = new Map();
+    function addSection(el, name) { if (!el||!isVisible(el)) return null; const ref='S'+sections.length; sections.push({ref,name,elements:[],description:getLabel(el).slice(0,80)||''}); sectionMap.set(el,ref); return ref; }
+    document.querySelectorAll('[role="dialog"],[aria-modal="true"],dialog[open]').forEach((d)=>{ if(isVisible(d)) addSection(d,'modal'); });
+    const h = document.querySelector('header,[role="banner"]'); if (h) addSection(h,'header');
+    document.querySelectorAll('nav,[role="navigation"]').forEach((n)=>{ if(isVisible(n)) addSection(n,'navigation'); });
+    const m = document.querySelector('main,[role="main"]'); if (m) addSection(m,'main');
+    document.querySelectorAll('aside,[role="complementary"]').forEach((a)=>{ if(isVisible(a)) addSection(a,'sidebar'); });
+    const f = document.querySelector('footer,[role="contentinfo"]'); if (f) addSection(f,'footer');
+    for (const action of actions) { const el = resolveRef(action.ref); if (el) { let found=false; for (const [se,sr] of sectionMap) { if (se.contains(el)) { action.section=sr; const s=sections.find((x)=>x.ref===sr); if(s) s.elements.push(action.ref); found=true; break; } } if(!found) action.section=null; } }
+    return sections;
+  }
+
+  // ═══ Content Extraction ═══
+  function extractHeadings() {
+    const h = []; document.querySelectorAll('h1,h2,h3,h4,h5,h6').forEach((el)=>{ if(isVisible(el)){const t=(el.innerText||el.textContent||'').trim(); if(t)h.push(t);} }); return h.slice(0,20);
+  }
+  function extractBodyText(maxLen) {
+    const max = maxLen || 8000;
+    // Strategy: try common content containers first, then fall back to body walk.
+    // This works for React/Vue/Angular SPAs where the content is in a specific
+    // container, and also for vanilla pages where body has the content.
+    var text = '';
+
+    // 1. Try article/main content containers (site quirks first, then generic)
+    var contentHosts = siteContentSelectors().concat([
+      'article', 'main', '[role="main"]',
+      '#content', '.content', '.main-content',
+      '[data-testid="tweetText"]', // x.com
+      '.timeline', '.stream',
+      '.post-content', '.entry-content',
+      '.product-description', '.description', // e-commerce
+      '[data-testid]', // generic test-id containers
+    ]);
+    for (var i = 0; i < contentHosts.length && text.length < max; i++) {
+      var els = document.querySelectorAll(contentHosts[i]);
+      for (var j = 0; j < els.length && text.length < max; j++) {
+        var t = (els[j].innerText || els[j].textContent || '').trim();
+        if (t.length > 50) { // only meaningful text
+          text += t + '\n\n';
+        }
+      }
+    }
+
+    // 2. If content containers didn't yield enough, do the full body walk
+    if (text.length < 200) {
+      text = '';
+      function walk(n) {
+        if (text.length >= max) return;
+        if (n.nodeType === Node.TEXT_NODE) { const s = n.textContent.trim(); if (s) text += s + ' '; return; }
+        if (n.nodeType !== Node.ELEMENT_NODE) return;
+        const tag = n.tagName.toLowerCase();
+        if (['script', 'style', 'noscript', 'svg', 'template', 'head'].includes(tag)) return;
+        if (n.getAttribute && n.getAttribute('aria-hidden') === 'true') return;
+        const style = cachedStyle(n);
+        if (style.display === 'none' || style.visibility === 'hidden') return;
+        if (/^(div|p|h[1-6]|li|tr|br|hr|section|article|header|footer|nav|main|aside|blockquote|pre|ul|ol|table|form|fieldset|span|a|button|label)$/i.test(tag)) text += '\n';
+        for (const c of n.childNodes) walk(c);
+        if (/^(div|p|h[1-6]|li|tr|br|hr|section|article|header|footer|nav|main|aside|blockquote|pre|ul|ol|table|form|fieldset)$/i.test(tag)) text += '\n';
+      }
+      walk(document.body);
+    }
+
+    text = text.replace(/\n{3,}/g, '\n\n').replace(/ {2,}/g, ' ').trim();
+    if (text.length > max) text = text.slice(0, max) + '...(truncated)';
+    return text;
+  }
+  function extractPageType() {
+    const url=window.location.href.toLowerCase(), title=(document.title||'').toLowerCase();
+    if(url.includes('login')||title.includes('log in')||title.includes('sign in'))return'auth';
+    if(url.includes('register')||url.includes('signup')||title.includes('sign up'))return'auth';
+    if(url.includes('search')||title.includes('search'))return'search';
+    if(url.includes('dashboard')||title.includes('dashboard'))return'app';
+    if(url.includes('settings')||url.includes('profile'))return'settings';
+    if(document.querySelector('article,.article,.post,.blog-post'))return'article';
+    return'generic';
+  }
+
+  // ═══ Shadow DOM + Iframe Traversal ═══
+  // ═══ Candidate collection + DOM versioning (2026-09-11) ═══
+  // The old path called getAllElements(document.body) — pushing EVERY element
+  // node — then per element ran isInteractive (→ isVisible → getComputedStyle +
+  // getBoundingClientRect) and isInViewport (→ getBoundingClientRect AGAIN).
+  // Two forced-layout reads and one full computed-style resolution per element
+  // in DOCUMENT ORDER. Measured ~5ms/element, so 2,206 elements ≈ 11s and
+  // >5,000 elements blew the 90s budget.
+  //
+  // Fixes here: (1) narrow the candidate set with a selector instead of walking
+  // every node; (2) one native checkVisibility() call instead of getComputedStyle;
+  // (3) read each rect exactly once and pass it forward.
+/* Interactive candidate collection (selector prefilter + shadow)
+ * Part 05 of 9 — source of truth for extension/websense-cs.js.
+ * DO NOT edit the built file; edit here and run `node tools/build-cs.mjs`.
+ * Split out 2026-09-11 (was one 3,7xx-line file). The code below is copied
+ * VERBATIM from the pre-split file; only this banner is added.
+ */
+  // ★ NO HARDCODED VOCABULARY (2026-10-01, Ali: "any value or names should be
+  // dynamically parsed by the script"). This was a 30-entry SELECTOR LIST — a declared
+  // vocabulary of what counts as a control, which silently missed every control it did
+  // not name (custom elements, anything carrying a role nobody thought to list).
+  // Candidates are now found by asking the PLATFORM, in one pass, with cheap property
+  // reads and ZERO style resolution:
+  //   el.tabIndex >= 0        the browser's own focusability computation
+  //   el.isContentEditable    platform-editable
+  //   onclick / onkeydown     a handler the page itself attached
+  //   role / any aria-* attr  the page asserting a semantics (whatever it chose)
+  function _isCandidateNode(el) {
+    if (!el || el.nodeType !== 1) return false;
+    try { if (el.tabIndex >= 0) return true; } catch (_) {}
+    try { if (el.isContentEditable) return true; } catch (_) {}
+    try {
+      if (typeof el.onclick === 'function' || typeof el.onkeydown === 'function') return true;
+    } catch (_) {}
+    const at = el.attributes;
+    if (at) {
+      for (let i = 0; i < at.length; i++) {
+        const n = at[i].name;
+        if (n === 'role' || n === 'contenteditable') return true;
+        if (n.length > 5 && n.lastIndexOf('aria-', 0) === 0) return true;
+      }
+    }
+    return false;
+  }
+
+  // ★ The page declares its OWN interactive cursors. Instead of resolving
+  // getComputedStyle for every element (the single most expensive thing in the old
+  // loop — measured ~5ms/element, which is what the caps were papering over), read the
+  // selectors out of the page's stylesheets. Same information, one pass over CSS text.
+  function _cursorSelectorText(rules, out, depth) {
+    if (!rules || depth > 6) return;
+    for (let i = 0; i < rules.length; i++) {
+      const r = rules[i];
+      if (r.cssRules) { _cursorSelectorText(r.cssRules, out, depth + 1); continue; }
+      let cur = '';
+      try { cur = (r.style && r.style.cursor) || ''; } catch (_) { cur = ''; }
+      if (!cur || cur === 'auto' || cur === 'default') continue;
+      if (r.selectorText) out.push(r.selectorText);
+    }
+  }
+
+  function _collectCursorCandidates(out, seen) {
+    const sels = [];
+    try {
+      for (let s = 0; s < document.styleSheets.length; s++) {
+        let rules = null;
+        try { rules = document.styleSheets[s].cssRules; } catch (_) { continue; }
+        _cursorSelectorText(rules, sels, 0);
+      }
+    } catch (_) {}
+    let hits = 0;
+    for (let i = 0; i < sels.length; i++) {
+      let found = null;
+      try { found = document.querySelectorAll(sels[i]); } catch (_) { continue; }
+      for (let j = 0; j < found.length; j++) {
+        if (!seen.has(found[j])) { seen.add(found[j]); out.push(found[j]); hits++; }
+      }
+    }
+    return { selectorsRead: sels.length, added: hits };
+  }
+
+  var _domVersion = 0;
+  var _lastMutationTs = Date.now();
+  var _domObserver = null;
+  var _sagCache = null;
+
+  // One always-on observer per tab. Counting mutations is what lets us (a) skip
+  // the settle wait on a quiet DOM and (b) reuse a previous SAG when nothing
+  // changed — both otherwise-free savings on every call.
+  // attributeFilter deliberately EXCLUDES data-websense-ref: assignRef() writes
+  // that attribute on every element it touches, and watching it would make our
+  // own bookkeeping look like a page mutation and defeat the cache.
+  function ensureDomObserver() {
+    if (_domObserver) return;
+    try {
+      _domObserver = new MutationObserver(function () {
+        _domVersion++;
+        _lastMutationTs = Date.now();
+      });
+      _domObserver.observe(document.documentElement || document.body, {
+        childList: true, subtree: true, attributes: true,
+        attributeFilter: ['class', 'disabled', 'hidden', 'style',
+                          'aria-expanded', 'aria-hidden', 'aria-disabled']
+      });
+    } catch (_) { _domObserver = null; }
+  }
+
+  // Candidates by PLATFORM STATE — no selector list. One `*` walk with cheap property
+  // reads (no geometry, no computed style), so it is safe to run over everything.
+  function _collectSelectorHits(root, out, seen) {
+    try {
+      const hits = root.querySelectorAll('*');
+      for (let i = 0; i < hits.length; i++) {
+        const el = hits[i];
+        if (!seen.has(el) && _isCandidateNode(el)) { seen.add(el); out.push(el); }
+      }
+    } catch (_) {}
+  }
+
+  // Shadow subtrees still need their own walk to find NESTED shadow hosts.
+  function _collectShadowHits(root, out, seen) {
+    _collectSelectorHits(root, out, seen);
+    try {
+      const all = root.querySelectorAll('*');
+      for (let j = 0; j < all.length; j++) {
+        if (all[j] && all[j].shadowRoot) _collectShadowHits(all[j].shadowRoot, out, seen);
+      }
+    } catch (_) {}
+  }
+
+  function collectInteractiveCandidates(options) {
+    options = options || {};
+    const out = [];
+    const seen = new Set();
+    // ONE full-DOM query, reused for the element count AND shadow-host discovery.
+    let all = null;
+    let totalElements = 0;
+    try { all = document.querySelectorAll('*'); totalElements = all.length; } catch (_) { all = null; }
+    _collectSelectorHits(document, out, seen);
+    if (all) {
+      for (let i = 0; i < all.length; i++) {
+        if (all[i] && all[i].shadowRoot) _collectShadowHits(all[i].shadowRoot, out, seen);
+      }
+    }
+    const selectorHits = out.length;
+
+    // ★ NO SKIP, NO CEILING. The old code skipped the cursor sweep above 1,800
+    // elements and bounded the loop at SCAN_CEILING — a cap on WORK that silently
+    // shrank the map on exactly the pages that most needed it. The sweep is now the
+    // page's own CSS (see _collectCursorCandidates), so it can run everywhere.
+    let cursor = { selectorsRead: 0, added: 0 };
+    if (options.includeCursorSweep !== false) {
+      cursor = _collectCursorCandidates(out, seen);
+    }
+
+    return {
+      nodes: out, totalElements: totalElements, selectorHits: selectorHits,
+      cursorSelectorsRead: cursor.selectorsRead, cursorAdded: cursor.added,
+    };
+  }
+
+  // Visibility using one native checkVisibility() call when available (Chrome
+  // 105+), falling back to computed style. Takes an already-read rect so we
+  // never call getBoundingClientRect twice for the same element.
+  function _isVisibleRect(el, rect) {
+    try {
+      if (typeof el.checkVisibility === 'function') {
+        // ★ VISIBILITY FIX (2026-10-01) — the gate that made x.com's thread "+"
+        // unreachable from every surface.
+        // `checkOpacity: true` walks the ANCESTOR chain, so an element that is
+        // itself fully opaque is reported invisible when any wrapper above it has
+        // opacity 0. Measured: a[data-testid="addButton"][href="/compose/post"] is
+        // 24x24, opacity 1, in-viewport, not disabled/inert/aria-hidden — and sits
+        // under such a wrapper, so every collector gate dropped it and find /
+        // explore_page / page_slice could not see the control at all.
+        // It was also self-inconsistent: this branch was strict while BOTH the
+        // fallback below and isVisible() read the element's OWN style only. Both
+        // paths now apply one rule, and opacity is deliberately NOT a visibility
+        // criterion at all — opacity:0 is a standard "present and interactive"
+        // pattern (focus rings, hit-target wrappers, this one), and a visibility
+        // gate must never hide something the page will happily click.
+        if (!el.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true })) return false;
+      } else {
+        const s = cachedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden') return false;
+      }
+    } catch (_) {
+      try {
+        const s2 = cachedStyle(el);
+        if (s2.display === 'none' || s2.visibility === 'hidden') return false;
+      } catch (_) {}
+    }
+    if (el.getAttribute('aria-hidden') === 'true') return false;
+    if (el.hidden) return false;
+    const r = rect || el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) return false;
+    return true;
+  }
+
+  function getAllElements(root) {
+    // Phase 4 (2026-08-15): OPTIONAL iframe recursion. With all_frames:true
+    // every frame runs its own content script, but the model can't always
+    // target frames by frameId, so the main-frame explore_page now ALSO walks
+    // into SAME-ORIGIN iframes and tags each element with its frameId. Cross-
+    // origin iframes (and ad frames) are skipped — they're not reachable from
+    // here and have their own bridge. This makes explore_page return the FULL
+    // interactive surface in one call instead of missing in-frame controls.
+    const elements = [];
+    function walk(node, frameId) {
+      if (!node) return;
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        node.__wsFrameId = frameId;
+        elements.push(node);
+        if (node.shadowRoot) { for (const c of node.shadowRoot.children) walk(c, frameId); }
+      }
+      if (node.children) { for (const c of node.children) walk(c, frameId); }
+    }
+    walk(root || document.body, 0);
+    // Recurse into same-origin iframes (top-level = frameId 0 already done).
+    try {
+      const iframes = document.querySelectorAll('iframe');
+      iframes.forEach(function (f, idx) {
+        if (f.src && /^(https?:)?\/\//.test(f.src) && !sameOrigin(f.src)) return; // cross-origin: skip
+        if (WS_IS_AD_FRAME) return; // never recurse ad frames
+        try {
+          const fd = f.contentDocument;
+          if (fd && fd.body) walk(fd.body, idx + 1);
+        } catch (_) { /* cross-origin or not ready — skip */ }
+      });
+    } catch (_) {}
+    return elements;
+  }
+
+  function sameOrigin(url) {
+    try { return new URL(url, location.href).origin === location.origin; } catch (_) { return false; }
+  }
+
+  // ═══ Main SAG Extraction (chunked + async for heavy DOMs) ═══
+  // Process elements in batches with yield-between to avoid blocking the
+  // main thread and to stay within the WebSocket response window.
+  const BATCH_SIZE = 150; // elements per chunk
+  const CHUNK_YIELD_MS = 0; // setTimeout(0) yield between chunks
+
+  // Wait for the DOM to stop mutating (SPA hydration settle) before extraction.
+  // React/Vue apps render progressively; exploring mid-hydration gives a
+  // half-empty SAG. Default: wait up to 2.5s for a 400ms quiet window.
+  function waitForSettle(maxWaitMs, quietMs) {
+    return new Promise(function (resolve) {
+      var maxWait = maxWaitMs || 2500;
+      var quiet = quietMs || 400;
+      var deadline = Date.now() + maxWait;
+      var timer = null;
+      function arm() {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(function () {
+          observer.disconnect();
+          resolve();
+        }, quiet);
+      }
+      var observer = new MutationObserver(function () {
+        if (Date.now() > deadline) { observer.disconnect(); if (timer) clearTimeout(timer); resolve(); return; }
+        arm();
+      });
+      try { observer.observe(document.body || document.documentElement, { childList: true, subtree: true, characterData: true }); } catch (_) { resolve(); return; }
+      arm();
+    });
+  }
+
+  function extractActionGraphSync(options) {
+    // Quick synchronous path for small pages (used as fallback).
+    return _doExtract(options, null);
+  }
+
+  async function extractActionGraph(options) {
+    options = options || {};
+    // P1 (2026-08-31): incremental path — cheap scan + diff vs last scan,
+    // full-SAG fallback on first call / churn (see exploreIncremental).
+    if (options.incremental) return await exploreIncremental(options);
+    wsLog('EAG:start opts=', JSON.stringify(options));
+
+    ensureDomObserver();
+
+    // ── 0. Reuse the last SAG when the DOM provably has not changed ──────────
+    // Only for the cheap (viewport-only) shape, identical options, and inside a
+    // short TTL. The TTL is the backstop for the one case the mutation counter
+    // cannot see: a layout change driven by JS/canvas with no DOM mutation.
+    // {fresh:true} forces a real scan.
+    const cheapShape = !options.full && !options.includeHidden;
+    const cacheKey = [!!options.full, options.includeContent !== false,
+                      !!options.includeHidden, options.maxActions || '',
+                      options.contentMaxLen || ''].join('|');
+    if (cheapShape && !options.fresh && _sagCache &&
+        _sagCache.key === cacheKey && _sagCache.domVersion === _domVersion &&
+        (Date.now() - _sagCache.ts) < SAG_CACHE_TTL_MS) {
+      wsLog('EAG:cache HIT age=' + (Date.now() - _sagCache.ts) + 'ms');
+      const hit = Object.assign({}, _sagCache.sag);
+      hit.cached = true;
+      hit.cacheAgeMs = Date.now() - _sagCache.ts;
+      return hit;
+    }
+
+    const scanStart = Date.now();
+
+    // REF STABILITY (2026-08-31, OSS smoke-test finding): refCounter is NOT
+    // reset here. Resetting it made refs from a previous explore silently
+    // re-point at DIFFERENT elements after a re-scan (silent wrong-click
+    // hazard) or die with "Element not found" (below-fold elements). Refs
+    // are only reset on SPA navigation (navObserver) — within one page they
+    // are stable for the tab's lifetime. refMap is still rebuilt (bounded).
+    refMap = new Map(); locatorByRef.clear();
+    _styleCacheClear();
+
+    // ── 1. Settle — only when the page actually changed recently ────────────
+    // The old code always paid a full 400ms quiet window even on a page that had
+    // been idle for minutes. That is pure added latency on every call.
+    const sinceMutation = Date.now() - _lastMutationTs;
+    if (options.settle !== false && sinceMutation < SETTLE_SKIP_IF_QUIET_MS) {
+      await waitForSettle(options.settleMs || 2500, options.quietMs || 200);
+    }
+    wsLog('EAG:settle skipped=' + (sinceMutation >= SETTLE_SKIP_IF_QUIET_MS) +
+          ' sinceMutation=' + sinceMutation + 'ms');
+
+    // ── 2. Candidates: PLATFORM STATE, not a selector list (2026-10-01) ─────
+    const cand = collectInteractiveCandidates(options);
+    const tCand = Date.now();
+    wsLog('EAG:candidates=' + cand.nodes.length + ' selectorHits=' + cand.selectorHits +
+          ' totalEls=' + cand.totalElements +
+          ' cursorSelectorsRead=' + cand.cursorSelectorsRead + ' cursorAdded=' + cand.cursorAdded);
+
+    // ── 3. Cheap attribute pass (property reads only — never forces layout) ──
+    const pass1 = [];
+    for (let i = 0; i < cand.nodes.length; i++) {
+      const el = cand.nodes[i];
+      if (el.disabled) continue;
+      if (el.getAttribute('aria-disabled') === 'true') continue;
+      if (el.getAttribute('inert') !== null) continue;
+      if (el.type === 'hidden') continue;   // platform IDL, not a tag/name vocabulary
+      pass1.push(el);
+    }
+
+    // ── 4. ONE geometry + visibility pass; each rect read exactly once ───────
+    const vw = window.innerWidth || document.documentElement.clientWidth;
+    const vh = window.innerHeight || document.documentElement.clientHeight;
+    const wantOffscreen = !!options.full || !!options.includeHidden;
+    const geo = [];
+    for (let i = 0; i < pass1.length; i++) {
+      const el = pass1[i];
+      let rect;
+      try { rect = el.getBoundingClientRect(); } catch (_) { continue; }
+      const vis = _isVisibleRect(el, rect);
+      if (options.includeHidden === false && !vis) continue;
+      const inVp = rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
+      if (!wantOffscreen && !inVp) continue;
+      geo.push({ el: el, rect: rect, vis: vis, inVp: inVp });
+    }
+
+    // ── 5. Viewport-first order ─────────────────────────────────────────────
+    // Old traversal was document order, so on a long page the elements the agent
+    // actually needs (near the viewport, or in an open dialog) could sit hundreds
+    // of entries down the list. In-viewport first, then top-to-bottom.
+    geo.sort(function (a, b) {
+      if (a.inVp !== b.inVp) return a.inVp ? -1 : 1;
+      return a.rect.top - b.rect.top;
+    });
+
+    // ── 6. Enrich ONLY what we will return ──────────────────────────────────
+    // classify/label/locator/intent/predictEffect are the expensive per-element
+    // work, so the cap is applied AFTER geometry + viewport filtering where it
+    // finally bounds real work. DEFAULT_MAX_ACTIONS also means the *default* call
+    // is bounded — it used to be 0 (unbounded), which is why explore_page's
+    // default hard-stalled at 90s on any page over ~5,000 elements.
+    //
+    // Measured 2026-09-11: this loop costs ~0.65ms per accepted action and is the
+    // dominant term once a page has many in-viewport interactives (3,000 links:
+    // 190ms wall, ~130ms of it here). Geometry is cheap by comparison
+    // (~0.02ms/element) — which is why an IntersectionObserver rewrite was
+    // measured and REJECTED as not worth the async complexity.
+    const tGeo = Date.now();
+    // ★ NO CAP (2026-10-01): 0 = unbounded, and the guard below must respect that.
+    const maxActions = options.maxActions > 0 ? options.maxActions : 0;
+    const actions = [];
+    for (let i = 0; i < geo.length; i++) {
+      if (maxActions > 0 && actions.length >= maxActions) break;
+      const el = geo[i].el;
+      if (!isInteractive(el, geo[i])) continue;
+      try {
+        const ref = assignRef(el);
+        const classification = _cachedClassify(el);
+        const attrs = getAttrs(el);
+        const state = extractState(el);
+        const label = getLabel(el);
+        const effect = predictEffect(el, classification, attrs);
+        // 2026-09-25 PRIVACY: `...state` spread the RAW el.value into every
+        // explore_page action, so a filled password appeared in the action list
+        // (and in any delta/session snapshot of it). Mask it for sensitive
+        // fields, keeping the has-a-value signal.
+        if (isSensitiveValueField(el)) state.value = '';
+        const action = { ref, type: classification.type, subtype: classification.subtype, label, predictedEffect: effect, ...state };
+        // Phase 4 (2026-08-15): surface frameId from explore_page iframe recursion.
+        if (el.__wsFrameId != null && el.__wsFrameId !== 0) action.frameId = el.__wsFrameId;
+        // A2 (2026-08-10): expose the semantic locator so the agent can
+        // re-target after re-render (locator survives; ref E# may die).
+        const loc = buildLocator(el);
+        if (loc && loc.length) action.locator = loc[0];
+        // A3 (2026-08-10): intent tag — the element's semantic purpose.
+        action.intent = detectIntent(el, classification);
+        if (classification.href) action.href = classification.href;
+        if (classification.target) action.target = classification.target;
+        if (classification.formRef) action.formRef = classification.formRef;
+        if (classification.expanded !== undefined) action.expanded = classification.expanded;
+        if (classification.selected !== undefined) action.selected = classification.selected;
+        if (classification.pressed !== undefined) action.pressed = classification.pressed;
+        actions.push(action);
+      } catch (_) { /* skip broken element */ }
+    }
+    wsLog('EAG:loop done, ' + actions.length + ' actions (geo=' + geo.length + ')');
+    const tAct = Date.now();
+
+    const truncated = geo.length > actions.length;
+
+    // ★ NO CONTENT CAP (2026-10-01). This used to trim content extraction above 400
+    // candidates to CONTENT_MAX_CHARS (6000) unless the caller opted out — i.e. the
+    // tool silently decided how much of the page the model was allowed to read. That is
+    // the same class as the LABEL_MAX=40 delta bug: a length threshold destroying
+    // meaning. Content length is now the caller's decision alone.
+    const opt2 = Object.assign({}, options);
+
+    const sag = _buildSAG(actions, opt2);
+    sag.truncated = truncated;
+    sag.returnedActions = actions.length;
+    sag.viewportCandidates = geo.length;
+    sag.candidatesExamined = pass1.length;
+    sag.candidatesFound = cand.nodes.length;
+    sag.totalElements = cand.totalElements;
+    sag.cursorSelectorsRead = cand.cursorSelectorsRead;
+    sag.cursorAdded = cand.cursorAdded;
+    sag.scanMs = tAct - scanStart;
+    // Split attribution (2026-09-11). `scanMs` alone was misleading: it conflated
+    // candidate collection, geometry and the per-action semantic work, and only the
+    // last of those scales with maxActions. Reported separately so a slow call can
+    // be attributed without guessing.
+    sag.candidatesMs = tCand - scanStart;
+    sag.geometryMs = tGeo - tCand;
+    sag.actionMs = tAct - tGeo;
+    wsLog('EAG:scanMs=' + sag.scanMs + ' (cand=' + sag.candidatesMs + ' geo=' + sag.geometryMs + ' act=' + sag.actionMs + ') returned=' + actions.length + ' geo=' + geo.length);
+
+    if (cheapShape && !options.fresh) {
+      _sagCache = { key: cacheKey, domVersion: _domVersion, ts: Date.now(), sag: sag };
+    }
+    return sag;
+  }
+
+  // Style cache — prevents calling getComputedStyle multiple times per element.
+  // NOTE (2026-09-11): this used to be a module-level WeakMap that was NEVER
+  // cleared, so a cached style from an earlier call could be reused after the
+  // element's style had changed — e.g. an element inside a modal that has since
+  // been shown stayed "display:none" forever, and dialog controls never appeared
+  // in the SAG. It is now rebuilt at the start of every extraction.
+  let _styleCache = new WeakMap();
+  function _styleCacheClear() { _styleCache = new WeakMap(); }
+  function cachedStyle(el) {
+    if (_styleCache.has(el)) return _styleCache.get(el);
+    var s;
+    try { s = window.getComputedStyle(el); } catch (_) { s = { display: 'block', visibility: 'visible', opacity: '1', cursor: 'default' }; }
+    _styleCache.set(el, s);
+    return s;
+  }
+  function _cachedClassify(el) {
+    // Re-use cached style instead of calling getComputedStyle again
+    const tag = el.tagName.toLowerCase();
+    const attrs = getAttrs(el);
+    const role = attrs.role || '';
+    const type = attrs.type || '';
+    const style = cachedStyle(el);
+
+    if (tag === 'a' && attrs.href) return { type: 'navigation', subtype: 'link', href: attrs.href, target: attrs.target || '_self' };
+    if (tag === 'a') return { type: 'action', subtype: 'anchor_button' };
+    if (tag === 'input' || tag === 'textarea') {
+      if (type === 'checkbox') return { type: 'toggle', subtype: 'checkbox' };
+      if (type === 'radio') return { type: 'toggle', subtype: 'radio' };
+      if (type === 'submit' || type === 'image') { const f = el.closest('form'); return { type: 'form_submit', subtype: 'input_submit', formRef: f ? assignRef(f) : null }; }
+      if (type === 'file') return { type: 'file_upload', subtype: 'file' };
+      if (type === 'button') return { type: 'action', subtype: 'input_button' };
+      return { type: 'form_input', subtype: type || 'text' };
+    }
+    if (tag === 'select') return { type: 'form_input', subtype: 'select' };
+    if (el.isContentEditable || attrs.contenteditable === 'true') return { type: 'form_input', subtype: 'contenteditable' };
+    if (attrs['aria-haspopup'] === 'dialog' || attrs['aria-haspopup'] === 'true' || attrs['data-toggle'] === 'modal' || attrs['data-bs-toggle'] === 'modal')
+      return { type: 'modal_trigger', subtype: tag === 'button' ? 'button' : role || 'element', target: attrs['aria-controls'] || (attrs['data-target'] || '').replace('#', '') };
+    if (attrs['aria-haspopup'] === 'menu' || attrs['data-toggle'] === 'dropdown' || attrs['data-bs-toggle'] === 'dropdown' || el.classList.contains('dropdown-toggle'))
+      return { type: 'dropdown_trigger', subtype: tag === 'button' ? 'button' : role || 'element', target: attrs['aria-controls'] || '' };
+    if (role === 'tab' || attrs['data-toggle'] === 'tab' || attrs['data-bs-toggle'] === 'tab')
+      return { type: 'tab_trigger', subtype: 'tab', target: attrs['aria-controls'] || '', selected: attrs['aria-selected'] === 'true' };
+    if (tag === 'summary' || (role === 'button' && attrs['aria-expanded'] !== undefined))
+      return { type: 'expand_collapse', subtype: 'button', expanded: attrs['aria-expanded'] === 'true' };
+    if (tag === 'details') return { type: 'expand_collapse', subtype: 'details', expanded: el.open };
+    if (role === 'switch' || attrs['aria-pressed'] !== undefined)
+      return { type: 'toggle', subtype: role === 'switch' ? 'switch' : 'button', pressed: attrs['aria-pressed'] === 'true' };
+    if (tag === 'button') {
+      if (type === 'submit') { const f = el.closest('form'); return { type: 'form_submit', subtype: 'button', formRef: f ? assignRef(f) : null }; }
+      const f = el.closest('form');
+      if (f) { const btns = f.querySelectorAll('button[type="submit"], button:not([type])'); if (btns.length === 1 && btns[0] === el) return { type: 'form_submit', subtype: 'button', formRef: assignRef(f) }; }
+      return { type: 'action', subtype: 'button' };
+    }
+    if (role) return { type: 'action', subtype: role };   // page's own word — no table
+    if (style.cursor === 'pointer') return { type: 'action', subtype: 'clickable' };
+    return { type: 'unknown', subtype: tag };
+  }
+
+  // Synchronous extraction for small DOMs
+  function _doExtractFromList(allElements, options) {
+    const actions = [];
+    let step = 'loop-start';
+    try {
+      // Bounded default here too (2026-09-11) — the legacy sync path had the same
+      // `|| 0` unbounded default, so a caller reaching it could still walk a
+      // whole page. Consistency matters more than the micro-difference.
+      const maxActions = options.maxActions > 0 ? options.maxActions : 0;   // 0 = UNBOUNDED (no caps)
+      for (const el of allElements) {
+        if (maxActions > 0 && actions.length >= maxActions) break;
+        step = 'isInteractive';
+        if (!isInteractive(el)) continue;
+        if (options.includeHidden === false && !isVisible(el)) continue;
+        if (!options.includeHidden && !isInViewport(el) && !options.full) continue;
+        step = 'assignRef';
+        const ref = assignRef(el);
+        step = 'classifyAction';
+        const classification = _cachedClassify(el);
+        step = 'getAttrs';
+        const attrs = getAttrs(el);
+        step = 'extractState';
+        const state = extractState(el);
+        step = 'getLabel';
+        const label = getLabel(el);
+        step = 'predictEffect';
+        const effect = predictEffect(el, classification, attrs);
+        step = 'build-action';
+        // 2026-09-25 PRIVACY: same masking as the async path above — never
+        // spread a password/OTP value into a published action.
+        if (isSensitiveValueField(el)) state.value = '';
+        const action = { ref, type: classification.type, subtype: classification.subtype, label, predictedEffect: effect, ...state };
+        // Phase 4 (2026-08-15): surface frameId from explore_page iframe recursion.
+        if (el.__wsFrameId != null && el.__wsFrameId !== 0) action.frameId = el.__wsFrameId;
+        // A2: expose the semantic locator (sync loop — discover_actions path)
+        const loc2 = buildLocator(el);
+        if (loc2 && loc2.length) action.locator = loc2[0];
+        // A3: intent tag (sync loop)
+        action.intent = detectIntent(el, classification);
+        if (classification.href) action.href = classification.href;
+        if (classification.target) action.target = classification.target;
+        if (classification.formRef) action.formRef = classification.formRef;
+        if (classification.expanded !== undefined) action.expanded = classification.expanded;
+        if (classification.selected !== undefined) action.selected = classification.selected;
+        if (classification.pressed !== undefined) action.pressed = classification.pressed;
+        actions.push(action);
+      }
+      wsLog('EAG:loop done (sync), ' + actions.length + ' actions');
+      return _buildSAG(actions, options);
+    } catch (e) {
+      wsLog('EAG:CRASH at step=' + step + ' | ' + e.message + ' | ' + (e.stack || '').slice(0, 600));
+      throw e;
+    }
+  }
+
+  function _doExtract(options, _unused) {
+    const allElements = getAllElements(document.body);
+    return _doExtractFromList(allElements, options);
+  }
+
+  // ═══ P1 INCREMENTAL EXPLORE (2026-08-31) ═══
+  // The full SAG path re-pays settle(≤2.5s) → full classify → content/bodyText
+  // extraction on EVERY call — expensive on heavy DOMs when the agent only
+  // needs to know WHAT CHANGED after its last action. The incremental path
+  // walks the DOM (no settle, no content extraction), compares each
+  // interactive element against the LAST SCAN, and returns only the delta:
+  // added / changed (with per-field changes) / removed.
+  //
+  // SCAN_CACHE: key(semantic identity) -> { fp, fpo, ref, label, action }.
+  // Per-document — a real navigation kills the CS and wipes it automatically;
+  // same-document SPA soft-navs keep it (which is the point).
+  // Semantics are CANONICAL in src/incr.js (diffScan/fieldChanges/
+  // identityKey/disambiguate) and unit-pinned in test-regressions.mjs. The
+  // inline mirrors below must stay in lockstep with src/incr.js.
+  let SCAN_CACHE = new Map();
+
+  // MIRROR of incr.js identityKey — priority: testid > id > name > aria > ph > pos.
+  function wsIdentityKey(a) {
+    if (a.testid) return 'tid:' + a.testid;
+    if (a.id) return 'id:' + a.id;
+    if (a.name) return 'name:' + a.tag + ':' + a.name + (a.type ? ':' + a.type : '');
+    if (a.ariaLabel) return 'aria:' + a.ariaLabel.slice(0, 60);
+    if (a.placeholder) return 'ph:' + a.placeholder.slice(0, 60);
+    return 'pos:' + a.tag + (a.type ? ':' + a.type : '') + ':' + (a.label || '').slice(0, 40) + (a.href ? ':' + String(a.href).slice(0, 40) : '');
+  }
+
+  // MIRROR of incr.js fieldChanges — per-field diff, values truncated.
+  function wsFieldChanges(prevFpo, currFpo, maxLen) {
+    var ml = maxLen || 40;
+    var out = [];
+    if (!prevFpo || !currFpo) return out;
+    var keys = Object.keys(Object.assign({}, prevFpo, currFpo));
+    for (var i = 0; i < keys.length; i++) {
+      var k = keys[i];
+      if (prevFpo[k] !== currFpo[k]) {
+        out.push({
+          field: k,
+          from: String(prevFpo[k] == null ? '' : prevFpo[k]).slice(0, ml),
+          to: String(currFpo[k] == null ? '' : currFpo[k]).slice(0, ml),
+        });
+      }
+    }
+    return out;
+  }
+
+  // Fingerprint of the action-relevant fields. Password values NEVER enter
+  // the fingerprint (privacy — mirrors the full path, which also masks them
+  // nowhere but they only surface in explicit form extraction).
+  function scanFingerprintOf(attrs, classification, label, state) {
+    var t = attrs.__tag;
+    var sensitive = t === 'input' && (attrs.type === 'password' || (attrs.type === 'text' && attrs.autocomplete === 'current-password'));
+    var value = sensitive ? '' : (state.value == null ? '' : String(state.value));
+    return {
+      fp: [
+        classification.type, classification.subtype, label,
+        classification.href || '', classification.target || '', value,
+        String(state.checked), String(state.disabled), String(state.disabledReason || ''),
+        String(state.expanded), String(state.selected), String(state.pressed),
+        // inViewport is DELIBERATELY NOT in the fingerprint (2026-09-21).
+        // Whether an element sits inside the viewport is a SCROLL artifact, not a
+        // page mutation. Including it flipped the fingerprint of every element
+        // crossing the fold, so a scroll was reported as a page change (measured:
+        // changedRatio 1.038 — 12 added / 40 removed — read as "the page changed").
+        // state.inViewport is still recorded in fpo below for informational use.
+        String(state.visible), String(state.required), String(state.readOnly),
+      ].join('|'),
+      fpo: {
+        type: classification.type, subtype: classification.subtype, label: label,
+        href: classification.href || '', target: classification.target || '', value: value,
+        checked: state.checked, disabled: state.disabled,
+        expanded: state.expanded, selected: state.selected, pressed: state.pressed,
+        visible: state.visible, inViewport: state.inViewport,
+        required: state.required, readOnly: state.readOnly,
+      },
+    };
+  }
+
+  // Cheap pass: walk elements, extract identity + fingerprint + a lean action
+  // object. NO settle wait, NO extractHeadings/extractBodyText, NO chunked
+  // yields. Dialog elements are scanned even when offscreen-viewport (the
+  // modal is usually what changed).
+  function collectScan() {
+    const allElements = getAllElements(document.body);
+    const pairs = [];
+    for (const el of allElements) {
+      if (!isInteractive(el)) continue;
+      if (!isInViewport(el) && !el.closest('[role="dialog"],[aria-modal="true"]')) continue;
+      const attrs = getAttrs(el);
+      const t = el.tagName.toLowerCase();
+      attrs.__tag = t;
+      const classification = _cachedClassify(el);
+      const label = getLabel(el);
+      const state = extractState(el);
+      const fp = scanFingerprintOf(attrs, classification, label, state);
+      const key = wsIdentityKey({
+        tag: t,
+        id: attrs.id || '',
+        testid: attrs['data-testid'] || attrs['data-test'] || '',
+        name: attrs.name || '',
+        type: attrs.type || '',
+        ariaLabel: (attrs['aria-label'] || '').slice(0, 60),
+        placeholder: (attrs.placeholder || '').slice(0, 60),
+        label: (label || '').slice(0, 40),
+        href: classification.href ? String(classification.href).slice(0, 40) : '',
+      });
+      pairs.push([key, { fp: fp.fp, fpo: fp.fpo, ref: null, label: String(label || '').slice(0, 60), el: el }]);
+    }
+    // MIRROR of incr.js disambiguate — duplicate keys get ':k<n>' in DOM order.
+    const seen = new Map();
+    const out = new Map();
+    for (const [key, entry] of pairs) {
+      const n = seen.get(key) || 0;
+      seen.set(key, n + 1);
+      out.set(n === 0 ? key : key + ':k' + n, entry);
+    }
+    return out;
+  }
+
+  // STABLE REFS: incremental explores do NOT reset refCounter/refMap, so refs
+  // from previous explores stay valid. Only NEW elements get fresh refs.
+  // NOTE: locator/intent are NOT built here — that's the expensive part, and
+  // they're only needed for the DELTA (added/changed). Enriched post-diff.
+  function collectScanWithRefs() {
+    const scan = collectScan();
+    for (const entry of scan.values()) {
+      const existing = elementSignatures.get(entry.el);
+      entry.ref = existing ? existing.ref : assignRef(entry.el);
+      // Lean action object — enriched with locator/intent for delta entries only.
+      entry.action = {
+        ref: entry.ref,
+        type: entry.fpo.type,
+        subtype: entry.fpo.subtype,
+        label: entry.label,
+        value: entry.fpo.value === '' ? null : entry.fpo.value,
+        checked: entry.fpo.checked,
+        disabled: entry.fpo.disabled,
+        expanded: entry.fpo.expanded,
+        selected: entry.fpo.selected,
+      };
+      if (entry.fpo.href) entry.action.href = entry.fpo.href;
+    }
+    return scan;
+  }
+
+  // Post-diff enrichment: build locator + intent ONLY for delta entries (the
+  // agent needs to act on those; unchanged elements already have locators
+  // from previous full SAGs).
+  function enrichDeltaActions(delta) {
+    const need = [].concat(delta.added, delta.changed.map(function (c) { return c.action; }));
+    for (const action of need) {
+      if (!action || !action.ref) continue;
+      const el = resolveRef(action.ref);
+      if (!el) continue;
+      const cls = _cachedClassify(el);
+      const loc = buildLocator(el);
+      if (loc && loc.length) action.locator = loc[0];
+      action.intent = detectIntent(el, cls);
+      if (cls.href) action.href = cls.href;
+    }
+    return delta;
+  }
+
+  async function exploreIncremental(options) {
+    wsLog('INCR:start');
+    // NO settle wait — hydration settled long ago by the time an agent calls
+    // incrementally; waiting would only make the delta stale.
+    const scan = collectScanWithRefs();
+    const hadBaseline = SCAN_CACHE.size > 0;
+    const prev = SCAN_CACHE;
+    // ── Inline diff (MIRROR of incr.js diffScan) ──
+    const added = [], changed = [], removed = [];
+    let unchangedCount = 0;
+    for (const [key, e] of scan) {
+      const p = prev.get(key);
+      if (!p) added.push(e.action);
+      else if (p.fp !== e.fp) changed.push({ action: e.action, changes: wsFieldChanges(p.fpo, e.fpo) });
+      else unchangedCount++;
+    }
+    for (const [key, p] of prev) {
+      if (!scan.has(key)) removed.push({ key: key, ref: p.ref || null, label: p.label || '' });
+    }
+    const totalTracked = Math.max(prev.size, scan.size);
+    const changedRatio = totalTracked > 0 ? (added.length + removed.length + changed.length) / totalTracked : 0;
+    const escalate = hadBaseline && totalTracked > 20 && changedRatio > 0.6;
+    // Always advance the baseline — next call diffs against THIS scan.
+    SCAN_CACHE = scan;
+
+    const meta = { url: location.href, title: document.title, readyState: document.readyState };
+
+    if (!hadBaseline || (escalate && options.full !== false)) {
+      // No baseline (first call) or >60% churn → FULL extraction fallback.
+      // NOTE: extractActionGraph resets refCounter/refMap — the complete SAG
+      // it returns supersedes all previously handed-out refs (same contract
+      // as a normal full explore). Seed the scan baseline from the result.
+      const sag = await extractActionGraph(Object.assign({}, options, { incremental: undefined }));
+      try { SCAN_CACHE = collectScanWithRefs(); } catch (_) {}
+      sag.incremental = true;
+      sag.escalated = hadBaseline; // true = churn fallback, false = first call
+      return sag;
+    }
+
+    // Locator/intent only for the delta — the scan itself stays cheap.
+    enrichDeltaActions({ added: added, changed: changed });
+
+    return {
+      incremental: true,
+      escalated: false,
+      added: added,
+      changed: changed,
+      removed: removed,
+      unchangedCount: unchangedCount,
+      changedRatio: changedRatio,
+      forms: extractForms(),
+      meta: meta,
+      elementCount: added.length + changed.length,
+      timestamp: Date.now(),
+    };
+  }
+
+  // Build the full SAG result from collected actions + page metadata
+/* SAG build, native value setters, and every native* action primitive
+ * Part 06 of 9 — source of truth for extension/websense-cs.js.
+ * DO NOT edit the built file; edit here and run `node tools/build-cs.mjs`.
+ * Split out 2026-09-11 (was one 3,7xx-line file). The code below is copied
+ * VERBATIM from the pre-split file; only this banner is added.
+ */
+  function _buildSAG(actions, options) {
+    wsLog('EAG:buildSAG actions=' + actions.length);
+    try {
+      wsLog('EAG:extractForms...');
+      const forms = extractForms();
+      wsLog('EAG:detectSections...');
+      const sections = detectSections(actions);
+      wsLog('EAG:extractContent...');
+      const content = options.includeContent === false ? null : { headings: extractHeadings(), bodyText: extractBodyText(options.contentMaxLen || 8000) };
+      wsLog('EAG:pageState...');
+      const pageState = { url: window.location.href, title: document.title, readyState: document.readyState, pageType: extractPageType(), framework: detectFramework(), viewport: { w: window.innerWidth, h: window.innerHeight }, scroll: { y: window.scrollY, maxY: Math.max(0, (document.documentElement.scrollHeight || 0) - window.innerHeight), pagesBelow: Math.max(0, Math.ceil(((document.documentElement.scrollHeight || 0) - window.innerHeight - window.scrollY) / window.innerHeight)) } };
+      wsLog('EAG:dialogs...');
+      const dialogs = [];
+      document.querySelectorAll('[role="dialog"][aria-modal="true"],dialog[open],.modal:not([hidden]),.ReactModal__Overlay--after-open').forEach(function (d) { if (isVisible(d)) dialogs.push({ ref: assignRef(d), label: getLabel(d).slice(0, 80) }); });
+      wsLog('EAG:captcha...');
+      const hasCaptcha = !!document.querySelector('iframe[src*="captcha"],iframe[src*="recaptcha"],.g-recaptcha,#captcha,[class*="captcha"]');
+      const isLoading = !!document.querySelector('[aria-busy="true"],.loading,.spinner,.loader,[data-loading]');
+      wsLog('EAG:navigation...');
+      const navigation = actions.filter(function (a) { return a.type === 'navigation'; }).map(function (a) { return { ref: a.ref, label: a.label, target: a.href }; });
+      wsLog('EAG:done successfully');
+      return { meta: pageState, forms, actions, sections, navigation, content, dialogs, alerts: [], captcha: hasCaptcha, loading: isLoading, elementCount: actions.length, timestamp: Date.now() };
+    } catch (e) {
+      wsLog('EAG:buildSAG CRASH | ' + e.message + ' | ' + (e.stack || '').slice(0, 600));
+      throw e;
+    }
+  }
+
+  // ═══ Native Action Handlers (ALL CSP-safe — NO eval) ═══
+  // Phase 3 (2026-08-15): walk the FULL prototype chain for the 'value' setter.
+  // Custom-element inputs (Lit, Stencil, Ionic, React-controlled web components)
+  // define value on a MIDDLE prototype, not the immediate one — the old
+  // Object.getPrototypeOf(element) only check missed them and silently fell back
+  // to el.value = value (which React/custom-elements revert on next render).
+  function getNativeValueSetter(element) {
+    let proto = Object.getPrototypeOf(element);
+    while (proto) {
+      const d = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (d && d.set) return d;
+      proto = Object.getPrototypeOf(proto);
+    }
+    return null;
+  }
+  function setNativeValue(element, value) { const d = getNativeValueSetter(element); if (d&&d.set) d.set.call(element, value); else element.value = value; }
+
+  async function nativeClick(el) {
+    if (!el) throw new Error('Element not found');
+    // v4 DISABLED DIAGNOSIS (2026-08-31, x.com Post-button lesson): a disabled
+    // button silently "absorbs" clicks — the agent then retries blindly. Refuse
+    // with a REASON instead. Checks: [disabled] attr, aria-disabled, and
+    // disabled-class heuristics (X uses r-icoktb / r-3pj75a on disabled buttons).
+    if (el.disabled === true || el.getAttribute('aria-disabled') === 'true') {
+      // Why is it disabled? Look for an adjacent char counter / required hint.
+      let hint = null;
+      try {
+        const scope = el.closest('[role="dialog"], form, [data-testid]') || el.parentElement;
+        const counter = scope && (scope.querySelector('[data-testid$="counter"], [class*="counter"], [aria-live]'));
+        if (counter) hint = (counter.textContent || '').trim().slice(0, 40);
+      } catch (_) {}
+      return {
+        success: false,
+        refused: 'disabled-button',
+        disabled: true,
+        ariaDisabled: el.getAttribute('aria-disabled') === 'true',
+        label: (el.textContent || '').trim().slice(0, 40),
+        hint,
+        reason: hint ? 'button disabled — adjacent counter says: ' + hint
+                     : 'button disabled — a prerequisite (text/validation) is not satisfied; typing/clicking it cannot work',
+      };
+    }
+    // BACKGROUND BLANK-TARGET (2026-08-13): <a target="_blank">
+    // clicks make Chrome open a new ACTIVE tab, raising the OS window — the
+    // remaining foreground-steal path (Bugcrowd "Submit report" is one).
+    // Intercept: open the href in a BACKGROUND tab via the SW instead.
+    let anchor = null;
+    if (el.tagName === 'A' && (el.target === '_blank' || el.target === '_new')) anchor = el;
+    else if (el.closest) { const a = el.closest('a[target="_blank"], a[target="_new"]'); if (a) anchor = a; }
+    if (anchor && anchor.href && !anchor.download) {
+      try {
+        const href = anchor.href;
+        const r = await relayTabControl('open_new_tab', { url: href, active: false });
+        if (r && !r.error) return { success: true, background: true, tabId: r.tabId, blankTarget: true };
+      } catch (_) { /* fall through to normal click */ }
+    }
+    if (el.scrollIntoViewIfNeeded) el.scrollIntoViewIfNeeded(); else el.scrollIntoView({behavior:'auto',block:'center',inline:'nearest'});
+    const rect = el.getBoundingClientRect(); const x = rect.left+rect.width/2; const y = rect.top+rect.height/2;
+    // REAL-CLICK SEMANTICS (2026-08-13, Ali directive — Bugcrowd VRT lesson):
+    // a genuine mouse click lands on the TOPMOST element at the cursor, not on
+    // the resolved container. React trees like Bugcrowd's VRT dropdown close on
+    // container (li) clicks but expand on the inner span/button. If the resolved
+    // element is a container, find the deepest clickable descendant at the point
+    // and dispatch there — identical to what elementFromPoint would give a user.
+    let targetEl = el;
+    try {
+      const top = document.elementFromPoint(x, y);
+      if (top && top !== el && el.contains(top)) {
+        // Walk down from the hit element to the deepest interactive child
+        // (button/span/a/input/label or the deepest leaf) — mirrors a real
+        // click's event target.
+        let deepest = top;
+        while (deepest.children && deepest.children.length > 0) {
+          let hit = null;
+          for (const c of deepest.children) {
+            const r = c.getBoundingClientRect();
+            if (r.width > 0 && r.height > 0 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) { hit = c; break; }
+          }
+          if (!hit) break;
+          deepest = hit;
+        }
+        targetEl = deepest;
+      }
+    } catch (_) { targetEl = el; }
+    const pOpts = {bubbles:true,cancelable:true,clientX:x,clientY:y,pointerType:'mouse'};
+    const mOpts = {bubbles:true,cancelable:true,clientX:x,clientY:y,button:0};
+    targetEl.dispatchEvent(new PointerEvent('pointerover',pOpts)); targetEl.dispatchEvent(new PointerEvent('pointerenter',{...pOpts,bubbles:false}));
+    targetEl.dispatchEvent(new MouseEvent('mouseover',mOpts)); targetEl.dispatchEvent(new MouseEvent('mouseenter',{...mOpts,bubbles:false}));
+    targetEl.dispatchEvent(new PointerEvent('pointerdown',pOpts)); targetEl.dispatchEvent(new MouseEvent('mousedown',mOpts));
+    try{targetEl.focus({preventScroll:true});}catch(_){}
+    targetEl.dispatchEvent(new PointerEvent('pointerup',pOpts)); targetEl.dispatchEvent(new MouseEvent('mouseup',mOpts));
+    // .click() EXISTS ONLY ON HTMLElement. The deepest-clickable walk above can
+    // land on an SVGElement (every icon-only button on a modern UI), and calling
+    // .click() there threw "targetEl.click is not a function" — an
+    // UNHANDLED_REJECTION that aborted the click AFTER the pointerdown/up
+    // sequence had already been dispatched, leaving the element half-clicked and
+    // the caller with no error. Fall back to a dispatched click event, which
+    // every EventTarget accepts.
+    if (typeof targetEl.click === 'function') targetEl.click();
+    else targetEl.dispatchEvent(new MouseEvent('click', mOpts));
+    return { success: true, target: targetEl.tagName.toLowerCase(), dispatchedOn: targetEl === el ? 'resolved' : 'deepest' };
+  }
+
+  // ═══ v4 EDITOR FRAMEWORK DETECTOR (2026-08-31) ═══
+  // Classifies any text-entry element so nativeType can pick the right strategy.
+  // Returns { kind, framework, strategy, stateControl }.
+  //   kind: input | textarea | select | editor | unknown
+  //   framework: draftjs | lexical | prosemirror | slate | quill | trix |
+  //              ckeditor | tinymce | google-docs | contenteditable | null
+  //   strategy: value | paste | insertText | beforeinput | iframe | unsupported
+  //   stateControl: selector of the dependent submit button, if discoverable
+  function detectEditor(el) {
+    if (!el || el.nodeType !== 1) return { kind: 'unknown', framework: null, strategy: 'none', stateControl: null };
+    const tag = el.tagName;
+    if (tag === 'TEXTAREA') return { kind: 'textarea', framework: null, strategy: 'value', stateControl: null };
+    if (tag === 'SELECT') return { kind: 'select', framework: null, strategy: 'select', stateControl: null };
+    if (tag === 'INPUT') {
+      const t = (el.getAttribute('type') || 'text').toLowerCase();
+      // value-settable types
+      if (!['checkbox','radio','file','range','color','submit','button','image','reset'].includes(t))
+        return { kind: 'input', framework: null, strategy: 'value', stateControl: null };
+      return { kind: 'input', framework: null, strategy: 'none', stateControl: null, inputType: t };
+    }
+    if (!el.isContentEditable) return { kind: 'unknown', framework: null, strategy: 'none', stateControl: null };
+
+    // ---- contenteditable: identify the editor framework ----
+    const cls = el.className || '';
+    const d = (sel) => !!el.querySelector(sel);
+    const up = (sel) => { let p = el.parentElement; while (p) { if (p.matches && p.matches(sel)) return true; p = p.parentElement; } return false; };
+
+    let framework = 'contenteditable';
+    let strategy = 'paste';           // default best bet for editors
+    if (d('.public-DraftEditor-content') || el.hasAttribute('data-offset-key') || d('[data-offset-key]') || up('.DraftEditor-root')) framework = 'draftjs';
+    else if (el.hasAttribute('data-lexical-editor') || d('[data-lexical-editor]')) framework = 'lexical';
+    else if (el.classList.contains('ProseMirror') || d('.ProseMirror')) framework = 'prosemirror';
+    else if (el.hasAttribute('data-slate-editor') || d('[data-slate-editor]')) framework = 'slate';
+    else if (el.classList.contains('ql-editor') || up('.ql-editor') || d('.ql-editor')) framework = 'quill';
+    else if (tag === 'TRIX-EDITOR' || up('trix-editor') || d('trix-editor')) framework = 'trix';
+    else if (el.classList.contains('ck-editor__editable') || el.classList.contains('ck-content') || d('.ck-editor__editable')) framework = 'ckeditor';
+    else if (up('.tox-edit-area') || d('.tox-edit-area')) framework = 'tinymce';
+    else if (up('#docs-editor') || d('.kix-appview-editor')) { framework = 'google-docs'; strategy = 'unsupported'; }
+
+    // iframe-hosted editor (CKEditor/TinyMCE inline frames)
+    let inIframe = false;
+    try { inIframe = (window.self !== window.top); } catch (_) { inIframe = true; }
+
+    // state control: a submit-ish sibling — the "source of truth" that proves
+    // the app REGISTERED our text. Walk up to the form-ish container, look for
+    // button[type=submit], [data-testid*=submit], or a button mentioning post/send/submit.
+    let stateControl = null;
+    try {
+      let scope = el.parentElement;
+      for (let i = 0; i < 6 && scope && !stateControl; i++) {
+        const btns = scope.querySelectorAll('button, [role="button"]');
+        for (const b of btns) {
+          const lbl = ((b.textContent || '') + ' ' + (b.getAttribute('data-testid') || '') + ' ' + (b.getAttribute('aria-label') || '')).toLowerCase();
+          const isSubmitish = b.getAttribute('type') === 'submit' || /submit|post|send|reply|tweet|publish|comment/.test(lbl);
+          if (isSubmitish) { stateControl = b; break; }
+        }
+        scope = scope.parentElement;
+      }
+    } catch (_) {}
+    const scInfo = stateControl ? {
+      disabled: stateControl.disabled || stateControl.getAttribute('aria-disabled') === 'true',
+      testid: stateControl.getAttribute('data-testid'),
+      text: (stateControl.textContent || '').trim().slice(0, 30),
+    } : null;
+
+    return { kind: 'editor', framework, strategy, inIframe, stateControl: scInfo };
+  }
+
+  // SYNTHETIC PASTE (v4): the strategy Draft.js/Lexical/ProseMirror/Slate/Quill
+  // actually honor — a ClipboardEvent with a real DataTransfer, dispatch on the
+  // focused editor. CSP-safe (no eval). Returns true if a handler preventDefault()ed
+  // (i.e. an editor consumed it).
+  function syntheticPaste(el, text) {
+    try {
+      el.focus();
+      // caret to end
+      const sel = window.getSelection();
+      const r = document.createRange();
+      r.selectNodeContents(el); r.collapse(false);
+      sel.removeAllRanges(); sel.addRange(r);
+      const dt = new DataTransfer();
+      dt.setData('text/plain', text);
+      dt.setData('text/html', text
+        .split('\n')
+        .map((l) => l.trim() === '' ? '<br>' : '<div>' + l.replace(/&/g,'&amp;').replace(/</g,'&lt;') + '</div>')
+        .join(''));
+      const ev = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt });
+      // v4.2 FIX: dispatchEvent returns FALSE when a handler calls
+      // preventDefault() (i.e. the editor CONSUMED it) and TRUE when the event
+      // went unhandled. The old code inverted this — a consuming editor was
+      // reported as not-consumed, the ladder fell through to insertText, and
+      // the text was inserted TWICE (observed live 2026-08-31).
+      const consumed = !el.dispatchEvent(ev);
+      return { dispatched: true, consumed, text: dt.getData('text/plain') };
+    } catch (e) {
+      return { dispatched: false, consumed: false, error: String(e) };
+    }
+  }
+
+  // STATE-TRUTH CHECK (v4): after typing, verify the app REGISTERED the text by
+  // inspecting the dependent submit control. DOM text present + submit still
+  // disabled = editor state didn't sync = strategy failed.
+  function checkStateTruth(el) {
+    try {
+      const det = el.__wsEditorDetect || detectEditor(el);
+      if (det.stateControl) {
+        const b = det.stateControl;
+        const disabled = b.disabled || b.getAttribute('aria-disabled') === 'true';
+        return { synced: !disabled, submitDisabled: disabled, submitLabel: det.stateControl.text };
+      }
+    } catch (_) {}
+    return { synced: null, submitDisabled: null, submitLabel: null };
+  }
+
+  async function nativeType(el, text, clearFirst) {
+    if (!el) throw new Error('Element not found');
+    // ★ A DISABLED TARGET CANNOT BE TYPED INTO, AND THE OLD RESULT DID NOT SAY SO (found
+    // 2026-10-01 by simulating a task on bbc.com/news). The search input there is
+    // disabled:1 and off-viewport while its menu is collapsed. setNativeValue on a disabled
+    // input does assign .value, so the page never accepts it and the verified read-back fails —
+    // and the failure came back with the generic escalation "re_read the field and re-type",
+    // which LOOPS FOREVER on a control that is disabled by design. The element's own state is
+    // the answer here, so report it instead of guessing at the read-back.
+    if (el.disabled) {
+      return { success: false, effect: 'failed', reason: 'the target is disabled',
+               hint: 'activate it first (open the menu or dialog that enables it), then type' };
+    }
+    if (el.readOnly) {
+      return { success: false, effect: 'failed', reason: 'the target is read-only',
+               hint: 'this field cannot be typed into until the page makes it editable' };
+    }
+    if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') {
+      return { success: false, effect: 'failed', reason: 'the target is aria-disabled',
+               hint: 'activate it first, then type' };
+    }
+    // ★ THE SAME LESSON, ONE MORE CASE (2026-10-01): a FILE input cannot be typed into at all —
+    // found by the same sweep, on x.com's composer. Typing "fails" and the caller is told to
+    // re-read and re-type; the real answer is that this control takes a file, not text.
+    if (el.tagName === 'INPUT' && el.type === 'file') {
+      return { success: false, effect: 'failed', reason: 'the target is a file input',
+               hint: 'use form{action:"upload", ref, filePath} — text cannot be typed into a file input' };
+    }
+    var cf = (typeof clearFirst !== 'undefined') ? clearFirst : true;
+    nativeClick(el);
+    if (cf!==false) { setNativeValue(el,''); el.dispatchEvent(new Event('input',{bubbles:true})); }
+    setNativeValue(el, text);
+    el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true}));
+    if (detectFramework()==='react') el.dispatchEvent(new InputEvent('beforeinput',{bubbles:true,data:text,inputType:'insertText'}));
+    // CONTENTEDITABLE SUPPORT (2026-08-31, marketing-campaign need): Draft.js /
+    // Lexical editors (x.com, LinkedIn, Reddit composers) are contenteditable
+    // DIVs — they have no .value, so the value-setter path above is a no-op and
+    // nativeType "succeeded" while typing nothing. For these, focus + select-all
+    // + document.execCommand('insertText') — CSP-safe (no eval), fires the
+    // beforeinput/input events Draft.js and Lexical actually listen to, and
+    // works multi-line. Verify by reading textContent instead of .value.
+    if (el.isContentEditable) {
+      // ═══ v4 STRATEGY LADDER (2026-08-31) ═══
+      // Detect the framework, then try: synthetic paste → execCommand insertText.
+      // Verify against the app's STATE TRUTH (dependent submit control), not the DOM.
+      const det = detectEditor(el);
+      el.__wsEditorDetect = det;
+      el.focus();
+      const sel = window.getSelection();
+      const results = { framework: det.framework, attempts: [] };
+
+      // CLEAR phase (shared): select-all + delete + settle ticks
+      // v4.1: VERIFY the clear actually emptied the editor before inserting.
+      // A framework that swallows execCommand('delete') leaves old content →
+      // insertText then APPENDS (doubling bug, observed live 2026-08-31).
+      // Retry up to 2x, then fall back to direct textContent wipe.
+      if (cf !== false) {
+        const readBackNow = () => (el.innerText || el.textContent || '').trim();
+        for (let i = 0; i < 3 && readBackNow() !== ''; i++) {
+          const rAll = document.createRange();
+          rAll.selectNodeContents(el);
+          sel.removeAllRanges(); sel.addRange(rAll);
+          document.execCommand('delete', false, null);
+          if (readBackNow() !== '') { el.textContent = ''; }
+          el.dispatchEvent(new Event('input', { bubbles: true }));
+          await new Promise((r) => setTimeout(r, 120));
+          await new Promise((r) => setTimeout(r, 80));
+        }
+      }
+
+      const readBack = () => (el.innerText || el.textContent || '').replace(/\n{3,}/g, '\n\n').trim();
+      const expected = String(text).trim();
+      const textMatches = () => { const v = readBack(); return v === expected || v.replace(/\n/g, '') === expected.replace(/\n/g, ''); };
+
+      // BASELINE: what the field held when this call took over, AFTER the clear
+      // phase. This is the whole discriminator — no parameter needed. Empty here
+      // means the clear succeeded (or was not asked for) and whatever appears
+      // later is OUR residue; non-empty means the caller legitimately left content
+      // to build on (clearFirst:false), and we must not destroy it.
+      const baselineAtHandoff = readBack();
+
+      // RUNG 1: synthetic ClipboardEvent paste (the strategy editors consume).
+      // v4.2: accept on TEXT MATCH as primary signal — some editors consume the
+      // event without preventDefault, and a second insertText would double it.
+      const p = syntheticPaste(el, text);
+      results.attempts.push({ rung: 'paste', dispatched: p.dispatched, consumed: p.consumed });
+      await new Promise((r) => setTimeout(r, 250));
+      if (p.dispatched && textMatches()) {
+        const truth = checkStateTruth(el);
+        results.attempts.push({ rung: 'verify', truth });
+        return new Promise(function(resolve) {
+          setTimeout(function() {
+            resolve({
+              success: true,
+              confirmed: truth.synced === false ? 'dom-synced-state-unsynced' : (truth.synced === true ? 'editor-state-synced' : 'paste-dom-persisted'),
+              actualValue: readBack().slice(0, 200),
+              reverted: false,
+              expected: expected.slice(0, 200),
+              ...results,
+            });
+          }, 300);
+        });
+      }
+
+      // RUNG 2: execCommand insertText (plain contenteditable fallback)
+      // v4.2.1 SELF-HEAL: if the final text contains the expected text
+      // MORE THAN ONCE (the doubling signature: paste inserted it AND
+      // insertText appended it — observed across Chrome CS re-injection
+      // races), wipe and retype once cleanly.
+      //
+      // v4.6.2 (2026-09-30) RESIDUE GUARD. Measured live on x.com's Draft.js
+      // composer: rung 1's paste could land PARTIALLY (first line dropped,
+      // remainder mangled) without matching `textMatches()` in the 250 ms window.
+      // Rung 2 then APPENDED the full text to that broken remnant, producing a
+      // 483-char field for a 269-char post — and the existing self-heal did NOT
+      // catch it, because its trigger is `occurrence > 1` (exact doubling) while
+      // a partial paste yields occurrence 0.
+      //
+      // The discriminator is the FIELD, not a flag. Compare what the paste rung
+      // left against the baseline this call started from:
+      //   baseline empty  + dirty now  -> WE caused it (partial paste) -> wipe.
+      //   baseline filled  + dirty now  -> the caller left it to build on
+      //                                   (clearFirst:false append) -> keep it.
+      // A guard keyed on clearFirst would have been both cruder and wrong; the
+      // page already knows which case this is.
+      const preInsert = readBack();
+      const dirtiedByUs = preInsert.length > 0 && baselineAtHandoff.length === 0;
+      let ok;
+      if (dirtiedByUs) {
+        el.textContent = '';
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        await new Promise((r) => setTimeout(r, 120));
+        results.attempts.push({ rung: 'pre-insert-wipe', reason: 'paste rung left residue in a field this call had emptied' });
+      }
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      sel.removeAllRanges(); sel.addRange(range);
+      ok = document.execCommand('insertText', false, text);
+      results.attempts.push({ rung: 'insertText', ok,
+        baselineWasEmpty: baselineAtHandoff.length === 0,
+        residueDiscarded: dirtiedByUs });
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      return new Promise(function(resolve) {
+        setTimeout(function() {
+          let finalVal = readBack();
+          const occurrence = finalVal.split(expected.replace(/\n/g, '')).length - 1;
+          if (expected.length > 0 && occurrence > 1) {
+            // doubling detected — wipe (hard) and retype once
+            el.textContent = '';
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            const r3 = document.createRange();
+            r3.selectNodeContents(el); r3.collapse(false);
+            sel.removeAllRanges(); sel.addRange(r3);
+            document.execCommand('insertText', false, text);
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            finalVal = readBack();
+            results.attempts.push({ rung: 'self-heal-retype', detected: 'doubling' });
+          }
+          // The post-condition is "the call's text is present, and nothing else
+          // WE added". When the caller handed us a baseline to build on
+          // (clearFirst:false), the correct end state is baseline + text, so
+          // comparing finalVal to `expected` alone would report a false failure on
+          // a perfectly good append. Judge against the baseline we measured.
+          const wantExact = baselineAtHandoff.length === 0;
+          const wantAppend = baselineAtHandoff + expected;
+          const flat = (s) => s.replace(/\n/g, '');
+          const matches = wantExact
+            ? (finalVal === expected || flat(finalVal) === flat(expected))
+            : (finalVal === wantAppend || flat(finalVal) === flat(wantAppend));
+          const truth = checkStateTruth(el);
+          resolve({
+            success: matches,
+            confirmed: matches ? (truth.synced === false ? 'dom-synced-state-unsynced' : 'contenteditable-persisted') : false,
+            actualValue: finalVal.slice(0, 200),
+            reverted: !matches,
+            expected: expected.slice(0, 200),
+            expectedFinal: (wantExact ? expected : wantAppend).slice(0, 200),
+            mode: wantExact ? 'replace' : 'append',
+            execCommandOk: ok,
+            stateTruth: truth,
+            ...results,
+          });
+        }, 500);
+      });
+    }
+    // Phase 3 (2026-08-15): VERIFY-PERSIST. React/custom-elements frequently
+        // DISCARD the programmatic value on the next render (value shows transiently
+        // then snaps back to the controlled value). The old code reported
+        // success:true from the immediate el.value read — a phantom success. Now we
+        // wait 2 rAF + ~400ms settle, re-read el.value, and only report success if
+        // the FINAL value actually equals what we set. `confirmed` = the app persisted
+        // it; `reverted` = the framework threw it away (caller must retry or report).
+        // v4.3 (2026-09-01): CUSTOM-ELEMENT SHADOW INPUT strategy. Form-associated
+        // custom elements (faceplate, Lit, Stencil) keep their ACTUAL input inside a
+        // shadow root — the value property setter works from this world but faceplate's
+        // validation state (faceplate-validity) only updates on events originating
+        // INSIDE the shadow tree. execCommand('insertText') on the focused host routes
+        // into the shadow input, firing proper beforeinput/input with composedPath
+        // containing the host. Verified on Reddit r/mcp submit.
+        return new Promise(function(resolve) {
+          // v4.3: if this is a form-associated custom element and the value-setter
+          // path wrote the property but the element still shows an *-validity=invalid
+          // attribute, re-route via execCommand insertText to trigger shadow-DOM events.
+          const isCustomElement = el.tagName.includes('-');
+          const hasValidityIssue = isCustomElement && el.getAttribute('faceplate-validity') === 'invalid';
+          if (hasValidityIssue) {
+            try {
+              el.focus();
+              document.execCommand('selectAll');
+              document.execCommand('delete');
+              document.execCommand('insertText', false, text);
+            } catch (_) {}
+          }
+          // v4.6.1 CONFIRMATION INTEGRITY (2026-09-11d). Two false-positive paths removed:
+          //  (1) `success: matches || hasValidityIssue` granted SUCCESS from the
+          //      faceplate-validity ATTRIBUTE alone, with no evidence the text was present.
+          //      An attribute is not evidence — hasValidityIssue now only ever DOWNGRADES
+          //      the verdict, it can never upgrade it.
+          //  (2) `matches` compared el.value, which is UNDEFINED for a rich-text editor
+          //      (Lexical/Draft.js/ProseMirror keep the text in child nodes). Comparing a
+          //      meaningless property is how a write was reported "value-persisted" on
+          //      Reddit while the editor was EMPTY. Read rendered text when there is no
+          //      usable value property.
+          // Also: one early match is not persistence — Lexical wipes DOM text it did not
+          // author, so re-read once after a settle and trust the LAST read.
+          var readBack = function(pass) {
+            var isEditorEl = el.isContentEditable === true || el.getAttribute('contenteditable') === 'true';
+            var hasVal = (typeof el.value === 'string' && el.value.length > 0) || (!isEditorEl && el.value !== undefined);
+            var finalVal = hasVal ? String(el.value) : String(el.innerText || el.textContent || '');
+            var matches = (finalVal === text) || (finalVal === String(text));
+            var validity = isCustomElement ? el.getAttribute('faceplate-validity') : null;
+            if (matches && pass < 2) {
+              setTimeout(function() { readBack(pass + 1); }, 500);
+              return;
+            }
+            resolve({
+              success: matches,
+              confirmed: matches ? (pass >= 2 ? 'value-persisted-after-settle' : 'value-persisted')
+                : (hasValidityIssue ? 'unconfirmed-shadow-input-text-missing' : false),
+              // 2026-09-25 PRIVACY: a password/OTP field must not echo the
+              // text we just wrote. The agent can fill it and see `success`;
+              // it never needs the secret back. All three echoes (actualValue,
+              // expected) are stripped and a mask flag explains why.
+              actualValue: isSensitiveValueField(el) ? '' : finalVal.slice(0, 200),
+              actualValueMasked: isSensitiveValueField(el) || undefined,
+              reverted: !matches,
+              expected: isSensitiveValueField(el) ? '' : String(text).slice(0, 200),
+              validity,
+              framework: hasValidityIssue ? 'custom-element' : undefined,
+              note: matches
+                ? (pass >= 2 ? 'Text still present on a second read 500ms later.' : 'Text present on first read.')
+                : 'Text is NOT present at read time, so this is NOT a success. '
+                  + (hasValidityIssue ? 'The custom element also reports faceplate-validity=invalid. ' : 'The framework discarded the value. ')
+                  + 'Use real_paste (genuine Ctrl+V) or scripts/real_input.py paste-text for this editor.',
+            });
+          };
+          // v4.3.1 CRITICAL FIX (2026-09-01): rAF NEVER FIRES IN BACKGROUND
+          // TABS (Chrome throttles to 0 when hidden) — type_text deadlocked
+          // 30s on every backgrounded tab (Reddit, LinkedIn all hit this).
+          // setTimeout DOES fire when throttled (~1s), so the verify completes.
+          var raf2 = function() { setTimeout(readBack, 400); };
+          setTimeout(raf2, 0);
+        });
+  }
+
+  function nativeSelect(el, value, clearAll) {
+    if (!el) throw new Error('Element not found');
+    if (el.tagName!=='SELECT') { let p=el.parentElement; while(p&&p.tagName!=='SELECT')p=p.parentElement; if(p)el=p; else throw new Error('Not a select'); }
+    // v4 (2026-08-31): multi-select support — value can be a string or an array
+    // (also JSON-encoded array string). Toggling option.selected fires the
+    // change event React/Naive selects listen to.
+    if (el.multiple) {
+      let wanted = Array.isArray(value) ? value.map(String)
+        : (() => { try { const j = JSON.parse(value); return Array.isArray(j) ? j.map(String) : [String(value)]; } catch (_) { return [String(value)]; } })();
+      let matchedAny = false;
+      const clearRest = typeof clearAll === 'boolean' ? clearAll : true;
+      for (const opt of el.options) {
+        const match = wanted.some((w) => opt.value === w || (opt.textContent || '').trim() === w || (opt.label || '') === w);
+        if (match) { opt.selected = true; matchedAny = true; }
+        else if (clearRest) { opt.selected = false; }
+      }
+      el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true }));
+      return { success: matchedAny, value: [].map.call(el.selectedOptions, (o) => o.value), multi: true };
+    }
+    let matched=false;
+    for (const opt of el.options) { if (opt.value===value||(opt.textContent||'').trim()===value||(opt.label||'')===value) { const d=getNativeValueSetter(el); if(d&&d.set)d.set.call(el,opt.value); else el.value=opt.value; matched=true; break; } }
+    if (matched) { el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); }
+    return { success:matched, value:el.value };
+  }
+
+  // v4 (2026-08-31): special input types — the value-setter path is wrong or
+  // insufficient for these. One entry point: form_special(ref, kind, value).
+  //   range    → set .value AsNumber within min/max/step + input/change
+  //   color    → set .value as #rrggbb + input/change
+  //   date     → set .valueAsDate (YYYY-MM-DD) + input/change
+  //   time     → set .value (HH:MM, HH:MM:SS) + input/change
+  //   number   → set .value via native setter (float-safe) + input/change
+  //   checkbox → .checked = !!value + change (no click — idempotent set)
+  //   radio    → .checked = true on the matching radio in its group + change
+  async function nativeSetSpecial(el, value) {
+    if (!el || el.tagName !== 'INPUT') throw new Error('Not an input');
+    const t = (el.getAttribute('type') || 'text').toLowerCase();
+    const fire = () => { el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); };
+    const set = (v) => { const d = getNativeValueSetter(el); if (d && d.set) d.set.call(el, v); else el.value = v; };
+    switch (t) {
+      case 'range': {
+        const num = Number(value);
+        if (isNaN(num)) return { success: false, refused: 'range-needs-number' };
+        const min = el.min === '' ? 0 : Number(el.min);
+        const max = el.max === '' ? 100 : Number(el.max);
+        const step = el.step && el.step !== 'any' ? Number(el.step) : 1;
+        let v = Math.min(max, Math.max(min, num));
+        // snap to step
+        v = min + Math.round((v - min) / step) * step;
+        v = Math.min(max, Math.max(min, v));
+        set(String(v)); fire();
+        return { success: true, value: el.value, min, max, step };
+      }
+      case 'color': {
+        let v = String(value).trim();
+        if (!/^#[0-9a-fA-F]{6}$/.test(v)) {
+          // accept #rgb or rgb() and normalize
+          if (/^#[0-9a-fA-F]{3}$/.test(v)) v = '#' + v.slice(1).split('').map((c) => c + c).join('');
+          else { const m = v.match(/rgb\((\d+)[,\s]+(\d+)[,\s]+(\d+)\)/); if (m) v = '#' + [m[1], m[2], m[3]].map((c) => Number(c).toString(16).padStart(2, '0')).join(''); else return { success: false, refused: 'color-needs-hex' }; }
+        }
+        set(v); fire();
+        return { success: true, value: el.value };
+      }
+      case 'date': case 'datetime-local': case 'month': case 'week': {
+        const v = String(value).trim();
+        set(v); fire();
+        // verify the browser accepted it (invalid dates keep value '')
+        return { success: el.value === v, value: el.value, note: el.value === v ? undefined : 'browser rejected the value format for type=' + t };
+      }
+      case 'time': {
+        const v = String(value).trim();
+        set(v); fire();
+        return { success: el.value === v, value: el.value };
+      }
+      case 'number': {
+        const num = Number(value);
+        if (isNaN(num)) return { success: false, refused: 'number-needs-number' };
+        set(String(num)); fire();
+        return { success: el.value !== '' && !isNaN(Number(el.value)), value: el.value };
+      }
+      case 'checkbox': {
+        el.checked = !!value && value !== 'false' && value !== '0';
+        fire();
+        return { success: true, checked: el.checked };
+      }
+      case 'radio': {
+        // value may be 'true' (just check this one) or a value of the radio in its group
+        const name = el.name;
+        if (value === true || value === 'true' || value === '') {
+          el.checked = true; fire();
+          return { success: el.checked, checked: el.checked };
+        }
+        const group = name ? Array.from(document.querySelectorAll('input[type="radio"][name="' + CSS.escape(name) + '"]')) : [el];
+        const target = group.find((r) => r.value === String(value)) || (group.find((r) => (r.labels || [])[0] && (r.labels[0].textContent || '').trim() === String(value)));
+        if (!target) return { success: false, refused: 'radio-not-found', group: group.map((r) => r.value) };
+        target.checked = true; target.dispatchEvent(new Event('input', { bubbles: true })); target.dispatchEvent(new Event('change', { bubbles: true }));
+        return { success: true, checked: true, value: target.value };
+      }
+      default:
+        return { success: false, refused: 'not-special', inputType: t };
+    }
+  }
+
+  function nativeToggle(el) {
+    if (!el) throw new Error('Element not found');
+    if (el.tagName==='INPUT'&&(el.type==='checkbox'||el.type==='radio')) { nativeClick(el); return {success:true,checked:el.checked}; }
+    if (el.getAttribute('aria-pressed')!==null||el.getAttribute('role')==='switch') { nativeClick(el); return {success:true,pressed:el.getAttribute('aria-pressed')==='true'}; }
+    nativeClick(el); return {success:true};
+  }
+
+  function nativeScrollIntoView(el) { if(!el)throw new Error('Element not found'); el.scrollIntoView({behavior:'smooth',block:'center',inline:'nearest'}); return{success:true}; }
+  function nativeScroll(direction, amount, ref) {
+    let target = document.documentElement;
+    if (ref) {
+      const el = resolveRef(ref);
+      if (el) {
+        let c = el;
+        while (c && c !== document.body) {
+          const st = window.getComputedStyle(c);
+          if (/(auto|scroll|overlay)/.test(st.overflowY) && c.scrollHeight > c.clientHeight) { target = c; break; }
+          c = c.parentElement;
+        }
+      }
+    } else {
+      // No ref: find the REAL page scroll container. x.com scrolls an inner div —
+      // window.scrollBy is a silent no-op there. Fall back to documentElement.
+      const sc = findScrollContainer();
+      if (sc) target = sc;
+    }
+    // amount semantics: NEW server sends TICKS (default 1); OLD server sent raw
+    // pixels (default 500). Rule: amount <= 20 → ticks (1 tick ≈ 80% viewport);
+    // amount > 20 → legacy raw pixels. This keeps a running OLD server safe
+    // until it restarts with the new code, and makes ticks work immediately.
+    var raw = (typeof amount === 'number' && !isNaN(amount)) ? amount : 1;
+    var sa;
+    if (raw > 20) {
+      sa = raw * (direction === 'down' || direction === 'right' ? 1 : -1);
+    } else {
+      var ticks = raw > 0 ? raw : 1;
+      var px = Math.round(ticks * window.innerHeight * 0.8);
+      if (direction === 'left' || direction === 'right') px = Math.round(ticks * window.innerWidth * 0.8);
+      sa = px * (direction === 'down' || direction === 'right' ? 1 : -1);
+    }
+    if (direction === 'down' || direction === 'up') {
+      if (target === document.documentElement) window.scrollBy({ top: sa, behavior: 'auto' });
+      else target.scrollTop += sa;
+    } else {
+      if (target === document.documentElement) window.scrollBy({ left: sa, behavior: 'auto' });
+      else target.scrollLeft += sa;
+    }
+    return { success: true, scrolledPx: sa, scrollY: target === document.documentElement ? window.scrollY : target.scrollTop, scrollX: target === document.documentElement ? window.scrollX : target.scrollLeft };
+  }
+  function nativeScrollTo(y) {
+    const sc = findScrollContainer();
+    const target = sc || document.documentElement;
+    if (target === document.documentElement) window.scrollTo({ top: y, behavior: 'auto' });
+    else target.scrollTop = y;
+    return { success: true, scrollY: target === document.documentElement ? window.scrollY : target.scrollTop };
+  }
+  // ★ nativePressKey WAS DELETED HERE (2026-10-01) — IT HAD ZERO CALLERS.
+  // Both dispatchers call nativePressKeyEnhanced(key, ref, modifiers):
+  //   00-bridge-and-transport.js  case 'press_key': nativePressKeyEnhanced(...)
+  //   70-capture-and-readers.js   case 'press_key': nativePressKeyEnhanced(...)
+  // I found this the hard way: a fix for the Enter default action, AND a test pinning it, both
+  // landed on this dead copy and the suite went green while the tool behaved exactly as before.
+  // A test that asserts on a symbol nobody calls is worth nothing. The test now resolves the
+  // symbol the dispatchers actually call, and there is one implementation per op.
+  function nativeEvaluate(script) {
+    // Supports both expressions and statements. Async-aware: a script whose
+    // last expression is a Promise is awaited and its resolved value returned.
+    try {
+      const fn = new Function('"use strict"; return (async () => { ' + script + ' })();');
+      const p = fn();
+      if (p && typeof p.then === 'function') {
+        return p.then(function (r) { return { success: true, result: serializeEvalResult(r) }; })
+                .catch(function (e) { return { success: false, error: String((e && e.message) || e) }; });
+      }
+      return { success: true, result: serializeEvalResult(p) };
+    } catch (err) {
+      // new Function can be blocked by strict page CSP (LinkedIn, HN, H1).
+      // Fall back to a NON-EVAL DOM reader for the common read cases.
+      const msg = String((err && err.message) || err);
+      const readFallback = safeDomRead(script);
+      if (readFallback !== undefined) return readFallback;
+      return { success: false, error: 'CSP blocked eval: ' + msg + ' — use evaluate_safe (no-eval DOM queries) or native tools', cspBlocked: true };
+    }
+  }
+  function serializeEvalResult(r) {
+    if (r === undefined) return 'undefined';
+    if (r === null) return 'null';
+    const t = typeof r;
+    if (t === 'string' || t === 'number' || t === 'boolean') return r;
+    if (r instanceof Element) return '<' + r.tagName.toLowerCase() + (r.id ? '#' + r.id : '') + (r.className && typeof r.className === 'string' ? '.' + r.className.split(/\s+/).join('.') : '') + '>';
+    try { return JSON.stringify(r); } catch (_) { return String(r); }
+  }
+  // CSP-proof read-only DOM queries that need NO eval. Called as an automatic
+  // fallback when new Function is blocked, and directly by the evaluate_safe tool.
+  function safeDomRead(expr) {
+    var q = String(expr || '').trim();
+    if (!q) return undefined;
+    var m = q.match(/^querySelector(?:All)?\((['"])(.*?)\1\)(?:\.(textContent|innerText|value|checked|href|src|options))?$/);
+    if (!m) return undefined;
+    var sel = m[2], kind = m[3];
+    try {
+      if (q.indexOf('querySelectorAll') === 0) {
+        // deepQueryAll: a shadow-hosted match must be visible to the safe-query
+        // path, otherwise the same selector answers found:false here while
+        // explore_page lists it as an action.
+        var all = deepQueryAll(sel);
+        var out = [];
+        for (var i = 0; i < all.length && i < 50; i++) {
+          var e = all[i];
+          out.push(e && e[kind] !== undefined && kind ? e[kind] : (e ? e.textContent || '' : ''));
+        }
+        return { success: true, method: 'safe-querySelectorAll', count: all.length, results: out };
+      }
+      var el = deepQuery(sel);
+      if (!el) return { success: true, method: 'safe-querySelector', found: false };
+      return { success: true, method: 'safe-querySelector', found: true, value: kind ? el[kind] : (el.textContent || '') };
+    } catch (e) { return { success: false, error: String((e && e.message) || e) }; }
+  }
+  function nativeEvaluateSafe(query) {
+    // Structured, no-eval DOM reader for strict-CSP pages. Modes:
+    //   {selector:"input[name=email]", extract:"value"}          → single
+    //   {selector:".item", extract:"text", all:true}             → array
+    //   {inputs:true}                                            → all form controls
+    //   {text:true}                                              → body innerText (capped)
+    //   {state:true}                                             → page state snapshot
+    try {
+      const q = query || {};
+      if (q.state) {
+        const d = document;
+        const inputs = Array.prototype.slice.call(deepQueryAll('input,textarea,select')).map(function (i) {
+          // 2026-09-25 PRIVACY: password/autocomplete-otp values are masked —
+          // this reader previously echoed EVERY input's value verbatim, so a
+          // filled password came back in the tool result (and in any session
+          // transcript that stored it).
+          const mv = maskedValue(i);
+          return { tag: i.tagName.toLowerCase(), name: i.name || '', type: i.type || '', value: mv.value, hasValue: mv.hasValue, checked: !!(i.checked || i.selected) };
+        });
+        return { success: true, mode: 'state', url: location.href, title: d.title, scrollY: window.scrollY, scrollH: (d.documentElement && d.documentElement.scrollHeight) || 0, inputCount: inputs.length, inputs: inputs.slice(0, 60) };
+      }
+      if (q.text) {
+        const t = (document.body && document.body.innerText) || '';
+        return { success: true, mode: 'text', length: t.length, text: t.slice(0, q.maxLen || 20000) };
+      }
+      if (q.inputs) {
+        const ins = Array.prototype.slice.call(deepQueryAll('input,textarea,select')).map(function (i) {
+          // 2026-09-25 PRIVACY: same masking as q.state above — never echo a
+          // password / OTP field's value.
+          const mv = maskedValue(i);
+          return { tag: i.tagName.toLowerCase(), name: i.name || '', type: i.type || '', value: mv.value, hasValue: mv.hasValue, checked: !!(i.checked || i.selected), placeholder: i.placeholder || '', label: getLabel(i).slice(0, 60) };
+        });
+        return { success: true, mode: 'inputs', count: ins.length, inputs: ins.slice(0, 100) };
+      }
+      if (!q.selector) return { success: false, error: 'evaluate_safe needs selector, inputs:true, text:true, or state:true' };
+      const el = deepQuery(q.selector);
+      if (!el) return { success: true, mode: 'query', found: false, selector: q.selector,
+        note: 'not found in the light DOM or in any OPEN shadow root. If the site uses a CLOSED shadow root no script can reach it — use explore_page refs or real_click at coordinates.' };
+      const ex = q.extract || 'text';
+      // 2026-09-25 PRIVACY: an explicit `evaluate{query:{selector:"#pw",
+      // extract:"value"}}` used to return a password's live value verbatim —
+      // the last echo surface after the readers and type path were masked.
+      // Password/OTP fields now report value:'' plus hasValue so the agent can
+      // still ask "is it filled?" without ever holding the secret. `html` mode
+      // is masked too: a form's outerHTML can carry the value attribute.
+      const sensitive = isSensitiveValueField(el);
+      let val;
+      if (ex === 'value') val = sensitive ? '' : (el.value !== undefined ? el.value : (el.textContent || ''));
+      else if (ex === 'attrs') { const o = {}; for (let i = 0; i < el.attributes.length; i++) o[el.attributes[i].name] = el.attributes[i].value; val = o; }
+      else if (ex === 'html') val = sensitive ? '[html withheld: sensitive field]' : el.outerHTML;
+      else val = el.textContent || '';
+      if (q.all) {
+        const els = deepQueryAll(q.selector);
+        const arr = [];
+        for (let i = 0; i < els.length && i < (q.maxLen || 100); i++) {
+          const e = els[i];
+          if (ex === 'value') arr.push(isSensitiveValueField(e) ? '' : (e.value !== undefined ? e.value : (e.textContent || '')));
+          else if (ex === 'attrs') { const o = {}; for (let k = 0; k < e.attributes.length; k++) o[e.attributes[k].name] = e.attributes[k].value; arr.push(o); }
+          else arr.push(e.textContent || '');
+        }
+        return { success: true, mode: 'query-all', found: true, count: arr.length, results: arr };
+      }
+      const out = { success: true, mode: 'query', found: true, inShadow: isInShadow(el), value: val };
+      if (sensitive) { out.hasValue = !!(el.value); out.valueMasked = true; }
+      return out;
+    } catch (e) { return { success: false, error: String((e && e.message) || e) }; }
+  }
+  async function nativeTypeMany(fields) {
+    // Batch-fill: one round trip for N fields. Each field: {ref, text, clearFirst?}
+    // 2026-09-25 FIX: nativeType is ASYNC (it waits 2 rAF + ~500ms settle to
+    // verify persistence) and this called it synchronously, so `r.success` was
+    // always undefined → every batch reported filled:0 / failed:N even though
+    // the fields were written. Also switched to resolveRefHealed so batch mode
+    // heals stale refs like single-field mode does (it was the ONLY type path
+    // still using the bare resolver — a rerender silently failed the whole batch).
+    const results = [];
+    if (!Array.isArray(fields)) return { success: false, error: 'fields must be an array' };
+    for (const f of fields) {
+      try {
+        const el = await resolveRefHealed(f.ref);
+        if (!el) { results.push({ ref: f.ref, success: false, error: 'Element not found' }); continue; }
+        const r = await nativeType(el, f.text, f.clearFirst !== false);
+        results.push({ ref: f.ref, success: !!r.success, actualValue: r.actualValue, confirmed: r.confirmed, reverted: !!r.reverted });
+      } catch (e) {
+        results.push({ ref: f.ref, success: false, error: String((e && e.message) || e) });
+      }
+    }
+    return { success: true, filled: results.filter(function (r) { return r.success; }).length, failed: results.filter(function (r) { return !r.success; }).length, results: results };
+  }
+
+  // ═══ CATEGORY A: Advanced Native Handlers (ALL CSP-safe) ═══
+
+  function nativeHover(el) {
+    if (!el) throw new Error('Element not found');
+    if (el.scrollIntoViewIfNeeded) el.scrollIntoViewIfNeeded(); else el.scrollIntoView({behavior:'auto',block:'center',inline:'nearest'});
+    const rect = el.getBoundingClientRect(); const x = rect.left+rect.width/2; const y = rect.top+rect.height/2;
+    const pOpts = {bubbles:true,cancelable:true,clientX:x,clientY:y,pointerType:'mouse'};
+    const mOpts = {bubbles:true,cancelable:true,clientX:x,clientY:y};
+    el.dispatchEvent(new PointerEvent('pointerover',pOpts));
+    el.dispatchEvent(new PointerEvent('pointerenter',{...pOpts,bubbles:false}));
+    el.dispatchEvent(new MouseEvent('mouseover',mOpts));
+    el.dispatchEvent(new MouseEvent('mouseenter',{...mOpts,bubbles:false}));
+    el.dispatchEvent(new PointerEvent('pointermove',pOpts));
+    el.dispatchEvent(new MouseEvent('mousemove',mOpts));
+    return { success: true, label: getLabel(el) };
+  }
+
+  function nativeRightClick(el) {
+    if (!el) throw new Error('Element not found');
+    if (el.scrollIntoViewIfNeeded) el.scrollIntoViewIfNeeded(); else el.scrollIntoView({behavior:'auto',block:'center',inline:'nearest'});
+    const rect = el.getBoundingClientRect(); const x = rect.left+rect.width/2; const y = rect.top+rect.height/2;
+    const pOpts = {bubbles:true,cancelable:true,clientX:x,clientY:y,pointerType:'mouse',button:2};
+    const mOpts = {bubbles:true,cancelable:true,clientX:x,clientY:y,button:2};
+    el.dispatchEvent(new PointerEvent('pointerdown',pOpts));
+    el.dispatchEvent(new MouseEvent('mousedown',mOpts));
+    el.dispatchEvent(new PointerEvent('pointerup',pOpts));
+    el.dispatchEvent(new MouseEvent('mouseup',mOpts));
+    el.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX:x,clientY:y,button:2}));
+    return { success: true };
+  }
+
+  // ★ A REAL Enter SUBMITS THE FORM; A SYNTHETIC ONE CANNOT (2026-10-01).
+  // Measured on en.wikipedia.org: press_key Enter reached the element with the RIGHT target
+  // ({key:'Enter', trusted:false, target:'searchInput'}) and the page did not move, because an
+  // untrusted event runs NO default action. So "type a query, press Enter" — one of the two or
+  // three commonest task shapes there is — silently did nothing, and nothing said why.
+  // This function is the one BOTH dispatchers call, so this is where the emulation belongs.
+  // It runs the default action the browser would have run, but only when unambiguous:
+  //   · the page did not claim the key (defaultPrevented === false),
+  //   · no modifier is held (Ctrl+Enter is not a submit),
+  //   · the target IS a text-like input (NOT a textarea — Enter there is a newline),
+  //   · the input is in a form that can submit.
+  // The result says what it did, so it is never invisible: defaultAction + defaultPrevented.
+  function nativePressKeyEnhanced(key, ref, modifiers) {
+    modifiers = modifiers || [];
+    const target = ref ? resolveRef(ref) : document.activeElement || document.body;
+    if (!target) throw new Error('Target not found');
+    const opts = { key, bubbles: true, cancelable: true };
+    if (modifiers.includes('ctrl')) opts.ctrlKey = true;
+    if (modifiers.includes('shift')) opts.shiftKey = true;
+    if (modifiers.includes('alt')) opts.altKey = true;
+    if (modifiers.includes('meta')) opts.metaKey = true;
+    const kd = new KeyboardEvent('keydown', opts);
+    target.dispatchEvent(kd);
+    target.dispatchEvent(new KeyboardEvent('keypress', opts));
+    target.dispatchEvent(new KeyboardEvent('keyup', opts));
+    const out = { success: true, key, modifiers, defaultPrevented: !!kd.defaultPrevented, defaultAction: null };
+    try {
+      const tag = (target.tagName || '').toLowerCase();
+      const ty = (target.type || '').toLowerCase();
+      const textLike = tag === 'input' && ['text', 'search', 'url', 'email', 'tel', 'number', 'password', ''].indexOf(ty) >= 0;
+      if (!kd.defaultPrevented && key === 'Enter' && modifiers.length === 0 && textLike
+          && target.form && typeof target.form.requestSubmit === 'function') {
+        target.form.requestSubmit();
+        out.defaultAction = 'form.requestSubmit() — a real Enter would have submitted this form';
+      }
+    } catch (e) { out.defaultActionError = String((e && e.message) || e); }
+    return out;
+  }
+
+  function nativeDragDrop(fromEl, toEl) {
+    if (!fromEl) throw new Error('Source element not found');
+    if (!toEl) throw new Error('Target element not found');
+    const fromRect = fromEl.getBoundingClientRect();
+    const toRect = toEl.getBoundingClientRect();
+    const fx = fromRect.left+fromRect.width/2, fy = fromRect.top+fromRect.height/2;
+    const tx = toRect.left+toRect.width/2, ty = toRect.top+toRect.height/2;
+    var dt; try { dt = new DataTransfer(); } catch(_) { dt = { data: {} }; }
+    fromEl.dispatchEvent(new DragEvent('dragstart', { bubbles:true, cancelable:true, clientX:fx, clientY:fy, dataTransfer:dt }));
+    fromEl.dispatchEvent(new DragEvent('drag', { bubbles:true, cancelable:true, clientX:fx, clientY:fy, dataTransfer:dt }));
+    toEl.dispatchEvent(new DragEvent('dragenter', { bubbles:true, cancelable:true, clientX:tx, clientY:ty, dataTransfer:dt }));
+    toEl.dispatchEvent(new DragEvent('dragover', { bubbles:true, cancelable:true, clientX:tx, clientY:ty, dataTransfer:dt }));
+    toEl.dispatchEvent(new DragEvent('drop', { bubbles:true, cancelable:true, clientX:tx, clientY:ty, dataTransfer:dt }));
+    fromEl.dispatchEvent(new DragEvent('dragend', { bubbles:true, cancelable:true, clientX:tx, clientY:ty, dataTransfer:dt }));
+    return { success: true };
+  }
+
+  function nativeClickXY(x, y, ref, button) {
+    button = button || 'left';
+    const btnNum = button === 'right' ? 2 : button === 'middle' ? 1 : 0;
+    let clientX = x, clientY = y;
+    let targetEl = document.elementFromPoint(clientX, clientY);
+    if (ref) { const el = resolveRef(ref); if (el) { const rect = el.getBoundingClientRect(); clientX = rect.left + x; clientY = rect.top + y; targetEl = document.elementFromPoint(clientX, clientY) || el; } }
+    if (!targetEl) targetEl = document.body;
+    const pOpts = {bubbles:true,cancelable:true,clientX,clientY,pointerType:'mouse',button:btnNum};
+    const mOpts = {bubbles:true,cancelable:true,clientX,clientY,button:btnNum};
+    targetEl.dispatchEvent(new PointerEvent('pointerover',pOpts));
+    targetEl.dispatchEvent(new MouseEvent('mouseover',mOpts));
+    targetEl.dispatchEvent(new PointerEvent('pointerdown',pOpts));
+    targetEl.dispatchEvent(new MouseEvent('mousedown',mOpts));
+    try{targetEl.focus({preventScroll:true});}catch(_){}
+    targetEl.dispatchEvent(new PointerEvent('pointerup',pOpts));
+    targetEl.dispatchEvent(new MouseEvent('mouseup',mOpts));
+    if (button === 'right') targetEl.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,clientX,clientY,button:2}));
+    else targetEl.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,clientX,clientY,button:btnNum}));
+    return { success: true, x: clientX, y: clientY, target: targetEl.tagName.toLowerCase() };
+  }
+
+  function nativeCopyToClipboard(text) {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.left = '-9999px'; ta.style.top = '0';
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    let ok = false; try { ok = document.execCommand('copy'); } catch(_) {}
+    document.body.removeChild(ta);
+    return { success: ok };
+  }
+
+  function locateFileInput(startEl) {
+    if (!startEl) return null;
+    // A non-Element startEl (a Promise from a missed `await`, a wrapper object)
+    // must NOT fall through to the proximity ranking below: every candidate
+    // would score 0 and all[0] — the FIRST file input on the page — would
+    // silently win. That is exactly how a .zip landed on a product-IMAGE input
+    // (2026-09-21). Fail honestly instead of retargeting someone else's field.
+    if (startEl.nodeType !== 1) return null;
+    if (startEl.tagName === 'INPUT' && startEl.type === 'file') return startEl;
+    // search descendants of the clicked/labeled element
+    let f = startEl.querySelector && startEl.querySelector('input[type="file"]');
+    if (f) return f;
+    // search ancestors (e.g. label wrapping the input)
+    let p = startEl.parentElement;
+    while (p) {
+      if (p.tagName === 'INPUT' && p.type === 'file') return p;
+      const inner = p.querySelector && p.querySelector('input[type="file"]');
+      if (inner) return inner;
+      p = p.parentElement;
+    }
+    // Last resort: the file input NEAREST to startEl — NOT simply the first one
+    // on the page.
+    //
+    // BUG (found 2026-09-21, measured on LemonSqueezy): this returned all[0].
+    // On any form with an image/avatar file input BEFORE the document input —
+    // which is most storefronts and CMSes — an upload silently targeted the WRONG
+    // field, while still reporting success:true / fileCount:1 /
+    // confirmed:"preview-visible". A .zip was repeatedly attached to the
+    // product-IMAGE input while the file input stayed empty.
+    //
+    // deepQueryAll: a file input built by a web component (common in rich
+    // composers) lives in a shadow root — missing it made upload fall through to
+    // the drop-zone strategy and report a false negative.
+    const all = deepQueryAll('input[type="file"]');
+    if (!all.length) return null;
+    if (all.length === 1) return all[0];
+    let best = all[0];
+    let bestScore = -1;
+    for (let i = 0; i < all.length; i++) {
+      const score = domCloseness(startEl, all[i]);
+      if (score > bestScore) { bestScore = score; best = all[i]; }
+    }
+    return best;
+  }
+
+  // Higher = more closely related: the depth of the deepest shared ancestor, so a
+  // sibling/child input outranks an unrelated one in another form section.
+  function domCloseness(a, b) {
+    if (!a || !b) return 0;
+    const chain = (el) => {
+      const out = [];
+      let c = el;
+      while (c) { out.push(c); c = c.parentElement || (c.getRootNode && c.getRootNode().host) || null; }
+      return out;
+    };
+    const A = chain(a);
+    const inB = new Set(chain(b));
+    for (let i = 0; i < A.length; i++) {
+      if (inB.has(A[i])) return A.length - i;
+    }
+    return 0;
+  }
+  // ═══ Upload — multi-strategy + honest confirmation (agentreach pattern) ═══
+  // Strategy 1: real <input type=file> via native 'files' setter + events.
+  // Strategy 2: drop-zone (no visible input) — DataTransfer drop event on the
+  //   upload zone. Confirmation is POSITIVE-ONLY: success:true means the file
+  //   landed in the input / drop registered AND (where possible) the page
+  //   showed evidence of accepting it. Never claims confirmed without proof.
+
+  function makeFileFromBase64(base64, fileName, mimeType) {
+    const bin = atob(base64); const arr = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+    return new File([arr], fileName, { type: mimeType || 'application/octet-stream' });
+  }
+
+  function isDropZone(el) {
+    if (!el) return false;
+    const cls = (el.className || '').toString().toLowerCase();
+    const testid = (el.getAttribute('data-testid') || '').toLowerCase();
+    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+    if (testid.indexOf('upload') !== -1) return true;
+    if (cls.indexOf('dropzone') !== -1 || cls.indexOf('drop-zone') !== -1 || cls.indexOf('upload-drop') !== -1 || cls.indexOf('upload-area') !== -1 || cls.indexOf('uploader') !== -1 || cls.indexOf('file-drop') !== -1) return true;
+    if (aria.indexOf('upload') !== -1 || aria.indexOf('drop') !== -1) return true;
+    return false;
+  }
+
+  function findDropZone(startEl) {
+    if (startEl) {
+      // ancestors + self
+      let el = startEl;
+      while (el) {
+        if (isDropZone(el)) return el;
+        el = el.parentElement;
+      }
+      // descendants
+      const inner = startEl.querySelector && startEl.querySelector('[data-testid*="upload"],[class*="dropzone"],[class*="drop-zone"],[class*="upload-area"],[class*="uploader"],[class*="file-drop"],[class*="upload-drop"]');
+      if (inner) return inner;
+    }
+    const all = deepQueryAll('[data-testid*="upload"],[class*="dropzone"],[class*="drop-zone"],[class*="upload-area"],[class*="uploader"],[class*="file-drop"],[class*="upload-drop"],[aria-label*="upload"],[aria-label*="drop"]');
+    for (let i = 0; i < all.length; i++) if (isDropZone(all[i])) return all[i];
+    return null;
+  }
+
+  function pageShowsFileName(fileName) {
+    // Positive confirmation heuristic: the filename (or its base) appears in
+    // visible page text / previews shortly after upload.
+    const base = String(fileName || '').replace(/\.[^.]+$/, '').toLowerCase();
+    if (!base || base.length < 3) return null; // can't verify reliably
+    try {
+      const t = (document.body.innerText || '').toLowerCase();
+      if (t.indexOf(base) !== -1) return true;
+    } catch (_) {}
+    return false;
+  }
+
+  async function nativeUploadFromBase64(inputEl, base64, fileName, mimeType) {
+    const file = makeFileFromBase64(base64, fileName, mimeType);
+
+    // ── Strategy 1: real file input ──
+    const realInput = locateFileInput(inputEl);
+    if (realInput) {
+      const dt = new DataTransfer(); dt.items.add(file);
+      try {
+        realInput.files = dt.files;
+      } catch (_) {
+        const d = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'files');
+        if (d && d.set) d.set.call(realInput, dt.files);
+      }
+      realInput.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+      realInput.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+      // v4.6.1 UPLOAD FALSE-NEGATIVE FIX (2026-09-11d). `realInput.files.length` is read
+      // back in the ISOLATED world, where the File/DataTransfer are realm-local. On
+      // strict-CSP pages Chrome reports an EMPTY FileList even when the file DID attach,
+      // so this reading produced "Input rejected the file" for uploads that had in fact
+      // succeeded — three copies of one video landed on a post the tool insisted had
+      // failed. NEVER assert failure from it: prefer page-side evidence, and otherwise
+      // report UNCONFIRMED rather than wrong.
+      const realmCount = realInput.files ? realInput.files.length : 0;
+      await new Promise((r) => setTimeout(r, 700));   // let the app render a preview
+      let shown = false;
+      try { shown = pageShowsFileName(file.name) === true; } catch (_) {}
+      // The read-back is ASYMMETRIC, and that asymmetry is the whole fix:
+      //   count > 0  => the file IS on the input (positive evidence)
+      //   count == 0 => proves NOTHING (see above) — never a rejection
+      // Measured on bench/shadow_fixture.html 2026-09-11d: a matching AND a
+      // mismatched file both read back 1, so Chrome does NOT filter a
+      // programmatically-assigned FileList by the input's `accept`. The
+      // read-back is therefore never grounds for asserting failure.
+      const attached = shown === true || realmCount > 0;
+      return {
+        success: attached,
+        method: 'file_input',
+        fileCount: realmCount,
+        fileName: file.name,
+        fileSize: file.size,
+        confirmed: shown === true ? 'preview-visible'
+          : (realmCount > 0 ? 'input-has-file' : 'unconfirmed-realm-readback'),
+        realmReadbackUnreliable: realmCount === 0,
+        note: shown === true
+          ? 'File attached — the page shows it.'
+          : (realmCount > 0
+            ? 'File is on the input (read-back confirms ' + realmCount + '), but no page preview yet — the widget may not have processed it.'
+            : 'The isolated-world read-back returned 0, which is NOT evidence of failure on a strict-CSP page (the File is realm-local). Check the page/preview directly, or use real_paste (genuine CF_HDROP) / scripts/real_input.py paste-file.'),
+      };
+    }
+
+    // ── Strategy 2: drop-zone (no visible input) ──
+    const zone = findDropZone(inputEl);
+    if (!zone) throw new Error('No file input or upload drop-zone found for ref');
+    const dt2 = new DataTransfer(); dt2.items.add(file);
+    zone.dispatchEvent(new DragEvent('dragenter', { bubbles: true, cancelable: true, dataTransfer: dt2 }));
+    zone.dispatchEvent(new DragEvent('dragover', { bubbles: true, cancelable: true, dataTransfer: dt2 }));
+    zone.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt2 }));
+    zone.dispatchEvent(new DragEvent('dragleave', { bubbles: true, cancelable: true, dataTransfer: dt2 }));
+    // Positive confirmation: wait a beat for the page to render a preview/name.
+    // P2 (2026-08-31): MANY apps process the drop asynchronously (upload →
+    // XHR → re-render), so a synchronous filename check can return false even
+    // though the file LANDED. Re-check after 500ms before declaring
+    // 'unconfirmed' — this is the fix for the phantom confirmed:false that
+    // made agents retry into duplicates on GitHub's dropzone.
+    let shown = pageShowsFileName(fileName);
+    if (!shown) {
+      await new Promise((r) => setTimeout(r, 500));
+      shown = pageShowsFileName(fileName);
+    }
+    return {
+      success: true,
+      method: 'dropzone',
+      fileName: file.name,
+      fileSize: file.size,
+      confirmed: shown === true ? 'preview-visible' : 'unconfirmed',
+      note: shown === true ? 'Drop dispatched and page shows the filename.' : 'Drop dispatched but no filename preview detected after 500ms — verify visually before claiming success.',
+    };
+  }
+
+  // ═══ v4 Strategy 3: CLIPBOARD-PASTE into editors (2026-08-31) ═══
+  // Rich-text editors (x.com composer, Discord, Slack, Notion) accept images /
+  // files via the paste pipeline — no file input, no dropzone. Synthetic
+  // ClipboardEvent('paste') carrying the file as a DataTransfer item, with the
+  // editor focused. consumed=true (handler called preventDefault) means the
+  // editor took it. Positive-only confirmation per PRINCIPLE 5.
+  async function nativeUploadPasteIntoEditor(targetEl, base64, fileName, mimeType) {
+    try {
+      const file = makeFileFromBase64(base64, fileName, mimeType);
+      const det = detectEditor(targetEl);
+      if (det.kind !== 'editor') {
+        return { success: false, refused: 'not-an-editor', note: 'paste-upload targets rich-text editors; use file_input/dropzone strategies for inputs' };
+      }
+      targetEl.focus();
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      const ev = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt });
+      // v4.2 FIX: dispatchEvent false == handler consumed (preventDefault)
+      const consumed = !targetEl.dispatchEvent(ev);
+      // Editor marks handling asynchronously — give it a beat, then look for
+      // ANY evidence the file registered (preview node, filename text, upload chip).
+      await new Promise((r) => setTimeout(r, 600));
+      const shown = pageShowsFileName(fileName);
+      return {
+        success: consumed,
+        method: 'editor_paste',
+        framework: det.framework,
+        fileName: file.name,
+        fileSize: file.size,
+        confirmed: shown === true ? 'preview-visible' : (consumed ? 'consumed-unverified' : 'unconfirmed'),
+        note: shown === true ? 'Paste dispatched and page shows the file.'
+            : consumed ? 'Paste event was consumed by the editor but no preview detected — verify before claiming success.'
+            : 'Editor did not consume the paste event.',
+      };
+    } catch (e) {
+      return { success: false, method: 'editor_paste', error: String(e) };
+    }
+  }
+
+  // ═══ Network Request Capture ═══
+/* Network/console capture, dropdown/accordion/tab readers, page state
+ * Part 07 of 9 — source of truth for extension/websense-cs.js.
+ * DO NOT edit the built file; edit here and run `node tools/build-cs.mjs`.
+ * Split out 2026-09-11 (was one 3,7xx-line file). The code below is copied
+ * VERBATIM from the pre-split file; only this banner is added.
+ */
+  var networkLog = [];
+  var networkCapturing = false;
+  function startNetworkCapture() {
+    if (networkCapturing) return;
+    networkCapturing = true;
+    var origFetch = window.fetch;
+    window.fetch = function() {
+      var url = arguments[0]; var opts = arguments[1] || {};
+      var entry = { type:'fetch', url: typeof url==='string'?url:((url&&typeof url==='object'&&url.url)||''), method: opts.method||'GET', timestamp: Date.now() };
+      networkLog.push(entry);
+      return origFetch.apply(this, arguments).then(function(resp) {
+        entry.status = resp.status;
+        resp.clone().text().then(function(b) { entry.responseBody = b.slice(0,500); }).catch(function(){});
+        return resp;
+      });
+    };
+    var origOpen = XMLHttpRequest.prototype.open;
+    var origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open = function(method, url) { this._wsMethod = method; this._wsUrl = url; return origOpen.apply(this, arguments); };
+    XMLHttpRequest.prototype.send = function() {
+      var entry = { type:'xhr', url: this._wsUrl, method: this._wsMethod, timestamp: Date.now() };
+      networkLog.push(entry);
+      var self = this;
+      this.addEventListener('load', function() { entry.status = self.status; try { entry.responseBody = (self.responseText||'').slice(0,500); } catch(_){} });
+      return origSend.apply(this, arguments);
+    };
+  }
+  function getNetworkLog(clear, maxEntries) {
+    var max = maxEntries || 50;
+    // MAIN-world entries (2026-09-25): network-hook.js patches the PAGE's
+    // fetch/XHR, which is the only place real page traffic ever goes. The
+    // isolated-world patch above still catches calls made BY the content script
+    // (e.g. its own probes) — keep both, main first (it is the real traffic).
+    var mainWorld = [];
+    try {
+      var el = document.getElementById('__ws_net_buffer');
+      if (el) {
+        var parsed = JSON.parse(el.getAttribute('data-ws-net') || '[]');
+        if (Array.isArray(parsed)) mainWorld = parsed;
+      }
+    } catch (_) {}
+    var all = mainWorld.concat(networkLog);
+    var entries = all.slice(-max);
+    // totalCaptured must be read BEFORE clearing (2026-09-25): the old code
+    // cleared the array first and then reported networkLog.length, so every
+    // clear:true call reported totalCaptured:0 — a permanent "nothing was ever
+    // captured" lie that hid real traffic from the agent.
+    var total = all.length;
+    if (clear) {
+      networkLog = [];
+      try { var el2 = document.getElementById('__ws_net_buffer'); if (el2) el2.removeAttribute('data-ws-net'); } catch (_) {}
+    }
+    return { entries: entries, totalCaptured: total, capturing: networkCapturing || mainWorld.length > 0,
+             cleared: !!clear, mainWorldEntries: mainWorld.length, isolatedWorldEntries: networkLog.length };
+  }
+
+  // ═══ CONSOLE / JS-ERROR CAPTURE (2026-08-30 — parity with Hermes browser_console) ═══
+  // Auto-starts on init so page-load JS errors are captured before the first explicit call.
+  var consoleCapturing = false;
+  var consoleLog = [];
+  var _origConsoleLog = null, _origConsoleWarn = null, _origConsoleError = null,
+      _origConsoleInfo = null, _origConsoleDebug = null;
+  function _pushConsole(type, args) {
+    try {
+      var text = Array.prototype.map.call(args, function (a) {
+        if (typeof a === 'string') return a;
+        try { return JSON.stringify(a); } catch (_) { return String(a); }
+      }).join(' ');
+      consoleLog.push({ type: type, text: text.slice(0, 2000), ts: Date.now() });
+      if (consoleLog.length > 300) consoleLog.shift(); // ring buffer
+    } catch (_) {}
+  }
+  function startConsoleCapture() {
+    if (consoleCapturing) return;
+    consoleCapturing = true;
+    _origConsoleLog = console.log; _origConsoleWarn = console.warn;
+    _origConsoleError = console.error; _origConsoleInfo = console.info;
+    _origConsoleDebug = console.debug;
+    console.log = function () { _pushConsole('log', arguments); return _origConsoleLog.apply(console, arguments); };
+    console.warn = function () { _pushConsole('warn', arguments); return _origConsoleWarn.apply(console, arguments); };
+    console.error = function () { _pushConsole('error', arguments); return _origConsoleError.apply(console, arguments); };
+    console.info = function () { _pushConsole('info', arguments); return _origConsoleInfo.apply(console, arguments); };
+    console.debug = function () { _pushConsole('debug', arguments); return _origConsoleDebug.apply(console, arguments); };
+    window.addEventListener('error', function (e) { _pushConsole('jserror', [String(e.message || '') + ' @ ' + (e.filename || '') + ':' + (e.lineno || '')]); }, true);
+    window.addEventListener('unhandledrejection', function (e) { _pushConsole('unhandledrejection', [String((e.reason && e.reason.message) || e.reason || '')]); }, true);
+  }
+  startConsoleCapture(); // auto-start so page-load errors are captured
+  function getConsoleLog(clear, maxEntries) {
+    var mainWorld = [];
+    try {
+      var el = document.getElementById('__ws_console_buffer');
+      if (el && el.getAttribute('data-ws')) {
+        var parsed = JSON.parse(el.getAttribute('data-ws') || '[]');
+        if (Array.isArray(parsed)) mainWorld = parsed;
+      }
+    } catch (_) {}
+    // merge: isolated-world captures first (page-world console in MAIN buffer)
+    var all = consoleLog.concat(mainWorld);
+    var entries = all.slice(-(maxEntries || 100));
+    if (clear) {
+      consoleLog = [];
+      try { var el2 = document.getElementById('__ws_console_buffer'); if (el2) el2.removeAttribute('data-ws'); } catch (_) {}
+    }
+    return { entries: entries, totalCaptured: all.length, capturing: consoleCapturing };
+  }
+
+
+  // ═══ Intelligence Tools ═══
+  function getDropdownOptions(ref) {
+    const el = resolveRef(ref); if(!el) return{error:'Element not found'};
+    if(el.tagName==='SELECT') return{ref,tag:'select',label:getLabel(el),options:extractSelectOptions(el),currentValue:el.value};
+    const cid = el.getAttribute('aria-controls');
+    if(cid){const lb=document.getElementById(cid); if(lb){const opts=Array.from(lb.querySelectorAll('[role="option"],li,.dropdown-item')).filter(isVisible).map((o)=>({value:o.getAttribute('data-value')||o.textContent.trim(),text:o.textContent.trim(),selected:o.getAttribute('aria-selected')==='true'||o.classList.contains('selected')})); return{ref,tag:el.tagName.toLowerCase(),label:getLabel(el),options:opts,currentValue:null,note:'Custom dropdown — click trigger to open, then click option'};}}
+    return{error:'Not a dropdown element'};
+  }
+
+  function getTabContents(ref) {
+    let tablists;
+    if(ref){const el=resolveRef(ref); if(!el)return{error:'Element not found'}; const tl=el.getAttribute('role')==='tablist'?el:el.closest('[role="tablist"]'); tablists=tl?[tl]:[];}
+    else tablists=Array.from(document.querySelectorAll('[role="tablist"]')).filter(isVisible);
+    if(tablists.length===0){const tabs=Array.from(document.querySelectorAll('[data-toggle="tab"],[data-bs-toggle="tab"]')).filter(isVisible); if(tabs.length>0)tablists=[tabs[0].parentElement];}
+    return tablists.map((tl)=>{const tabs=Array.from(tl.querySelectorAll('[role="tab"],[data-toggle="tab"],[data-bs-toggle="tab"]')); return{ref:assignRef(tl),label:getLabel(tl).slice(0,50),tabs:tabs.map((t)=>{const pid=t.getAttribute('aria-controls')||t.getAttribute('data-target')||(t.getAttribute('href')||'').replace('#',''); const panel=pid?document.getElementById(pid):null; return{ref:assignRef(t),label:getLabel(t),active:t.getAttribute('aria-selected')==='true'||t.classList.contains('active'),panelRef:pid,contentPreview:panel?(panel.innerText||'').trim().slice(0,200):'[not found]',isHidden:panel?!isVisible(panel):true};})};});
+  }
+
+  function getAccordionContents(ref) {
+    let sections;
+    if(ref){const el=resolveRef(ref); if(!el)return{error:'Element not found'}; sections=[el];}
+    else sections=Array.from(document.querySelectorAll('details,[aria-expanded],[data-bs-toggle="collapse"]')).filter(isVisible);
+    return sections.map((el)=>{if(el.tagName==='DETAILS'){const s=el.querySelector('summary'); return{ref:assignRef(el),tag:'details',label:s?getLabel(s):getLabel(el),expanded:el.open,contentPreview:(el.innerText||'').trim().slice(0,200)};} const exp=el.getAttribute('aria-expanded')==='true'; const ctrl=el.getAttribute('aria-controls')||el.getAttribute('data-bs-target'); const panel=ctrl?document.getElementById(ctrl.replace('#','')):null; return{ref:assignRef(el),tag:el.tagName.toLowerCase(),label:getLabel(el).slice(0,80),expanded:exp,contentPreview:panel?(panel.innerText||'').trim().slice(0,200):'[not accessible]'};});
+  }
+
+  function previewAction(ref) {
+    const el=resolveRef(ref); if(!el)return{error:'Element not found'};
+    const c=classifyAction(el); const attrs=getAttrs(el); const state=extractState(el); const effect=predictEffect(el,c,attrs);
+    const ctx={opensNewTab:attrs.target==='_blank',sameOrigin:c.href?new URL(c.href,location.href).origin===location.origin:null,triggersDownload:attrs.download!==undefined,isFileUpload:el.tagName==='INPUT'&&el.type==='file',acceptedFileTypes:el.accept||null,isReactControlled:detectFramework()==='react'};
+    return{ref,classification:c,state,effect,context:ctx};
+  }
+
+  function getQuickState() { return{url:window.location.href,title:document.title,readyState:document.readyState,dialogCount:document.querySelectorAll('[role="dialog"][aria-modal="true"],dialog[open]').length,bodyTextHash:(document.body.innerText||'').slice(0,500)}; }
+
+  // page_state for the WS direct-dispatch path (was MISSING — page ops silently
+  // fell back to the SW relay; fixed 2026-08-09)
+  function getPageState() {
+    var isTop = false;
+    try { isTop = (window.self === window.top); } catch (_) {}
+    var scrollC = null;
+    try { scrollC = findScrollContainer() === document.documentElement ? 'window' : 'inner'; } catch (_) { scrollC = 'unknown'; }
+    var dialogs = [];
+    try { dialogs = WS_DIALOGS.slice(-5).map(function(d){return {type:d.type,message:d.message};}); } catch (_) {}
+    // 2026-09-25: include the MAIN-world queue. The page's own alert/confirm/
+    // prompt never touch the isolated-world WS_DIALOGS, so without this every
+    // status reported pendingDialogs:[] even while a confirm() was blocking the
+    // page — a silent-wrong-outcome class.
+    try { dialogs = dialogs.concat(readMainWorldDialogs().slice(-5)); } catch (_) {}
+    var recent = [];
+    try { recent = readRecentMainWorldDialogs().slice(-8); } catch (_) {}
+    return {
+      url: window.location.href,
+      title: document.title,
+      readyState: document.readyState,
+      hasModal: !!document.querySelector('[role="dialog"][aria-modal="true"],dialog[open],.modal:not([hidden])'),
+      hasCaptcha: !!document.querySelector('iframe[src*="captcha"],iframe[src*="recaptcha"],.g-recaptcha,#captcha'),
+      isLoading: !!document.querySelector('[aria-busy="true"],.loading,.spinner,.loader'),
+      pendingDialogs: dialogs,
+      recentDialogs: recent,
+      hasBeforeUnload: !!WS_HAS_BEFOREUNLOAD,
+      viewport: { w: window.innerWidth, h: window.innerHeight },
+      scrollPct: Math.round(window.scrollY / Math.max(1, (document.documentElement.scrollHeight || 1) - window.innerHeight) * 100),
+      scrollContainer: scrollC,
+      isMainFrame: isTop,
+      // ★ ONE FRESHNESS TRUTH (2026-10-01). The relay copy used to report a HARDCODED
+      // wsVersion:'v4.6.0', which was both a hardcoded value and stale — the real build was
+      // v4.6.1. The build stamp is substituted here at build time and encodes BOTH the
+      // version and the source hash, so reporting it is the only freshness claim that
+      // cannot rot. Reported from one place so both dispatchers agree.
+      csBuild:'v4.6.1-d57fb3a3',
+    };
+  }
+
+  // ═══ Doctor — content-script diagnostics (agentreach doctor pattern) ═══
+  function doctorContent() {
+    var docCookies = [];
+    try {
+      document.cookie.split(';').forEach(function (c) {
+        var n = (c.split('=')[0] || '').trim();
+        if (n) docCookies.push(n);
+      });
+    } catch (_) {}
+    var scrollC = null;
+    try { scrollC = findScrollContainer() === document.documentElement ? 'window' : 'inner'; } catch (_) { scrollC = 'unknown'; }
+    var isTop = false;
+    try { isTop = (window.self === window.top); } catch (_) {}
+    return {
+      url: location.href,
+      title: document.title,
+      readyState: document.readyState,
+      isMainFrame: isTop,
+      framework: detectFramework(),
+      pageType: extractPageType(),
+      quirks: getSiteQuirks(),
+      scrollContainer: scrollC,
+      scrollY: window.scrollY,
+      pendingDialogs: WS_DIALOGS.length,
+      hasBeforeUnload: WS_HAS_BEFOREUNLOAD,
+      wsBridge: { connecting: !!(window.__WEBSENSE_DEBUG__ || []).length ? 'attempts-logged' : 'silent', debugTail: (window.__WEBSENSE_DEBUG__ || []).slice(-12) },
+      docCookieNames: docCookies.slice(0, 50),
+      docCookieCount: docCookies.length,
+      loaded: window.__WEBSENSE_LOADED__ === true,
+    };
+  }
+
+  // ═══ Message Handler (SYNC guard + async worker) ═══
+  // CRITICAL: the guard must return a REAL synchronous false. An async
+  // function's `return false` yields a Promise (truthy) → Chrome keeps the
+  // message channel open forever waiting for sendResponse → tabs.sendMessage
+  // never settles → the relay hangs until hub timeout. Split so subframes /
+  // ad frames close the channel synchronously.
+  function handleMessage(message, sender, sendResponse) {
+    // NEVER respond from ad iframes — they hijack page ops via the broadcast
+    // PAGE_CONTROL relay (chrome.tabs.sendMessage without frameId hits ALL frames).
+    if (WS_IS_AD_FRAME) return false;
+    // Only the main frame answers untargeted page ops. Subframes answer ONLY
+    // when the message explicitly targets them via frameId.
+    var isTop = false;
+    try { isTop = (window.self === window.top); } catch (_) { isTop = false; }
+    if (!isTop && (message.frameId === undefined || message.frameId === 0)) return false;
+    // Sync guard passed — hand off to the async worker, keep channel open.
+    handleMessageAsync(message, sender, sendResponse);
+    return true;
+  }
+
+  async function handleMessageAsync(message, sender, sendResponse) {
+    const { type, id, ...params } = message;
+    let result;
+    try {
+      switch (type) {
+        // ── Ops ONLY this route can serve. These need the offscreen document or the
+        //    service worker (tab/cookie/download control), which a page script has no
+        //    API for — so they stay here as a routing table, not an implementation.
+        case 'cookie_op':
+        case 'download_op':
+        case 'get_active_tab':
+        case 'respawn_offscreen':
+        case 'switch_tab':
+        case 'close_tab':
+        case 'list_frames':
+        case 'download_state':
+        case 'list_tabs': {
+          result = await relayTabControl(type, params);
+          break;
+        }
+        // ── EVERY page op: DELEGATE. This path used to carry a hand-maintained SECOND
+        //    copy of 48 ops (2026-10-01 audit: 48 in both switches, and already drifted —
+        //    action_preview called a function that exists nowhere, extract_text/ping/
+        //    get_status answered different shapes). There is now ONE implementation,
+        //    wsDispatchPage() in 00-bridge-and-transport.js; it is declared in the FIRST
+        //    file of the concatenation, so it is hoisted and visible here. `ctx` carries
+        //    only the sender identity this route alone knows.
+        default:
+          result = await wsDispatchPage(message, { sender: sender });
+      }
+      sendResponse({type:type+'_result',id,success:true,data:result});
+    } catch(err) {
+      sendResponse({type:type+'_result',id,success:false,data:err instanceof Error?err.message:String(err)});
+    }
+    return true;
+  }
+
+  chrome.runtime.onMessage.addListener(handleMessage);
+
+  // Re-extract on SPA navigation
+/* handleMessage op dispatcher, diff/event observers, boot
+ * Part 08 of 9 — source of truth for extension/websense-cs.js.
+ * DO NOT edit the built file; edit here and run `node tools/build-cs.mjs`.
+ * Split out 2026-09-11 (was one 3,7xx-line file). The code below is copied
+ * VERBATIM from the pre-split file; only this banner is added.
+ */
+  let lastUrl = window.location.href;
+  const navObserver = new MutationObserver(() => {
+    if (window.location.href !== lastUrl) { lastUrl = window.location.href; refMap = new Map(); refCounter = 0; locatorByRef.clear(); }
+  });
+  if (document.body) navObserver.observe(document.body, {childList:true,subtree:true});
+
+  // ═══ A1 (2026-08-10): LIVE DIFF ENGINE ═══
+  // A persistent MutationObserver ring buffer. After every action the agent can
+  // call page_diff to get ONLY what changed since the last read — instead of a
+  // full re-snapshot. This is the biggest token win in the no-vision stack:
+  // re-reads cost ~10% of explore_page.
+  const diffBuf = [];
+  const DIFF_CAP = 200; // ring buffer cap — don't let a heavy SPA OOM the tab
+  let diffSince = Date.now();
+  let diffObserver = null;
+
+  function startDiffObserver() {
+    if (diffObserver || !document.body) return;
+    diffObserver = new MutationObserver((muts) => {
+      const now = Date.now();
+      for (const m of muts) {
+        // Coalesce: only record the FIRST mutation touching a given node id
+        // per second (avoid flood on frameworks that mutate ancestors + child).
+        const key = (m.target && m.target.nodeType === 1 ? m.target.getAttribute('data-websense-ref') : null) || '';
+        const nodeInfo = describeMutation(m);
+        if (!nodeInfo) continue;
+        diffBuf.push({ t: now, type: m.type, node: nodeInfo, key });
+        if (diffBuf.length > DIFF_CAP) diffBuf.splice(0, diffBuf.length - DIFF_CAP);
+      }
+    });
+    diffObserver.observe(document.body, { childList: true, subtree: true, attributes: true, characterData: true });
+  }
+
+  function describeMutation(m) {
+    try {
+      const el = m.target && m.target.nodeType === 1 ? m.target : (m.target && m.target.parentElement);
+      if (!el) return null;
+      const tag = el.tagName ? el.tagName.toLowerCase() : '#text';
+      const ref = el.getAttribute ? el.getAttribute(REF_ATTR) || assignRef(el) : null;
+      const cls = (el.className || '').toString().slice(0, 40);
+      const txt = m.type === 'characterData' ? String(m.target.nodeValue || '').slice(0, 60) : '';
+      const added = m.addedNodes && m.addedNodes.length ? Array.from(m.addedNodes).slice(0, 3).map(n => {
+        return { tag: n.tagName ? n.tagName.toLowerCase() : '#text', id: n.id || '', ref: n.nodeType === 1 ? (n.getAttribute ? n.getAttribute(REF_ATTR) || assignRef(n) : null) : null };
+      }) : [];
+      const removedCount = m.removedNodes ? m.removedNodes.length : 0;
+      return { tag, ref, cls, txt, added, removedCount, attr: m.attributeName || null };
+    } catch (_) { return null; }
+  }
+
+  function getPageDiff() {
+    if (!diffObserver) startDiffObserver();
+    const since = diffSince;
+    diffSince = Date.now();
+    const out = diffBuf.filter((d) => d.t >= since);
+    // dedupe by key+type+tag (coalesce framework churn)
+    const seen = new Set();
+    const unique = [];
+    for (const d of out) {
+      const k = d.key + '|' + d.type + '|' + (d.node ? d.node.tag + (d.node.attr || '') : '');
+      if (seen.has(k)) continue;
+      seen.add(k);
+      unique.push(d);
+    }
+    const changed = unique.length;
+    // Classify: what KIND of change was it (modal appeared? form? text?)
+    const modal = unique.some((d) => d.node && d.node.tag && /dialog|modal|popup|overlay/.test(d.node.tag + ' ' + (d.node.cls || '')));
+    const form = unique.some((d) => d.node && d.node.tag && /form|input|select|textarea|button/.test(d.node.tag));
+    const text = unique.some((d) => d.node && d.node.txt);
+    return {
+      success: true,
+      changed,
+      since,
+      modal: modal ? 'likely' : 'none',
+      form: form ? 'likely' : 'none',
+      textChanged: text,
+      entries: unique.slice(0, 40), // cap payload — the summary fields carry the signal
+      total: diffBuf.length,
+      hint: changed === 0 ? 'no changes since last read' : (changed + ' changes — ' + (modal ? 'modal-level, ' : '') + (form ? 'form-level, ' : '') + (text ? 'text' : 'layout')),
+    };
+  }
+
+  // ═══ A6 (2026-08-10): EVENT STREAM ═══
+  // Named, classified events on top of the diff buffer — the agent waits ON
+  // the browser ("dialog appeared?", "navigation completed?") instead of blind
+  // sleep+poll. dialog_open/dialog_close are detected by MutationObserver;
+  // navigation by URL change; network by performance entries.
+  const eventBuf = [];
+  const EVENT_CAP = 100;
+  let lastEventScan = Date.now();
+
+  function scanEvents() {
+    // 1. URL change → navigation event
+    if (window.location.href !== lastUrl) {
+      eventBuf.push({ t: Date.now(), type: 'navigation', detail: lastUrl + ' -> ' + window.location.href });
+      lastUrl = window.location.href;
+    }
+    // 2. Network: collect new resource entries (fetch/XHR/img) since last scan
+    try {
+      if (window.performance && window.performance.getEntriesByType) {
+        const entries = window.performance.getEntriesByType('resource').filter((e) => e.startTime >= lastEventScan - 100);
+        if (entries.length) {
+          // Summarize: count + top slowest
+          const byType = {};
+          for (const e of entries.slice(-20)) {
+            const kind = (e.initiatorType || 'other');
+            byType[kind] = (byType[kind] || 0) + 1;
+          }
+          eventBuf.push({ t: Date.now(), type: 'network', detail: JSON.stringify(byType), count: entries.length });
+        }
+      }
+    } catch (_) {}
+    lastEventScan = Date.now();
+    if (eventBuf.length > EVENT_CAP) eventBuf.splice(0, eventBuf.length - EVENT_CAP);
+  }
+
+  // Called on every diff read — drains the mutation buffer into named events.
+  function drainDiffToEvents() {
+    const diff = getPageDiff();
+    if (diff.changed === 0) return diff;
+    const now = Date.now();
+    // dialog_open/close: added/removed nodes with dialog/modal classes
+    for (const e of diff.entries) {
+      if (!e.node) continue;
+      const cls = (e.node.cls || '') + ' ' + (e.node.tag || '');
+      if (/dialog|modal|popup|overlay/.test(cls)) {
+        if (e.node.added && e.node.added.length) eventBuf.push({ t: now, type: 'dialog_open', detail: e.node.tag + ' ' + e.node.cls, ref: e.node.ref || null });
+        if (e.node.removedCount > 0) eventBuf.push({ t: now, type: 'dialog_close', detail: e.node.tag, ref: e.node.ref || null });
+      }
+      if (e.node.added && e.node.added.length && /form|input|select|textarea|button/.test(e.node.tag)) {
+        eventBuf.push({ t: now, type: 'form_update', detail: e.node.tag, ref: e.node.ref || null });
+      }
+    }
+    if (eventBuf.length > EVENT_CAP) eventBuf.splice(0, eventBuf.length - EVENT_CAP);
+    return diff;
+  }
+
+  function getEvents(since) {
+    scanEvents();
+    const sinceT = since || Date.now() - 60000; // default: last 60s
+    const out = eventBuf.filter((e) => e.t >= sinceT);
+    // also drain any pending dialog/form mutations into events
+    drainDiffToEvents();
+    const out2 = eventBuf.filter((e) => e.t >= sinceT);
+    return { success: true, count: out2.length, since: sinceT, events: out2.slice(-30), hint: out2.length ? out2.map((e) => e.type).join(', ') : 'no events since ' + new Date(sinceT).toISOString() };
+  }
+
+  window.__WEBSENSE_LOADED__ = true;
+})();
