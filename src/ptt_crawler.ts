@@ -51,16 +51,43 @@ export interface CrawlerOptions {
     skipPBs?: undefined | boolean;
     /** Whether to fetch the content of each post. */
     getContents?: undefined | boolean;
+    /**
+     * Whether to keep the pages already crawled when a page after the first one
+     * fails. Default: `false`.
+     */
+    continueOnPageError?: undefined | boolean;
     /** A callback function to receive progress updates. */
     onProgress?: (progress: Progress) => void;
+}
+
+/**
+ * The stage at which a multi-page crawl stopped early.
+ * - `pagination_wait`: clicking "previous page" or waiting for the list container timed out.
+ * - `page_parse`: parsing the posts of the page threw an error.
+ */
+export type CrawlFailureStage = 'pagination_wait' | 'page_parse';
+
+/**
+ * Describes why a multi-page crawl stopped before all requested pages were crawled.
+ */
+export interface CrawlStopReason {
+    /** The 1-based number of the page that failed. */
+    page: number;
+    /** The stage at which the crawl failed. */
+    stage: CrawlFailureStage;
+    /** The original error message. */
+    message: string;
 }
 
 /**
  * Represents the progress of the crawler.
  */
 export interface Progress {
-    /** The type of the current operation. */
-    type: 'crawling_pages' | 'fetching_contents';
+    /**
+     * The type of the current operation. `crawl_interrupted` is emitted only
+     * when `continueOnPageError` is enabled and the crawl stops early.
+     */
+    type: 'crawling_pages' | 'fetching_contents' | 'crawl_interrupted';
     /** A human-readable message describing the current status. */
     message: string;
     /** The number of items completed so far. */
@@ -69,6 +96,8 @@ export interface Progress {
     total: number;
     /** The completion percentage (0-100). */
     percent: number;
+    /** The reason the crawl stopped early. Only present for `crawl_interrupted`. */
+    stopReason?: CrawlStopReason;
 }
 
 /**
@@ -108,6 +137,11 @@ export interface MergedPages {
     marks: string[];
     /** Array of post contents. Only available if `getContents` is true. */
     contents?: string[];
+    /**
+     * Why the multi-page crawl stopped early. Only present when
+     * `continueOnPageError` is enabled and a page after the first one failed.
+     */
+    stopReason?: CrawlStopReason;
 }
 
 /**
@@ -246,11 +280,14 @@ export class PttCrawler {
         const data_pages: CrawlerOnePage[] = [];
         const pages = typeof options.pages === 'number' && options.pages > 0 ? Math.floor(options.pages) : 1;
         const onProgress = options.onProgress;
+        const continueOnPageError = options.continueOnPageError === true;
 
         this.scrapingBoard = options.board || 'Tos';
         this.scrapingPages = pages;
         this.skipBottomPosts = typeof options.skipPBs === 'boolean' ? options.skipPBs : this.skipBottomPosts;
         this.getContents = typeof options.getContents === 'boolean' ? options.getContents : this.getContents;
+
+        let stopReason: CrawlStopReason | undefined;
 
         /***** 前往 ptt要爬的版面並爬取資料(最新頁面) *****/
         const page = this.pages[0].p;
@@ -296,22 +333,54 @@ export class PttCrawler {
                         percent: Math.round((i + 1 / this.scrapingPages) * 100),
                     });
                 }
-                /***** 點選 "上一頁" 到上一頁較舊的資料 *****/
-                await page.evaluate(() => {
-                    const buttonPrePage = document.querySelector<HTMLDivElement>(
-                        '#action-bar-container > div > div.btn-group.btn-group-paging > a:nth-child(2)'
-                    );
-                    buttonPrePage?.click();
-                });
-                await retry(async (context) => {
-                    if (this.debug.enable && this.debug.printRetryInfo) {
-                        fmlog('event_msg', [`RETRY`, `attemptNum: ${context.attemptNum}`, '']);
-                    }
-                    await page.waitForSelector(this.stopSelector, { timeout: this.puppteerTimeout });
-                }, this.retryOpt);
+                try {
+                    /***** 點選 "上一頁" 到上一頁較舊的資料 *****/
+                    await page.evaluate(() => {
+                        const buttonPrePage = document.querySelector<HTMLDivElement>(
+                            '#action-bar-container > div > div.btn-group.btn-group-paging > a:nth-child(2)'
+                        );
+                        buttonPrePage?.click();
+                    });
+                    await retry(async (context) => {
+                        if (this.debug.enable && this.debug.printRetryInfo) {
+                            fmlog('event_msg', [`RETRY`, `attemptNum: ${context.attemptNum}`, '']);
+                        }
+                        await page.waitForSelector(this.stopSelector, { timeout: this.puppteerTimeout });
+                    }, this.retryOpt);
+                } catch (e) {
+                    if (!continueOnPageError) throw e;
+                    stopReason = {
+                        page: i + 1,
+                        stage: 'pagination_wait',
+                        message: this._errorMessage(e),
+                    };
+                    break;
+                }
 
-                /***** 抓取網頁資料 (上一頁) *****/
-                data_pages.push(await page.evaluate(this._scrapingOnePage, this.skipBottomPosts));
+                try {
+                    /***** 抓取網頁資料 (上一頁) *****/
+                    data_pages.push(await page.evaluate(this._scrapingOnePage, this.skipBottomPosts));
+                } catch (e) {
+                    if (!continueOnPageError) throw e;
+                    stopReason = {
+                        page: i + 1,
+                        stage: 'page_parse',
+                        message: this._errorMessage(e),
+                    };
+                    break;
+                }
+            }
+
+            /***** 採集提前中斷：發出一次可識別的進度事件 *****/
+            if (stopReason && onProgress) {
+                onProgress({
+                    type: 'crawl_interrupted',
+                    message: `Crawl stopped at page ${stopReason.page} of ${this.scrapingPages} (${stopReason.stage}): ${stopReason.message}`,
+                    current: data_pages.length,
+                    total: this.scrapingPages,
+                    percent: Math.round((data_pages.length / this.scrapingPages) * 100),
+                    stopReason,
+                });
             }
 
             /***** 將多頁資料 "照實際新舊順序" 合成 1 個物件 *****/
@@ -320,6 +389,11 @@ export class PttCrawler {
             /***** 爬各帖內文 *****/
             if (this.getContents) {
                 retObj.contents = await this._scrapingAllContents(retObj.urls, onProgress);
+            }
+
+            /***** 只有真的提前中斷才附加停因，正常完成不帶此欄位 *****/
+            if (stopReason) {
+                retObj.stopReason = stopReason;
             }
             return retObj;
         } catch (e) {
@@ -395,6 +469,17 @@ export class PttCrawler {
         }
 
         return { aryTitle, aryHref, aryRate, aryAuthor, aryDate, aryMark };
+    }
+
+    /**
+     * Extracts a human-readable message from an unknown thrown value.
+     * @private
+     * @param {unknown} e - The thrown value.
+     * @returns {string} The error message.
+     */
+    private _errorMessage(e: unknown): string {
+        if (e instanceof Error) return e.message;
+        return String(e);
     }
 
     /**

@@ -66,6 +66,9 @@ To scrape data from PTT using Node.js, I created a simple crawler module in
 * 提供進度回報 (`onProgress`)，即時監控爬取狀態  
   Provides progress reporting (`onProgress`) for real-time monitoring of
  crawling status.  
+* 多頁爬取時可選擇「部分頁面失敗仍回傳已爬資料」，並附上停因  
+  Option to keep the data already crawled when a later page fails, along
+ with the reason the crawl stopped.  
 
 ## 注意事項 (Prerequisites)  
 
@@ -163,6 +166,15 @@ This module is optimized for Linux, including Docker
       dates: string[];
       marks: string[];
       contents?: string[]; // Only exists when getContents is true
+      stopReason?: CrawlStopReason; // Only when the crawl stopped early
+  }
+
+  // 多頁爬取提前中斷時，說明停在第幾頁、哪個階段、以及原始錯誤訊息
+  // Explains where and why a multi-page crawl stopped early.
+  interface CrawlStopReason {
+      page: number;   // 失敗頁碼，從 1 開始 (1-based page number)
+      stage: 'pagination_wait' | 'page_parse'; // 翻頁等待 / 頁面解析
+      message: string; // 原始錯誤訊息 (original error message)
   }
   ```
 
@@ -196,6 +208,11 @@ This module is optimized for Linux, including Docker
   `contents`: This field is only included when `getContents` is `true`.
    Each element in the array is the full content of a post,
  including comments.  
+* `stopReason`: 只有當 `continueOnPageError` 為 `true` 且多頁爬取提前中斷時才會包含此欄位；
+正常完成時為 `undefined`。  
+  `stopReason`: This field is only included when `continueOnPageError` is
+ `true` and the multi-page crawl stopped early; it is `undefined` on a
+ normal completion.  
 
 ## 如何跑範例程式？ (How to run the example ?)  
 
@@ -303,9 +320,20 @@ resources. **Default: `5`**.
       Whether to skip pinned posts. **Default: `true`**.  
     * `getContents` (boolean): 是否爬取內文。**預設值: `false`**。  
       Whether to scrape the content of each post. **Default: `false`**.  
-    * `onProgress` (function): `(progress: Progress) => void` 爬取進度的回呼函式。  
+    * `continueOnPageError` (boolean): 多頁爬取時，若第 2 頁(含)之後的頁面
+      在翻頁等待或解析時失敗，是否停止翻頁並回傳已成功爬取的頁面(附 `stopReason`)。
+      首頁失敗仍會拋錯。**預設值: `false`**。  
+      When crawling multiple pages, whether to stop paginating and return the
+      pages already crawled (with `stopReason`) if a page after the first one
+      fails while waiting for pagination or parsing. A failure on the first
+      page still throws. **Default: `false`**.  
+    * `onProgress` (function): `(progress: Progress) => void` 爬取進度的回呼函式。
+      當上述中斷發生時，會額外發出一次 `type: 'crawl_interrupted'` 的事件
+      (內含 `stopReason`)；正常完成時不會發出。  
       `(progress: Progress) => void` A callback function to
-      receive progress updates.  
+      receive progress updates. When the interruption above occurs, one extra
+      `type: 'crawl_interrupted'` event (containing `stopReason`) is emitted;
+      it is not emitted on a normal completion.  
 
 * `close()`: 關閉爬蟲並釋放資源 (close the crawler and release resources).  
 

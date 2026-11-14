@@ -257,6 +257,237 @@ describe('PttCrawler - Mock Test', () => {
         });
     });
 
+    describe('continueOnPageError', () => {
+        const mockPage1Data = {
+            aryTitle: ['[公告] 板規', '[閒聊] 今天天氣真好'],
+            aryHref: ['http://ptt.cc/post1', 'http://ptt.cc/post2'],
+            aryRate: ['10', '爆'],
+            aryAuthor: ['SYSOP', 'user1'],
+            aryDate: ['1/01', '8/19'],
+            aryMark: ['', ''],
+        };
+        const mockPage2Data = {
+            aryTitle: ['[情報] 某某商店特價'],
+            aryHref: ['http://ptt.cc/post3'],
+            aryRate: ['99'],
+            aryAuthor: ['user2'],
+            aryDate: ['8/18'],
+            aryMark: ['M'],
+        };
+        const expectedPage1Only: MergedPages = {
+            titles: ['[閒聊] 今天天氣真好', '[公告] 板規'],
+            urls: ['http://ptt.cc/post2', 'http://ptt.cc/post1'],
+            rates: ['爆', '10'],
+            authors: ['user1', 'SYSOP'],
+            dates: ['8/19', '1/01'],
+            marks: ['', ''],
+        };
+
+        beforeEach(async () => {
+            await crawler.init();
+            vi.mocked(mockPage.goto).mockResolvedValue(undefined);
+            vi.mocked(mockPage.waitForSelector).mockResolvedValue(undefined);
+        });
+
+        it('should still throw if the first page fails to load', async () => {
+            vi.mocked(mockPage.goto).mockRejectedValue(new Error('First page timeout'));
+
+            await expect(
+                crawler.crawl({ board: 'TestBoard', pages: 3, continueOnPageError: true })
+            ).rejects.toThrow('First page timeout');
+        });
+
+        it('should return the first page data with a stop reason when page 2 parsing fails', async () => {
+            let scrapeCallCount = 0;
+            vi.mocked(mockPage.evaluate).mockImplementation(async (_fn, ...args) => {
+                if (args.length > 0) {
+                    scrapeCallCount++;
+                    if (scrapeCallCount === 1) return mockPage1Data;
+                    throw new Error('Parse exploded');
+                }
+                return undefined;
+            });
+
+            const result = await crawler.crawl({
+                board: 'TestBoard',
+                pages: 3,
+                continueOnPageError: true,
+            });
+
+            expect(result.titles).toEqual(expectedPage1Only.titles);
+            expect(result.urls).toEqual(expectedPage1Only.urls);
+            expect(result.rates).toEqual(expectedPage1Only.rates);
+            expect(result.authors).toEqual(expectedPage1Only.authors);
+            expect(result.dates).toEqual(expectedPage1Only.dates);
+            expect(result.marks).toEqual(expectedPage1Only.marks);
+            expect(result.contents).toBeUndefined();
+            expect(result.stopReason).toEqual({
+                page: 2,
+                stage: 'page_parse',
+                message: 'Parse exploded',
+            });
+            // Stopped immediately: the third page was never attempted.
+            expect(scrapeCallCount).toBe(2);
+        });
+
+        it('should return the first page data with a stop reason when pagination wait times out', async () => {
+            let scrapeCallCount = 0;
+            vi.mocked(mockPage.evaluate).mockImplementation(async (_fn, ...args) => {
+                if (args.length > 0) {
+                    scrapeCallCount++;
+                    return mockPage1Data;
+                }
+                return undefined;
+            });
+            // The first waitForSelector is for the initial page load, the second for page 2.
+            vi.mocked(mockPage.waitForSelector)
+                .mockResolvedValueOnce(undefined)
+                .mockRejectedValueOnce(new Error('Waiting for selector failed'));
+
+            const result = await crawler.crawl({
+                board: 'TestBoard',
+                pages: 3,
+                continueOnPageError: true,
+            });
+
+            expect(result.titles).toEqual(expectedPage1Only.titles);
+            expect(result.stopReason).toEqual({
+                page: 2,
+                stage: 'pagination_wait',
+                message: 'Waiting for selector failed',
+            });
+            expect(scrapeCallCount).toBe(1);
+        });
+
+        it('should still throw when continueOnPageError is not enabled', async () => {
+            let scrapeCallCount = 0;
+            vi.mocked(mockPage.evaluate).mockImplementation(async (_fn, ...args) => {
+                if (args.length > 0) {
+                    scrapeCallCount++;
+                    if (scrapeCallCount === 1) return mockPage1Data;
+                    throw new Error('Parse exploded');
+                }
+                return undefined;
+            });
+
+            await expect(crawler.crawl({ board: 'TestBoard', pages: 2 })).rejects.toThrow(
+                'Parse exploded'
+            );
+        });
+
+        it('should not include a stop reason when every page succeeds', async () => {
+            let scrapeCallCount = 0;
+            vi.mocked(mockPage.evaluate).mockImplementation(async (_fn, ...args) => {
+                if (args.length > 0) {
+                    scrapeCallCount++;
+                    return scrapeCallCount === 1 ? mockPage1Data : mockPage2Data;
+                }
+                return undefined;
+            });
+
+            const result = await crawler.crawl({
+                board: 'TestBoard',
+                pages: 2,
+                continueOnPageError: true,
+            });
+
+            expect(result.stopReason).toBeUndefined();
+            expect('stopReason' in result).toBe(false);
+            expect(result.titles).toEqual([
+                '[閒聊] 今天天氣真好',
+                '[公告] 板規',
+                '[情報] 某某商店特價',
+            ]);
+        });
+
+        it('should emit exactly one crawl_interrupted progress event on interruption', async () => {
+            let scrapeCallCount = 0;
+            vi.mocked(mockPage.evaluate).mockImplementation(async (_fn, ...args) => {
+                if (args.length > 0) {
+                    scrapeCallCount++;
+                    if (scrapeCallCount === 1) return mockPage1Data;
+                    throw new Error('Parse exploded');
+                }
+                return undefined;
+            });
+            const onProgressMock = vi.fn();
+
+            await crawler.crawl({
+                board: 'TestBoard',
+                pages: 3,
+                continueOnPageError: true,
+                onProgress: onProgressMock,
+            });
+
+            const interruptedEvents = onProgressMock.mock.calls
+                .map((call) => call[0])
+                .filter((progress) => progress.type === 'crawl_interrupted');
+
+            expect(interruptedEvents).toHaveLength(1);
+            expect(interruptedEvents[0]).toEqual(
+                expect.objectContaining({
+                    type: 'crawl_interrupted',
+                    current: 1,
+                    total: 3,
+                    stopReason: {
+                        page: 2,
+                        stage: 'page_parse',
+                        message: 'Parse exploded',
+                    },
+                })
+            );
+            expect(interruptedEvents[0].message).toContain('page 2');
+        });
+
+        it('should not emit a crawl_interrupted progress event when every page succeeds', async () => {
+            vi.mocked(mockPage.evaluate).mockResolvedValue(mockPage1Data);
+            const onProgressMock = vi.fn();
+
+            await crawler.crawl({
+                board: 'TestBoard',
+                pages: 2,
+                continueOnPageError: true,
+                onProgress: onProgressMock,
+            });
+
+            const interruptedEvents = onProgressMock.mock.calls
+                .map((call) => call[0])
+                .filter((progress) => progress.type === 'crawl_interrupted');
+
+            expect(interruptedEvents).toHaveLength(0);
+        });
+
+        it('should still fetch contents for the pages that were crawled before stopping', async () => {
+            let scrapeCallCount = 0;
+            vi.mocked(mockPage.evaluate).mockImplementation(async (_fn, ...args) => {
+                if (args.length === 1 && typeof args[0] === 'boolean') {
+                    scrapeCallCount++;
+                    if (scrapeCallCount === 1) return mockPage1Data;
+                    throw new Error('Parse exploded');
+                }
+                if (args.length === 0) {
+                    // Content scraping evaluate call.
+                    return 'Some content';
+                }
+                return undefined;
+            });
+
+            const result = await crawler.crawl({
+                board: 'TestBoard',
+                pages: 2,
+                continueOnPageError: true,
+                getContents: true,
+            });
+
+            expect(result.stopReason).toEqual({
+                page: 2,
+                stage: 'page_parse',
+                message: 'Parse exploded',
+            });
+            expect(result.contents).toEqual(['Some content', 'Some content']);
+        });
+    });
+
     describe('resultsToObjects', () => {
         it('should transform MergedPages to an array of Post objects', () => {
             const mergedPages: MergedPages = {
