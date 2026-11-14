@@ -23,11 +23,13 @@ export async function scrape(config: Config) {
         log: config.log || false,
         visited: config.noRevisit ? new Set() : null
     }
-    await saveOutput(
-        createWriteStream(config.save), 
-        getOutputFormat(config.save),
-        await pipe(config.parse)()
-    )
-
-    await browser.close()
+    try {
+        await saveOutput(
+            createWriteStream(config.save),
+            getOutputFormat(config.save),
+            await pipe(config.parse)()
+        )
+    } finally {
+        await browser.close()
+    }
 }

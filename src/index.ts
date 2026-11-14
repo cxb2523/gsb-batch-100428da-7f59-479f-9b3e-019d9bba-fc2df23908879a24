@@ -18,7 +18,8 @@ declare global {
 
 
 export { pipe } from './pipe'
-export { open } from './open'
+export { open, SKIP_REASON_ALREADY_VISITED } from './open'
+export type { SkipRecord } from './open'
 export { $, $$ } from './query'
 export { attr, text } from './property'
 export { save } from './save'

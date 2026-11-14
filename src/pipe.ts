@@ -1,6 +1,7 @@
 import R from 'ramda'
 import { isIterable } from './isIterable'
 import { iteratorToArray } from './iteratorToArray'
+import { isSkipIterable } from './open'
 
 
 
@@ -14,6 +15,13 @@ export function pipe(...funcs: any[]): (...args: any[]) => Promise<any>|any {
 
         if (args.length == 1 && R.isNil(arg)) {
             return null
+        }
+
+        // A skipped page (noRevisit hit) has no DOM and no remaining stage can
+        // meaningfully process it. Propagate its marked record untouched until the
+        // output layer unwraps it, so $/$$/text/... never receive a fake Page.
+        if (args.length == 1 && isSkipIterable(arg)) {
+            return arg
         }
 
         if (isIterable(arg)) {

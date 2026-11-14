@@ -133,7 +133,12 @@ The parsing workflow: a `pipe` function, an object or an array
 `log: true` turns on log output for debugging
 
 ### noRevisit
-Set `true` to not revisit already visited pages
+Set `true` to not revisit already visited pages.    
+When `open()` receives an already visited URL it does not open a new browser page; instead a skip record is emitted into the output alongside the normal data:
+```json
+{"url":"https://example.com/some-page","reason":"already visited"}
+```
+The reason string is exported as `SKIP_REASON_ALREADY_VISITED`.
 
 ### options
 ```typescript
@@ -160,6 +165,7 @@ Opens a given or root url
 ```typescript
 open(url: string|null = null)
 ```
+Every page opened by `open()` is guaranteed to be closed: when parsing finishes, when its result iterator is abandoned before being consumed completely, or when parsing throws. With [`noRevisit`](#norevisit), an already visited URL never opens a page and yields a `{ url, reason }` skip record instead.
 
 ### $ / $$
 ```typescript
