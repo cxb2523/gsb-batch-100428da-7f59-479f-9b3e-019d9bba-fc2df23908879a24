@@ -1,0 +1,362 @@
+"""Level ketik standar (verifikasi per karakter)."""
+
+import ctypes
+import io
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import threading
+import time
+from urllib.parse import urlparse
+
+from playwright.sync_api import sync_playwright
+
+from .. import state
+from . import games
+from .. import jsutil
+from .. import typing_core
+from ..jstemplates import (HOLD_LESSON_JS, MODAL_HINT_JS, QUIET_ALIVE_JS, START_BANNER_JS)
+
+
+
+
+def handle_standard(frame, text):
+    # Level terkunci premium: modal premium menutupi lesson, input mati.
+    # Dulu bot mencoba mengetik 3x (gagal, buang waktu) bahkan sempat
+    # mengklik tombol CTA premium yang membawa ke Stripe Checkout.
+    # Sekarang: langsung lewati level via tombol lanjut (klik mouse asli).
+    for fr in jsutil.all_frames():
+        hint = jsutil.run_js(MODAL_HINT_JS, fr)
+        if hint and hint.get("premium"):
+            print("[Premium] level terkunci premium - lewati via tombol lanjut")
+            try:
+                typing_core._mark_bot_click()
+                state.PAGE.locator(".navbar-continue, a.navbar-continue") \
+                    .first.click(timeout=2500)
+            except Exception:
+                pass
+            state.last_action_time = time.time()
+            return True
+    hold = jsutil.run_js(HOLD_LESSON_JS, frame) or {}
+    hold_key = hold.get("key")
+
+    rem = typing_core.read_remaining(frame)
+    if rem is None:
+        return False
+    # anti-busur: teks sama persis & sudah dicoba 3x berturut-turut ->
+    # diamkan SEMENTARA (8 dtk). UI baru Nov 2026: di transisi layar skor
+    # -> lesson berikutnya, stage kadang belum interaktif - 3 percobaan
+    # pertama bisa terbakar percuma. Dulu diam selamanya tanpa log: bot
+    # nampak mati di stage mengetik. Ketikan selalu verifikasi per
+    # karakter (tidak pernah salah), jadi mencoba ulang aman.
+    if rem == state._std_last_rem:
+        state._std_attempts += 1
+        if state._std_attempts > 3:
+            if time.time() - state._std_last_try < 8.0:
+                return False
+            if state._std_attempts == 4:
+                print("[Standard] 3x ketik tak terkonsumsi (stage belum "
+                      "siap?) - mencoba lagi")
+            state._std_attempts = 1   # mulai giliran coba baru
+    else:
+        state._std_last_rem = rem
+        state._std_attempts = 1
+    state._std_last_try = time.time()
+
+    print(f"[Standard] Sisa {len(rem)} karakter: {rem[:24]!r}..."
+          + (f" (TAHAN {hold_key!r})" if hold_key else ""))
+    typing_core.focus_frame(frame)
+
+    # stabilisasi: sisa teks tidak berubah sebentar (halaman siap)
+    for _ in range(8):
+        time.sleep(0.12)
+        r2 = typing_core.read_remaining(frame)
+        if r2 is None or r2 != rem:
+            rem = r2
+            continue
+        break
+    if rem is None:
+        return False
+
+    # aktifkan lesson: klik banner "Start Typing" jika sedang tampil
+    if jsutil.run_js(START_BANNER_JS, frame):
+        print("[Standard] banner Start Typing diklik")
+        # UI baru: stage butuh sesaat setelah banner untuk mengaktifkan
+        # input - dulu 0.4 dtk cukup di situs lama, ketikan awal kadang
+        # tak terkonsumsi di UI baru.
+        time.sleep(0.8)
+        rem = typing_core.read_remaining(frame) or ""
+
+    typed_any = False
+    try:
+        if hold_key:
+            state.PAGE.keyboard.down(hold_key)
+            time.sleep(0.15)
+        # ketik per-karakter terverifikasi (prinsip: tidak boleh salah):
+        # Karakter berikutnya tidak pernah dikirim sebelum karakter saat ini
+        # terverifikasi dikonsumsi dengan benar oleh engine lesson.
+        # - salah tidak pernah berantai: deteksi terjadi 1 karakter, bukan 20.
+        # - kalau konsumsi tidak persis (keystroke hilang / DOM berganti /
+        # banner pause), ketikan berhenti dan realign ke DOM - tidak
+        # pernah lanjut berdasarkan asumsi.
+        # - modifier (Shift dll.) dilepas dulu: sisa modifier = karakter
+        # salah pada lesson berikutnya.
+        # - karakter yang ditandai salah (_err) segera di-Backspace sekali;
+        # kalau situs tidak mengizinkan, dicatat dan lanjut (maks 1 char).
+        # penting: selama mengetik tidak ada klik apa pun - klik di tengah
+        # ketikan bisa me-reset lesson.
+        typing_core._clear_modifiers()
+        pre_err = typing_core.count_errors(frame)
+        if pre_err:
+            print(f"[Standard] {pre_err} karakter salah sudah ada sebelum mulai, "
+                  "coba koreksi dengan Backspace")
+            try:
+                for _ in range(pre_err):
+                    state.PAGE.keyboard.press("Backspace")
+                    time.sleep(0.06)
+                time.sleep(0.4)
+            except Exception:
+                pass
+            left = typing_core.count_errors(frame)
+            if left is not None and left < pre_err:
+                rem = typing_core.read_remaining(frame) or rem
+            else:
+                print("[Standard] koreksi awal tidak mempan (salah terkunci) "
+                      "- lanjut, akurasi lesson ini bisa < 100%")
+        stall = 0
+        verified = 0
+        bs_ok = True
+        state._burst_len = 1
+        state._burst_streak = 0
+        err_prev = typing_core.count_errors(frame)
+        if err_prev is None:
+            err_prev = 0
+        while True:
+            if state.STOP:
+                break
+            while state.PAUSED and not state.STOP:
+                time.sleep(0.15)
+            if not rem:
+                break
+            # burst ADAPTIF: mulai 1 karakter (aman utk hilang/salah),
+            # panjang 1->2->4->8 setelah rentetan bersih; anomali apa
+            # pun -> kembali ke 1. Dulu per karakter selalu: round-trip
+            # verifikasi JS ~60-90ms per char membunuh laju nyata (live:
+            # setting 300 terukur ~110 wpm fluktuatif 140-250 -
+            # verifikasi lebih lama daripada jeda ketiknya). Pecah tepat
+            # setelah Enter/Tab agar tombol khusus tetap presisi.
+            n = min(state._burst_len, len(rem))
+            for spec in ("\n", "\t"):
+                idx = rem.find(spec)
+                if 0 <= idx < n:
+                    n = idx + 1
+            if not typing_core.type_burst(rem[:n]):
+                break
+            typed_any = True
+            rem2, err_after = typing_core.read_state(frame)
+            if err_after is None:
+                err_after = err_prev
+            if rem2 == rem[n:]:
+                # bersih persis sepanjang burst - panjangkan cepat:
+                # 1 -> 4 -> 8 (lesson pendek: dulu 1->2->4->8 membuat
+                # hampir seluruh lesson berjalan di burst kecil -
+                # verifikasi per char membaca ~107 wpm walau setting 300)
+                state._burst_streak += n
+                if state._burst_streak >= 4 and state._burst_len < 8:
+                    state._burst_len = 4 if state._burst_len < 4 else 8
+                    state._burst_streak = 0
+            elif rem2 != rem:
+                # DOM geser di tengah burst (transisi baris dsb.) -
+                # pelan-pelan lagi
+                state._burst_len = 1
+                state._burst_streak = 0
+            if err_after > err_prev and bs_ok:
+                # salah terdeteksi DI DALAM burst terakhir (dulu per
+                # karakter: salah selalu = karakter terakhir). Situs
+                # asli: 1 backspace = hapus 1 karakter terakhir apa pun
+                # statusnya -> mundur seluruh token yang sudah habis
+                # dikonsumsi burst ini, lalu ketik ulang pelan (burst=1,
+                # verifikasi per karakter - jaminan nol salah tersisa).
+                state._burst_len = 1
+                state._burst_streak = 0
+                konsumsi = 0
+                if rem2 is not None:
+                    konsumsi = len(rem) - len(rem2)
+                mundur = min(max(konsumsi, 1), 8)
+                try:
+                    for _ in range(mundur):
+                        state.PAGE.keyboard.press("Backspace")
+                        time.sleep(0.04)
+                    time.sleep(0.12)
+                except Exception:
+                    pass
+                r_chk, err_chk = typing_core.read_state(frame)
+                if (r_chk is not None and err_chk is not None
+                        and err_chk < err_after):
+                    rem2 = r_chk  # token salah kembali pending - ulang
+                    err_after = err_chk
+                else:
+                    bs_ok = False
+                    print("[Standard] koreksi mundur tidak mempan "
+                          "(lanjut - tercatat di akurasi)")
+                    rem2 = r_chk
+            if rem2 is None or rem2 == "":
+                # bisa berarti selesai, tapi juga "baris berikut belum
+                # muncul di DOM" (render progresif). Jangan langsung anggap
+                # selesai: tunggu grace, ketik ulang tidak boleh (Enter
+                # dobel = salah). Baris baru muncul < 300 ms di situs asli,
+                # jadi grace singkat cukup.
+                got = None
+                for _ in range(16):
+                    time.sleep(0.05)
+                    r = typing_core.read_remaining(frame)
+                    if r:
+                        got = r
+                        break
+                if got:
+                    rem = got
+                    stall = 0
+                    continue
+                break  # benar-benar tidak ada token = lesson selesai
+            if rem2 == rem:
+                # Karakter tidak terkonsumsi. Penyebab umum: klik user (di
+                # halaman / di luar window -> blur -> engine pause sesaat,
+                # caret pindah). pulihkan sekarang, bukan tangga jeda:
+                # dulu stall 1-7 menumpuk sleep 0.05+0.15 (~0.5-3 dtk
+                # tersendat per klik) dan spam-klik mencapai stall>=8 ->
+                # tombol lanjut diklik -> typing berhenti total (keluhan
+                # live 2x). Sekarang: fokus + banner dipulihkan tiap
+                # iterasi (murah, tanpa klik mouse), poll cepat; eskalasi
+                # tombol lanjut hanya kalau user tidak sedang memegang
+                # halaman (klik user = mouse-only watcher, aman dari
+                # ketikan bot sendiri).
+                stall += 1
+                state._burst_len = 1
+                state._burst_streak = 0
+                user_kehadian = typing_core._user_active(3.0)
+                if user_kehadian:
+                    stall = min(stall, 3)
+                    if not state._stall_user_note:
+                        state._stall_user_note = True
+                        print("[Standard] user memegang halaman - fokus "
+                              "dipulihkan terus, mengetik tidak berhenti")
+                else:
+                    state._stall_user_note = False
+                jsutil.run_js(QUIET_ALIVE_JS, frame)
+                typing_core.focus_frame(frame)
+                if jsutil.run_js(START_BANNER_JS, frame):
+                    print("[Standard] banner pause muncul, diklik")
+                    time.sleep(0.15)
+                time.sleep(0.04)
+                r_retry, _ = typing_core.read_state(frame)
+                if r_retry is not None and r_retry != rem:
+                    rem = r_retry
+                    stall = 0
+                    verified += 1
+                    if verified % 20 == 0:
+                        typing_core.keep_alive_quiet(frame)
+                    if verified % 25 == 0:
+                        typing_core.esc_modals_only(frame)
+                    continue
+                if stall >= 8 and not user_kehadian:
+                    # benar-benar macet tanpa user: kemungkinan lesson
+                    # selesai tapi layar skor tidak muncul (bug situs,
+                    # terbukti L87/192) - satu klik tombol lanjut langsung
+                    # ke lesson berikutnya.
+                    print("[Standard] ketikan tidak masuk - mungkin selesai "
+                          "tanpa layar skor, coba tombol lanjut")
+                    if games._phaser_try_advance():
+                        state.last_action_time = time.time()
+                        time.sleep(0.6)
+                        return True
+                    break
+                err_prev = err_after
+                continue
+            # terkonsumsi / DOM berubah -> selalu percaya DOM terbaru
+            rem = rem2
+            stall = 0
+            verified += 1
+            err_prev = err_after
+            # (kalibrasi overhead per karakter dihapus: jalur burst memakai
+            # pacing internal Playwright, jeda python per karakter tidak
+            # ada lagi di jalur ini)
+            if verified % 20 == 0:
+                typing_core.keep_alive_quiet(frame)
+            if verified % 25 == 0:
+                typing_core.esc_modals_only(frame)
+    finally:
+        if hold_key:
+            try:
+                state.PAGE.keyboard.up(hold_key)
+            except Exception:
+                pass
+        typing_core._clear_modifiers()
+    if typing_core._lesson_gone():
+        # browser/window ditutup (atau user pindah halaman) saat mengetik:
+        # keluar SEKARANG - dulu deadline post-lesson (10+8 dtk) tetap
+        # dibakar sehingga kartu GUI terpaku di 'mengetik' berdetik-detik
+        # (keluhan live: tutup browser = kartu tidak update).
+        return False
+    if not typed_any:
+        return False
+    state.last_typed_text = text
+    state.stats["std"] += 1
+    state.last_action_time = time.time()
+    err_total = typing_core.count_errors(frame)
+    if err_total:
+        print(f"[Standard] lesson selesai dengan {err_total} karakter salah")
+
+    # Tunggu transisi post-lesson. penting: keluar segera begitu URL
+    # berganti (level baru) - intro/skor->level baru tidak pernah
+    # menghasilkan det std/mini/tut, dulu loop ini burn deadline penuh
+    # (10+8 dtk) padahal level berikutnya sudah siap dikerjakan.
+    # Kasus nyata (L113): lesson selesai tapi layar skor tidak pernah
+    # muncul (bug situs) - tombol lanjut ada, klik mouse asli langsung.
+    entry_url = state.PAGE.url
+    no_score_clicked = 0
+    entry_wait_start = time.time()
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        if jsutil.close_overlays_all_frames():
+            time.sleep(0.6)
+            continue
+        det, _, _ = jsutil.detect_all_frames()
+        if det == "score":
+            typing_core.advance_score_screen()
+            time.sleep(0.8)
+        if det in ("std", "mini", "tut"):
+            break
+        if state.PAGE.url != entry_url:
+            break   # level sudah pindah - jangan tunggu sisa deadline
+        if no_score_clicked < 3 and time.time() > entry_wait_start + 3.0 + 4.0 * no_score_clicked:
+            # 3 dtk tanpa skor/URL: kemungkinan layar skor tidak muncul
+            # -> klik lanjut (mouse asli) menyelesaikannya. Dulu sekali
+            # klik saja - kalau klik pertama gagal (tombol belum dirender /
+            # overlay), bot membakar sisa deadline lalu masuk rantai stall
+            # supervisor (freeze panjang, keluhan live 245 -> 246).
+            try:
+                loc = state.PAGE.locator(".navbar-continue, a.navbar-continue").first
+                if loc.count() and loc.is_visible():
+                    loc.click(timeout=2000)
+                    no_score_clicked += 1
+                    print("[Standard] layar skor belum muncul - klik "
+                          "tombol lanjut")
+                    time.sleep(0.8)
+                    continue
+            except Exception:
+                pass
+        time.sleep(0.25)
+
+    deadline = time.time() + 8
+    while time.time() < deadline:
+        det, _, _ = jsutil.detect_all_frames()
+        if det != "unknown":
+            break
+        if state.PAGE.url != entry_url:
+            break
+        time.sleep(0.2)
+    state.last_action_time = time.time()
+    return True

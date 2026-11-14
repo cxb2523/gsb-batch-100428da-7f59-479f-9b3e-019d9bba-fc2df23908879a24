@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+
+# File probe/debug sementara (dibuat saat pengembangan)
+_*.py
+_*.png
+_*.js
+!server/worker.js
+
+# Rahasia backend (vault privat menyimpan salinannya)
+server/_signing.json
+server/_admin.json
+server/_admin_key.txt
+server/_store/
+
+# Snapshot manual engine (backup lokal, bukan bagian dari repo)
+version3_stable.py
+
+# Hasil build PyInstaller (exe 50MB+ tidak disimpan di git, build ulang dengan:
+#   python -m PyInstaller --onefile --name TypingBot autopilot_pw.py )
+build/
+dist/
+*.spec
+
+# Log output yang di-paste
+paste_*.txt
+
+# Log sesi bot & dump debug
+bot.log
+_*.txt
+
+# Lisensi lokal (spesifik per mesin)
+license.dat
+
+# Data runtime per-user (dibuat ulang otomatis oleh program)
+level_map.json
+typingbot_settings.json
