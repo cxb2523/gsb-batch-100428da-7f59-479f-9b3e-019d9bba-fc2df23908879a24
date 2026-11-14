@@ -304,8 +304,14 @@ def build_server() -> FastMCP:
                 >0 = true BFS up to that link depth, honoring the filters.
 
         Returns:
-            {root, pages: [{url, markdown, title, ...}], count, discovered, elapsed_ms}
-            or {error, root} on failure.
+            {root, pages: [{url, markdown, title, ...}], count, discovered,
+             excluded_links: [{url, reason, found_on, depth}],
+             truncated_links: [{url, reason: "depth_limit"|"quota_limit",
+                                found_on, depth}], elapsed_ms}
+            excluded_links = same-host page links rejected by include/exclude
+            filters at discovery time; truncated_links = links that passed
+            the filters but were not collected because of max_depth or the
+            max_pages hard cap. or {error, root} on failure.
         """
         try:
             r = crawl_site(
@@ -316,6 +322,8 @@ def build_server() -> FastMCP:
                 "root": r.root,
                 "pages": [_scrape_to_dict(p, include_html=False) for p in r.pages],
                 "count": len(r.pages),
+                "excluded_links": r.excluded_links,
+                "truncated_links": r.truncated_links,
                 "method": r.method,
                 "elapsed_ms": r.elapsed_ms,
             }

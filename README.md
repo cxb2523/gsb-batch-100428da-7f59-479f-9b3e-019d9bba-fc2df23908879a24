@@ -33,7 +33,7 @@ deep processing (LLM-ready markdown, citations, structured extraction)
 | `scrape(url, prefer="auto")` | Single URL → LLM-ready markdown |
 | `extract(url, schema)` | Scrape + structured extraction (JsonCss schema) |
 | `map_site(root, include_pattern=None, limit=200)` | Enumerate all internal URLs |
-| `crawl(root, max_pages=5, prefer="auto", include_paths=None, exclude_paths=None, max_depth=0)` | Multi-page crawl with path filters + true BFS depth |
+| `crawl(root, max_pages=5, prefer="auto", include_paths=None, exclude_paths=None, max_depth=0)` | Multi-page crawl with path filters + true BFS depth; returns `excluded_links` and `truncated_links` audit manifests |
 | `document(url)` | PDF/DOCX/PPTX → markdown (no browser, optional `[docs]` extras) |
 | `search(query, limit=10)` | Web search via DuckDuckGo HTML (no API key) |
 | `search_papers(query, limit=8, source="arxiv", category=None)` | Academic search via arXiv + Crossref (no API key) — feed `pdf_url` into `document` |
@@ -388,7 +388,41 @@ python scripts/test_ladder_bug.py  # SPA-shell ladder escalation regression
 python scripts/test_js_eval.py     # stealth js/wait_for params regression
 python scripts/test_scope_selector.py  # crawl css_selector/max_depth wiring
 python scripts/test_link_harvest.py    # map/BFS link purity regression
+python scripts/test_crawl_discovery.py # filter-first quota + BFS branch traversal + audit manifests
 ```
+
+### Crawl discovery semantics & audit manifests
+
+Both flat harvest (`max_depth=0`) and BFS (`max_depth>0`) apply the
+`include_paths` / `exclude_paths` regex filters **during discovery, before a
+link counts toward `max_pages`** — excluded links never consume quota, so a
+site whose navigation is full of excluded links (e.g. `/tag/` pages) still
+fills the crawl with qualifying pages. In BFS, filtered pages are still
+fetched as **transit-only** nodes while within the depth limit, so branches
+reachable only through an excluded page keep being explored instead of being
+dropped. Same-host-only, static-resource skipping, URL dedup, and the
+`max_pages` hard cap are unchanged.
+
+The `crawl` result includes two checkable manifests so you can tell whether
+your filters are too strict:
+
+```json
+{
+  "excluded_links": [
+    {"url": "https://site/tag/foo/", "reason": "exclude_paths",
+     "found_on": "https://site/", "depth": 1}
+  ],
+  "truncated_links": [
+    {"url": "https://site/blog/post-3", "reason": "depth_limit",
+     "found_on": "https://site/blog/post-2", "depth": 4},
+    {"url": "https://site/news/", "reason": "quota_limit",
+     "found_on": "https://site/", "depth": 1}
+  ]
+}
+```
+
+`reason` is `include_paths` / `exclude_paths` for filtered links, and
+`depth_limit` / `quota_limit` for qualifying links that could not be collected.
 
 ---
 

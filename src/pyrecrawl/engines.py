@@ -19,7 +19,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Lock, Thread
@@ -485,6 +485,16 @@ class CrawlResult:
     pages: list[FetchResult]
     method: str
     elapsed_ms: int
+    # Auditable discovery manifests (flat + BFS paths). Each entry is
+    # {"url", "reason", "found_on", "depth"} — depth is None for the flat
+    # path, which only harvests links off the root page.
+    # excluded_links: same-host page links rejected by include_paths /
+    #   exclude_paths during discovery (before any quota accounting).
+    # truncated_links: links that passed every filter but were never
+    #   collected — reason "depth_limit" (deeper than max_depth) or
+    #   "quota_limit" (max_pages hard cap reached before their turn).
+    excluded_links: list[dict[str, Any]] = field(default_factory=list)
+    truncated_links: list[dict[str, Any]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -1097,6 +1107,24 @@ def _scope_to_selector(r: FetchResult, css_selector: str | None) -> FetchResult:
     )
 
 
+def _classify_link(
+    url: str,
+    *,
+    inc_re: re.Pattern | None,
+    exc_re: re.Pattern | None,
+) -> tuple[bool, str | None]:
+    """Apply include/exclude filters to one URL.
+
+    Returns (passes, reason) — reason is None when the link is kept,
+    otherwise "include_paths" or "exclude_paths".
+    """
+    if inc_re and not inc_re.search(url):
+        return False, "include_paths"
+    if exc_re and exc_re.search(url):
+        return False, "exclude_paths"
+    return True, None
+
+
 def crawl_site(
     root: str,
     *,
@@ -1112,27 +1140,35 @@ def crawl_site(
     Path filters (regex, matched against the full URL):
       include_paths — keep only URLs matching
       exclude_paths — drop URLs matching (applied after include)
-      max_depth     — 0 = flat harvest (map_urls, default); >0 = BFS from
-                      root up to that link depth, honoring the filters
+      max_depth     — 0 = flat harvest (default); >0 = BFS from root up to
+                      that link depth, honoring the filters
       css_selector  — scope each page's html/markdown to the matched element
                       (llm tier: native crawl4ai css_selector; other tiers:
                       lxml re-scope of the fetched HTML, no extra request)
 
+    Discovery contract (flat and BFS alike):
+      * Filters are applied during discovery, BEFORE a link counts against
+        max_pages — excluded links can never consume quota, so a site full
+        of excluded links still fills the quota with qualifying pages.
+      * BFS still fetches filtered pages as transit-only nodes (without
+        collecting them) when they sit within max_depth, so branches behind
+        an excluded page (e.g. everything linked from a /tag/ hub) keep
+        getting explored instead of being dropped wholesale.
+      * Same-host only, static resources skipped, global URL dedup, and
+        max_pages stays a hard cap.
+      * The result carries two auditable manifests: ``excluded_links``
+        (rejected by a filter) and ``truncated_links`` (passed the filters
+        but not collected — reason depth_limit or quota_limit).
+
     For deep semantic crawling (BFS/DFS with filters), prefer="llm" delegates
     to Crawl4AI's BFSDeepCrawlStrategy (max_depth=0 maps to 1 = root + links).
+    The llm tier does not produce the discovery manifests.
     """
     import time
     from urllib.parse import urlparse
 
     inc_re = re.compile(include_paths) if include_paths else None
     exc_re = re.compile(exclude_paths) if exclude_paths else None
-
-    def _passes(u: str) -> bool:
-        if inc_re and not inc_re.search(u):
-            return False
-        if exc_re and exc_re.search(u):
-            return False
-        return True
 
     if prefer == "llm":
         t0 = time.perf_counter()
@@ -1142,7 +1178,8 @@ def crawl_site(
         pages: list[FetchResult] = []
         for r in data["results"]:
             rurl = r.get("url", root)
-            if not _passes(rurl):
+            passes, _ = _classify_link(rurl, inc_re=inc_re, exc_re=exc_re)
+            if not passes:
                 continue
             html = r.get("html") or r.get("cleaned_html") or ""
             md = r.get("markdown") or {}
@@ -1167,50 +1204,159 @@ def crawl_site(
     def _internal_links(html: str, base_url: str) -> list[str]:
         return list(_iter_internal_links(html, base_url, root_host))
 
+    def _fetch(url: str) -> FetchResult:
+        return _scope_to_selector(scrape_smart(url, prefer=prefer), css_selector)
+
+    def _error_page(url: str, e: Exception) -> FetchResult:
+        return FetchResult(
+            url=url, final_url=url, status=0, html="", markdown="",
+            title=None, method="error", elapsed_ms=0, meta={"error": str(e)},
+        )
+
+    # max_pages is a hard cap; a non-positive cap means nothing is collected.
+    cap = max(0, int(max_pages))
     pages: list[FetchResult] = []
+    excluded_links: list[dict[str, Any]] = []
+    truncated_links: list[dict[str, Any]] = []
+    # Global dedup: a URL is classified once, at first discovery, so the two
+    # manifests can never double-count or overlap with collected pages.
+    discovered: set[str] = set()
+
+    def _record_excluded(url: str, reason: str, found_on: str,
+                         depth: int | None) -> None:
+        excluded_links.append({
+            "url": url, "reason": reason,
+            "found_on": found_on, "depth": depth,
+        })
+
+    def _record_truncated(url: str, reason: str, found_on: str,
+                          depth: int | None) -> None:
+        truncated_links.append({
+            "url": url, "reason": reason,
+            "found_on": found_on, "depth": depth,
+        })
+
+    def _discover(html: str, base_url: str, found_on: str,
+                  depth: int | None, *, allow_depth_truncation: bool
+                  ) -> list[tuple[str, int | None, bool]]:
+        """Harvest same-host page links, filter first, dedup globally.
+
+        Returns (url, depth, collect) triples in document order:
+          collect=True  — passed every filter, eligible for the page quota;
+          collect=False — rejected by a filter, recorded in excluded_links
+                          and (BFS only) still traversable as a transit node.
+        Links deeper than max_depth (BFS only) go to truncated_links with
+        reason depth_limit. Non-page / external links are already removed by
+        _iter_internal_links.
+        """
+        found: list[tuple[str, int | None, bool]] = []
+        child_depth = None if depth is None else depth + 1
+        for link in _internal_links(html, base_url):
+            if link in discovered:
+                continue
+            discovered.add(link)
+            passes, reason = _classify_link(link, inc_re=inc_re, exc_re=exc_re)
+            if not passes:
+                _record_excluded(link, reason or "filter", found_on, child_depth)
+                found.append((link, child_depth, False))
+                continue
+            if allow_depth_truncation and child_depth is not None and child_depth > max_depth:
+                _record_truncated(link, "depth_limit", found_on, child_depth)
+                continue
+            found.append((link, child_depth, True))
+        return found
+
+    if cap == 0:
+        return CrawlResult(
+            root=root, pages=pages, method="bfs" if max_depth else "map+scrape",
+            elapsed_ms=int((time.perf_counter() - t0) * 1000),
+            excluded_links=excluded_links, truncated_links=truncated_links,
+        )
+
     if max_depth and max_depth > 0:
-        # BFS from root up to max_depth link-hops, applying filters + cap
-        visited: set[str] = {root}
-        frontier = [root]
-        depth = 0
-        while frontier and depth <= max_depth and len(pages) < max_pages:
-            nxt: list[str] = []
-            for u in frontier:
-                if len(pages) >= max_pages:
-                    break
-                try:
-                    raw = scrape_smart(u, prefer=prefer)
-                    pages.append(_scope_to_selector(raw, css_selector))
-                except Exception as e:  # noqa: BLE001
-                    pages.append(FetchResult(
-                        url=u, final_url=u, status=0, html="", markdown="",
-                        title=None, method="error", elapsed_ms=0, meta={"error": str(e)},
-                    ))
-                    continue
-                if depth < max_depth:
-                    # discover links on the FULL html — scoping is for stored
-                    # content only, or a nav-scoped selector would starve BFS
-                    for link in _internal_links(raw.html, raw.final_url or u):
-                        if link not in visited and _passes(link):
-                            visited.add(link)
-                            nxt.append(link)
-            frontier = nxt
-            depth += 1
-    else:
-        mapped = map_urls(root, limit=max_pages * 4 if (inc_re or exc_re) else max_pages)
-        candidates = [u for u in mapped.urls if _passes(u)][:max_pages]
-        for url in candidates:
+        # True BFS. Each queue entry is (url, depth, collect, found_on):
+        #   collect=True  — passes the filters; scraped and counts toward
+        #                   the max_pages quota.
+        #   collect=False — filtered out of the result but still fetched as
+        #                   a transit node so its outgoing links keep the
+        #                   branch alive (only while depth < max_depth).
+        #   found_on      — the page whose harvest produced this link.
+        queue: deque[tuple[str, int, bool, str]] = deque()
+        discovered.add(root)
+        queue.append((root, 0, True, root))
+
+        while queue:
+            if len(pages) >= cap:
+                # Hard cap reached. Qualifying links still queued will never
+                # be collected — report them as quota truncations. The
+                # transit-only backlog is dropped silently.
+                for u, _d, collect, found_on in queue:
+                    if collect:
+                        _record_truncated(u, "quota_limit", found_on, _d)
+                queue.clear()
+                break
+
+            u, depth, collect, _found_on = queue.popleft()
             try:
-                page = _scope_to_selector(scrape_smart(url, prefer=prefer), css_selector)
-                pages.append(page)
+                raw = scrape_smart(u, prefer=prefer)
+            except Exception as e:  # noqa: BLE001 — per-page isolation
+                if collect and len(pages) < cap:
+                    pages.append(_error_page(u, e))
+                # A failed transit page cannot expose new links; the branch
+                # simply ends here.
+                continue
+
+            if collect:
+                pages.append(_scope_to_selector(raw, css_selector))
+
+            if depth >= max_depth:
+                # At the depth ceiling there is no further traversal. Still
+                # harvest once so filtered links are accounted for and
+                # qualifying links beyond the ceiling land in the
+                # depth_limit manifest instead of vanishing.
+                _discover(raw.html, raw.final_url or u, u, depth,
+                          allow_depth_truncation=True)
+                continue
+
+            found = _discover(raw.html, raw.final_url or u, u, depth,
+                              allow_depth_truncation=False)
+            for link, child_depth, keep in found:
+                if not keep and child_depth >= max_depth:
+                    # A filtered page only has value as a transit node. At
+                    # the last traversable depth it cannot reveal anything
+                    # collectable within the ceiling, so don't fetch it.
+                    continue
+                queue.append((link, child_depth, keep, u))
+    else:
+        # Flat harvest: fetch root once, apply filters at discovery time so
+        # excluded links never consume quota, then take up to max_pages.
+        try:
+            root_page = scrape_smart(root, prefer=prefer)
+            if _looks_like_block(root_page.html, root_page.status):
+                root_page = scrape_stealth(root, timeout=60)
+        except Exception as e:  # noqa: BLE001
+            return CrawlResult(
+                root=root, pages=[_error_page(root, e)], method="map+scrape",
+                elapsed_ms=int((time.perf_counter() - t0) * 1000),
+                excluded_links=excluded_links, truncated_links=truncated_links,
+            )
+
+        candidates = [u for u, _d, collect in _discover(
+            root_page.html, root_page.final_url or root, root, None,
+            allow_depth_truncation=False,
+        ) if collect]
+        for url in candidates[cap:]:
+            _record_truncated(url, "quota_limit", root, None)
+        for url in candidates[:cap]:
+            try:
+                pages.append(_fetch(url))
             except Exception as e:  # noqa: BLE001
-                pages.append(FetchResult(
-                    url=url, final_url=url, status=0, html="", markdown="",
-                    title=None, method="error", elapsed_ms=0, meta={"error": str(e)},
-                ))
+                pages.append(_error_page(url, e))
+
     return CrawlResult(
         root=root, pages=pages, method="bfs" if max_depth else "map+scrape",
         elapsed_ms=int((time.perf_counter() - t0) * 1000),
+        excluded_links=excluded_links, truncated_links=truncated_links,
     )
 
 
