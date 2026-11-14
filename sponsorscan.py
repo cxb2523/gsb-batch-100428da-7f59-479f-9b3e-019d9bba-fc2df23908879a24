@@ -1,0 +1,1887 @@
+#!/usr/bin/env python3
+"""
+sponsorscan - find entry-level jobs at employers with real H-1B filing history.
+
+Two data sources, both of which are structurally durable:
+
+  1. DOL OFLC LCA disclosure data. Published quarterly by the Office of Foreign
+     Labor Certification. A legal filing requirement, so it keeps coming out
+     regardless of anyone's business model. Free bulk download, no key.
+
+  2. Public ATS job board APIs (Greenhouse, Lever, Ashby, Workday, Eightfold) and
+     Amazon's own job search. Served straight from
+     the employer with no aggregator in between to abandon it.
+
+Usage:
+    python sponsorscan.py load-lca --latest
+    python sponsorscan.py fetch-jobs
+    python sponsorscan.py report --out matches.csv
+
+`companies.yaml` ships with confirmed boards, so a first run can skip
+`discover` and go straight to fetch-jobs. Two commands exist to make setup
+less fiddly:
+
+    python sponsorscan.py setup     # answer a few questions, get a profile
+    python sponsorscan.py doctor    # report which stage needs attention
+
+Run `python sponsorscan.py <command> --help` for per-command options.
+"""
+
+import argparse
+import csv
+import gzip
+import hashlib
+import html
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
+import requests
+import yaml
+
+try:
+    from rapidfuzz import process as rf_process
+    from rapidfuzz import fuzz as rf_fuzz
+    HAVE_RAPIDFUZZ = True
+except ImportError:
+    HAVE_RAPIDFUZZ = False
+
+DB_PATH = os.environ.get("SPONSORSCAN_DB", "sponsorscan.db")
+UA = {"User-Agent": "sponsorscan/1.0 (personal job search tool)"}
+
+
+# ---------------------------------------------------------------- normalization
+
+# Suffixes and filler tokens stripped before matching employer names. "Google
+# LLC", "GOOGLE INC." and "Google, Inc" all collapse to "google".
+_SUFFIXES = {
+    "inc", "incorporated", "llc", "l l c", "lp", "llp", "plc", "ltd", "limited",
+    "co", "corp", "corporation", "company", "holdings", "holding", "group",
+    "usa", "us", "america", "americas", "na", "the", "and", "of",
+}
+
+_PUNCT = re.compile(r"[^a-z0-9 ]+")
+_WS = re.compile(r"\s+")
+
+
+def norm_employer(name):
+    """Collapse an employer name to a comparable key."""
+    if not name:
+        return ""
+    s = str(name).lower()
+    s = s.replace("&", " and ")
+    s = _PUNCT.sub(" ", s)
+    toks = [t for t in _WS.sub(" ", s).strip().split(" ") if t and t not in _SUFFIXES]
+    return " ".join(toks)
+
+
+# ------------------------------------------------------------------- db schema
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS employers (
+    employer_norm    TEXT PRIMARY KEY,
+    employer_display TEXT,
+    certified        INTEGER DEFAULT 0,
+    denied           INTEGER DEFAULT 0,
+    withdrawn        INTEGER DEFAULT 0,
+    titles           TEXT,
+    states           TEXT,
+    lvl1 INTEGER DEFAULT 0,
+    lvl2 INTEGER DEFAULT 0,
+    lvl3 INTEGER DEFAULT 0,
+    lvl4 INTEGER DEFAULT 0,
+    secondary INTEGER DEFAULT 0,
+    new_hires INTEGER DEFAULT 0,
+    first_fy INTEGER,
+    last_fy  INTEGER,
+    perm_certified INTEGER DEFAULT 0,
+    perm_filed     INTEGER DEFAULT 0
+);
+-- Filings per fiscal quarter, by each row's decision date. DOL has published
+-- both ways: FY2025's quarterly files hold one quarter each, while the FY2026
+-- Q3 file holds October through June. Filing rows by their own quarter means a
+-- file replaces exactly the quarters it contains, so neither kind is counted
+-- twice or lost. `employers` is rebuilt from these as the sum of all quarters.
+-- Quarter (0, 0) holds rows whose decision date was missing.
+CREATE TABLE IF NOT EXISTS lca_quarters (
+    fiscal_year INTEGER,
+    quarter     INTEGER,
+    source      TEXT,
+    loaded_at   TEXT,
+    PRIMARY KEY (fiscal_year, quarter)
+);
+CREATE TABLE IF NOT EXISTS lca_quarter_employers (
+    fiscal_year      INTEGER,
+    quarter          INTEGER,
+    employer_norm    TEXT,
+    employer_display TEXT,
+    certified INTEGER, denied INTEGER, withdrawn INTEGER,
+    titles TEXT,
+    states TEXT,
+    lvl1 INTEGER, lvl2 INTEGER, lvl3 INTEGER, lvl4 INTEGER,
+    secondary INTEGER DEFAULT 0, new_hires INTEGER DEFAULT 0,
+    PRIMARY KEY (fiscal_year, quarter, employer_norm)
+);
+-- Green card (PERM) filings, stored per quarter the same way.
+CREATE TABLE IF NOT EXISTS perm_quarters (
+    fiscal_year INTEGER,
+    quarter     INTEGER,
+    source      TEXT,
+    loaded_at   TEXT,
+    PRIMARY KEY (fiscal_year, quarter)
+);
+CREATE TABLE IF NOT EXISTS perm_quarter_employers (
+    fiscal_year      INTEGER,
+    quarter          INTEGER,
+    employer_norm    TEXT,
+    employer_display TEXT,
+    certified INTEGER, denied INTEGER, withdrawn INTEGER,
+    PRIMARY KEY (fiscal_year, quarter, employer_norm)
+);
+CREATE TABLE IF NOT EXISTS jobs (
+    job_key      TEXT PRIMARY KEY,
+    source       TEXT,
+    company      TEXT,
+    company_norm TEXT,
+    title        TEXT,
+    location     TEXT,
+    url          TEXT,
+    posted       TEXT,
+    description  TEXT,
+    fetched_at   TEXT,
+    lca_name     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_norm ON jobs(company_norm);
+CREATE TABLE IF NOT EXISTS fetched_companies (
+    company_norm TEXT PRIMARY KEY,
+    fetched_at   TEXT
+);
+CREATE TABLE IF NOT EXISTS fetch_failures (
+    board     TEXT PRIMARY KEY,
+    error     TEXT,
+    failed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS probe_cache (
+    provider   TEXT,
+    slug       TEXT,
+    ok         INTEGER,
+    n_jobs     INTEGER,
+    checked_at TEXT,
+    PRIMARY KEY (provider, slug)
+);
+"""
+
+
+def connect():
+    con = sqlite3.connect(DB_PATH)
+    con.executescript(SCHEMA)
+    have = {r[1] for r in con.execute("PRAGMA table_info(employers)")}
+    for col in ("lvl1", "lvl2", "lvl3", "lvl4"):
+        if col not in have:
+            con.execute(f"ALTER TABLE employers ADD COLUMN {col} INTEGER DEFAULT 0")
+    for col in ("first_fy", "last_fy", "secondary", "new_hires", "perm_certified",
+                "perm_filed"):
+        if col not in have:
+            con.execute(f"ALTER TABLE employers ADD COLUMN {col} INTEGER")
+    quarter_cols = {r[1] for r in con.execute("PRAGMA table_info(lca_quarter_employers)")}
+    for col in ("secondary", "new_hires"):
+        if col not in quarter_cols:
+            con.execute(f"ALTER TABLE lca_quarter_employers ADD COLUMN {col} "
+                        "INTEGER DEFAULT 0")
+    # The name a board's employer files under at DOL, from `lca_name:` in
+    # companies.yaml, when it differs from the name shown in reports.
+    if "lca_name" not in {r[1] for r in con.execute("PRAGMA table_info(jobs)")}:
+        con.execute("ALTER TABLE jobs ADD COLUMN lca_name TEXT")
+    # A Workday guess is a tenant name; the board it resolves to is stored here.
+    if "resolved" not in {r[1] for r in con.execute("PRAGMA table_info(probe_cache)")}:
+        con.execute("ALTER TABLE probe_cache ADD COLUMN resolved TEXT")
+    con.commit()
+    return con
+
+
+# ------------------------------------------------------------------- load-lca
+
+# The DOL file has ~100 columns and the exact header set drifts between fiscal
+# years, so columns are resolved by name rather than position.
+WANTED = {
+    "employer": ["EMPLOYER_NAME"],
+    "status": ["CASE_STATUS"],
+    "title": ["JOB_TITLE", "SOC_TITLE"],
+    "state": ["WORKSITE_STATE", "WORKSITE_STATE_1", "EMPLOYER_STATE"],
+    # Prevailing wage level (I-IV). Under the FY2027 weighted selection rule,
+    # petitions filed at Level III/IV get better lottery odds, so an employer's
+    # typical level directly affects your chances, not just your pay.
+    "wage_level": ["PW_WAGE_LEVEL", "PW_WAGE_LEVEL_1"],
+    # Tells which fiscal year and quarter the file covers.
+    "decided": ["DECISION_DATE"],
+    # "Yes" when the worker is placed at another company's site, the mark of
+    # a staffing or consulting firm.
+    "secondary": ["SECONDARY_ENTITY", "SECONDARY_ENTITY_1"],
+    # How many of the filing's workers are new hires rather than extensions.
+    "new_employment": ["NEW_EMPLOYMENT"],
+}
+
+# How much of each employer's title and state lists is kept per quarter.
+_YEAR_TITLES, _YEAR_STATES = 40, 20
+
+
+def _fiscal_quarter(value):
+    """(fiscal_year, quarter) of a decision date, or None when unreadable.
+
+    The federal fiscal year starts on 1 October, so 30 June 2026 is FY2026 Q3.
+    """
+    if isinstance(value, datetime):
+        day = value
+    else:
+        text = str(value or "").strip()[:10]
+        for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+            try:
+                day = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            return None
+    fiscal_year = day.year + 1 if day.month >= 10 else day.year
+    return fiscal_year, (day.month - 10) % 12 // 3 + 1
+
+
+def _top(counts, n):
+    """The n most frequent entries; ties break alphabetically, so the result
+    does not depend on the order the counts were gathered in."""
+    return dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:n])
+
+
+def _rebuild_employers(con):
+    """Rebuild `employers` as the sum of every quarter loaded."""
+    merged = {}
+    for (fy, norm, display, cert, den, wd, titles, states,
+         l1, l2, l3, l4, sec, hires) in con.execute(
+            "SELECT fiscal_year, employer_norm, employer_display, certified, denied, "
+            "withdrawn, titles, states, lvl1, lvl2, lvl3, lvl4, secondary, new_hires "
+            "FROM lca_quarter_employers ORDER BY fiscal_year, quarter"):
+        rec = merged.setdefault(norm, {
+            "display": display, "counts": [0] * 9, "titles": {}, "states": {},
+            "years": []})
+        rec["display"] = display  # the latest year's spelling, read last
+        for i, v in enumerate((cert, den, wd, l1, l2, l3, l4, sec, hires)):
+            rec["counts"][i] += v or 0
+        for field, raw in (("titles", titles), ("states", states)):
+            for k, v in json.loads(raw or "{}").items():
+                rec[field][k] = rec[field].get(k, 0) + v
+        if fy:
+            rec["years"].append(fy)
+
+    # Green card filings. An employer may file these without any LCA in the
+    # quarters loaded, so it gets a row of its own.
+    for norm, display, cert, den, wd in con.execute(
+            "SELECT employer_norm, employer_display, certified, denied, withdrawn "
+            "FROM perm_quarter_employers ORDER BY fiscal_year, quarter"):
+        rec = merged.setdefault(norm, {
+            "display": display, "counts": [0] * 9, "titles": {}, "states": {},
+            "years": []})
+        rec.setdefault("perm", [0, 0])
+        rec["perm"][0] += cert or 0
+        rec["perm"][1] += (cert or 0) + (den or 0) + (wd or 0)
+
+    con.execute("DELETE FROM employers")
+    con.executemany(
+        "INSERT INTO employers (employer_norm, employer_display, certified, denied, "
+        "withdrawn, titles, states, lvl1, lvl2, lvl3, lvl4, secondary, new_hires, "
+        "first_fy, last_fy, perm_certified, perm_filed) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        [(norm, rec["display"], *rec["counts"][:3],
+          json.dumps(list(_top(rec["titles"], 12))),
+          json.dumps(list(_top(rec["states"], 8))),
+          *rec["counts"][3:9],
+          min(rec["years"]) if rec["years"] else None,
+          max(rec["years"]) if rec["years"] else None,
+          *rec.get("perm", (0, 0)))
+         for norm, rec in merged.items()])
+    return len(merged)
+
+
+# A PERM (green card) disclosure file. Since FY2024 the employer column is
+# EMP_BUSINESS_NAME; older files used EMPLOYER_NAME, like the LCA files.
+PERM_WANTED = {
+    "employer": ["EMP_BUSINESS_NAME", "EMPLOYER_NAME"],
+    "status": ["CASE_STATUS"],
+    "decided": ["DECISION_DATE"],
+}
+
+
+def _is_perm(header, src):
+    """True for a PERM file: its own employer column, or an older PERM file
+    that has no LCA visa class and says PERM in its name."""
+    upper = {str(h).strip().upper() for h in header if h is not None}
+    return "EMP_BUSINESS_NAME" in upper or (
+        "VISA_CLASS" not in upper and "PERM" in os.path.basename(src).upper())
+
+
+def _resolve_columns(header, wanted=None):
+    idx = {}
+    upper = [str(h).strip().upper() if h is not None else "" for h in header]
+    for key, candidates in (wanted or WANTED).items():
+        for cand in candidates:
+            if cand in upper:
+                idx[key] = upper.index(cand)
+                break
+    missing = [k for k in ("employer", "status") if k not in idx]
+    if missing:
+        raise SystemExit(
+            f"Could not find required column(s) {missing} in the file header.\n"
+            f"Saw: {upper[:25]}..."
+        )
+    return idx
+
+
+def _iter_rows(path):
+    """Stream rows from .xlsx or .csv without loading the whole file."""
+    if path.lower().endswith((".xlsx", ".xlsm")):
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True, data_only=True)
+        ws = wb[wb.sheetnames[0]]
+        for row in ws.iter_rows(values_only=True):
+            yield list(row)
+        wb.close()
+    else:
+        with open(path, newline="", encoding="utf-8", errors="replace") as fh:
+            for row in csv.reader(fh):
+                yield row
+
+
+def _resolve_latest_lca():
+    """Find the newest LCA disclosure file linked from the DOL page.
+
+    Returns the URL, or exits with the manual instructions. A DOL redesign is
+    the expected failure here, so it must not surface as a traceback.
+    """
+    import onboarding
+
+    print(f"Looking for the newest disclosure file on {onboarding.DOL_PERFORMANCE_PAGE}")
+    try:
+        r = requests.get(onboarding.DOL_PERFORMANCE_PAGE, headers=UA, timeout=60)
+        r.raise_for_status()
+        url = onboarding.latest_lca_link(r.text, onboarding.DOL_PERFORMANCE_PAGE)
+    except requests.RequestException as exc:
+        url = None
+        print(f"Could not reach the DOL site: {exc}")
+
+    if not url:
+        raise SystemExit(
+            "Could not resolve a disclosure link automatically.\n"
+            f"Open {onboarding.DOL_PERFORMANCE_PAGE}, download the most recent\n"
+            "'LCA Programs (H-1B, H-1B1, E-3)' file, then run:\n"
+            "  python sponsorscan.py load-lca <downloaded file> --replace")
+
+    print(f"Found {url}")
+    if sys.stdin.isatty():
+        reply = input("Download this file? (Y/n): ").strip().lower()
+        if reply.startswith("n"):
+            raise SystemExit("Cancelled.")
+    return url
+
+
+def cmd_load_lca(args):
+    prebuilt = getattr(args, "prebuilt", None)
+    if args.latest and args.path:
+        raise SystemExit(
+            "argument --latest: not allowed with an explicit path. "
+            "Pass one or the other.")
+    if prebuilt and (args.latest or args.path):
+        raise SystemExit("argument --prebuilt: not allowed with --latest or a path. "
+                         "Pass one of them.")
+    if prebuilt:
+        by_kind, meta = _read_prebuilt(prebuilt)
+        green = f"; green card filings {meta['perm_quarters']}" if meta.get("perm_quarters") else ""
+        print(f"Prebuilt table built {meta.get('built', '?')}, "
+              f"covering {meta.get('quarters', '?')}{green}.")
+        for kind, quarters in by_kind.items():
+            _store_quarters(quarters, f"prebuilt {meta.get('built', '')}".strip(),
+                            args.replace, kind)
+        return
+    if not args.latest and not args.path:
+        raise SystemExit(
+            "Provide a path to a disclosure file, pass --latest to resolve the newest "
+            "one from the DOL site, or pass --prebuilt for the table SponsorScan "
+            "publishes.")
+
+    src = _resolve_latest_lca() if args.latest else args.path
+    if src.startswith(("http://", "https://")):
+        import onboarding
+        local = onboarding.local_filename_for(src)
+        print(f"Downloading {src} -> {local} (this file is typically 100-400 MB)")
+        try:
+            with requests.get(src, stream=True, headers=UA, timeout=120) as r:
+                r.raise_for_status()
+                with open(local, "wb") as fh:
+                    for chunk in r.iter_content(1 << 20):
+                        fh.write(chunk)
+        except requests.RequestException as exc:
+            if os.path.exists(local):
+                os.remove(local)  # a partial file would load as a short dataset
+            # Nothing has been deleted yet, so an existing database is intact.
+            raise SystemExit(
+                f"Could not download {src}: {exc}\n"
+                "The DOL site blocks some networks, including GitHub's runners. "
+                "Download the file in a browser and pass its local path instead.")
+        src = local
+
+    if not os.path.exists(src):
+        raise SystemExit(f"No such file: {src}")
+
+    agg = {}  # (fiscal_year, quarter) -> employer key -> counts
+    rows = _iter_rows(src)
+    try:
+        header = next(rows)
+    except StopIteration:
+        raise SystemExit("File is empty.")
+    if _is_perm(header, src):
+        _load_perm(rows, _resolve_columns(header, PERM_WANTED), src, args.replace)
+        return
+    idx = _resolve_columns(header)
+
+    n = 0
+    for row in rows:
+        n += 1
+        if n % 100_000 == 0:
+            print(f"  ...{n:,} rows")
+
+        def get(key, row=row):  # bound now: the row is read on this pass only
+            i = idx.get(key)
+            return row[i] if i is not None and i < len(row) else None
+
+        emp = get("employer")
+        if not emp:
+            continue
+        key = norm_employer(emp)
+        if not key:
+            continue
+
+        quarter = _fiscal_quarter(get("decided")) or (0, 0)
+        rec = agg.setdefault(quarter, {}).setdefault(key, {
+            "display": str(emp).strip(), "certified": 0, "denied": 0,
+            "withdrawn": 0, "titles": {}, "states": {},
+            "lvl": {1: 0, 2: 0, 3: 0, 4: 0}, "secondary": 0, "new_hires": 0,
+        })
+
+        status = (str(get("status")) or "").strip().upper()
+        if status.startswith("CERTIFIED") and "WITHDRAWN" in status:
+            rec["withdrawn"] += 1
+        elif status.startswith("CERTIFIED"):
+            rec["certified"] += 1
+        elif status.startswith("DENIED"):
+            rec["denied"] += 1
+        elif status.startswith("WITHDRAWN"):
+            rec["withdrawn"] += 1
+
+        t = get("title")
+        if t:
+            t = str(t).strip().lower()[:80]
+            rec["titles"][t] = rec["titles"].get(t, 0) + 1
+        st = get("state")
+        if st:
+            st = str(st).strip().upper()[:2]
+            rec["states"][st] = rec["states"].get(st, 0) + 1
+        lvl = str(get("wage_level") or "").strip().upper().replace("LEVEL", "").strip()
+        lvl_n = {"I": 1, "II": 2, "III": 3, "IV": 4,
+                 "1": 1, "2": 2, "3": 3, "4": 4}.get(lvl)
+        if lvl_n:
+            rec["lvl"][lvl_n] += 1
+        if str(get("secondary") or "").strip().upper() in ("Y", "YES"):
+            rec["secondary"] += 1
+        try:
+            if float(get("new_employment") or 0) > 0:
+                rec["new_hires"] += 1
+        except ValueError:
+            pass
+
+    print(f"Read {n:,} rows, {len({k for e in agg.values() for k in e}):,} "
+          f"distinct employers.")
+
+    quarters = {
+        fyq: [(key, rec["display"], rec["certified"], rec["denied"], rec["withdrawn"],
+               json.dumps(_top(rec["titles"], _YEAR_TITLES)),
+               json.dumps(_top(rec["states"], _YEAR_STATES)),
+               rec["lvl"][1], rec["lvl"][2], rec["lvl"][3], rec["lvl"][4],
+               rec["secondary"], rec["new_hires"])
+              for key, rec in employers.items()]
+        for fyq, employers in agg.items()}
+    _store_quarters(quarters, os.path.basename(src), args.replace)
+
+
+def _load_perm(rows, idx, src, replace):
+    """Read a PERM file per quarter, then store it like an LCA file."""
+    agg = {}  # (fiscal_year, quarter) -> employer key -> counts
+    n = 0
+    for row in rows:
+        n += 1
+        if n % 100_000 == 0:
+            print(f"  ...{n:,} rows")
+
+        def get(key, row=row):  # bound now: the row is read on this pass only
+            i = idx.get(key)
+            return row[i] if i is not None and i < len(row) else None
+
+        emp = get("employer")
+        key = norm_employer(emp) if emp else ""
+        if not key:
+            continue
+        quarter = _fiscal_quarter(get("decided")) or (0, 0)
+        rec = agg.setdefault(quarter, {}).setdefault(
+            key, {"display": str(emp).strip(), "counts": [0, 0, 0]})
+        # "Certified - Expired" is a certification the employer did not take to
+        # the next step in time; it still shows the employer sponsors.
+        status = str(get("status") or "").strip().upper()
+        slot = (0 if status.startswith("CERTIFIED") else
+                1 if status.startswith("DENIED") else
+                2 if status.startswith("WITHDRAWN") else None)
+        if slot is not None:
+            rec["counts"][slot] += 1
+    print(f"Read {n:,} rows of green card (PERM) filings.")
+    quarters = {fyq: [(key, rec["display"], *rec["counts"]) for key, rec in emps.items()]
+                for fyq, emps in agg.items()}
+    _store_quarters(quarters, os.path.basename(src), replace, "perm")
+
+
+# Columns of each kind's per-quarter table, in order: what export-lca writes and
+# load-lca --prebuilt reads back.
+_QUARTER_COLUMNS = ("fiscal_year", "quarter", "employer_norm", "employer_display",
+                    "certified", "denied", "withdrawn", "titles", "states",
+                    "lvl1", "lvl2", "lvl3", "lvl4", "secondary", "new_hires")
+_PERM_COLUMNS = ("fiscal_year", "quarter", "employer_norm", "employer_display",
+                 "certified", "denied", "withdrawn")
+_KIND_COLUMNS = {"lca": _QUARTER_COLUMNS, "perm": _PERM_COLUMNS}
+
+
+def _store_quarters(quarters, source, replace, kind="lca"):
+    """Replace the given quarters of one kind of filing, then rebuild `employers`.
+
+    `kind` is "lca" or "perm". `quarters` maps (fiscal_year, quarter) to rows
+    of that kind's per-quarter table without their first two columns.
+    `replace` clears that kind only. Called only once a whole file has been
+    read and checked, so a failed read leaves the database as it was.
+    """
+    columns = _KIND_COLUMNS[kind]
+    table, loads = f"{kind}_quarter_employers", f"{kind}_quarters"
+    con = connect()
+    loaded = con.execute("SELECT COUNT(*) FROM lca_quarters").fetchone()[0]
+    # Employers loaded before quarters were tracked cannot be combined with others.
+    legacy = not loaded and con.execute("SELECT COUNT(*) FROM employers").fetchone()[0]
+    if legacy and kind == "perm":
+        con.close()
+        raise SystemExit("The LCA data in this database predates multi-year loading, "
+                         "so green card filings cannot be added to it. Load the LCA "
+                         "files again first (or `load-lca --prebuilt --replace`).")
+    if replace or legacy:
+        if legacy and not replace:
+            print("The employer data already loaded predates multi-year loading, so "
+                  "this file replaces it. Load your other files again to combine them.")
+        for name in (table, loads) + (("employers",) if legacy else ()):
+            con.execute(f"DELETE FROM {name}")
+
+    placeholders = ",".join("?" * len(columns))
+    for (fiscal_year, quarter), rows in quarters.items():
+        con.execute(f"DELETE FROM {table} WHERE fiscal_year = ? AND quarter = ?",
+                    (fiscal_year, quarter))
+        con.executemany(
+            f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})",
+            [(fiscal_year, quarter, *row) for row in rows])
+        con.execute(f"INSERT OR REPLACE INTO {loads} VALUES (?, ?, ?, ?)",
+                    (fiscal_year, quarter, source, time.strftime("%Y-%m-%d %H:%M")))
+    total = _rebuild_employers(con)
+    held = _describe_quarters(con.execute(
+        "SELECT fiscal_year, quarter FROM lca_quarters WHERE fiscal_year > 0"))
+    green = _describe_quarters(con.execute(
+        "SELECT fiscal_year, quarter FROM perm_quarters WHERE fiscal_year > 0"))
+    con.commit()
+    con.close()
+    this = _describe_quarters(q for q in quarters if q[0]) or "a file with no decision dates"
+    what = "green card filings for " if kind == "perm" else ""
+    print(f"Loaded {what}{this}. {DB_PATH} now holds {total:,} employers"
+          f"{', from ' + held if held else ''}"
+          f"{'; green card filings from ' + green if green else ''}.")
+
+
+# ----------------------------------------------------------- prebuilt table
+#
+# Loading DOL's files takes a 100-400 MB download per quarter and minutes of
+# parsing, and DOL blocks GitHub's runners. The per-quarter table those files
+# produce is a few MB, so each quarter it is built once with `export-lca` and
+# published as the `lca-latest` release, and `load-lca --prebuilt` reads it in
+# seconds. A pointer file names the data file and its SHA-256, so a truncated
+# or altered download is refused before anything changes.
+
+PREBUILT_LCA_URL = ("https://github.com/pruhnav/sponsorscan/releases/download/"
+                    "lca-latest/lca.json")
+
+
+def _read_prebuilt(pointer):
+    """(quarters, meta) from a prebuilt table, once its checksum matches."""
+    if pointer.startswith(("http://", "https://")):
+        try:
+            r = requests.get(pointer, headers=UA, timeout=60)
+            r.raise_for_status()
+            meta = r.json()
+            data_url = pointer.rsplit("/", 1)[0] + "/" + meta["file"]
+            d = requests.get(data_url, headers=UA, timeout=300)
+            d.raise_for_status()
+            data = d.content
+        except (requests.RequestException, ValueError, KeyError) as exc:
+            raise SystemExit(f"Could not download the prebuilt table from {pointer}: "
+                             f"{exc}\nNothing was changed. Load a DOL file instead "
+                             "(see `load-lca --help`).") from None
+    else:
+        meta = json.loads(Path(pointer).read_text(encoding="utf-8"))
+        data = Path(pointer).with_name(meta["file"]).read_bytes()
+    if hashlib.sha256(data).hexdigest() != meta.get("sha256"):
+        raise SystemExit("The prebuilt table's checksum does not match its pointer "
+                         f"({pointer}), so the download is incomplete or altered. "
+                         "Nothing was changed. Try again, or load a DOL file instead.")
+    by_kind = {}  # "lca" or "perm" -> (fiscal_year, quarter) -> rows
+    for line in gzip.decompress(data).decode("utf-8").splitlines():
+        row = json.loads(line)
+        kind = row.get("kind", "lca")  # tables built before PERM had no kind
+        if kind == "lca":
+            for field in ("titles", "states"):
+                row[field] = json.dumps(row[field])
+        by_kind.setdefault(kind, {}).setdefault(
+            (row["fiscal_year"], row["quarter"]), []).append(
+            tuple(row[c] for c in _KIND_COLUMNS[kind][2:]))
+    return by_kind, meta
+
+
+def cmd_export_lca(args):
+    """Write the per-quarter table and its pointer, ready to publish."""
+    con = connect()
+    lines = []
+    for kind, columns in _KIND_COLUMNS.items():
+        for row in con.execute(
+                f"SELECT {', '.join(columns)} FROM {kind}_quarter_employers "
+                "ORDER BY fiscal_year, quarter, employer_norm"):
+            record = dict(zip(columns, row), kind=kind)
+            if kind == "lca":
+                for field in ("titles", "states"):
+                    record[field] = json.loads(record[field] or "{}")
+            lines.append(json.dumps(record, sort_keys=True, separators=(",", ":")))
+    held = _describe_quarters(con.execute(
+        "SELECT fiscal_year, quarter FROM lca_quarters WHERE fiscal_year > 0"))
+    green = _describe_quarters(con.execute(
+        "SELECT fiscal_year, quarter FROM perm_quarters WHERE fiscal_year > 0"))
+    employers = con.execute("SELECT COUNT(*) FROM employers").fetchone()[0]
+    con.close()
+    if not lines:
+        raise SystemExit("Nothing to export. Load DOL files with `load-lca` first.")
+    # mtime=0, so the same table always compresses to the same bytes.
+    data = gzip.compress(("\n".join(lines) + "\n").encode("utf-8"), mtime=0)
+    out = Path(args.out)
+    out.write_bytes(data)
+    # Version 2 adds green card (PERM) rows, each tagged with its kind.
+    meta = {"format": "sponsorscan-lca", "version": 2, "file": out.name,
+            "sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
+            "quarters": held, "perm_quarters": green, "employers": employers,
+            "built": time.strftime("%Y-%m-%d")}
+    pointer = out.with_name("lca.json")
+    pointer.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    print(f"Wrote {out} ({len(data) / 1e6:.1f} MB, {employers:,} employers, {held}) "
+          f"and {pointer}.\nPublish both:  gh release upload lca-latest {out} {pointer} "
+          "--clobber")
+
+
+def _describe_quarters(quarters):
+    """'FY2025 Q4, FY2026 Q1-Q3' for a set of (fiscal_year, quarter)."""
+    by_year = {}
+    for fiscal_year, quarter in quarters:
+        by_year.setdefault(fiscal_year, []).append(quarter)
+    parts = []
+    for fiscal_year in sorted(by_year):
+        qs = sorted(by_year[fiscal_year])
+        contiguous = qs == list(range(qs[0], qs[-1] + 1))
+        if len(qs) == 1:
+            parts.append(f"FY{fiscal_year} Q{qs[0]}")
+        elif contiguous:
+            parts.append(f"FY{fiscal_year} Q{qs[0]}-Q{qs[-1]}")
+        else:
+            parts.append(f"FY{fiscal_year} " + ", ".join(f"Q{q}" for q in qs))
+    return ", ".join(parts)
+
+
+# ------------------------------------------------------------------ fetch-jobs
+#
+# NOTE: every function in this section makes a live HTTP call and could NOT be
+# tested in the environment where this was written. If a provider changes its
+# response shape, this is the first place to look.
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_BLOCK_RE = re.compile(r"(?i)<\s*(?:br|/p|/div|/li|/tr|/h[1-6])\s*/?>")
+_SPACE_RUN = re.compile(r"[ \t\r\f\v]+")
+_BLANK_RUN = re.compile(r"\n\s*\n+")
+
+
+def html_to_text(raw):
+    """Flatten ATS markup to prose.
+
+    Greenhouse serves `content` as HTML inside an escaped JSON string, so a
+    posting arrives looking like `&lt;p&gt;We don&#39;t sponsor&lt;/p&gt;`.
+    The filters downstream are word-boundary regexes over prose and need real
+    text. Unescape, turn block tags into newlines so that clause-bounded
+    patterns cannot run across list items, then drop the remaining tags.
+    """
+    if not raw:
+        return ""
+    text = html.unescape(str(raw))
+    text = _BLOCK_RE.sub("\n", text)
+    text = _TAG_RE.sub(" ", text)
+    text = html.unescape(text)
+    text = _SPACE_RUN.sub(" ", text)
+    return _BLANK_RUN.sub("\n", text).strip()
+
+
+def _get_json(url, timeout=25):
+    r = requests.get(url, headers=UA, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def fetch_greenhouse(slug):
+    url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
+    data = _get_json(url)
+    out = []
+    for j in data.get("jobs", []):
+        loc = (j.get("location") or {}).get("name", "")
+        out.append({
+            "job_key": f"greenhouse:{slug}:{j.get('id')}",
+            "source": "greenhouse", "title": j.get("title", ""),
+            "location": loc, "url": j.get("absolute_url", ""),
+            # updated_at moves whenever the employer bulk-edits its board, so
+            # a years-old posting would read as new. first_published does not.
+            "posted": (j.get("first_published") or j.get("updated_at") or "")[:10],
+            "description": html_to_text(j.get("content", "")),
+        })
+    return out
+
+
+def fetch_lever(slug):
+    url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
+    data = _get_json(url)
+    out = []
+    for j in data:
+        cats = j.get("categories") or {}
+        out.append({
+            "job_key": f"lever:{slug}:{j.get('id')}",
+            "source": "lever", "title": j.get("text", ""),
+            "location": cats.get("location", "") or "",
+            "url": j.get("hostedUrl", ""),
+            "posted": time.strftime("%Y-%m-%d", time.gmtime((j.get("createdAt") or 0) / 1000))
+                      if j.get("createdAt") else "",
+            "description": html_to_text(
+                (j.get("descriptionPlain") or "") + " " +
+                " ".join(str(d.get("text", "")) + " " + str(d.get("content", ""))
+                         for d in (j.get("lists") or []))),
+        })
+    return out
+
+
+def fetch_ashby(slug):
+    url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}?includeCompensation=true"
+    data = _get_json(url)
+    out = []
+    for j in data.get("jobs", []):
+        out.append({
+            "job_key": f"ashby:{slug}:{j.get('id')}",
+            "source": "ashby", "title": j.get("title", ""),
+            "location": j.get("location", "") or "",
+            "url": j.get("jobUrl", "") or j.get("applyUrl", ""),
+            "posted": (j.get("publishedAt") or "")[:10],
+            "description": html_to_text(j.get("descriptionPlain", "")),
+        })
+    return out
+
+
+# Amazon, the largest H-1B filer, runs its own job site. One search covers all
+# of Amazon (AWS, Devices, Ring...), so a companies.yaml slug names job
+# categories, as they appear in amazon.jobs URLs, instead of a board. Results
+# carry the full description and qualifications, so no detail requests.
+AMAZON_SEARCH = "https://www.amazon.jobs/en/search.json"
+AMAZON_PAGE = 100       # the API's largest page
+AMAZON_MAX_PAGES = 40   # 4,000 postings, newest first, is weeks of tech hiring
+AMAZON_DELAY = 0.3
+
+
+def _amazon_date(text):
+    """"November  6, 2026" as 2026-11-06; blank when unreadable."""
+    try:
+        return datetime.strptime(" ".join(str(text or "").split()), "%B %d, %Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
+def fetch_amazon(slug):
+    """US postings from amazon.jobs in the slug's categories ("all" for every one)."""
+    categories = [c.strip() for c in str(slug or "").split(",") if c.strip()]
+    if categories == ["all"]:
+        categories = []
+    params = [("base_query", ""), ("loc_query", ""), ("sort", "recent"),
+              ("result_limit", str(AMAZON_PAGE)), ("normalized_country_code[]", "USA"),
+              *(("category[]", category) for category in categories)]
+    out, seen = [], set()
+    for page in range(AMAZON_MAX_PAGES):
+        r = requests.get(AMAZON_SEARCH, params=params + [("offset", str(page * AMAZON_PAGE))],
+                         headers=UA, timeout=25)
+        r.raise_for_status()
+        jobs = r.json().get("jobs") or []
+        fresh = 0
+        for j in jobs:
+            key = str(j.get("id_icims") or j.get("id") or "")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            fresh += 1
+            path = str(j.get("job_path") or "")
+            sections = [html_to_text(j.get("description", "")),
+                        "Basic qualifications\n" + html_to_text(j.get("basic_qualifications", "")),
+                        "Preferred qualifications\n" + html_to_text(j.get("preferred_qualifications", ""))]
+            out.append({
+                "job_key": f"amazon:{key}", "source": "amazon", "title": j.get("title", ""),
+                "location": j.get("normalized_location") or j.get("location") or "",
+                # Only a path on Amazon's own site becomes a link.
+                "url": "https://www.amazon.jobs" + path if path.startswith("/") and not path.startswith("//") else "",
+                "posted": _amazon_date(j.get("posted_date")),
+                "description": "\n\n".join(sections),
+            })
+        if len(jobs) < AMAZON_PAGE or not fresh:  # the last page, or an API ignoring offset
+            break
+        time.sleep(AMAZON_DELAY)
+    return out
+
+
+# Eightfold runs career sites for large employers such as Microsoft. Its search
+# returns 10 postings per request and no description, and its edge refuses
+# bursts ("Please try again later", HTTP 429). So the slug narrows the search
+# (the careers URL, with `domain=` and any number of `query=`), and descriptions
+# are fetched only for titles that are not senior or level II and above, which
+# the report's defaults exclude anyway. Pacing and backoff follow what walks
+# Microsoft's board without stalling.
+EIGHTFOLD_PAGE = 10              # the API's fixed page size
+EIGHTFOLD_MAX_PAGES = 15         # per query: the 150 newest postings
+EIGHTFOLD_DELAY = 0.5
+EIGHTFOLD_BACKOFF = (2, 4, 8, 16, 32)
+_EIGHTFOLD_LEVEL = re.compile(r"\b(?:II|III|IV|V|2|3|4)\b")
+_HOSTNAME = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
+
+class EightfoldRefused(RuntimeError):
+    """The site kept answering "slow down" after every backoff."""
+
+
+def _eightfold_get(host, method, params):
+    for wait in (*EIGHTFOLD_BACKOFF, None):
+        r = requests.get(f"https://{host}/api/pcsx/{method}", params=params,
+                         headers={**UA, "Accept": "application/json"}, timeout=25)
+        if r.status_code != 429:
+            r.raise_for_status()
+            return r.json().get("data") or {}
+        if wait is None:
+            break
+        time.sleep(wait)
+    raise EightfoldRefused(f"{host} kept asking to slow down (HTTP 429)")
+
+
+def fetch_eightfold(slug):
+    """US postings from an Eightfold career site, such as Microsoft's."""
+    parts = urlsplit(slug if "://" in slug else "https://" + slug)
+    host = (parts.hostname or "").lower()
+    if not _HOSTNAME.match(host):
+        raise ValueError(f"eightfold slug needs a careers host, such as "
+                         f"apply.careers.microsoft.com/careers?domain=microsoft.com; got {slug!r}")
+    options = parse_qs(parts.query)
+    domain = (options.get("domain") or [host])[0]
+    queries = options.get("query") or [""]
+    positions, seen = [], set()
+    try:
+        for query in queries:
+            for page in range(EIGHTFOLD_MAX_PAGES):
+                rows = _eightfold_get(host, "search", {
+                    "domain": domain, "start": page * EIGHTFOLD_PAGE, "query": query,
+                    "location": "United States", "sort_by": "timestamp"}).get("positions") or []
+                for p in rows:
+                    if p.get("id") not in seen:
+                        seen.add(p.get("id"))
+                        positions.append(p)
+                if len(rows) < EIGHTFOLD_PAGE:
+                    break
+                time.sleep(EIGHTFOLD_DELAY)
+    except EightfoldRefused:
+        if not positions:
+            raise
+    out = []
+    for p in positions:
+        title = p.get("name") or ""
+        if is_senior_title(title) or _EIGHTFOLD_LEVEL.search(title):
+            continue
+        time.sleep(EIGHTFOLD_DELAY)
+        try:
+            details = _eightfold_get(host, "position_details", {
+                "position_id": p["id"], "domain": domain, "hl": "en"})
+        except EightfoldRefused:
+            if out:
+                break  # keep what was read; the next fetch picks up the rest
+            raise
+        public = str(details.get("publicUrl") or "")
+        path = str(p.get("positionUrl") or "")
+        if urlsplit(public).scheme == "https" and (urlsplit(public).hostname or "").lower() == host:
+            url = public
+        elif path.startswith("/") and not path.startswith("//"):
+            url = f"https://{host}{path}"
+        else:
+            url = ""
+        stamp = p.get("postedTs") or p.get("creationTs")
+        out.append({
+            "job_key": f"eightfold:{host}:{p['id']}", "source": "eightfold", "title": title,
+            "location": "; ".join(p.get("locations") or []),
+            "url": url,
+            "posted": datetime.fromtimestamp(int(stamp), timezone.utc).strftime("%Y-%m-%d") if stamp else "",
+            "description": html_to_text(details.get("jobDescription", "")),
+        })
+    return out
+
+
+# Workday hosts most large employers, which are most of the DOL filers. Its list
+# endpoint gives titles and a relative "Posted 3 Days Ago", but no description,
+# and the report needs the description for its disqualifier checks. So the list
+# is paged in full (cheap) and details are fetched only for recent postings.
+WORKDAY_MAX_AGE_DAYS = 2  # "Posted 2 Days Ago" can still be inside a 48-hour report
+WORKDAY_PAGE = 20          # the API rejects anything larger
+WORKDAY_DETAIL_DELAY = 0.1  # per request, per worker
+WORKDAY_WORKERS = 4
+_WORKDAY_AGE = re.compile(r"posted\s+(today|yesterday|(\d+)\+?\s+days?\s+ago)", re.I)
+
+
+def workday_age_days(posted_on):
+    """Days since posting from Workday's "Posted N Days Ago" text, or None."""
+    m = _WORKDAY_AGE.search(posted_on or "")
+    if not m:
+        return None
+    word = m.group(1).lower()
+    if word == "today":
+        return 0
+    if word == "yesterday":
+        return 1
+    return int(m.group(2))
+
+
+def fetch_workday(slug, max_age_days=WORKDAY_MAX_AGE_DAYS):
+    """slug is 'tenant/wdN/site', e.g. 'adobe/wd5/external_experienced'.
+
+    A big board can be narrowed to the board's own categories by adding them
+    as a query: 'walmart/wd504/WalmartExternal?jobFamilyGroup=<id>', with the
+    ids the board's filters use. Repeat a name for several values.
+    """
+    base, _, query = slug.partition("?")
+    parts = base.split("/")
+    if len(parts) != 3:
+        raise ValueError(f"workday slug must be tenant/wdN/site, got '{slug}'")
+    tenant, wd, site = parts
+    facets = parse_qs(query)
+    api = f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}"
+    headers = {**UA, "Accept": "application/json"}
+
+    def list_page(offset):
+        r = requests.post(f"{api}/jobs", headers=headers, timeout=25, json={
+            "appliedFacets": facets, "limit": WORKDAY_PAGE, "offset": offset,
+            "searchText": ""})
+        r.raise_for_status()
+        time.sleep(WORKDAY_DETAIL_DELAY)
+        return r.json()
+
+    def detail(path):
+        try:
+            return _get_json(f"{api}{path}").get("jobPostingInfo") or {}
+        except (requests.RequestException, ValueError) as exc:
+            return exc
+        finally:
+            time.sleep(WORKDAY_DETAIL_DELAY)
+
+    # The list has no usable sort order, so every page is read. The first page
+    # gives the total; the rest go through a small pool, since a big employer
+    # lists thousands of jobs at 20 a page.
+    first = list_page(0)
+    total = first.get("total") or 0
+    with ThreadPoolExecutor(WORKDAY_WORKERS) as pool:
+        pages = [first] + list(pool.map(list_page, range(WORKDAY_PAGE, total, WORKDAY_PAGE)))
+
+        # Ordering is unstable between requests, so a job can appear twice.
+        recent = {}
+        for page in pages:
+            for j in page.get("jobPostings") or []:
+                age = workday_age_days(j.get("postedOn"))
+                if age is not None and age > max_age_days:
+                    continue
+                recent.setdefault(j.get("externalPath", ""), j)
+        details = list(pool.map(detail, recent))
+
+    out, last_error = [], None
+    for (path, j), info in zip(recent.items(), details):
+        if isinstance(info, Exception):
+            last_error = info
+            continue
+        places = [info.get("location") or ""] + list(info.get("additionalLocations") or [])
+        location = "; ".join(p for p in places if p)
+        country = (info.get("country") or {}).get("descriptor")
+        if country:
+            location = f"{location}, {country}" if location else country
+        out.append({
+            "job_key": f"workday:{slug}:{info.get('jobReqId') or j.get('externalPath')}",
+            "source": "workday", "title": info.get("title") or j.get("title", ""),
+            "location": location, "url": info.get("externalUrl", ""),
+            "posted": (info.get("startDate") or "")[:10],
+            "description": html_to_text(info.get("jobDescription", "")),
+        })
+
+    # One bad detail is skipped; all of them failing means the board is down,
+    # and fetch-jobs must record that rather than an empty board.
+    if recent and not out:
+        raise last_error
+    return out
+
+
+FETCHERS = {"greenhouse": fetch_greenhouse, "lever": fetch_lever, "ashby": fetch_ashby,
+            "amazon": fetch_amazon, "eightfold": fetch_eightfold,
+            "workday": fetch_workday}
+
+
+def cmd_fetch_jobs(args):
+    with open(args.companies, encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh)
+
+    con = connect()
+    if args.replace:
+        con.execute("DELETE FROM jobs")
+        con.execute("DELETE FROM fetched_companies")
+        con.execute("DELETE FROM fetch_failures")
+    # SpeedyApply feeds were removed: their rows had no posting text, so the
+    # citizenship, clearance, degree and experience checks could not run on
+    # them. Rows a feed stored before go now, even without --replace.
+    con.execute("DELETE FROM jobs WHERE source = 'speedyapply'")
+    con.execute("DELETE FROM fetch_failures WHERE board LIKE 'speedyapply/%'")
+    con.commit()
+    if cfg.get("feeds"):
+        print("  ! companies.yaml has a `feeds:` section. Feeds are no longer "
+              "supported, so it is ignored; you can delete it.\n")
+
+    total, failed = 0, []
+    for provider, entries in (cfg.get("companies") or {}).items():
+        fetcher = FETCHERS.get(provider)
+        if not fetcher:
+            print(f"  ! unknown provider '{provider}', skipping")
+            continue
+        for entry in entries or []:
+            lca_name = None
+            if isinstance(entry, dict):
+                slug = entry.get("slug")
+                display = entry.get("name") or slug
+                lca_name = entry.get("lca_name")
+            else:
+                slug, display = entry, entry
+            try:
+                if provider == "workday":
+                    jobs = fetcher(slug, max_age_days=args.workday_days)
+                else:
+                    jobs = fetcher(slug)
+            except Exception as exc:
+                failed.append(f"{provider}/{slug}: {exc}")
+                # Read by the notification email, so a dead board is noticed.
+                con.execute("INSERT OR REPLACE INTO fetch_failures VALUES (?, ?, ?)",
+                            (f"{provider}/{slug}", str(exc)[:200],
+                             time.strftime("%Y-%m-%d %H:%M")))
+                con.commit()
+                continue
+            rows = [(
+                j["job_key"], j["source"], display, norm_employer(display),
+                j["title"], j["location"], j["url"], j["posted"],
+                j["description"][:20000], time.strftime("%Y-%m-%d %H:%M"), lca_name,
+            ) for j in jobs]
+            con.executemany(
+                "INSERT OR REPLACE INTO jobs (job_key, source, company, company_norm, "
+                "title, location, url, posted, description, fetched_at, lca_name) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+            # The report baselines employers it has not tracked before. A board
+            # that answered with no postings is tracked all the same, so its
+            # first real opening is reported rather than silenced.
+            con.execute("DELETE FROM fetch_failures WHERE board = ?",
+                        (f"{provider}/{slug}",))
+            con.execute(
+                "INSERT OR REPLACE INTO fetched_companies VALUES (?, ?)",
+                (norm_employer(display), time.strftime("%Y-%m-%d %H:%M")))
+            con.commit()
+            total += len(rows)
+            print(f"  {display:<28} {provider:<11} {len(rows):>4} postings")
+            time.sleep(args.delay)
+
+    con.close()
+    print(f"\n{total:,} postings stored.")
+    if failed:
+        print(f"{len(failed)} board(s) failed. Usually a wrong slug:")
+        for f in failed:
+            print("  -", f)
+
+
+# ------------------------------------------------------------------- discover
+#
+# Turns the employer list you already loaded from DOL into a company list, by
+# guessing job board slugs from employer names and probing which ones are real.
+
+# Words dropped when building slug guesses, on top of the corporate suffixes in
+# _SUFFIXES. These appear in legal names but rarely in board URLs.
+_SLUG_DROP = {"technologies", "technology", "systems", "solutions", "services",
+              "software", "labs", "laboratories", "international", "global",
+              "worldwide", "enterprises", "industries", "partners", "ventures"}
+
+PROBE_URLS = {
+    "greenhouse": "https://boards-api.greenhouse.io/v1/boards/{slug}/jobs",
+    "lever": "https://api.lever.co/v0/postings/{slug}?mode=json&limit=1",
+    "ashby": "https://api.ashbyhq.com/posting-api/job-board/{slug}",
+}
+
+
+def slug_candidates(name):
+    """Plausible board slugs for an employer name, most likely first.
+
+    Deliberately conservative. It does not try single-token guesses on
+    multi-word names, because 'definitive' from 'Definitive Intelligence' would
+    happily match some unrelated company's board and quietly poison the results.
+    """
+    base = norm_employer(name)
+    if not base:
+        return []
+    toks = [t for t in base.split() if t not in _SLUG_DROP] or base.split()
+    joined = "".join(toks)
+    out = [joined]
+    if len(toks) > 1:
+        out.append("-".join(toks))
+    # Variants that keep the filler words ("benchlingtechnologies"). Generated
+    # whenever anything was dropped, not just for multi-token names, or a name
+    # that reduces to a single token would never get this guess.
+    full = "".join(base.split())
+    if full != joined:
+        out.append(full)
+        out.append("-".join(base.split()))
+    seen, uniq = set(), []
+    for s in out:
+        if s and s not in seen and 2 <= len(s) <= 40:
+            seen.add(s)
+            uniq.append(s)
+    return uniq
+
+
+def probe(provider, slug, timeout=12):
+    """Return (ok, n_jobs). A real board with zero openings still counts as ok.
+
+    `ok` is True (the board exists), False (it definitively does not), or None
+    (could not tell). The None case matters because a 429 or a read timeout
+    says nothing about the slug: recording it as False would write off a real
+    employer until the database is rebuilt. Only definitive answers are cached.
+    """
+    url = PROBE_URLS[provider].format(slug=slug)
+    try:
+        r = requests.get(url, headers=UA, timeout=timeout)
+    except requests.RequestException:
+        return None, 0
+    if r.status_code in (404, 410):
+        return False, 0
+    if r.status_code != 200:
+        # 429, 5xx, or a redirect to a login page: unknown, not a miss.
+        return None, 0
+    try:
+        data = r.json()
+    except ValueError:
+        return False, 0
+    if provider == "greenhouse":
+        return isinstance(data, dict) and "jobs" in data, len(data.get("jobs", []))
+    if provider == "lever":
+        return isinstance(data, list), len(data)
+    return isinstance(data, dict) and "jobs" in data, len(data.get("jobs", []))
+
+
+# Workday data centers, most common first. Every other wdN host is absent from
+# DNS. A slug is tenant/wdN/site: the tenant is guessable from the employer
+# name, the data center is found by trying each host, and the site is guessed
+# from names employers commonly use. Site names are case-insensitive.
+WORKDAY_HOSTS = ("wd1", "wd5", "wd12", "wd3", "wd10", "wd103", "wd108", "wd102",
+                 "wd105", "wd107", "wd109", "wd501", "wd502", "wd503", "wd504")
+WORKDAY_SITES = ("external", "careers", "externalcareers", "external_careers",
+                 "externalcareersite", "external_career_site", "external_career",
+                 "external_experienced", "corporatecareers", "ext", "jobs",
+                 "{t}", "{t}careers", "{t}_careers", "{t}external", "{t}_external",
+                 "{t}externalcareersite", "{t}_external_career_site", "{n}", "{n}_careers")
+
+
+def _workday_status(tenant, wd, site, timeout):
+    """(status code or None, total jobs) for one tenant/wd/site guess."""
+    url = f"https://{tenant}.{wd}.myworkdayjobs.com/wday/cxs/{tenant}/{site}/jobs"
+    try:
+        r = requests.post(url, headers={**UA, "Accept": "application/json"},
+                          timeout=timeout, json={"appliedFacets": {}, "limit": 1,
+                                                 "offset": 0, "searchText": ""})
+    except requests.RequestException:
+        return None, 0
+    total = 0
+    if r.status_code == 200:
+        try:
+            total = r.json().get("total") or 0
+        except ValueError:
+            return None, 0
+    return r.status_code, total
+
+
+def find_workday_board(tenant, name, timeout=12):
+    """Return (ok, slug, n_jobs) for a Workday tenant guess.
+
+    ok is True with the full slug on a hit. It is False with slug None when no
+    data center knows the tenant, and False with a partial "tenant/wdN" slug
+    when the tenant exists but none of the common site names match, so the
+    caller can report it for a manual lookup. It is None when an error
+    (429, 5xx, timeout) made the answer uncertain, which must not be cached.
+    """
+    for wd in WORKDAY_HOSTS:
+        status, total = _workday_status(tenant, wd, "external", timeout)
+        if status == 422:
+            continue            # unknown tenant on this data center
+        if status == 200:
+            return True, f"{tenant}/{wd}/external", total
+        if status != 404:
+            return None, None, 0
+
+        words = [t for t in norm_employer(name).split() if t not in _SLUG_DROP]
+        sites = dict.fromkeys(s.format(t=tenant, n="_".join(words))
+                              for s in WORKDAY_SITES[1:])
+        for site in sites:
+            status, total = _workday_status(tenant, wd, site, timeout)
+            if status == 200:
+                return True, f"{tenant}/{wd}/{site}", total
+            if status != 404:
+                return None, None, 0
+        return False, f"{tenant}/{wd}", 0
+    return False, None, 0
+
+
+DEFAULT_ROLES = ("software", "developer", "engineer", "data scien", "data analyst",
+                 "machine learning", "computer", "research", "programmer",
+                 "statistician", "analyst")
+
+
+def _discover_workday(con, candidates, args):
+    """Search Workday for the heavier filers. Returns {display: [(slug, n)]}.
+
+    Each tenant guess can cost a request per data center, so this is opt-in
+    and limited to employers with at least --workday-min-certified filings,
+    which is where Workday users are. Every definite answer is cached.
+    """
+    from concurrent.futures import as_completed
+
+    targets = [(d, c) for _, d, c in candidates if c >= args.workday_min_certified]
+    cached = {slug: (ok, n, resolved) for slug, ok, n, resolved in con.execute(
+        "SELECT slug, ok, n_jobs, resolved FROM probe_cache WHERE provider = 'workday'")}
+
+    pending = {}
+    for display, certified in targets:
+        for tenant in slug_candidates(display):
+            if "-" in tenant or tenant in cached:
+                continue  # Workday tenants have no hyphens
+            if tenant not in pending or certified > pending[tenant][1]:
+                pending[tenant] = (display, certified)
+
+    print(f"\nWorkday: {len(targets):,} employers with >= {args.workday_min_certified} "
+          f"certified LCAs, {len(pending):,} tenant guesses to try "
+          f"({len(cached):,} already cached).")
+    transient = 0
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futs = {pool.submit(find_workday_board, t, d): (t, d) for t, (d, _) in pending.items()}
+        try:
+            for fut in as_completed(futs):
+                tenant, display = futs[fut]
+                try:
+                    ok, board, n = fut.result()
+                except Exception:
+                    ok, board, n = None, None, 0
+                if ok is None:
+                    transient += 1
+                    continue
+                con.execute(
+                    "INSERT OR REPLACE INTO probe_cache VALUES (?,?,?,?,?,?)",
+                    ("workday", tenant, int(ok), n, time.strftime("%Y-%m-%d"), board))
+                con.commit()
+                cached[tenant] = (ok, n, board)
+                if ok:
+                    print(f"  HIT workday     {board:<40} {n:>4} jobs   ({display})")
+        except KeyboardInterrupt:
+            print("\nInterrupted. Workday answers so far are cached.")
+            pool.shutdown(wait=False, cancel_futures=True)
+    if transient:
+        print(f"  {transient:,} Workday search(es) failed transiently and were left "
+              f"uncached. Re-run to retry them.")
+
+    found, partial = {}, []
+    for display, _ in targets:
+        for tenant in slug_candidates(display):
+            ok, n, board = cached.get(tenant, (False, 0, None))
+            if ok:
+                found.setdefault(display, []).append((board, n))
+            elif board:
+                partial.append((board, display))
+    if partial:
+        print("  Workday tenants found, but not their site name. Open the employer's "
+              "careers page, copy the part after myworkdayjobs.com/, and add "
+              "tenant/wdN/site to companies.yaml by hand:")
+        for board, display in sorted(set(partial)):
+            print(f"    {board:<24} {display}")
+    return found
+
+
+def cmd_discover(args):
+    con = connect()
+    roles = [r.strip().lower() for r in args.roles.split(",") if r.strip()] \
+        if args.roles else list(DEFAULT_ROLES)
+    states = [s.strip().upper() for s in args.states.split(",") if s.strip()] \
+        if args.states else None
+
+    rows = con.execute(
+        "SELECT employer_norm, employer_display, certified, titles, states "
+        "FROM employers WHERE certified >= ? ORDER BY certified DESC",
+        (args.min_certified,)).fetchall()
+    if not rows:
+        raise SystemExit("No employers loaded. Run `load-lca` first.")
+
+    candidates = []
+    for norm, display, certified, titles_json, states_json in rows:
+        titles = " ".join(json.loads(titles_json or "[]")).lower()
+        if roles and not any(r in titles for r in roles):
+            continue
+        if states:
+            emp_states = json.loads(states_json or "[]")
+            if not any(s in emp_states for s in states):
+                continue
+        # No name-based exclusion. Filtering employers by whether their name
+        # contains "consulting" drops Deloitte and Palantir while keeping TCS,
+        # Infosys and Accenture, which is arbitrary and silently loses good
+        # employers. Volume and wage-level data are in the report instead, so
+        # you can judge rather than have the tool judge for you.
+        if args.max_certified and certified > args.max_certified:
+            continue
+        candidates.append((norm, display, certified))
+        if len(candidates) >= args.limit:
+            break
+
+    print(f"{len(candidates):,} candidate employers "
+          f"(certified >= {args.min_certified}"
+          f"{', states ' + ','.join(states) if states else ', nationwide'}).")
+
+    cache = {(p, s): (ok, n) for p, s, ok, n in con.execute(
+        "SELECT provider, slug, ok, n_jobs FROM probe_cache")}
+
+    # Two employers can generate the same slug guess ("Acme Labs" and "Acme
+    # Laboratories" both reduce to "acme"). One task per (provider, slug),
+    # attributed to the heaviest filer, avoids probing the same URL twice.
+    pending = {}
+    for norm, display, certified in candidates:
+        for slug in slug_candidates(display):
+            for provider in PROBE_URLS:
+                if (provider, slug) in cache:
+                    continue
+                prev = pending.get((provider, slug))
+                if prev is None or certified > prev[1]:
+                    pending[(provider, slug)] = (display, certified)
+    tasks = [(p, s, d, c) for (p, s), (d, c) in pending.items()]
+
+    print(f"{len(tasks):,} probes to run "
+          f"({len(cache):,} already cached). Ctrl-C is safe, results are saved as they land.")
+
+    done, transient = 0, 0
+    if tasks:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futs = {pool.submit(probe, p, s): (p, s, d, c) for p, s, d, c in tasks}
+            try:
+                for fut in as_completed(futs):
+                    provider, slug, display, certified = futs[fut]
+                    try:
+                        ok, n = fut.result()
+                    except Exception:
+                        ok, n = False, 0
+                    done += 1
+                    if ok is None:
+                        # Not a definitive answer. Left uncached so that the
+                        # next run retries instead of writing the employer off.
+                        transient += 1
+                        continue
+                    con.execute(
+                        "INSERT OR REPLACE INTO probe_cache "
+                        "(provider, slug, ok, n_jobs, checked_at) VALUES (?,?,?,?,?)",
+                        (provider, slug, int(ok), n, time.strftime("%Y-%m-%d")))
+                    if ok:
+                        cache[(provider, slug)] = (True, n)
+                        print(f"  HIT {provider:<11} {slug:<28} {n:>4} jobs   ({display})")
+                    if done % 300 == 0:
+                        con.commit()
+                        print(f"  ...{done:,}/{len(tasks):,}")
+            except KeyboardInterrupt:
+                print("\nInterrupted, saving what we have.")
+            finally:
+                con.commit()
+    if transient:
+        print(f"  {transient:,} probe(s) failed transiently (timeout, rate limit "
+              f"or server error) and were left uncached. Re-run to retry them.")
+
+    workday = _discover_workday(con, candidates, args) \
+        if getattr(args, "workday", False) else {}
+
+    # Rebuild the company list from every cached hit that maps to a candidate.
+    by_display = {}
+    for norm, display, certified in candidates:
+        for slug in slug_candidates(display):
+            for provider in PROBE_URLS:
+                ok, n = cache.get((provider, slug), (False, 0))
+                if ok:
+                    prev = by_display.get(display)
+                    if prev is None or n > prev[2]:
+                        by_display[display] = (provider, slug, n, certified)
+        for board, n in workday.get(display, []):
+            prev = by_display.get(display)
+            if prev is None or n > prev[2]:
+                by_display[display] = ("workday", board, n, certified)
+
+    existing = {}
+    if os.path.exists(args.out):
+        with open(args.out, encoding="utf-8") as fh:
+            cfg = yaml.safe_load(fh) or {}
+        if args.merge:
+            existing = cfg.get("companies") or {}
+
+    # Providers discover cannot probe, such as Workday, are carried over as-is.
+    merged = {p: list(v or []) for p, v in existing.items()}
+    for p in (*PROBE_URLS, "workday"):
+        merged.setdefault(p, [])
+    seen = {p: {(e.get("slug") if isinstance(e, dict) else e) for e in merged[p]}
+            for p in merged}
+    added = 0
+    for display, (provider, slug, n, certified) in sorted(
+            by_display.items(), key=lambda kv: -kv[1][3]):
+        if slug in seen[provider]:
+            continue
+        merged[provider].append({"slug": slug, "name": display})
+        seen[provider].add(slug)
+        added += 1
+
+    with open(args.out, "w", encoding="utf-8") as fh:
+        fh.write("# Generated by `sponsorscan.py discover`. Hand edits to `name:`\n"
+                 "# are preserved on re-run with --merge (the default).\n"
+                 "#\n"
+                 "# Slugs are guessed from DOL employer names and confirmed by a live\n"
+                 "# probe, so a listed board definitely exists. It is still possible for\n"
+                 "# a guess to land on a DIFFERENT company with a similar name. If a\n"
+                 "# company's postings look wrong, delete its line.\n\n")
+        out = {"companies": {p: v for p, v in merged.items() if v}}
+        yaml.safe_dump(out, fh, sort_keys=False, default_flow_style=False)
+
+    con.close()
+    total = sum(len(v) for v in merged.values())
+    print(f"\n{len(by_display):,} employers matched to a live board. "
+          f"Added {added:,} new; {total:,} companies now in {args.out}.")
+    print("Next:  python sponsorscan.py fetch-jobs --replace")
+
+
+# ---------------------------------------------------------------------- report
+
+# "Only U.S. citizens are eligible", the word order the other citizenship
+# patterns miss.
+ONLY_CITIZENS = r"\bonly\s+(?:u\.?\s?s\.?|united states)\s?(?:citizens?|persons?)\b"
+
+# A restriction stated in the negative is not a restriction: "this position
+# does not require a security clearance", "a clearance is not required".
+_NEGATED_BEFORE = re.compile(
+    r"(?:\b(?:no|not|non|without|never)\b|n't\b)[^.;\n]{0,40}$", re.I)
+_NEGATED_AFTER = re.compile(
+    r"^[^.;\n]{0,25}?\b(?:not|never)\s+(?:be\s+)?(?:required|needed|necessary)\b"
+    r"|^[^.;\n]{0,25}?\bis\s+optional\b", re.I)
+
+
+class Unnegated:
+    """A pattern whose matches stated in the negative are skipped.
+
+    It has the `search` and `pattern` of a compiled pattern, so it sits in the
+    same lists and callers need not know the difference.
+    """
+
+    def __init__(self, pattern):
+        self.pattern = pattern
+        self._regex = re.compile(pattern, re.I)
+
+    def search(self, text):
+        text = text or ""
+        for match in self._regex.finditer(text):
+            before = text[max(0, match.start() - 60):match.start()]
+            after = text[match.end():match.end() + 40]
+            if not (_NEGATED_BEFORE.search(before) or _NEGATED_AFTER.search(after)):
+                return match
+        return None
+
+
+# Clearance and export-control restrictions, shared by every report.
+#
+# A bare mention of export controls is not one: "this role may be subject to
+# U.S. export control laws" is boilerplate at many employers that sponsor,
+# often through an export license. Only a requirement to work with
+# export-controlled material counts here; "must be a U.S. person" is caught by
+# the citizenship patterns.
+CLEARANCE_RES = [
+    Unnegated(r"\bsecurity clearance\b"),
+    Unnegated(r"\bitar\b"),
+    re.compile(r"\b(?:require|requires|required|must)\b[^.;\n]{0,60}"
+               r"\bexport[- ]controlled\b", re.I),
+]
+
+# Phrases that mean you are excluded regardless of anything else. Checked against
+# the posting body. This is the filter that actually matters while on OPT.
+DISQUALIFIERS = [
+    # Any negation followed by "sponsor" within the same clause. Catches the
+    # long tail of phrasings ("do not offer", "does not provide", "unable to",
+    # "without", "no sponsorship available", "not now or in the future require")
+    # without needing a pattern per variant. A sentence, a semicolon and a line
+    # break all end the clause, so that an unrelated negation earlier in the
+    # sentence cannot reach the word: "There is no cost to relocate; we sponsor
+    # visas" is not a refusal.
+    r"\b(?:not|no|non|unable|without|cannot|can't|won't|unwilling)\b[^.;\n]{0,60}?sponsor",
+    r"\bmust be (?:a |an )?(?:u\.?\s?s\.?|united states)\s?(?:citizen|person|national)\b",
+    r"\b(?:u\.?\s?s\.?|united states)\s?citizenship (?:is )?required\b",
+    r"\b(?:u\.?\s?s\.?|united states)\s?(?:citizens?|persons?)\s+only\b",
+    ONLY_CITIZENS,
+]
+
+SPONSOR_POSITIVE = [
+    r"\bvisa sponsorship (?:is )?available\b",
+    r"\bwe (?:will )?sponsor\b",
+    r"\bh-?1b sponsorship\b",
+    r"\bsponsorship (?:is )?(?:available|offered|provided)\b",
+]
+
+SENIOR_TITLE = re.compile(
+    r"\b(senior|sr\.?|staff|principal|distinguished|lead|architect|manager|"
+    r"director|head of|vp|vice president|chief|fellow)\b", re.I)
+
+ENTRY_TITLE = re.compile(
+    r"\b(intern|internship|new ?grad|new graduate|university grad|recent grad|"
+    r"early career|entry.level|junior|jr\.?|associate|apprentice|i{1,2}\b)\b", re.I)
+
+# Wording that marks a posting as early career even when the title also has a
+# senior word, as in "Program Manager Intern". Stricter than ENTRY_TITLE, which
+# includes "associate" and a bare "II" and would let "Senior Associate" through.
+EARLY_CAREER_TITLE = re.compile(
+    r"\b(intern|internship|new ?grad|new graduate|university grad|recent grad|"
+    r"early career|entry.level|apprentice(?:ship)?)\b", re.I)
+
+
+def is_senior_title(title):
+    title = title or ""
+    return bool(SENIOR_TITLE.search(title)) and not EARLY_CAREER_TITLE.search(title)
+
+
+DISQ_RE = [re.compile(p, re.I) for p in DISQUALIFIERS] + CLEARANCE_RES
+POS_RE = [re.compile(p, re.I) for p in SPONSOR_POSITIVE]
+
+
+def load_employer_index(con):
+    rows = con.execute(
+        "SELECT employer_norm, employer_display, certified, denied, withdrawn, titles, "
+        "       states, lvl1, lvl2, lvl3, lvl4 FROM employers").fetchall()
+    out = {}
+    for r in rows:
+        lvls = [r[7] or 0, r[8] or 0, r[9] or 0, r[10] or 0]
+        tot = sum(lvls)
+        filed = (r[2] or 0) + (r[3] or 0) + (r[4] or 0)
+        out[r[0]] = {
+            "display": r[1], "certified": r[2], "denied": r[3], "withdrawn": r[4],
+            "titles": json.loads(r[5] or "[]"), "states": json.loads(r[6] or "[]"),
+            "lvls": lvls,
+            # Share filed at Level III/IV. Higher is better on two counts: the
+            # pay is higher, and the FY2027 weighted lottery favours those levels.
+            "senior_share": round((lvls[2] + lvls[3]) / tot, 2) if tot else None,
+            "trouble_rate": round(((r[3] or 0) + (r[4] or 0)) / filed, 2) if filed else None,
+        }
+    return out
+
+
+def match_employer(company_norm, index, keys, cutoff):
+    """The DOL employer a board's company name stands for, as (key, score).
+
+    Every name tied for the best score is a candidate, the exact key included,
+    and the one with the most certified LCAs wins. DOL lists stub filers under
+    bare brand names beside the entity that does the company's real filing:
+    "AMAZON" with 2 certified LCAs next to Amazon.com Services LLC with 92,132.
+    Taking the exact key, or the first fuzzy hit in table order, lands on the
+    stub. Where a brand and its legal name share no words (Instacart files as
+    Maplebear), set `lca_name:` in companies.yaml instead.
+    """
+    candidates = [(company_norm, 100)] if company_norm in index else []
+    if HAVE_RAPIDFUZZ and keys and cutoff > 0:
+        candidates += [(key, int(score)) for key, score, _ in rf_process.extract(
+            company_norm, keys, scorer=rf_fuzz.token_set_ratio,
+            score_cutoff=cutoff, limit=None)]
+    if not candidates:
+        return None, 0
+    top = max(score for _, score in candidates)
+    best = max((key for key, score in candidates if score == top),
+               key=lambda k: (index[k].get("certified") or 0, k == company_norm, k))
+    return best, top
+
+
+def cmd_report(args):
+    con = connect()
+    index = load_employer_index(con)
+    keys = list(index.keys())
+    if not index:
+        raise SystemExit("No LCA data loaded. Run `load-lca` first.")
+
+    locs = [s.strip().lower() for s in (args.locations or "").split(",") if s.strip()]
+    results, dropped = [], 0
+
+    for row in con.execute(
+            "SELECT company, company_norm, title, location, url, posted, description, source, "
+            "lca_name FROM jobs"):
+        company, cnorm, title, location, url, posted, desc, source, lca_name = row
+        blob = f"{title}\n{desc}"
+
+        hit = next((p.pattern for p in DISQ_RE if p.search(blob)), None)
+        if hit:
+            dropped += 1
+            continue
+
+        if not args.include_senior and is_senior_title(title):
+            continue
+
+        score, why = 0, []
+
+        key, conf = match_employer(norm_employer(lca_name) if lca_name else cnorm,
+                                   index, keys, args.fuzzy_cutoff)
+        emp = index.get(key) if key else None
+        if emp and emp["certified"] > 0:
+            score += 40
+            why.append(f"{emp['certified']} certified LCAs")
+            if conf < 100:
+                why.append(f"fuzzy match {conf} to '{emp['display']}'")
+            if emp["certified"] >= 25:
+                score += 10
+            if emp["senior_share"] is not None and emp["senior_share"] >= 0.5:
+                score += 10
+                why.append(f"{int(emp['senior_share']*100)}% filed at wage level III/IV")
+            # Denied and withdrawn filings are reported in their own column
+            # but never lower the score: see sponsorship_score in
+            # sponsor_daily_report.py for why.
+            tl = (title or "").lower()
+            if any(any(w in t for w in tl.split() if len(w) > 4) for t in emp["titles"]):
+                score += 15
+                why.append("filed for similar roles")
+        elif args.sponsors_only:
+            continue
+
+        if ENTRY_TITLE.search(title or ""):
+            score += 20
+            why.append("entry level")
+
+        if locs and any(loc in (location or "").lower() for loc in locs):
+            score += 15
+            why.append("location match")
+        elif locs and not args.any_location:
+            continue
+
+        if any(p.search(blob) for p in POS_RE):
+            score += 10
+            why.append("sponsorship stated in posting")
+
+        results.append({
+            "score": score, "company": company, "title": title,
+            "location": location, "posted": posted, "source": source,
+            "signals": "; ".join(why), "url": url,
+            "lca_certified": emp["certified"] if emp else 0,
+            "lca_senior_wage_share": emp["senior_share"] if emp else None,
+            "lca_denied_withdrawn_rate": emp["trouble_rate"] if emp else None,
+        })
+
+    con.close()
+    results.sort(key=lambda r: (-r["score"], r["company"]))
+
+    if args.out:
+        with open(args.out, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=list(results[0].keys()) if results else
+                               ["score", "company", "title", "location", "posted",
+                                "source", "signals", "url", "lca_certified",
+                                "lca_senior_wage_share", "lca_denied_withdrawn_rate"])
+            w.writeheader()
+            w.writerows(results)
+        print(f"Wrote {len(results)} rows to {args.out}")
+
+    print(f"\n{dropped} postings dropped on explicit disqualifiers "
+          f"(citizenship, clearance, or no-sponsorship language).\n")
+    for r in results[:args.top]:
+        print(f"[{r['score']:>3}] {r['company']} - {r['title']}")
+        print(f"      {r['location'] or '?'} | {r['posted'] or '?'} | {r['signals']}")
+        print(f"      {r['url']}\n")
+
+
+# ----------------------------------------------------------------------- setup
+
+def cmd_setup(args):
+    """Ask a few questions and write a valid profile."""
+    import onboarding
+
+    print("This writes a candidate profile. Blank answers take the default.\n")
+    try:
+        path = onboarding.run_setup(onboarding.console_ask,
+                                    profiles_dir=args.profiles_dir,
+                                    notify=print)
+    except (KeyboardInterrupt, EOFError):
+        raise SystemExit("\nCancelled. Nothing was written.")
+
+    from profile_loader import load_profile
+
+    print(f"\nWrote {path}\n")
+    print(onboarding.setup_guide(load_profile(path), path, windows=os.name == "nt"))
+
+
+# ---------------------------------------------------------------------- doctor
+
+def cmd_doctor(args):
+    """Report which pipeline stage needs attention.
+
+    The checks live in onboarding.py as pure functions; this only supplies the
+    paths, the environment and the date, then prints and sets the exit code.
+    """
+    import datetime
+
+    import onboarding
+
+    results = onboarding.run_checks(
+        db_path=args.db or DB_PATH,
+        companies_path=args.companies,
+        profile_path=args.profile,
+        env=os.environ,
+        today=datetime.date.today())
+
+    print(onboarding.format_results(results))
+    raise SystemExit(onboarding.exit_code(results))
+
+
+# ------------------------------------------------------------------------ main
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    a = sub.add_parser("load-lca", help="Load DOL LCA disclosure file into SQLite")
+    a.add_argument("path", nargs="?", default=None,
+                   help="Local .xlsx/.csv path, or an https:// URL")
+    a.add_argument("--latest", action="store_true",
+                   help="Resolve the newest disclosure file from the DOL site "
+                        "instead of passing a path")
+    a.add_argument("--prebuilt", nargs="?", const=PREBUILT_LCA_URL, default=None,
+                   metavar="POINTER",
+                   help="Load the employer table SponsorScan publishes each quarter, "
+                        "in seconds instead of minutes (or the lca.json at POINTER)")
+    a.add_argument("--replace", action="store_true", help="Clear existing employer rows first")
+    a.set_defaults(func=cmd_load_lca)
+
+    x = sub.add_parser("export-lca",
+                       help="Write the loaded LCA data as a prebuilt table, for publishing")
+    x.add_argument("out", nargs="?", default="lca.ndjson.gz",
+                   help="Data file to write; lca.json is written beside it")
+    x.set_defaults(func=cmd_export_lca)
+
+    b = sub.add_parser("fetch-jobs", help="Pull live postings from ATS job boards")
+    b.add_argument("--companies", default="companies.yaml")
+    b.add_argument("--replace", action="store_true")
+    b.add_argument("--delay", type=float, default=0.4, help="Seconds between boards")
+    b.add_argument("--workday-days", type=int, default=WORKDAY_MAX_AGE_DAYS,
+                   help="Fetch Workday postings up to this many days old "
+                        f"(default {WORKDAY_MAX_AGE_DAYS})")
+    b.set_defaults(func=cmd_fetch_jobs)
+
+    d = sub.add_parser("discover", help="Build companies.yaml from the DOL employer list")
+    d.add_argument("--out", default="companies.yaml")
+    d.add_argument("--min-certified", type=int, default=5,
+                   help="Skip employers with fewer certified LCAs (default 5)")
+    d.add_argument("--roles", default="",
+                   help="Comma-separated title keywords; blank uses a tech/data default set")
+    d.add_argument("--states", default="",
+                   help="Comma-separated 2-letter states; blank means nationwide")
+    d.add_argument("--limit", type=int, default=2000, help="Max employers to probe")
+    d.add_argument("--workers", type=int, default=12)
+    d.add_argument("--max-certified", type=int, default=0,
+                   help="Skip employers above this many certified LCAs "
+                        "(0 = no cap). Use to exclude the handful of mega-filers.")
+    d.add_argument("--workday", action="store_true",
+                   help="Also search Workday boards. Slower: up to one request per "
+                        "Workday data center for each guess")
+    d.add_argument("--workday-min-certified", type=int, default=100,
+                   help="Only search Workday for employers with at least this many "
+                        "certified LCAs (default 100)")
+    d.add_argument("--no-merge", dest="merge", action="store_false",
+                   help="Overwrite the company list instead of merging into it")
+    d.set_defaults(func=cmd_discover, merge=True)
+
+    c = sub.add_parser("report", help="Join, filter, rank, export")
+    c.add_argument("--out", default="matches.csv")
+    c.add_argument("--top", type=int, default=25)
+    c.add_argument("--locations", default="",
+                   help="Comma-separated location substrings; blank means anywhere in the US")
+    c.add_argument("--any-location", action="store_true",
+                   help="Keep postings that miss the location filter")
+    c.add_argument("--include-senior", action="store_true")
+    c.add_argument("--sponsors-only", action="store_true",
+                   help="Drop employers with no certified LCAs on record")
+    c.add_argument("--fuzzy-cutoff", type=int, default=90)
+    c.set_defaults(func=cmd_report)
+
+    st = sub.add_parser("setup", help="Answer a few questions to write a profile")
+    st.add_argument("--profiles-dir", default="profiles",
+                    help="Directory the profile is written to")
+    st.set_defaults(func=cmd_setup)
+
+    doc = sub.add_parser("doctor",
+                         help="Check each pipeline stage and report what to fix")
+    doc.add_argument("--profile", default=None,
+                     help="Profile to validate; omitted skips the profile checks")
+    doc.add_argument("--companies", default="companies.yaml")
+    doc.add_argument("--db", default=None,
+                     help="Database to inspect; defaults to SPONSORSCAN_DB or ./sponsorscan.db")
+    doc.set_defaults(func=cmd_doctor)
+
+    dashboard = sub.add_parser("dashboard", help="Open your local job and application dashboard")
+    dashboard.add_argument("--profile", default=None,
+                           help="Existing profile; otherwise use the local onboarding screen")
+    dashboard.add_argument("--db", default=None, help="Existing job database")
+    dashboard.add_argument("--companies", default="companies.yaml")
+    dashboard.add_argument("--workspace", default=".sponsorscan-dashboard",
+                           help="Private folder for dashboard profile and application history")
+    dashboard.add_argument("--port", type=int, default=8765)
+    dashboard.add_argument("--no-browser", action="store_true",
+                           help="Print the URL without opening the browser")
+
+    def open_dashboard(args):
+        from local_dashboard import run_dashboard
+        run_dashboard(args)
+
+    dashboard.set_defaults(func=open_dashboard)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

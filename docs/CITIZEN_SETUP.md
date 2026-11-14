@@ -1,0 +1,311 @@
+# U.S. Citizen Setup
+
+This guide explains how to configure SponsorScan for a U.S. citizen candidate.
+
+The citizen profile keeps roles that require U.S. citizenship or permanent work
+authorization, while still applying entry-level, resume, degree, and seniority
+filters.
+
+**You do not need the DOL LCA data.** Sponsorship history says nothing about
+whether a job suits a citizen, so a profile with `work_authorization` set to
+`us_citizen` or `permanent_resident` ignores it. Skip `load-lca` entirely. Every
+job gets the same flat sponsorship score, so an employer that has never filed an
+LCA ranks the same as one that files thousands, and the `minimum_score` and
+priority labels mean the same as for any other profile. If LCA data happens to be
+loaded, `lca_certified` still shows each employer's filing count as information.
+
+## 1. Copy the example profile
+
+From the repository root:
+
+### Windows PowerShell
+
+```powershell
+Copy-Item ".\profiles\citizen_profile.example.json" `
+  ".\profiles\citizen_profile.json"
+```
+
+### macOS and Linux
+
+```bash
+cp profiles/citizen_profile.example.json profiles/citizen_profile.json
+```
+
+The copied file is your personal configuration. Do not edit the example file
+directly if you want to keep a clean template for future users.
+
+## 2. Update the profile
+
+Open the copy you just made, `profiles/citizen_profile.json`. The `profiles`
+folder is inside the `sponsorscan` folder. Any plain-text editor works; from the
+`sponsorscan` folder, one of these opens it:
+
+```powershell
+notepad profiles\citizen_profile.json
+```
+
+```bash
+open -e profiles/citizen_profile.json   # macOS, in TextEdit
+```
+
+Keep the quotation marks, commas and braces as they are, and save it as plain
+text with the `.json` name unchanged. `python sponsorscan.py doctor --profile
+profiles/citizen_profile.json` reports a mistake in the file by line.
+
+At minimum, update:
+
+```json
+{
+  "profile_id": "your_name_citizen",
+  "name": "Your Name"
+}
+```
+
+Use a short, unique `profile_id` because SponsorScan may use it when naming
+state files and outputs.
+
+## 3. Configure eligibility rules
+
+The citizen example includes these defaults:
+
+```json
+{
+  "work_authorization": "us_citizen",
+  "max_required_experience": 1,
+  "reject_senior_titles": true,
+  "reject_level_ii_plus_titles": true,
+  "reject_masters_mentions": false,
+  "reject_phd_mentions": false,
+  "reject_clearance_roles": true,
+  "reject_citizenship_required": false,
+  "reject_permanent_authorization_required": false,
+  "reject_opt_excluded": false,
+  "reject_no_future_sponsorship": false
+}
+```
+
+### Field behavior
+
+| Field | Meaning |
+|---|---|
+| `max_required_experience` | Highest acceptable minimum years-of-experience requirement |
+| `reject_senior_titles` | Reject Senior, Staff, Principal, Lead, Manager, and similar titles |
+| `reject_level_ii_plus_titles` | Reject Engineer II/III/IV/V and numeric Level 2+ titles |
+| `reject_masters_required` | Reject postings that *require* a master's degree (default true) |
+| `reject_phd_required` | Reject postings that *require* a PhD (default true) |
+| `reject_masters_mentions` | Reject postings that mention a master's degree at all, including "a plus" |
+| `reject_phd_mentions` | Reject postings that mention a PhD at all, including "a plus" |
+| `reject_clearance_roles` | Reject roles that require a security clearance |
+| `reject_citizenship_required` | Keep or reject U.S.-citizenship-required roles |
+| `reject_permanent_authorization_required` | Keep or reject permanent-work-authorization roles |
+| `reject_opt_excluded` | Relevant mainly to OPT profiles; normally false for citizens |
+| `reject_no_future_sponsorship` | Only applies to profiles that need sponsorship; a citizen's profile ignores it |
+
+The `_required` flags look for a stated requirement, such as "a PhD is
+required" or "minimum qualifications: master's degree". They are on by default
+because such a posting is a genuine blocker for an entry-level candidate.
+
+The `_mentions` flags are far blunter: they fire on any occurrence of the
+degree, so "a Master's is a plus" is rejected too. Leave them off unless the
+`_required` filters are letting through more than you want to read.
+
+A U.S. citizen can generally keep citizenship-required roles, so
+`reject_citizenship_required` is set to false in
+`profiles/citizen_profile.example.json`. The loader's own default is true, so a
+profile written from scratch has to set it explicitly. `sponsor_daily_report.py`
+prints a warning when `work_authorization` is `us_citizen` while the flag is
+still true, since that combination drops exactly the roles a citizen is
+eligible for.
+
+A citizen may still not hold an active security clearance. Keep
+`reject_clearance_roles` set to true unless the candidate is specifically
+targeting clearance-required positions.
+
+## 4. Add target roles
+
+Edit the `target_roles` list to match the candidate's search.
+
+Example:
+
+```json
+"target_roles": [
+  "Software Engineer",
+  "Backend Engineer",
+  "Full Stack Engineer",
+  "Data Engineer"
+]
+```
+
+Keep role names specific enough to avoid unrelated listings.
+
+## 5. Add resume skills
+
+The `skills` object controls resume-weighted ranking.
+
+Example:
+
+```json
+"skills": {
+  "Python": 7,
+  "Java": 6,
+  "SQL": 6,
+  "AWS": 5,
+  "React": 4,
+  "Docker": 3
+}
+```
+
+Higher values indicate stronger or more relevant skills.
+
+Recommended scale:
+
+| Weight | Meaning |
+|---|---|
+| 7 | Core strength with strong project, work, or research evidence |
+| 5-6 | Strong practical experience |
+| 3-4 | Working knowledge |
+| 1-2 | Familiarity or supporting skill |
+
+Only include skills that the candidate can reasonably discuss in an interview.
+
+## 6. Configure locations
+
+Update `preferred_locations`:
+
+```json
+"preferred_locations": [
+  "Remote",
+  "California",
+  "Texas"
+]
+```
+
+Use terms that are likely to appear in job descriptions or ATS location fields.
+
+## 7. Configure output files
+
+Keep report and state files separate from other profiles:
+
+```json
+"output_files": {
+  "all_matches": "citizen_matches_48h.csv",
+  "new_matches": "citizen_new_jobs_48h.csv",
+  "state": ".sponsorscan_citizen_state.json"
+}
+```
+
+The state file tracks jobs already seen by this profile. Do not reuse one state
+file across multiple users.
+
+## 8. Run the profile locally
+
+Fetch current jobs. This also creates the database; there is no `load-lca`
+step for a citizen profile:
+
+```powershell
+python sponsorscan.py fetch-jobs --replace
+```
+
+Run the personalized report:
+
+```powershell
+python sponsor_daily_report.py `
+  --profile ".\profiles\citizen_profile.json"
+```
+
+The same command on macOS or Linux:
+
+```bash
+python sponsor_daily_report.py \
+  --profile profiles/citizen_profile.json
+```
+
+The report script should read output names, time window, minimum score, roles,
+skills, and eligibility rules from the profile.
+
+## 9. Keep personal files private
+
+Do not commit a real candidate profile if it contains personal information.
+
+Add the personal file to `.gitignore`:
+
+```gitignore
+profiles/*.json
+!profiles/*.example.json
+```
+
+This keeps example profiles in the repository while ignoring private copies.
+
+Also avoid committing:
+
+- generated CSV reports;
+- state files;
+- resume content;
+- email addresses;
+- Google credentials;
+- Gmail app passwords.
+
+## 10. Optional automation
+
+After the local profile works, it can be used with GitHub Actions, Google Sheets,
+and email notifications.
+
+See:
+
+```text
+docs/EMAIL_SETUP.md
+docs/GOOGLE_SHEETS_SETUP.md
+```
+
+The example workflow reads the profile and skips its LCA steps for a citizen,
+so there is nothing to download and no `LCA_FILE_URL` to set.
+
+Each automated user should have:
+
+- a separate profile;
+- separate output files;
+- a separate state file;
+- separate notification settings where applicable.
+
+## Troubleshooting
+
+### Citizenship-required roles are missing
+
+Confirm:
+
+```json
+"reject_citizenship_required": false
+```
+
+### Clearance-required roles are missing
+
+Confirm:
+
+```json
+"reject_clearance_roles": false
+```
+
+Only disable this when the candidate intentionally wants clearance-required
+positions.
+
+### Too many experienced roles are appearing
+
+Lower:
+
+```json
+"max_required_experience": 1
+```
+
+and confirm that senior and Level II+ title filtering remain enabled.
+
+### Good roles are being removed because they mention graduate degrees
+
+Set:
+
+```json
+"reject_masters_mentions": false,
+"reject_phd_mentions": false
+```
+
+A degree mention is not always a hard requirement, so these settings should match
+the candidate's actual preferences.
