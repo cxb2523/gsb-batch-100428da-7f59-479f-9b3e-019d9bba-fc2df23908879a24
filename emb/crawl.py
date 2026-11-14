@@ -62,19 +62,19 @@ def _sitemap_urls(
             if loc and loc.text:
                 loc_url = loc.text.strip()
                 if allowed_domain and urlparse(loc_url).netloc != allowed_domain:
-                    _log.debug("Skipping off-domain sitemap URL: %s", loc_url)
+                    _log.debug("Skipping off-domain sitemap page URL: %s", loc_url)
                     continue
                 try:
                     validate_url(loc_url)
                     urls.append(loc_url)
                 except ValueError:
-                    _log.debug("Skipping blocked sitemap URL: %s", loc_url)
+                    _log.debug("Skipping blocked sitemap page URL: %s", loc_url)
         return urls
     except Exception:
         return []
 
 
-def _find_sitemaps(url: str, client: httpx.Client) -> list[str]:
+def _find_sitemaps(url: str, client: httpx.Client, *, same_domain: bool = True) -> list[str]:
     parsed = urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
     candidates = [
@@ -88,7 +88,7 @@ def _find_sitemaps(url: str, client: httpx.Client) -> list[str]:
             for line in resp.text.splitlines():
                 if line.lower().startswith("sitemap:") and len(candidates) < 10:
                     candidate = line.split(":", 1)[1].strip()
-                    if urlparse(candidate).netloc != parsed.netloc:
+                    if same_domain and urlparse(candidate).netloc != parsed.netloc:
                         _log.debug("Skipping off-domain robots.txt sitemap: %s", candidate)
                         continue
                     try:
@@ -100,7 +100,8 @@ def _find_sitemaps(url: str, client: httpx.Client) -> list[str]:
         pass
     found = []
     for sm in candidates:
-        if urlparse(sm).netloc != parsed.netloc:
+        if same_domain and urlparse(sm).netloc != parsed.netloc:
+            _log.debug("Skipping off-domain sitemap candidate: %s", sm)
             continue
         try:
             if safe_head(client, sm, timeout=5).status_code == 200:
@@ -134,10 +135,10 @@ def crawl(
 
     with httpx.Client(timeout=timeout) as client:
         if use_sitemap:
-            for sm in _find_sitemaps(url, client):
+            for sm in _find_sitemaps(url, client, same_domain=same_domain):
                 for u in _sitemap_urls(sm, client, allowed_domain=domain if same_domain else None):
                     if same_domain and urlparse(u).netloc != domain:
-                        _log.debug("Skipping off-domain sitemap seed: %s", u)
+                        _log.debug("Skipping off-domain sitemap page URL: %s", u)
                         continue
                     if u not in visited:
                         queue.append((u, 0))

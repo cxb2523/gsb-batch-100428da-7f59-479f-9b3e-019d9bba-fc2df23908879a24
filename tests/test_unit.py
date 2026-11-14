@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
 import pytest
 
@@ -1600,3 +1601,379 @@ class TestMapUrl:
 
         assert "https://example.com/on-site" in result.links
         assert "https://other.com/offsite" not in result.links
+
+
+# sitemap same-domain filtering and recursion caps
+
+def _xml_response(text: str, status: int = 200) -> MagicMock:
+    r = MagicMock()
+    r.status_code = status
+    r.text = text
+    r.raise_for_status = MagicMock()
+    return r
+
+
+def _urlset(urls: list[str]) -> str:
+    locs = "".join(f"<url><loc>{u}</loc></url>" for u in urls)
+    return (
+        '<?xml version="1.0"?>'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        f"{locs}</urlset>"
+    )
+
+
+def _sitemap_index(sub_urls: list[str]) -> str:
+    locs = "".join(f"<sitemap><loc>{u}</loc></sitemap>" for u in sub_urls)
+    return (
+        '<?xml version="1.0"?>'
+        '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+        f"{locs}</sitemapindex>"
+    )
+
+
+class TestSitemapUrlsSameDomain:
+    def test_filters_off_domain_pages_and_sub_sitemaps(self, caplog):
+        from emb.crawl import _sitemap_urls
+
+        index_xml = _sitemap_index([
+            "https://example.com/sub.xml",
+            "https://evil.com/evil-sub.xml",
+        ])
+        same_domain_xml = _urlset([
+            "https://example.com/ok",
+            "https://evil.com/offsite",
+        ])
+
+        requested: list[str] = []
+
+        def fake_get(client, url, **kwargs):
+            requested.append(url)
+            if url.endswith("sitemap.xml"):
+                return _xml_response(index_xml)
+            if url.endswith("sub.xml"):
+                return _xml_response(same_domain_xml)
+            return _xml_response(_urlset(["https://evil.com/should-not-fetch"]))
+
+        mock_client = MagicMock()
+        with patch("emb.crawl.validate_url"), \
+             patch("emb.crawl.safe_get", side_effect=fake_get):
+            caplog.set_level("DEBUG", logger="emb.crawl")
+            urls = _sitemap_urls(
+                "https://example.com/sitemap.xml",
+                mock_client,
+                allowed_domain="example.com",
+            )
+
+        assert "https://example.com/ok" in urls
+        assert all("evil.com" not in u for u in urls)
+        # The off-domain sub-sitemap must never be requested.
+        assert "https://evil.com/evil-sub.xml" not in requested
+        assert "https://evil.com/offsite" not in requested
+
+        messages = "\n".join(rec.getMessage() for rec in caplog.records)
+        assert "sub-sitemap" in messages
+        assert "https://evil.com/evil-sub.xml" in messages
+        assert "page URL" in messages
+        assert "https://evil.com/offsite" in messages
+
+    def test_no_filter_when_allowed_domain_empty(self):
+        from emb.crawl import _sitemap_urls
+
+        xml = _urlset([
+            "https://example.com/ok",
+            "https://other.com/offsite",
+        ])
+        mock_client = MagicMock()
+        with patch("emb.crawl.validate_url"), \
+             patch("emb.crawl.safe_get", return_value=_xml_response(xml)):
+            urls = _sitemap_urls(
+                "https://example.com/sitemap.xml",
+                mock_client,
+                allowed_domain=None,
+            )
+
+        assert "https://example.com/ok" in urls
+        assert "https://other.com/offsite" in urls
+
+    def test_visited_cap_bounds_total_requests(self):
+        # A branching index fans out to many distinct sub-sitemaps. The
+        # len(_visited) > 50 guard must bound the number of GET requests.
+        from emb.crawl import _sitemap_urls
+
+        sub_urls = [f"https://example.com/sub-{i}.xml" for i in range(60)]
+        index_xml = _sitemap_index(sub_urls)
+
+        call_count = {"n": 0}
+
+        def fake_get(client, url, **kwargs):
+            call_count["n"] += 1
+            if url.endswith("sitemap.xml"):
+                return _xml_response(index_xml)
+            return _xml_response(_urlset([f"https://example.com/page-{url}"]))
+
+        mock_client = MagicMock()
+        with patch("emb.crawl.validate_url"), \
+             patch("emb.crawl.safe_get", side_effect=fake_get):
+            urls = _sitemap_urls(
+                "https://example.com/sitemap.xml",
+                mock_client,
+                allowed_domain="example.com",
+            )
+
+        # One index request plus at most 50 sub-sitemaps.
+        assert call_count["n"] <= 51
+        assert all("example.com" in u for u in urls)
+
+
+class TestCrawlSitemapSameDomain:
+    def test_mixed_domain_index_keeps_only_start_domain(self, caplog):
+        from emb.crawl import crawl
+        from emb.types import ScrapeResult
+
+        scrape_result = ScrapeResult(
+            url="https://example.com", markdown=_RICH_TEXT, success=True
+        )
+        index_xml = _sitemap_index(["https://example.com/sub.xml"])
+        sub_xml = _urlset([
+            "https://example.com/sitemap-page",
+            "https://evil.com/offsite-page",
+        ])
+        home_html = "<html><body>no links</body></html>"
+
+        def fake_get(client, url, **kwargs):
+            if url == "https://example.com/sitemap.xml":
+                return _xml_response(index_xml)
+            if url == "https://example.com/sub.xml":
+                return _xml_response(sub_xml)
+            r = MagicMock()
+            r.status_code = 200
+            r.text = home_html
+            return r
+
+        mock_client = MagicMock()
+        with patch("emb.crawl.validate_url"), \
+             patch("emb.crawl._find_sitemaps",
+                   return_value=["https://example.com/sitemap.xml"]), \
+             patch("emb.crawl._scrape_html", return_value=scrape_result), \
+             patch("emb.crawl.safe_get", side_effect=fake_get), \
+             patch("emb.crawl.httpx.Client") as MockClient:
+            MockClient.return_value.__enter__.return_value = mock_client
+            MockClient.return_value.__exit__.return_value = False
+            caplog.set_level("DEBUG", logger="emb.crawl")
+            result = crawl(
+                "https://example.com", max_pages=10, max_depth=1,
+                same_domain=True,
+            )
+
+        page_urls = [page.url for page in result.pages]
+        assert "https://example.com/sitemap-page" in page_urls
+        assert all("evil.com" not in u for u in page_urls)
+
+        messages = "\n".join(rec.getMessage() for rec in caplog.records)
+        assert "page URL" in messages
+        assert "https://evil.com/offsite-page" in messages
+
+    def test_same_domain_false_accepts_cross_domain_sitemap_seed(self):
+        from emb.crawl import crawl
+        from emb.types import ScrapeResult
+
+        scrape_result = ScrapeResult(
+            url="https://example.com", markdown=_RICH_TEXT, success=True
+        )
+        # robots.txt points at an off-domain sitemap, whose page URLs are also
+        # off-domain. With same_domain=False the crawler still accepts them.
+        robots_txt = "Sitemap: https://other.com/sitemap.xml\n"
+        other_xml = _urlset(["https://other.com/page"])
+
+        def fake_get(client, url, **kwargs):
+            if url == "https://example.com/robots.txt":
+                r = MagicMock()
+                r.status_code = 200
+                r.text = robots_txt
+                return r
+            if url == "https://other.com/sitemap.xml":
+                return _xml_response(other_xml)
+            r = MagicMock()
+            r.status_code = 200
+            r.text = "<html><body>no links</body></html>"
+            return r
+
+        def fake_head(client, url, **kwargs):
+            r = MagicMock()
+            r.status_code = 200
+            return r
+
+        mock_client = MagicMock()
+        with patch("emb.crawl.validate_url"), \
+             patch("emb.crawl._scrape_html", return_value=scrape_result), \
+             patch("emb.crawl.safe_get", side_effect=fake_get), \
+             patch("emb.crawl.safe_head", side_effect=fake_head), \
+             patch("emb.crawl.httpx.Client") as MockClient:
+            MockClient.return_value.__enter__.return_value = mock_client
+            MockClient.return_value.__exit__.return_value = False
+            result = crawl(
+                "https://example.com", max_pages=10, max_depth=1,
+                same_domain=False,
+            )
+
+        assert "https://other.com/page" in [page.url for page in result.pages]
+
+    def test_find_sitemaps_filters_robots_off_domain_by_default(self):
+        from emb.crawl import _find_sitemaps
+
+        robots_txt = "Sitemap: https://evil.com/sitemap.xml\n"
+        robots_resp = MagicMock()
+        robots_resp.status_code = 200
+        robots_resp.text = robots_txt
+        head_resp = MagicMock()
+        head_resp.status_code = 200
+        mock_client = MagicMock()
+        mock_client.get.return_value = robots_resp
+        mock_client.head.return_value = head_resp
+
+        with patch("emb.crawl.validate_url"):
+            filtered = _find_sitemaps(
+                "https://example.com/", mock_client, same_domain=True
+            )
+            allowed = _find_sitemaps(
+                "https://example.com/", mock_client, same_domain=False
+            )
+
+        assert all("evil.com" not in sm for sm in filtered)
+        assert "https://evil.com/sitemap.xml" in allowed
+
+
+class TestMapUrlSitemap:
+    def test_mixed_domain_index_excludes_cross_domain_pages(self, caplog):
+        from emb.map import map_url
+
+        index_xml = _sitemap_index(["https://example.com/sub.xml"])
+        sub_xml = _urlset([
+            "https://example.com/from-sub",
+            "https://evil.com/from-sub-offsite",
+        ])
+        top_xml = _urlset([
+            "https://example.com/from-top",
+            "https://evil.com/top-offsite",
+        ])
+
+        def fake_get(url, **kwargs):
+            if "robots.txt" in url:
+                return _xml_response("", status=404)
+            if url == "https://example.com/sitemap.xml":
+                return _xml_response(index_xml)
+            if url == "https://example.com/sub.xml":
+                return _xml_response(sub_xml)
+            if "/sitemap" in url:
+                return _xml_response(top_xml)
+            return _xml_response("<html><body></body></html>")
+
+        mock_client = MagicMock()
+        with patch("emb.map.validate_url"), \
+             patch("emb.map.httpx.Client") as MockClient:
+            mock_client.get.side_effect = fake_get
+            MockClient.return_value.__enter__.return_value = mock_client
+            MockClient.return_value.__exit__.return_value = False
+            caplog.set_level("DEBUG", logger="emb.map")
+            result = map_url("https://example.com/")
+
+        assert "https://example.com/from-sub" in result.links
+        assert "https://example.com/from-top" in result.links
+        assert all("evil.com" not in link for link in result.links)
+
+        messages = "\n".join(rec.getMessage() for rec in caplog.records)
+        assert "page URL" in messages
+        assert "https://evil.com/from-sub-offsite" in messages
+
+    def test_more_than_ten_sub_sitemaps_never_requests_eleventh(self):
+        from emb.map import map_url
+
+        sub_urls = [f"https://example.com/sub-{i}.xml" for i in range(12)]
+        index_xml = _sitemap_index(sub_urls)
+        requested: list[str] = []
+
+        def fake_get(url, **kwargs):
+            requested.append(url)
+            if "robots.txt" in url:
+                return _xml_response("", status=404)
+            if url == "https://example.com/sitemap.xml":
+                return _xml_response(index_xml)
+            if url.startswith("https://example.com/sub-"):
+                return _xml_response(
+                    _urlset([f"https://example.com/page/{url.rsplit('/', 1)[-1]}"])
+                )
+            return _xml_response("", status=404)
+
+        mock_client = MagicMock()
+        with patch("emb.map.validate_url"), \
+             patch("emb.map.httpx.Client") as MockClient:
+            mock_client.get.side_effect = fake_get
+            MockClient.return_value.__enter__.return_value = mock_client
+            MockClient.return_value.__exit__.return_value = False
+            map_url("https://example.com/")
+
+        sub_requests = [u for u in requested if u.startswith(
+            "https://example.com/sub-")]
+        assert len(sub_requests) == 10
+        assert "https://example.com/sub-10.xml" not in requested
+        assert "https://example.com/sub-11.xml" not in requested
+
+    def test_fallback_links_same_domain_http_only_and_no_fragment(self):
+        from emb.map import map_url
+
+        home_html = (
+            "<html><body>"
+            '<a href="/local#section">local</a>'
+            '<a href="https://example.com/other">other</a>'
+            '<a href="https://evil.com/external">external</a>'
+            '<a href="javascript:void(0)">js</a>'
+            '<a href="mailto:a@b.com">mail</a>'
+            "</body></html>"
+        )
+
+        def fake_get(url, **kwargs):
+            if "/sitemap" in url or "robots.txt" in url:
+                return _xml_response("", status=404)
+            return _xml_response(home_html)
+
+        mock_client = MagicMock()
+        with patch("emb.map.validate_url"), \
+             patch("emb.map.httpx.Client") as MockClient:
+            mock_client.get.side_effect = fake_get
+            MockClient.return_value.__enter__.return_value = mock_client
+            MockClient.return_value.__exit__.return_value = False
+            result = map_url("https://example.com/")
+
+        assert result.total >= 1
+        assert all("evil.com" not in link for link in result.links)
+        assert all(urlparse(link).scheme in ("http", "https")
+                   for link in result.links)
+        assert all("#" not in link for link in result.links)
+        assert "https://example.com/local" in result.links
+        assert "https://example.com/other" in result.links
+
+    def test_fallback_runs_when_sitemap_has_no_usable_entries(self):
+        # All sitemap entries are off-domain, so discovery stays empty and the
+        # homepage link fallback must take over.
+        from emb.map import map_url
+
+        sitemap_xml = _urlset(["https://evil.com/offsite"])
+        home_html = '<html><body><a href="/home-only">h</a></body></html>'
+
+        def fake_get(url, **kwargs):
+            if "robots.txt" in url:
+                return _xml_response("", status=404)
+            if "/sitemap" in url:
+                return _xml_response(sitemap_xml)
+            return _xml_response(home_html)
+
+        mock_client = MagicMock()
+        with patch("emb.map.validate_url"), \
+             patch("emb.map.httpx.Client") as MockClient:
+            mock_client.get.side_effect = fake_get
+            MockClient.return_value.__enter__.return_value = mock_client
+            MockClient.return_value.__exit__.return_value = False
+            result = map_url("https://example.com/")
+
+        assert "https://example.com/home-only" in result.links
+        assert all("evil.com" not in link for link in result.links)

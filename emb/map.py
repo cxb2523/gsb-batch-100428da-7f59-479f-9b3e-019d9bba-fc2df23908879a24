@@ -50,56 +50,62 @@ def map_url(url: str, *, max_links: int = 500, timeout: int = 15) -> MapResult:
 
         for sm_url in candidates:
             if urlparse(sm_url).netloc != domain:
+                _log.debug("Skipping off-domain sitemap candidate: %s", sm_url)
                 continue
             try:
                 resp = safe_get(client, sm_url, timeout=timeout)
                 if resp.status_code != 200:
                     continue
                 soup = BeautifulSoup(resp.text, "lxml-xml")
-                # Recurse into sub-sitemaps.
+                # Recurse into sub-sitemaps, capped per index document.
                 sub_count = 0
                 for sm in soup.find_all("sitemap"):
-                    if sub_count >= 10:
-                        break
                     loc = sm.find("loc")
-                    if loc and loc.text:
-                        next_url = loc.text.strip()
-                        if urlparse(next_url).netloc != domain:
-                            _log.debug("Skipping off-domain sub-sitemap: %s", next_url)
-                            continue
-                        try:
-                            validate_url(next_url)
-                        except ValueError:
-                            _log.debug("Skipping blocked sub-sitemap: %s", next_url)
-                            continue
-                        inner = safe_get(client, next_url, timeout=timeout)
-                        if inner.status_code == 200:
-                            for tag in BeautifulSoup(inner.text, "lxml-xml").find_all("url"):
-                                loc_tag = tag.find("loc")
-                                if loc_tag and loc_tag.text:
-                                    loc_url = loc_tag.text.strip()
-                                    if urlparse(loc_url).netloc != domain:
-                                        _log.debug("Skipping off-domain sitemap URL: %s", loc_url)
-                                        continue
-                                    try:
-                                        validate_url(loc_url)
-                                        discovered.add(loc_url)
-                                    except ValueError:
-                                        _log.debug("Skipping blocked sitemap URL: %s", loc_url)
-                        sub_count += 1
+                    if not loc or not loc.text:
+                        continue
+                    next_url = loc.text.strip()
+                    if urlparse(next_url).netloc != domain:
+                        _log.debug("Skipping off-domain sub-sitemap: %s", next_url)
+                        continue
+                    try:
+                        validate_url(next_url)
+                    except ValueError:
+                        _log.debug("Skipping blocked sub-sitemap: %s", next_url)
+                        continue
+                    if sub_count >= 10:
+                        _log.debug(
+                            "Sub-sitemap limit (10) reached in %s; not requesting %s",
+                            sm_url, next_url,
+                        )
+                        continue
+                    inner = safe_get(client, next_url, timeout=timeout)
+                    sub_count += 1
+                    if inner.status_code == 200:
+                        for tag in BeautifulSoup(inner.text, "lxml-xml").find_all("url"):
+                            loc_tag = tag.find("loc")
+                            if loc_tag and loc_tag.text:
+                                loc_url = loc_tag.text.strip()
+                                if urlparse(loc_url).netloc != domain:
+                                    _log.debug("Skipping off-domain sitemap page URL: %s", loc_url)
+                                    continue
+                                try:
+                                    validate_url(loc_url)
+                                    discovered.add(loc_url)
+                                except ValueError:
+                                    _log.debug("Skipping blocked sitemap page URL: %s", loc_url)
                 # Collect page URLs.
                 for url_tag in soup.find_all("url"):
                     loc = url_tag.find("loc")
                     if loc and loc.text:
                         loc_url = loc.text.strip()
                         if urlparse(loc_url).netloc != domain:
-                            _log.debug("Skipping off-domain sitemap URL: %s", loc_url)
+                            _log.debug("Skipping off-domain sitemap page URL: %s", loc_url)
                             continue
                         try:
                             validate_url(loc_url)
                             discovered.add(loc_url)
                         except ValueError:
-                            _log.debug("Skipping blocked sitemap URL: %s", loc_url)
+                            _log.debug("Skipping blocked sitemap page URL: %s", loc_url)
                 if len(discovered) >= max_links:
                     break
             except Exception:
