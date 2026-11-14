@@ -1,0 +1,116 @@
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude settings
+.claude/settings.local.json
+.claude/settings.json
+
+# Gstack (security reports, analytics)
+.gstack/
+
+# Customer data (contains sensitive chat records)
+导出的聊天记录/
+
+# Data (runtime)
+data/chat_raw/*
+data/videos/*
+data/qdrant/*
+data/pending/*
+data/context/*
+data/state/*
+data/heartbeat.txt
+data/watchdog.pid
+data/test_*
+data/.escalation_state.json
+!data/chat_raw/.gitkeep
+!data/videos/.gitkeep
+!data/qdrant/.gitkeep
+!data/pending/.gitkeep
+
+# Debug screenshots
+debug_*.png
+debug_name_*.png
+debug_chat*.png
+debug_col2*.png
+debug_red_dots*.png
+debug_row*.png
+debug_small*.png
+debug_processed*.png
+debug_detected*.png
+
+# Debug session data (keep code, exclude runtime output)
+debug/2*/
+debug/latest/
+debug/__pycache__/
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Model files (large)
+models/
+bge_model/
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Whisper models
+whisper_models/
+
+# Test files
+test_*.py
+test_*.txt
+debug_*.txt
+node_modules
+package-lock.json
+.gstack/

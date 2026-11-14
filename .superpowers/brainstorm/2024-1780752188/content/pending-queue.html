@@ -1,0 +1,99 @@
+<h2>待处理队列 Tab — 布局方案</h2>
+<p class="subtitle">弹窗超时后，条目进入这里。销售在空闲时处理。</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>紧凑表格（信息扫描优先）</h3>
+      <div class="mockup" style="max-width:600px;margin:12px auto">
+        <div class="mockup-header">GUI 控制面板 — 待处理 (3)</div>
+        <div class="mockup-body">
+          <table style="width:100%;font-size:11px;border-collapse:collapse;">
+            <tr style="background:#f5f5f5;">
+              <th style="padding:6px;text-align:left;border-bottom:1px solid #ddd;">时间</th>
+              <th style="padding:6px;text-align:left;border-bottom:1px solid #ddd;">客户</th>
+              <th style="padding:6px;text-align:left;border-bottom:1px solid #ddd;">消息摘要</th>
+              <th style="padding:6px;text-align:left;border-bottom:1px solid #ddd;">AI建议</th>
+              <th style="padding:6px;text-align:left;border-bottom:1px solid #ddd;">置信度</th>
+              <th style="padding:6px;text-align:left;border-bottom:1px solid #ddd;">操作</th>
+            </tr>
+            <tr>
+              <td style="padding:6px;border-bottom:1px solid #eee;">14:32</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;">张姐</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;max-width:120px;overflow:hidden;">这个课程多少钱...</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;max-width:120px;overflow:hidden;">您好！课程原价29...</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;">62%</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;">
+                <button style="font-size:10px;padding:2px 6px;">发送</button>
+                <button style="font-size:10px;padding:2px 6px;">编辑</button>
+                <button style="font-size:10px;padding:2px 6px;">忽略</button>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:6px;border-bottom:1px solid #eee;">14:28</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;">李哥</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;max-width:120px;overflow:hidden;">有没有试听课？...</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;max-width:120px;overflow:hidden;">有的！我们有免费...</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;">55%</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;">
+                <button style="font-size:10px;padding:2px 6px;">发送</button>
+                <button style="font-size:10px;padding:2px 6px;">编辑</button>
+                <button style="font-size:10px;padding:2px 6px;">忽略</button>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:6px;border-bottom:1px solid #eee;">14:15</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;">王姐</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;max-width:120px;overflow:hidden;">什么时候开课？...</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;max-width:120px;overflow:hidden;">下一期6月15号...</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;">71%</td>
+              <td style="padding:6px;border-bottom:1px solid #eee;">
+                <button style="font-size:10px;padding:2px 6px;">发送</button>
+                <button style="font-size:10px;padding:2px 6px;">编辑</button>
+                <button style="font-size:10px;padding:2px 6px;">忽略</button>
+              </td>
+            </tr>
+          </table>
+          <div style="margin-top:8px;display:flex;gap:6px;justify-content:flex-end;">
+            <button class="mock-button" style="font-size:11px;padding:4px 12px;">一键发送全部 (>70%)</button>
+          </div>
+        </div>
+      </div>
+      <p>所有信息在一行内可见，批量操作快捷。适合处理量大的场景。</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>卡片视图（逐条处理）</h3>
+      <div class="mockup" style="max-width:480px;margin:12px auto">
+        <div class="mockup-header">GUI — 待处理 2/3</div>
+        <div class="mockup-body">
+          <div style="background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px;margin-bottom:8px;">
+            <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+              <strong>张姐</strong>
+              <span style="font-size:11px;color:#888;">⏱ 14:32 (2分钟前) | 置信度 62%</span>
+            </div>
+            <div style="background:#f8f8f8;padding:8px;border-radius:4px;margin-bottom:6px;font-size:12px;">
+              <span style="color:#888;">客户: </span>"这个课程多少钱？学完能做什么？"
+            </div>
+            <div style="background:#e3f2fd;padding:8px;border-radius:4px;margin-bottom:8px;font-size:12px;">
+              <span style="color:#1976d2;">AI: </span>"您好！课程原价 2980，现在活动价 1980。学完后您可以在抖音独立创作短视频、开橱窗带货..."
+            </div>
+            <div style="display:flex;gap:6px;">
+              <button class="mock-button" style="flex:1;background:#e0e0e0;color:#333;">编辑后发送</button>
+              <button class="mock-button" style="flex:1;background:#1976d2;color:#fff;">直接发送</button>
+              <button style="flex:1;background:none;border:1px solid #ccc;border-radius:4px;font-size:12px;color:#888;">跳过</button>
+            </div>
+          </div>
+          <div style="font-size:10px;color:#888;text-align:center;">
+            ← 上一条 | 下一条 →
+          </div>
+        </div>
+      </div>
+      <p>每条单独呈现，信息完整，决策更慎重。但处理大量积压时较慢。</p>
+    </div>
+  </div>
+</div>
