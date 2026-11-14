@@ -1,0 +1,68 @@
+[project]
+name = "okf-kit"
+version = "0.3.3"
+description = "Turn any website into a portable, agent-ready Open Knowledge Format (OKF) bundle — build, sync, and chat, no LLM required to start."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "okf-kit contributors" }]
+keywords = ["okf", "open-knowledge-format", "rag", "llm", "agents", "crawler", "knowledge-graph"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Text Processing :: Markup :: Markdown",
+]
+dependencies = [
+    "httpx>=0.27",
+    "trafilatura>=1.8",
+    # trafilatura imports justext, which needs lxml.html.clean. Modern lxml
+    # (>=5.2) split that out into a separate package, so declare it explicitly
+    # or a clean install breaks at `import trafilatura`.
+    "lxml-html-clean>=0.1",
+    "selectolax>=0.3.21",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# JS-rendered sites (heavy: pulls a Playwright Chromium). Constrain trafilatura
+# to a build whose lxml requirement is compatible with crawl4ai's (lxml~=5.3);
+# only applies when the [js] extra is installed, so plain installs get latest.
+js = ["crawl4ai>=0.6.0", "trafilatura>=1.8,<2.1"]
+# Chat against any OpenAI-compatible endpoint (OpenAI, Ollama, vLLM, …).
+chat = ["openai>=1.60"]
+# Claude as a chat provider.
+anthropic = ["anthropic>=0.40"]
+# Optional LLM enrichment during build.
+enrich = ["openai>=1.60"]
+# MCP server for Claude Code/Desktop, Cursor, etc.
+mcp = ["mcp>=1.2.0"]
+# Local HTTP API for GUIs (the desktop app / any web UI). Consume-only — does
+# not pull the crawl stack, so it stays light to bundle.
+serve = ["fastapi>=0.110", "uvicorn>=0.27", "keyring>=24"]
+all = ["okf-kit[js,chat,anthropic,enrich,mcp,serve]"]
+dev = ["pytest>=7.0", "pytest-asyncio>=0.23", "ruff>=0.6", "build>=1.0"]
+
+[project.urls]
+Homepage = "https://github.com/vinodborole/okf-kit"
+Repository = "https://github.com/vinodborole/okf-kit"
+Issues = "https://github.com/vinodborole/okf-kit/issues"
+Specification = "https://github.com/GoogleCloudPlatform/knowledge-catalog/blob/main/okf/SPEC.md"
+
+[project.scripts]
+okf = "okf_kit.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["okf_kit*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
