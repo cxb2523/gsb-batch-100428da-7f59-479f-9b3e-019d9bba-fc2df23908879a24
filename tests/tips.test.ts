@@ -1,0 +1,236 @@
+import { Actor, type Dataset } from 'apify';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { findActorTip, findActorTipInResults, storeActorTip } from '../src/tips.js';
+
+describe('findActorTip', () => {
+    it.each([
+        ['https://www.facebook.com/apify/posts', 'For scraping facebook.com, we recommend using [Facebook Posts Scraper](https://apify.com/apify/facebook-posts-scraper)', 'KoJrdxJCTtpon81KY'],
+        ['https://www.facebook.com/groups/1234567890', 'For scraping Facebook groups, we recommend using [Facebook Groups Scraper](https://apify.com/apify/facebook-groups-scraper)', '2chN8UQcH1CfxLRNE'],
+        ['https://www.zillow.com/homedetails/123', 'For scraping zillow.com, we recommend using [Zillow Detail Scraper](https://apify.com/maxcopell/zillow-detail-scraper)', 'ENK9p4RZHg0iVso52'],
+        ['https://www.instagram.com/apify/', 'For scraping instagram.com, we recommend using [Instagram Scraper](https://apify.com/apify/instagram-scraper)', 'shu8hvrXbJbY3Eb9W'],
+        ['https://www.google.com/maps/place/Prague', 'For scraping Google Maps, we recommend using [Google Maps Scraper](https://apify.com/compass/crawler-google-places)', 'nwua9Gu5YrADL7ZDj'],
+        ['https://maps.google.com/?q=prague', 'For scraping Google Maps, we recommend using [Google Maps Scraper](https://apify.com/compass/crawler-google-places)', 'nwua9Gu5YrADL7ZDj'],
+        ['https://www.booking.com/hotel/cz/prague.html', 'For scraping booking.com, we recommend using [Booking Scraper](https://apify.com/voyager/booking-scraper)', 'oeiQgfg5fsmIJB7Cn'],
+        ['https://www.tripadvisor.com/Hotel_Review-g274707', 'For scraping tripadvisor.com, we recommend using [Tripadvisor Scraper](https://apify.com/maxcopell/tripadvisor)', 'dbEyMBriog95Fv8CW'],
+        ['https://www.youtube.com/watch?v=dQw4w9WgXcQ', 'For scraping youtube.com, we recommend using [YouTube Scraper](https://apify.com/streamers/youtube-scraper)', 'h7sDV53CddomktSi5'],
+        ['https://youtu.be/dQw4w9WgXcQ', 'For scraping youtube.com, we recommend using [YouTube Scraper](https://apify.com/streamers/youtube-scraper)', 'h7sDV53CddomktSi5'],
+        ['https://www.tiktok.com/@apify', 'For scraping tiktok.com, we recommend using [TikTok Scraper](https://apify.com/clockworks/tiktok-scraper)', 'GdWCkxBtKWOsKjdch'],
+        ['https://www.amazon.com/dp/B08N5WRWNW', 'For scraping amazon.com, we recommend using [Amazon Crawler](https://apify.com/junglee/amazon-crawler)', 'BG3WDrGdteHgZgbPK'],
+    ])('recommends the Actor listed in the issue for %s', (query, message, actorId) => {
+        const tip = findActorTip({ query });
+        expect(tip?.message).toBe(message);
+        expect(tip?.recommendedActorId).toBe(actorId);
+    });
+
+    it('marks the tip as informational', () => {
+        expect(findActorTip({ query: 'https://www.tiktok.com/@apify' })?.level).toBe('info');
+    });
+
+    it.each([
+        // The site name appears in the path, not in the host.
+        'https://example.com/facebook',
+        'https://example.com/redirect?to=https://www.facebook.com/apify',
+        // Plain Google Search is what this Actor does itself.
+        'https://www.google.com/search?q=prague+restaurants',
+        // Hosts that only look like a listed domain.
+        'https://notfacebook.com/apify',
+        'https://facebook.com.evil.example/apify',
+    ])('does not recommend anything for %s', (query) => {
+        expect(findActorTip({ query })).toBeNull();
+    });
+
+    it.each([
+        ['site:instagram.com nike', 'Instagram Scraper'],
+        ['cheap hotels booking.com prague', 'Booking Scraper'],
+        ['google.com/maps prague restaurants', 'Google Maps Scraper'],
+        ['"tripadvisor.com" prague', 'Tripadvisor Scraper'],
+    ])('finds a listed domain mentioned in the search query %s', (query, actorTitle) => {
+        expect(findActorTip({ query })?.message).toContain(actorTitle);
+    });
+
+    it.each([
+        'best hotels in prague',
+        'site:google.com apify',
+        'nike -www.instagram.com',
+    ])('does not recommend anything for the search query %s', (query) => {
+        expect(findActorTip({ query })).toBeNull();
+    });
+
+    it.each([
+        ['https://www.amazon.co.uk/dp/B08N5WRWNW', 'Amazon Crawler'],
+        ['https://www.amazon.de/dp/B08N5WRWNW', 'Amazon Crawler'],
+        ['https://www.amazon.com.mx/dp/B08N5WRWNW', 'Amazon Crawler'],
+        ['https://www.google.co.uk/maps/place/Prague', 'Google Maps Scraper'],
+        ['https://maps.google.co.uk/?q=prague', 'Google Maps Scraper'],
+        ['https://www.tripadvisor.co.uk/Hotel_Review-g274707', 'Tripadvisor Scraper'],
+    ])('recognizes the country domain %s', (query, actorTitle) => {
+        expect(findActorTip({ query })?.message).toContain(actorTitle);
+    });
+
+    it.each([
+        // The brand is only a subdomain of someone else's site.
+        'https://amazon.abc.com/dp/1',
+        'https://amazon.example.com/dp/1',
+        'https://notamazon.de/dp/1',
+        'https://google.com.evil.example/maps',
+        // A country domain does not turn plain Google Search into a Maps request.
+        'https://www.google.co.uk/search?q=prague',
+    ])('does not read %s as a country domain of a listed site', (query) => {
+        expect(findActorTip({ query })).toBeNull();
+    });
+
+    it('keeps sites that have a single global domain pinned to it', () => {
+        expect(findActorTip({ query: 'https://facebook.ru/apify' })).toBeNull();
+        expect(findActorTip({ query: 'https://instagram.de/apify' })).toBeNull();
+        expect(findActorTip({ query: 'https://booking.de/hotel/cz/prague.html' })).toBeNull();
+    });
+
+    it('matches subdomains, keeping the more specific rule first', () => {
+        expect(findActorTip({ query: 'https://m.facebook.com/groups/123' })?.message).toContain('Facebook Groups Scraper');
+        expect(findActorTip({ query: 'https://m.facebook.com/apify' })?.message).toContain('Facebook Posts Scraper');
+    });
+
+    it('matches a path segment exactly, not merely its prefix', () => {
+        expect(findActorTip({ query: 'https://www.facebook.com/groups' })?.message).toContain('Facebook Groups Scraper');
+        expect(findActorTip({ query: 'https://www.google.com/maps' })?.message).toContain('Google Maps Scraper');
+        expect(findActorTip({ query: 'https://www.facebook.com/groupsomething' })?.message).toContain('Facebook Posts Scraper');
+        expect(findActorTip({ query: 'https://www.google.com/mapsomething' })).toBeNull();
+    });
+
+    it.each([
+        'go to zillow.com for listings',
+        'go to zillow.com, and get the listings',
+        'go to zillow.com. thanks',
+        'go to zillow.com; now',
+        'go to zillow.com!',
+        'is zillow.com down?',
+        'see (zillow.com) for details',
+        'see [zillow.com] for details',
+        'go to zillow.com...',
+    ])('finds the domain whatever punctuation surrounds it: %s', (query) => {
+        expect(findActorTip({ query })?.message).toContain('Zillow Detail Scraper');
+    });
+
+    it('strips the punctuation before matching a path segment', () => {
+        expect(findActorTip({ query: 'google.com/maps, prague' })?.message).toContain('Google Maps Scraper');
+    });
+
+    it('ignores the case of the input', () => {
+        expect(findActorTip({ query: 'HTTPS://WWW.TIKTOK.COM/@APIFY' })?.message).toContain('TikTok Scraper');
+        expect(findActorTip({ query: 'Site:Instagram.com nike' })?.message).toContain('Instagram Scraper');
+    });
+
+    it('never throws on tokens that cannot be parsed as a URL', () => {
+        expect(findActorTip({ query: 'https:// http://[ .. :: %% "" -' })).toBeNull();
+    });
+
+    it('reads `query` first and falls back to `url`', () => {
+        expect(findActorTip({ url: 'https://www.tiktok.com/@apify' })?.message).toContain('TikTok Scraper');
+        expect(findActorTip({ query: '', url: 'https://www.tiktok.com/@apify' })?.message).toContain('TikTok Scraper');
+        expect(findActorTip({ query: 'https://www.tiktok.com/@apify', url: 'https://www.amazon.com/dp/1' })?.message).toContain('TikTok Scraper');
+        expect(findActorTip({})).toBeNull();
+    });
+});
+
+describe('findActorTipInResults', () => {
+    function mockResults(...results: { url: string; rank?: number }[]) {
+        const items = results.map(({ url, rank }) => (rank === undefined ? { metadata: { url } } : { metadata: { url }, searchResult: { rank } }));
+        vi.spyOn(Actor, 'openDataset').mockResolvedValue({ getData: async () => ({ items }) } as unknown as Dataset);
+    }
+
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    it('recommends the site of the result Google ranked first, not of the page stored first', async () => {
+        // In the order the pages finished loading, which is how they are stored.
+        mockResults(
+            { url: 'https://example.com/', rank: 2 },
+            { url: 'https://www.facebook.com/apify', rank: 1 },
+            { url: 'https://example.org/', rank: 3 },
+        );
+
+        expect((await findActorTipInResults())?.message).toContain('Facebook Posts Scraper');
+    });
+
+    it('prefers the site of the top-ranked result over a site that half of the results come from', async () => {
+        mockResults(
+            { url: 'https://www.facebook.com/apify', rank: 1 },
+            { url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', rank: 2 },
+            { url: 'https://www.youtube.com/watch?v=yPYZpwSpKmA', rank: 3 },
+            { url: 'https://example.com/', rank: 4 },
+        );
+
+        expect((await findActorTipInResults())?.message).toContain('Facebook Posts Scraper');
+    });
+
+    it('recommends a site that at least half of the results come from when the top-ranked result is not listed', async () => {
+        mockResults(
+            { url: 'https://example.com/', rank: 1 },
+            { url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', rank: 2 },
+            { url: 'https://www.youtube.com/watch?v=yPYZpwSpKmA', rank: 3 },
+            { url: 'https://example.org/', rank: 4 },
+        );
+
+        expect((await findActorTipInResults())?.message).toContain('YouTube Scraper');
+    });
+
+    it('recommends nothing for listed sites that rank below an unlisted one and have less than half of the results', async () => {
+        mockResults(
+            { url: 'https://example.com/', rank: 1 },
+            { url: 'https://www.facebook.com/apify', rank: 2 },
+            { url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', rank: 3 },
+            { url: 'https://www.instagram.com/apify/', rank: 4 },
+        );
+
+        expect(await findActorTipInResults()).toBeNull();
+    });
+
+    it('counts the results from unlisted sites toward the half', async () => {
+        mockResults(
+            { url: 'https://example.com/', rank: 1 },
+            { url: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', rank: 2 },
+            { url: 'https://www.youtube.com/watch?v=yPYZpwSpKmA', rank: 3 },
+            { url: 'https://example.org/', rank: 4 },
+            { url: 'https://example.net/', rank: 5 },
+        );
+
+        expect(await findActorTipInResults()).toBeNull();
+    });
+
+    it('recommends the site a fetched URL ended up on, when the results carry no rank', async () => {
+        mockResults({ url: 'https://www.instagram.com/apify/' });
+
+        expect((await findActorTipInResults())?.message).toContain('Instagram Scraper');
+    });
+
+    it('never throws when the results cannot be read', async () => {
+        vi.spyOn(Actor, 'openDataset').mockRejectedValue(new Error('Dataset not found'));
+
+        expect(await findActorTipInResults()).toBeNull();
+    });
+});
+
+describe('storeActorTip', () => {
+    afterEach(() => {
+        vi.restoreAllMocks();
+    });
+
+    it('stores the tip under the reserved `TIP` key', async () => {
+        const setValue = vi.spyOn(Actor, 'setValue').mockResolvedValue(undefined);
+        const tip = { message: 'For scraping tiktok.com, ...', level: 'info', recommendedActorId: 'GdWCkxBtKWOsKjdch' } as const;
+
+        await storeActorTip(tip);
+
+        expect(setValue).toHaveBeenCalledWith('TIP', tip);
+    });
+
+    it('writes nothing when there is no tip', async () => {
+        const setValue = vi.spyOn(Actor, 'setValue').mockResolvedValue(undefined);
+
+        await storeActorTip(null);
+
+        expect(setValue).not.toHaveBeenCalled();
+    });
+});

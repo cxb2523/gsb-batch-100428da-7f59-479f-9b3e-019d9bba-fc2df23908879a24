@@ -1,0 +1,57 @@
+{
+    "name": "rag-web-browser",
+    "version": "0.0.1",
+    "type": "module",
+    "description": "RAG Web Browser - run Google Search queries and extract content from the top search results.",
+    "engines": {
+        "node": ">=20.0.0"
+    },
+    "dependencies": {
+        "@crawlee/impit-client": "^3.17.0",
+        "@crawlee/memory-storage": "^3.11.1",
+        "@ghostery/adblocker-playwright": "^2.5.2",
+        "@mozilla/readability": "^0.6.0",
+        "apify": "^3.7.2",
+        "cheerio": "^1.0.0-rc.12",
+        "crawlee": "^3.15.3",
+        "express": "^4.21.2",
+        "joplin-turndown-plugin-gfm": "^1.0.12",
+        "jsdom": "^24.1.1",
+        "playwright": "1.64.1",
+        "tldts": "^7.4.10",
+        "turndown": "^7.2.0"
+    },
+    "devDependencies": {
+        "@apify/eslint-config": "^1.0.0",
+        "@apify/tsconfig": "^0.1.0",
+        "@eslint/compat": "^1.2.7",
+        "@eslint/eslintrc": "^3.3.1",
+        "@eslint/js": "^9.23.0",
+        "@types/express": "^5.0.0",
+        "@types/node": "^22.13.1",
+        "@types/turndown": "^5.0.5",
+        "domhandler": "^5.0.3",
+        "eslint": "^9.23.0",
+        "eslint-config-prettier": "^9.1.0",
+        "eslint-plugin-import": "^2.29.1",
+        "globals": "^16.0.0",
+        "idcac-playwright": "^0.2.0",
+        "tsx": "^4.6.2",
+        "typescript": "^5.3.3",
+        "typescript-eslint": "^8.29.0",
+        "vitest": "^3.0.5"
+    },
+    "scripts": {
+        "start": "pnpm start:dev",
+        "start:prod": "node dist/src/main.js",
+        "start:dev": "tsx src/main.ts",
+        "build": "tsc",
+        "build:playwright-blockers": "NODE_NO_WARNINGS=1 tsx scripts/build-playwright-blockers.ts",
+        "lint": "eslint",
+        "lint:fix": "eslint --fix",
+        "test": "vitest run"
+    },
+    "author": "Apify",
+    "license": "ISC",
+    "packageManager": "pnpm@11.24.0+sha512.bd27e345e976dcb0be0b7a1228217b049a817e21b1f355c90dbe7dc46671895a8bc1e6d06c24554505ea93ea0b45f489a27ec1bfbc8de6a9659fca0f16fa0000"
+}

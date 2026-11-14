@@ -1,0 +1,222 @@
+import type { IncomingMessage, ServerResponse } from 'node:http';
+
+import type { CheerioCrawlerOptions } from 'crawlee';
+import { log } from 'crawlee';
+
+import type { CrawlerKind } from './const.js';
+import { PLAYWRIGHT_REQUEST_TIMEOUT_NORMAL_MODE_SECS } from './const.js';
+import { addContentCrawlRequest, addSearchRequest, createAndStartContentCrawler, createAndStartSearchCrawler } from './crawlers.js';
+import { UserInputError } from './errors.js';
+import { processInput } from './input.js';
+import { getMiniActor } from './mini-actors.js';
+import { createResponsePromise, RunShuttingDownError } from './responses.js';
+import type {
+    ContentCrawlerOptions,
+    ContentScraperSettings,
+    Input,
+    Output,
+    RagWebBrowserInput,
+    UrlToMarkdownInput,
+} from './types.js';
+import {
+    addTimeMeasureEvent,
+    createRequest,
+    createSearchRequest,
+    extractActorRequestId,
+    interpretAsUrl,
+    parseParameters,
+    randomId,
+} from './utils.js';
+
+/**
+ * Prepares the request for the search.
+ * Decide whether input.query is a URL or a search query. If it's a URL, we don't need to run the search crawler.
+ * Return the request, isUrl and responseId.
+ */
+function prepareRequest(
+    input: Input,
+    contentCrawlerKey: CrawlerKind,
+    contentScraperSettings: ContentScraperSettings,
+    actorRequestId?: string,
+) {
+    // The crawlers are shared, so the proxy a caller asked for rides on the request instead.
+    const contentProxyOptions = input.proxyConfiguration;
+    if (!getMiniActor().runsSearch) {
+        const { url } = (input as Input & UrlToMarkdownInput);
+        if (!url) {
+            throw new UserInputError('The `url` parameter must be provided and non-empty.');
+        }
+        const interpretedUrl = interpretAsUrl(url);
+        if (!interpretedUrl) {
+            throw new UserInputError('The `url` parameter must be a valid URL or a string that can be interpreted as a URL.');
+        }
+
+        const responseId = randomId();
+        const req = createRequest(
+            interpretedUrl,
+            { url: interpretedUrl },
+            responseId,
+            contentScraperSettings,
+            contentProxyOptions,
+            null,
+            actorRequestId,
+        );
+        addTimeMeasureEvent(req.userData!, 'request-received', Date.now());
+        return { req, isUrl: true, responseId };
+    }
+
+    const { query, maxResults } = input as Input & RagWebBrowserInput;
+    if (!query) {
+        throw new UserInputError('The `query` parameter must be provided and non-empty.');
+    }
+    const interpretedUrl = interpretAsUrl(query);
+    const validatedQuery = interpretedUrl ?? query;
+    const responseId = randomId();
+
+    const req = interpretedUrl
+        ? createRequest(
+            validatedQuery,
+            { url: validatedQuery },
+            responseId,
+            contentScraperSettings,
+            contentProxyOptions,
+            null,
+            actorRequestId,
+        )
+        : createSearchRequest(
+            {
+                query: validatedQuery,
+                responseId,
+                maxResults,
+                contentCrawlerKey,
+                contentScraperSettings,
+                serpMaxRetries: (input as Input & RagWebBrowserInput).serpMaxRetries,
+                contentProxyOptions,
+                // `checkAccess` rides along so the access check this proxy never wanted stays skipped.
+                proxyOptions: { groups: [(input as Input & RagWebBrowserInput).serpProxyGroup], checkAccess: false },
+                actorRequestId,
+            },
+        );
+
+    addTimeMeasureEvent(req.userData!, 'request-received', Date.now());
+    return { req, isUrl: !!interpretedUrl, responseId };
+}
+
+/**
+ * Internal function that handles the common logic for search.
+ * Returns a promise that resolves to the final results array of Output objects.
+ */
+async function runSearchProcess(params: Partial<Input>, actorRequestId?: string): Promise<Output[]> {
+    // Process the query parameters the same way as normal inputs
+    const {
+        input,
+        searchCrawlerOptions,
+        contentCrawlerOptions,
+        contentScraperSettings,
+    } = await processInput(params);
+
+    // A request that rebuilds a missing crawler must give it a Standby lifetime, not its own.
+    searchCrawlerOptions.keepAlive = true;
+    contentCrawlerOptions.crawlerOptions.keepAlive = true;
+
+    const { key: contentCrawlerKey } = await createAndStartContentCrawler(contentCrawlerOptions);
+
+    const { req, isUrl, responseId } = prepareRequest(
+        input,
+        contentCrawlerKey,
+        contentScraperSettings,
+        actorRequestId,
+    );
+
+    // Create a promise that resolves when all requests are processed
+    const resultsPromise = createResponsePromise(responseId, input.requestTimeoutSecs);
+
+    if (isUrl) {
+        // If input is a direct URL, skip the search crawler
+        if (getMiniActor().runsSearch) {
+            const { query } = (input as Input & RagWebBrowserInput);
+            log.info(`Skipping Google Search query as "${query}" is a valid URL`);
+        }
+        await addContentCrawlRequest(req, responseId, contentCrawlerKey);
+    } else {
+        // If input is a search query, run the search crawler first
+        const { key: searchCrawlerKey } = await createAndStartSearchCrawler(searchCrawlerOptions);
+        await addSearchRequest(req, searchCrawlerKey);
+    }
+
+    // Return promise that resolves when all requests are processed
+    return resultsPromise;
+}
+
+/**
+ * Handles the search request at the /search or /fetch endpoint (HTTP scenario).
+ * Uses the unified runSearchProcess function and then sends an HTTP response.
+ */
+export async function handleSearchRequest(request: IncomingMessage, response: ServerResponse) {
+    try {
+        const params = parseParameters(request.url?.slice(getMiniActor().route.length) ?? '');
+        log.info(`Received query parameters: ${JSON.stringify(params)}`);
+
+        const actorRequestId = extractActorRequestId(request.headers);
+
+        const results = await runSearchProcess(params, actorRequestId);
+
+        response.writeHead(200, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify(results));
+    } catch (e) {
+        const error = e as Error;
+        let statusCode = 500;
+        if (error instanceof UserInputError) statusCode = 400;
+        else if (error instanceof RunShuttingDownError) statusCode = 503;
+        log.error(`Error occurred: ${error.message}`);
+        response.writeHead(statusCode, { 'Content-Type': 'application/json' });
+        response.end(JSON.stringify({ errorMessage: error.message }));
+    }
+}
+
+/**
+ * Runs the search and scrape in normal mode.
+ */
+export async function handleSearchNormalMode(
+    input: Input,
+    searchCrawlerOptions: CheerioCrawlerOptions,
+    contentCrawlerOptions: ContentCrawlerOptions,
+    contentScraperSettings: ContentScraperSettings,
+) {
+    /* eslint-disable no-param-reassign */
+    const startedTime = Date.now();
+    contentCrawlerOptions.crawlerOptions.requestHandlerTimeoutSecs = PLAYWRIGHT_REQUEST_TIMEOUT_NORMAL_MODE_SECS;
+
+    const {
+        crawler: contentCrawler,
+        key: contentCrawlerKey,
+    } = await createAndStartContentCrawler(contentCrawlerOptions, false);
+
+    const { req, isUrl } = prepareRequest(
+        input,
+        contentCrawlerKey,
+        contentScraperSettings,
+    );
+    if (isUrl) {
+        if (getMiniActor().runsSearch) {
+            // If the input query is a URL, we don't need to run the search crawler
+            const { query } = (input as Input & RagWebBrowserInput);
+            log.info(`Skipping Google Search query as "${query}" is a valid URL`);
+        }
+        await addContentCrawlRequest(req, '', contentCrawlerKey);
+    } else {
+        const { crawler: searchCrawler, key: searchCrawlerKey } = await createAndStartSearchCrawler(searchCrawlerOptions, false);
+        await addSearchRequest(req, searchCrawlerKey);
+        addTimeMeasureEvent(req.userData!, 'before-cheerio-run', startedTime);
+        log.info(`Running Google Search crawler with request: ${req.url}`);
+        await searchCrawler!.run();
+    }
+
+    addTimeMeasureEvent(req.userData!, 'before-playwright-run', startedTime);
+    log.info(`Running target page crawler with request: ${req.url}`);
+    await contentCrawler!.run();
+    /* eslint-enable no-param-reassign */
+
+    const { requestsFinished, requestsFailed } = contentCrawler!.stats.state;
+    return { requestsFinished, requestsFailed };
+}

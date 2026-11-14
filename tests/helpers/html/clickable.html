@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clickable Test Page</title>
+</head>
+<body>
+    <p>always visible content</p>
+
+    <button id="toggle">Show details</button>
+    <div id="panel"></div>
+
+    <a id="anchor" href="#anchor-panel">Show more</a>
+    <div id="anchor-panel"></div>
+
+    <a id="link" href="/basic#section">Link to another page</a>
+    <div id="link-panel"></div>
+
+    <script>
+        // Collapsed content is added to the page only when clicked, and takes a moment to render
+        const reveal = (panelId, text) => {
+            window.setTimeout(() => {
+                document.getElementById(panelId).textContent = text;
+            }, 150);
+        };
+
+        document.getElementById('toggle').addEventListener('click', () => reveal('panel', 'collapsed panel content'));
+        document.getElementById('anchor').addEventListener('click', () => reveal('anchor-panel', 'anchor panel content'));
+        document.getElementById('link').addEventListener('click', () => reveal('link-panel', 'link panel content'));
+
+        // The elements become collapsed only once the page is interactive, so they cannot be clicked
+        // before the Actor waits for the dynamic content
+        window.setTimeout(() => {
+            for (const id of ['toggle', 'anchor', 'link']) {
+                document.getElementById(id).setAttribute('aria-expanded', 'false');
+            }
+        }, 200);
+    </script>
+</body>
+</html>
