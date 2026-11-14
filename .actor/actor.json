@@ -1,0 +1,16 @@
+{
+	"actorSpecification": 1,
+	"name": "zalando-scraper",
+	"title": "Zalando Scraper",
+	"description": "This actor extracts product data from zalando.com.",
+	"version": "0.0",
+	"meta": {
+		"templateId": "ts-crawlee-cheerio"
+	},
+	"input": "./input_schema.json",
+	"output": "./output_schema.json",
+	"dockerfile": "./Dockerfile",
+	"storages": {
+		"dataset": "./dataset_schema.json"
+	}
+}
