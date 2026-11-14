@@ -15,7 +15,7 @@ Works out of the box on **Hyprland, Sway**, and other **wlroots-based** composit
 
 - **Mouse Control** — Move, click (`left`, `right`, `middle`, `nothing`), swipe (drag), auto-click, scroll, button press and release at absolute coordinates.
 - **Keyboard Automation** — Type text, tap keys, hold keys down/up, and execute complex hotkeys (`Ctrl+Alt+T`, `Ctrl+S`).
-- **Cursor Tracking** — Real-time position generator or one-shot snapshot (`get_position()`) across multiple compositors:
+- **Cursor Tracking** — Real-time position generator or one-shot snapshot (`get_position()`) across multiple compositors, with an **ordered, explainable fallback chain**: if a backend's binary is missing, fails to start, times out, or returns empty coordinates, the next one is tried automatically and every failure is recorded:
   - Hyprland (`hyprctl`)
   - Sway / wlroots (`wl-find-cursor`)
   - KDE Plasma (`kwin` scripting via D-Bus)
@@ -140,6 +140,57 @@ for x, y in mouse_position_generator(interval=0.1):
     # Break loop whenever needed
 ```
 
+### Explainable Fallback & Diagnostics
+
+Both `get_position()` and `mouse_position_generator()` run on the same
+ordered fallback engine. Failures are never swallowed: each skipped or failed
+backend is recorded with a categorized reason (`binary_missing`,
+`unavailable`, `startup_failed`, `read_timeout`, `empty_result`,
+`read_error`) and the stage it happened at (`probe`, `startup`, `read`).
+
+Opt into the diagnostics without changing the legacy `(x, y)` return type:
+
+```python
+from wayland_automation.mouse_position import (
+    PositionReport, mouse_position_generator, get_position_with_report,
+)
+
+# Snapshot with full provenance
+pos, report = get_position_with_report()
+print(pos)                       # (800, 600)
+print(report.active_backend)     # e.g. "wl-find-cursor"
+for failure in report.skipped:
+    print("skipped:", failure.render())
+
+# Streaming: inspect live state and react to backend hand-overs
+report = PositionReport()
+def on_switch(switch):
+    print(f"{switch.from_backend} -> {switch.to_backend} "
+          f"({switch.reason.value}) at {switch.at_position}")
+
+for x, y in mouse_position_generator(
+    interval=0.1, report=report, on_switch=on_switch
+):
+    ...  # report.failures / report.switches stay updated in place
+```
+
+If **every** backend fails, a `NoBackendAvailableError` (a `RuntimeError`
+subclass) is raised whose message summarizes each backend individually,
+e.g.:
+
+```text
+No mouse tracking backend could provide a cursor position; per-backend results:
+  - hyprctl [probe/binary_missing]: hyprctl not found on PATH
+  - xdotool [probe/unavailable]: DISPLAY is not set (no XWayland session)
+  - evdev [startup/startup_failed]: ...
+```
+
+During a stream, if the active backend fails `read_fail_threshold`
+consecutive reads (default 3) it is retired and the next candidate takes
+over. The replacement is anchored at the last known coordinate (the `evdev`
+integration backend is seeded automatically), so a switch never replays or
+moves the reported position backwards.
+
 ---
 
 ## Command Line Interface (CLI)
@@ -221,11 +272,19 @@ wayland-automation pos --interval 0.1      # Live coordinate feed
 ### Cursor Tracking Functions
 
 - `wa.get_position() -> tuple[int, int]`  
-  Retrieves a single snapshot of the current cursor coordinate.
+  Retrieves a single snapshot of the current cursor coordinate, trying each
+  backend in priority order. Raises `NoBackendAvailableError` (a
+  `RuntimeError`) with a per-backend failure summary if all of them fail.
+- `wa.get_position_with_report(report=None) -> tuple[tuple[int, int], PositionReport]`  
+  Same snapshot, plus a `PositionReport` exposing `active_backend`,
+  `failures`, `skipped`, `switches` and `last_position`.
 - `wa.position() -> tuple[int, int]`  
   Alias for `get_position()`.
-- `wa.mouse_position_generator(interval: float = 0.2, print_output: bool = False)`  
-  Yields `(x, y)` tuples continuously.
+- `wa.mouse_position_generator(interval: float = 0.2, print_output: bool = False, *, report=None, backends=None, read_fail_threshold=3, on_switch=None)`  
+  Yields `(x, y)` tuples continuously. The legacy positional API is
+  unchanged; the keyword arguments expose fallback diagnostics, allow
+  injecting custom (e.g. fake) backends, tune the consecutive-failure
+  switch threshold, and register a callback for `BackendSwitch` events.
 
 ---
 

@@ -198,7 +198,12 @@ def main(argv: List[str] = None) -> int:
 
     elif args.command == "pos":
         if args.once:
-            p = wa.get_position()
+            try:
+                p = wa.get_position()
+            except Exception as exc:
+                # NoBackendAvailableError carries the per-backend summary.
+                print(f"Could not retrieve cursor position: {exc}", file=sys.stderr)
+                return 1
             if p:
                 print(f"{p[0]} {p[1]}")
             else:
@@ -209,6 +214,9 @@ def main(argv: List[str] = None) -> int:
             try:
                 for _ in wa.mouse_position_generator(interval=args.interval, print_output=True):
                     pass
+            except Exception as exc:
+                print(f"\nCould not retrieve cursor position: {exc}", file=sys.stderr)
+                return 1
             except KeyboardInterrupt:
                 print("\nStopped.")
             return 0

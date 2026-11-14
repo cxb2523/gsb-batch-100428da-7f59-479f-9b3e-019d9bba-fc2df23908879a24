@@ -46,8 +46,10 @@ __all__ = [
     "mouse_up",
     "mouseUp",
     "get_position",
+    "get_position_with_report",
     "position",
     "mouse_position_generator",
+    "NoBackendAvailableError",
     "typewrite",
     "press",
     "keyDown",
@@ -160,17 +162,42 @@ def get_position() -> Optional[Tuple[int, int]]:
     return _get_pos()
 
 
+def get_position_with_report(report=None):
+    """Snapshot plus a diagnostics report (active backend, failures, switches)."""
+    from .mouse_position import get_position_with_report as _get_with_report
+    return _get_with_report(report=report)
+
+
 def position() -> Optional[Tuple[int, int]]:
     """Alias for get_position()."""
     return get_position()
 
 
 def mouse_position_generator(
-    interval: Optional[float] = None, print_output: bool = False
+    interval: Optional[float] = None,
+    print_output: bool = False,
+    report=None,
+    backends=None,
+    read_fail_threshold=None,
+    on_switch=None,
 ) -> Generator[Tuple[int, int], None, None]:
-    """Continuous generator yielding (x, y) coordinates."""
+    """Continuous generator yielding (x, y) coordinates.
+
+    Extra keyword arguments (``report``, ``backends``,
+    ``read_fail_threshold``, ``on_switch``) expose the ordered fallback
+    chain's diagnostics without changing the legacy positional API.
+    """
     from .mouse_position import mouse_position_generator as _gen
-    return _gen(interval=interval, print_output=print_output)
+    kwargs = dict(interval=interval, print_output=print_output)
+    if report is not None:
+        kwargs["report"] = report
+    if backends is not None:
+        kwargs["backends"] = backends
+    if read_fail_threshold is not None:
+        kwargs["read_fail_threshold"] = read_fail_threshold
+    if on_switch is not None:
+        kwargs["on_switch"] = on_switch
+    return _gen(**kwargs)
 
 
 def typewrite(text: str, interval: float = 0.0) -> None:
@@ -223,7 +250,12 @@ def __getattr__(name: str) -> Any:
     elif name in ("Keyboard", "KeyboardError"):
         from . import keyboard_controller
         return getattr(keyboard_controller, name)
-    elif name in ("get_position", "mouse_position_generator"):
+    elif name in (
+        "get_position",
+        "get_position_with_report",
+        "mouse_position_generator",
+        "NoBackendAvailableError",
+    ):
         from . import mouse_position
         return getattr(mouse_position, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
