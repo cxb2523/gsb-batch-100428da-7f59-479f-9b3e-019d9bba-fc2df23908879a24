@@ -3,6 +3,8 @@ from traceback import print_exc
 import asyncio
 import httpx
 import json
+import threading
+import time
 from typing import List, Dict, Any, TypeAlias, Optional
 from async_pool import AsyncPool
 import os
@@ -54,6 +56,77 @@ def save_obj(obj: JSON_TYPE, filename: str):
         json.dump(obj, f, ensure_ascii=False, indent=2)
 
 
+class RateLimitExceededError(Exception):
+    """触发 B 站 412 限流且重试次数用尽时抛出，用于替代直接退出进程"""
+
+
+class FailedFloorManager:
+    """
+    记录因限流未抓完的楼层，落盘到 data/video_{oid}/failed_floors.json。
+    重启后据此判断楼层是否需要重试：已失败过的楼层即使存在部分数据文件也重新爬取，
+    补抓成功后从清单中移除。
+    线程安全：AsyncPool 的回调运行在独立线程中，所有读写统一加锁。
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cache: Dict[int, Dict[str, Any]] = {}
+
+    def _load(self, oid: int) -> Dict[str, Any]:
+        if oid in self._cache:
+            return self._cache[oid]
+        path = f"data/video_{oid}/failed_floors.json"
+        floors: Dict[str, Any] = {}
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for item in json.load(f):
+                        floors[str(item["rpid"])] = item
+            except (json.JSONDecodeError, KeyError, TypeError):
+                print("失败清单 {} 内容损坏，将重新记录".format(path))
+        self._cache[oid] = {"path": path, "floors": floors}
+        return self._cache[oid]
+
+    def _flush(self, entry: Dict[str, Any]):
+        records = sorted(entry["floors"].values(),
+                         key=lambda x: (x["page"], x["rpid"]))
+        save_obj(records, entry["path"])
+
+    def is_failed(self, oid: int, rpid: int) -> bool:
+        """该楼层是否处于失败待重试状态"""
+        with self._lock:
+            return str(rpid) in self._load(oid)["floors"]
+
+    def mark_failed(self, oid: int, page: int, rpid: int, reason: str):
+        """记录一个未抓完的楼层（同一 rpid 重复记录会覆盖，不会产生重复条目）"""
+        with self._lock:
+            entry = self._load(oid)
+            entry["floors"][str(rpid)] = {
+                "oid": oid,
+                "page": page,
+                "rpid": rpid,
+                "reason": reason,
+                "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            self._flush(entry)
+        print("--- 已将 rpid 为 {:12d} 的楼层记入失败清单（{}）".format(rpid, reason))
+
+    def clear(self, oid: int, rpid: int):
+        """楼层补抓成功后，将其从失败清单移除"""
+        with self._lock:
+            entry = self._load(oid)
+            if entry["floors"].pop(str(rpid), None) is not None:
+                self._flush(entry)
+                print("--- rpid 为 {:12d} 的楼层已补抓成功，从失败清单移除".format(rpid))
+
+    def failed_count(self, oid: int) -> int:
+        with self._lock:
+            return len(self._load(oid)["floors"])
+
+
+failed_floor_manager = FailedFloorManager()
+
+
 async def get_html(url: str, params: Dict = None, headers: Dict = None, cookies: Dict = None, timeout: int = 30, client: httpx.AsyncClient = None, retry_time: int = 0):
     m_client = client
     try:
@@ -63,8 +136,8 @@ async def get_html(url: str, params: Dict = None, headers: Dict = None, cookies:
         r = await m_client.get(url, timeout=timeout, params=params, headers=headers, cookies=cookies)
         if r.status_code == 412:
             if retry_time >= MAX_RETRY_TIME_WHEN_LIMITED:
-                print("请求频率过高，引发 B 站限流了，已达到最大重试次数，放弃重试，尝试结束应用")
-                os._exit(1)
+                raise RateLimitExceededError(
+                    "请求频率过高，引发 B 站限流，已重试 {} 次仍失败，放弃该请求: {}".format(retry_time, url))
             print(f"请求频率过高，引发 B 站限流了，我正在尝试休眠 {SLEEP_TIME_WHEN_LIMITED}s... （当前重试次数: {retry_time}）")
             await asyncio.sleep(SLEEP_TIME_WHEN_LIMITED)
             return await get_html(url, params, headers, cookies, timeout, client, retry_time + 1)
@@ -110,18 +183,26 @@ async def crawl_one_page_video(oid: int, page: int, pagination_str: str, client:
     video_replies = obj["data"]["replies"]
 
     for root_reply in video_replies:
-        saved_file_name =  f"data/video_{oid}/page_{page}/rpid_{root_reply['rpid']}_convs.json"
-        if SKIP_EXISTED_DATA and os.path.exists(saved_file_name):
-            print("--- rpid 为 {:12d} 的评论已经爬过，跳过爬取".format(root_reply["rpid"]))
+        rpid = root_reply["rpid"]
+        saved_file_name =  f"data/video_{oid}/page_{page}/rpid_{rpid}_convs.json"
+        # 已爬过且不在失败清单中的楼层才跳过；失败过的楼层需要重试并覆盖旧的部分数据
+        if SKIP_EXISTED_DATA and os.path.exists(saved_file_name) and not failed_floor_manager.is_failed(oid, rpid):
+            print("--- rpid 为 {:12d} 的评论已经爬过，跳过爬取".format(rpid))
             continue
-        comment_replies: Dict[str, Any] = await get_reply(oid, root_reply["rpid"], root_reply["rcount"])
+        comment_replies, failed_pages = await get_reply(oid, rpid, root_reply["rcount"])
         conversations = build_conv_from_replies(root_reply, comment_replies)
         if conversations:
             save_obj(conversations, saved_file_name)
             print("--- 保存 rpid 为 {:12d} 的评论并构建对话完毕，共 {:6d} 条".format(
-                root_reply["rpid"], len(conversations)))
+                rpid, len(conversations)))
         else:
-            print("--- rpid 为 {:12d} 的评论没有符合要求的对话，跳过保存".format(root_reply["rpid"]))
+            print("--- rpid 为 {:12d} 的评论没有符合要求的对话，跳过保存".format(rpid))
+        if failed_pages:
+            reason = "；".join("第 {} 页回复：{}".format(p, r) for p, r in failed_pages)
+            failed_floor_manager.mark_failed(oid, page, rpid, reason)
+        else:
+            # 本次抓取完整，若之前在失败清单中则移除
+            failed_floor_manager.clear(oid, rpid)
         await asyncio.sleep(SLEEP_TIME_ONE_REPLY)
 
     print("爬取到的第 {} 页，第一条评论是 {}".format(
@@ -148,16 +229,42 @@ async def get_one_page_reply(oid: int, page: int, r_root: int):
 
 
 async def get_reply(oid: int, r_root: int, total_count: int):
-    """获取某个楼层的所有回复"""
+    """获取某个楼层的所有回复
+
+    返回 (replies, failed_pages)：
+    - replies 为已成功获取的回复（可能不完整）
+    - failed_pages 为未拿到的分页列表 [(page, reason), ...]，为空表示该楼层抓取完整
+    """
     total_page = total_count // 20 + 1
     replies = []
+    failed_pages = []
+    # AsyncPool 的回调运行在独立线程中，用 Event 在线程间传递“停止提交”信号
+    rate_limited = threading.Event()
+
+    def make_callback(page: int):
+        def callback(future):
+            try:
+                replies.extend(future.result())
+            except RateLimitExceededError as e:
+                # 该分页限流重试耗尽：停止提交后续分页，并记录失败页
+                rate_limited.set()
+                failed_pages.append((page, str(e)))
+            except Exception:
+                print_exc()
+        return callback
+
     for page in range(1, total_page + 1):
+        if rate_limited.is_set():
+            # 已有限流失败，停止提交该楼层的后续分页请求，剩余页一并记为未抓取
+            for rest_page in range(page, total_page + 1):
+                failed_pages.append((rest_page, "同楼层其他分页触发限流，未再提交请求"))
+            break
         if page % 10 == 0:
             print("---- 正在爬取 r_root: {}, page: {}".format(r_root, page))
         pool.submit(get_one_page_reply(oid, page, r_root),
-                    callback=lambda future: replies.extend(future.result()))
+                    callback=make_callback(page))
     pool.wait()
-    return replies
+    return replies, failed_pages
 
 
 async def crawl_one_video(oid: int):
@@ -177,7 +284,12 @@ async def crawl_one_video(oid: int):
     pagination = ''
     async with httpx.AsyncClient() as client:
         for page in range(1, total_page + 1):
-            next_page = await crawl_one_page_video(oid, page, pagination_str=pagination, client=client)
+            try:
+                next_page = await crawl_one_page_video(oid, page, pagination_str=pagination, client=client)
+            except RateLimitExceededError as e:
+                # 评论列表页本身限流重试耗尽：已抓数据均已保存，提前结束本次运行，可重启续跑
+                print("- 视频 {} 的第 {} 页评论列表请求触发限流且重试耗尽（{}），提前结束本次运行，可重启续跑".format(oid, page, e))
+                break
 
             print("-- 爬取视频 {} 的第 {} 页评论完毕，下一页: {}".format(oid, page, next_page))
             if next_page is None:
@@ -185,6 +297,9 @@ async def crawl_one_video(oid: int):
                 break
             await asyncio.sleep(SLEEP_TIME_ONE_PAGE)
             pagination = next_page
+    failed = failed_floor_manager.failed_count(oid)
+    if failed:
+        print("- 视频 {} 本次运行有 {} 个楼层未抓完，详见 data/video_{}/failed_floors.json，重启后将自动重试".format(oid, failed, oid))
 
 
 def build_conv_from_replies(root_reply: JSON_TYPE, replies: List[JSON_TYPE]) -> List[List[Dict]]:
