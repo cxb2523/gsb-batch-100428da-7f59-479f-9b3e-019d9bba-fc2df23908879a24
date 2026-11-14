@@ -25,7 +25,7 @@ Escáner ofensivo web escrito en Python que combina crawling, detección de XSS,
 
 ## Funcionalidades
 
-- Crawling de la aplicación objetivo
+- Crawling de la aplicación objetivo con final trazable por URL (`--crawl-report`)
 - Detección de XSS reflected (GET y formularios)
 - Detección de SQLi GET y POST en formularios
 - Análisis de cabeceras de seguridad (6 cabeceras)
@@ -87,12 +87,32 @@ python3 webxray.py --version
 -k, --insecure     No verificar TLS
 --rate             Máximo de peticiones por segundo
 --json-output      Guardar resultados en JSON/JSONL
+--crawl-report     Guardar el registro de descubrimiento (outcome por URL) en JSON/JSONL
 --format           Formato de salida para export y stdout (json|jsonl)
 --stdout           Enviar findings normalizados a stdout
     --version      Muestra la versión
 ```
 
 > `-H`, `-c`, `-x`, `-k` y `--rate` se aplican a todas las peticiones de webxray, crawler incluido. En `--waf-xss`, la detección del WAF la hace `wafw00f`, que no las recibe.
+
+### Finales del descubrimiento
+
+Cada URL candidata que toca el crawler obtiene un registro de final estable; las páginas que fallan ya no abortan la ronda ni se omiten en silencio. Outcomes:
+
+| outcome | significado |
+| --- | --- |
+| `fetched` | pedida, respuesta recibida y HTML parseado |
+| `parse_failed` | respuesta recibida pero el cuerpo no se pudo parsear |
+| `depth_limit` | encolada pero no pedida por alcanzar `--depth` |
+| `request_failed` | la petición HTTP falló (ver el campo `error`) |
+| `excluded_cross_site` | enlace externo, excluido del crawler |
+| `duplicate` | URL ya vista, ignorada |
+
+Cada registro tiene siempre los mismos siete campos: `url`, `outcome`, `depth`, `source`, `status`, `error`, `links_found`. Se escriben en un documento separado con `--crawl-report` (JSON/JSONL, respeta `--format`) y nunca se mezclan con el flujo de findings, cuyo esquema no cambia. El escaneo por defecto sigue cubriendo todas las URLs encoladas —incluidas las fallidas y las de profundidad límite— mediante `scannable_urls()`.
+
+```bash
+python3 webxray.py -u https://target.com --crawl-report crawl.jsonl --format jsonl
+```
 
 ---
 

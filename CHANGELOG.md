@@ -4,6 +4,25 @@ All notable changes to **webxray** are documented here.
 
 ---
 
+## [1.4.0] – 2026-11-14
+
+### Added
+- `discover_urls()` devuelve ahora un registro por cada URL candidata con su final trazable, en vez de una lista plana que silenciaba saltos y fallos. Outcomes estables: `fetched`, `parse_failed`, `depth_limit`, `request_failed` (con resumen del error en el campo `error`), `excluded_cross_site` y `duplicate`. El esquema del registro es fijo: `url`, `outcome`, `depth`, `source`, `status`, `error`, `links_found`.
+- `scannable_urls()`: extrae del registro las URLs que el escaneo debe cubrir (todas las que se encolaron, en el mismo orden BFS que antes). El flujo principal la usa, asi que XSS/SQLi/cabeceras siguen escaneando las mismas URLs y una pagina fallida no hace perder candidatas.
+- `--crawl-report`: escribe el registro de descubrimiento en un documento JSON/JSONL separado (respeta `--format`). No se mezcla con los findings, cuya estructura queda intacta.
+- `crawl_outcome_summary()` y linea de log con el conteo de outcomes al terminar el descubrimiento.
+- Tests contra servidor HTTP local cubriendo fetch normal, fallo de peticion (sin interrumpir la ronda), respuesta no parseable, truncado por profundidad, exclusion cross-site, duplicados, estabilidad del esquema y compatibilidad del CLI.
+
+### Changed
+- Un fallo de red o de parseo en una pagina ya no se omite en silencio: se registra (`request_failed`/`parse_failed`) y el crawler continua con el resto de la cola.
+- `discover_urls()` devuelve `List[dict]` en vez de `List[str]`; los consumidores que necesiten la lista antigua usan `scannable_urls()`.
+
+### Notas de compatibilidad
+- Las reglas de mismo host, desduplicacion, semantica de profundidad y la aplicacion de `-H`/`-c`/`-x`/`-k`/`--rate` a todas las peticiones no cambian.
+- `--json-output`/`--stdout` siguen emitiendo unicamente findings normalizados, con el mismo esquema.
+
+---
+
 ## [1.3.0] – 2026-11-05
 
 ### Added

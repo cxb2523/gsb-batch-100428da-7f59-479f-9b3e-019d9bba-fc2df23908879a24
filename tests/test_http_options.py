@@ -56,7 +56,8 @@ def server():
 def test_headers_and_cookie_reach_every_request(server):
     base, seen = server
     webxray.configure_http(["X-Bugbounty: theoffsecgirl"], "session=abc", None, False, 0)
-    urls = webxray.discover_urls(base, max_depth=1, timeout=5)
+    crawl_records = webxray.discover_urls(base, max_depth=1, timeout=5)
+    urls = webxray.scannable_urls(crawl_records)
     session = webxray.make_session()
     for u in urls:
         webxray.check_xss(session, u, timeout=5)

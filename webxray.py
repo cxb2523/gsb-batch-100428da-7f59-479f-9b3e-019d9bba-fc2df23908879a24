@@ -11,7 +11,7 @@
 Pensado para recon / bug bounty como primer filtro rapido.
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 import argparse
 import json
@@ -129,6 +129,55 @@ class ScanSession(requests.Session):
 
 SCAN_HEADERS: Dict[str, str] = {}
 SCAN_PROXIES: Optional[Dict[str, str]] = None
+
+# Resultados posibles de una URL candidata durante el descubrimiento. Son
+# valores estables: forman parte del esquema de salida (--crawl-report) y no
+# deben renombrarse sin versionar el cambio.
+OUTCOME_FETCHED = "fetched"                       # pedida, respuesta recibida y HTML parseado
+OUTCOME_PARSE_FAILED = "parse_failed"             # respuesta recibida, pero el HTML no se pudo parsear
+OUTCOME_DEPTH_LIMIT = "depth_limit"               # encolada, no pedida por alcanzar max_depth
+OUTCOME_REQUEST_FAILED = "request_failed"         # la peticion fallo (ver campo "error")
+OUTCOME_CROSS_SITE = "excluded_cross_site"        # enlace externo, excluido del crawler
+OUTCOME_DUPLICATE = "duplicate"                   # URL ya conocida, ignorada
+
+# Outcomes de URLs que si llegaron a la cola del crawler: son exactamente las
+# que la version antigua devolvia en la lista y las que el escaneo debe cubrir.
+CRAWL_QUEUED_OUTCOMES = (
+    OUTCOME_FETCHED,
+    OUTCOME_PARSE_FAILED,
+    OUTCOME_REQUEST_FAILED,
+    OUTCOME_DEPTH_LIMIT,
+)
+
+# Campos estables del registro de descubrimiento. Siempre aparecen los siete
+# (con None cuando no aplican) para que los consumidores puedan fiarse del
+# esquema; van en un documento separado (--crawl-report), nunca se mezclan con
+# los findings.
+CRAWL_RECORD_FIELDS = (
+    "url", "outcome", "depth", "source", "status", "error", "links_found",
+)
+
+
+def make_crawl_record(url: str, outcome: str, depth: int,
+                      source: Optional[str] = None, status: Optional[int] = None,
+                      error: Optional[str] = None, links_found: int = 0) -> dict:
+    return {
+        "url": url,
+        "outcome": outcome,
+        "depth": depth,
+        "source": source,
+        "status": status,
+        "error": error,
+        "links_found": links_found,
+    }
+
+
+def _summarize_error(exc: BaseException, limit: int = 200) -> str:
+    """Resumen corto y estable de una excepcion de red/parseo."""
+    text = f"{type(exc).__name__}: {exc}".strip()
+    if len(text) > limit:
+        text = text[: limit - 3] + "..."
+    return text
 
 
 def make_session() -> requests.Session:
@@ -282,42 +331,117 @@ def write_output(findings: List[dict], fmt: str, stdout: bool = False, output_fi
         log_info(f"Resultados guardados en {output_file}")
 
 
-def discover_urls(start_url: str, max_depth: int = 1, timeout: int = 10) -> List[str]:
+def discover_urls(start_url: str, max_depth: int = 1, timeout: int = 10) -> List[dict]:
+    """Descubre URLs internas por BFS y devuelve un registro por cada
+    URL candidata con el final que le toco (ver constantes OUTCOME_*).
+
+    Cada registro tiene SIEMPRE las claves de CRAWL_RECORD_FIELDS:
+      url          -> URL canonica (sin fragmento)
+      outcome      -> fetched / parse_failed / depth_limit / request_failed /
+                      excluded_cross_site / duplicate
+      depth        -> profundidad BFS (0 = semilla)
+      source       -> URL de la pagina cuyo enlace revelo esta URL (None en la semilla)
+      status       -> codigo HTTP de la respuesta (None si no llego a haberla)
+      error        -> resumen del fallo (solo en request_failed/parse_failed)
+      links_found  -> enlaces <a href> extraidos tras parsear la respuesta
+
+    Una pagina que falla no interrumpe la ronda: se registra el fallo y el
+    resto de la cola se sigue procesando. El orden de las decisiones se
+    mantiene igual que antes: mismo host -> repeticion -> encolado.
+    """
     start_url = normalize_url(start_url)
     seen = {start_url}
     queue = [(start_url, 0)]
-    discovered: List[str] = []
+    # Padre que encolo cada URL (la semilla no tiene). Permite arrastrar el
+    # "source" hasta el registro final con el que salga de la cola.
+    sources: Dict[str, Optional[str]] = {start_url: None}
+    records: List[dict] = []
 
     session = make_session()
 
     while queue:
         current, depth = queue.pop(0)
-        discovered.append(current)
+        source = sources.get(current)
 
         if depth >= max_depth:
+            # Se descubrio dentro del rango permitido, pero no se pide porque
+            # su profundidad ya iguala el techo.
+            records.append(
+                make_crawl_record(current, OUTCOME_DEPTH_LIMIT, depth, source=source)
+            )
             continue
 
         try:
             resp = session.get(current, timeout=timeout, verify=True)
         except requests.RequestException as e:
             log_warn(f"Error al solicitar {current}: {e}")
+            records.append(
+                make_crawl_record(current, OUTCOME_REQUEST_FAILED, depth,
+                                  source=source, error=_summarize_error(e))
+            )
             continue
 
         try:
             tree = html.fromstring(resp.text)
-        except Exception:
+        except Exception as e:
+            # Hubo respuesta, pero no es HTML parseable: no se pueden extraer
+            # enlaces de ella, aunque la URL sigue siendo candidata a escaneo.
+            log_warn(f"No se pudo parsear {current}: {e}")
+            records.append(
+                make_crawl_record(current, OUTCOME_PARSE_FAILED, depth,
+                                  source=source, status=resp.status_code,
+                                  error=_summarize_error(e))
+            )
             continue
 
-        for el in tree.xpath("//a[@href]"):
+        link_els = tree.xpath("//a[@href]")
+        records.append(
+            make_crawl_record(current, OUTCOME_FETCHED, depth,
+                              source=source, status=resp.status_code,
+                              links_found=len(link_els))
+        )
+
+        for el in link_els:
             href = el.get("href")
             if not href:
                 continue
             full = urljoin(current, href).split("#", 1)[0]
-            if full not in seen and same_host(start_url, full):
-                seen.add(full)
-                queue.append((full, depth + 1))
+            if not same_host(start_url, full):
+                records.append(
+                    make_crawl_record(full, OUTCOME_CROSS_SITE, depth + 1, source=current)
+                )
+                continue
+            if full in seen:
+                records.append(
+                    make_crawl_record(full, OUTCOME_DUPLICATE, depth + 1, source=current)
+                )
+                continue
+            seen.add(full)
+            sources[full] = current
+            queue.append((full, depth + 1))
 
-    return discovered
+    return records
+
+
+def scannable_urls(crawl_records: List[dict]) -> List[str]:
+    """Extrae del registro de descubrimiento las URLs que el escaneo
+    (XSS/SQLi/cabeceras) debe cubrir: todas las que se encolaron de verdad,
+    en el mismo orden que producia la version antigua. Los enlaces
+    cross-site y los duplicados nunca entraron en la cola y se excluyen."""
+    urls: List[str] = []
+    for record in crawl_records:
+        if record.get("outcome") in CRAWL_QUEUED_OUTCOMES:
+            urls.append(record["url"])
+    return urls
+
+
+def crawl_outcome_summary(crawl_records: List[dict]) -> Dict[str, int]:
+    """Conteo de registros por outcome, para el log de progreso."""
+    summary: Dict[str, int] = {}
+    for record in crawl_records:
+        outcome = record.get("outcome", "unknown")
+        summary[outcome] = summary.get(outcome, 0) + 1
+    return summary
 
 
 def mutate_url_with_payload(url: str, param: str, payload: str) -> Optional[str]:
@@ -717,6 +841,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rate", type=float, default=0,
                         help="Maximo de peticiones por segundo (default: sin limite)")
     parser.add_argument("--json-output", help="Guardar resultados en JSON/JSONL")
+    parser.add_argument("--crawl-report",
+                        help="Guardar el registro de descubrimiento (outcome por URL) en JSON/JSONL; "
+                             "documento separado de los findings")
     parser.add_argument("--format", choices=["json", "jsonl"], default="json",
                         help="Formato de salida para export y stdout")
     parser.add_argument("--stdout", action="store_true",
@@ -738,8 +865,21 @@ def main() -> None:
         all_findings.extend(check_waf_xss(start_url, timeout=timeout))
     else:
         log_info(f"Descubriendo URLs desde {start_url} (profundidad {args.depth})")
-        urls = discover_urls(start_url, max_depth=args.depth, timeout=timeout)
+        crawl_records = discover_urls(start_url, max_depth=args.depth, timeout=timeout)
+        urls = scannable_urls(crawl_records)
         log_info(f"URLs descubiertas: {len(urls)}")
+        log_info(f"Finales del descubrimiento: {crawl_outcome_summary(crawl_records)}")
+
+        if args.crawl_report:
+            try:
+                write_output(
+                    crawl_records,
+                    fmt=args.format,
+                    stdout=False,
+                    output_file=args.crawl_report,
+                )
+            except OSError as e:
+                log_error(f"No se pudo escribir el informe de descubrimiento: {e}")
 
         session = make_session()
 
