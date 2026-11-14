@@ -2735,6 +2735,42 @@ async function handleScrapingEvent(progressDiv, modal, eventType, data) {
       break;
     }
 
+    // Per-movie batch outcome: shows which movies are complete, partial (some
+    // site failed, data from the others kept) or failed (nothing merged).
+    case 'scrapeProgress': {
+      const sites = (data.failedSites || []).map(f =>
+        f.reason ? `${f.scraper}: ${f.reason}` : f.scraper).join(', ');
+      const notFound = (data.notFoundSites || []).map(f => f.scraper).join(', ');
+      let message;
+      let type;
+
+      if (data.status === 'success') {
+        type = 'success';
+        message = window.i18n
+          ? window.i18n.t("messages.scrapeItemSuccess", { code: data.code, sources: (data.sources || []).join(', ') })
+          : `✓ ${data.code}: merged data from ${(data.sources || []).join(', ')}`;
+      } else if (data.status === 'partial') {
+        type = 'warning';
+        message = window.i18n
+          ? window.i18n.t("messages.scrapeItemPartial", { code: data.code, sites })
+          : `⚠️ ${data.code}: data merged, but these sites failed: ${sites}`;
+      } else if (data.status === 'failed' && notFound) {
+        type = 'warning';
+        message = window.i18n
+          ? window.i18n.t("messages.scrapeItemNotFound", { code: data.code, sites: notFound })
+          : `ℹ️ ${data.code}: some sites have no data: ${notFound}`;
+      } else {
+        type = 'error';
+        message = window.i18n
+          ? window.i18n.t("messages.scrapeItemFailed", { code: data.code })
+          : `❌ ${data.code}: every site failed or had no data`;
+      }
+
+      appendProgress(progressDiv, message, type);
+      if (data.status !== 'success') showNotification(message, type, 8000);
+      break;
+    }
+
     case 'complete':
       appendProgress(progressDiv, '✅ ' + data.message, 'success');
       switchToCloseButton(cancelBtn, modal);

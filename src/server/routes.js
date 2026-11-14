@@ -1378,6 +1378,18 @@ router.delete("/scrape/current", (req, res) => {
   try {
     // Check if a specific ID was provided in the request body
     const { id } = req.body;
+    const { readScrapeProgress, writeScrapeProgress } = require('../core/scrapeProgress');
+    const outputDir = getScrapePath();
+
+    // Deleting a movie drops its progress entry too, so it isn't reported as
+    // completed (or as a partial gap) after the file is gone.
+    const forgetProgress = (movieId) => {
+      if (!movieId) return;
+      const progress = readScrapeProgress(outputDir);
+      if (!progress.items[movieId]) return;
+      delete progress.items[movieId];
+      writeScrapeProgress(progress, outputDir);
+    };
 
     if (id) {
       // Reload items to ensure we have the latest list
@@ -1392,10 +1404,13 @@ router.delete("/scrape/current", (req, res) => {
       // Set the current index to the found item and delete it
       scrapeReader.currentIndex = index;
       const result = scrapeReader.deleteCurrent();
+      if (result.ok) forgetProgress(id);
       res.json(result);
     } else {
       // Legacy behavior: delete current item based on currentIndex
+      const currentId = scrapeReader.getCurrent()?.id;
       const result = scrapeReader.deleteCurrent();
+      if (result.ok) forgetProgress(currentId);
       res.json(result);
     }
   } catch (err) {
@@ -1413,7 +1428,7 @@ router.delete("/scrape/all", (req, res) => {
     }
 
     const files = fs.readdirSync(outputDir);
-    const jsonFiles = files.filter(f => f.endsWith('.json'));
+    const jsonFiles = files.filter(f => f.endsWith('.json') && !f.startsWith('.'));
 
     let deletedCount = 0;
     jsonFiles.forEach(file => {
@@ -1421,6 +1436,12 @@ router.delete("/scrape/all", (req, res) => {
       fs.unlinkSync(filePath);
       deletedCount++;
     });
+
+    // The delete-all action also clears the batch resume state: with no scrape
+    // JSONs left, keeping "success" entries would wrongly skip everything.
+    const { readScrapeProgress, writeScrapeProgress, emptyProgress } = require('../core/scrapeProgress');
+    const progress = readScrapeProgress(outputDir);
+    writeScrapeProgress({ ...progress, items: emptyProgress().items }, outputDir);
 
     // Reload scrape reader
     scrapeReader.loadScrapeItems();
@@ -1436,6 +1457,21 @@ router.get("/scrape/count", (req, res) => {
   try {
     const count = scrapeReader.getCount();
     res.json({ ok: true, count });
+  } catch (err) {
+    res.json(fail(err.message));
+  }
+});
+
+// ─────────────────────────────
+// GET /scrape/progress
+// Batch scrape progress: per-movie status (success / partial / failed) with
+// the failed sites and reasons, as written to data/scrape/.scrape-progress.json.
+// ─────────────────────────────
+router.get("/scrape/progress", (req, res) => {
+  try {
+    const { readScrapeProgress } = require('../core/scrapeProgress');
+    const progress = readScrapeProgress(getScrapePath());
+    res.json({ ok: true, progress });
   } catch (err) {
     res.json(fail(err.message));
   }
@@ -1928,6 +1964,7 @@ router.post("/scrape/save", async (req, res) => {
 router.post("/scrape/start", async (req, res) => {
   const { EventEmitter } = require('events');
   const { scrapeAll, extractCodesFromLibrary } = require('../core/scraperManager');
+  const { readScrapeProgress, isCodeCompleted } = require('../core/scrapeProgress');
 
   try {
     // Get config - always reload fresh config to ensure we use the current library path
@@ -1950,20 +1987,29 @@ router.post("/scrape/start", async (req, res) => {
 
     console.error(`[Routes] Found ${codes.length} file(s) to scrape`);
 
-    // Filter out already scraped codes
+    // Resume from the progress file: skip movies already merged with no site
+    // errors; retry the partial / failed ones (they may have a JSON from the
+    // sites that did succeed, but still miss data from the failed ones).
     const outputDir = getScrapePath();
     console.error(`[Routes] Scrape output directory: ${outputDir}`);
 
-    const codesToScrape = codes.filter(code => {
-      const jsonPath = path.join(outputDir, `${code}.json`);
-      return !fs.existsSync(jsonPath);
+    const progress = readScrapeProgress(outputDir);
+    const codesToScrape = [];
+    const skippedCodes = [];
+
+    codes.forEach(code => {
+      if (isCodeCompleted(code, progress, outputDir)) {
+        skippedCodes.push(code);
+      } else {
+        codesToScrape.push(code);
+      }
     });
 
     if (codesToScrape.length === 0) {
       return res.json({ ok: false, error: 'All files already scraped. Nothing to do.' });
     }
 
-    console.error(`[Routes] Scraping ${codesToScrape.length} new file(s)`);
+    console.error(`[Routes] Scraping ${codesToScrape.length} file(s), skipping ${skippedCodes.length} already completed`);
 
     // Return immediate response with WebSocket ID
     const scrapeId = Date.now().toString();
@@ -2025,6 +2071,16 @@ router.post("/scrape/start", async (req, res) => {
       });
     });
 
+    // Per-movie outcome after the merge (success / partial / failed), so the
+    // UI can show which movies still miss a site.
+    emitter.on('scrapeProgress', (data) => {
+      req.wss.clients.forEach(client => {
+        if (client.readyState === 1) {
+          client.send(JSON.stringify({ event: 'scrapeProgress', data, scrapeId }));
+        }
+      });
+    });
+
     emitter.on('scraperError', (data) => {
       req.wss.clients.forEach(client => {
         if (client.readyState === 1) {
@@ -2079,7 +2135,7 @@ router.post("/scrape/start", async (req, res) => {
     });
 
     // Execute scraping (don't await, let it run in background)
-    scrapeAll(codesToScrape, emitter)
+    scrapeAll(codesToScrape, emitter, { skipped: skippedCodes })
       .then(() => {
         console.error('[Routes] Video scraping completed successfully');
 
@@ -2618,7 +2674,7 @@ router.post("/genre-rules/apply", async (req, res) => {
       return res.json({ ok: true, updated: 0, message: 'Scrape directory is empty' });
     }
 
-    const files = fs.readdirSync(scrapeDir).filter(f => f.endsWith('.json'));
+    const files = fs.readdirSync(scrapeDir).filter(f => f.endsWith('.json') && !f.startsWith('.'));
     let updated = 0;
 
     for (const file of files) {

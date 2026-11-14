@@ -17,6 +17,22 @@ const fs = require('fs');
 const path = require('path');
 const { loadConfig, getScrapePath, getLibraryPaths } = require('./config');
 const { applyGenreRules } = require('./genreFilter');
+const {
+  readScrapeProgress,
+  writeScrapeProgress,
+  isCodeCompleted,
+  buildProgressEntry,
+  STATUS_SUCCESS,
+  STATUS_PARTIAL,
+  STATUS_FAILED,
+  SITE_OK,
+  SITE_NOT_FOUND,
+  SITE_ERROR
+} = require('./scrapeProgress');
+
+// Scrapers live in scrapers/movies; SCRAPERS_DIR lets a test point the
+// orchestrator at a folder of fake scrapers instead of the real sites.
+const SCRAPERS_DIR = process.env.SCRAPERS_DIR || path.join(__dirname, '../../scrapers/movies');
 
 // Sentinel value for "scraper" params/dropdowns meaning "run every scraper
 // configured in scrapers.video, in priority order, and merge like a normal
@@ -131,8 +147,196 @@ function extractCodesFromLibrary(libraryPaths) {
 // ─────────────────────────────
 
 /**
- * Execute a single scraper for given codes
- * Returns the JSON output from stdout
+ * Error family of a failed site, from a reason string or a scraper's own
+ * `error` field. Keeps "the site said this movie doesn't exist" apart from
+ * "the site failed us" (crash, rate limit, session limit, bad output).
+ *
+ * @param {string} reason
+ * @returns {'session_limit'|'rate_limited'|'not_found'|'site_error'}
+ */
+function classifySiteError(reason) {
+  const text = String(reason || '');
+  if (/session[\s_-]*limit/i.test(text)) return 'session_limit';
+  if (/rate[\s_-]*limit|error\s*1015|too\s*many\s*requests|\b429\b/i.test(text)) return 'rate_limited';
+  if (/not\s*found|\b404\b|no\s+(?:such|matching)\s+(?:movie|video|item)/i.test(text)) return 'not_found';
+  return 'site_error';
+}
+
+/** Last stderr line mentioning a batch-level stop (rate/session limit). */
+function findBatchStopLine(stderrText) {
+  const lines = String(stderrText || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => /rate[\s_-]*limit|error\s*1015|too\s*many\s*requests|\b429\b|session[\s_-]*limit/i.test(line));
+  return lines.length > 0 ? lines[lines.length - 1] : '';
+}
+
+/**
+ * True when a scraper result carries actual movie data (not just `{code}`).
+ * Any populated field beyond code/id/bookkeeping counts: a site may know only
+ * a director or a content id for a movie, and that data must still be merged
+ * instead of being reported as "no such movie". Uses isDeepEmpty so schema
+ * defaults (`rating: {value: 0}`, `images: {poster: '', fanart: []}`) don't
+ * count as data.
+ */
+function hasMeaningfulScraperData(data) {
+  if (!data || data.error) return false;
+  const ignored = new Set(['code', 'dvd_id', 'id', 'error']);
+  return Object.keys(data).some(field => !ignored.has(field) && !isDeepEmpty(data[field]));
+}
+
+/** Outcomes marking every requested code with the same failure. */
+function allErrorOutcomes(codes, errorKind, reason) {
+  const outcomes = new Map();
+  codes.forEach(code => outcomes.set(code, { status: SITE_ERROR, errorKind, reason }));
+  return outcomes;
+}
+
+/**
+ * What one site said about one code, from its stderr log lines: scrapers
+ * often swallow a per-movie error and return a bare `{code}`, so the log is
+ * the only place that says whether the movie is missing or the request failed.
+ *
+ * @param {string} code
+ * @param {string} stderrText
+ * @returns {{status: string, reason: string, errorKind?: string}|null}
+ */
+function classifyStderrForCode(code, stderrText) {
+  const upper = String(code || '').toUpperCase();
+  if (!upper) return null;
+
+  // Whole-token match: "SS-1" must not match a log line about "SS-10".
+  const escaped = upper.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const codeRe = new RegExp(`(?<![A-Za-z0-9])${escaped}(?![A-Za-z0-9])`, 'i');
+
+  const lines = String(stderrText || '')
+    .split(/\r?\n/)
+    .map(line => line.trim())
+    .filter(line => line && codeRe.test(line));
+
+  let notFoundLine = '';
+  for (const line of lines) {
+    if (/not\s*found|no\s+(?:matching\s+)?(?:results?|data)|http\s*404|\b404\b/i.test(line)) {
+      notFoundLine = notFoundLine || line;
+      continue;
+    }
+    if (/error|fail|exception|timeout|timed out|rate|session|blocked|denied|http\s*[45]\d\d|status\s*[45]\d\d/i.test(line)) {
+      return { status: SITE_ERROR, errorKind: classifySiteError(line), reason: line };
+    }
+  }
+
+  return notFoundLine ? { status: SITE_NOT_FOUND, reason: notFoundLine } : null;
+}
+
+/**
+ * Per-code outcome of one scraper run, from its stdout results, exit status
+ * and stderr log:
+ *   ok        -> data for that movie
+ *   not_found -> the site answered but has no such movie
+ *   error     -> the site failed (crash, rate limit, session limit, bad output)
+ *
+ * Data found before a non-zero exit is kept: a batch that scraped five movies
+ * and then got rate limited must not lose those five.
+ *
+ * @param {string[]} codes - requested codes
+ * @param {object[]} results - parsed scraper stdout
+ * @param {object} [context]
+ * @param {number} [context.exitCode]
+ * @param {string} [context.stderrText]
+ * @returns {Map<string, {status: string, reason?: string, errorKind?: string}>}
+ */
+function buildOutcomes(codes, results, { exitCode = 0, stderrText = '' } = {}) {
+  const outcomes = new Map();
+  const byCode = new Map();
+
+  (Array.isArray(results) ? results : []).forEach(result => {
+    const code = result && (result.code || result.dvd_id);
+    if (code) byCode.set(String(code).toUpperCase(), result);
+  });
+
+  const batchStopReason = findBatchStopLine(stderrText);
+  const batchStopKind = batchStopReason ? classifySiteError(batchStopReason) : '';
+
+  codes.forEach(code => {
+    const result = byCode.get(code.toUpperCase());
+
+    // Data found: merge it, whatever the process did afterwards.
+    if (hasMeaningfulScraperData(result)) {
+      outcomes.set(code, { status: SITE_OK });
+      return;
+    }
+
+    // The scraper reported its own per-movie error (e.g. {code, error:'SESSION_LIMIT'})
+    if (result && result.error) {
+      const reason = String(result.error);
+      const errorKind = classifySiteError(reason);
+      outcomes.set(code, {
+        status: errorKind === 'not_found' ? SITE_NOT_FOUND : SITE_ERROR,
+        ...(errorKind === 'not_found' ? {} : { errorKind }),
+        reason
+      });
+      return;
+    }
+
+    // No stanza-level signal: the site's own log line for this code can still
+    // tell an HTTP/parse failure from "no such movie".
+    const logOutcome = classifyStderrForCode(code, stderrText);
+
+    if (result) {
+      // A bare {code} means "no data". With a non-zero exit, the scraper's
+      // catch-all error path produced it, so it is a failure, not a miss.
+      if (logOutcome && logOutcome.status === SITE_ERROR) {
+        outcomes.set(code, logOutcome);
+        return;
+      }
+      if (exitCode !== 0) {
+        outcomes.set(code, {
+          status: SITE_ERROR,
+          errorKind: 'site_error',
+          reason: `scraper exited with code ${exitCode}`
+        });
+        return;
+      }
+      outcomes.set(code, {
+        status: SITE_NOT_FOUND,
+        reason: (logOutcome && logOutcome.reason) || 'no data returned'
+      });
+      return;
+    }
+
+    // No result at all: the site stopped before reaching this code.
+    if (logOutcome && logOutcome.status === SITE_ERROR) {
+      outcomes.set(code, logOutcome);
+      return;
+    }
+    if (batchStopKind && batchStopKind !== 'not_found') {
+      outcomes.set(code, {
+        status: SITE_ERROR,
+        errorKind: batchStopKind,
+        reason: batchStopReason
+      });
+      return;
+    }
+    if (exitCode !== 0) {
+      outcomes.set(code, {
+        status: SITE_ERROR,
+        errorKind: 'site_error',
+        reason: `scraper exited with code ${exitCode}`
+      });
+      return;
+    }
+    outcomes.set(code, {
+      status: SITE_NOT_FOUND,
+      reason: 'no result returned'
+    });
+  });
+
+  return outcomes;
+}
+
+/**
+ * Execute a single scraper for given codes and report, per code, whether the
+ * site returned data, has no such movie, or failed.
  *
  * INTERACTIVE SCRAPER SUPPORT:
  * - Scrapers can be interactive (e.g., require user input, open browser)
@@ -142,23 +346,40 @@ function extractCodesFromLibrary(libraryPaths) {
  * - Emits 'scraperError' events when scraper fails
  * - Supports interactive prompts via 'prompt' events
  *
+ * BATCH MODE (`batch: true`):
+ * - A site failure never waits for (or asks) the user; the batch continues
+ * - Returns data found before a non-zero exit instead of dropping it
+ *
  * @param {string} scraperName - Name of the scraper
  * @param {string[]} codes - Array of DVD codes to scrape
  * @param {EventEmitter} emitter - Event emitter for progress updates (optional)
- * @returns {Promise<object[]>} - Parsed JSON array from scraper stdout
+ * @param {object} [options]
+ * @param {boolean} [options.batch] - Unattended batch mode
+ * @returns {Promise<{results: object[], outcomes: Map}>}
  */
-function executeScraper(scraperName, codes, emitter = null) {
+function executeScraperDetailed(scraperName, codes, emitter = null, options = {}) {
+  const { batch = false } = options;
+
   return new Promise((resolve, reject) => {
-    // Scrapers are now in scrapers/movies/ subdirectory
-    const scraperPath = path.join(__dirname, '../../scrapers/movies', scraperName, 'run.js');
+    // Scrapers are now in scrapers/movies/ subdirectory (or SCRAPERS_DIR)
+    const scraperPath = path.join(SCRAPERS_DIR, scraperName, 'run.js');
 
     // Check if scraper exists
     if (!fs.existsSync(scraperPath)) {
       const message = `Scraper not found: ${scraperPath}`;
       console.error(`[ScraperManager] ${message}`);
-      if (emitter) emitter.emit('scraperError', { scraperName, message });
+      // In batch mode this is one failing site among others, not a stop:
+      // report it as progress and let the remaining sites contribute.
+      if (emitter) {
+        emitter.emit(batch ? 'progress' : 'scraperError', batch
+          ? { message }
+          : { scraperName, message });
+      }
       // Return minimal results for all codes
-      resolve(codes.map(code => ({ code })));
+      resolve({
+        results: codes.map(code => ({ code })),
+        outcomes: allErrorOutcomes(codes, 'scraper_not_found', message)
+      });
       return;
     }
 
@@ -167,16 +388,19 @@ function executeScraper(scraperName, codes, emitter = null) {
     console.error(`[ScraperManager] Codes: ${codes.join(', ')}`);
     if (emitter) emitter.emit('progress', { message: `${message} for ${codes.join(', ')}` });
 
-    // Spawn scraper process
+    // Spawn scraper process with the same Node binary running the app
+    // (process.execPath), so scrapers also start when `node` is not on PATH
+    // (e.g. the bundled runtime in data/runtime).
     // - stdin: 'pipe' -> can send interactive responses
     // - stdout: 'pipe' -> capture JSON output for parsing
     // - stderr: 'pipe' -> capture progress messages and emit them
-    const child = spawn('node', [scraperPath, ...codes], {
+    const child = spawn(process.execPath, [scraperPath, ...codes], {
       stdio: ['pipe', 'pipe', 'pipe']
     });
 
     let stdout = '';
     let stdoutBuffer = '';
+    let stderrText = '';
 
     // Collect stdout and handle interactive prompts
     child.stdout.on('data', (data) => {
@@ -230,83 +454,127 @@ function executeScraper(scraperName, codes, emitter = null) {
 
     // Capture stderr (progress logs) and emit as events
     child.stderr.on('data', (data) => {
-      const lines = data.toString().split('\n').filter(l => l.trim());
+      const chunk = data.toString();
+      stderrText += chunk;
+      const lines = chunk.split('\n').filter(l => l.trim());
       lines.forEach(line => {
         console.error(line);
         if (emitter) emitter.emit('progress', { message: line });
       });
     });
 
+    // Ask the user whether to continue after a site-level failure. Batch mode
+    // never asks: one site failing must not stop the other sites or the batch.
+    const askToContinue = async (failureMessage) => {
+      if (batch || !emitter) return true;
+      return new Promise((resolvePrompt) => {
+        emitter.emit('scraperError', {
+          scraperName,
+          message: failureMessage,
+          callback: resolvePrompt
+        });
+      });
+    };
+
+    // Parse stdout, whether the process exited 0 or not: a scraper that
+    // already scraped part of the batch before failing still returns it.
+    const parseStdout = () => {
+      try {
+        const parsed = JSON.parse(stdout);
+        return Array.isArray(parsed) ? parsed : [parsed];
+      } catch (_) {
+        return null;
+      }
+    };
+
+    // Report per-code outcomes to the UI. Errors are non-blocking progress
+    // lines in batch mode; "not found" keeps the existing warning event.
+    const reportOutcomes = (outcomes) => {
+      if (!emitter) return;
+      outcomes.forEach((outcome, code) => {
+        if (outcome.status === SITE_ERROR) {
+          const reason = outcome.errorKind ? `${outcome.errorKind}: ${outcome.reason}` : outcome.reason;
+          console.error(`[ScraperManager] ${scraperName} failed for ${code}: ${reason}`);
+          emitter.emit('progress', { message: `${scraperName} failed for ${code} (${reason})` });
+        } else if (outcome.status === SITE_NOT_FOUND) {
+          console.error(`[ScraperManager] ${scraperName} found no data for ${code}: ${outcome.reason}`);
+          emitter.emit('scraperWarning', { scraperName, code, reason: outcome.reason });
+        }
+      });
+    };
+
     // Handle process exit
     child.on('close', async (code) => {
+      const parsedResults = stdout.trim() ? parseStdout() : null;
+
       if (code !== 0) {
-        const message = `Scraper ${scraperName} exited with code ${code}`;
-        console.error(`[ScraperManager] ${message}`);
+        const failureMessage = `Scraper ${scraperName} exited with code ${code}`;
+        console.error(`[ScraperManager] ${failureMessage}`);
 
-        // Ask user if they want to continue (via emitter callback)
-        if (emitter) {
-          const shouldContinue = await new Promise((resolvePrompt) => {
-            emitter.emit('scraperError', {
-              scraperName,
-              exitCode: code,
-              message,
-              callback: resolvePrompt  // Callback per ricevere risposta utente
-            });
-          });
+        if (batch) {
+          // Keep whatever the scraper managed to return, mark the rest failed
+          const results = parsedResults || codes.map(c => ({ code: c }));
+          const outcomes = buildOutcomes(codes, parsedResults || results, { exitCode: code, stderrText });
+          reportOutcomes(outcomes);
+          resolve({ results, outcomes });
+          return;
+        }
 
-          if (!shouldContinue) {
-            // User chose to stop - reject to stop scraping
-            reject(new Error(`Scraping stopped by user after ${scraperName} failed`));
-            return;
-          }
+        const shouldContinue = await askToContinue(failureMessage);
+        if (!shouldContinue) {
+          // User chose to stop - reject to stop scraping
+          reject(new Error(`Scraping stopped by user after ${scraperName} failed`));
+          return;
         }
 
         // Return minimal results if user chose to continue
-        resolve(codes.map(c => ({ code: c })));
+        resolve({
+          results: codes.map(c => ({ code: c })),
+          outcomes: buildOutcomes(codes, [], { exitCode: code, stderrText })
+        });
         return;
       }
 
       // Parse JSON output
-      try {
-        const parsed = JSON.parse(stdout);
-        const results = Array.isArray(parsed) ? parsed : [parsed];
-        const message = `Scraper ${scraperName} completed successfully`;
-        console.error(`[ScraperManager] ${message}`);
-        if (emitter) emitter.emit('progress', { message });
+      if (!parsedResults) {
+        const parseMessage = `Failed to parse JSON from ${scraperName}: ${stdout.trim() ? 'invalid JSON' : 'empty output'}`;
+        console.error(`[ScraperManager] ${parseMessage}`);
 
-        // A scraper that fails on a single code still exits 0 and returns
-        // just { code } — surface it, or it silently looks like a success.
-        codes.forEach(c => {
-          const r = results.find(x => x && (x.code || x.dvd_id || '').toUpperCase() === c.toUpperCase());
-          if (r && (r.title || r.coverUrl || (Array.isArray(r.actor) && r.actor.length > 0))) return;
-          const reason = (r && r.error) || 'no data returned';
-          console.error(`[ScraperManager] ${scraperName} found no data for ${c}: ${reason}`);
-          if (emitter) emitter.emit('scraperWarning', { scraperName, code: c, reason });
-        });
-
-        resolve(results);
-      } catch (error) {
-        const message = `Failed to parse JSON from ${scraperName}: ${error.message}`;
-        console.error(`[ScraperManager] ${message}`);
-
-        // Ask user if they want to continue
-        if (emitter) {
-          const shouldContinue = await new Promise((resolvePrompt) => {
-            emitter.emit('scraperError', {
-              scraperName,
-              message,
-              callback: resolvePrompt
-            });
+        if (batch) {
+          const outcomes = buildOutcomes(codes, [], { stderrText });
+          outcomes.forEach(outcome => {
+            if (outcome.status === SITE_NOT_FOUND) {
+              outcome.status = SITE_ERROR;
+              outcome.errorKind = 'invalid_output';
+              outcome.reason = parseMessage;
+            }
           });
-
-          if (!shouldContinue) {
-            reject(new Error(`Scraping stopped by user after ${scraperName} failed to parse JSON`));
-            return;
-          }
+          reportOutcomes(outcomes);
+          resolve({ results: codes.map(c => ({ code: c })), outcomes });
+          return;
         }
 
-        resolve(codes.map(c => ({ code: c })));
+        const shouldContinue = await askToContinue(parseMessage);
+        if (!shouldContinue) {
+          reject(new Error(`Scraping stopped by user after ${scraperName} failed to parse JSON`));
+          return;
+        }
+
+        resolve({
+          results: codes.map(c => ({ code: c })),
+          outcomes: allErrorOutcomes(codes, 'invalid_output', parseMessage)
+        });
+        return;
       }
+
+      const results = parsedResults;
+      const message = `Scraper ${scraperName} completed successfully`;
+      console.error(`[ScraperManager] ${message}`);
+      if (emitter) emitter.emit('progress', { message });
+
+      const outcomes = buildOutcomes(codes, results, { stderrText });
+      reportOutcomes(outcomes);
+      resolve({ results, outcomes });
     });
 
     // Handle process error
@@ -314,25 +582,32 @@ function executeScraper(scraperName, codes, emitter = null) {
       const message = `Failed to execute ${scraperName}: ${error.message}`;
       console.error(`[ScraperManager] ${message}`);
 
-      // Ask user if they want to continue
-      if (emitter) {
-        const shouldContinue = await new Promise((resolvePrompt) => {
-          emitter.emit('scraperError', {
-            scraperName,
-            message,
-            callback: resolvePrompt
-          });
-        });
-
-        if (!shouldContinue) {
-          reject(new Error(`Scraping stopped by user after ${scraperName} failed to execute`));
-          return;
-        }
+      const shouldContinue = await askToContinue(message);
+      if (!shouldContinue) {
+        reject(new Error(`Scraping stopped by user after ${scraperName} failed to execute`));
+        return;
       }
 
-      resolve(codes.map(c => ({ code: c })));
+      resolve({
+        results: codes.map(c => ({ code: c })),
+        outcomes: allErrorOutcomes(codes, 'spawn_error', message)
+      });
     });
   });
+}
+
+/**
+ * Execute a single scraper for given codes (array-only compatibility wrapper).
+ *
+ * @param {string} scraperName - Name of the scraper
+ * @param {string[]} codes - Array of DVD codes to scrape
+ * @param {EventEmitter} emitter - Event emitter for progress updates (optional)
+ * @param {object} [options] - See executeScraperDetailed
+ * @returns {Promise<object[]>} - Parsed JSON array from scraper stdout
+ */
+async function executeScraper(scraperName, codes, emitter = null, options = {}) {
+  const { results } = await executeScraperDetailed(scraperName, codes, emitter, options);
+  return results;
 }
 
 // ─────────────────────────────
@@ -638,9 +913,9 @@ async function executeScraperOrAll(scraperOrAll, code, emitter, config) {
  * @param {object} data - Scraped and merged data
  * @param {string[]} sources - List of scraper names used
  * @param {string[]} libraryPaths - Library roots (searched in order for the video)
+ * @param {string} [outputDir] - scrape output directory (defaults to data/scrape)
  */
-function saveToFile(code, data, sources, libraryPaths) {
-  const outputDir = getScrapePath();
+function saveToFile(code, data, sources, libraryPaths, outputDir = getScrapePath()) {
 
   // Ensure output directory exists
   if (!fs.existsSync(outputDir)) {
@@ -697,18 +972,153 @@ function saveToFile(code, data, sources, libraryPaths) {
   }
 }
 
-// ─────────────────────────────
-// Main Orchestration
-// ─────────────────────────────
+/**
+ * Empty for carry-over purposes: like isEmptyValue, but an object/array of
+ * only empty leaves counts as empty too (createEmptyMovie() always seeds
+ * `images: {poster:'', fanart:[]}`, `rating: {value:0, votes:0}`, `runtime: 0`:
+ * those must not mask a real previous value). 0 counts as empty here, so a
+ * runtime the missing site used to provide survives the retry.
+ */
+function isDeepEmpty(value) {
+  if (isEmptyValue(value)) return true;
+  if (typeof value === 'number') return value === 0;
+  if (Array.isArray(value)) return value.length === 0;
+  if (value && typeof value === 'object') return Object.values(value).every(isDeepEmpty);
+  return false;
+}
 
 /**
- * Main scraping function
+ * Fill empty fields of `target` from `fallback` (a previously merged movie).
+ * Used when retrying a partial movie: the data merged from sites that already
+ * succeeded before must not be lost just because they missed this run. Fresh
+ * values always win; only gaps are filled, so merge priority is unchanged.
+ *
+ * @param {object} target - freshly merged movie (mutated)
+ * @param {object|null|undefined} fallback - previous merged data
+ * @returns {object} target
+ */
+function carryOverFields(target, fallback) {
+  if (!fallback || typeof fallback !== 'object') return target;
+
+  Object.keys(fallback).forEach(field => {
+    if (field === 'id' || field === 'code') return;
+    if (field === 'actor') {
+      // Cast is a union in priority order: fresh actors first, old ones only
+      // added when not already present (mergeActors dedupes by name/id).
+      target.actor = mergeActors([target.actor, fallback.actor]);
+      return;
+    }
+    if (isDeepEmpty(target[field]) && !isDeepEmpty(fallback[field])) {
+      target[field] = fallback[field];
+    }
+  });
+
+  return target;
+}
+
+/**
+ * Merge one code from however many sites succeeded, and persist its progress
+ * entry. A site that errored for this code is recorded but never blocks the
+ * merge of the sites that did return data.
+ *
+ * Retries pass `previous` (the movie's existing JSON): if some site errors
+ * again, fields and cast already merged from sites that succeeded before are
+ * carried over instead of being dropped.
+ *
+ * @param {object} params
+ * @param {string} params.code - DVD code
+ * @param {object[]} params.scraperResults - {scraperName, data} of successful sites
+ * @param {Object<string, object>} params.outcomes - site name -> outcome
+ * @param {object} params.config - loaded config
+ * @param {string[]} params.libraryPaths - library roots
+ * @param {object} [params.previous] - existing wrapper for this code (retries)
+ * @returns {{status: string, entry: object, merged: object}}
+ */
+function mergeAndRecordCode({ code, scraperResults, outcomes, config, libraryPaths, previous = null, scrapeDir = getScrapePath() }) {
+  const merged = mergeResults(code, scraperResults, config);
+
+  if (merged.genres && config.genreRules) {
+    merged.genres = applyGenreRules(merged.genres, config.genreRules);
+  }
+
+  const usedScrapers = scraperResults.map(r => r.scraperName);
+  const hasSiteError = Object.values(outcomes).some(o => o.status === SITE_ERROR);
+  const hasMissingSite = Object.values(outcomes).some(o => o.status !== SITE_OK);
+
+  // A retry that still misses a site keeps the data that site provided in an
+  // earlier run (fresh fields keep priority).
+  if (hasMissingSite && previous && previous.data) {
+    carryOverFields(merged, previous.data);
+  }
+
+  // Only save if we have valid data (not just code/id fields)
+  const hasValidData = merged.title || merged.studio || merged.releaseDate ||
+                       (merged.actor && merged.actor.length > 0) ||
+                       (merged.genres && merged.genres.length > 0);
+
+  // Sites whose data came from the previous merge still count as sources.
+  const sources = hasMissingSite && previous && previous.data
+    ? [...new Set([...usedScrapers, ...(previous.sources || [])])]
+    : usedScrapers;
+
+  let status;
+  let saveError = '';
+
+  if (hasValidData) {
+    try {
+      saveToFile(code, merged, sources, libraryPaths, scrapeDir);
+      // Saved data is kept even when another site failed: that movie is
+      // "partial", not lost, and only the failed sites get retried.
+      status = hasSiteError ? STATUS_PARTIAL : STATUS_SUCCESS;
+    } catch (error) {
+      status = STATUS_FAILED;
+      saveError = `failed to save merged data: ${error.message}`;
+    }
+  } else {
+    status = STATUS_FAILED;
+  }
+
+  const entry = buildProgressEntry({ status, outcomes, sources });
+  if (saveError) entry.reason = saveError;
+
+  return { status, entry, merged };
+}
+
+/**
+ * Load an existing scraped movie wrapper ({scrapedAt, sources, videoFile, data}).
+ *
+ * @param {string} scrapeDir - scrape directory
+ * @param {string} code - DVD code
+ * @returns {object|null}
+ */
+function readExistingWrapper(scrapeDir, code) {
+  const jsonPath = path.join(scrapeDir, `${code}.json`);
+  try {
+    const parsed = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Main scraping function.
+ *
+ * Runs every enabled site for the whole batch, merges per movie, and records
+ * each movie's outcome in data/scrape/.scrape-progress.json. A site error for
+ * one movie (including rate/session limits) never stops the other sites from
+ * contributing, and data already returned by the sites that succeeded is kept.
  *
  * @param {string[]} codes - Array of DVD codes to scrape
  * @param {EventEmitter} emitter - Event emitter for progress updates (optional)
+ * @param {object} [options]
+ * @param {boolean} [options.batch=true] - Unattended: one site failing never prompts
+ * @param {string} [options.scrapeDir] - scrape directory (defaults to data/scrape)
+ * @param {string[]} [options.skipped] - codes skipped by the resume filter (recorded only)
  * @returns {Promise<object[]>} - Array of merged results
  */
-async function scrapeAll(codes, emitter = null) {
+async function scrapeAll(codes, emitter = null, options = {}) {
+  const { batch = true, scrapeDir = getScrapePath(), skipped = [] } = options;
   const config = loadConfig();
 
   // Get list of enabled scrapers (new structure: config.scrapers.video)
@@ -730,25 +1140,60 @@ async function scrapeAll(codes, emitter = null) {
     codes
   });
 
-  // Execute all enabled scrapers sequentially
+  // Progress file shared with the next run: successful movies are skipped,
+  // partial/failed ones are retried. Loaded once and flushed before the run
+  // and after every merged movie, so an interrupted batch still leaves the
+  // entries finished so far (a resumed run only redoes what is missing).
+  const progress = readScrapeProgress(scrapeDir);
+  progress.scrapers = enabledScrapers.slice();
+  progress.lastRun = {
+    startedAt: new Date().toISOString(),
+    finishedAt: '',
+    codes: codes.slice(),
+    skipped: skipped.slice()
+  };
+  writeScrapeProgress(progress, scrapeDir);
+
+  // Execute all enabled scrapers sequentially. Per code, this keeps the
+  // outcome of every site: ok / not_found / error (+ kind and reason).
   const scraperOutputs = [];
+  const outcomesByCode = new Map();
+  codes.forEach(code => outcomesByCode.set(code, {}));
 
   for (const scraperName of enabledScrapers) {
-    const results = await executeScraper(scraperName, codes, emitter);
-    scraperOutputs.push({
-      scraperName,
-      results
+    let run;
+    try {
+      run = await executeScraperDetailed(scraperName, codes, emitter, { batch });
+    } catch (error) {
+      // Only a deliberate user stop (non-batch mode) rejects. Record it as a
+      // site failure for the movies not merged yet, then stop the batch.
+      if (!batch) {
+        progress.lastRun.finishedAt = new Date().toISOString();
+        writeScrapeProgress(progress, scrapeDir);
+        throw error;
+      }
+      run = {
+        results: codes.map(code => ({ code })),
+        outcomes: allErrorOutcomes(codes, 'site_error', error.message)
+      };
+    }
+
+    const { results, outcomes } = run;
+    scraperOutputs.push({ scraperName, results });
+
+    codes.forEach(code => {
+      const outcome = outcomes.get(code) ||
+        { status: SITE_ERROR, errorKind: 'invalid_output', reason: 'no outcome reported' };
+      outcomesByCode.get(code)[scraperName] = outcome;
     });
   }
 
-  // Group results by code
+  // Group successful site results by code
   const resultsByCode = {};
-
   codes.forEach(code => {
     resultsByCode[code] = [];
   });
 
-  // Collect data from each scraper for each code
   scraperOutputs.forEach(({ scraperName, results }) => {
     results.forEach(data => {
       // Match by code or dvd_id field
@@ -761,45 +1206,71 @@ async function scrapeAll(codes, emitter = null) {
 
       // Find matching code (case-insensitive)
       const matchingCode = codes.find(c => c.toUpperCase() === (code || '').toUpperCase());
+      if (!matchingCode || !resultsByCode[matchingCode]) return;
 
-      if (matchingCode && resultsByCode[matchingCode]) {
-        resultsByCode[matchingCode].push({
-          scraperName,
-          data
-        });
-      }
+      // Only data-bearing results are merged; an errored/empty result must
+      // not shadow the value another site provided.
+      const outcome = outcomesByCode.get(matchingCode)[scraperName];
+      if (!outcome || outcome.status !== SITE_OK) return;
+
+      resultsByCode[matchingCode].push({ scraperName, data });
     });
   });
 
-  // Merge results for each code and save to files
+  // Merge results for each code, save files, record progress
   const finalResults = [];
+  const summary = { total: codes.length, success: 0, partial: 0, failed: 0 };
+  const libraryPaths = getLibraryPaths(config);
 
   for (const code of codes) {
-    const scraperResults = resultsByCode[code] || [];
-    const merged = mergeResults(code, scraperResults, config);
+    const outcomes = outcomesByCode.get(code) || {};
+    // A retried movie may already hold data from sites that succeeded before.
+    const previous = progress.items[code] ? readExistingWrapper(scrapeDir, code) : null;
 
-    if (merged.genres && config.genreRules) {
-      merged.genres = applyGenreRules(merged.genres, config.genreRules);
-    }
+    const { status, entry, merged } = mergeAndRecordCode({
+      code,
+      scraperResults: resultsByCode[code] || [],
+      outcomes,
+      config,
+      libraryPaths,
+      previous,
+      scrapeDir
+    });
 
-    // Only save if we have valid data (not just code/id fields)
-    // Check for meaningful data beyond just id/code
-    const hasValidData = merged.title || merged.studio || merged.releaseDate ||
-                         (merged.actor && merged.actor.length > 0) ||
-                         (merged.genres && merged.genres.length > 0);
-
-    if (hasValidData) {
-      // Collect which scrapers provided data for this code
-      const usedScrapers = scraperResults.map(r => r.scraperName);
-
-      // Save to file with wrapper structure
-      saveToFile(code, merged, usedScrapers, getLibraryPaths(config));
-    } else {
-      console.error(`[ScraperManager] Skipping save for ${code}: no valid data`);
-    }
-
+    summary[status]++;
+    progress.items[code] = entry;
     finalResults.push(merged);
+    // Flush per movie: an interrupted batch keeps everything merged so far,
+    // so the next run doesn't redo completed movies.
+    writeScrapeProgress(progress, scrapeDir);
+
+    if (status === STATUS_FAILED) {
+      const reasons = entry.failedSites.concat(entry.notFoundSites)
+        .map(f => `${f.scraper}: ${f.reason}`).join('; ');
+      console.error(`[ScraperManager] ${code}: failed, no usable data${reasons ? ` (${reasons})` : ''}`);
+    } else if (status === STATUS_PARTIAL) {
+      const failed = entry.failedSites.map(f => `${f.scraper} (${f.errorKind})`).join(', ');
+      console.error(`[ScraperManager] ${code}: partial, failed sites: ${failed}`);
+    }
+
+    if (emitter) {
+      emitter.emit('scrapeProgress', {
+        code,
+        status,
+        sources: entry.sources,
+        failedSites: entry.failedSites,
+        notFoundSites: entry.notFoundSites,
+        summary: { ...summary }
+      });
+    }
   }
+
+  progress.lastRun.finishedAt = new Date().toISOString();
+  progress.lastRun.summary = summary;
+  writeScrapeProgress(progress, scrapeDir);
+
+  console.error(`[ScraperManager] Batch finished: ${summary.success} success, ` +
+    `${summary.partial} partial, ${summary.failed} failed of ${summary.total}`);
 
   // Note: Actor scraping is now handled in routes.js, not here
   // This allows better control over the completion flow
@@ -832,15 +1303,20 @@ async function main() {
 
     console.error(`[ScraperManager] Found ${codes.length} file(s) to scrape`);
 
-    // Filter out already scraped codes
-    const outputDir = getScrapePath();
-    const codesToScrape = codes.filter(code => {
-      const jsonPath = path.join(outputDir, `${code}.json`);
-      const exists = fs.existsSync(jsonPath);
-      if (exists) {
+    // Resume: skip movies already merged without site errors; retry the
+    // partial and failed ones from the previous run.
+    const scrapeDir = getScrapePath();
+    const progress = readScrapeProgress(scrapeDir);
+    const codesToScrape = [];
+    const skipped = [];
+
+    codes.forEach(code => {
+      if (isCodeCompleted(code, progress, scrapeDir)) {
+        skipped.push(code);
         console.error(`[ScraperManager] Skipping ${code} - already scraped`);
+      } else {
+        codesToScrape.push(code);
       }
-      return !exists;
     });
 
     if (codesToScrape.length === 0) {
@@ -848,12 +1324,12 @@ async function main() {
       process.exit(0);
     }
 
-    console.error(`[ScraperManager] Scraping ${codesToScrape.length} new file(s), skipped ${codes.length - codesToScrape.length}`);
+    console.error(`[ScraperManager] Scraping ${codesToScrape.length} file(s), skipped ${skipped.length}`);
 
     // Execute scraping
-    const results = await scrapeAll(codesToScrape);
+    const results = await scrapeAll(codesToScrape, null, { skipped });
 
-    console.error(`[ScraperManager] Completed. Saved ${results.length} JSON file(s) to data/scrape/`);
+    console.error(`[ScraperManager] Completed. Merged ${results.length} item(s), progress in ${getScrapePath()}`);
 
   } catch (error) {
     console.error(`[ScraperManager] Fatal error: ${error.message}`);
@@ -867,4 +1343,18 @@ if (require.main === module) {
 }
 
 // Export for use as module
-module.exports = { scrapeAll, extractCodesFromLibrary, extractMovieId, executeScraper, executeScraperOrAll, mergeResults, mergeActors, mergeRescrapeActors, isEmptyValue, formatTitle, MULTI_SCRAPER_VALUE };
+module.exports = {
+  scrapeAll,
+  extractCodesFromLibrary,
+  extractMovieId,
+  executeScraper,
+  executeScraperDetailed,
+  executeScraperOrAll,
+  mergeResults,
+  mergeActors,
+  mergeRescrapeActors,
+  isEmptyValue,
+  formatTitle,
+  classifySiteError,
+  MULTI_SCRAPER_VALUE
+};

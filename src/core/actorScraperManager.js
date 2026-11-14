@@ -17,6 +17,7 @@ const { normalizeActorName, actorToNFO, nfoToActor, isPartialBirthdate } = requi
 const { getActorsCachePath, findLocalPhoto, SCRAPED_PHOTO_PREFIX } = require('../../scrapers/actors/cache-helper');
 const actorDb = require('../../scrapers/actors/actorDb');
 const { loadConfig, getScrapePath } = require('./config');
+const { isScrapeItemFile } = require('./scrapeProgress');
 
 // ─────────────────────────────
 // Local Storage
@@ -837,8 +838,8 @@ function extractActorEntriesFromMovies() {
     const files = fs.readdirSync(scrapePath);
 
     files.forEach(filename => {
-      // Skip non-JSON files
-      if (!filename.endsWith('.json')) return;
+      // Skip non-JSON files (and dot-files like .scrape-progress.json)
+      if (!isScrapeItemFile(filename)) return;
 
       const filePath = path.join(scrapePath, filename);
 
@@ -1020,8 +1021,8 @@ async function updateMovieActorData() {
     const files = fs.readdirSync(scrapePath);
 
     for (const filename of files) {
-      // Skip non-JSON files
-      if (!filename.endsWith('.json')) continue;
+      // Skip non-JSON files (and dot-files like .scrape-progress.json)
+      if (!isScrapeItemFile(filename)) continue;
 
       total++;
       const filePath = path.join(scrapePath, filename);

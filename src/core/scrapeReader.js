@@ -1,6 +1,7 @@
 const fs = require("fs");
 const path = require("path");
 const { getScrapePath } = require('./config');
+const { isScrapeItemFile } = require('./scrapeProgress');
 
 // getScrapePath() is now imported from config.js and always returns data/scrape
 
@@ -44,8 +45,8 @@ class ScrapeReader {
 
     const files = fs.readdirSync(this.scrapePath);
 
-    // Filter only .json files
-    const jsonFiles = files.filter(f => f.endsWith(".json"));
+    // Filter only .json files (dot-files like .scrape-progress.json excluded)
+    const jsonFiles = files.filter(isScrapeItemFile);
 
     this.items = jsonFiles.map(filename => ({
       id: path.basename(filename, ".json"),

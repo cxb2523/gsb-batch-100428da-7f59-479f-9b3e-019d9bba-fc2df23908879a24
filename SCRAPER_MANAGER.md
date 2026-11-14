@@ -110,13 +110,71 @@ Empty values are NEVER included in the final output.
 
 ### Failure Handling
 
-If a scraper:
-- Exits with non-zero code → treat as "no data"
-- Returns only `{ "code": "XXX" }` → treat as "no data"
-- Fails to parse JSON → treat as "no data"
+Batch orchestration keeps every site independent: a site failing for one
+movie (crash, non-zero exit, rate limit, session limit) never blocks the other
+sites from contributing that movie, and never discards data already returned.
 
-If ALL scrapers fail for a code:
-- Output: `{ "code": "XXX" }`
+Per site, each movie ends as:
+
+| Site outcome | Meaning |
+|---|---|
+| `ok` | the site returned data |
+| `not_found` | the site answered, it has no such movie |
+| `error` | the site failed — `errorKind` is `rate_limited`, `session_limit`, `invalid_output`, `scraper_not_found`, `spawn_error` or `site_error`, plus the reason |
+
+Per movie, the batch status is:
+
+| Status | Meaning |
+|---|---|
+| `success` | merged data saved, no site errored |
+| `partial` | merged data saved from the sites that succeeded; at least one site errored |
+| `failed` | no site provided usable data |
+
+A scraper that exits non-zero after returning part of its output keeps that
+output: the movies it already scraped are merged, the rest are marked failed.
+
+### Progress File And Resume
+
+After each merged movie the batch writes `data/scrape/.scrape-progress.json`
+(dot-prefixed, so the scrape readers never list it as a movie):
+
+```json
+{
+  "version": 1,
+  "scrapers": ["javlibrary", "r18dev"],
+  "lastRun": { "startedAt": "...", "finishedAt": "...", "codes": ["..."], "skipped": [], "summary": { "total": 3, "success": 1, "partial": 1, "failed": 1 } },
+  "items": {
+    "SDDM-943": {
+      "status": "partial",
+      "updatedAt": "...",
+      "sources": ["r18dev"],
+      "scrapers": {
+        "javlibrary": { "status": "error", "errorKind": "rate_limited", "reason": "Rate limited by the site" },
+        "r18dev": { "status": "ok" }
+      },
+      "failedSites": [{ "scraper": "javlibrary", "reason": "Rate limited by the site", "errorKind": "rate_limited" }],
+      "notFoundSites": []
+    }
+  }
+}
+```
+
+Re-running the same batch reads this file:
+- `success` movies are skipped;
+- `partial` / `failed` movies are scraped again, and the entry is rewritten, so
+  a recovered site leaves no stale failure behind;
+- a retry that still misses a site keeps the fields that site's data provided
+  in an earlier run (fresh values keep priority);
+- deleting a movie (or the whole scrape list) drops its entry.
+
+Codes with no progress entry fall back to the legacy rule (an existing
+`data/scrape/{id}.json` means already scraped).
+
+### Output Format
+
+`data/scrape/{id}.json` keeps its existing wrapper:
+`{ scrapedAt, sources, videoFile, data }`. Only `sources` reflects the merge;
+merge priority rules and field handling are unchanged.
 
 ## Example
 
@@ -226,6 +284,7 @@ This works because stdin is inherited from your terminal.
 - If one scraper fails, others continue
 - Final output includes all successfully merged data
 - Codes with no data get `{ "code": "XXX" }`
+- Per-movie, per-site outcomes are persisted for resuming (see below)
 
 ### File Structure
 
@@ -244,9 +303,8 @@ javinizer-js/
 ## Limitations
 
 - No parallel execution (scrapers run sequentially)
-- No retry logic
+- No automatic retry within a single run (re-running the batch retries partial/failed movies)
 - No timeout handling
-- No partial result caching
-- No progress reporting (except stderr logs)
 
-These limitations are intentional to keep the code simple and predictable.
+Progress tracking replaced the old "no partial result caching" limitation: see
+[Progress File And Resume](#progress-file-and-resume).

@@ -78,7 +78,8 @@ async function updateAllMovieThumbs() {
 
     for (const filename of files) {
       // Skip non-JSON files
-      if (!filename.endsWith('.json')) continue;
+      // Skip non-JSON files (and dot-files like .scrape-progress.json)
+      if (!filename.endsWith('.json') || filename.startsWith('.')) continue;
 
       total++;
       const filePath = path.join(scrapePath, filename);

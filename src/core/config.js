@@ -152,6 +152,15 @@ function getScrapePath() {
 }
 
 /**
+ * Path of the batch scrape progress file.
+ * Lives next to the scrape JSONs (data/scrape) but is dot-prefixed so the
+ * scrape readers, which list *.json, never mistake it for a movie.
+ */
+function getScrapeProgressPath() {
+  return path.join(getScrapePath(), '.scrape-progress.json');
+}
+
+/**
  * Get path to the persisted library index cache
  * Used to avoid a full folder rescan on every server restart
  */
@@ -176,6 +185,6 @@ function getSearchIndexCachePath() {
 }
 
 module.exports = {
-  loadConfig, saveConfig, getScrapePath, getLibraryCachePath, getLibraryPositionPath, getSearchIndexCachePath,
+  loadConfig, saveConfig, getScrapePath, getScrapeProgressPath, getLibraryCachePath, getLibraryPositionPath, getSearchIndexCachePath,
   getLibraryPaths, isInsideLibrary, getLibraryRootOf, resolveLibraryFolder
 };
