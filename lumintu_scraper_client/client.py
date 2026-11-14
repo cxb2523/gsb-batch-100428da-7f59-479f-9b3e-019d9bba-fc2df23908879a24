@@ -5,6 +5,7 @@ from ._http_client import HttpClient
 from ._logging import get_logger
 from ._models import UserInfo, ScrapingResult
 from ._errors import LumintuScraperError
+from ._batch import BatchClient
 
 logger = get_logger()
 
@@ -37,6 +38,9 @@ class LumintuScraperClient:
 
     def result(self):
         return ResultClient(self.http)
+
+    def batch(self):
+        return BatchClient(self)
 
 
 class ActorCall:
