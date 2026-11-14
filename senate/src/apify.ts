@@ -62,11 +62,23 @@ async function main(): Promise<void> {
       `fetch_failed_count=${stats.fetchFailedCount}, unknown_doc_type_count=${stats.unknownDocTypeCount}`,
     );
     if (stats.fetchFailedCount > 0) {
+      const failed = stats.outcomes
+        .filter((o) => o.outcome === 'fetch_failed')
+        .map((o) => `${o.filing_id} (${o.detail_url}): ${o.error}`)
+        .join('; ');
       log.warn(
         `${stats.fetchFailedCount} filing(s) produced a fetch_failed placeholder this run — ` +
         `the PTR detail-page fetch failed after retries (network/timeout/non-2xx), not a ` +
         `parser or format issue. Transient: a later run that successfully fetches the same ` +
-        `filing automatically supersedes this placeholder. See dataset rows with parse_status="fetch_failed".`,
+        `filing automatically supersedes this placeholder. See dataset rows with parse_status="fetch_failed". ` +
+        `Filings: ${failed}`,
+      );
+    }
+    if (!stats.listingComplete) {
+      log.warn(
+        `Listing incomplete — the filing list could not be read to the end. ` +
+        `${stats.outcomes.length} collected filing(s) were still fetched and counted, ` +
+        `but this run does not cover the full window.`,
       );
     }
     if (stats.unknownDocTypeCount > 0) {

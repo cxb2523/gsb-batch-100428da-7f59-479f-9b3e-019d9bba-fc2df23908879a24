@@ -32,5 +32,24 @@ export function buildRunSummary(stats: PipelineStats): Record<string, unknown> {
     // content is unknown, so the filter can't be evaluated on them.
     placeholdersWithheld: stats.placeholdersExcludedCount,
     placeholdersExcludedCount: stats.placeholdersExcludedCount, // same value, kept for existing consumers
+    // Per-filing outcome breakdown for this run. The four filing kinds below
+    // are mutually exclusive: every recognized filing contributes exactly one.
+    // unknownDocTypeCount is separate — those listing rows had no recognizable
+    // filing (no /ptr/ or /paper/ link), so they have no filing_id and are
+    // never written as placeholders.
+    electronicPtrCount: stats.electronicPtrCount ?? 0,
+    paperCount: stats.paperCount ?? 0,
+    emptyPtrCount: stats.emptyPtrCount ?? 0,
+    fetchFailedCount: stats.fetchFailedCount ?? 0,
+    unknownDocTypeCount: stats.unknownDocTypeCount ?? 0,
+    unknownDocTypeExamples: stats.unknownDocTypeExamples ?? [],
+    // Per-filing index behind the counts above: filing_id, detail URL, and
+    // (for fetch_failed) the error message — so a run's failures can be
+    // located directly instead of re-reading the dataset.
+    outcomes: stats.outcomes ?? [],
+    // False when the listing stopped early; the filings collected before the
+    // failure were still fetched and counted, but the run is incomplete.
+    listingComplete: stats.listingComplete ?? true,
+    incomplete: stats.incomplete ?? false,
   };
 }

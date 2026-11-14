@@ -70,7 +70,7 @@ One row per individual transaction reported in a Senate PTR:
 | `row_index_in_filing` | `integer \| null` | 0-based position of the row among its filing's parsed rows, in source order — tells apart identical rows inside one filing (they share a `content_hash`). Not part of `id` or `content_hash`; `0` on a placeholder |
 | `supersedes_filing_id` | `string \| null` | On an amendment's rows: the `filing_id` of the earlier filing by the same filer that the amendment re-lists trades from. `null` when not determinable — see "Duplicate transactions across filings" |
 | `is_superseded` | `boolean` | `true` on the surviving rows of a filing that a later amendment supersedes by that rule. `false` otherwise |
-| `parse_status` | `'ok' \| 'fetch_failed' \| 'scanned_unparsed' \| 'parse_failed'` | `'ok'` for a normally-parsed electronic PTR row. `'fetch_failed'` means the PTR detail-page fetch itself failed after retries — a transient network/host issue, superseded automatically once a later run succeeds. `'scanned_unparsed'` means this filing was submitted **on paper** — Senate EFD serves it as a scanned image/PDF at `/search/view/paper/<id>/`, and there's no OCR fallback. `'parse_failed'` means the `/ptr/<uuid>/` page fetched fine (not a paper filing) but had zero parseable table rows — a parser bug or a Senate EFD layout change. See "Coverage" below |
+| `parse_status` | `'ok' \| 'fetch_failed' \| 'scanned_unparsed' \| 'parse_failed'` | `'ok'` for a normally-parsed electronic PTR row. `'fetch_failed'` means the PTR detail-page fetch itself failed after retries — a transient network/host issue, or a session that stayed redirected to the home page even after the one re-handshake retry; superseded automatically once a later run succeeds. `'scanned_unparsed'` means this filing was submitted **on paper** — Senate EFD serves it as a scanned image/PDF at `/search/view/paper/<id>/`, and there's no OCR fallback. `'parse_failed'` means the `/ptr/<uuid>/` page fetched fine (not a paper filing) but had zero parseable table rows — a parser bug or a Senate EFD layout change. See "Coverage" below |
 | `pdf_url` | `string \| null` | Populated only on a placeholder row — the filing's detail page (Senate has no per-row PDF; the whole filing's data lives on that one page). `null` on every normally-parsed row |
 | `fetchedAt` | `string` (ISO 8601 UTC) | When this row was first pulled from source. Immutable — never updated by a later re-fetch of the same, unchanged row. See "Fetch timestamps and immutable history" below |
 | `lastModifiedAt` | `string` (ISO 8601 UTC) | When this row's content last changed. Equal to `fetchedAt` until a revision is detected |
@@ -124,15 +124,44 @@ Two more placeholder kinds cover different failure layers. An electronic PTR
 `'parse_failed'` placeholder — that's a parser or Senate EFD layout break,
 not a known-unreadable filing, but it still gets flagged rather than
 silently dropped. And a `/ptr/` detail-page fetch that fails outright after
-retries (network error, timeout) produces a `'fetch_failed'` placeholder —
-transient, and automatically superseded by real rows once a later run's
-fetch succeeds for the same filing.
+retries (network error, timeout, or a session that is *still* redirected to
+the home page after the one re-handshake retry) produces a `'fetch_failed'`
+placeholder — transient, and automatically superseded by real rows once a
+later run's fetch succeeds for the same filing.
 
 Every production run reports counters — `electronic_ptr_count`,
 `paper_count`, `empty_ptr_count`, `fetch_failed_count` — in the actor's log
-output and its `OUTPUT` record in the run's key-value store, so the
-electronic-vs-paper ratio (and any transient fetch failures) for any given
-run can be read back without re-scraping the listing.
+output, its `OUTPUT` record, and `RUN_SUMMARY` in the run's key-value store,
+so the electronic-vs-paper ratio (and any transient fetch failures) for any
+given run can be read back without re-scraping the listing.
+
+### Per-run outcome counts (`fetchAll` / `OUTPUT` / `RUN_SUMMARY`)
+
+`fetchAll()` — and the run's `OUTPUT` and `RUN_SUMMARY` records — report the
+five outcome counts for the run, covering every filing the listing returned:
+
+| Counter | Meaning | Output |
+|---|---|---|
+| `electronicPtrCount` | `/ptr/` filing whose detail page parsed successfully | transaction rows |
+| `paperCount` | `/paper/` filing (no detail-page request is made) | one `scanned_unparsed` placeholder |
+| `emptyPtrCount` | `/ptr/` detail page fetched, zero table rows | one `parse_failed` placeholder |
+| `fetchFailedCount` | `/ptr/` detail-page fetch failed after retries (including a redirect that persisted after re-handshake) | one `fetch_failed` placeholder |
+| `unknownDocTypeCount` | listing row whose link matched neither `/ptr/` nor `/paper/` | nothing — counted only; up to 5 example URLs in `unknownDocTypeExamples` |
+
+The four filing kinds are mutually exclusive and every recognized filing
+contributes exactly one: a filing is never counted twice, and a filing that
+produced a placeholder is never also counted as an electronic success. A
+listing row too malformed to read a link from is unreadable, not an
+unrecognized format, and does not count toward `unknownDocTypeCount`.
+
+Alongside the counts, `fetchAll()` returns `outcomes` — one entry per filing
+`{ filing_id, politician, filing_date, doc_type, outcome, detail_url,
+row_count, error?, source_id? }`. `detail_url` equals the placeholder row's
+`pdf_url`, `error` equals its `raw_json.fetch_error`, and `source_id` is the
+placeholder's source id — so a counter can be traced straight to the filing
+and its row. When listing pagination fails partway, the filings already
+collected are still fetched and counted normally, and the run is marked
+incomplete (`listingComplete: false`, `incomplete: true`, `success: false`).
 
 ### Duplicate transactions across filings
 
@@ -436,6 +465,12 @@ because a `tickers` or transaction-date filter was set),
 `skippedByMemberCount`, `skippedByTransactionDateCount`,
 `filteredByTickerCount` and `filteredByTransactionDateCount`. (`duplicatesRemoved`
 and `placeholdersExcludedCount` are the same two numbers under their earlier names.)
+
+It also carries the run's outcome breakdown — `electronicPtrCount`,
+`paperCount`, `emptyPtrCount`, `fetchFailedCount`, `unknownDocTypeCount`
+(with `unknownDocTypeExamples`), the per-filing `outcomes` list (each entry
+has `filing_id`, `detail_url` and — for `fetch_failed` — `error`), and
+`listingComplete` / `incomplete`. See "Per-run outcome counts" above.
 
 ---
 

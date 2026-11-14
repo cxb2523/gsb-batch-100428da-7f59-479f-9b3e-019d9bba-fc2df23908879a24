@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Senate actor
+
+#### Added
+- **`fetchAll()` reports per-run filing outcomes.** The five outcome counts — `electronicPtrCount` (electronic `/ptr/` filing parsed successfully), `paperCount`, `emptyPtrCount` (detail page fetched, zero table rows), `fetchFailedCount`, `unknownDocTypeCount` — are now computed from one per-filing outcome list and also exposed together as `outcomeCounts`. `fetchAll()` additionally returns `outcomes`: one entry per filing (`filing_id`, `politician`, `filing_date`, `doc_type`, `outcome`, `detail_url`, `row_count`, plus `error` on `fetch_failed` and `source_id` on placeholders). `detail_url` equals the placeholder row's `pdf_url` and `error` equals its `raw_json.fetch_error`, so a count can be traced to the filing and its row. The same breakdown is written to `OUTPUT` and `RUN_SUMMARY` (`electronicPtrCount` … `unknownDocTypeExamples`, `outcomes`, `listingComplete`, `incomplete`), and `fetchFailedCount > 0` now logs each failing filing's id, URL and error.
+- **`fetchAll()` flags an incomplete run when listing pagination fails.** Previously a mid-listing failure returned only the filings collected so far, without fetching their details. Those filings are now fetched, parsed and counted normally; the run is then reported incomplete (`listingComplete: false`, `incomplete: true`, `success: false`, `error` naming the offset).
+- **New tests (`senate/tests/fetchOutcomes.test.js`)** — a fabricated HTML eFD site behind a replaceable request layer (`__setTransportForTests`) covers a normal table, an empty table, a throwing fetch, a paper filing, an unknown link shape, a redirect that succeeds after re-handshake, a redirect that persists after re-handshake, and a pagination failure. No real site is contacted.
+
+#### Fixed
+- **A redirect-to-home that persists through the re-handshake retry is now counted as a fetch failure.** It used to be returned as if it were the PTR page: zero table rows → a `parse_failed` placeholder, silently misclassifying a session failure as a parser/layout break (and counting the filing in the wrong bucket). It now produces a `fetch_failed` placeholder, counted in `fetchFailedCount`, with the reason preserved in `raw_json.fetch_error`. A redirect that the retry resolves still counts as an electronic success. The retry itself is unchanged: one re-handshake, one retry.
+- **Duplicate listing rows can no longer produce two placeholders for one filing.** A filing returned twice by the listing (overlapping pages, a source retry) is collapsed to one outcome / one placeholder before any detail fetch; previously it was counted twice and fetched twice.
+- **A listing row with no readable link no longer counts as an unknown link shape.** `unknownDocTypeCount` now means exactly "a readable link matching neither `/ptr/` nor `/paper/`"; a row too malformed to yield a URL at all is unreadable, not a new filing format.
+
 ## [Unreleased] - Lobbying × Trades Overlap deprecated
 
 The Lobbying × Trades Overlap actor (`lobbying-overlap/`) is deprecated: not maintained and not available on Apify. See [`lobbying-overlap/DEPRECATED.md`](./lobbying-overlap/DEPRECATED.md). Earlier entries below are kept as history.

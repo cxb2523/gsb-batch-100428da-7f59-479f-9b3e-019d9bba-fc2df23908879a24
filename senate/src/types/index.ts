@@ -174,6 +174,50 @@ export type Transaction = z.infer<typeof TransactionSchema>;
 
 // ─── Fetch result returned by the fetcher layer ───────────────────────────────
 
+// A per-filing outcome for one run. Exactly one entry per recognized filing
+// (every /ptr/ or /paper/ link the listing returned and this run processed);
+// an unrecognized link shape has no FilingMeta and therefore no entry — it is
+// only counted (and its URL kept as an example) in OutcomeCounts. The four
+// kinds are mutually exclusive, so a filing that produced a placeholder is
+// never also counted as an electronic success, and one filing can never
+// contribute two placeholders.
+export type FilingOutcomeKind = 'electronic_ptr' | 'paper' | 'empty_ptr' | 'fetch_failed';
+
+export interface FilingOutcome {
+  // The filing's own id — the /ptr/<uuid> or /paper/<id> segment of its
+  // listing link, and the same value its rows/placeholder carry as filing_id.
+  filing_id: string;
+  politician: string;
+  filing_date: string;
+  doc_type: 'ptr' | 'paper';
+  outcome: FilingOutcomeKind;
+  // The filing's detail page — equal to the placeholder row's pdf_url on
+  // paper / empty_ptr / fetch_failed outcomes.
+  detail_url: string;
+  // Rows contributed by this filing: the parsed transaction count for
+  // electronic_ptr, 1 for each placeholder outcome (placeholder rows are
+  // output rows too).
+  row_count: number;
+  // Set only on fetch_failed — the same message stored in the placeholder's
+  // raw_json.fetch_error.
+  error?: string;
+  // Set only on placeholder outcomes — the placeholder row's source_id, so a
+  // caller holding either the outcome list or the dataset can join them.
+  source_id?: string;
+}
+
+// The five run-level outcome counts. These mirror the flat fields on
+// FetchResult (electronicPtrCount, paperCount, emptyPtrCount,
+// fetchFailedCount, unknownDocTypeCount); this object groups them under one
+// named record so a caller can consume the breakdown as a unit.
+export interface OutcomeCounts {
+  electronicPtrCount: number;
+  paperCount: number;
+  emptyPtrCount: number;
+  fetchFailedCount: number;
+  unknownDocTypeCount: number;
+}
+
 export interface FetchResult {
   success: boolean;
   records: RawTransaction[];
@@ -195,7 +239,9 @@ export interface FetchResult {
   //   unknownDocTypeExamples — up to 5 example URLs from unknownDocTypeCount,
   //                            for diagnosing what the new shape looks like.
   //   fetchFailedCount     — a /ptr/ detail-page fetch that failed after
-  //                          retries. Produces a 'fetch_failed' placeholder
+  //                          retries (including a home-page redirect that
+  //                          persisted after the one re-handshake retry).
+  //                          Produces a 'fetch_failed' placeholder
   //                          (see buildFetchFailedPlaceholder) — transient,
   //                          superseded by pipeline.ts once a later run's
   //                          fetch succeeds for the same filing_id.
@@ -205,6 +251,25 @@ export interface FetchResult {
   unknownDocTypeCount: number;
   unknownDocTypeExamples: string[];
   fetchFailedCount: number;
+  // The same five counts, grouped under one named record — the five fields
+  // above are kept as-is so existing consumers do not change.
+  outcomeCounts: OutcomeCounts;
+  // One entry per recognized filing this run processed — the authoritative
+  // per-filing index behind the counts above. Lets a caller go from "this run
+  // had N fetch failures" straight to the filings (and their placeholders)
+  // instead of re-reading the dataset. Deduplicated per filing: one filing
+  // yields exactly one outcome, so a filing that produced a placeholder is
+  // never also counted as an electronic success.
+  outcomes: FilingOutcome[];
+  // False when the listing could not be read to the end (a pagination
+  // failure). The filings collected before the failure were still fetched,
+  // parsed and counted — but the run does not cover the full window.
+  listingComplete: boolean;
+  // True whenever this run's output is not a complete picture: listing
+  // incomplete, or too many detail-page fetches failed. Mirrors `success`
+  // but is explicit about the data being partial rather than the fetch layer
+  // throwing outright.
+  incomplete: boolean;
   // Filings skipped before their detail page was fetched because they could
   // not match the `members` / `transactionDateFrom` inputs. Absent when no
   // such filter was set.

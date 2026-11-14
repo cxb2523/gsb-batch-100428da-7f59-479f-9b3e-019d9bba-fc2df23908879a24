@@ -1,10 +1,21 @@
-import axios, { AxiosError, AxiosInstance, InternalAxiosRequestConfig, AxiosResponse } from 'axios';
+import axios, {
+  AxiosError,
+  AxiosInstance,
+  InternalAxiosRequestConfig,
+  AxiosResponse,
+  type AxiosAdapter,
+} from 'axios';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { CookieJar } from 'tough-cookie';
 import { format, subDays } from 'date-fns';
 import * as cheerio from 'cheerio';
 import type { Agent } from 'https';
-import type { FetchResult, RawTransaction } from '../types/index.js';
+import type {
+  FetchResult,
+  FilingOutcome,
+  OutcomeCounts,
+  RawTransaction,
+} from '../types/index.js';
 import { makeLogger } from '../utils/logger.js';
 import { config } from '../utils/config.js';
 import { withRetry } from '../utils/retry.js';
@@ -58,6 +69,15 @@ function getHttpsAgent(): Agent | undefined {
 
 // ─── HTTP client with cookie jar ──────────────────────────────────────────────
 
+// Test seam: when set (see `__setTransportForTests`), every client built by
+// createClient() dispatches through this adapter instead of the network. The
+// cookie jar, redirect walker and handshake logic stay real — only the wire
+// is replaced, so tests exercise the same code paths production does.
+let testAdapter: AxiosAdapter | undefined;
+
+export function __setTransportForTests(adapter: AxiosAdapter | undefined): void {
+  testAdapter = adapter;
+}
 function createClient(): { client: AxiosInstance; jar: CookieJar } {
   const jar = new CookieJar();
 
@@ -71,6 +91,7 @@ function createClient(): { client: AxiosInstance; jar: CookieJar } {
     headers: BROWSER_HEADERS,
     maxRedirects: 0,
     validateStatus: (s) => s >= 200 && s < 400, // accept 3xx so axios doesn't throw
+    ...(testAdapter ? { adapter: testAdapter } : {}),
   });
 
   client.interceptors.request.use(async (cfg: InternalAxiosRequestConfig) => {
@@ -294,6 +315,13 @@ function rowToFilingMetaOrUnknown(row: string[]): FilingMeta | UnknownDocTypeRow
   const reportLinkMatch = reportCell.match(HREF_RE);
   const reportPath = reportLinkMatch?.[1] ?? '';
 
+  // No link at all is UNREADABLE, not an unrecognized link shape: there is
+  // no URL to record and nothing a new link format would explain. Such a
+  // row must not inflate unknownDocTypeCount (or suggest the Senate changed
+  // its URL format). Only a readable href that matches neither /ptr/ nor
+  // /paper/ is an unknown filing-format signal.
+  if (!reportPath) return null;
+
   const ptrMatch = reportPath.match(PTR_PATH_RE);
   const paperMatch = reportPath.match(PAPER_PATH_RE);
   const docType: 'ptr' | 'paper' | null = ptrMatch ? 'ptr' : paperMatch ? 'paper' : null;
@@ -316,6 +344,40 @@ function isFilingMeta(v: FilingMeta | UnknownDocTypeRow | null): v is FilingMeta
 
 function isUnknownDocTypeRow(v: FilingMeta | UnknownDocTypeRow | null): v is UnknownDocTypeRow {
   return v !== null && !isFilingMeta(v);
+}
+
+// The filing's detail page — /search/view/ptr/<uuid>/ or /search/view/paper/<id>/
+// resolved against BASE. Every placeholder's pdf_url and every FilingOutcome's
+// detail_url come from here, so they agree by construction.
+function detailUrlFor(meta: FilingMeta): string {
+  return meta.report_path.startsWith('http') ? meta.report_path : `${BASE}${meta.report_path}`;
+}
+
+// A filing id is unique per filing KIND: a /paper/ id and a /ptr/ uuid live in
+// different id spaces, so only the pair identifies a filing. Used to collapse
+// a filing the listing returned twice (overlapping pages, a source retry)
+// into ONE outcome / ONE placeholder — never two, and never one placeholder
+// plus a real row for the same filing.
+function filingKey(meta: FilingMeta): string {
+  return `${meta.docType}:${meta.doc_id}`;
+}
+
+function dedupeFilings(filings: FilingMeta[]): { unique: FilingMeta[]; duplicates: number } {
+  const seen = new Set<string>();
+  const unique: FilingMeta[] = [];
+  let duplicates = 0;
+
+  for (const f of filings) {
+    const key = filingKey(f);
+    if (seen.has(key)) {
+      duplicates++;
+      continue;
+    }
+    seen.add(key);
+    unique.push(f);
+  }
+
+  return { unique, duplicates };
 }
 
 // Kept for direct unit testing (tests/senateFetcher.test.js) — returns null
@@ -363,6 +425,13 @@ async function fetchPtrHtmlOnce(
  * Fetch a PTR detail page. If the response is a home-page redirect (session
  * lost terms acceptance), re-run the handshake and retry once.
  *
+ * `stillRedirected` reports that ONE retry's outcome to the caller, which
+ * records it as a fetch failure (see fetchFilingsDetail). The persistent case
+ * must not be returned as if it were the PTR page: parsePtrTransactions would
+ * see "zero table rows", emit a parse_failed placeholder, and the filing would
+ * be counted in the wrong bucket. The detail retry contract stays one
+ * re-handshake plus one retry.
+ *
  * Returns { html, csrf } where csrf is the (possibly refreshed) token —
  * caller should propagate it for subsequent requests.
  */
@@ -371,7 +440,7 @@ async function fetchPtrHtml(
   jar: CookieJar,
   reportPath: string,
   csrf: string,
-): Promise<{ html: string; csrf: string }> {
+): Promise<{ html: string; csrf: string; stillRedirected: boolean; finalUrl: string }> {
   const requested = reportPath.startsWith('http') ? reportPath : `${BASE}${reportPath}`;
   let result = await fetchPtrHtmlOnce(client, reportPath);
 
@@ -390,12 +459,24 @@ async function fetchPtrHtml(
       );
       const cookies = await jar.getCookies(BASE);
       log.warn(`  ${cookies.map((c) => `${c.key}=${c.value.slice(0, 8)}...`).join('; ')}`);
+      return { html: result.html, csrf: newCsrf, stillRedirected: true, finalUrl: result.finalUrl };
     }
 
-    return { html: result.html, csrf: newCsrf };
+    return { html: result.html, csrf: newCsrf, stillRedirected: false, finalUrl: result.finalUrl };
   }
 
-  return { html: result.html, csrf };
+  return { html: result.html, csrf, stillRedirected: false, finalUrl: result.finalUrl };
+}
+
+// The persisting-redirect case is reported via `stillRedirected` and turned
+// into a fetch failure by the caller (see fetchFilingsDetail) — it must not
+// go through another fetch-layer retry: one re-handshake plus one retry, then
+// the outcome is final.
+function redirectFailureMessage(meta: FilingMeta, finalUrl: string): string {
+  return (
+    `PTR detail page for filing ${meta.doc_id} still redirected to the home page after ` +
+    `re-handshake (session or terms acceptance not restored); final URL: ${finalUrl}`
+  );
 }
 
 // ─── Filing type ──────────────────────────────────────────────────────────────
@@ -503,9 +584,7 @@ export function parsePtrTransactions(html: string, meta: FilingMeta): PtrParseRe
 // transaction-detail field is blank; pdf_url points at the detail page
 // itself (Senate has no per-row PDF) so a human/parser-fix can go look.
 export function buildParseFailedPlaceholder(meta: FilingMeta): RawTransaction {
-  const detailUrl = meta.report_path.startsWith('http')
-    ? meta.report_path
-    : `${BASE}${meta.report_path}`;
+  const detailUrl = detailUrlFor(meta);
 
   return {
     politician: meta.politician,
@@ -541,9 +620,7 @@ export function buildParseFailedPlaceholder(meta: FilingMeta): RawTransaction {
 // electronic filings, so "the detail page" is the closest equivalent here).
 
 export function buildPaperPlaceholder(meta: FilingMeta): RawTransaction {
-  const detailUrl = meta.report_path.startsWith('http')
-    ? meta.report_path
-    : `${BASE}${meta.report_path}`;
+  const detailUrl = detailUrlFor(meta);
 
   return {
     politician: meta.politician,
@@ -581,9 +658,7 @@ export function buildPaperPlaceholder(meta: FilingMeta): RawTransaction {
 // the moment a later run's fetch succeeds for this same filing_id.
 
 export function buildFetchFailedPlaceholder(meta: FilingMeta, errorMessage: string): RawTransaction {
-  const detailUrl = meta.report_path.startsWith('http')
-    ? meta.report_path
-    : `${BASE}${meta.report_path}`;
+  const detailUrl = detailUrlFor(meta);
 
   return {
     politician: meta.politician,
@@ -785,6 +860,164 @@ async function fetchAllFilings(
   return { filings, total, partial: false, unknownDocTypeCount, unknownDocTypeExamples };
 }
 
+export interface DetailFetchOptions {
+  // withRetry retry count around the detail fetch (existing call sites differ:
+  // fetchAll retries twice, fetchPage did not retry at all).
+  retries: number;
+  // Keep the polite inter-filing delay. false turns it off (tests).
+  pace: boolean;
+}
+
+interface DetailFetchResult {
+  records: RawTransaction[];
+  outcomes: FilingOutcome[];
+  // Number of filings whose detail fetch failed — drives the ≥25% partial rule.
+  detailFailures: number;
+  csrf: string;
+}
+
+function emptyOutcomeCounts(unknownDocTypeCount = 0): OutcomeCounts {
+  return {
+    electronicPtrCount: 0,
+    paperCount: 0,
+    emptyPtrCount: 0,
+    fetchFailedCount: 0,
+    unknownDocTypeCount,
+  };
+}
+
+function countOutcomes(
+  outcomes: FilingOutcome[],
+  unknownDocTypeCount: number,
+): OutcomeCounts {
+  const counts = emptyOutcomeCounts(unknownDocTypeCount);
+  for (const o of outcomes) {
+    switch (o.outcome) {
+      case 'electronic_ptr': counts.electronicPtrCount++; break;
+      case 'paper': counts.paperCount++; break;
+      case 'empty_ptr': counts.emptyPtrCount++; break;
+      case 'fetch_failed': counts.fetchFailedCount++; break;
+    }
+  }
+  return counts;
+}
+
+// ─── Per-filing processing (shared by fetchAll and fetchPage) ────────────────
+// Produces EXACTLY ONE outcome per input filing and exactly one output row
+// set per outcome:
+//   paper        → one scanned_unparsed placeholder, NO detail-page request
+//   electronic   → the parsed transaction rows (possibly zero if the table
+//                  had rows but none carried enough cells — still a success,
+//                  matching the existing isEmpty semantics)
+//   empty_ptr    → one parse_failed placeholder
+//   fetch_failed → one fetch_failed placeholder carrying the error message
+// The four kinds are mutually exclusive, so a filing is never counted twice
+// and never contributes both a placeholder and real rows in the same run.
+async function fetchFilingsDetail(
+  client: AxiosInstance,
+  jar: CookieJar,
+  filings: FilingMeta[],
+  initialCsrf: string,
+  options: DetailFetchOptions,
+): Promise<DetailFetchResult> {
+  const records: RawTransaction[] = [];
+  const outcomes: FilingOutcome[] = [];
+  let detailFailures = 0;
+  let activeCsrf = initialCsrf;
+
+  for (let i = 0; i < filings.length; i++) {
+    const meta = filings[i]!;
+    const base = {
+      filing_id: meta.doc_id,
+      politician: meta.politician,
+      filing_date: meta.filing_date,
+      doc_type: meta.docType,
+      detail_url: detailUrlFor(meta),
+    };
+
+    // Every placeholder outcome goes through here, so the outcome, the
+    // placeholder row and the placeholder's pdf_url/source_id always agree.
+    const recordFetchFailure = (message: string): void => {
+      // This filing WAS enumerated in the listing (meta is a real FilingMeta)
+      // — silently continuing would drop it from output with no trace. Emit
+      // a fetch_failed placeholder instead; transient, so pipeline.ts's
+      // supersede step replaces it once a later run's fetch succeeds for
+      // this filing_id.
+      log.warn(`PTR ${meta.doc_id} (${meta.politician}) detail fetch failed: ${message} — emitting fetch_failed placeholder`);
+      detailFailures++;
+      const placeholder = buildFetchFailedPlaceholder(meta, message);
+      records.push(placeholder);
+      outcomes.push({
+        ...base,
+        outcome: 'fetch_failed',
+        row_count: 1,
+        source_id: placeholder.source_id,
+        error: message,
+      });
+    };
+
+    if (meta.docType === 'paper') {
+      const placeholder = buildPaperPlaceholder(meta);
+      records.push(placeholder);
+      outcomes.push({
+        ...base,
+        outcome: 'paper',
+        row_count: 1,
+        source_id: placeholder.source_id,
+      });
+      continue; // No detail page worth fetching — it's a scanned image/PDF
+    }
+
+    try {
+      const result = await withRetry(
+        () => fetchPtrHtml(client, jar, meta.report_path, activeCsrf),
+        options.retries,
+        500,
+      );
+      activeCsrf = result.csrf;
+
+      if (result.stillRedirected) {
+        // The one re-handshake retry did not restore the session. The fetched
+        // body is the home page, not the PTR — counting it as an empty parse
+        // would misclassify a session failure as a parser/layout break. A
+        // throw here would be retried by withRetry (it is outside the closure
+        // above); the contract is one re-handshake + one retry, after which
+        // the outcome is final, so record the failure directly instead.
+        recordFetchFailure(redirectFailureMessage(meta, result.finalUrl));
+        if (options.pace && i < filings.length - 1) await delay(PTR_DELAY_MS);
+        continue;
+      }
+
+      const { records: txs, isEmpty } = parsePtrTransactions(result.html, meta);
+      records.push(...txs);
+
+      if (isEmpty) {
+        // txs is exactly the one parse_failed placeholder emitted by
+        // parsePtrTransactions — take its source_id rather than re-deriving
+        // it, so the outcome and the placeholder can never drift apart.
+        outcomes.push({ ...base, outcome: 'empty_ptr', row_count: txs.length, source_id: txs[0]?.source_id });
+      } else {
+        outcomes.push({ ...base, outcome: 'electronic_ptr', row_count: txs.length });
+      }
+    } catch (err) {
+      recordFetchFailure(toAxiosMessage(err));
+    }
+
+    if (options.pace && i < filings.length - 1) await delay(PTR_DELAY_MS);
+  }
+
+  return { records, outcomes, detailFailures, csrf: activeCsrf };
+}
+
+export interface FetchAllOptions extends EarlyFilterOptions {
+  // Overrides the DEBUG_PTR_LIMIT env var. Read per call — the env var is
+  // captured once at module load, which is before the Actor input is known.
+  debugPtrLimit?: number;
+  // Test seam: false skips the polite inter-filing delay (PTR_DELAY_MS).
+  // Defaults to true, so production pacing is unchanged.
+  pace?: boolean;
+}
+
 export async function fetchPage(
   offset: number,
   fromDate: string = isoDefaultStart(),
@@ -801,81 +1034,43 @@ export async function fetchPage(
     );
 
     const unknownDocTypeExamples: string[] = [];
-    const { filings, unknownCount: unknownDocTypeCount } = collectFilings(response.data, unknownDocTypeExamples);
+    const collected = collectFilings(response.data, unknownDocTypeExamples);
+    const { unique: filings } = dedupeFilings(collected.filings);
 
-    const records: RawTransaction[] = [];
-    let electronicPtrCount = 0;
-    let paperCount = 0;
-    let emptyPtrCount = 0;
-    let fetchFailedCount = 0;
-    let activeCsrf = csrf;
-
-    for (let i = 0; i < filings.length; i++) {
-      const meta = filings[i]!;
-
-      if (meta.docType === 'paper') {
-        paperCount++;
-        records.push(buildPaperPlaceholder(meta));
-        continue; // No detail page worth fetching — it's a scanned image/PDF
-      }
-
-      try {
-        const result = await fetchPtrHtml(client, jar, meta.report_path, activeCsrf);
-        activeCsrf = result.csrf;
-        const { records: txs, isEmpty } = parsePtrTransactions(result.html, meta);
-        records.push(...txs);
-        if (isEmpty) emptyPtrCount++;
-        else electronicPtrCount++;
-      } catch (err) {
-        // This filing WAS enumerated in the listing (meta is a real
-        // FilingMeta) — silently continuing would drop it from output with
-        // no trace. Emit a fetch_failed placeholder instead; transient, so
-        // pipeline.ts's supersede step replaces it once a later run's
-        // fetch succeeds for this filing_id.
-        const message = toAxiosMessage(err);
-        log.warn(`PTR ${meta.doc_id} fetch failed: ${message} — emitting fetch_failed placeholder`);
-        fetchFailedCount++;
-        records.push(buildFetchFailedPlaceholder(meta, message));
-      }
-      if (i < filings.length - 1) await delay(PTR_DELAY_MS);
-    }
+    const detail = await fetchFilingsDetail(client, jar, filings, csrf, { retries: 0, pace: true });
+    const counts = countOutcomes(detail.outcomes, collected.unknownCount);
 
     log.info(
-      `Page offset=${offset}: ${filings.length} filings → ${records.length} transactions ` +
-      `(electronic=${electronicPtrCount}, paper=${paperCount}, empty=${emptyPtrCount}, ` +
-      `fetchFailed=${fetchFailedCount}, unknownDocType=${unknownDocTypeCount})`,
+      `Page offset=${offset}: ${filings.length} filings → ${detail.records.length} transactions ` +
+      `(electronic=${counts.electronicPtrCount}, paper=${counts.paperCount}, empty=${counts.emptyPtrCount}, ` +
+      `fetchFailed=${counts.fetchFailedCount}, unknownDocType=${counts.unknownDocTypeCount})`,
     );
     return {
       success: true,
-      records,
-      electronicPtrCount,
-      paperCount,
-      emptyPtrCount,
-      unknownDocTypeCount,
+      records: detail.records,
+      ...counts,
       unknownDocTypeExamples,
-      fetchFailedCount,
+      outcomeCounts: counts,
+      outcomes: detail.outcomes,
+      listingComplete: true,
+      incomplete: false,
     };
   } catch (err) {
     const message = toAxiosMessage(err);
     log.error(`fetchPage failed at offset=${offset}: ${message}`);
+    const counts = emptyOutcomeCounts();
     return {
       success: false,
       records: [],
       error: message,
-      electronicPtrCount: 0,
-      paperCount: 0,
-      emptyPtrCount: 0,
-      unknownDocTypeCount: 0,
+      ...counts,
       unknownDocTypeExamples: [],
-      fetchFailedCount: 0,
+      outcomeCounts: counts,
+      outcomes: [],
+      listingComplete: false,
+      incomplete: true,
     };
   }
-}
-
-export interface FetchAllOptions extends EarlyFilterOptions {
-  // Overrides the DEBUG_PTR_LIMIT env var. Read per call — the env var is
-  // captured once at module load, which is before the Actor input is known.
-  debugPtrLimit?: number;
 }
 
 export async function fetchAll(
@@ -894,54 +1089,61 @@ export async function fetchAll(
   } catch (err) {
     const message = toAxiosMessage(err);
     log.error(`Handshake failed: ${message}`);
-    return {
-      success: false,
-      records: [],
-      error: `Handshake failed: ${message}`,
-      electronicPtrCount: 0,
-      paperCount: 0,
-      emptyPtrCount: 0,
-      unknownDocTypeCount: 0,
-      unknownDocTypeExamples: [],
-      fetchFailedCount: 0,
-    };
+    // Nothing could be read at all — the listing never got as far as being
+    // queried, so the run does not cover the window.
+    return failureResult(`Handshake failed: ${message}`, { listingComplete: false, incomplete: true });
   }
 
-  // Phase 1: collect all filings via DataTables listing
+  // Phase 1: collect all filings via DataTables listing. When pagination
+  // stops early, the filings collected so far are still returned — they are
+  // fetched and counted below, and the run is reported incomplete.
   const listing = await fetchAllFilings(client, csrf, fromDate, toDate);
+  if (listing.partial) {
+    log.warn(
+      `Listing incomplete — continuing with the ${listing.filings.length} filing(s) already collected: ` +
+      `${listing.error}`,
+    );
+  }
+
   if (listing.filings.length === 0) {
+    // An empty listing on a COMPLETE listing read is a legitimate empty
+    // window, not a failure (same semantics as before). A first-page failure
+    // is a failure and leaves the run incomplete.
+    const counts = emptyOutcomeCounts(listing.unknownDocTypeCount);
     return {
       success: !listing.partial,
       records: [],
       error: listing.error ?? 'No filings found',
-      electronicPtrCount: 0,
-      paperCount: 0,
-      emptyPtrCount: 0,
-      unknownDocTypeCount: listing.unknownDocTypeCount,
+      ...counts,
       unknownDocTypeExamples: listing.unknownDocTypeExamples,
-      fetchFailedCount: 0,
+      outcomeCounts: counts,
+      outcomes: [],
+      listingComplete: !listing.partial,
+      incomplete: listing.partial,
     };
   }
-  log.info(`Listing complete: ${listing.filings.length} PTR filings collected`);
+
+  // A filing returned twice by the listing (overlapping pages, a source
+  // retry) must yield exactly one outcome and at most one placeholder.
+  const { unique: uniqueFilings, duplicates: duplicateFilings } = dedupeFilings(listing.filings);
+  if (duplicateFilings > 0) {
+    log.warn(`Listing returned ${duplicateFilings} duplicate filing(s) — counting each filing once`);
+  }
+  log.info(`Listing complete: ${uniqueFilings.length} PTR filings collected`);
 
   // Phase 1b: drop filings that can't match the user's filters BEFORE any
   // detail-page fetch (each costs a request + the polite-delay).
-  const early = filterFilingsEarly(listing.filings, options);
+  const early = filterFilingsEarly(uniqueFilings, options);
   if (early.skippedByMember > 0 || early.skippedByTransactionDate > 0) {
     log.info(
-      `Early filters: ${early.kept.length}/${listing.filings.length} filings kept ` +
+      `Early filters: ${early.kept.length}/${uniqueFilings.length} filings kept ` +
       `(skipped ${early.skippedByMember} by members, ${early.skippedByTransactionDate} by transactionDateFrom)`,
     );
   }
 
-  // Phase 2: fetch each PTR detail page, parse transactions
-  const allRecords: RawTransaction[] = [];
-  let detailErrors = 0;
-  let electronicPtrCount = 0;
-  let paperCount = 0;
-  let emptyPtrCount = 0;
-  let fetchFailedCount = 0;
-
+  // Phase 2: fetch each PTR detail page, parse transactions. One outcome per
+  // filing; the counts are derived from the outcome list so they can never
+  // disagree with it.
   const filingsToFetch = debugPtrLimit > 0
     ? early.kept.slice(0, debugPtrLimit)
     : early.kept;
@@ -949,82 +1151,66 @@ export async function fetchAll(
     log.warn(`debugPtrLimit=${debugPtrLimit} — fetching subset only`);
   }
 
-  let activeCsrf = csrf;
-  for (let i = 0; i < filingsToFetch.length; i++) {
-    const meta = filingsToFetch[i]!;
-
-    if (meta.docType === 'paper') {
-      paperCount++;
-      allRecords.push(buildPaperPlaceholder(meta));
-      continue; // No detail page worth fetching — it's a scanned image/PDF
-    }
-
-    try {
-      const result = await withRetry(
-        () => fetchPtrHtml(client, jar, meta.report_path, activeCsrf),
-        2,
-        500,
-      );
-      activeCsrf = result.csrf;
-      const { records: txs, isEmpty } = parsePtrTransactions(result.html, meta);
-      allRecords.push(...txs);
-      if (isEmpty) emptyPtrCount++;
-      else electronicPtrCount++;
-      if ((i + 1) % 10 === 0 || i === filingsToFetch.length - 1) {
-        log.info(`Detail progress: ${i + 1}/${filingsToFetch.length} PTRs → ${allRecords.length} txs`);
-      }
-    } catch (err) {
-      // This filing WAS enumerated in the listing (meta is a real
-      // FilingMeta) — silently continuing to the next one would drop a
-      // known filing from output with no trace. Emit a fetch_failed
-      // placeholder instead; transient, so pipeline.ts's supersede step
-      // replaces it once a later run's fetch succeeds for this filing_id.
-      detailErrors++;
-      fetchFailedCount++;
-      const message = toAxiosMessage(err);
-      log.warn(`PTR ${meta.doc_id} (${meta.politician}) detail fetch failed: ${message} — emitting fetch_failed placeholder`);
-      allRecords.push(buildFetchFailedPlaceholder(meta, message));
-    }
-    if (i < filingsToFetch.length - 1) await delay(PTR_DELAY_MS);
-  }
+  const detail = await fetchFilingsDetail(client, jar, filingsToFetch, csrf, {
+    retries: 2,
+    pace: options.pace !== false,
+  });
+  const counts = countOutcomes(detail.outcomes, listing.unknownDocTypeCount);
 
   log.info(
-    `fetchAll complete: ${filingsToFetch.length} filings → ${allRecords.length} transactions, ` +
-    `${detailErrors} detail errors (electronic=${electronicPtrCount}, paper=${paperCount}, ` +
-    `empty=${emptyPtrCount}, fetchFailed=${fetchFailedCount}, unknownDocType=${listing.unknownDocTypeCount})`,
+    `fetchAll complete: ${filingsToFetch.length} filings → ${detail.records.length} transactions, ` +
+    `${detail.detailFailures} detail errors (electronic=${counts.electronicPtrCount}, ` +
+    `paper=${counts.paperCount}, empty=${counts.emptyPtrCount}, ` +
+    `fetchFailed=${counts.fetchFailedCount}, unknownDocType=${counts.unknownDocTypeCount})`,
   );
 
   // Partial = listing was incomplete OR ≥25% of detail fetches failed
-  const partialDetail = detailErrors > filingsToFetch.length / 4;
+  const partialDetail = detail.detailFailures > filingsToFetch.length / 4;
+  const incomplete = listing.partial || partialDetail;
   const earlyCounts = {
     skippedByMemberCount: early.skippedByMember,
     skippedByTransactionDateCount: early.skippedByTransactionDate,
   };
-  if (listing.partial || partialDetail) {
-    return {
-      success: false,
-      records: allRecords,
-      error: listing.error ?? `${detailErrors}/${filingsToFetch.length} PTR detail fetches failed`,
-      electronicPtrCount,
-      paperCount,
-      emptyPtrCount,
-      unknownDocTypeCount: listing.unknownDocTypeCount,
-      unknownDocTypeExamples: listing.unknownDocTypeExamples,
-      fetchFailedCount,
-      ...earlyCounts,
-    };
-  }
 
   return {
-    success: true,
-    records: allRecords,
-    electronicPtrCount,
-    paperCount,
-    emptyPtrCount,
-    unknownDocTypeCount: listing.unknownDocTypeCount,
+    success: !incomplete,
+    records: detail.records,
+    error: incomplete
+      ? listing.error ?? `${detail.detailFailures}/${filingsToFetch.length} PTR detail fetches failed`
+      : undefined,
+    ...counts,
     unknownDocTypeExamples: listing.unknownDocTypeExamples,
-    fetchFailedCount,
+    outcomeCounts: counts,
+    outcomes: detail.outcomes,
+    listingComplete: !listing.partial,
+    incomplete,
     ...earlyCounts,
+  };
+}
+
+// A FetchResult for a run that could not get as far as enumerating filings.
+// Reports zeroed outcome counts so a caller can always read the five counts
+// off the result, whatever path returned it.
+function failureResult(
+  error: string,
+  overrides: {
+    listingComplete: boolean;
+    incomplete?: boolean;
+    unknownDocTypeCount?: number;
+    unknownDocTypeExamples?: string[];
+  },
+): FetchResult {
+  const counts = emptyOutcomeCounts(overrides.unknownDocTypeCount ?? 0);
+  return {
+    success: false,
+    records: [],
+    error,
+    ...counts,
+    unknownDocTypeExamples: overrides.unknownDocTypeExamples ?? [],
+    outcomeCounts: counts,
+    outcomes: [],
+    listingComplete: overrides.listingComplete,
+    incomplete: overrides.incomplete ?? false,
   };
 }
 

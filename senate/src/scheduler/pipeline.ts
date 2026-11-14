@@ -9,7 +9,7 @@ import { resolveWindow } from '../utils/window.js';
 import { makeLogger } from '../utils/logger.js';
 import { toErrorMessage } from '../utils/errors.js';
 import { config } from '../utils/config.js';
-import type { Transaction, StoreAdapter } from '../types/index.js';
+import type { Transaction, StoreAdapter, FilingOutcome } from '../types/index.js';
 
 const log = makeLogger('pipeline');
 
@@ -33,6 +33,19 @@ export interface PipelineStats {
   // network/host failure shows up in run stats instead of the filing
   // silently vanishing.
   fetchFailedCount: number;
+  // One entry per filing this run processed (electronic / paper / empty /
+  // fetch-failed), with its filing_id, detail page URL and — for
+  // fetch_failed — the same error message stored in the placeholder's
+  // raw_json.fetch_error. Derived from the same per-filing outcome list the
+  // five counts above are computed from, so the counts and this index can
+  // never disagree. See FetchResult.outcomes.
+  outcomes: FilingOutcome[];
+  // False when the listing could not be read to the end; the filings
+  // collected before the failure were still fetched and counted.
+  listingComplete: boolean;
+  // True whenever the run's data is not a complete picture (listing
+  // incomplete, or ≥25% of detail fetches failed). See FetchResult.incomplete.
+  incomplete: boolean;
   // ── Filters, dedup and the charge cap ─────────────────────────────────────
   // The filing-date window actually used (inclusive, YYYY-MM-DD).
   windowFrom: string;
@@ -86,6 +99,7 @@ function emptyStats(window: { fromDate: string; toDate: string }): PipelineStats
     inserted: 0, skipped: 0, errors: 0,
     electronicPtrCount: 0, paperCount: 0, emptyPtrCount: 0,
     unknownDocTypeCount: 0, unknownDocTypeExamples: [], fetchFailedCount: 0,
+    outcomes: [], listingComplete: true, incomplete: false,
     windowFrom: window.fromDate, windowTo: window.toDate,
     skippedByMemberCount: 0, skippedByTransactionDateCount: 0,
     filteredByTickerCount: 0, filteredByTransactionDateCount: 0,
@@ -181,6 +195,9 @@ export async function runPipeline(
   const { electronicPtrCount, paperCount, emptyPtrCount, unknownDocTypeCount, unknownDocTypeExamples, fetchFailedCount } = fetchResult;
   Object.assign(stats, {
     electronicPtrCount, paperCount, emptyPtrCount, unknownDocTypeCount, unknownDocTypeExamples, fetchFailedCount,
+    outcomes: fetchResult.outcomes,
+    listingComplete: fetchResult.listingComplete,
+    incomplete: fetchResult.incomplete,
     skippedByMemberCount: fetchResult.skippedByMemberCount ?? 0,
     skippedByTransactionDateCount: fetchResult.skippedByTransactionDateCount ?? 0,
   });
@@ -188,8 +205,20 @@ export async function runPipeline(
     `Filing formats: electronic=${electronicPtrCount}, paper=${paperCount}, ` +
     `empty=${emptyPtrCount}, fetchFailed=${fetchFailedCount}, unknownDocType=${unknownDocTypeCount}`,
   );
+  if (!fetchResult.listingComplete) {
+    log.warn(
+      `Listing was incomplete (${fetchResult.error ?? 'pagination stopped early'}) — ` +
+      `${fetchResult.outcomes.length} collected filing(s) were still fetched and counted, ` +
+      `but this run does not cover the full window`,
+    );
+  }
   if (fetchFailedCount > 0) {
     log.warn(`${fetchFailedCount} filing(s) produced a fetch_failed placeholder this run`);
+    for (const o of fetchResult.outcomes) {
+      if (o.outcome === 'fetch_failed') {
+        log.warn(`  fetch_failed: filing_id=${o.filing_id} (${o.politician}) ${o.detail_url} — ${o.error}`);
+      }
+    }
   }
 
   if (!fetchResult.success && fetchResult.records.length === 0) {
