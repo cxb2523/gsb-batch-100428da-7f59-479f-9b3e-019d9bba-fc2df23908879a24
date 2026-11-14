@@ -1,0 +1,16 @@
+{
+  "name": "google-maps-scraper-node",
+  "version": "1.0.0",
+  "description": "Fault-tolerant Google Maps listing scrapers (Selenium and Playwright).",
+  "main": "selenium_scraper.js",
+  "scripts": {
+    "test": "node tests/run_tests.js"
+  },
+  "dependencies": {
+    "chromedriver": "^157.0.2",
+    "playwright": "^1.65.1",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "selenium-webdriver": "^4.52.0"
+  }
+}

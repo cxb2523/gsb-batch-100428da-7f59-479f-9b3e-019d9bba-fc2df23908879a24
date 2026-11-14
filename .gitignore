@@ -1,2 +1,19 @@
 __pycache__/
 *.pyc
+
+# Node dependencies
+NodeJS/node_modules/
+
+# Selenium Manager driver cache (created at runtime)
+chromedriver/
+se-metadata.json
+NodeJS/chromedriver/
+NodeJS/se-metadata.json
+
+# Scraper output
+maps_data*.csv
+maps_data*.json
+
+# Test artifacts
+tests/tmp/
+*.log

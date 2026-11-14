@@ -36,14 +36,18 @@ pip install selenium pandas playwright playwright-stealth
 playwright install
 ```
 
-The second line downloads the browsers Playwright drives.
+The second line downloads the browsers Playwright drives. `pandas` and
+`playwright-stealth` are optional: the listing scrapers write CSV with the
+standard-library `csv` module and run without stealth when the package is
+missing.
 
 ### Node.js Setup
 
-Install required packages:
+Install required packages (a `package.json` is provided):
 
 ```bash
-npm install selenium-webdriver playwright playwright-extra playwright-extra-plugin-stealth axios
+cd NodeJS
+npm install
 ```
 
 The API examples need only `axios` from that list.
@@ -55,20 +59,62 @@ The two folders mirror each other, one script per method.
 ```
 google-maps-scraper/
 │
-├── python/
+├── Python/
+│   ├── maps_common.py            # shared scroll/parse/CSV logic
 │   ├── selenium_scraper.py
 │   ├── playwright_scraper.py
 │   ├── hasdata_api_scraper.py
+│   ├── hasdata_reviews_scraper.py
 │
-├── nodejs/
+├── NodeJS/
+│   ├── maps_common.js            # shared scroll/parse/CSV logic
+│   ├── package.json
 │   ├── selenium_scraper.js
 │   ├── playwright_scraper.js
 │   ├── hasdata_api_scraper.js
+│   ├── hasdata_reviews_scraper.js
+│
+├── tests/                        # fixture-page acceptance tests (no live Maps)
+│   ├── fixtures/
+│   ├── test_python_scrapers.py
+│   ├── run_tests.js
+│   └── README.md
 │
 └── README.md
 ```
 
-Each script scrapes the same fields, business name, rating, review count, category, services, image, and detail URL. Output is saved in both `.json` and `.csv`.
+Each listing scraper captures the same seven fields — business name, rating,
+review count, category, services, image, and detail URL — and always writes
+the fixed header `Name,Rating,Reviews,Category,Services,Image,Detail URL`.
+
+## Reliable termination and honest output
+
+A fixed number of scrolls is not trustworthy: the panel can reach its bottom
+early, a card can miss a rating or an image, and a search can return nothing
+at all. Both browser stacks (Python and Node.js, Selenium and Playwright)
+therefore share identical behavior, implemented in `maps_common`:
+
+* **Scroll stall detection** — after every scroll round the panel's
+  `scrollHeight` is compared with the previous round. Two consecutive rounds
+  without any growth stop the loop early (`reached_bottom`); otherwise it
+  ends at the configured cap (`max_scrolls_reached`). `max_scrolls` and
+  `scroll_pause` keep their original meaning.
+* **Per-field fault tolerance** — each field is extracted independently and a
+  missing element becomes an empty string, so one incomplete card can never
+  fail the record or the run. Rating is still the number from the
+  `aria-label`; the review count is parsed from the text and its thousands
+  separators are removed.
+* **Zero results** — a run with no cards still writes a header-only CSV and
+  prints an explicit "0 records collected" message instead of a fake success
+  line. Columns are never dropped, even if every card lacks a field.
+* **Truthful console summary** — every run prints the records actually
+  written and why scrolling stopped (reached bottom or scroll limit).
+
+The scrapers accept a local page URL and headless flag (via the
+`MAPS_URL`, `MAPS_OUTPUT`, `MAPS_MAX_SCROLLS`, `MAPS_SCROLL_PAUSE`,
+`MAPS_HEADLESS` and `MAPS_BROWSER_CHANNEL` environment variables), which the
+test suite uses to run fully offline against an injected fixture page. See
+[`tests/README.md`](tests/README.md) for the four acceptance scenarios.
 
 ## Scraper Examples
 
