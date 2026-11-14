@@ -40,6 +40,17 @@ def _print_decision(d):
     console.print(label)
 
 
+def _print_failed_queries(queries):
+    """Avisa que busquedas fallaron (con razon), si las hubo."""
+    failed = [q for q in (queries or []) if q.get("status") == "failed"]
+    if not failed:
+        return
+    console.print(f"  [yellow]![/yellow] {len(failed)} busqueda(s) fallaron:")
+    for q in failed:
+        reason = (q.get("error") or "error desconocido")[:80]
+        console.print(f"    [dim]✗ {q.get('query', '?')}: {reason}[/dim]")
+
+
 class _RichEvents:
     """Traduce eventos de la fachada a Progress/prints de Rich."""
 
@@ -196,7 +207,11 @@ def cmd_run(
             console.print("\n  [dim]Cancelado.[/dim]")
         elif kind == "session_expired":
             console.print("  [red]![/red] Sesion expirada. Ejecuta: [cyan]jobhunter login[/cyan]")
+        elif kind == "scrape_failed":
+            console.print(f"  [red]✗[/red] {result['error']['message']}")
+            _print_failed_queries(result.get("queries"))
         elif kind == "no_posts":
+            _print_failed_queries(result.get("queries"))
             console.print(
                 f"  [bold]{stats.get('posts_scraped', 0)}[/bold] posts  ·  "
                 f"[bold]{stats.get('posts_with_emails', 0)}[/bold] con email  ·  "
@@ -214,6 +229,7 @@ def cmd_run(
         f"[bold]{stats['posts_with_emails']}[/bold] con email  ·  "
         f"[dim]{stats['posts_no_emails']} sin email (omitidos)[/dim]"
     )
+    _print_failed_queries(result.get("queries"))
 
     offers = result["offers"]
     blacklist_info = "  ·  " + str(stats["blacklisted"]) + " bloqueadas" if stats.get("blacklisted") else ""

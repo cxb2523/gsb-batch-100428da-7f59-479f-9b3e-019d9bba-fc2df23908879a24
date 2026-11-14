@@ -17,6 +17,7 @@ import random
 import re
 import smtplib
 import time
+import urllib.parse
 from datetime import datetime
 
 import requests
@@ -47,21 +48,46 @@ def cfg_ready(cfg):
     return all(cfg.get(k) for k in keys)
 
 
-def _error(kind, message, stats=None, decisions=None):
+def _error(kind, message, stats=None, decisions=None, queries=None):
     return {
         "offers": [],
         "stats": stats or {},
         "decisions": decisions or [],
+        "queries": queries or [],
         "error": {"kind": kind, "message": message},
     }
+
+
+def _is_login_url(url):
+    """True si la URL indica redirect al login de LinkedIn (sesion expirada).
+
+    Mira solo el path: la query de busqueda del usuario puede contener
+    palabras como "login" sin que la sesion haya expirado.
+    """
+    try:
+        path = urllib.parse.urlparse(url or "").path.lower()
+    except Exception:
+        return False
+    return "/login" in path or "/signin" in path or "authwall" in path
+
+
+def _short_error(exc):
+    """Resumen de una linea del error, apto para mostrar al usuario."""
+    return (str(exc).split("\n")[0].strip() or exc.__class__.__name__)[:200]
 
 
 def search_offers(cfg, kb, time_filter="24h", on_event=None, pace=True):
     """Fases 1-2 del pipeline: scrape + analisis + filtros. Sin UI.
 
     Retorna {"offers": [job_dict], "stats": dict, "decisions": [dict],
+    "queries": [{"query", "status": "success"|"failed", "error", "posts"}],
     "error": None | {"kind", "message"}}. error.kind:
-    not_configured | no_session | session_expired | no_posts | cancelled.
+    not_configured | no_session | session_expired | scrape_failed | no_posts | cancelled.
+
+    Cada query se scrapea de forma independiente: si una falla, se registra su
+    desenlace en "queries" y se continua con las demas. Si TODAS fallan, se
+    devuelve error kind="scrape_failed". La sesion expirada (redirect a login)
+    aborta el run completo, antes o durante el loop de queries.
     """
     emit = on_event or _noop
 
@@ -77,6 +103,7 @@ def search_offers(cfg, kb, time_filter="24h", on_event=None, pace=True):
     all_posts = []
     seen = set()
     scrape_error = None
+    query_results = []
     emit("phase", {"phase": "scrape", "status": "start", "detail": "Buscando en LinkedIn",
                    "total": len(queries)})
     try:
@@ -91,7 +118,7 @@ def search_offers(cfg, kb, time_filter="24h", on_event=None, pace=True):
             page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded")
             page.wait_for_timeout(4000)
 
-            if "login" in page.url or "signin" in page.url:
+            if _is_login_url(page.url):
                 browser.close()
                 return _error("session_expired", "Sesion de LinkedIn expirada. Vuelve a iniciar sesion.")
 
@@ -99,13 +126,30 @@ def search_offers(cfg, kb, time_filter="24h", on_event=None, pace=True):
             for qi, query in enumerate(queries, 1):
                 emit("progress", {"phase": "scrape", "current": qi - 1,
                                   "total": total_q, "msg": query})
-                posts = scrape_posts(page, query, time_filter=time_filter)
+                try:
+                    posts = scrape_posts(page, query, time_filter=time_filter)
+                except Exception as e:
+                    if _is_login_url(page.url):
+                        browser.close()
+                        return _error("session_expired",
+                                      "Sesion de LinkedIn expirada. Vuelve a iniciar sesion.",
+                                      queries=query_results)
+                    query_results.append({"query": query, "status": "failed",
+                                          "error": _short_error(e), "posts": 0})
+                    continue
+                if _is_login_url(page.url):
+                    browser.close()
+                    return _error("session_expired",
+                                  "Sesion de LinkedIn expirada. Vuelve a iniciar sesion.",
+                                  queries=query_results)
                 for pi in posts:
                     key = pi["text"][:150]
                     if key not in seen:
                         seen.add(key)
                         pi["query"] = query
                         all_posts.append(pi)
+                query_results.append({"query": query, "status": "success",
+                                      "error": None, "posts": len(posts)})
                 if pace:
                     time.sleep(random.uniform(2, 5))
 
@@ -127,19 +171,28 @@ def search_offers(cfg, kb, time_filter="24h", on_event=None, pace=True):
         scrape_error = str(e)
 
     posts_with_emails = [p for p in all_posts if p.get("emails_found")]
+    queries_failed = sum(1 for q in query_results if q["status"] == "failed")
     stats = {
         "posts_scraped": len(all_posts),
         "posts_with_emails": len(posts_with_emails),
         "posts_no_emails": len(all_posts) - len(posts_with_emails),
         "scrape_error": scrape_error,
+        "queries_total": len(query_results),
+        "queries_failed": queries_failed,
     }
     emit("phase", {"phase": "scrape", "status": "done",
                    "detail": str(len(all_posts)) + " posts, " + str(len(posts_with_emails)) + " con email",
                    "total": len(queries)})
 
+    if query_results and queries_failed == len(query_results):
+        reason = query_results[0]["error"] or "error desconocido"
+        return _error("scrape_failed",
+                      "Fallaron las " + str(queries_failed) + " busquedas. Primer error: " + reason,
+                      stats=stats, queries=query_results)
+
     if not posts_with_emails:
         return _error("no_posts", "No se encontraron posts con email. Intenta un periodo mas amplio.",
-                      stats=stats)
+                      stats=stats, queries=query_results)
 
     # ── Fase 2: Analisis con IA ──
     offers = []
@@ -224,7 +277,8 @@ def search_offers(cfg, kb, time_filter="24h", on_event=None, pace=True):
     emit("phase", {"phase": "dedupe", "status": "done",
                    "detail": str(len(offers_with_email)) + " ofertas finales", "total": None})
 
-    return {"offers": offers_with_email, "stats": stats, "decisions": decisions, "error": None}
+    return {"offers": offers_with_email, "stats": stats, "decisions": decisions,
+            "queries": query_results, "error": None}
 
 
 CV_EXTRACT_PROMPT = """Lee este CV/resume y extrae TODA la informacion en JSON.

@@ -347,7 +347,7 @@ class Bridge:
             "mode": "test" if test_email else "run",
             "test_email": test_email or None,
             "offers": {}, "prepared": {},
-            "stats": {}, "decisions": [],
+            "stats": {}, "decisions": [], "queries": [],
             "results": [], "sent": 0, "errors": 0, "skipped": 0,
         }
         def work():
@@ -355,9 +355,11 @@ class Bridge:
                                            on_event=self._emit, pace=True)
             self._run["stats"] = result["stats"]
             self._run["decisions"] = result["decisions"]
+            self._run["queries"] = result.get("queries", [])
             if result["error"]:
                 payload = dict(result["error"])
                 payload["stats"] = result["stats"]
+                payload["queries"] = result.get("queries", [])
                 self._emit("search_error", payload)
                 return
             offers_out = []
@@ -365,7 +367,8 @@ class Bridge:
                 offer["id"] = i
                 self._run["offers"][i] = offer
                 offers_out.append(offer)
-            self._emit("search_done", {"offers": offers_out, "stats": result["stats"]})
+            self._emit("search_done", {"offers": offers_out, "stats": result["stats"],
+                                       "queries": result.get("queries", [])})
         self._run_async(work)
         return _ok()
 

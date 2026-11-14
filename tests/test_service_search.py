@@ -87,9 +87,12 @@ class SearchBase(unittest.TestCase):
     def run_search(self, cfg=None, kb=None, scrape_side_effect=None,
                    filter_side_effect=None, page_url="https://www.linkedin.com/feed/"):
         cm, page = _fake_playwright(page_url)
+        self.page = page
         with patch("jobhunter.service.sync_playwright", return_value=cm), \
-             patch("jobhunter.service.scrape_posts", side_effect=scrape_side_effect or [[], []]), \
+             patch("jobhunter.service.scrape_posts",
+                   side_effect=scrape_side_effect or [[], []]) as m_scrape, \
              patch("jobhunter.service.agent_filter", side_effect=filter_side_effect or []):
+            self.scrape_mock = m_scrape
             return search_offers(cfg or CFG, kb or _kb(), on_event=self.on_event, pace=False)
 
 
@@ -198,6 +201,103 @@ class TestFilters(SearchBase):
         )
         self.assertEqual(len(res["offers"]), 1)
         self.assertEqual(res["stats"]["batch_dupes"], 1)
+
+
+class TestQueryFailures(SearchBase):
+    """Una query que falla no aborta el run; solo si TODAS fallan hay error."""
+    CFG3 = dict(CFG, search_queries=["q1", "q2", "q3"])
+
+    def phases(self):
+        return [(p["phase"], p["status"]) for n, p in self.events if n == "phase"]
+
+    def test_partial_failure_keeps_other_posts(self):
+        p1 = _post("oferta uno " + "a" * 100, ["hr@techco.com"], index=0)
+        p3 = _post("oferta tres " + "c" * 100, ["hr@tres.com"], index=0)
+        res = self.run_search(
+            cfg=self.CFG3,
+            scrape_side_effect=[[p1], RuntimeError("scroll timeout\nstacktrace"), [p3]],
+            filter_side_effect=[
+                _offer_answer(),
+                _offer_answer(company="TresCo", contact_email="hr@tres.com"),
+            ],
+        )
+        self.assertIsNone(res["error"])
+        # los posts de las queries exitosas siguen su curso normal
+        self.assertEqual(len(res["offers"]), 2)
+        self.assertEqual({o["query"] for o in res["offers"]}, {"q1", "q3"})
+        self.assertEqual(res["stats"]["posts_scraped"], 2)
+        self.assertEqual(res["stats"]["queries_total"], 3)
+        self.assertEqual(res["stats"]["queries_failed"], 1)
+        # desenlace por query expuesto en el resultado
+        queries = res["queries"]
+        self.assertEqual([q["status"] for q in queries],
+                         ["success", "failed", "success"])
+        self.assertEqual(queries[1]["query"], "q2")
+        self.assertIn("scroll timeout", queries[1]["error"])
+        self.assertNotIn("stacktrace", queries[1]["error"])
+        self.assertEqual(queries[1]["posts"], 0)
+        self.assertIsNone(queries[0]["error"])
+        # la query fallida no produjo posts
+        self.assertNotIn("q2", {o["query"] for o in res["offers"]})
+        # las fases conservan su orden habitual
+        self.assertEqual(self.phases(), [
+            ("scrape", "start"), ("scrape", "done"),
+            ("analyze", "start"), ("analyze", "done"),
+            ("dedupe", "start"), ("dedupe", "done"),
+        ])
+
+    def test_partial_failure_dedupes_across_queries(self):
+        p1 = _post("mismo texto " + "a" * 100, ["hr@techco.com"], index=0)
+        dup = dict(p1)
+        res = self.run_search(
+            cfg=self.CFG3,
+            scrape_side_effect=[[p1], RuntimeError("boom"), [dup]],
+            filter_side_effect=[_offer_answer()],
+        )
+        self.assertIsNone(res["error"])
+        self.assertEqual(res["stats"]["posts_scraped"], 1)
+        self.assertEqual(len(res["offers"]), 1)
+        self.assertEqual(res["offers"][0]["query"], "q1")
+
+    def test_all_queries_failed_returns_error(self):
+        res = self.run_search(cfg=self.CFG3, scrape_side_effect=RuntimeError("boom"))
+        self.assertEqual(res["error"]["kind"], "scrape_failed")
+        self.assertIn("boom", res["error"]["message"])
+        self.assertEqual(res["offers"], [])
+        self.assertEqual(len(res["queries"]), 3)
+        self.assertTrue(all(q["status"] == "failed" for q in res["queries"]))
+        self.assertEqual(res["stats"]["queries_failed"], 3)
+        # no se analiza nada: solo corrio la fase de scrape
+        self.assertEqual(self.phases(), [("scrape", "start"), ("scrape", "done")])
+
+    def test_session_expired_mid_run_aborts(self):
+        p1 = _post("oferta " + "a" * 100, ["hr@techco.com"])
+
+        def scrape(page, query, time_filter="24h"):
+            if query == "q2":
+                self.page.url = "https://www.linkedin.com/login"
+                raise RuntimeError("target closed")
+            return [p1]
+
+        res = self.run_search(cfg=self.CFG3, scrape_side_effect=scrape)
+        # la sesion expirada aborta el run, no se traga como fallo de una query
+        self.assertEqual(res["error"]["kind"], "session_expired")
+        self.assertEqual(self.scrape_mock.call_count, 2)  # q3 nunca se intenta
+        self.assertEqual([q["query"] for q in res["queries"]], ["q1"])
+
+    def test_login_keyword_in_query_not_confused_with_expiry(self):
+        cfg = dict(CFG, search_queries=["login page designer"])
+        p1 = _post("oferta " + "a" * 100, ["hr@techco.com"])
+
+        def scrape(page, query, time_filter="24h"):
+            page.url = ("https://www.linkedin.com/search/results/content/"
+                        "?keywords=login%20page%20designer")
+            return [p1]
+
+        res = self.run_search(cfg=cfg, scrape_side_effect=scrape,
+                              filter_side_effect=[_offer_answer()])
+        self.assertIsNone(res["error"])
+        self.assertEqual(len(res["offers"]), 1)
 
 
 if __name__ == "__main__":
