@@ -6,7 +6,7 @@ import ipaddress
 import os
 import posixpath
 import socket
-from typing import Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -181,6 +181,7 @@ def filter_safe_crawl_urls(
     source_url: Optional[str] = None,
     purpose: str = "crawl",
     allow_external_hosts: bool = False,
+    skipped: Optional[List[Dict[str, str]]] = None,
 ) -> List[str]:
     """Validate and deduplicate URLs before they are passed to the crawler.
 
@@ -188,6 +189,10 @@ def filter_safe_crawl_urls(
     ``allow_external_hosts`` is false, URLs whose host differs from the source
     host are skipped. Skipped URLs are intentionally silent at this layer so
     callers can decide how noisy logs should be.
+
+    When ``skipped`` is a list, URLs rejected by the safety policy (unsafe or
+    disallowed external host) are appended to it as ``{"url", "reason"}``
+    entries. Duplicates dropped by deduplication are not reported.
     """
 
     safe: List[str] = []
@@ -201,7 +206,9 @@ def filter_safe_crawl_urls(
                 if source_url
                 else validate_fetch_url(str(raw), purpose=purpose)
             )
-        except UnsafeURL:
+        except UnsafeURL as exc:
+            if skipped is not None:
+                skipped.append({"url": raw, "reason": str(exc)})
             continue
 
         parsed = urlparse(candidate)
@@ -216,6 +223,11 @@ def filter_safe_crawl_urls(
         ).geturl()
 
         if source_url and not allow_external_hosts and not same_hostname(source_url, normalized):
+            if skipped is not None:
+                skipped.append({
+                    "url": raw,
+                    "reason": "external host not allowed by crawl safety policy",
+                })
             continue
         if normalized in seen:
             continue

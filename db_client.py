@@ -1234,6 +1234,29 @@ class SupabaseClient:
             print_error(f"Error updating crawl job {job_id}: {e}")
             return False
 
+    def merge_crawl_job_options(self, job_id: int, extra: Dict[str, Any]) -> bool:
+        """Merge keys into a crawl job's options JSONB (read-modify-free, atomic at SQL level)."""
+        if not job_id or not extra:
+            return False
+        try:
+            self.ensure_runtime_schema()
+            with self._get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE crawl_jobs
+                        SET options = COALESCE(options, '{}'::jsonb) || %s::jsonb,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = %s
+                        """,
+                        (json.dumps(extra), job_id),
+                    )
+                conn.commit()
+            return True
+        except Exception as e:
+            print_error(f"Error merging crawl job {job_id} options: {e}")
+            return False
+
     def get_latest_crawl_job_by_site_id(self, site_id: int) -> Optional[Dict[str, Any]]:
         """Return the latest crawl job for a site."""
         try:

@@ -48,7 +48,19 @@ def crawl_command(args):
     
     if is_sitemap:
         print_header(f"Crawling sitemap: {url}")
-        site_id = crawler.crawl_sitemap(url, site_name, site_description, max_urls=max_urls)
+        site_id = crawler.crawl_sitemap(
+            url, site_name, site_description,
+            max_urls=max_urls, retry_failed_only=args.retry_failed,
+        )
+        report = getattr(crawler, "last_sitemap_report", None)
+        if report:
+            print_info(
+                f"Sitemap report: {report['stored_count']} stored, "
+                f"{report['failed_count']} failed, "
+                f"{report['skipped_unsafe_count']} blocked by safety policy."
+            )
+            for entry in report.get("failed_urls", []):
+                print_warning(f"  failed: {entry['url']} ({entry['status']}): {entry['reason']}")
     else:
         print_header(f"Crawling website: {url}")
         site_id = crawler.crawl_site(url, site_name, site_description)
@@ -183,6 +195,11 @@ def main():
     crawl_parser.add_argument("--description", help="Description of the site (optional)")
     crawl_parser.add_argument("--sitemap", action="store_true", help="Treat URL as a sitemap")
     crawl_parser.add_argument("--max-urls", type=int, help="Maximum number of URLs to crawl")
+    crawl_parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Sitemap only: re-crawl only URLs that failed or were not completed in the previous run",
+    )
     
     # Search command
     search_parser = subparsers.add_parser("search", help="Search the crawled data")

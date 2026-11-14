@@ -1,9 +1,9 @@
 import os
-import time
 import json
 import re
 import asyncio
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Union
 from urllib.parse import urlparse
 from tqdm import tqdm
@@ -22,6 +22,18 @@ from security_utils import (
 )
 from search_quality import rerank_search_results_by_query_terms
 from utils import console, print_header, print_success, print_error, print_warning, print_info, get_rich_progress
+
+
+def _utc_timestamp() -> str:
+    """ISO-8601 timestamp; time.strftime('%f') is not portable (raises on Windows)."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+# Per-URL outcome statuses recorded in a sitemap crawl report.
+SITEMAP_STATUS_STORED = "stored"                    # crawled and stored in the database
+SITEMAP_STATUS_CRAWL_ERROR = "crawl_error"          # the fetch/crawl itself raised
+SITEMAP_STATUS_EMPTY_CONTENT = "empty_content"      # crawled but nothing indexable remained after cleanup
+SITEMAP_STATUS_SKIPPED_UNSAFE = "skipped_unsafe"    # blocked by the crawl safety policy (never fetched)
 
 
 def _extract_urls_from_text_or_markdown(body: str) -> List[str]:
@@ -54,6 +66,10 @@ class WebCrawler:
         self.embedding_generator = EmbeddingGenerator()
         self.db_client = SupabaseClient()
         self.content_enhancer = ContentEnhancer()
+        # Per-URL outcomes of the most recent crawl_sitemap run (see _SITEMAP_URL_STATUSES).
+        self.last_sitemap_report: Optional[Dict[str, Any]] = None
+        # In-memory history of sitemap reports by site_id, used for retry_failed_only runs.
+        self._sitemap_history: Dict[int, Dict[str, Any]] = {}
 
     def extract_domain(self, url: str) -> str:
         """Extract the domain name from a URL.
@@ -161,7 +177,7 @@ class WebCrawler:
             "metadata": {
                 "source": self.extract_domain(url),
                 "url_path": urlparse(url).path,
-                "crawled_at": time.strftime("%Y-%m-%dT%H:%M:%S.%f%z"),
+                "crawled_at": _utc_timestamp(),
                 "content_hygiene": hygiene,
             },
         }
@@ -172,7 +188,7 @@ class WebCrawler:
             "source": self.extract_domain(page["url"]),
             "url_path": urlparse(page["url"]).path,
             "chunk_size": chunk_size,
-            "crawled_at": time.strftime("%Y-%m-%dT%H:%M:%S.%f%z"),
+            "crawled_at": _utc_timestamp(),
             **extra,
         }
 
@@ -821,10 +837,73 @@ class WebCrawler:
         n_chunk = sum(1 for p in enhanced_pages if p.get("is_chunk"))
         return {"parent_pages": n_parent, "chunks": n_chunk, "stored": len(enhanced_pages)}
 
+    @staticmethod
+    def _build_sitemap_report(
+        *,
+        sitemap_url: str,
+        site_id: int,
+        retry_failed_only: bool,
+        max_urls: Optional[int],
+        url_outcomes: List[Dict[str, Any]],
+        skipped_unsafe: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """Assemble the per-URL sitemap crawl report stored on the crawler and in the job record."""
+        stored = [e for e in url_outcomes if e.get("status") == SITEMAP_STATUS_STORED]
+        failed = [
+            e for e in url_outcomes
+            if e.get("status") in (SITEMAP_STATUS_CRAWL_ERROR, SITEMAP_STATUS_EMPTY_CONTENT)
+        ]
+        return {
+            "sitemap_url": sitemap_url,
+            "site_id": site_id,
+            "retry_failed_only": bool(retry_failed_only),
+            "max_urls": max_urls,
+            "total_urls": len(url_outcomes),
+            "stored_count": len(stored),
+            "failed_count": len(failed),
+            "skipped_unsafe_count": len(skipped_unsafe),
+            "url_outcomes": url_outcomes,
+            "failed_urls": failed,
+            "skipped_unsafe_urls": skipped_unsafe,
+        }
+
+    def _previous_sitemap_outcomes(self, site_id: int, sitemap_url: str) -> Dict[str, Dict[str, Any]]:
+        """Return {url: outcome} from the most recent sitemap report for this site.
+
+        Looks at the in-memory history first (same-process runs), then at the
+        latest crawl job's options (reports persisted by the API layer).
+        """
+        report = (getattr(self, "_sitemap_history", None) or {}).get(site_id)
+        if not report:
+            try:
+                job = self.db_client.get_latest_crawl_job_by_site_id(site_id)
+            except Exception as e:
+                print_info(f"Could not read previous crawl job for site {site_id}: {e}")
+                job = None
+            options = (job or {}).get("options") or {}
+            if isinstance(options, str):
+                try:
+                    options = json.loads(options)
+                except ValueError:
+                    options = {}
+            if isinstance(options, dict):
+                report = options.get("sitemap_report")
+
+        if not isinstance(report, dict) or report.get("sitemap_url") != sitemap_url:
+            return {}
+
+        outcomes: Dict[str, Dict[str, Any]] = {}
+        for entry in report.get("url_outcomes") or []:
+            url = entry.get("url")
+            if url:
+                outcomes[url] = entry
+        return outcomes
+
     def crawl_sitemap(self, sitemap_url: str, site_name: Optional[str] = None,
                      description: Optional[str] = None, max_urls: Optional[int] = None,
                      start_only: bool = False, needs_description: bool = False,
-                     raise_on_error: bool = False, **advanced_options) -> int:
+                     raise_on_error: bool = False, retry_failed_only: bool = False,
+                     **advanced_options) -> int:
         """Crawl a sitemap, generate embeddings, and store in the database.
 
         Args:
@@ -835,6 +914,9 @@ class WebCrawler:
             start_only: If True, only start the crawl and return the site ID without waiting for completion.
             needs_description: If True, force generation of a description even if one exists.
             raise_on_error: If True, raise when the crawl returns no pages or fails.
+            retry_failed_only: If True, skip URLs that were stored successfully by a previous
+                run (read from the previous sitemap report) and only re-crawl URLs that failed
+                or were never completed. Previously stored pages are not stored again.
             **advanced_options: Additional options for the crawl.
                 - follow_external_links: Whether to follow external links.
                 - include_patterns: List of URL patterns to include.
@@ -857,6 +939,12 @@ class WebCrawler:
 
         Returns:
             The site ID in the database.
+
+        After the run, ``self.last_sitemap_report`` holds a per-URL report:
+        each sitemap URL is marked stored / crawl_error / empty_content /
+        skipped_unsafe (with a human-readable reason for failures), alongside
+        stored/failed counts. A run with at least one stored URL is considered
+        successful; the batch as a whole only fails when nothing was stored.
         """
         # Ensure URL is a string
         sitemap_url = validate_fetch_url(str(sitemap_url), purpose="sitemap crawl")
@@ -906,6 +994,12 @@ class WebCrawler:
         # If start_only is True, return the site_id without waiting for the crawl to complete
         if start_only:
             return site_id
+
+        # Reset per-run sitemap report state (attributes may be missing on
+        # instances built via __new__ in tests).
+        self.last_sitemap_report = None
+        if not hasattr(self, "_sitemap_history") or self._sitemap_history is None:
+            self._sitemap_history = {}
 
         try:
             # First, fetch the sitemap XML directly
@@ -966,21 +1060,31 @@ class WebCrawler:
                 "CRAWL_SITEMAP_ALLOW_EXTERNAL",
                 default=False,
             )
+            skipped_unsafe: List[Dict[str, str]] = []
             safe_urls = filter_safe_crawl_urls(
                 urls,
                 source_url=sitemap_url,
                 purpose="sitemap URL",
                 allow_external_hosts=allow_external_sitemap_urls,
+                skipped=skipped_unsafe,
             )
-            skipped_urls = len(urls) - len(safe_urls)
-            if skipped_urls > 0:
+            if skipped_unsafe:
                 print_warning(
-                    f"Skipped {skipped_urls} sitemap URL(s) blocked by crawl safety policy. "
+                    f"Skipped {len(skipped_unsafe)} sitemap URL(s) blocked by crawl safety policy. "
                     "Set CRAWL_SITEMAP_ALLOW_EXTERNAL=true or CRAWL_ALLOWED_HOSTS for trusted exceptions."
                 )
             urls = safe_urls
 
             if not urls:
+                self.last_sitemap_report = self._build_sitemap_report(
+                    sitemap_url=sitemap_url,
+                    site_id=site_id,
+                    retry_failed_only=retry_failed_only,
+                    max_urls=max_urls,
+                    url_outcomes=[],
+                    skipped_unsafe=skipped_unsafe,
+                )
+                self._sitemap_history[site_id] = self.last_sitemap_report
                 message = "No safe crawlable URLs remained after sitemap safety filtering."
                 print_warning(message)
                 if raise_on_error:
@@ -1049,9 +1153,35 @@ class WebCrawler:
             if 'exclude_patterns' in advanced_options:
                 crawl_options['exclude_patterns'] = advanced_options['exclude_patterns']
 
-            # Crawl each URL found in the sitemap
+            # In retry mode, load the previous run's per-URL outcomes so that
+            # already-stored URLs can be skipped instead of re-crawled.
+            previous_outcomes: Dict[str, Dict[str, Any]] = {}
+            if retry_failed_only:
+                previous_outcomes = self._previous_sitemap_outcomes(site_id, sitemap_url)
+                if previous_outcomes:
+                    reusable = sum(1 for e in previous_outcomes.values() if e.get("status") == SITEMAP_STATUS_STORED)
+                    print_info(
+                        f"Retry-failed mode: {reusable} previously stored URL(s) will be skipped; "
+                        "only failed or unfinished URLs are re-crawled."
+                    )
+                else:
+                    print_info("Retry-failed mode: no previous sitemap report found; crawling all URLs.")
+
+            # Crawl each URL found in the sitemap, recording a per-URL outcome.
             all_pages = []
+            url_outcomes: List[Dict[str, Any]] = []
             for url in urls:
+                prev = previous_outcomes.get(url)
+                if prev and prev.get("status") == SITEMAP_STATUS_STORED:
+                    print_info(f"Skipping previously stored URL: {url}")
+                    url_outcomes.append({
+                        "url": url,
+                        "status": SITEMAP_STATUS_STORED,
+                        "reason": "already stored in a previous run; skipped",
+                        "reused": True,
+                    })
+                    continue
+
                 print_info(f"Crawling URL from sitemap: {url}")
                 try:
                     # Crawl the individual URL
@@ -1067,13 +1197,46 @@ class WebCrawler:
                     if pages:
                         all_pages.extend(pages)
                         print_info(f"Successfully processed URL: {url}")
+                        url_outcomes.append({"url": url, "status": SITEMAP_STATUS_STORED, "reason": ""})
                     else:
+                        reason = "crawl returned no indexable content after cleanup"
                         print_warning(f"No content found for URL: {url}")
+                        url_outcomes.append({"url": url, "status": SITEMAP_STATUS_EMPTY_CONTENT, "reason": reason})
                 except Exception as e:
                     print_error(f"Error crawling URL {url}: {e}")
+                    url_outcomes.append({"url": url, "status": SITEMAP_STATUS_CRAWL_ERROR, "reason": str(e)})
+
+            report = self._build_sitemap_report(
+                sitemap_url=sitemap_url,
+                site_id=site_id,
+                retry_failed_only=retry_failed_only,
+                max_urls=max_urls,
+                url_outcomes=url_outcomes,
+                skipped_unsafe=skipped_unsafe,
+            )
+            self.last_sitemap_report = report
+            self._sitemap_history[site_id] = report
+
+            failed_entries = report["failed_urls"]
+            if failed_entries:
+                print_warning(
+                    f"{report['failed_count']} of {report['total_urls']} sitemap URL(s) failed "
+                    f"({report['stored_count']} stored); see the sitemap report for per-URL reasons."
+                )
 
             if not all_pages:
+                # Retry run where everything was already stored previously: nothing to do,
+                # but the batch is complete rather than failed.
+                if report["stored_count"] > 0 and report["failed_count"] == 0:
+                    print_info("All sitemap URLs were already stored in a previous run; nothing to re-crawl.")
+                    return site_id
+
                 message = "No pages were successfully crawled from the sitemap."
+                if failed_entries:
+                    details = "; ".join(
+                        f"{e['url']} ({e['status']}): {e['reason']}" for e in failed_entries[:10]
+                    )
+                    message += f" Failures: {details}"
                 print_warning(message)
                 if raise_on_error:
                     raise RuntimeError(message)
@@ -1110,6 +1273,12 @@ class WebCrawler:
             page_ids = self.db_client.add_pages(site_id, enhanced_pages, replace_chunks=True)
 
             print_success(f"Successfully stored {len(page_ids)} pages in the database.")
+            if self.last_sitemap_report:
+                r = self.last_sitemap_report
+                print_info(
+                    f"Sitemap crawl report: {r['stored_count']} stored, {r['failed_count']} failed, "
+                    f"{r['skipped_unsafe_count']} blocked by safety policy (of {r['total_urls']} URL(s))."
+                )
 
             return site_id
 

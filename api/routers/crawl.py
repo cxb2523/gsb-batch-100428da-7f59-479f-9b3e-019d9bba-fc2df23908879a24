@@ -26,6 +26,7 @@ class CrawlRequest(BaseModel):
     site_description: Optional[str] = None
     is_sitemap: bool = False
     max_urls: Optional[int] = None
+    retry_failed_only: bool = False
     follow_external_links: Optional[bool] = None
     include_patterns: Optional[List[str]] = None
     exclude_patterns: Optional[List[str]] = None
@@ -72,6 +73,7 @@ class CrawlRequest(BaseModel):
 class RefreshRequest(BaseModel):
     is_sitemap: Optional[bool] = None
     max_urls: Optional[int] = None
+    retry_failed_only: bool = False
     follow_external_links: Optional[bool] = None
     include_patterns: Optional[List[str]] = None
     exclude_patterns: Optional[List[str]] = None
@@ -199,6 +201,7 @@ def crawl_in_background(
     advanced_options: Optional[Dict[str, Any]] = None,
     job_id: Optional[int] = None,
     queue_site_id: Optional[int] = None,
+    retry_failed_only: bool = False,
 ) -> None:
     """
     queue_site_id is the site row when the job was queued (for log filenames and tracing).
@@ -241,6 +244,7 @@ def crawl_in_background(
                 max_urls=max_urls,
                 needs_description=needs_description,
                 raise_on_error=True,
+                retry_failed_only=retry_failed_only,
                 **options,
             )
         else:
@@ -257,6 +261,11 @@ def crawl_in_background(
         total_count = crawler.db_client.get_page_count_by_site_id(site_id, include_chunks=True)
         page_count = crawler.db_client.get_page_count_by_site_id(site_id, include_chunks=False)
         chunk_count = total_count - page_count
+
+        # Persist the per-URL sitemap report (success/failure detail) on the job record.
+        sitemap_report = getattr(crawler, "last_sitemap_report", None)
+        if job_id and sitemap_report:
+            crawler.db_client.merge_crawl_job_options(job_id, {"sitemap_report": sitemap_report})
 
         if job_id:
             crawler.db_client.update_crawl_job(
@@ -299,6 +308,10 @@ def crawl_in_background(
         if job_id:
             try:
                 db_client = crawler.db_client if crawler else WebCrawler().db_client
+                # Keep whatever per-URL detail was collected before the failure.
+                sitemap_report = getattr(crawler, "last_sitemap_report", None) if crawler else None
+                if sitemap_report:
+                    db_client.merge_crawl_job_options(job_id, {"sitemap_report": sitemap_report})
                 db_client.update_crawl_job(
                     job_id,
                     status="failed",
@@ -455,6 +468,7 @@ async def crawl(
             advanced_options,
             job_id,
             site_id,
+            crawl_data.retry_failed_only,
         )
 
         site = crawler.db_client.get_site_by_id(site_id) or {}
@@ -659,6 +673,7 @@ async def refresh_site(
             advanced_options,
             job_id,
             site_id,
+            refresh_data.retry_failed_only,
         )
 
         return CrawlResponse(
@@ -725,6 +740,7 @@ async def refresh_stale_sites(
                 {},
                 job_id,
                 site["id"],
+                False,
             )
             queued.append(
                 {
