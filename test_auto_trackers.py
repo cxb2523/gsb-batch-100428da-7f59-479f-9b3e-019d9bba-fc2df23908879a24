@@ -213,28 +213,219 @@ class GroupTest(unittest.TestCase):
         return tf.process_tracker_group("T", ["http://src"], path or self.path, tf.RunResources(), **kwargs)
 
     def test_empty_fetch_keeps_old_file(self):
-        self.assertFalse(tf.process_tracker_group("T", [], self.path, tf.RunResources()))
+        outcome, ok = tf.process_tracker_group("T", [], self.path, tf.RunResources())
+        self.assertEqual((outcome, ok), (tf.GroupOutcome.DONE, False))
         self.assertEqual(self._content(), self._old_lines())
 
     def test_big_drop_keeps_old_file(self):
-        self.assertFalse(self._run(lambda urls, resources: trackers(*self.old[:5])))
+        self.assertFalse(self._run(lambda urls, resources: trackers(*self.old[:5]))[1])
         self.assertEqual(self._content(), self._old_lines())
 
     def test_all_invalid_keeps_old_file(self):
         self.assertFalse(self._run(lambda urls, resources: trackers("udp://new:1/announce"),
                                    validate=True,
-                                   check=lambda trackers_, resources, max_workers: set()))
+                                   check=lambda trackers_, resources, max_workers: set())[1])
         self.assertEqual(self._content(), self._old_lines())
 
     def test_small_drop_is_written(self):
         keep = trackers(*self.old[1:])
-        self.assertTrue(self._run(lambda urls, resources: keep))
+        self.assertTrue(self._run(lambda urls, resources: keep)[1])
         self.assertEqual(self._content(), "\n".join(sorted(t.url for t in keep)) + "\n")
 
     def test_write_failure_is_reported(self):
         missing = os.path.join(self.dir, "no-such-dir", "trackers.txt")
-        self.assertFalse(self._run(lambda urls, resources: trackers("udp://new:1/announce"), path=missing))
+        self.assertFalse(self._run(lambda urls, resources: trackers("udp://new:1/announce"), path=missing)[1])
         self.assertFalse(os.path.exists(os.path.dirname(missing)))  # 原子写不留残骸
+
+
+class InterruptTest(unittest.TestCase):
+    """Ctrl-C 不白跑：已完成的组不回滚，正处理的组按保护规则落盘，后续组不启动。
+
+    全部离线：拉取/质检都用注入的假函数，DNS 与 HTTP 探测不会被执行；
+    真正测的是「中断发生时刻的落盘决策」与逐组结局。
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = tmp.name
+        self.old = ["udp://t%d:1/announce" % i for i in range(20)]
+        self.done_urls = trackers("udp://done1:1/announce", "udp://done2:1/announce")
+        self.new_urls = trackers("udp://new1:1/announce", "udp://new2:1/announce")
+
+    def _path(self, name):
+        return os.path.join(self.dir, name)
+
+    def _write_old(self, name):
+        with open(self._path(name), "w", encoding="utf-8", newline="\n") as f:
+            f.write("".join(line + "\n" for line in self.old))
+
+    def _read_bytes(self, name):
+        with open(self._path(name), "rb") as f:
+            return f.read()
+
+    def _groups(self):
+        return [tf.TrackerGroup("G1", ["http://g1"], "g1.txt"),
+                tf.TrackerGroup("G2", ["http://g2"], "g2.txt"),
+                tf.TrackerGroup("G3", ["http://g3"], "g3.txt")]
+
+    def _leftovers(self):
+        """目录里除了三个输出文件之外不该有临时文件。"""
+        return sorted(n for n in os.listdir(self.dir) if not n.endswith(".txt"))
+
+    def test_interrupt_saves_completed_and_partial_groups_only(self):
+        fetched = []
+
+        def fake_fetch(urls, resources):
+            fetched.append(urls[0])
+            if urls[0] == "http://g1":
+                return self.done_urls
+            if urls[0] == "http://g2":
+                return self.new_urls
+            raise AssertionError("第三组不应被拉取")  # 未开始的组不再发起拉取
+
+        def fake_check(raw, resources, max_workers):
+            if raw == self.done_urls:  # G1 正常通过
+                return raw
+            # G2 在质检中途被 Ctrl-C：中断前已确认的条目挂在异常上
+            exc = KeyboardInterrupt()
+            exc.valid_trackers = {tracker("udp://new1:1/announce")}
+            raise exc
+
+        with self.assertLogs("tracker-fetcher", level="INFO") as captured:
+            code = tf.main(["--output-dir", self.dir], groups=self._groups(),
+                           fetch=fake_fetch, check=fake_check)
+
+        self.assertEqual(code, 130)  # 中断不得伪装成正常结束
+        self.assertEqual(fetched, ["http://g1", "http://g2"])
+
+        # G1 正常完成：新文件按正常一轮的格式落盘
+        self.assertEqual(self._read_bytes("g1.txt"),
+                         b"udp://done1:1/announce\nudp://done2:1/announce\n")
+        # G2 中断后已保存：内容与排序/换行同正常一轮
+        self.assertEqual(self._read_bytes("g2.txt"), b"udp://new1:1/announce\n")
+        # G3 未开始：文件不存在
+        self.assertFalse(os.path.exists(self._path("g3.txt")))
+        self.assertEqual(self._leftovers(), [])  # 不留临时文件
+
+        log = "\n".join(captured.output)
+        self.assertIn("本轮被 Ctrl-C 中断", log)
+        self.assertIn("G1: 已完成", log)
+        self.assertIn("G2: 中断后已保存", log)
+        self.assertIn("G3: 未开始", log)
+
+    def test_interrupt_without_valid_data_keeps_old_file_byte_for_byte(self):
+        # G1 没有旧文件（首次生成）；G2/G3 有旧文件，用来验证「逐字节保留」
+        self._write_old("g2.txt")
+        self._write_old("g3.txt")
+        before = self._read_bytes("g2.txt")
+
+        def fake_fetch(urls, resources):
+            if urls[0] == "http://g1":
+                return self.done_urls
+            if urls[0] == "http://g2":
+                return self.new_urls
+            raise AssertionError("第三组不应被拉取")
+
+        def fake_check(raw, resources, max_workers):
+            if raw == self.done_urls:  # G1 正常通过
+                return raw
+            raise KeyboardInterrupt()  # 还没确认任何有效条目
+
+        with self.assertLogs("tracker-fetcher", level="INFO") as captured:
+            code = tf.main(["--output-dir", self.dir], groups=self._groups(),
+                           fetch=fake_fetch, check=fake_check)
+
+        self.assertEqual(code, 130)
+        self.assertEqual(self._read_bytes("g1.txt"),  # 已完成的组不回滚
+                         b"udp://done1:1/announce\nudp://done2:1/announce\n")
+        self.assertEqual(self._read_bytes("g2.txt"), before)  # 逐字节保留
+        self.assertEqual(self._read_bytes("g3.txt"), before)  # 未被触及
+        self.assertEqual(self._leftovers(), [])
+
+        log = "\n".join(captured.output)
+        self.assertIn("G1: 已完成", log)
+        self.assertIn("G2: 中断且无有效数据", log)
+        self.assertIn("G3: 未开始", log)
+
+    def test_completed_groups_stay_and_unstarted_group_file_untouched(self):
+        """第三组原文件存在时，未开始也不得被改写或删除。"""
+        self._write_old("g3.txt")
+        before = self._read_bytes("g3.txt")
+
+        def fake_fetch(urls, resources):
+            return self.done_urls if urls[0] == "http://g1" else self.new_urls
+
+        def fake_check(raw, resources, max_workers):
+            if raw == self.done_urls:  # G1 正常通过
+                return raw
+            # G2 的质检：已确认一条后被打断
+            exc = KeyboardInterrupt()
+            exc.valid_trackers = {tracker("udp://new1:1/announce")}
+            raise exc
+
+        with self.assertLogs("tracker-fetcher", level="INFO"):
+            code = tf.main(["--output-dir", self.dir], groups=self._groups(),
+                           fetch=fake_fetch, check=fake_check)
+        self.assertEqual(code, 130)
+        self.assertEqual(self._read_bytes("g3.txt"), before)
+
+    def test_interrupt_during_fetch_phase_keeps_old_file(self):
+        """拉取阶段被打断且没拿到任何条目：旧文件原样，摘要记「中断且无有效数据」。"""
+        self._write_old("g1.txt")
+        before = self._read_bytes("g1.txt")
+
+        def fake_fetch(urls, resources):
+            raise KeyboardInterrupt()
+
+        with self.assertLogs("tracker-fetcher", level="INFO") as captured:
+            code = tf.main(["--output-dir", self.dir], groups=self._groups()[:1], fetch=fake_fetch)
+        self.assertEqual(code, 130)
+        self.assertEqual(self._read_bytes("g1.txt"), before)
+        self.assertIn("G1: 中断且无有效数据", "\n".join(captured.output))
+
+    def test_no_validate_interrupt_keeps_already_fetched(self):
+        """--no-validate 时拉取阶段中断，已拉到的条目就是有效条目，照常落盘。"""
+        def fake_fetch(urls, resources):
+            exc = KeyboardInterrupt()
+            exc.raw_trackers = set(self.done_urls)
+            raise exc
+
+        with self.assertLogs("tracker-fetcher", level="INFO") as captured:
+            code = tf.main(["--output-dir", self.dir, "--no-validate"],
+                           groups=self._groups()[:1], fetch=fake_fetch)
+        self.assertEqual(code, 130)
+        self.assertEqual(self._read_bytes("g1.txt"),
+                         b"udp://done1:1/announce\nudp://done2:1/announce\n")
+        self.assertIn("G1: 中断后已保存", "\n".join(captured.output))
+
+    def test_interrupt_falls_through_drop_protection(self):
+        """中断后已确认的条目太少：骤降保护照常拦截，旧文件逐字节保留。"""
+        self._write_old("g1.txt")
+        before = self._read_bytes("g1.txt")
+
+        def fake_check(raw, resources, max_workers):
+            exc = KeyboardInterrupt()
+            exc.valid_trackers = set(tracker("udp://t0:1/announce"))
+            raise exc
+
+        with self.assertLogs("tracker-fetcher", level="INFO") as captured:
+            code = tf.main(["--output-dir", self.dir], groups=self._groups()[:1],
+                           fetch=lambda urls, resources: set(self.old), check=fake_check)
+        self.assertEqual(code, 130)
+        self.assertEqual(self._read_bytes("g1.txt"), before)
+        self.assertIn("G1: 中断但未落盘", "\n".join(captured.output))
+
+
+    def test_other_exceptions_still_propagate(self):
+        """只有 Ctrl-C 被就地处理；其他异常照旧冒泡，不被误当成中断。"""
+        def fake_fetch(urls, resources):
+            raise RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            tf.process_tracker_group("T", ["http://src"], self._path("g1.txt"),
+                                     tf.RunResources(), fetch=fake_fetch)
+        self.assertFalse(os.path.exists(self._path("g1.txt")))
 
 
 if __name__ == "__main__":

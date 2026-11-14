@@ -29,6 +29,9 @@ jobs:
           python auto-trackers-fetcher.py # 步骤4：运行你的主程序
 
       - name: Commit and Push
+        # 即使上一步被中断/失败也提交：已完成和「中断后已保存」的组已经原子落盘，
+        # 不提交就等于扔掉了本轮成果。退出码仍保持 130/1，运行结果不会被伪装成成功。
+        if: always()
         run: |
           # 步骤5：如果有新更新，将生成的 txt 文件提交回仓库
           git config --global user.name 'github-actions[bot]'

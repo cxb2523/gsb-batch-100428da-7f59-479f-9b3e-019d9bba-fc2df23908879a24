@@ -15,7 +15,9 @@
 - 探测结果按 URL 缓存，BEST/ALL 重叠的条目每轮只探一次；
 - 只收 udp:// http:// https://，源里的 ws/wss 条目会被丢弃（当前源约 1 条）；
 - 一轮的资源（拉取/探测/DNS 缓存 + 连接池）收进 RunResources，一轮 = 一个实例；
-- 解析产出 Tracker；质检判定与 Tracker 解析各自是不碰 I/O 的纯函数/module。
+- 解析产出 Tracker；质检判定与 Tracker 解析各自是不碰 I/O 的纯函数/module；
+- 中断不白跑：Ctrl-C 打断某一组时，该组已确认有效的条目照常走保护规则落盘，
+  已完成的组不回滚，未开始的组不再发起拉取/探测，并输出逐组结局摘要、退出码 130。
 
 注意：缓存与连接池是 RunResources 的实例状态——一轮更新 = 一个实例；想重来就换一个实例，实例之间互不串味。
 """
@@ -240,6 +242,18 @@ def verdict_for(status: Optional[int]) -> Verdict:
 
 # --- 拉取（带指数退避重试 + 结果缓存）---
 
+def abandon_executor(executor: ThreadPoolExecutor, futures) -> None:
+    """中断时放弃剩余任务：取消还没开始的，不等正在跑的（requests 自带超时）。
+
+    不用 with 语句收尾，是因为它的 shutdown(wait=True) 会把 Ctrl-C 卡到所有
+    在途请求超时为止；这里只放弃、不等待。
+    """
+    cancelled = sum(1 for future in futures if future.cancel())
+    executor.shutdown(wait=False)
+    if cancelled:
+        logger.warning("中断：已取消 %d 个尚未开始的任务", cancelled)
+
+
 def fetch_trackers_from_url(url: str, resources: RunResources,
                             max_retries: int = MAX_RETRIES) -> Set[Tracker]:
     """拉取单源 Tracker 列表，指数退避 + 抖动重试；最终失败返回空集合（不抛）。"""
@@ -272,13 +286,25 @@ def fetch_all_trackers(urls: List[str], resources: RunResources) -> Set[Tracker]
     all_trackers: Set[Tracker] = set()
     results: Dict[str, Set[Tracker]] = {}
     max_workers = max(1, min(len(urls), 10))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    executor = ThreadPoolExecutor(max_workers=max_workers)
+    futures: Dict[object, str] = {}
+    try:
         futures = {executor.submit(fetch_cached, url): url for url in urls}
         for future in as_completed(futures):
             url = futures[future]
             result = future.result()
             results[url] = result
             all_trackers.update(result)
+        executor.shutdown(wait=True)
+    except BaseException as exc:
+        # 中断时不再等剩余拉取（requests 自带超时，线程会自行收尾）；
+        # 已拉到的结果挂在异常上，--no-validate 的组还能拿它当有效条目落盘。
+        try:
+            exc.raw_trackers = set(all_trackers)
+        except (AttributeError, TypeError):  # 属性只读的异常对象；不影响主流程
+            pass
+        abandon_executor(executor, futures)
+        raise
 
     original_count = sum(len(v) for v in results.values())
     if original_count > len(all_trackers):
@@ -350,7 +376,11 @@ def _validate_tracker_url_uncached(tracker: Tracker, resources: RunResources) ->
 
 def filter_valid_trackers(trackers: Set[Tracker], resources: RunResources,
                           max_workers: Optional[int] = None) -> Set[Tracker]:
-    """多线程质检：筛掉无效的 tracker，返回有效的那些。"""
+    """多线程质检：筛掉无效的 tracker，返回有效的那些。
+
+    被中断时二次抛出异常，但异常对象上挂着 `.valid_trackers`（中断前已确认有效的
+    条目集合），调用方据此仍可落盘——见 save_partial_trackers。
+    """
     if not trackers:
         return set()
     valid_trackers: Set[Tracker] = set()
@@ -359,9 +389,12 @@ def filter_valid_trackers(trackers: Set[Tracker], resources: RunResources,
     workers = max_workers or min(len(trackers), 20)
     workers = max(1, workers)
 
-    with ThreadPoolExecutor(max_workers=workers) as executor:
+    executor = ThreadPoolExecutor(max_workers=workers)
+    futures: Dict[object, Tracker] = {}
+    completed = 0
+    total = 0
+    try:
         futures = {executor.submit(validate_tracker_url, tracker, resources): tracker for tracker in trackers}
-        completed = 0
         total = len(futures)
         for future in as_completed(futures):
             completed += 1
@@ -374,6 +407,18 @@ def filter_valid_trackers(trackers: Set[Tracker], resources: RunResources,
                 invalid_count += 1
             if completed % 50 == 0 or completed == total:
                 logger.info("质检进度: %d/%d (已过滤: %d)", completed, total, invalid_count)
+        executor.shutdown(wait=True)
+    except BaseException as exc:
+        # 先记下中断前的结果，再原样抛出（KeyboardInterrupt 不能被吞掉）。
+        # 注意挂的是副本：中断落盘会读它，别让后续线程改动同一个集合。
+        try:
+            exc.valid_trackers = set(valid_trackers)
+            exc.completed = completed
+            exc.total = total
+        except (AttributeError, TypeError):  # 少数异常对象属性只读；不影响主流程
+            pass
+        abandon_executor(executor, futures)
+        raise
 
     logger.info("质检完毕: 总计 %d 条, 有效 %d 条（其中 UDP 未探测 %d 条，只确认了域名）, 过滤 %d 条",
                 len(trackers), len(valid_trackers), unprobed_count, invalid_count)
@@ -468,6 +513,34 @@ def plan_update(
     return UpdatePlan(True, True, tuple(logs))
 
 
+class GroupOutcome:
+    """一组在一轮里的结局；前四种就是摘要里逐组打印的内容。
+
+    第五种只出现在「已拿到有效条目，但保护规则/干跑/写盘失败让它没落盘」时——
+    这种情况既不是「无有效数据」，也不该谎称「已保存」。
+    """
+
+    DONE = "已完成"
+    SAVED_AFTER_INTERRUPT = "中断后已保存"
+    NO_DATA_AFTER_INTERRUPT = "中断且无有效数据"
+    NOT_STARTED = "未开始"
+    KEPT_AFTER_INTERRUPT = "中断但未落盘"
+
+
+class Interrupted(Exception):
+    """一次中断：打断哪一组、该组中断后的结局、原始异常（留给 main 收口成 130）。
+
+    用异常而不是返回值，是因为「中断」必须在调用栈上冒泡；但它不是致命错误——
+    被打断的那一组已经按保护规则落过盘了。
+    """
+
+    def __init__(self, group: str, outcome: str, error: BaseException) -> None:
+        super().__init__("%s: %s" % (group, outcome))
+        self.group = group
+        self.outcome = outcome
+        self.error = error
+
+
 def process_tracker_group(
     name: str,
     urls: List[str],
@@ -478,26 +551,70 @@ def process_tracker_group(
     max_workers: Optional[int] = None,
     fetch: Callable[[List[str], RunResources], Set[Tracker]] = fetch_all_trackers,
     check: Callable[[Set[Tracker], RunResources, Optional[int]], Set[Tracker]] = filter_valid_trackers,
-) -> bool:
-    """处理单组 Tracker：拉取 → 质检 → 判断（plan_update）→ 落日志 → 写盘。返回是否成功。
+) -> Tuple[str, bool]:
+    """处理单组 Tracker：拉取 → 质检 → 判断（plan_update）→ 落日志 → 写盘。
 
+    返回 (结局, 是否成功)。结局是 GroupOutcome 里的常量：
+    - 正常跑完是 DONE（成功与否看 plan / 写盘）；
+    - 拉取或质检抛 KeyboardInterrupt 时，不再向外抛：已确认有效的条目照常走
+      plan_update 的保护规则落盘，然后标记为 SAVED_AFTER_INTERRUPT；没有有效
+      条目则旧文件原样保留，标记为 NO_DATA_AFTER_INTERRUPT；有有效条目却被
+      保护规则/干跑/写盘失败拦下，标记为 KEPT_AFTER_INTERRUPT；被中断的一组
+      一律不算成功，且整轮退出码为 130。其他异常照旧向上抛。
     注入的两个 callable 的契约：预期失败返回空集/子集、不抛异常——由 plan_update 的
-    no-data / no-valid 两条分支接住。
+    no-data / no-valid 两条分支接住；真正的中断才向上抛。
     """
     logger.info("=== 处理 %s ===", name)
-    raw_trackers = fetch(urls, resources)
-    if raw_trackers and validate:
-        logger.info("%s 开始质检过滤...", name)
-        valid_trackers = check(raw_trackers, resources, max_workers)
-    else:
-        valid_trackers = raw_trackers
+    raw_trackers: Set[Tracker] = set()
+    try:
+        raw_trackers = fetch(urls, resources)
+        if raw_trackers and validate:
+            logger.info("%s 开始质检过滤...", name)
+            valid_trackers = check(raw_trackers, resources, max_workers)
+        else:
+            valid_trackers = raw_trackers
+    except KeyboardInterrupt as exc:
+        # 中断不算这一组的「正常完成」：已到手的结果照常落盘，然后由 main 收口
+        if getattr(exc, "valid_trackers", None) is not None:  # 质检阶段被打断
+            valid_trackers = set(exc.valid_trackers)
+        elif not validate:  # 拉取阶段被打断：--no-validate 时拉到的就是有效条目
+            raw_trackers = set(getattr(exc, "raw_trackers", ()))
+            valid_trackers = set(raw_trackers)
+        else:
+            valid_trackers = set()
+        outcome = save_partial_trackers(name, output_file, raw_trackers, valid_trackers, dry_run)
+        logger.warning("%s 处理被打断（Ctrl-C）：%s", name, outcome)
+        raise Interrupted(name, outcome, exc)
 
     plan = plan_update(raw_trackers, valid_trackers, read_old_trackers(output_file), dry_run)
     for level, text in plan.logs:
         logger.log(level, "%s %s", name, text)
     if not plan.write:
-        return plan.ok
-    return save_trackers(output_file, valid_trackers)
+        return GroupOutcome.DONE, plan.ok
+    return GroupOutcome.DONE, save_trackers(output_file, valid_trackers)
+
+
+def save_partial_trackers(name: str, output_file: str, raw_trackers: Set[Tracker],
+                          valid_trackers: Set[Tracker], dry_run: bool) -> str:
+    """中断后为这一组落盘：已确认有效的条目走与正常一轮完全相同的保护规则。
+
+    返回该组的结局字符串。没有有效条目时什么都不写（旧文件逐字节保持原样）；
+    空结果保护、骤降保护、无变化跳过、干跑、原子写入都与正常一轮一致。
+    """
+    if not valid_trackers:
+        logger.warning("%s 中断时尚未确认任何有效条目，旧文件保持原样", name)
+        return GroupOutcome.NO_DATA_AFTER_INTERRUPT
+
+    plan = plan_update(raw_trackers, valid_trackers,
+                       read_old_trackers(output_file), dry_run)
+    for level, text in plan.logs:
+        logger.log(level, "%s [中断后] %s", name, text)
+    if not plan.write:
+        # 无变化（磁盘上已经是这份内容）算「已保存」；被骤降保护拦下或干跑没写，如实说未落盘
+        return GroupOutcome.SAVED_AFTER_INTERRUPT if plan.ok and not dry_run else GroupOutcome.KEPT_AFTER_INTERRUPT
+    if save_trackers(output_file, valid_trackers):
+        return GroupOutcome.SAVED_AFTER_INTERRUPT
+    return GroupOutcome.KEPT_AFTER_INTERRUPT
 
 
 # --- 主入口 ---
@@ -519,30 +636,74 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return args
 
 
-def main(argv: Optional[List[str]] = None) -> int:
+def main(argv: Optional[List[str]] = None, groups: Optional[List[TrackerGroup]] = None,
+         fetch: Optional[Callable[[List[str], RunResources], Set[Tracker]]] = None,
+         check: Optional[Callable[[Set[Tracker], RunResources, Optional[int]], Set[Tracker]]] = None) -> int:
+    """跑一轮：逐组拉取/质检/落盘；被中断时保存已完成的组并输出逐组摘要。
+
+    中断的三种来源（本组内 KeyboardInterrupt、线程里未回收的 KeyboardInterrupt、
+    组与组之间的信号）都在这里收口，统一返回 130，绝不伪装成正常结束。
+    groups / fetch / check 是给测试注入用的；生产路径一律用默认值。
+    """
     args = parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level.upper()),
                         format="%(levelname)s: %(message)s")
     os.makedirs(args.output_dir, exist_ok=True)
 
+    injected = {}
+    if fetch is not None:
+        injected["fetch"] = fetch
+    if check is not None:
+        injected["check"] = check
+
     resources = RunResources()
+    group_list = GROUPS if groups is None else groups
+    outcomes: Dict[str, str] = {}
+    ok = True
+    interrupted = False
+    current: Optional[str] = None
 
     logger.info("=== Tracker 更新开始 ===")
     try:
-        ok = True
-        for group in GROUPS:
-            if not process_tracker_group(group.name, group.urls,
-                                         os.path.join(args.output_dir, group.output_file), resources,
-                                         validate=not args.no_validate, dry_run=args.dry_run,
-                                         max_workers=args.max_workers):
+        for group in group_list:
+            current = group.name
+            try:
+                outcome, group_ok = process_tracker_group(
+                    group.name, group.urls, os.path.join(args.output_dir, group.output_file), resources,
+                    validate=not args.no_validate, dry_run=args.dry_run, max_workers=args.max_workers,
+                    **injected)
+            except Interrupted as exc:
+                outcomes[group.name] = exc.outcome
+                interrupted = True
+                break
+            outcomes[group.name] = outcome
+            if not group_ok:
                 ok = False
-        logger.info("=== 全部完成（%s）===", "成功" if ok else "部分失败")
-        return 0 if ok else 1
     except KeyboardInterrupt:
-        logger.error("收到中断信号，退出")
-        return 130
+        # 组与组之间、或落盘/比对阶段漏上来的中断：这一组不谎称完成，也不谎称已保存
+        interrupted = True
+        if current is not None and current not in outcomes:
+            outcomes[current] = GroupOutcome.KEPT_AFTER_INTERRUPT
     finally:
         resources.close()
+
+    if interrupted:
+        logger.error("=== 本轮被 Ctrl-C 中断，退出码 130 ===")
+    else:
+        logger.info("=== 全部完成（%s）===", "成功" if ok else "部分失败")
+    log_summary(group_list, outcomes)
+    if interrupted:
+        return 130
+    return 0 if ok else 1
+
+
+def log_summary(groups: List[TrackerGroup], outcomes: Dict[str, str]) -> None:
+    """逐组结局摘要；没跑到（或没跑完）的组按「未开始」计。"""
+    lines = ["=== 本轮结局摘要 ==="]
+    for group in groups:
+        outcome = outcomes.get(group.name, GroupOutcome.NOT_STARTED)
+        lines.append("  %s: %s" % (group.name, outcome))
+    logger.info("\n".join(lines))
 
 
 if __name__ == "__main__":
