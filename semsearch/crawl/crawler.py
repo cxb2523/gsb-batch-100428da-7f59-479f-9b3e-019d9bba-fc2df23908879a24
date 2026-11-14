@@ -27,7 +27,7 @@ from .content_filter import is_fetchable_document_url, is_indexable_page
 from .language import detect_page_language, is_crawlable_language
 from .metadata import extract_outbound_links
 from .robots import USER_AGENT, RobotsCache
-from .sitemap import SitemapLoader
+from .sitemap import SITEMAP_MAX_URLS, SitemapLoader, SitemapStatus
 
 SEED_URLS = [
     "https://developer.mozilla.org/en-US/",
@@ -44,7 +44,6 @@ HTTP_HEADERS = {
 MAX_CONCURRENT_PER_DOMAIN = 2
 RATE_LIMIT_DELAY = 1.0  # minimum seconds between requests to the same domain
 REFETCH_INTERVAL = 86400  # seconds before a cached page is considered stale (24h)
-SITEMAP_MAX_URLS = 5000  # cap per domain to avoid queue explosion
 HTTP_POOL_LIMITS = httpx.Limits(max_connections=30, max_keepalive_connections=15)
 AUX_POOL_LIMITS = httpx.Limits(max_connections=15, max_keepalive_connections=8)
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=10.0, pool=60.0)
@@ -188,13 +187,20 @@ async def _load_domain_sitemap(
     ctx: CrawlerContext, domain: str, sitemap_urls: list[str]
 ) -> None:
     try:
-        page_urls = await ctx.sitemap_loader.load(domain, sitemap_urls)
-        capped = cap_sitemap_urls(page_urls)
-        if len(page_urls) > len(capped):
+        result = await ctx.sitemap_loader.load(domain, sitemap_urls)
+        capped = result.pages
+        if result.truncated:
             ctx.progress.print(
-                f"  [dim]Sitemap {domain}: capped at {len(capped):,} URLs[/dim]"
+                f"  [dim]Sitemap {domain}: truncated at "
+                f"{result.truncation_limit:,} of {result.total_pages:,} URLs[/dim]"
             )
         ctx.progress.print(f"  [cyan]Sitemap[/cyan] {domain}: {len(capped):,} URLs")
+        for outcome in result.outcomes:
+            if outcome.status is not SitemapStatus.SUCCESS:
+                ctx.progress.print(
+                    f"  [dim]Sitemap skipped[/dim] ({outcome.status.value}) "
+                    f"depth={outcome.depth} {outcome.url}"
+                )
         ctx.stats.inc("sitemap_urls", by=len(capped))
         for page_url in capped:
             if ctx.shutdown_event.is_set():
