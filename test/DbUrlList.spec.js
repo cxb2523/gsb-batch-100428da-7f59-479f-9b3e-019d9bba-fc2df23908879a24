@@ -197,6 +197,18 @@ describe("DbUrlList", function () {
     }));
   });
 
+  it("defines the finalUrl and numRedirects columns", function () {
+    new DbUrlList(opts);
+    sinon.assert.calledWith(defineSpy, "url", sinon.match({
+      finalUrl: {
+        allowNull: true
+      },
+      numRedirects: {
+        allowNull: false
+      }
+    }));
+  });
+
   describe("#insertIfNotExists", function () {
     it("creates the url table", function (done) {
       new DbUrlList(opts).insertIfNotExists(makeUrl("https://example.com")).then(function () {
@@ -243,6 +255,36 @@ describe("DbUrlList", function () {
           errorCode: "HTTP_ERROR",
           numErrors: 1,
           nextRetryDate: sinon.match(Date)
+        }));
+        done();
+      });
+    });
+
+    it("inserts the final URL and number of redirects", function (done) {
+      var url = new Url({
+        url: "https://example.com/redirect",
+        statusCode: 301,
+        finalUrl: "https://example.com/target",
+        numRedirects: 4
+      });
+
+      new DbUrlList(opts).insertIfNotExists(url).then(function () {
+        sinon.assert.calledWith(createSpy, sinon.match({
+          url: "https://example.com/redirect",
+          statusCode: 301,
+          finalUrl: "https://example.com/target",
+          numRedirects: 4
+        }));
+        done();
+      });
+    });
+
+    it("inserts null/0 when the URL did not redirect", function (done) {
+      new DbUrlList(opts).insertIfNotExists(makeUrl("https://example.com")).then(function () {
+        sinon.assert.calledWith(createSpy, sinon.match({
+          url: "https://example.com",
+          finalUrl: null,
+          numRedirects: 0
         }));
         done();
       });
@@ -356,6 +398,36 @@ describe("DbUrlList", function () {
         done();
       });
     });
+
+    it("upserts the final URL and number of redirects", function (done) {
+      var url = new Url({
+        url: "https://example.com/redirect",
+        statusCode: 302,
+        finalUrl: "https://example.com/target",
+        numRedirects: 5
+      });
+
+      new DbUrlList(opts).upsert(url).then(function () {
+        sinon.assert.calledWith(upsertSpy, sinon.match({
+          url: "https://example.com/redirect",
+          statusCode: 302,
+          finalUrl: "https://example.com/target",
+          numRedirects: 5
+        }));
+        done();
+      });
+    });
+
+    it("upserts null/0 for a URL that did not redirect", function (done) {
+      new DbUrlList(opts).upsert(makeUrl("https://example.com", 201)).then(function () {
+        sinon.assert.calledWith(upsertSpy, sinon.match({
+          url: "https://example.com",
+          finalUrl: null,
+          numRedirects: 0
+        }));
+        done();
+      });
+    });
   });
 
   describe("#getNextUrl", function () {
@@ -398,6 +470,38 @@ describe("DbUrlList", function () {
     it("provides the URL object", function (done) {
       new DbUrlList(opts).getNextUrl().then(function (url) {
         expect(url.getUrl()).to.equal("https://example.com/tocrawl");
+        done();
+      });
+    });
+
+    it("provides the final URL and number of redirects", function (done) {
+      findOneResult = Promise.resolve({
+        get: function (field) {
+          if (field === "url") {
+            return "https://example.com/redirect";
+          }
+          if (field === "finalUrl") {
+            return "https://example.com/target";
+          }
+          if (field === "numRedirects") {
+            return 3;
+          }
+
+          return null;
+        }
+      });
+
+      new DbUrlList(opts).getNextUrl().then(function (url) {
+        expect(url.getFinalUrl()).to.equal("https://example.com/target");
+        expect(url.getNumRedirects()).to.equal(3);
+        done();
+      });
+    });
+
+    it("defaults final URL to null and redirects to 0 for old records", function (done) {
+      new DbUrlList(opts).getNextUrl().then(function (url) {
+        expect(url.getFinalUrl()).to.equal(null);
+        expect(url.getNumRedirects()).to.equal(0);
         done();
       });
     });

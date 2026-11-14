@@ -273,6 +273,8 @@ information about errors and status codes.
 | url | Absolute-path string url |
 | statusCode | HTTP status code or `null`. |
 | errorCode | String error code or `null`. |
+| finalUrl | Final URL in the redirect chain, or `null` if the URL did not redirect and was not reached via a redirect. |
+| numRedirects | Number of redirects followed (as separate queue entries) to reach this URL. Defaults to `0`. |
 
 Example usage:
 
@@ -294,6 +296,8 @@ The following methods are available:
 | --- | --- |
 | getUniqueId | Get the unique identifier for this object. |
 | getUrl | Get the absolute-path string URL. |
+| getFinalUrl | Get the final URL in the redirect chain, or `null` if there was none. |
+| getNumRedirects | Get the number of redirects followed to reach this URL, or `0` if none were. |
 | getErrorCode | Get the error code, or `null` if it is empty. |
 | getStatusCode | Get the status code, or `null` if it is empty. |
 
@@ -366,6 +370,18 @@ crawler.addHandler(supercrawler.handlers.sitemapsParser());
 ```
 
 ## Changelog
+
+### 2.1.0
+
+* [Added] Redirect tracking. When a page returns a 3xx redirect, the crawler
+still queues the destination as a separate entry (it does not follow the
+redirect), but it now also records the destination as the original URL's
+`finalUrl` and keeps a `numRedirects` counter along the chain. `Url` exposes
+`getFinalUrl()` and `getNumRedirects()`. Redirect chains longer than 10 stops
+queueing further destinations; the offending URL finishes with the
+`TOO_MANY_REDIRECTS` error code.
+* [Added] `DbUrlList` persists `finalUrl` and `numRedirects`, adding the
+columns automatically to tables created before these fields existed.
 
 ### 2.0.0
 

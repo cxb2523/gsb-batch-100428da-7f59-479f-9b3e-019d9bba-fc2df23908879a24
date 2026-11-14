@@ -66,4 +66,48 @@ describe("Url", function () {
       }).getErrorMessage()).to.equal(null);
     });
   });
+
+  describe("#getFinalUrl", function () {
+    it("returns the final URL if specified", function () {
+      expect(new Url({
+        url: "https://example.com/old",
+        finalUrl: "https://example.com/new"
+      }).getFinalUrl()).to.equal("https://example.com/new");
+    });
+
+    it("defaults to null if final URL not specified", function () {
+      expect(new Url({
+        url: "https://example.com"
+      }).getFinalUrl()).to.equal(null);
+    });
+  });
+
+  describe("#getNumRedirects", function () {
+    it("returns the number of redirects if specified", function () {
+      expect(new Url({
+        url: "https://example.com",
+        numRedirects: 3
+      }).getNumRedirects()).to.equal(3);
+    });
+
+    it("defaults to 0 if number of redirects not specified", function () {
+      expect(new Url({
+        url: "https://example.com"
+      }).getNumRedirects()).to.equal(0);
+    });
+
+    it("accepts redirectCount as an alias option", function () {
+      expect(new Url({
+        url: "https://example.com",
+        redirectCount: 2
+      }).getNumRedirects()).to.equal(2);
+    });
+
+    it("exposes getRedirectCount as an alias", function () {
+      expect(new Url({
+        url: "https://example.com",
+        numRedirects: 2
+      }).getRedirectCount()).to.equal(2);
+    });
+  });
 });
