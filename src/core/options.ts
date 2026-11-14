@@ -1,7 +1,7 @@
 import { safeParse, type $ZodType } from 'zod/v4/core';
 import * as z from 'zod/mini';
 import type { OnDegradation } from './degradation.ts';
-import type { OnRequest, OnResponse, OnRetry } from './http.ts';
+import type { OnOutcome, OnRequest, OnResponse, OnRetry } from './http.ts';
 import type { OnIntegrityEvent } from './integrity.ts';
 import { ValidationError } from './errors.ts';
 
@@ -14,6 +14,7 @@ export const requestOptionsSchema = z.object({
   onRequest: z.optional(z.custom<OnRequest>((value) => typeof value === 'function')),
   onResponse: z.optional(z.custom<OnResponse>((value) => typeof value === 'function')),
   onRetry: z.optional(z.custom<OnRetry>((value) => typeof value === 'function')),
+  onOutcome: z.optional(z.custom<OnOutcome>((value) => typeof value === 'function')),
 });
 
 export type RequestOptions = z.infer<typeof requestOptionsSchema>;

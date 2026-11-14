@@ -38,6 +38,28 @@ export type OnRequest = (event: RequestEvent) => void;
 export type OnResponse = (event: ResponseEvent) => void;
 export type OnRetry = (event: RetryEvent) => void;
 
+export interface WaitDetail {
+  delayMs: number;
+  reason: 'status' | 'network';
+  status?: number;
+}
+
+export type OutcomeKind =
+  'success' | 'rate-limited' | 'blocked' | 'http-error' | 'network-error' | 'timeout' | 'aborted';
+
+export type RateLimitCause = 'retries-exhausted' | 'retry-after-exceeded';
+
+export interface OutcomeEvent {
+  outcome: OutcomeKind;
+  attempts: number;
+  waitedMs: number;
+  waits: WaitDetail[];
+  status?: number;
+  rateLimitCause?: RateLimitCause;
+}
+
+export type OnOutcome = (event: OutcomeEvent) => void;
+
 export interface HttpClientConfig {
   fetchImpl?: typeof fetch;
   throttle?: number;
@@ -49,6 +71,7 @@ export interface HttpClientConfig {
   onRequest?: OnRequest;
   onResponse?: OnResponse;
   onRetry?: OnRetry;
+  onOutcome?: OnOutcome;
 }
 
 export interface HttpClient {
@@ -276,6 +299,29 @@ function blockedError(block: Block): BlockedError {
   return new BlockedError(`Blocked by Google Play (${block})`);
 }
 
+type OutcomeSummary = Pick<OutcomeEvent, 'outcome' | 'status' | 'rateLimitCause'>;
+
+function classifyOutcome(error: unknown, retryAfterExceeded: boolean): OutcomeSummary {
+  if (error instanceof BlockedError) {
+    return { outcome: 'blocked' };
+  }
+  if (error instanceof RateLimitError) {
+    return {
+      outcome: 'rate-limited',
+      status: error.status,
+      rateLimitCause: retryAfterExceeded ? 'retry-after-exceeded' : 'retries-exhausted',
+    };
+  }
+  if (error instanceof HttpError) {
+    if (error.status > 0) {
+      return { outcome: 'http-error', status: error.status };
+    }
+    const cause = error.cause as { name?: unknown } | undefined;
+    return cause?.name === 'TimeoutError' ? { outcome: 'timeout' } : { outcome: 'network-error' };
+  }
+  return { outcome: 'aborted' };
+}
+
 export function createHttpClient(config: HttpClientConfig = {}): HttpClient {
   const fetchImpl = config.fetchImpl ?? fetch;
   const retries = config.retries ?? DEFAULT_RETRIES;
@@ -288,6 +334,9 @@ export function createHttpClient(config: HttpClientConfig = {}): HttpClient {
   const request = async (req: HttpRequest): Promise<string> => {
     const method = req.method ?? 'GET';
     const headers = buildHeaders(method, config.headers, req.headers);
+    const waits: WaitDetail[] = [];
+    let attempts = 0;
+    let retryAfterExceeded = false;
     const eventFor = (attempt: number): RequestEvent => ({
       url: req.url,
       method,
@@ -295,6 +344,7 @@ export function createHttpClient(config: HttpClientConfig = {}): HttpClient {
     });
 
     const attemptOnce = async (attempt: number): Promise<Attempt> => {
+      attempts += 1;
       emit(config.onRequest, eventFor(attempt));
       const startedAt = performance.now();
       const attemptSignal = attemptSignalFor(timeoutMs, callerSignal);
@@ -325,16 +375,19 @@ export function createHttpClient(config: HttpClientConfig = {}): HttpClient {
         const retryable = block !== undefined || isRetryableStatus(response.status);
         if (retryable && attempt < retries && honored) {
           callerSignal?.throwIfAborted();
-          const delayMs = retryAfterMs ?? jitteredBackoff(attempt);
-          emit(config.onRetry, {
-            ...eventFor(attempt),
-            delayMs,
+          const waitDetail: WaitDetail = {
+            delayMs: retryAfterMs ?? jitteredBackoff(attempt),
             reason: 'status',
             status: response.status,
-          });
-          return { delayMs };
+          };
+          waits.push(waitDetail);
+          emit(config.onRetry, { ...eventFor(attempt), ...waitDetail });
+          return { delayMs: waitDetail.delayMs };
         }
 
+        if (retryable && !honored) {
+          retryAfterExceeded = true;
+        }
         throw block === undefined
           ? mapStatusToError(response.status, req.url)
           : blockedError(block);
@@ -344,9 +397,10 @@ export function createHttpClient(config: HttpClientConfig = {}): HttpClient {
         }
         callerSignal?.throwIfAborted();
         if (attempt < retries) {
-          const delayMs = jitteredBackoff(attempt);
-          emit(config.onRetry, { ...eventFor(attempt), delayMs, reason: 'network' });
-          return { delayMs };
+          const waitDetail: WaitDetail = { delayMs: jitteredBackoff(attempt), reason: 'network' };
+          waits.push(waitDetail);
+          emit(config.onRetry, { ...eventFor(attempt), ...waitDetail });
+          return { delayMs: waitDetail.delayMs };
         }
         const httpError = new HttpError(`Network request to ${req.url} failed`, 0, req.url);
         httpError.cause = error;
@@ -356,18 +410,38 @@ export function createHttpClient(config: HttpClientConfig = {}): HttpClient {
       }
     };
 
-    for (let attempt = 0; ; attempt += 1) {
-      callerSignal?.throwIfAborted();
-      if (limiter) {
-        await limiter(callerSignal);
+    const runAttempts = async (): Promise<string> => {
+      for (let attempt = 0; ; attempt += 1) {
+        callerSignal?.throwIfAborted();
+        if (limiter) {
+          await limiter(callerSignal);
+        }
+        callerSignal?.throwIfAborted();
+        const outcome = await attemptOnce(attempt);
+        callerSignal?.throwIfAborted();
+        if ('body' in outcome) {
+          return outcome.body;
+        }
+        await wait(outcome.delayMs, callerSignal);
       }
-      callerSignal?.throwIfAborted();
-      const outcome = await attemptOnce(attempt);
-      callerSignal?.throwIfAborted();
-      if ('body' in outcome) {
-        return outcome.body;
-      }
-      await wait(outcome.delayMs, callerSignal);
+    };
+
+    const settledDetails = (): Pick<OutcomeEvent, 'attempts' | 'waitedMs' | 'waits'> => ({
+      attempts,
+      waitedMs: waits.reduce((total, waitDetail) => total + waitDetail.delayMs, 0),
+      waits: waits.map((waitDetail) => ({ ...waitDetail })),
+    });
+
+    try {
+      const body = await runAttempts();
+      emit(config.onOutcome, { outcome: 'success', ...settledDetails() });
+      return body;
+    } catch (error) {
+      emit(config.onOutcome, {
+        ...classifyOutcome(error, retryAfterExceeded),
+        ...settledDetails(),
+      });
+      throw error;
     }
   };
 

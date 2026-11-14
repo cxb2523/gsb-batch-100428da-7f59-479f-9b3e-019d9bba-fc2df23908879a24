@@ -3,7 +3,9 @@ import {
   clientFromOptions,
   createHttpClient,
   createRateLimiter,
+  type OnOutcome,
   type OnResponse,
+  type OutcomeEvent,
   type RequestEvent,
   type ResponseEvent,
   type RetryEvent,
@@ -1253,5 +1255,142 @@ describe('request lifecycle hooks', () => {
     await client.request({ url: 'https://x' });
 
     expect(events.map((event) => event.kind)).toEqual(['request', 'response']);
+  });
+});
+
+describe('outcome callback', () => {
+  const recordingOutcome = (): { outcomes: OutcomeEvent[]; onOutcome: OnOutcome } => {
+    const outcomes: OutcomeEvent[] = [];
+    return { outcomes, onOutcome: (event) => outcomes.push(event) };
+  };
+
+  it('reports a success after a retried 500 with the wait detail', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    const { outcomes, onOutcome } = recordingOutcome();
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(fakeResponse({ status: 500 }))
+      .mockResolvedValueOnce(fakeResponse({ body: 'recovered' }));
+    const client = createHttpClient({ fetchImpl, onOutcome });
+
+    const pending = client.request({ url: 'https://x' });
+    await vi.runAllTimersAsync();
+
+    await expect(pending).resolves.toBe('recovered');
+    expect(outcomes).toEqual([
+      {
+        outcome: 'success',
+        attempts: 2,
+        waitedMs: 250,
+        waits: [{ delayMs: 250, reason: 'status', status: 500 }],
+      },
+    ]);
+  });
+
+  it('reports a captcha redirect as blocked even when its status is 200', async () => {
+    const { outcomes, onOutcome } = recordingOutcome();
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(fakeResponse({ status: 200, url: CAPTCHA_URL, body: 'challenge' }));
+    const client = createHttpClient({ fetchImpl, retries: 0, onOutcome });
+
+    const error = await client.request({ url: 'https://x' }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(BlockedError);
+    expect(outcomes).toEqual([{ outcome: 'blocked', attempts: 1, waitedMs: 0, waits: [] }]);
+  });
+
+  it('distinguishes an over-cap Retry-After from exhausted retries', async () => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const overCap = recordingOutcome();
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValue(fakeResponse({ status: 429, headers: { 'Retry-After': '120' } }));
+    const capped = createHttpClient({ fetchImpl, onOutcome: overCap.onOutcome });
+
+    const cappedError = await capped
+      .request({ url: 'https://x' })
+      .catch((caught: unknown) => caught);
+
+    expect(cappedError).toBeInstanceOf(RateLimitError);
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(overCap.outcomes).toEqual([
+      {
+        outcome: 'rate-limited',
+        attempts: 1,
+        waitedMs: 0,
+        waits: [],
+        status: 429,
+        rateLimitCause: 'retry-after-exceeded',
+      },
+    ]);
+
+    const exhausted = recordingOutcome();
+    const drained = vi.fn().mockResolvedValue(fakeResponse({ status: 429 }));
+    const retrying = createHttpClient({
+      fetchImpl: drained,
+      retries: 1,
+      onOutcome: exhausted.onOutcome,
+    });
+
+    const settled = retrying.request({ url: 'https://x' }).catch((caught: unknown) => caught);
+    await vi.runAllTimersAsync();
+    const exhaustedError = await settled;
+
+    expect(exhaustedError).toBeInstanceOf(RateLimitError);
+    expect(drained).toHaveBeenCalledTimes(2);
+    expect(exhausted.outcomes).toEqual([
+      {
+        outcome: 'rate-limited',
+        attempts: 2,
+        waitedMs: 0,
+        waits: [{ delayMs: 0, reason: 'status', status: 429 }],
+        status: 429,
+        rateLimitCause: 'retries-exhausted',
+      },
+    ]);
+  });
+
+  it('reports a caller abort with the attempts made so far', async () => {
+    const controller = new AbortController();
+    const { outcomes, onOutcome } = recordingOutcome();
+    const fetchImpl = vi.fn(
+      (_input: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            reject(init.signal?.reason as Error);
+          });
+        }),
+    );
+    const client = createHttpClient({ fetchImpl, signal: controller.signal, onOutcome });
+
+    const settled = client.request({ url: 'https://x' }).catch((caught: unknown) => caught);
+    controller.abort();
+    const error = await settled;
+
+    expect((error as DOMException).name).toBe('AbortError');
+    expect(outcomes).toEqual([{ outcome: 'aborted', attempts: 1, waitedMs: 0, waits: [] }]);
+  });
+
+  it('ignores an outcome callback that throws or rejects', async () => {
+    const throwing = vi.fn(() => {
+      throw new Error('sync outcome failure');
+    });
+    const fetchImpl = vi.fn().mockResolvedValue(fakeResponse({ body: 'ok' }));
+    const client = createHttpClient({ fetchImpl, onOutcome: throwing });
+
+    await expect(client.request({ url: 'https://x' })).resolves.toBe('ok');
+    expect(throwing).toHaveBeenCalledTimes(1);
+
+    const rejecting = vi.fn(() => Promise.reject(new Error('async outcome failure')));
+    const asyncClient = createHttpClient({
+      fetchImpl,
+      onOutcome: rejecting as unknown as OnOutcome,
+    });
+
+    await expect(asyncClient.request({ url: 'https://x' })).resolves.toBe('ok');
+    expect(rejecting).toHaveBeenCalledTimes(1);
   });
 });
