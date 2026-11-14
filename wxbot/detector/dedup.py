@@ -42,19 +42,42 @@ class ImageHashCache:
 
 
 class ClickCooldown:
-    """Prevent re-clicking the same Y position within a timeout window."""
+    """Prevent re-clicking the same Y position within a timeout window.
 
-    def __init__(self, cooldown_seconds: float = 60.0):
+    Optionally red-dot-signature aware: when the caller passes the current
+    cluster signature (see ``wxbot.detector.red_dot``) and it differs from
+    the signature recorded at the last click, the row is considered to have
+    NEW content and the cooldown is bypassed.  An identical signature (or
+    no signature evidence at all) keeps the cooldown in effect.
+    """
+
+    def __init__(self, cooldown_seconds: float = 60.0,
+                 signature_tolerance_px: int = 0):
         self._tried: Dict[int, float] = {}
+        self._signatures: Dict[int, tuple] = {}
         self._cooldown = cooldown_seconds
+        self._sig_tolerance = signature_tolerance_px
 
-    def is_clickable(self, y: int, timeout: float = None) -> bool:
+    def is_clickable(self, y: int, timeout: float = None,
+                     signature: tuple = None) -> bool:
         t = timeout if timeout is not None else self._cooldown
-        last = self._tried.get(y, 0)
-        return (time.monotonic() - last) > t
+        last = self._tried.get(y)
+        if last is None or (time.monotonic() - last) > t:
+            return True
+        # Inside the cooldown window: only a CHANGED red-dot cluster
+        # (new message arrived on the same row) bypasses the cooldown.
+        if signature is not None:
+            from wxbot.detector.red_dot import signatures_match
+            prev = self._signatures.get(y)
+            if prev is not None and not signatures_match(
+                    prev, signature, self._sig_tolerance):
+                return True
+        return False
 
-    def mark_clicked(self, y: int):
+    def mark_clicked(self, y: int, signature: tuple = None):
         self._tried[y] = time.monotonic()
+        if signature is not None:
+            self._signatures[y] = signature
 
 
 class MessageDedup:

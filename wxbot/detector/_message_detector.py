@@ -55,6 +55,7 @@ class MessageDetector:
         self._ocr: Optional[PaddleOCR] = None
         self._seen_col2: set = set()
         self._tried_y: dict = {}
+        self._clicked_sigs: dict = {}  # y → 上次点击时记录的红点簇签名
         self._last_reply = 0.0
         self._seen_messages: dict = {}  # OCR文本hash → (timestamp, original_text)
         self._cooldown = self._cfg.get("reply_cooldown_seconds", 10)
@@ -105,6 +106,8 @@ class MessageDetector:
         self._rd_excess_b = rd.get("red_excess_b", 20)
         self._rd_cluster_gap = rd.get("cluster_gap", 5)
         self._rd_cluster_min = rd.get("cluster_min_points", 2)
+        # 红点簇签名比较容差（像素），0 = 完全一致才算“旧红点未消失”
+        self._rd_sig_tolerance = rd.get("signature_tolerance_px", 0)
 
         # 蓝泡
         bb = det.get("blue_bubble", {})
@@ -193,6 +196,17 @@ class MessageDetector:
         from wxbot.detector.red_dot import detect_red_dots_legacy
         return detect_red_dots_legacy(img, config=self._cfg.get("detection", {}).get("red_dot"))
 
+    def detect_red_dot_clusters(self, img: Image.Image) -> List:
+        """Return full red-dot DetectorResults (with cluster signatures).
+
+        Each result's ``metadata['signature']`` identifies the cluster
+        (pixel count + bbox); pass it to is_clickable/mark_clicked so the
+        click cooldown can distinguish a NEW red dot on the same row from
+        the OLD one that has not disappeared yet.
+        """
+        from wxbot.detector.red_dot import detect_red_dots
+        return detect_red_dots(img, config=self._cfg.get("detection", {}).get("red_dot"))
+
     # ═══ 图像去重 ═══════════════════════════
 
     def col2_seen(self, img: Image.Image) -> bool:
@@ -204,16 +218,37 @@ class MessageDetector:
             self._seen_col2.clear()
         return False
 
-    def is_clickable(self, y: int, timeout: int = None) -> bool:
+    def is_clickable(self, y: int, timeout: int = None,
+                     signature: tuple = None) -> bool:
+        """点击冷却检查。
+
+        冷却期内默认不可再点；但当传入当前红点簇 ``signature`` 且它与
+        上次点击时记录的签名不一致（新消息导致红点簇变大/移动）时，
+        视为同一行出现了新内容，允许绕过冷却重新进入该会话。
+        签名一致（或没有可比较的签名记录）仍按冷却跳过。
+        """
         if timeout is None:
             timeout = self._click_cooldown
         now = time.time()
-        if y in self._tried_y and now - self._tried_y[y] < timeout:
-            return False
-        return True
+        last = self._tried_y.get(y)
+        if last is None or now - last >= timeout:
+            return True
+        # 冷却期内：红点簇特征变化 → 新消息，绕过冷却
+        if signature is not None:
+            from wxbot.detector.red_dot import signatures_match
+            prev = self._clicked_sigs.get(y)
+            if prev is not None and not signatures_match(
+                    prev, signature, self._rd_sig_tolerance):
+                logger.info(f"y={y} 红点簇变化(旧{prev}→新{signature})，"
+                            f"绕过点击冷却")
+                return True
+        return False
 
-    def mark_clicked(self, y: int):
+    def mark_clicked(self, y: int, signature: tuple = None):
+        """记录点击时间与当时红点簇签名（如有）。"""
         self._tried_y[y] = time.time()
+        if signature is not None:
+            self._clicked_sigs[y] = signature
 
     # ═══ 像素判定 ═══════════════════════════
 

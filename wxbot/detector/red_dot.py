@@ -5,8 +5,13 @@ indicating unread messages. Extracted from the original MessageDetector class.
 
 Original signature: detect_red_dots(self, img: Image.Image) -> List[int]
 New signature: detect_red_dots(img: Image.Image, config: dict = None) -> List[DetectorResult]
+
+Each DetectorResult carries a cluster ``signature`` in ``metadata`` —
+``(cluster_size, x_min, y_min, x_max, y_max)`` — so the scan scheduler can
+tell "a NEW red dot appeared on the same row" apart from "the OLD red dot
+has not disappeared yet" and decide whether to bypass the click cooldown.
 """
-from typing import List
+from typing import List, Optional
 
 from PIL import Image
 import numpy as np
@@ -28,6 +33,9 @@ DEFAULTS = {
     "cluster_min_points": 2,
 }
 
+# Signature layout: (pixel_count, x_min, y_min, x_max, y_max)
+SIGNATURE_FIELDS = 5
+
 
 def detect_red_dots(img: Image.Image, config: dict = None) -> List[DetectorResult]:
     """Detect red dot clusters in the chat list screenshot.
@@ -38,13 +46,26 @@ def detect_red_dots(img: Image.Image, config: dict = None) -> List[DetectorResul
     by minimum cluster size.
 
     Args:
-        img: Column-2 screenshot as PIL Image (RGB).
+        img: Column-2 screenshot as PIL Image (RGB).  ``None`` or a
+            zero-sized image safely yields an empty list (window not
+            found / empty capture).
         config: Optional dict overriding any DEFAULTS key.
 
     Returns:
         List of DetectorResult, one per red-dot cluster.  The ``metadata``
-        dict carries ``y_center`` (int) and ``cluster_size`` (int).
+        dict carries:
+
+        - ``y_center`` (int): cluster vertical center (legacy position).
+        - ``cluster_size`` (int): number of red pixels in the cluster.
+        - ``cluster_bbox`` (tuple): actual pixel bbox
+          ``(x_min, y_min, x_max, y_max)`` of the cluster.
+        - ``signature`` (tuple): ``(cluster_size, x_min, y_min, x_max,
+          y_max)`` — comparable via :func:`signatures_match` to decide
+          whether the row's red dot changed since the last click.
     """
+    if img is None:
+        return []
+
     cfg = dict(DEFAULTS)
     if config:
         cfg.update(config)
@@ -60,8 +81,11 @@ def detect_red_dots(img: Image.Image, config: dict = None) -> List[DetectorResul
     cluster_gap = cfg["cluster_gap"]
     cluster_min = cfg["cluster_min_points"]
 
-    pixels = img.load()
     w, h = img.size
+    if w == 0 or h == 0:
+        return []
+
+    pixels = img.load()
     scan_w = max(int(w * scan_w_ratio), scan_w_min)
 
     dots = []
@@ -87,30 +111,35 @@ def detect_red_dots(img: Image.Image, config: dict = None) -> List[DetectorResul
             cur.append(dots[i])
         else:
             if len(cur) >= cluster_min:
-                y_center = sum(d[1] for d in cur) // len(cur)
-                y_min = min(d[1] for d in cur)
-                y_max = max(d[1] for d in cur)
-                clusters.append(DetectorResult(
-                    detected=True,
-                    confidence=_compute_confidence(cur, cluster_min),
-                    bbox=(0, y_min, scan_w, y_max),
-                    text="",
-                    metadata={"y_center": y_center, "cluster_size": len(cur)},
-                ))
+                clusters.append(_cluster_result(cur, cluster_min))
             cur = [dots[i]]
     if len(cur) >= cluster_min:
-        y_center = sum(d[1] for d in cur) // len(cur)
-        y_min = min(d[1] for d in cur)
-        y_max = max(d[1] for d in cur)
-        clusters.append(DetectorResult(
-            detected=True,
-            confidence=_compute_confidence(cur, cluster_min),
-            bbox=(0, y_min, scan_w, y_max),
-            text="",
-            metadata={"y_center": y_center, "cluster_size": len(cur)},
-        ))
+        clusters.append(_cluster_result(cur, cluster_min))
 
     return clusters
+
+
+def _cluster_result(cluster: list, cluster_min: int) -> DetectorResult:
+    """Build a DetectorResult for one cluster, including its signature."""
+    y_center = sum(d[1] for d in cluster) // len(cluster)
+    x_min = min(d[0] for d in cluster)
+    x_max = max(d[0] for d in cluster)
+    y_min = min(d[1] for d in cluster)
+    y_max = max(d[1] for d in cluster)
+    bbox = (x_min, y_min, x_max, y_max)
+    signature = (len(cluster), x_min, y_min, x_max, y_max)
+    return DetectorResult(
+        detected=True,
+        confidence=_compute_confidence(cluster, cluster_min),
+        bbox=bbox,
+        text="",
+        metadata={
+            "y_center": y_center,
+            "cluster_size": len(cluster),
+            "cluster_bbox": bbox,
+            "signature": signature,
+        },
+    )
 
 
 def _compute_confidence(cluster: list, min_points: int) -> float:
@@ -125,6 +154,31 @@ def _compute_confidence(cluster: list, min_points: int) -> float:
     elif ratio >= 2:
         return 0.6
     return 0.4
+
+
+def cluster_signature(result: DetectorResult) -> Optional[tuple]:
+    """Extract the comparable signature from a red-dot DetectorResult."""
+    if result is None:
+        return None
+    return result.metadata.get("signature")
+
+
+def signatures_match(sig_a: Optional[tuple], sig_b: Optional[tuple],
+                     tolerance_px: int = 0) -> bool:
+    """True if two red-dot signatures describe the same cluster.
+
+    Signatures compare field-by-field (pixel count + bbox corners); every
+    field must differ by no more than ``tolerance_px``.  Anything else —
+    a bigger cluster, a shifted bbox — counts as NEW content.  Missing or
+    malformed signatures never match (no evidence → no bypass decision
+    based on them).
+    """
+    if not sig_a or not sig_b:
+        return False
+    if len(sig_a) != SIGNATURE_FIELDS or len(sig_b) != SIGNATURE_FIELDS:
+        return False
+    return all(abs(int(a) - int(b)) <= tolerance_px
+               for a, b in zip(sig_a, sig_b))
 
 
 # Legacy-compatible wrapper returning plain y-centers

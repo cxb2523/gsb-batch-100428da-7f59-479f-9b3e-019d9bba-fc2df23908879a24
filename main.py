@@ -258,7 +258,12 @@ def _main_impl():
                 return
 
             # ══ 3. 红点检测 ══
-            reds = detector.detect_red_dots(c2_img)
+            red_results = detector.detect_red_dot_clusters(c2_img)
+            reds = [r.metadata["y_center"] for r in red_results]
+            # y_center → 红点簇签名（像素规模+包围盒），用于区分
+            # “同一行出现新红点”与“旧红点还没消失”
+            red_sigs = {r.metadata["y_center"]: r.metadata.get("signature")
+                        for r in red_results}
             if reds:
                 log.info(f"红点: {len(reds)}个, Y={reds}")
 
@@ -274,9 +279,13 @@ def _main_impl():
                 cw2 = c2_img.size[0]
                 for ry in reversed(reds):
                     # Skip recently processed y-positions to avoid
-                    # expensive OCR re-scan every 3s after send failure
-                    if not detector.is_clickable(ry, timeout=15):
-                        log.info(f"红点y={ry} 冷却中，跳过")
+                    # expensive OCR re-scan every 3s after send failure.
+                    # 但若红点簇签名与上次点击时不同（同一行来了新消息），
+                    # 绕过冷却重新进入该会话。
+                    ry_sig = red_sigs.get(ry)
+                    if not detector.is_clickable(ry, timeout=15,
+                                                 signature=ry_sig):
+                        log.info(f"红点y={ry} 冷却中且红点簇未变化，跳过")
                         continue
                     row_img = c2_img.crop(
                         (0, max(0, ry + row_top_offset), cw2,
@@ -298,7 +307,7 @@ def _main_impl():
                         customer_red_y = ry
                         customer_name = detector.clean_name_text(name_text) if name_text else "客户"
                         break
-                    detector.mark_clicked(ry)
+                    detector.mark_clicked(ry, signature=ry_sig)
 
                 if customer_red_y is None:
                     log.info("红点均非客户对话")
@@ -307,7 +316,8 @@ def _main_impl():
                     if not scanner.click_col2_row(customer_red_y):
                         log.warning("col2 点击失败，跳过")
                         return
-                    detector.mark_clicked(customer_red_y)
+                    detector.mark_clicked(customer_red_y,
+                                          signature=red_sigs.get(customer_red_y))
                     time.sleep(t_after_click_row)
 
                     # ══ 6. 聊天区截图 ══

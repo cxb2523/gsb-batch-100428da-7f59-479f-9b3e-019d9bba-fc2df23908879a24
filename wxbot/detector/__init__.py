@@ -51,7 +51,10 @@ class ChatState:
     has_blue: bool = False
 
 
-from wxbot.detector.red_dot import detect_red_dots, detect_red_dots_legacy
+from wxbot.detector.red_dot import (
+    detect_red_dots, detect_red_dots_legacy,
+    cluster_signature, signatures_match,
+)
 from wxbot.detector.bubble import (  # noqa: E402
     is_blue_pixel, is_gray_pixel, mask_bubble, extract_bubbles,
 )
@@ -78,6 +81,7 @@ from wxbot.detector._message_detector import (  # noqa: E402
 __all__ = [
     "DetectorResult", "Bubble", "ChatState",
     "detect_red_dots", "detect_red_dots_legacy",
+    "cluster_signature", "signatures_match",
     "is_blue_pixel", "is_gray_pixel", "mask_bubble", "extract_bubbles",
     "detect_name_region", "has_green_badge",
     "is_customer_name", "clean_name_text", "is_customer",

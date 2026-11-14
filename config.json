@@ -55,7 +55,8 @@
       "red_excess_g": 20,
       "red_excess_b": 20,
       "cluster_gap": 5,
-      "cluster_min_points": 2
+      "cluster_min_points": 2,
+      "signature_tolerance_px": 0
     },
     "blue_bubble": {
       "b_excess_r": 15,
