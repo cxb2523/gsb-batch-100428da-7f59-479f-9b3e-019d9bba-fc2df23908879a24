@@ -1,0 +1,22 @@
+# Runtime-generated directories
+output/
+done/
+failed/
+
+# Ignore user-placed input CSV files, but track the sample
+input/*
+!input/expr_example.csv
+
+# SQLite queue database (auto-created at runtime)
+queue.db
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Test & type-checking caches
+.pytest_cache/
+.mypy_cache/
+
+# Package build artifacts (pip install -e .)
+*.egg-info/

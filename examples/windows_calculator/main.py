@@ -1,0 +1,243 @@
+"""RPA Core orchestration for the Windows Calculator example.
+
+Scans an input directory for CSV expression files, builds a transaction
+per file, and runs the queue loop.
+"""
+from __future__ import annotations
+
+import shutil
+import sys
+from pathlib import Path
+
+from rpacore import (
+    ConfigField,
+    Engine,
+    QueueItem,
+    QueueRunSummary,
+    SqliteQueue,
+    Status,
+    SystemException,
+    Transaction,
+    configure_logger,
+    get_logger,
+    load_config,
+    run_queue_loop,
+    validate_config,
+)
+from rpacore import resolve_config_path, resolve_config_paths
+
+from steps._path_utils import unique_destination, validate_contained_path
+from steps.open_calculator import OpenCalculator
+from steps.load_expressions import LoadExpressions
+from steps.process_expressions import ProcessExpressions
+from steps.write_report import WriteReport
+from steps.close_calculator import CloseCalculator
+from steps.move_file import MoveFile
+
+logger = get_logger(__name__)
+DEFINITION_IDENTITY = "windows-calculator/batch/v1"
+PROJECT_ROOT = Path(__file__).resolve().parent
+_CONFIG_FIELDS = (
+    ConfigField("engine_max_retries", int, min_value=0),
+    ConfigField(
+        "log_level",
+        str,
+        choices=("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        allow_empty=False,
+    ),
+    ConfigField("transaction_db_path", str, allow_empty=False),
+    ConfigField("input_dir", str, allow_empty=False),
+    ConfigField("output_dir", str, allow_empty=False),
+    ConfigField("done_dir", str, allow_empty=False),
+    ConfigField("failed_dir", str, allow_empty=False),
+    ConfigField("queue.db_path", str, allow_empty=False),
+    ConfigField("queue.lease_timeout", int, min_value=1),
+    ConfigField("queue.max_retries", int, choices=(0,)),
+    ConfigField("calculator_path", str, required=False, allow_empty=False),
+)
+_SUMMARY_FIELDS = (
+    "processed",
+    "completed",
+    "failed",
+    "callback_errors",
+    "persistence_errors",
+    "lifecycle_errors",
+    "notification_errors",
+    "retry_scheduled",
+    "terminal_failed",
+    "lease_lost",
+    "transition_unknown",
+)
+
+
+def _validate_config(config: dict[str, object]) -> None:
+    try:
+        validate_config(config, _CONFIG_FIELDS)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SystemException(f"Invalid config: {exc}", action="main") from exc
+    for key in (
+        "log_level",
+        "transaction_db_path",
+        "input_dir",
+        "output_dir",
+        "done_dir",
+        "failed_dir",
+        "calculator_path",
+    ):
+        if key in config and not str(config[key]).strip():
+            raise SystemException(f"Config key '{key}' must be a non-empty string", action="main")
+    queue_config = config.get("queue")
+    if isinstance(queue_config, dict) and not str(queue_config["db_path"]).strip():
+        raise SystemException("Config key 'queue.db_path' must be a non-empty string", action="main")
+
+
+def scan_inbox(config: dict, queue: SqliteQueue) -> int:
+    """Add new CSV files in the input directory as queue items."""
+    input_dir = Path(str(config["input_dir"]))
+    if not input_dir.exists():
+        raise SystemException(
+            f"Input directory does not exist: {input_dir}", action="scan_inbox"
+        )
+
+    count = 0
+    for csv_file in sorted(input_dir.glob("*.csv")):
+        reference = f"calculator-{csv_file.stem}"
+        added = queue.add_once(
+            QueueItem(
+                reference=reference,
+                payload={"file_path": str(csv_file)},
+            )
+        )
+        if added:
+            count += 1
+    return count
+
+
+def build_transaction(item: QueueItem) -> Transaction:
+    """Build a 6-step transaction for one CSV file.
+
+    Note: transaction.state is seeded from item.payload by run_queue_loop()
+    via _seed_transaction_state_from_payload() — no manual state= needed.
+    """
+    return Transaction(
+        reference=item.reference,
+        definition_identity=DEFINITION_IDENTITY,
+        steps=[
+            LoadExpressions(name="load_expressions", execution_order=1),
+            OpenCalculator(name="open_calculator", execution_order=2),
+            ProcessExpressions(name="process_expressions", execution_order=3),
+            CloseCalculator(name="close_calculator", execution_order=4),
+            WriteReport(name="write_report", execution_order=5),
+            MoveFile(name="move_file", execution_order=6),
+        ],
+    )
+
+
+def _move_failed_file(item: QueueItem, config: dict) -> None:
+    """Move a failed CSV file to the failed directory."""
+    file_path = item.payload.get("file_path")
+    failed_dir = config.get("failed_dir")
+    if not isinstance(file_path, str) or not isinstance(failed_dir, str):
+        raise SystemException(
+            f"Cannot move failed file: file_path={file_path!r}, failed_dir={failed_dir!r}",
+            action="move_failed_file",
+        )
+
+    input_dir = config.get("input_dir")
+    if not isinstance(input_dir, str):
+        raise SystemException("Missing input_dir for failed-file move", action="move_failed_file")
+    src = validate_contained_path(file_path, input_dir, action="move_failed_file")
+    if not src.exists():
+        raise SystemException(f"Failed source file does not exist: {src}", action="move_failed_file")
+
+    dst_dir = Path(failed_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = unique_destination(dst_dir, src.name, action="move_failed_file")
+
+    try:
+        shutil.move(str(src), str(dst))
+    except OSError as exc:
+        raise SystemException(
+            f"Failed to move {src} to {dst}: {exc}",
+            action="move_failed_file",
+        ) from exc
+
+
+def _load_example_config() -> dict[str, object]:
+    config = load_config(PROJECT_ROOT / "config.toml", require_file=True)
+    _validate_config(config)
+    resolved = resolve_config_paths(
+        config,
+        (
+            "input_dir",
+            "output_dir",
+            "done_dir",
+            "failed_dir",
+            "transaction_db_path",
+            "queue.db_path",
+        ),
+        base_dir=PROJECT_ROOT,
+        root=PROJECT_ROOT,
+    )
+    if "calculator_path" in config:
+        resolved["calculator_path"] = resolve_config_path(
+            config["calculator_path"],
+            base_dir=PROJECT_ROOT,
+            key="calculator_path",
+        )
+    return resolved
+
+
+def _summary_values(summary: QueueRunSummary) -> dict[str, int]:
+    """Project all authoritative queue delivery counters in stable order."""
+    return {field: getattr(summary, field) for field in _SUMMARY_FIELDS}
+
+
+def main() -> None:
+    config = _load_example_config()
+    configure_logger(level=str(config["log_level"]))
+
+    for key in ("input_dir", "done_dir", "failed_dir"):
+        Path(str(config[key])).mkdir(parents=True, exist_ok=True)
+
+    queue = SqliteQueue(config["queue"])
+    enqueued = scan_inbox(config, queue)
+    logger.info("Enqueued %d CSV file(s).", enqueued)
+
+    engine = Engine(max_retries=int(config["engine_max_retries"]))
+
+    def after_item(item: QueueItem, transaction: Transaction | None, error: Exception | None) -> None:
+        if transaction is not None:
+            if transaction.status is not Status.SUCCESSFUL:
+                _move_failed_file(item, config)
+        elif error is not None:
+            _move_failed_file(item, config)
+
+    class _NoopCredentials:
+        """Minimal credential provider — no secrets needed for local CLI."""
+        def get(self, name: str) -> str:
+            return ""
+
+    summary = run_queue_loop(
+        queue,
+        engine,
+        build_transaction,
+        config,
+        credentials=_NoopCredentials(),
+        worker_id="calculator-worker",
+        logger=logger,
+        after_item=after_item,
+        transaction_db_path=str(config["transaction_db_path"]),
+    )
+
+    summary_values = _summary_values(summary)
+    logger.info(
+        "Queue run complete. %s",
+        " ".join(f"{field}={value}" for field, value in summary_values.items()),
+    )
+    if summary.failed > 0 or summary.callback_errors > 0:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

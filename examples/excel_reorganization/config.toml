@@ -1,0 +1,8 @@
+# Excel Reorganization Configuration
+
+# Engine retries apply to retryable failed steps within this transaction.
+max_retries = 2
+log_level = "INFO"
+csv_path = "sample_data/sample.csv"
+output_dir = "output"
+transaction_db_path = "rpacore.db"

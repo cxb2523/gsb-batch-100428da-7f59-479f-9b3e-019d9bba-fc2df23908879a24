@@ -1,0 +1,5 @@
+max_retries = 1
+log_level = "INFO"
+transaction_db_path = "rpacore.db"
+screenshot_dir = ""
+credential_provider = "env"

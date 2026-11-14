@@ -1,0 +1,12 @@
+engine_max_retries = 1
+log_level = "INFO"
+transaction_db_path = "rpacore.db"
+
+input_dir = "input"
+output_dir = "output"
+done_dir = "done"
+failed_dir = "failed"
+[queue]
+db_path = "queue.db"
+lease_timeout = 30
+max_retries = 0

@@ -1,0 +1,256 @@
+from __future__ import annotations
+
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+from uuid import uuid4
+
+from rpacore import (
+    ConfigField,
+    Engine,
+    OutcomeCategory,
+    ProcessContext,
+    Status,
+    SystemException,
+    Transaction,
+    configure_logger,
+    get_logger,
+    load_config,
+    resolve_config_paths,
+    save_transaction,
+    validate_config,
+)
+
+from steps.load_json_file import LoadJsonFile
+from steps.validate_events import ValidateEvents
+from steps.normalize_events import NormalizeEvents
+from steps.write_output import WriteOutput
+from steps.write_error_report import WriteErrorReport
+
+logger = get_logger(__name__)
+FILE_DEFINITION_IDENTITY = "json-event-log-processor/file/v1"
+ERROR_REPORT_DEFINITION_IDENTITY = "json-event-log-processor/error-report/v1"
+
+# The project root is the directory containing main.py.
+# All config paths (inbox_dir, results_dir, transaction_db_path) must resolve
+# under this root to prevent path traversal attacks.  [S1, S2]
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+LOG_LEVELS = ("CRITICAL", "DEBUG", "ERROR", "INFO", "WARNING")
+MAX_RETRIES_UPPER_BOUND = 10  # Upper bound for max_retries config
+PATH_KEYS = ("transaction_db_path", "inbox_dir", "results_dir")
+CONFIG_FIELDS = (
+    ConfigField("max_retries", int, min_value=0, max_value=MAX_RETRIES_UPPER_BOUND),
+    ConfigField("log_level", str, choices=LOG_LEVELS),
+    ConfigField("transaction_db_path", str, allow_empty=False),
+    ConfigField("inbox_dir", str, allow_empty=False),
+    ConfigField("results_dir", str, allow_empty=False),
+)
+
+
+def _record_persistence_error(config: dict[str, Any], tx: Transaction, exc: Exception) -> None:
+    errors = config.setdefault("persistence_errors", [])
+    if isinstance(errors, list):
+        errors.append({
+            "transaction_reference": tx.reference,
+            "transaction_id": tx.id,
+            "status": tx.status.name,
+            "exception_type": exc.__class__.__name__,
+            "message": str(exc),
+        })
+
+
+def _save_transaction_safely(tx: Transaction, db_path: str, config: dict[str, Any]) -> bool:
+    try:
+        save_transaction(tx, db_path=db_path)
+    except Exception as exc:
+        _record_persistence_error(config, tx, exc)
+        logger.exception(
+            "Failed to persist transaction %s; continuing batch",
+            tx.reference,
+        )
+        return False
+    return True
+
+
+def _make_error_report_tx(run_id: str, report_attempt: int = 1) -> Transaction:
+    return Transaction(
+        reference="error-report",
+        definition_identity=ERROR_REPORT_DEFINITION_IDENTITY,
+        state={"run_id": run_id},
+        metadata={
+            "example": "json_event_log_processor",
+            "run_id": run_id,
+            "transaction_kind": "error-report",
+            "report_attempt": report_attempt,
+        },
+        steps=[
+            WriteErrorReport(name="write_error_report", execution_order=1),
+        ],
+    )
+
+
+def _run_error_report(engine: Engine, config: dict[str, Any], db_path: str, run_id: str) -> bool:
+    """Publish and persist the run's error report; return whether both succeeded.
+
+    A publication or persistence failure is still recorded as a failed
+    ``error-report`` transaction, so the missing report stays auditable.
+    """
+    error_tx = _make_error_report_tx(run_id, report_attempt=1)
+    engine.run(ProcessContext(transaction=error_tx, config=config))
+    persisted = _save_transaction_safely(error_tx, db_path, config)
+    if error_tx.status != Status.SUCCESSFUL:
+        logger.error("Error report was not published for run %s", run_id)
+        return False
+    if persisted:
+        return True
+
+    # The report is written, but its own transaction record is missing, so the
+    # batch is not fully durable.  Refresh the report so the missing record is
+    # audited, then report the failure to the caller.
+    logger.warning("Refreshing error report after error-report transaction persistence failed")
+    refreshed_error_tx = _make_error_report_tx(run_id, report_attempt=2)
+    engine.run(ProcessContext(transaction=refreshed_error_tx, config=config))
+    return False
+
+
+def _validate_config(config: dict[str, object]) -> dict[str, object]:
+    """Return validated config with paths contained under ``PROJECT_ROOT``."""
+    if "db_path" in config:
+        raise SystemException(
+            "Config key 'db_path' has been renamed to 'transaction_db_path'",
+            action="main",
+        )
+
+    try:
+        validated = validate_config(config, CONFIG_FIELDS)
+        return resolve_config_paths(
+            {**config, **validated},
+            PATH_KEYS,
+            base_dir=PROJECT_ROOT,
+            root=PROJECT_ROOT,
+        )
+    except SystemException:
+        raise
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        raise SystemException(f"Invalid config: {exc}", action="main") from exc
+
+
+def main() -> int:
+    """Process the inbox batch and return the process exit code.
+
+    Exit 0 means every selected file has a durable outcome — a success or an
+    audited business rejection — and this run's error report was published and
+    its transaction persisted.  Any system failure, unresolved file, missing
+    file transaction record, or unpublished/unpersisted error report exits
+    nonzero, even when other outputs were produced.
+    """
+    config = _validate_config(load_config(PROJECT_ROOT / "config.toml", require_file=True))
+    configure_logger(level=str(config["log_level"]))
+
+    engine = Engine(max_retries=config["max_retries"])
+    db_path = config["transaction_db_path"]
+    inbox_dir = config["inbox_dir"]
+    results_dir = config["results_dir"]
+    run_id = f"json-event-log-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-{uuid4().hex[:8]}"
+    config["run_id"] = run_id
+
+    # Ensure results directory exists
+    Path(results_dir).mkdir(parents=True, exist_ok=True)
+
+    # --- List files in inbox (setup) ---
+    inbox_path = Path(inbox_dir)
+    if not inbox_path.exists():
+        raise SystemException(
+            f"Inbox directory does not exist: {inbox_dir}",
+            action="main",
+        )
+
+    json_files = sorted(inbox_path.glob("*.json"))
+
+    logger.info("Found %d JSON files in %s", len(json_files), inbox_dir)
+
+    if not json_files:
+        logger.warning("No JSON files found in %s. Nothing to process.", inbox_dir)
+        # Still run error report (will be empty)
+        report_durable = _run_error_report(engine, config, db_path, run_id)
+        logger.info("No files to process. Exiting.")
+        return 0 if report_durable else 1
+
+    # --- One transaction per file ---
+    successful = 0
+    persisted_successful = 0
+    failed = 0
+    unresolved = 0
+    batch_incomplete = False
+
+    for json_file in json_files:
+        file_tx = Transaction(
+            reference=f"json-file-{json_file.stem}",
+            definition_identity=FILE_DEFINITION_IDENTITY,
+            state={"current_file": str(json_file)},
+            metadata={
+                "example": "json_event_log_processor",
+                "run_id": run_id,
+                "source_file": json_file.name,
+            },
+            steps=[
+                LoadJsonFile(name="load_json_file", execution_order=1),
+                ValidateEvents(name="validate_events", execution_order=2),
+                NormalizeEvents(name="normalize_events", execution_order=3),
+                WriteOutput(name="write_output", execution_order=4),
+            ],
+        )
+        engine.run(ProcessContext(transaction=file_tx, config=config))
+        events = file_tx.state.get("events")
+        if isinstance(events, list):
+            file_tx.metadata["event_count"] = len(events)
+        failed_steps = file_tx.failed_steps()
+        file_tx.metadata["error_count"] = sum(
+            len(step.exceptions) for step in failed_steps
+        )
+        persisted = _save_transaction_safely(file_tx, db_path, config)
+
+        if not persisted:
+            batch_incomplete = True
+            logger.error("No durable transaction record for %s", json_file.name)
+
+        if file_tx.status == Status.SUCCESSFUL:
+            successful += 1
+            if persisted:
+                persisted_successful += 1
+                logger.info("Processed: %s", json_file.name)
+            else:
+                logger.warning("Processed but could not persist: %s", json_file.name)
+        elif file_tx.status == Status.FAILED:
+            failed += 1
+            if file_tx.outcome_category != OutcomeCategory.BUSINESS_FAILED:
+                batch_incomplete = True
+            if failed_steps:
+                details = "; ".join(f"{s.name}({s.__class__.__name__})" for s in failed_steps)
+                logger.warning("File %s failed: %s", json_file.name, details)
+            else:
+                logger.warning("File %s: %s", json_file.name, file_tx.status)
+        else:
+            unresolved += 1
+            batch_incomplete = True
+            logger.warning("File %s unresolved: %s", json_file.name, file_tx.status)
+
+    # --- Error report transaction ---
+    report_durable = _run_error_report(engine, config, db_path, run_id)
+    if not report_durable:
+        batch_incomplete = True
+
+    logger.info(
+        "Batch complete. %d successful (%d persisted), %d failed, %d unresolved out of %d files.",
+        successful, persisted_successful, failed, unresolved, len(json_files),
+    )
+    if batch_incomplete:
+        logger.error("Batch %s did not reach a fully durable outcome", run_id)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
