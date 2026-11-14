@@ -33,7 +33,7 @@ export function createConnectHandler({ robots, config, logger, mitm, blockLog })
       decision = await robots.decide(`https://${host}/`, config.robotsUa || '*');
     } catch (err) {
       logger?.error('connect decision error', { host, error: err.message });
-      decision = { allowed: false, reason: 'error', line: 0 };
+      decision = { allowed: false, reason: 'error', line: 0, failureCategory: null };
     }
 
     logger?.info(decision.allowed ? 'connect-allow' : 'connect-block', {
@@ -49,6 +49,7 @@ export function createConnectHandler({ robots, config, logger, mitm, blockLog })
         url: `https://${host}/`,
         origin: `https://${host}`,
         reason: decision.reason,
+        failureCategory: decision.failureCategory ?? null,
         line: decision.line || 0,
         dest: 'connect',
         ua: req.headers?.['user-agent'] || null,

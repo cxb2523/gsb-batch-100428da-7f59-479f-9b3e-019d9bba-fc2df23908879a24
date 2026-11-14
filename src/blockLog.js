@@ -157,7 +157,7 @@ dialog::backdrop{background:rgba(0,0,0,.4)}
       <thead><tr>
         <th>Time</th><th>Method</th>
         <th style="min-width:220px">URL</th>
-        <th>Type</th><th>Reason</th><th>Line</th>
+        <th>Type</th><th>Reason</th><th>Failure</th><th>Line</th>
         <th style="min-width:140px">Referer</th><th>Client IP</th>
       </tr></thead>
       <tbody id="tbody"></tbody>
@@ -256,6 +256,7 @@ function addRow(ev){
     '<td class="url" title="'+esc(ev.url)+'">'+esc(ev.url)+'</td>'+
     '<td><span class="badge '+destClass(dest)+'">'+esc(dest)+'</span></td>'+
     '<td class="reason">'+esc(ev.reason)+'</td>'+
+    '<td class="reason">'+esc(ev.failureCategory||'')+'</td>'+
     '<td>'+(ev.line||'')+'</td>'+
     '<td class="url" title="'+esc(ev.referer)+'">'+esc(ev.referer||'')+'</td>'+
     '<td>'+esc(ev.clientIp||'')+'</td>';

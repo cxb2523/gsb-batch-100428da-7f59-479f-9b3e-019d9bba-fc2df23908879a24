@@ -25,12 +25,17 @@ parser whether the URL is allowed for the request's `User-Agent`.
 **Fail behaviour** (when robots.txt can't be read):  
 `2xx` → apply the rules · `4xx` → allow (no restrictions) · `5xx` / timeout / network error → block.
 
+When the proxy fails closed it records a failure category so the dashboard and
+`/_proxy/log.json` distinguish the causes: `http-5xx` (origin answered with a 5xx or other
+error status), `timeout` (the fetch was aborted after `ROBOTS_TIMEOUT_MS`), or
+`network-error` (connection/DNS failure and similar).
+
 ## Quick start
 
 ```bash
 npm install
 npm start       # listens on :8080, host-only HTTPS, smart block mode
-npm test        # 31 node:test cases
+npm test        # 40 node:test cases
 ```
 
 ```bash
@@ -92,12 +97,16 @@ A self-contained web dashboard is available at `http://<proxy-host>:<port>/_prox
 extra setup required. It has two tabs:
 
 **Block Log** — live-updating table of every blocked request via EventSource. Each row
-includes: timestamp · method · full URL · resource type · robots.txt reason · matched line ·
-Referer · client IP. Rows are prepended in real time and color-coded by resource type.
+includes: timestamp · method · full URL · resource type · robots.txt reason · failure category
+(populated only when the block is due to an unreadable robots.txt — `http-5xx`, `timeout`, or
+`network-error`; empty for rule-based blocks) · matched line · Referer · client IP. Rows are
+prepended in real time and color-coded by resource type.
 
 **robots.txt Cache** — inspect, add, edit, and delete cached robots.txt entries per origin.
 Columns show policy (parse / allow / block), time until expiry, effective TTL, and whether
-the entry was fetched from the origin or manually overridden. Actions:
+the entry was fetched from the origin or manually overridden. Fetched entries whose fetch
+failed carry `failureCategory` (`http-5xx` / `timeout` / `network-error`); manually
+overridden entries never show fetch-failure information. Actions:
 
 - **View** — read-only modal with the full cached robots.txt body
 - **Edit** — overrides the body for an origin without a network fetch

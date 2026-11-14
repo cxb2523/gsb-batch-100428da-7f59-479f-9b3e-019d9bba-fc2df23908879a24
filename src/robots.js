@@ -5,6 +5,12 @@
 //   2xx  -> parse the body and apply the rules
 //   4xx  -> "allow all"  (missing/forbidden robots.txt = no restrictions, per the spec)
 //   5xx / network error / timeout -> "block all"
+//
+// When a fetch fails closed, the cache entry records *why* in failureCategory:
+//   'http-5xx'      : origin responded with a 5xx (or other non-4xx error) status
+//   'timeout'       : the fetch was aborted by our timeout (AbortError)
+//   'network-error' : everything else thrown by fetch (DNS, connection reset, …)
+// Successful fetches and manual overrides carry no failure category.
 import { RobotsMatcher } from 'google-robotstxt-parser';
 
 export class RobotsCache {
@@ -18,7 +24,7 @@ export class RobotsCache {
     this.config = config;
     this.logger = logger;
     this.fetch = fetchImpl || globalThis.fetch;
-    /** @type {Map<string, {policy: string, body: string, expires: number}>} */
+    /** @type {Map<string, {policy: string, body: string, expires: number, failureCategory: string|null}>} */
     this.cache = new Map();
     /** @type {Map<string, Promise>} in-flight fetches, deduped by origin */
     this.pending = new Map();
@@ -27,7 +33,7 @@ export class RobotsCache {
   /**
    * @param {string} targetUrl  the full URL the client wants to reach
    * @param {string|null} requestUa  the client's User-Agent (used unless ROBOTS_UA is set)
-   * @returns {Promise<{allowed: boolean, reason: string, line: number}>}
+   * @returns {Promise<{allowed: boolean, reason: string, line: number, failureCategory: string|null}>}
    */
   async decide(targetUrl, requestUa) {
     const url = new URL(targetUrl);
@@ -37,10 +43,15 @@ export class RobotsCache {
     const entry = await this._getEntry(origin);
 
     if (entry.policy === 'allow') {
-      return { allowed: true, reason: 'robots-absent', line: 0 };
+      return { allowed: true, reason: 'robots-absent', line: 0, failureCategory: null };
     }
     if (entry.policy === 'block') {
-      return { allowed: false, reason: 'robots-unavailable', line: 0 };
+      return {
+        allowed: false,
+        reason: 'robots-unavailable',
+        line: 0,
+        failureCategory: entry.failureCategory ?? null,
+      };
     }
 
     // policy === 'parse'
@@ -50,6 +61,7 @@ export class RobotsCache {
       allowed,
       reason: allowed ? 'robots-allow' : 'robots-disallow',
       line: matcher.matchingLine(),
+      failureCategory: null,
     };
   }
 
@@ -91,17 +103,21 @@ export class RobotsCache {
 
       if (res.ok) {
         const body = await res.text();
-        entry = { policy: 'parse', body };
+        entry = { policy: 'parse', body, failureCategory: null };
       } else if (res.status >= 400 && res.status < 500) {
-        entry = { policy: 'allow', body: '' };
+        entry = { policy: 'allow', body: '', failureCategory: null };
       } else {
-        entry = { policy: 'block', body: '' };
+        // 5xx (or any other error status) -> fail closed, tagged with the failure class.
+        entry = { policy: 'block', body: '', failureCategory: 'http-5xx' };
       }
       this.logger?.debug('robots fetched', { origin, status: res.status, policy: entry.policy });
     } catch (err) {
       // Network error, timeout/abort, DNS failure, etc. -> fail closed.
-      entry = { policy: 'block', body: '' };
-      this.logger?.warn('robots fetch failed', { origin, error: err.message });
+      // AbortError is what our AbortController raises when the timeout fires; an abort from
+      // any other source still means the fetch did not complete, so it is classed the same way.
+      const failureCategory = err?.name === 'AbortError' ? 'timeout' : 'network-error';
+      entry = { policy: 'block', body: '', failureCategory };
+      this.logger?.warn('robots fetch failed', { origin, error: err.message, failureCategory });
     }
 
     entry.expires = this._now() + ttlMs;
@@ -114,15 +130,20 @@ export class RobotsCache {
   /** Returns a snapshot of all cache entries for the dashboard UI. */
   getAll() {
     const now = this._now();
-    return [...this.cache.entries()].map(([origin, e]) => ({
-      origin,
-      policy: e.policy,
-      expiresAt: e.expires,
-      ttlMs: e.ttlMs ?? this.config.cacheTtlMs,
-      isOverride: e.isOverride ?? false,
-      remainingMs: Math.max(0, e.expires - now),
-      body: e.body ?? '',
-    }));
+    return [...this.cache.entries()].map(([origin, e]) => {
+      const snapshot = {
+        origin,
+        policy: e.policy,
+        expiresAt: e.expires,
+        ttlMs: e.ttlMs ?? this.config.cacheTtlMs,
+        isOverride: e.isOverride ?? false,
+        remainingMs: Math.max(0, e.expires - now),
+        body: e.body ?? '',
+      };
+      // Manual overrides never result from a fetch, so they carry no failure information.
+      if (!snapshot.isOverride) snapshot.failureCategory = e.failureCategory ?? null;
+      return snapshot;
+    });
   }
 
   /** Removes an origin from the cache; the next request will re-fetch. */

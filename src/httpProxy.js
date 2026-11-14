@@ -255,6 +255,7 @@ export function createRequestHandler({ robots, config, logger, blockLog, mode = 
         url: targetUrl,
         origin: (() => { try { return new URL(targetUrl).origin; } catch { return targetUrl; } })(),
         reason: decision.reason,
+        failureCategory: decision.failureCategory ?? null,
         line: decision.line,
         dest: detectDest(req, targetUrl),
         ua: req.headers['user-agent'] || null,

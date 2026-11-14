@@ -157,3 +157,144 @@ test('blocked requests appear in /_proxy/log.json', async (t) => {
   assert.equal(events[0].method, 'GET');
   assert.ok(typeof events[0].ts === 'number');
 });
+
+// Failure categories: 5xx, timeout/abort and network failure each get their own label,
+// and every one of them lands in the block log with that label attached.
+test('robots fetch failures: 5xx, timeout and network error get distinct failureCategory in the log', async (t) => {
+  const fetchImpl = async (url) => {
+    if (url === 'http://fivexx.test/robots.txt') {
+      return { ok: false, status: 503, headers: { get: () => null }, text: async () => '' };
+    }
+    if (url === 'http://timeout.test/robots.txt') {
+      const err = new Error('The operation was aborted');
+      err.name = 'AbortError';
+      throw err;
+    }
+    if (url === 'http://neterr.test/robots.txt') {
+      throw new Error('ECONNREFUSED');
+    }
+    throw new Error('unexpected url: ' + url);
+  };
+  const config = loadConfig({ HTTPS_MODE: 'host-only' });
+  const { server } = await createProxy({ config, fetchImpl, logger: silent });
+  const port = await listen(server);
+  t.after(() => server.close());
+
+  const targets = [
+    ['http://fivexx.test/page', 'http-5xx'],
+    ['http://timeout.test/page', 'timeout'],
+    ['http://neterr.test/page', 'network-error'],
+  ];
+  for (const [target] of targets) {
+    await new Promise((resolve, reject) => {
+      const req = http.request({
+        host: '127.0.0.1', port,
+        method: 'GET', path: target,
+        headers: { host: new URL(target).host },
+      });
+      req.on('response', (res) => { res.resume(); res.on('end', resolve); });
+      req.on('error', reject);
+      req.end();
+    });
+  }
+
+  const r = await directGet(port, '/_proxy/log.json');
+  const events = JSON.parse(r.body);
+  assert.equal(events.length, 3);
+
+  const byOrigin = Object.fromEntries(events.map((e) => [e.origin, e.failureCategory]));
+  for (const [target, expected] of targets) {
+    const origin = new URL(target).origin;
+    assert.equal(byOrigin[origin], expected, `${origin} should be tagged ${expected}`);
+  }
+  assert.equal(new Set(Object.values(byOrigin)).size, 3);
+});
+
+// 4xx keeps the fail-open behaviour: request is forwarded and no block event is recorded.
+test('4xx robots.txt: request allowed and no block event (and no failure category) is produced', async (t) => {
+  const origin = http.createServer((req, res) => {
+    if (req.url === '/robots.txt') {
+      res.writeHead(404, { 'content-type': 'text/plain' });
+      return res.end('not found');
+    }
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('PAGE ' + req.url);
+  });
+  const originPort = await listen(origin);
+  t.after(() => origin.close());
+
+  // Point robots fetching at the same local origin so the 404 is served locally.
+  const fetchImpl = async (url) => {
+    const u = new URL(url);
+    return new Promise((resolve, reject) => {
+      const r = http.request({ host: u.hostname, port: u.port || 80, path: u.pathname }, (resp) => {
+        let body = '';
+        resp.on('data', (d) => (body += d));
+        resp.on('end', () => resolve({
+          ok: resp.statusCode >= 200 && resp.statusCode < 300,
+          status: resp.statusCode,
+          headers: { get: () => null },
+          text: async () => body,
+        }));
+      });
+      r.on('error', reject);
+      r.end();
+    });
+  };
+
+  const config = loadConfig({ HTTPS_MODE: 'host-only' });
+  const { server } = await createProxy({ config, fetchImpl, logger: silent });
+  const port = await listen(server);
+  t.after(() => server.close());
+
+  const r = await new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1', port,
+      method: 'GET', path: `http://127.0.0.1:${originPort}/anything`,
+      headers: { host: `127.0.0.1:${originPort}` },
+    });
+    req.on('response', (res) => {
+      let body = '';
+      res.on('data', (d) => (body += d));
+      res.on('end', () => resolve({ status: res.statusCode, body }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+  assert.equal(r.status, 200);
+  assert.equal(r.body, 'PAGE /anything');
+
+  const log = await directGet(port, '/_proxy/log.json');
+  assert.deepEqual(JSON.parse(log.body), []);
+});
+
+// A rule-based block (2xx robots.txt with Disallow) must leave failureCategory empty.
+test('normal robots-disallow block: failureCategory is null in the log event', async (t) => {
+  const fetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    headers: { get: () => null },
+    text: async () => 'User-agent: *\nDisallow: /private/\n',
+  });
+  const config = loadConfig({ HTTPS_MODE: 'host-only' });
+  const { server } = await createProxy({ config, fetchImpl, logger: silent });
+  const port = await listen(server);
+  t.after(() => server.close());
+
+  await new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1', port,
+      method: 'GET', path: 'http://rules.test/private/secret',
+      headers: { host: 'rules.test' },
+    });
+    req.on('response', (res) => { res.resume(); res.on('end', resolve); });
+    req.on('error', reject);
+    req.end();
+  });
+
+  const r = await directGet(port, '/_proxy/log.json');
+  const events = JSON.parse(r.body);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].reason, 'robots-disallow');
+  assert.equal(events[0].failureCategory, null);
+});
