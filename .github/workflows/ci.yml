@@ -21,7 +21,12 @@ jobs:
       # can prove without a desktop: every module compiles, and the matcher's
       # dependency stack resolves. That is exactly what this job checks.
       - name: Compile all modules (syntax + bytecode)
-        run: python -m compileall -q reflex kernel journal
+        run: python -m compileall -q reflex kernel journal tests
 
       - name: Resolve runtime dependencies
         run: pip install --quiet opencv-python-headless numpy mss
+
+      # The recorder durability tests need Windows (global hooks + virtual-desktop
+      # metrics); on Linux they self-skip and the job only proves they import-compile.
+      - name: Recorder durability tests (self-skip on non-Windows)
+        run: python tests/test_recording_flow.py
