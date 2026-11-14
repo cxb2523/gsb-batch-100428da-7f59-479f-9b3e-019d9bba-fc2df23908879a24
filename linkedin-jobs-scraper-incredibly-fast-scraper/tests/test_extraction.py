@@ -1,4 +1,4 @@
-thonimport json
+import json
 import os
 import sys
 from typing import List, Dict, Any
@@ -68,8 +68,8 @@ def test_data_exporter_json_and_csv(tmp_path: pytest.TempPathFactory):
         }
     ]
 
-    json_path = tmp_path.mktemp("out") / "jobs.json"
-    csv_path = tmp_path.mktemp("out") / "jobs.csv"
+    json_path = tmp_path / "jobs.json"
+    csv_path = tmp_path / "jobs.csv"
 
     DataExporter.export(records, "json", str(json_path))
     DataExporter.export(records, "csv", str(csv_path))

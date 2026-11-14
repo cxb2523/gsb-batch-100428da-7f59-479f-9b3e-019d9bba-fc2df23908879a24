@@ -1,4 +1,4 @@
-thonimport argparse
+import argparse
 import json
 import logging
 import os
@@ -76,6 +76,14 @@ def parse_args() -> argparse.Namespace:
         help="Path to the output file. Extension does not determine the format.",
     )
     parser.add_argument(
+        "--report-file",
+        type=str,
+        help=(
+            "Path to the scrape report JSON file. Defaults to the output file "
+            "path plus '.report.json'."
+        ),
+    )
+    parser.add_argument(
         "--title-contains",
         nargs="*",
         help="Filter: job titles must contain one of these terms (case-insensitive).",
@@ -118,6 +126,20 @@ def determine_output_path(
         return args.output_file
     os.makedirs(default_dir, exist_ok=True)
     return os.path.join(default_dir, f"linkedin_jobs.{default_format}")
+
+def determine_report_path(args: argparse.Namespace, output_path: str) -> str:
+    if args.report_file:
+        return args.report_file
+    return f"{output_path}.report.json"
+
+def write_report(report: Any, report_path: str) -> None:
+    """Persist the scrape report as standalone JSON (kept out of job records)."""
+    parent = os.path.dirname(os.path.abspath(report_path))
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, exist_ok=True)
+    payload = report.to_dict() if hasattr(report, "to_dict") else report
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 def main() -> None:
     logging.basicConfig(
@@ -165,11 +187,25 @@ def main() -> None:
 
     try:
         logger.info("Starting scrape: max_jobs=%d", max_jobs)
-        jobs = scraper.scrape_search(search_url, max_jobs=max_jobs)
+        report = scraper.scrape_search_with_report(search_url, max_jobs=max_jobs)
     except Exception as exc:
         logger.exception("Scraping failed: %s", exc)
         sys.exit(1)
 
+    report_path = determine_report_path(args, output_path)
+    try:
+        write_report(report, report_path)
+        logger.info("Wrote scrape report to '%s'.", report_path)
+    except Exception as exc:
+        logger.exception("Failed to write scrape report: %s", exc)
+
+    jobs = report.jobs
+    if report.failed:
+        logger.warning(
+            "Scraping stopped early on a failed page (%s); keeping %d already-collected jobs.",
+            report.stop_reason,
+            len(jobs),
+        )
     logger.info("Scraped %d jobs before filtering.", len(jobs))
 
     criteria = create_filter_criteria(args)
