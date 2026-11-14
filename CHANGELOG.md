@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fetched through the guarded fetch path. No keys, no login.
 - `daemon start|stop|status`: manage the Maps scraper's web mode on 127.0.0.1.
   `stop` only signals a PID it recorded and only while the port still answers.
+- `map` / `map_website` follows sitemap indexes: a `sitemapindex` is read as a
+  list of child sitemaps and recursed into (depth-capped, self-references
+  refused), so pages behind a real-world index are discovered instead of
+  silently yielding nothing. The result gained `sitemapOutcomes`, one entry per
+  sitemap address with `url`, `kind` (`index`/`urlset`/`unknown`), `status`
+  (`ok`/`http_error`/`parse_error`/`skipped_limit`), `pagesFound` and an optional
+  `error`, so a failed child map is no longer indistinguishable from a site with
+  no pages.
 
 ### Fixed
 

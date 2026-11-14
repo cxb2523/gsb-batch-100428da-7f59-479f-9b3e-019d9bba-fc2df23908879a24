@@ -47,7 +47,7 @@ Web crawling for Large Language Models (LLMs) is broken by default: modern web p
   - `link_format`: Choose between `inline` (standard markdown), `references` (footnote citations `[1]`, saving ~25% tokens on repetitive URLs), or `strip` (pure text).
   - `image_mode`: Choose between `ignore` (zero tokens), `alt_only` (preserves semantic context without URL bloat), or `markdown` (full `![alt](url)`).
 - **Autonomous Mapping & Recursive Crawling:**
-  - `map_website`: Inspects `/robots.txt`, sitemaps, and root anchors to discover all pages in a domain.
+  - `map_website`: Inspects `/robots.txt`, sitemaps, and root anchors to discover all pages in a domain. Recurses into `sitemapindex` children and reports a `sitemapOutcomes` entry (`kind`, `status`, `pagesFound`, `error`) for every sitemap address, so failed sub-maps are visible rather than swallowed.
   - `crawl_website`: Breadth-first autonomous crawling with max depth, max pages, URL pattern filters (substring, `*` wildcard), and real-time token accounting.
 - **Pre-Crawl Browser Actions:** Automate clicks, scrolls, typing, and waits in Playwright before extracting content (dismiss cookie banners, scroll for infinite loading, expand accordions).
 - **Dual Hybrid Crawling Engine:**
