@@ -73,6 +73,7 @@ phone_list = []
 
 prefix_cache_dict = {}  # Key = URL, value = prefix
 url_log_list = []  # Used for seeing if URL has been logged yet
+url_outcome_dict = {}  # Key = check link, value = outcome (FAILED/SKIPPED)
 
 
 # Blanks
@@ -195,12 +196,14 @@ class Phone:
 
 
 class URL:
-    def __init__(self, url, depth, log_entry=None, source=None):
+    def __init__(self, url, depth, log_entry=None, source=None,
+                 outcome=None):
         self.url = url
         self.depth = depth  # Current, not total, depth level
         self.log_entry = log_entry
         self.source = str(source)  # Never let this be a soup, always str
         self.log_url = get_rebuilt_link(url)
+        self.outcome = outcome  # FAILED/SKIPPED marker, if any
 
         # Blank squad
         self.parsed_list = []
@@ -211,7 +214,12 @@ class URL:
         else:
             indent = ''
 
-        return indent + self.log_url
+        output = indent + self.log_url
+
+        if self.outcome is not None:
+            output += ' | ' + self.outcome
+
+        return output
 
     def get_print_output(self):
         if redundancy_level != 0:
@@ -219,10 +227,41 @@ class URL:
         else:
             indent = ''
 
-        if self.log_entry is not None:
-            return indent + self.log_url + ' | ' + self.log_entry
+        output = indent + self.log_url
 
-        return indent + self.log_url
+        if self.log_entry is not None:
+            output += ' | ' + self.log_entry
+
+        if self.outcome is not None:
+            output += ' | ' + self.outcome
+
+        return output
+
+
+def get_url_outcome(url):  # Return the recorded outcome for a URL, if any
+    return url_outcome_dict.get(get_check_link(url))
+
+
+def set_url_outcome(url, outcome):
+    # Record each address's outcome only once per job;
+    # repeat encounters reuse the first recorded outcome
+    check_link = get_check_link(url)
+
+    if check_link not in url_outcome_dict:
+        url_outcome_dict[check_link] = outcome
+
+
+def get_parsed_url_log(url, depth):
+    # Build the URL log entry for a parsed link that was not crawled,
+    # marking crawlable cross-domain links as skipped
+    bare_url = get_stripped_url(url)
+
+    if (url.strip() != ''
+            and is_qualified_crawl_url(url)
+            and not bare_url.startswith(og_url_domain)):
+        set_url_outcome(url, 'SKIPPED: Cross-domain URL')
+
+    return URL(url, depth, outcome=get_url_outcome(url))
 
 
 def crawl(current_url, current_depth):
@@ -232,7 +271,8 @@ def crawl(current_url, current_depth):
 
     if current_depth > 0 and not has_crawled:
         current_soup = get_soup(current_url)
-        url_class = URL(current_url, current_depth, None, current_soup)
+        url_class = URL(current_url, current_depth, None, current_soup,
+                        get_url_outcome(current_url))
         current_crawl_job, url_dict[current_check_link] = url_class, url_class
         has_qualified_attributes = False
         tag_list = get_tag_list(current_url, current_soup)
@@ -279,7 +319,8 @@ def crawl(current_url, current_depth):
             else:
                 if (not is_qualified_email(parsed_url)
                         and not is_qualified_phone(parsed_url)):
-                    write_log(URL(parsed_url, current_depth - 1))
+                    write_log(get_parsed_url_log(parsed_url,
+                                                 current_depth - 1))
                 elif is_qualified_email(parsed_url):
                     write_log(Email(parsed_url))
                 elif is_qualified_phone(parsed_url):
@@ -308,6 +349,7 @@ def crawl(current_url, current_depth):
             current_relog_job = deepcopy(url_dict[current_check_link])
             current_relog_job.depth = current_depth
             current_relog_job.log_entry = 'Already crawled'
+            current_relog_job.outcome = get_url_outcome(current_url)
 
             write_log(current_relog_job)
 
@@ -323,7 +365,8 @@ def crawl(current_url, current_depth):
                 else:
                     if (not is_qualified_email(item)
                             and not is_qualified_phone(item)):
-                        write_log(URL(item, current_depth - 1))
+                        write_log(get_parsed_url_log(item,
+                                                     current_depth - 1))
                     elif is_qualified_email(item):
                         write_log(Email(item))
                     elif is_qualified_phone(item):
@@ -482,10 +525,13 @@ def get_stripped_phone(phone):  # Return raw phone
 def get_soup(url):
     url = get_rebuilt_link(url)
     code = None
+    error_summary = None
 
     try:  # Read and store code for parsing
         code = request.urlopen(url, timeout=timeout).read()
     except Exception as exception:
+        error_summary = (str(exception).splitlines()
+                         or [type(exception).__name__])[0][:120]
         write_log(DebugError(code_unable_to_crawl,
                              'Unable to crawl',
                              url,
@@ -495,6 +541,12 @@ def get_soup(url):
 
     if code is None:
         code = ''
+
+    if len(code) == 0:  # Request failed or read came back empty
+        if error_summary is None:
+            error_summary = 'Empty response'
+
+        set_url_outcome(url, 'FAILED: ' + error_summary)
 
     return BeautifulSoup(code, features='lxml')
 
