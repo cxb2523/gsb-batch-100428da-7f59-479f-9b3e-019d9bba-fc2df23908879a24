@@ -114,15 +114,52 @@ npm run regenerate:api
 npm test
 ```
 
+## Partial-year scraping
+
+Scraping is month-by-month and every month of a requested year gets an outcome
+record, so one changed month panel no longer discards the other eleven. Each month
+is reported as:
+
+| status | meaning |
+| --- | --- |
+| `success` | month panel was found and passed structural validation |
+| `failed` | page missing, parse error, or structurally unexpected panel (with `code` and `reason`) |
+| `not-attempted` | extraction never reached the month (for example, the page or browser failed first) |
+
+Per-year behaviour:
+
+- **At least one month collected.** `dist/calendar.json` is written with the year
+  containing only the months that were collected. With the API switch on,
+  `api/<year>/index.json` is written from the same collected months. A failed month
+  is never substituted with an empty month object.
+- **All 12 months collected.** Additionally, `api/<year>/events.json` and
+  `api/<year>/weeks.json` are written. Those flat endpoints still require a
+  complete year.
+- **Missing months with the API switch on.** `events.json` and `weeks.json` are
+  skipped, and the reason (which months are unavailable) is recorded in
+  `api/<year>/outcome.json` under `api.reason`.
+- **All 12 months failed.** No `dist/calendar.json` entry, no `api/<year>/` directory,
+  and no `outcome-<year>.json` are written. The crawler returns `ok: false`,
+  `status: "failed"`, and a `failedYears` entry carrying the per-month reasons.
+
+Each written year also leaves a `dist/outcome-<year>.json` audit record with the
+status, counts, and per-month outcomes. The crawler entry point keeps its original
+signature — `crawlTimeIr(years, exportApi)` — and additionally returns a structured
+result (`ok`, `status`, per-year `counts`, `months`, `api`, and `files`), so callers
+can distinguish complete, partial, and failed runs instead of a silent success.
+
 ## Develop and contribute
 
 The scraper remains a historical Puppeteer 2 integration. Its selectors and live
 compatibility have not been revalidated. Scraping requires installing dependencies
-and a compatible browser; `npm start` opens the interactive CLI. The ICS generator
-uses the stored Gregorian `mDate` components without timezone-dependent parsing,
-and gives all-day events an exclusive end on the following day. Fixtures cover
-leap days, year rollover and the 1405 snapshot. Existing ICS downloads are preserved;
-this does not revalidate the original Jalali-to-Gregorian conversion or upstream
-holiday accuracy.
+and a compatible browser; `npm start` opens the interactive CLI. The scraper exposes
+`extractYear` and `launchBrowser` injection points on its third argument so the
+month-by-month orchestration can be tested offline. The ICS generator uses the
+stored Gregorian `mDate` components without timezone-dependent parsing, and gives
+all-day events an exclusive end on the following day; it only runs for years that
+actually produced calendar data. Fixtures cover leap days, year rollover, the 1405
+snapshot, and the complete/partial/total-failure scraping outcomes. Existing ICS
+downloads are preserved; this does not revalidate the original
+Jalali-to-Gregorian conversion or upstream holiday accuracy.
 
 The package metadata follows the existing [MIT license](LICENSE).
