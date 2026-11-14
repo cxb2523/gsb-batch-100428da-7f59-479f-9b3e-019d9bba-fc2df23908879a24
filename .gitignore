@@ -1,0 +1,15 @@
+result.json
+*.pyc
+.scrapy/
+invana_bot.egg-info/
+dist/
+.tox/
+.pytest_cache/
+.coverage
+./examples/basic/crawl_test.py
+./__playground
+.DS_Store
+site/
+examples/scripts/*
+exampo/
+___scripts/.logs/*
