@@ -30,11 +30,24 @@ class PluginManager:
         """
         Iterates through all registered plugins and runs those whose should_run() method returns True.
         The plugins are executed asynchronously, and their output (if any) is passed along.
+
+        If a plugin raises, the error is logged together with the plugin name and the URL
+        (it is never silently skipped) and the remaining plugins still run so that their
+        side effects (e.g. persistence) are not lost. However, the content returned to the
+        caller is the *original*, unprocessed content, so a partially processed chain can
+        never replace the raw page that is saved and used for link discovery.
         """
+        original_content = content
+        failed = False
         for plugin in self.plugins:
+            plugin_name = plugin.__class__.__name__
             try:
                 if await plugin.should_run(url, content):
                     content = await plugin.process(url, content)
             except Exception as e:
-                logging.error(f"Error in plugin {plugin.__class__.__name__}: {e}")
-        return content
+                failed = True
+                logging.error(
+                    f"Plugin {plugin_name} failed for URL {url}: {e}",
+                    exc_info=True,
+                )
+        return original_content if failed else content

@@ -17,8 +17,12 @@ titles_table = Table(
     Column('title', Text, nullable=True)
 )
 
-# Create the table if it doesn't exist
-metadata.create_all(engine)
+# Create the table if it doesn't exist. Importing the plugin must not require a
+# reachable database; failures are reported here and again on first write.
+try:
+    metadata.create_all(engine)
+except Exception as e:
+    logging.warning(f"Could not ensure 'titles' table exists at import time: {e}")
 
 class TitleLoggerPlugin(Plugin):
     async def should_run(self, url: str, content: str) -> bool:

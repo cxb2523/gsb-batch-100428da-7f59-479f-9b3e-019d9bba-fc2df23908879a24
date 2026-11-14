@@ -55,8 +55,12 @@ scraped_data_table = Table(
     Column('content_blocks', JSON, nullable=True),  # Main content blocks
 )
 
-# Create the table if it doesn't exist
-metadata.create_all(engine)
+# Create the table if it doesn't exist. Importing the plugin must not require a
+# reachable database; failures are reported here and again on first write.
+try:
+    metadata.create_all(engine)
+except Exception as e:
+    logging.warning(f"Could not ensure 'scraped_data' table exists at import time: {e}")
 
 
 class WebScraperPlugin(Plugin):

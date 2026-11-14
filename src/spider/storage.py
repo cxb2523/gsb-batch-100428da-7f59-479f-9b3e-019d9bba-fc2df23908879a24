@@ -16,7 +16,12 @@ pages_table = Table(
     Column('content', Text, nullable=False)
 )
 
-metadata.create_all(engine)
+try:
+    metadata.create_all(engine)
+except Exception as e:
+    # Importing the module must not require a reachable database; a warning is
+    # logged here and save_page reports any remaining SQLAlchemy error on write.
+    logging.warning(f"Could not ensure 'pages' table exists at import time: {e}")
 
 def save_page(url: str, content: str) -> None:
     """

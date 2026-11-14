@@ -15,7 +15,10 @@ entities_table = Table(
     Column('url', String, primary_key=True),
     Column('entities', JSON, nullable=False)
 )
-metadata.create_all(engine)
+try:
+    metadata.create_all(engine)
+except Exception as e:
+    logging.warning(f"Could not ensure 'entities' table exists at import time: {e}")
 
 class EntityExtractionPlugin(Plugin):
     def __init__(self):
