@@ -8,7 +8,7 @@ import lxml.html
 from typing import List, Tuple, Set, Dict, Any, Optional
 
 from .config import DIRS, SOCIAL_DOMAINS, TECHNICAL_PATTERNS, EXTERNAL_WHITELIST
-from .downloader import AsyncDownloader
+from .downloader import AsyncDownloader, DownloadResult, format_summary
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +215,15 @@ class SiteParser:
             for t in technical:
                 logger.info(f" - {t}")
 
+    def report_download_summary(self, results: List[DownloadResult]) -> None:
+        """İndirme sonuçlarını (başarı/atlama/hata) log'a özetler."""
+        summary = format_summary(results)
+        failures = [r for r in results if r.failed]
+        if failures:
+            logger.warning(summary)
+        else:
+            logger.info(summary)
+
     async def fetch_input(self, target: str) -> str:
         if target.startswith("http://") or target.startswith("https://"):
             logger.info(f"Fetching remote HTML from {target}")
@@ -236,14 +245,18 @@ class SiteParser:
         logger.info(f"Identified {len(download_queue)} unique assets. Starting concurrent download phase.")
 
         # 2. Initiate Concurrent Downloads
+        #    Her URL için bir DownloadResult döner; sadece gerçekten çevrimdışı
+        #    kullanılabilir (indirilen veya zaten var olan) kaynaklar sayfa
+        #    yeniden yazımına dahil edilir. Başarısız/zaman aşımına uğrayan
+        #    URL'ler orijinal adresleriyle kalır.
         url_to_local: Dict[str, str] = {}
         async with AsyncDownloader(self.output_dir) as downloader:
-            queue_list = list(download_queue)
-            tasks = [downloader.download_file(url, folder) for url, folder in queue_list]
-            results = await asyncio.gather(*tasks)
-            for (url, _), local_path in zip(queue_list, results):
-                if local_path:
-                    url_to_local[url] = local_path
+            results = await downloader.download_all(download_queue)
+            for result in results:
+                if result.ok and result.local_path:
+                    url_to_local[result.url] = result.local_path
+
+        self.report_download_summary(results)
 
         # 3. Apply local URL replacements and serialize in a thread pool (Event Loop Isolation)
         transformed_html, _ = await asyncio.to_thread(_parse_and_transform_html, html_content, url_to_local)
