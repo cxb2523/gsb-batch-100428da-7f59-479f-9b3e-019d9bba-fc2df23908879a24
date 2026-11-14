@@ -517,7 +517,12 @@ function openAppleModal() {
           const res = await api.playbookRun({ playbook, targets: 'all' })
           report((res.results || []).map(r => ({
             tag: '#' + r.instanceId,
-            text: r.ok ? '✓ 配置完成' : `✗ 第 ${(r.failedAt ?? 0) + 1} 步 ${r.step || ''} — ${r.reason}`,
+            text: r.ok
+              ? '✓ 配置完成' + (r.skipped && r.skipped.length ? `(可选步骤 ${r.skipped.map(i => i + 1).join(',')} 已跳过)` : '')
+              : `✗ 第 ${(r.failedAt ?? 0) + 1} 步 ${r.step || ''} — ${r.reason}` +
+                (r.strategy ? ` · 策略 ${r.strategy}` : '') +
+                (r.driftPx != null ? ` · 偏差 ${r.driftPx}px` : '') +
+                (r.attempts && r.attempts.length > 1 ? ` · 试了 ${r.attempts.length} 次` : ''),
             bad: !r.ok,
           })))
           if (stopBeforeCart && res.ok > 0) {
