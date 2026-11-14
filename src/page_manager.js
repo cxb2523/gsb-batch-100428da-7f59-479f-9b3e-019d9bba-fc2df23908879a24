@@ -266,7 +266,9 @@ class PageManager {
 
             const skipOutput = !!request._skipOutput;
 
-            // request._outputSeqNo = !request._skipOutput ? ++this.lastOutputSeqNo : null;
+            // The final outcome of the request (if it was already recorded by the crawler).
+            // A request that is still being retried has no final outcome yet and hence gets no 'requestOutcome'.
+            const finalOutcome = this.phantomCrawler.requestOutcomeTracker.getFinalOutcome(request.id);
 
             // Remove unnecessary fields
             delete request._skipOutput;
@@ -280,9 +282,12 @@ class PageManager {
                 // "errorInfo" if it was non-empty in the specific crawler execution.
                 // In order to emulate this (bad) behavior in the Dataset items API endpoint,
                 // we need to remove empty "errorInfo" here completely.
-                const requestToPush = request.errorInfo === '' || request.errorInfo === null
-                    ? _.omit(request, 'errorInfo')
-                    : request;
+                let requestToPush = request;
+                if (requestToPush.errorInfo === '' || requestToPush.errorInfo === null) {
+                    requestToPush = _.omit(requestToPush, 'errorInfo');
+                }
+                // Attach the final outcome so that it's available from the dataset output item
+                if (finalOutcome) requestToPush = { ...requestToPush, requestOutcome: finalOutcome };
                 await this.dataset.pushData(requestToPush);
             }
 

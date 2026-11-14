@@ -14,6 +14,7 @@ const LinkedList = require('apify-shared/linked_list');
 const { ACTOR_EVENT_NAMES } = require('apify-shared/consts');
 const { PageManager, fixLegacyRequestDates, AFTER_LOAD_UPDATABLE_REQUEST_FIELDS } = require('./page_manager');
 const LiveViewServer = require('./live_view_server');
+const { RequestOutcomeTracker } = require('./request_outcome');
 
 const { log } = Apify.utils;
 
@@ -154,6 +155,8 @@ class PhantomCrawler {
         this.dataset = dataset;
         this.isRunning = false;
         this.pageManager = new PageManager(this);
+        // Keeps track of how every request eventually ended (success, retries exhausted, crashes exhausted)
+        this.requestOutcomeTracker = new RequestOutcomeTracker();
         this.proxyConfiguration = this.input.proxyConfiguration;
 
         this.actorTaskId = process.env.APIFY_ACTOR_TASK_ID || null;
@@ -507,21 +510,56 @@ class PhantomCrawler {
             this.exitedSlavesCount++;
 
             const request = slave.lastFetchedRequest;
-            if (request && this.isRunning) {
-                // apparently PhantomJS crashed, keep track how many times it happened for this request,
-                // retry the request few times and then give up on it
-                request._crashesCount = (request._crashesCount | 0) + 1;
-                if (request._crashesCount < MAX_CRASHES_PER_REQUEST) {
-                    await this.pageManager.reclaimRequest(request, slave.id);
-                } else {
-                    request.errorInfo += `Crawler crashed ${MAX_CRASHES_PER_REQUEST} times while processing the page, giving up.\n`;
-                    delete request._crashesCount;
-                    request._pageCrashed = true;
-                    await this.pageManager.markRequestHandled(request, slave.id);
-                }
+            if (request) {
+                await this.handleRequestAfterSlaveExit(request, slave.id);
             }
         } catch (e) {
             this.fatalError(e);
+        }
+    }
+
+    /**
+     * Handles a request whose PhantomJS process exited before it could be marked as handled.
+     * If the process crashed too many times for the same request, the request is given up
+     * and its final outcome is recorded; otherwise the request is reclaimed and retried.
+     *
+     * @param request Legacy request object
+     * @param slaveId ID of the slave that exited, used for logging only
+     * @return {Promise}
+     * @private
+     */
+    async handleRequestAfterSlaveExit(request, slaveId) {
+        if (!request || !this.isRunning) return;
+
+        const retryCount = request._retryCount | 0;
+
+        // apparently PhantomJS crashed, keep track how many times it happened for this request,
+        // retry the request few times and then give up on it
+        request._crashesCount = (request._crashesCount | 0) + 1;
+        const crashCount = request._crashesCount;
+
+        if (crashCount < MAX_CRASHES_PER_REQUEST) {
+            // The request is still being retried, so it must NOT get a final outcome yet
+            this.requestOutcomeTracker.recordPhantomJsCrash(request, {
+                crashCount,
+                retryCount,
+                errorInfo: request.errorInfo,
+            });
+            await this.pageManager.reclaimRequest(request, slaveId);
+        } else {
+            const errorInfoBeforeGivingUp = request.errorInfo || '';
+            request.errorInfo += `Crawler crashed ${MAX_CRASHES_PER_REQUEST} times while processing the page, giving up.\n`;
+            delete request._crashesCount;
+            request._pageCrashed = true;
+
+            this.requestOutcomeTracker.finalizePhantomJsCrashLimit(request, {
+                crashCount,
+                retryCount,
+                // Prefer the error reported by the page processing, fall back to the crash notice itself
+                errorInfo: errorInfoBeforeGivingUp.trim() ? errorInfoBeforeGivingUp : request.errorInfo,
+            });
+
+            await this.pageManager.markRequestHandled(request, slaveId);
         }
     }
 
@@ -713,6 +751,11 @@ class PhantomCrawler {
                                 retryCount: slave.lastFetchedRequest._retryCount,
                                 maxPageRetryCount: this.input.maxPageRetryCount,
                             });
+                            // The request is still being retried, so it must NOT get a final outcome yet
+                            this.requestOutcomeTracker.recordPageLoadRetry(slave.lastFetchedRequest, {
+                                retryCount: slave.lastFetchedRequest._retryCount,
+                                errorInfo: request.errorInfo,
+                            });
                             await this.pageManager.reclaimRequest(slave.lastFetchedRequest, slave.id);
                             slave.lastFetchedRequest = null;
                             break;
@@ -730,9 +773,31 @@ class PhantomCrawler {
                     });
                     request = slave.lastFetchedRequest;
                     slave.lastFetchedRequest = null;
+                    // Keep the load error reported by the last failed attempt for the outcome record,
+                    // before the "giving up" notice is appended to 'errorInfo'
+                    const lastLoadErrorInfo = request.errorInfo || '';
                     if (errorInfoSuffix) {
                         request.errorInfo += errorInfoSuffix;
                         request._pageFailed = true;
+                    }
+
+                    // Record the final outcome of the request. It must be done before markRequestHandled(),
+                    // because that function pushes the request (including the outcome) to the dataset.
+                    // Note that if the page could not be loaded, the request is given up here
+                    // (either retries were exhausted above or retrying is disabled by maxPageRetryCount = 0),
+                    // so it must NOT be reported as a success.
+                    if (request.loadErrorCode > 0) {
+                        this.requestOutcomeTracker.finalizePageLoadRetryExhausted(request, {
+                            retryCount: request._retryCount | 0,
+                            crashCount: request._crashesCount | 0,
+                            errorInfo: lastLoadErrorInfo,
+                        });
+                    } else {
+                        this.requestOutcomeTracker.finalizeSuccess(request, {
+                            retryCount: request._retryCount | 0,
+                            crashCount: request._crashesCount | 0,
+                            errorInfo: request.errorInfo,
+                        });
                     }
 
                     // Mark the request as handled

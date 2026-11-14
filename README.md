@@ -814,6 +814,47 @@ endpoint in API reference.
 To skip the records containing the `errorInfo` field from the results,
 add the `skipFailedPages=1` query parameter. This will ensure the results have a fixed structure, which is especially useful for tabular formats such as CSV or Excel.
 
+### Request outcome
+
+Each dataset item also contains a `requestOutcome` field, which describes how the request
+eventually ended. This makes it possible to tell, without digging through logs, whether a URL
+was processed successfully, gave up after too many page load failures, or was abandoned
+because its PhantomJS process kept crashing.
+
+The field is only present for requests that were actually finished (i.e. marked as handled),
+so a request that is still being retried or is waiting in the queue has no outcome yet.
+Each request gets exactly one final outcome:
+
+```javascript
+{
+  // ID of the Request and the URL that was crawled
+  requestId: String,
+  url: String,
+
+  // One of the following values:
+  //  - SUCCESS ......................... the page was processed (possibly after some retries),
+  //                                      in which case 'retryCount' tells how many retries were needed
+  //  - PAGE_LOAD_RETRY_EXHAUSTED ....... the page repeatedly failed to load and the
+  //                                      'maxPageRetryCount' limit was reached
+  //  - PHANTOMJS_CRASH_LIMIT_EXCEEDED .. the PhantomJS process crashed 3 times while processing
+  //                                      the page, so the crawler gave up on it
+  outcome: String,
+
+  // Number of page load retries that happened for this request
+  retryCount: Number,
+
+  // Number of PhantomJS crashes that happened for this request
+  crashCount: Number,
+
+  // A one-line summary of the last error message, or null if no error was recorded
+  errorMessage: String
+}
+```
+
+The outcome records of in-progress requests are kept in memory only, so nothing is written
+until the request is finished. Internal retry/crash counters are not available in the dataset,
+only these final outcome records are.
+
 
 ## Request object
 
