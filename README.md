@@ -55,3 +55,27 @@ seat or newly listed date it files an issue that @mentions you. GitHub
 delivers the email. The job paces itself to about six requests a minute
 because Cinemark rate-limits around 60-70 requests per ten minutes, so a full
 sweep takes about 20 unhurried minutes.
+
+## Checking what a run did
+
+Every sweep writes an outcome record to `state.json` under `last_sweep`: one
+entry per showtime in that run's watch list, plus counts. Each entry has the
+date, the showtime start, the outcome, and a short reason when it failed:
+
+| outcome | meaning |
+|---|---|
+| `checked` | seat map read successfully (whether or not seats were open) |
+| `fetch_failed` | retries ran out (rate limit, block, server/network error) |
+| `no_data` | seat page loaded but had no seat markup, so nothing could be read |
+
+`python3 watch.py --report` prints the seat availability plus the previous
+run's per-showtime outcomes and summary, entirely from `state.json`, so it
+works offline. A state file written by an older version simply reports that
+there is no outcome record yet.
+
+When a fetch has to back off, the log says which attempt it was, how long it
+will wait, which showtime or date triggered it, and why. Long waits log a
+progress line each minute, so a quiet log means something is genuinely wrong.
+A showing that ultimately fails is recorded as `fetch_failed` and the sweep
+carries on with the rest.
+
