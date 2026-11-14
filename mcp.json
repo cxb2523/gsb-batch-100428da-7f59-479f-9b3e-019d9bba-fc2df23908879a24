@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "google-discover": {
+      "command": "uvx",
+      "args": [
+        "google-discover-api-mcp",
+        "mcp"
+      ]
+    }
+  }
+}
