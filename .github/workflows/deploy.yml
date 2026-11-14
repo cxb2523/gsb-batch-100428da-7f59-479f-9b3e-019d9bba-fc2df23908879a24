@@ -1,0 +1,298 @@
+name: Deploy console10
+
+# Deploy static SPA only — does NOT stop batch/coinbot.
+#
+# Triggers:
+#   - workflow_dispatch (manual; dry_run / rebuild / artifact options)
+#   - workflow_run: after successful CI on main (auto deploy that run's artifact)
+#
+# Required secrets (repo and/or Environment `pxed`):
+#   PXED_SSH_PRIVATE_KEY  — deploy key private PEM
+#   PXED_HOST             — ssh target (prefer direct host, e.g. user@pxed1497962.bohrium.tech)
+#   PXED_KNOWN_HOSTS      — known_hosts lines (REQUIRED for real deploy)
+# Optional:
+#   PXED_SSH_PORT         — default 22
+#   PXED_WEB              — remote web root (default /data/grok-register/apps/web)
+#
+# Protection: job uses Environment `pxed`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build when not using artifact. Empty = this workflow SHA."
+        required: false
+        default: ""
+        type: string
+      use_latest_artifact:
+        description: "Prefer console10-web artifact from a successful main CI run."
+        required: false
+        default: true
+        type: boolean
+      remote_web:
+        description: "Override remote web root under /data/grok-register (empty = secret/default)."
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "Build/download only; do not scp/ssh."
+        required: false
+        default: false
+        type: boolean
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+concurrency:
+  group: deploy-console10
+  cancel-in-progress: false
+
+# I6: explicit least privilege (repo default may be read; workflow_run needs actions:read)
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  deploy:
+    name: deploy-to-pxed
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # C1: Environment gate
+    environment: pxed
+    permissions:
+      contents: read
+      actions: read
+    # Auto path: only on successful CI that was a push to main (not PR CI)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+
+    steps:
+      - name: Resolve mode
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          # workflow_run fields are empty on workflow_dispatch; inputs empty on workflow_run
+          WR_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || '' }}
+          WR_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || '' }}
+          WR_URL: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.html_url || '' }}
+          INPUT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || '' }}
+          INPUT_USE_ARTIFACT: ${{ github.event_name == 'workflow_dispatch' && (inputs.use_latest_artifact && 'true' || 'false') || 'true' }}
+          INPUT_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && (inputs.dry_run && 'true' || 'false') || 'false' }}
+          INPUT_REMOTE_WEB: ${{ github.event_name == 'workflow_dispatch' && inputs.remote_web || '' }}
+          THIS_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            echo "trigger=auto" >> "$GITHUB_OUTPUT"
+            echo "dry_run=false" >> "$GITHUB_OUTPUT"
+            echo "prefer_artifact=true" >> "$GITHUB_OUTPUT"
+            echo "ci_run_id=$WR_ID" >> "$GITHUB_OUTPUT"
+            echo "ref=$WR_SHA" >> "$GITHUB_OUTPUT"
+            echo "remote_web_input=" >> "$GITHUB_OUTPUT"
+            echo "Auto-deploy from CI run $WR_ID sha=$WR_SHA ($WR_URL)"
+          else
+            REF="$INPUT_REF"
+            if [[ -z "$REF" ]]; then
+              REF="$THIS_SHA"
+            fi
+            echo "trigger=manual" >> "$GITHUB_OUTPUT"
+            echo "dry_run=$INPUT_DRY_RUN" >> "$GITHUB_OUTPUT"
+            echo "prefer_artifact=$INPUT_USE_ARTIFACT" >> "$GITHUB_OUTPUT"
+            echo "ci_run_id=" >> "$GITHUB_OUTPUT"
+            echo "ref=$REF" >> "$GITHUB_OUTPUT"
+            echo "remote_web_input=$INPUT_REMOTE_WEB" >> "$GITHUB_OUTPUT"
+            echo "Manual deploy ref=$REF dry_run=$INPUT_DRY_RUN prefer_artifact=$INPUT_USE_ARTIFACT"
+          fi
+
+      - name: Checkout (always — need deploy script)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.mode.outputs.ref }}
+
+      - name: Sanitize remote web root
+        id: web
+        env:
+          PXED_WEB_SECRET: ${{ secrets.PXED_WEB }}
+          REMOTE_WEB_INPUT: ${{ steps.mode.outputs.remote_web_input }}
+        run: |
+          set -euo pipefail
+          # C2: never interpolate untrusted path into remote shell.
+          if [[ -n "${REMOTE_WEB_INPUT}" ]]; then
+            CANDIDATE="$REMOTE_WEB_INPUT"
+          elif [[ -n "${PXED_WEB_SECRET:-}" ]]; then
+            CANDIDATE="$PXED_WEB_SECRET"
+          else
+            CANDIDATE="/data/grok-register/apps/web"
+          fi
+          while [[ "$CANDIDATE" == */ && "$CANDIDATE" != / ]]; do
+            CANDIDATE="${CANDIDATE%/}"
+          done
+          case "$CANDIDATE" in
+            /data/grok-register|/data/grok-register/*) ;;
+            *)
+              echo "remote_web must be under /data/grok-register, got: $CANDIDATE" >&2
+              exit 1
+              ;;
+          esac
+          if [[ "$CANDIDATE" == *..* ]]; then
+            echo "remote_web must not contain .." >&2
+            exit 1
+          fi
+          if [[ ! "$CANDIDATE" =~ ^/data/grok-register(/[A-Za-z0-9._+-]+)*$ ]]; then
+            echo "remote_web has unsafe characters: $CANDIDATE" >&2
+            exit 1
+          fi
+          echo "remote_web=$CANDIDATE" >> "$GITHUB_OUTPUT"
+          echo "Using remote_web=$CANDIDATE"
+
+      # I1: only accept runs that actually published console10-web; else rebuild.
+      - name: Obtain console10 tarball
+        id: tarball
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PREFER_ARTIFACT: ${{ steps.mode.outputs.prefer_artifact }}
+          CI_RUN_ID: ${{ steps.mode.outputs.ci_run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/console10-ci
+          OUT=/tmp/console10-ci/console10-webroot.tgz
+          got=0
+
+          download_from_run() {
+            local run_id="$1"
+            local dir
+            dir="$(mktemp -d /tmp/console10_art.XXXXXX)"
+            if ! gh run download "$run_id" --repo "$REPO" --name console10-web --dir "$dir" 2>/tmp/console10_dl.err; then
+              echo "download failed for run $run_id: $(cat /tmp/console10_dl.err 2>/dev/null || true)"
+              rm -rf "$dir"
+              return 1
+            fi
+            local tgz
+            tgz=$(find "$dir" -name 'console10-webroot.tgz' | head -1)
+            if [[ -z "$tgz" || ! -s "$tgz" ]]; then
+              echo "run $run_id has console10-web name but missing tarball"
+              find "$dir" -maxdepth 4 -type f || true
+              rm -rf "$dir"
+              return 1
+            fi
+            cp -f "$tgz" "$OUT"
+            rm -rf "$dir"
+            echo "Using artifact from CI run $run_id"
+            return 0
+          }
+
+          if [[ "$PREFER_ARTIFACT" == "true" ]]; then
+            if [[ -n "${CI_RUN_ID}" ]]; then
+              # auto path: this exact successful CI run
+              if download_from_run "$CI_RUN_ID"; then
+                got=1
+              else
+                echo "CI run $CI_RUN_ID has no usable console10-web; will rebuild"
+              fi
+            else
+              # manual: scan recent successful CI runs for artifact name (I1)
+              mapfile -t RUN_IDS < <(gh run list \
+                --repo "$REPO" \
+                --branch main \
+                --workflow CI \
+                --json databaseId,conclusion,status \
+                --limit 30 \
+                --jq '.[] | select(.conclusion=="success" and .status=="completed") | .databaseId')
+              for run_id in "${RUN_IDS[@]:-}"; do
+                # confirm artifact exists before download
+                has=$(gh api "repos/$REPO/actions/runs/$run_id/artifacts" \
+                  --jq '[.artifacts[] | select(.name=="console10-web" and .expired==false)] | length')
+                if [[ "${has:-0}" -gt 0 ]]; then
+                  if download_from_run "$run_id"; then
+                    got=1
+                    break
+                  fi
+                else
+                  echo "skip CI run $run_id (no console10-web artifact)"
+                fi
+              done
+            fi
+          fi
+
+          if [[ "$got" -eq 1 ]]; then
+            ls -la "$OUT"
+            echo "source=artifact" >> "$GITHUB_OUTPUT"
+            echo "path=$OUT" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Falling back to rebuild from ref ${{ steps.mode.outputs.ref }}"
+          echo "source=rebuild" >> "$GITHUB_OUTPUT"
+          echo "path=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Node (rebuild fallback)
+        if: ${{ steps.tarball.outputs.source == 'rebuild' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Build + pack (rebuild fallback)
+        if: ${{ steps.tarball.outputs.source == 'rebuild' }}
+        run: |
+          set -euo pipefail
+          ./scripts/build_web_console.sh
+          mkdir -p /tmp/console10-ci
+          tar -C apps/web/dist -czf /tmp/console10-ci/console10-webroot.tgz .
+          ls -la /tmp/console10-ci/console10-webroot.tgz
+          test -s /tmp/console10-ci/console10-webroot.tgz
+
+      - name: Require deploy secrets
+        if: ${{ steps.mode.outputs.dry_run != 'true' }}
+        env:
+          PXED_SSH_PRIVATE_KEY: ${{ secrets.PXED_SSH_PRIVATE_KEY }}
+          PXED_HOST: ${{ secrets.PXED_HOST }}
+          PXED_KNOWN_HOSTS: ${{ secrets.PXED_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in PXED_SSH_PRIVATE_KEY PXED_HOST PXED_KNOWN_HOSTS; do
+            if [[ -z "${!name}" ]]; then
+              echo "Missing required secret: $name" >&2
+              missing=1
+            fi
+          done
+          if [[ "$missing" -ne 0 ]]; then
+            echo "Real deploy needs PXED_SSH_PRIVATE_KEY + PXED_HOST + PXED_KNOWN_HOSTS" >&2
+            echo "Tip: manual dry_run=true builds/downloads without secrets." >&2
+            exit 1
+          fi
+
+      # I3: single deploy script path
+      - name: Deploy via scripts/deploy_web_console10.sh
+        if: ${{ steps.mode.outputs.dry_run != 'true' }}
+        env:
+          PXED_SSH_PRIVATE_KEY: ${{ secrets.PXED_SSH_PRIVATE_KEY }}
+          PXED_HOST: ${{ secrets.PXED_HOST }}
+          PXED_SSH_PORT: ${{ secrets.PXED_SSH_PORT }}
+          PXED_KNOWN_HOSTS: ${{ secrets.PXED_KNOWN_HOSTS }}
+          PXED_WEB: ${{ steps.web.outputs.remote_web }}
+          CONSOLE10_TGZ: /tmp/console10-ci/console10-webroot.tgz
+          SKIP_BUILD: "1"
+          PRUNE_STALE_ASSETS: "1"
+          DRY_RUN: "0"
+        run: |
+          set -euo pipefail
+          chmod +x scripts/deploy_web_console10.sh
+          ./scripts/deploy_web_console10.sh
+
+      - name: Dry-run summary
+        if: ${{ steps.mode.outputs.dry_run == 'true' }}
+        run: |
+          set -euo pipefail
+          ls -la /tmp/console10-ci/console10-webroot.tgz
+          echo "source=${{ steps.tarball.outputs.source }}"
+          echo "remote_web=${{ steps.web.outputs.remote_web }}"
+          echo "trigger=${{ steps.mode.outputs.trigger }}"
+          echo "dry_run=1 — skipped scp/ssh"

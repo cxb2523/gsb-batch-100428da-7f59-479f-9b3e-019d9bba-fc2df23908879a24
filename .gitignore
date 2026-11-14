@@ -1,0 +1,85 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+dist/
+.DS_Store
+# node deps / Vite cache at repo root (only providers/* subtree deps are local)
+node_modules/
+node_modules/**
+# macOS AppleDouble sidecar files (break Chrome --load-extension if copied to host)
+**/._*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# secrets / local runtime
+config.json
+config.local.json
+config.json.bak*
+.control_api_users.json
+.control_api_users.json.tmp
+.control_api_login.txt
+.control_api_session_secret
+.env
+# Project-owned egress catalog (may contain proxy credentials)
+nodes.json
+nodes.txt
+nodes.list
+proxy_list.txt
+nodes.json.tmp
+# Embedded mihomo core + imported Clash YAML (secrets + large binary)
+.nodes/
+accounts_*.txt
+emails_used.txt
+emails_error.txt
+mail_credentials.txt
+# keep directory structure; never track hotmail credential batches
+mail_assets/*
+!mail_assets/.gitkeep
+!mail_assets/README.md
+cpa_auths/*
+!cpa_auths/.gitkeep
+# Outlook private per-account refresh-token artifacts (0600, never commit)
+outlook_auths/*
+!outlook_auths/.gitkeep
+cookies/
+screenshots/
+*.log
+*.bak
+
+# register backups & secrets
+backups/
+accounts_cli.txt
+cpa_auths/*.json
+logs/
+
+# 第三方参照注册机（只读借鉴，勿提交）
+/grok-register/
+
+# Provider runtime (node_modules often on pxed /personal/*-register)
+providers/*/node_modules/
+providers/*/output/
+providers/*/logs/
+providers/*/.env
+providers/*/dist/
+!providers/_template/.env.example
+
+# local live harness ledgers (never commit)
+_live_activation_*.txt
+_live_activation_*.log
+_live_activation_*.py
+created_mailboxes.txt
+# local nodes catalog backups (timestamped .bak copies)
+nodes.json.bak.*
+# underscore-prefixed one-off probe scripts (local ops, not for repo)
+scripts/_*
+output/
+
+# console10 (Vite + Preact) local deps
+apps/web/node_modules/
+
+# local Claude session/scratch (never commit)
+.claude/

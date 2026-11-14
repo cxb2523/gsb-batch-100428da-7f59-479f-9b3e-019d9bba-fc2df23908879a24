@@ -1,0 +1,68 @@
+# Example: Grok + tinyhost paired mailbox/decode (M4 FIXED_EMAIL + OTP_HELPER)
+#   python -m register_core run --profile profiles/grok-tinyhost.example.yaml -n 1
+#
+# Requires: register_cli.py / grok_register_ttk; EMAIL_PROVIDER=fixed when FIXED_EMAIL set.
+# Product ok requires this-run SSO in accounts ledger (email----pw----sso).
+
+apiVersion: register.v1
+kind: RegisterProfile
+metadata:
+  name: grok-tinyhost
+
+spec:
+  provider:
+    name: grok
+    options:
+      threads: 1
+
+  count: 1
+
+  mailbox:
+    type: tinyhost
+    # domain omitted on purpose (same lesson as chatgpt-tinyhost): the source file
+    # (register_core/email/sources/tinyhost.py L25) flags publicvm.com as "accepts
+    # allocate but never delivers OpenAI OTP" — two pxed grok runs (090655/092054)
+    # only ever hit OTP 30s×5 timeout. An unpinned tinyhost mailbox allocates a
+    # currently-healthy random domain from the tinyhost.shop API (leruvo.icu /
+    # datgemini.io.vn / …), which actually receives xAI OTP. Set
+    # REGISTER_EMAIL_DOMAIN / GROK_EMAIL_DOMAIN to override if a specific domain is
+    # wanted; leave unset for auto.
+
+  decode:
+    type: tinyhost
+    options:
+      timeout_s: 180
+
+  strategy:
+    fail_fast: true
+    fail_fast_kinds:
+      - fatal
+      - verify
+      - registration_disallowed
+    # egress: Clash mixed-port (pxed Grok production default, same backend the legacy
+    # run-register.sh pinned via preflight-clash-nodes.sh + PROXY=127.0.0.1:7897).
+    # Pinned here (not `auto`) so register_core owns a concrete proxy: profile_to_job
+    # sets extra["proxy"]=this URL → grok_adapter force-sets child PROXY/CPA_PROXY
+    # (attempt proxy wins over ambient shell env). Pipeline owns attribution /
+    # strategy / verifier / sink; Clash leaf health is still probed by
+    # preflight-clash-nodes.sh in run-register-core.sh (nodes.json L1/L2 catalog
+    # preflight is a separate `list|auto` backend, not Grok's default).
+    egress:
+      mode: clash
+      proxy: "http://127.0.0.1:7897"
+    mail_proxy: direct
+    cool_soft_seconds: 30
+    burn:
+      enabled: true
+      track: [ip, domain, proxy]
+      on_kinds: [registration_disallowed, unsupported_email]
+      state_path: output/grok_burn_state.json
+
+  verify:
+    enabled: true
+
+  sink:
+    path: output/pipeline-grok.jsonl
+
+  secrets:
+    mode: prod

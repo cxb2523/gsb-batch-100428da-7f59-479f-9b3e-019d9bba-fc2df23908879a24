@@ -1,0 +1,37 @@
+# mise — grok-register
+# 工具链：mise 管 Python 版本 + venv，uv 管包
+
+[tools]
+python = "3.13"
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+PROJECT_ROOT = "{{config_root}}"
+
+[tasks.deps]
+run = "uv sync --extra dev"
+description = "用 uv 同步依赖（含 dev/pytest）"
+
+[tasks.check]
+run = "python -m py_compile register_cli.py cpa_export.py account_backup.py grok_register_ttk.py cf_mail_debug.py"
+description = "核心模块语法检查"
+
+[tasks.test]
+run = "uv run python -m pytest -q"
+description = "离线单测（默认不访问真实邮箱）"
+
+[tasks.register]
+description = "跑账号注册（默认 1 个；多个用 mise run register -- --extra 5）"
+run = "uv run python -u register_cli.py"
+
+[tasks.batch10]
+description = "再注册 10 个账号"
+run = "uv run python -u register_cli.py --extra 10 --threads 1 --no-headless --fast"
+
+[tasks.control-api]
+run = "bash scripts/run_control_api.sh"
+description = "启动 Web control plane（默认 127.0.0.1:8787）"
+
+[tasks.mail-debug]
+run = "uv run python cf_mail_debug.py"
+description = "邮箱链路调试脚本"

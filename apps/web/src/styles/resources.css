@@ -1,0 +1,309 @@
+/* Resources page (nodes / mail / import) */
+
+.page-resources .card {
+  margin-top: var(--space-3);
+}
+
+.resources-tab {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
+}
+
+.actions-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  align-items: center;
+}
+
+.actions-bar .grow {
+  flex: 1 1 16rem;
+  min-width: 12rem;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  padding: 0.35rem 0.55rem;
+  font: inherit;
+}
+
+/* .chip-row 由 components.css 定义（后加载，三条声明全部覆盖，
+   实际生效的 gap 是 components.css 的 0.4rem 而非这里的 0.35rem）。 */
+
+.chip.hot {
+  color: var(--accent);
+  border-color: rgba(91, 159, 212, 0.5);
+}
+
+.badge.pool {
+  color: var(--accent);
+  border-color: rgba(91, 159, 212, 0.45);
+}
+
+.badge.unknown {
+  color: var(--muted);
+}
+
+.import-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+
+.import-grid .card {
+  margin-top: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.import-grid h2,
+.resources-tab h2 {
+  margin: 0 0 0.25rem;
+  font-size: 1rem;
+}
+
+.import-grid textarea,
+.mail-tab textarea {
+  width: 100%;
+  min-height: 5rem;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 0.5rem 0.6rem;
+  font: inherit;
+  resize: vertical;
+}
+
+.mail-form.grid,
+.nodes-tab .grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.65rem 0.85rem;
+}
+
+.mail-form label,
+.nodes-tab .grid > label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+.mail-form input,
+.nodes-tab .grid input,
+.nodes-tab .grid select,
+.resources-tab label.inline input,
+.resources-tab label.inline select {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  padding: 0.35rem 0.5rem;
+  font: inherit;
+}
+
+.mail-form .span2,
+.nodes-tab .grid .span2,
+.nodes-tab .grid .actions {
+  grid-column: 1 / -1;
+}
+
+.nodes-tab .grid .actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.mail-toolbar {
+  margin-bottom: 0;
+}
+
+.mail-probe-kpis {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem 1rem;
+  margin: 0.5rem 0 0.75rem;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.mail-probe-kpis strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.mail-domain-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem 0.75rem;
+  align-items: center;
+}
+
+.mail-domain-chips .chip,
+.provider-multi .chip {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.2rem 0.65rem;
+  cursor: pointer;
+  user-select: none;
+}
+
+.provider-panel {
+  margin-bottom: 0.75rem;
+}
+
+.provider-panel-summary {
+  list-style: none;
+  cursor: default;
+}
+
+.provider-panel-summary::-webkit-details-marker {
+  display: none;
+}
+
+.provider-panel-toggle {
+  background: transparent;
+  border: 0;
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  padding: 0;
+  cursor: pointer;
+}
+
+.provider-panel-body {
+  margin-top: 0.65rem;
+}
+
+.hint.tight {
+  margin: 0.25rem 0 0;
+  font-size: 0.8rem;
+}
+
+.hint.warn {
+  color: #e0a060;
+}
+
+.mail-probe-controls {
+  margin: 0.35rem 0 0.75rem;
+  gap: 0.55rem;
+}
+
+.mail-probe-results .table-wrap {
+  overflow: auto;
+  max-height: 28rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.mail-probe-results table.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.mail-probe-results table.data-table th,
+.mail-probe-results table.data-table td {
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+.mail-probe-results table.data-table th {
+  position: sticky;
+  top: 0;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.mail-probe-results tr.dead td {
+  background: rgba(212, 91, 91, 0.06);
+}
+
+.mail-probe-results tr.soft td {
+  background: rgba(212, 180, 91, 0.07);
+}
+
+.mail-probe-results .badge.ok {
+  color: #7dcea0;
+}
+
+.mail-probe-results .badge.bad {
+  color: #f0a0a0;
+}
+
+.mail-probe-results .badge.soft {
+  color: #e0c070;
+}
+
+.mail-probe-results td.muted {
+  color: var(--muted);
+  max-width: 22rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resources-tab label.check {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--text);
+  font-size: 0.86rem;
+}
+
+.resources-tab label.inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.card.muted {
+  color: var(--muted);
+}
+
+@media (max-width: 800px) {
+  .import-grid,
+  .mail-form.grid,
+  .nodes-tab .grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Mail tab 分区（batch-2 IA）：配置区 vs 运维区 */
+.mail-section-title {
+  margin: 1.1rem 0 0.4rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: var(--text);
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3rem;
+}
+
+.mail-section-title .hint {
+  font-weight: 400;
+}
+
+/* 全局 defaultDomains（原来 CF / CloudMail 面板各一份，现在一处） */
+.mail-global-domains h2 {
+  margin-top: 0;
+}
+
+.mail-global-domains .mail-domains-input {
+  display: block;
+  margin-top: 0.6rem;
+}
+
+.mail-global-domains .mail-domains-input input {
+  width: 100%;
+}

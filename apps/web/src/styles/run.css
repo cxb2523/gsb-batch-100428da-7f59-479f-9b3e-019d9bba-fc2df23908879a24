@@ -1,0 +1,277 @@
+/* Register 页外壳 + 日志页共用：split 布局、表单面板、ops 反馈、run-header、.log。
+   RunProgress 自身的样式已拆到 run-progress.css（只有注册页引用）。
+   .page-head / .page-head h1 / .toolbar 由 base.css 全局定义（后加载并覆盖本文件），
+   这里只保留 base.css 未设置的 .toolbar.wrap gap。 */
+
+.toolbar.wrap {
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.split {
+  display: grid;
+  grid-template-columns: minmax(320px, 0.95fr) minmax(340px, 1.15fr);
+  gap: var(--space-4);
+  align-items: start;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+}
+
+.form-panel {
+  max-height: calc(100vh - 7.5rem);
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.progress-panel {
+  max-height: calc(100vh - 7.5rem);
+  overflow: auto;
+}
+
+.stack-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.provider-multi.mail-domain-chips,
+.form-panel .mail-domain-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem 0.75rem;
+  align-items: center;
+}
+
+.form-panel .mail-domain-chips .chip {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.2rem 0.65rem;
+  cursor: pointer;
+  color: var(--text);
+  font-size: 0.86rem;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.form-panel .hint.tight {
+  margin: 0.35rem 0 0;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.form-panel .hint.warn {
+  color: #e0a060;
+}
+
+/* .field-grid 本体在 components.css（后加载，逐条覆盖），这里只留 .span2 ——
+   components.css 只在 @media (max-width: 640px) 里定义 .field-grid .span2，
+   宽屏下没有等价规则，删掉会让跨列字段塌回单列。 */
+.field-grid .span2 {
+  grid-column: 1 / -1;
+}
+
+.info-box {
+  background: rgba(91, 159, 212, 0.08);
+  border: 1px dashed rgba(91, 159, 212, 0.3);
+  border-radius: 8px;
+  padding: 0.65rem 0.75rem;
+  color: var(--muted);
+  font-size: 0.84rem;
+  line-height: 1.45;
+}
+
+.form-foot-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  padding-top: 0.35rem;
+  border-top: 1px solid var(--border);
+  align-items: center;
+}
+
+.form-foot-toolbar .link-hint {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 0.8rem;
+  text-decoration: none;
+  border-bottom: 1px dotted var(--border);
+}
+
+.form-foot-toolbar .link-hint:hover {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+.advanced {
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 0.35rem 0.6rem 0.6rem;
+  background: var(--panel-2);
+}
+
+.advanced summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.85rem;
+  padding: 0.2rem 0;
+}
+
+.advanced[open] {
+  border-color: rgba(91, 159, 212, 0.35);
+}
+
+.advanced .field-grid {
+  margin-top: 0.5rem;
+}
+
+label.check {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--text);
+  font-size: 0.86rem;
+  padding-top: 0.45rem;
+  display: flex;
+}
+
+label.check.muted {
+  color: var(--muted);
+}
+
+label.check input {
+  width: auto;
+}
+
+/* ops feedback / log：外观（配色、边框、间距、字号）全部由 components.css
+   定义并后加载覆盖，这里只保留 components.css 没有设置的那几条。
+   注意 .ops-feedback / .ops-log-wrap 的 margin-bottom 也是死的 ——
+   components.css 用 `margin: 0 0 0.65rem` 简写整体覆盖了纵向外边距。 */
+.ops-feedback {
+  cursor: pointer;
+}
+
+/* components.css 的 .ops-feedback.ok 只给了 border-color / background，
+   没有 color —— 这条文字色仍然生效，不能删。 */
+.ops-feedback.ok {
+  color: var(--ok);
+}
+
+/* components.css 的 .ops-log-wrap > summary 已给了 cursor / color（子选择器；
+   .ops-log-wrap 就是 <details>，summary 必为其直接子元素，两种写法命中同一节点），
+   这里只补 components.css 没设的 font-size。 */
+.ops-log-wrap summary {
+  font-size: 0.85rem;
+}
+
+.ops-log {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.ops-log li {
+  font-size: 0.78rem;
+  align-items: baseline;
+}
+
+.ops-log .t {
+  font-family: var(--mono);
+}
+
+/* components.css 的 .ops-log .k 没有 color，默认态的灰色由这条提供
+   （.k.ok/.err/.warn 三个状态色则已在 components.css 里定义）。 */
+.ops-log .k {
+  color: var(--muted);
+}
+
+.ops-log .m {
+  color: var(--text);
+}
+
+.run-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.55rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  font-weight: 650;
+}
+
+.run-header .status-word {
+  letter-spacing: 0.03em;
+  font-size: 1.05rem;
+}
+
+.run-header .meta-chips {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+
+.run-header[data-state="alive"] {
+  border-color: rgba(91, 212, 154, 0.35);
+}
+
+.run-header[data-state="stuck"],
+.run-header-stuck {
+  background: rgba(212, 91, 91, 0.12);
+  border-color: rgba(212, 91, 91, 0.5);
+}
+
+.chip.mini {
+  font-size: 0.7rem;
+  padding: 0.14rem 0.5rem;
+  color: var(--muted);
+}
+
+/* .chip.chip-err / .chip.chip-danger 由 components.css 定义（后加载，
+   color + border-color 两条都被覆盖），这里不再重复。 */
+
+.log {
+  background: #070b10;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 0.65rem 0.75rem;
+  color: #c9d4e4;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+}
+
+.log.compact {
+  max-height: 8rem;
+}
+
+@media (max-width: 900px) {
+  .split {
+    grid-template-columns: 1fr;
+  }
+  .split > .progress-panel {
+    order: -1;
+  }
+  .form-panel,
+  .progress-panel {
+    max-height: none;
+  }
+  .field-grid {
+    grid-template-columns: 1fr;
+  }
+}

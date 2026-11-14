@@ -1,0 +1,233 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  test:
+    name: offline-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Sync dependencies
+        run: uv sync --extra dev
+
+      - name: Shell syntax (setup/doctor/hub)
+        run: |
+          bash -n scripts/setup_simple.sh
+          bash -n scripts/doctor_secrets.sh
+          bash -n scripts/build_web_console.sh
+          bash -n scripts/deploy_web_console10.sh
+          bash -n register.sh
+          bash -n providers/mimo/run-register.sh
+          bash -n providers/mimo/smoke.sh
+          bash -n providers/_template/run-register.sh
+
+      - name: Syntax check
+        run: |
+          # I4: required paths must exist (fail CI if deleted);
+          # optional paths may be staged features and are skipped when absent.
+          set -euo pipefail
+          required=(
+            register_cli.py
+            grok_register_ttk.py
+            cpa_export.py
+            account_backup.py
+            tab_pool.py
+            proxy_bridge.py
+            proxy_rotate.py
+            mail_pool_probe.py
+            node_score.py
+            cpa_xai/__init__.py
+            cpa_xai/accounts.py
+            cpa_xai/browser_confirm.py
+            cpa_xai/mint.py
+            cpa_xai/oauth_device.py
+            cpa_xai/probe.py
+            cpa_xai/protocol_mint.py
+            cpa_xai/proxyutil.py
+            cpa_xai/schema.py
+            cpa_xai/writer.py
+            register_core/__init__.py
+            register_core/__main__.py
+            register_core/cli.py
+            register_core/contracts.py
+            register_core/errors.py
+            register_core/pipeline.py
+            register_core/email/__init__.py
+            register_core/providers/__init__.py
+            register_core/providers/grok_adapter.py
+            register_core/providers/mimo_adapter.py
+            register_core/verify/__init__.py
+            register_core/sink/jsonl_sink.py
+            register_core/util/process.py
+            register_core/util/secrets.py
+            register_core/verify/mimo_tts.py
+            register_core/verify/grok_chat.py
+            apps/control_api/app.py
+            apps/control_api/mail_ops.py
+            apps/control_api/nodes_ops.py
+            apps/control_api/accounts_ops.py
+            apps/control_api/system_ops.py
+            apps/control_api/process_registry.py
+            providers/mimo/inject_cpa_openai.py
+            scripts/backfill_cpa_xai_from_accounts.py
+            scripts/backup_registered_accounts.py
+            scripts/export_cpa_xai_from_grok_auth.py
+            scripts/remint_expired_and_sync_authdir.py
+            scripts/quality_milestone_watch.py
+            scripts/quality_sample_accounts.py
+            scripts/probe_mail_pool.py
+          )
+          optional=(
+            # Keep empty or list experimental modules not yet always shipped.
+          )
+          missing=0
+          present=()
+          for f in "${required[@]}"; do
+            if [[ -f "$f" ]]; then
+              present+=("$f")
+            else
+              echo "ERROR: required file missing: $f" >&2
+              missing=1
+            fi
+          done
+          if [[ "$missing" -ne 0 ]]; then
+            exit 1
+          fi
+          for f in "${optional[@]:-}"; do
+            [[ -z "$f" ]] && continue
+            if [[ -f "$f" ]]; then
+              present+=("$f")
+            else
+              echo "skip optional missing: $f"
+            fi
+          done
+          uv run python -m py_compile "${present[@]}"
+
+      - name: Offline unit tests
+        env:
+          # Never run live mailbox / remote inject in CI
+          GROK_REGISTER_LIVE: ""
+        run: uv run python -m pytest -q
+
+      - name: Secret path guard
+        run: |
+          set -euo pipefail
+          if git ls-files | grep -E '(^|/)(config\.json|\.env|mail_credentials\.txt|accounts_cli\.txt)$|mail_assets/hotmail|cpa_auths/xai-|^backups/|^logs/'; then
+            echo "Refusing tracked secret/runtime paths" >&2
+            git ls-files | grep -E '(^|/)(config\.json|\.env|mail_credentials\.txt|accounts_cli\.txt)$|cpa_auths/xai-|^backups/|^logs/' >&2
+            exit 1
+          fi
+          echo "OK: no secret runtime paths tracked"
+          bash scripts/doctor_secrets.sh || test $? -eq 2
+
+  web-test:
+    name: web-unit-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # No main-only guard: console10 前端测试在 push 和 PR 上都要跑
+    # （package-web 只在 main push 跑，PR 上前端曾经完全没有覆盖）。
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install deps
+        working-directory: apps/web
+        run: npm ci
+
+      - name: Unit tests
+        working-directory: apps/web
+        run: npm test
+
+  package-web:
+    name: package-console10
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [test]
+    # M1: only package on main (PR CI still runs tests; deploy uses main artifacts)
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Web unit tests
+        working-directory: apps/web
+        run: |
+          npm ci
+          npm test
+
+      - name: Build console10
+        run: ./scripts/build_web_console.sh
+
+      - name: Pack tarball
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          tar -C apps/web/dist -czf artifacts/console10-webroot.tgz .
+          # also keep a flat dist tree for artifact browsing
+          cp -a apps/web/dist artifacts/console10-dist
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("artifacts/console10-webroot.tgz")
+          print(f"artifact_bytes={p.stat().st_size}")
+          assert p.stat().st_size > 1000, "web tarball too small"
+          idx = Path("artifacts/console10-dist/index.html")
+          assert idx.is_file(), "missing index.html in dist"
+          print("index_head:")
+          print(idx.read_text(encoding="utf-8", errors="replace")[:400])
+          PY
+
+      - name: Upload console10 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: console10-web
+          path: |
+            artifacts/console10-webroot.tgz
+            artifacts/console10-dist/**
+          if-no-files-found: error
+          retention-days: 14

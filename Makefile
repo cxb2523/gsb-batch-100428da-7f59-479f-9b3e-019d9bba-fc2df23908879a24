@@ -1,0 +1,71 @@
+# ai-register-machine — common developer targets
+.PHONY: help test test-unit syntax doctor list core-list example clean build-web package-web
+
+ROOT := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+PY   := uv run python
+
+help:
+	@echo "ai-register-machine"
+	@echo "  make test        offline pytest (root + tests/)"
+	@echo "  make test-unit   skeleton + layer unit tests only"
+	@echo "  make syntax      bash -n + py_compile critical paths"
+	@echo "  make doctor      local secret hygiene (never prints secrets)"
+	@echo "  make build-web   Vite console10 → apps/web/dist"
+	@echo "  make package-web tar apps/web/dist → /tmp/console10-webroot.tgz"
+	@echo "  make list        hub help + core list"
+	@echo "  make example     run examples/minimal_pipeline.py"
+	@echo "  make clean       caches only"
+
+test:
+	$(PY) -m pytest -q
+
+test-unit:
+	$(PY) -m pytest -q tests/unit test_register_core_layers.py
+
+syntax:
+	bash -n register.sh
+	bash -n run-register.sh
+	bash -n preflight-clash-nodes.sh
+	bash -n start-clash-for-grok.sh
+	bash -n providers/mimo/run-register.sh
+	bash -n providers/mimo/smoke.sh
+	bash -n providers/_template/run-register.sh
+	bash -n providers/typesafe/run-register.sh
+	bash -n providers/typesafe/smoke.sh
+	bash -n providers/chatgpt/run-register.sh
+	bash -n scripts/setup_simple.sh
+	bash -n scripts/doctor_secrets.sh
+	bash -n scripts/build_web_console.sh
+	bash -n scripts/deploy_web_console10.sh
+	$(PY) -m py_compile register_cli.py register_core/cli.py register_core/pipeline.py \
+	  register_core/providers/registry.py register_core/util/secrets.py \
+	  register_core/util/process.py register_core/verify/mimo_tts.py \
+	  register_core/verify/grok_chat.py providers/mimo/inject_cpa_openai.py \
+	  scripts/probe_clash_nodes.py mail_pool_probe.py \
+	  register_core/providers/typesafe_adapter.py register_core/verify/typesafe_key.py \
+	  providers/typesafe/protocol/flow.py providers/typesafe/protocol/session.py \
+	  providers/typesafe/protocol/constants.py apps/control_api/schemas.py
+doctor:
+	bash scripts/doctor_secrets.sh || test $$? -eq 2
+
+build-web:
+	bash scripts/build_web_console.sh
+
+package-web: build-web
+	tar -C apps/web/dist -czf /tmp/console10-webroot.tgz .
+	@ls -la /tmp/console10-webroot.tgz
+	@echo "upload/deploy via GitHub Actions preferred; local: DRY_RUN=1 ./scripts/deploy_web_console10.sh"
+
+list:
+	./register.sh help
+	$(PY) -m register_core list
+
+core-list:
+	$(PY) -m register_core list
+
+example:
+	$(PY) examples/minimal_pipeline.py
+
+clean:
+	find . -type d -name __pycache__ -not -path './.venv/*' -prune -exec rm -rf {} + 2>/dev/null || true
+	rm -rf .pytest_cache

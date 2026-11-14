@@ -1,0 +1,47 @@
+# Example: ChatGPT + tinyhost paired mailbox/decode
+#   python -m register_core run --profile profiles/chatgpt-tinyhost.example.yaml -n 1
+
+apiVersion: register.v1
+kind: RegisterProfile
+metadata:
+  name: chatgpt-tinyhost
+
+spec:
+  provider:
+    name: chatgpt
+    options:
+      otp_timeout_s: 180
+
+  count: 1
+
+  mailbox:
+    type: tinyhost
+    # domain omitted on purpose: remove the profile pin so CHATGPT_EMAIL_DOMAIN
+    # (legacy operator knob, e.g. huychau.online) is honored by the chatgpt adapter
+    # (extra["email_domain"] unset → adapter self.email_domain ← env). Echoes the
+    # legacy non-profile path behavior. Pin via CHATGPT_EMAIL_DOMAIN=<domain>.
+
+  decode:
+    type: tinyhost
+    options:
+      timeout_s: 180
+
+  strategy:
+    fail_fast: true
+    egress:
+      mode: clash
+      proxy: "http://127.0.0.1:7897"
+    mail_proxy: direct
+    burn:
+      enabled: true
+      track: [ip, domain]
+      on_kinds: [registration_disallowed, unsupported_email]
+
+  verify:
+    enabled: true
+
+  sink:
+    path: providers/chatgpt/output/pipeline.jsonl
+
+  secrets:
+    mode: prod

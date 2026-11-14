@@ -1,0 +1,2048 @@
+"""Register-scoped proxy / egress rotation.
+
+Modes
+-----
+off   — no rotation
+list  — rotate explicit proxy URLs; only Chromium / register HTTP use them
+        (other apps untouched)
+clash — **domain-scoped Clash rotation** (recommended with local 7897):
+        ensure a dedicated selector group (default ``GROK-REG``) + DOMAIN-SUFFIX
+        rules for xAI/Grok hosts pointing at that group; rotate **only that
+        group's node**. Never touch the main profile selector (e.g. 宝可梦).
+tetherpool — **TetherPool (IP-Pool) anti-sybil lease mode** (每号新租约):
+        per-account ``GET /v1/acquire_for_registration`` lease (tier=premium,
+        anti-sybil IP cooldown against reuse within ``tetherpool_cooldown``),
+        Chromium/HTTP/mint all ride the ``:9101`` parametric gateway URL for the
+        SAME account_id (shared ``leases`` table ⇒ exact sticky binding).
+        Fail-fast may report ``/v1/battery/event`` so the pool's circuit breaker
+        reacts. Control-plane outage ⇒ fall back to ``tetherpool_fallback_proxy``
+        (or ``proxy``) and keep going. Defaults: api/gateway on mesh
+        ``10.144.144.9`` (env ``TETHERPOOL_API_BASE`` / ``TETHERPOOL_GATEWAY_BASE``).
+
+Whole-machine impact
+--------------------
+- list: none outside register browser / its HTTP clients
+- tetherpool: none outside register browser / its HTTP clients (gateway is a
+  remote forward proxy; nothing local is switched)
+- clash: only traffic matching the injected domain rules uses the rotated node
+  (TUN/system-proxy clients hitting those domains share it; everything else
+  keeps the original policy group). On process exit we restore the GROK-REG
+  node to the pre-session value.
+"""
+
+from __future__ import annotations
+
+import atexit
+import http.client
+import json
+import os
+import re
+import socket
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+from proxy_bridge import proxy_log_label
+
+LogFn = Optional[Callable[[str], None]]
+
+DEFAULT_CLASH_GROUP = "GROK-REG"
+DEFAULT_CLASH_DONOR_GROUP = "宝可梦"
+DEFAULT_CLASH_API = "unix:///tmp/verge/verge-mihomo.sock"
+DEFAULT_CLASH_CONFIG_PATH = (
+    "~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/clash-verge.yaml"
+)
+DEFAULT_CLASH_PROFILES_DIR = (
+    "~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles"
+)
+DEFAULT_CLASH_PROFILES_YAML = (
+    "~/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev/profiles.yaml"
+)
+
+DEFAULT_GROK_DOMAINS = (
+    "x.ai",
+    "grok.com",
+    "grok.x.ai",
+    "assets.grok.com",
+)
+
+# A single mint job (browser mint of one account) finishes well under this. Any
+# mint hold older than MINT_HOLD_TTL_SEC is a leaked hold (mint killed before its
+# release ran, e.g. a release that threw) and is reaped on the next acquire/rotate.
+# Conservative so a legitimately slow mint never loses its pin mid-flight.
+MINT_HOLD_TTL_SEC = 60 * 10
+
+# Meta/group names + personal dog VPS (35.212.179.13 / mango9502 AnyTLS+TUIC)
+# and P1024 leaves that hairpin via dialer-proxy through that VPS.
+# Host config clash_node_exclude replaces this wholesale when set.
+_DEFAULT_CLASH_EXCLUDE = (
+    r"剩余|距离|套餐|建议|官网|DIRECT|REJECT|自动选择|故障转移|"
+    r"Pass|Compatible|REJECT-DROP|GLOBAL|GROK-REG|"
+    r"GVPS-AnyTLS|GVPS-TUIC|googlevps|P1024-"
+)
+
+_SELECTOR_TYPES = frozenset(
+    {"Selector", "URLTest", "Fallback", "LoadBalance", "Relay"}
+)
+_SKIP_NODE_TYPES = frozenset(
+    {
+        "Selector",
+        "URLTest",
+        "Fallback",
+        "LoadBalance",
+        "Relay",
+        "Direct",
+        "Reject",
+        "Compatible",
+        "Pass",
+        "RejectDrop",
+    }
+)
+
+
+def _log(log: LogFn, msg: str) -> None:
+    if log:
+        try:
+            log(msg)
+        except Exception:
+            pass
+
+
+def _truthy(val: Any, default: bool = False) -> bool:
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if not s:
+        return default
+    return s in {"1", "true", "yes", "y", "on"}
+
+
+def _as_int(val: Any, default: int) -> int:
+    try:
+        return int(val)
+    except Exception:
+        return default
+
+
+def parse_proxy_list(raw: Any) -> list[str]:
+    """Parse proxy pool from list / JSON array / comma|newline|semicolon / file path."""
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    text = str(raw).strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            data = json.loads(text)
+            if isinstance(data, list):
+                return [str(x).strip() for x in data if str(x).strip()]
+        except Exception:
+            pass
+    if ("\n" not in text and "," not in text and ";" not in text) and (
+        text.endswith(".txt")
+        or text.endswith(".list")
+        or os.path.isfile(os.path.expanduser(text))
+    ):
+        try:
+            p = Path(text).expanduser()
+            if p.is_file():
+                lines = []
+                for line in p.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    lines.append(line)
+                return lines
+        except Exception:
+            pass
+    parts = re.split(r"[\n,;]+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def parse_domain_list(raw: Any, default: tuple[str, ...] = DEFAULT_GROK_DOMAINS) -> list[str]:
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return list(default)
+    if isinstance(raw, (list, tuple)):
+        out = [str(x).strip().lstrip(".") for x in raw if str(x).strip()]
+        return out or list(default)
+    text = str(raw).strip()
+    if text.startswith("["):
+        try:
+            data = json.loads(text)
+            if isinstance(data, list):
+                out = [str(x).strip().lstrip(".") for x in data if str(x).strip()]
+                return out or list(default)
+        except Exception:
+            pass
+    parts = re.split(r"[\n,;|\s]+", text)
+    out = [p.strip().lstrip(".") for p in parts if p.strip()]
+    return out or list(default)
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    def __init__(self, unix_path: str, timeout: float = 5.0):
+        super().__init__("localhost", timeout=timeout)
+        self._unix_path = unix_path
+
+    def connect(self) -> None:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self._unix_path)
+        self.sock = sock
+
+
+def clash_request(
+    api: str,
+    method: str,
+    path: str,
+    *,
+    body: Any = None,
+    secret: str = "",
+    timeout: float = 8.0,
+) -> tuple[int, Any]:
+    """HTTP(S) or unix-socket request against Clash external controller."""
+    raw = str(api or "").strip()
+    if not raw:
+        raise ValueError("clash_api empty")
+    method = method.upper()
+    if not path.startswith("/"):
+        path = "/" + path
+
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    if secret:
+        headers["Authorization"] = f"Bearer {secret}"
+
+    if raw.startswith("unix://") or raw.startswith("unix:"):
+        sock_path = (
+            raw.split("unix://", 1)[-1] if "unix://" in raw else raw.split("unix:", 1)[-1]
+        )
+        sock_path = sock_path.strip()
+        if not sock_path:
+            raise ValueError("unix clash_api missing path")
+        conn = _UnixHTTPConnection(sock_path, timeout=timeout)
+        try:
+            conn.request(method, path, body=data, headers=headers)
+            resp = conn.getresponse()
+            raw_body = resp.read()
+            status = int(resp.status)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    else:
+        if "://" not in raw:
+            raw = "http://" + raw
+        url = raw.rstrip("/") + path
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                status = int(resp.status)
+                raw_body = resp.read()
+        except urllib.error.HTTPError as e:
+            status = int(e.code)
+            raw_body = e.read() if e.fp else b""
+
+    if not raw_body:
+        return status, None
+    try:
+        return status, json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        return status, raw_body.decode("utf-8", "replace")
+
+
+def clash_get_proxies(api: str, *, secret: str = "", timeout: float = 8.0) -> dict[str, Any]:
+    status, data = clash_request(api, "GET", "/proxies", secret=secret, timeout=timeout)
+    if status >= 400 or not isinstance(data, dict):
+        raise RuntimeError(f"clash GET /proxies failed status={status} body={data!r}")
+    proxies = data.get("proxies") or {}
+    if not isinstance(proxies, dict):
+        raise RuntimeError("clash /proxies missing proxies map")
+    return proxies
+
+
+def clash_list_nodes(
+    api: str,
+    group: str,
+    *,
+    secret: str = "",
+    exclude_re: str = _DEFAULT_CLASH_EXCLUDE,
+    include_re: str = "",
+    timeout: float = 8.0,
+    proxies: dict[str, Any] | None = None,
+) -> tuple[list[str], str, dict[str, Any]]:
+    """Return (usable_node_names, current_now, group_info)."""
+    if proxies is None:
+        proxies = clash_get_proxies(api, secret=secret, timeout=timeout)
+    g = proxies.get(group)
+    if not isinstance(g, dict):
+        selectors = [
+            k
+            for k, v in proxies.items()
+            if isinstance(v, dict) and v.get("type") in _SELECTOR_TYPES
+        ]
+        raise RuntimeError(f"clash group not found: {group!r}; selectors={selectors[:20]}")
+    all_names = list(g.get("all") or [])
+    now = str(g.get("now") or "")
+    ex = re.compile(exclude_re) if exclude_re else None
+    inc = re.compile(include_re) if include_re else None
+    usable: list[str] = []
+    for name in all_names:
+        if not name:
+            continue
+        if name == group:
+            continue
+        if ex and ex.search(name):
+            continue
+        if inc and not inc.search(name):
+            continue
+        meta = proxies.get(name) if isinstance(proxies.get(name), dict) else {}
+        ntype = str((meta or {}).get("type") or "")
+        if ntype in _SKIP_NODE_TYPES:
+            continue
+        usable.append(name)
+    return usable, now, g
+
+
+def clash_switch_node(
+    api: str,
+    group: str,
+    node: str,
+    *,
+    secret: str = "",
+    flush: bool = True,
+    timeout: float = 8.0,
+) -> None:
+    enc_group = urllib.parse.quote(group, safe="")
+    status, body = clash_request(
+        api,
+        "PUT",
+        f"/proxies/{enc_group}",
+        body={"name": node},
+        secret=secret,
+        timeout=timeout,
+    )
+    if status >= 400:
+        raise RuntimeError(
+            f"clash switch failed status={status} body={body!r} group={group!r} node={node!r}"
+        )
+    if flush:
+        try:
+            clash_request(api, "DELETE", "/connections", secret=secret, timeout=timeout)
+        except Exception:
+            pass
+
+
+def _filter_leaf_names(
+    proxies: dict[str, Any],
+    names: list[str],
+    *,
+    exclude_re: str,
+    include_re: str = "",
+) -> list[str]:
+    """Keep real proxy leaves. Groups, DIRECT/REJECT, and the exclude regex drop out."""
+    ex = re.compile(exclude_re) if exclude_re else None
+    inc = re.compile(include_re) if include_re else None
+    out: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if not name or name in seen:
+            continue
+        if ex and ex.search(name):
+            continue
+        if inc and not inc.search(name):
+            continue
+        meta = proxies.get(name) if isinstance(proxies.get(name), dict) else {}
+        # An allowlist name that is not a loaded leaf must not enter the pool.
+        # Donor fallback still accepts a name whose type the API did not return.
+        if not isinstance(meta, dict) or not meta:
+            continue
+        ntype = str(meta.get("type") or "")
+        if ntype in _SKIP_NODE_TYPES:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _leaf_nodes_from_donor(
+    proxies: dict[str, Any],
+    donor_group: str,
+    *,
+    exclude_re: str,
+    include_re: str = "",
+    allowlist: list[str] | None = None,
+) -> list[str]:
+    """Collect leaves for a new dedicated selector.
+
+    ``allowlist`` wins: only those exact names, and only if they are live
+    leaves. That is how a pool stays a known set (US, reachable, not
+    google-vps) instead of inheriting every member of the donor group.
+    """
+    if allowlist:
+        return _filter_leaf_names(
+            proxies, list(allowlist), exclude_re=exclude_re, include_re=""
+        )
+    donor = proxies.get(donor_group) if isinstance(proxies.get(donor_group), dict) else None
+    names: list[str] = []
+    if donor and isinstance(donor.get("all"), list):
+        names = list(donor.get("all") or [])
+    else:
+        # fallback: all non-selector leaves
+        for name, meta in proxies.items():
+            if not isinstance(meta, dict):
+                continue
+            if str(meta.get("type") or "") in _SKIP_NODE_TYPES:
+                continue
+            names.append(name)
+    return _filter_leaf_names(
+        proxies, names, exclude_re=exclude_re, include_re=include_re
+    )
+
+
+def _yaml_quote(s: str) -> str:
+    """Minimal YAML double-quote for node names with emoji / special chars."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _build_group_yaml(group: str, nodes: list[str]) -> str:
+    lines = [
+        f"- name: {_yaml_quote(group)}",
+        "  type: select",
+        "  proxies:",
+    ]
+    for n in nodes:
+        lines.append(f"    - {_yaml_quote(n)}")
+    return "\n".join(lines) + "\n"
+
+
+def _build_domain_rules(domains: list[str], group: str) -> list[str]:
+    rules = []
+    for d in domains:
+        d = d.strip().lstrip(".")
+        if not d:
+            continue
+        rules.append(f"DOMAIN-SUFFIX,{d},{group}")
+    return rules
+
+
+def autodetect_verge_enhancement_files(
+    profiles_yaml_path: str = DEFAULT_CLASH_PROFILES_YAML,
+) -> tuple[str, str]:
+    """Read Clash Verge profiles.yaml → (groups_file, rules_file) for current profile.
+
+    Returns empty strings if not found. Best-effort; never raises.
+    """
+    try:
+        p = Path(profiles_yaml_path).expanduser()
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return "", ""
+    m = re.search(r"(?m)^current:\s*(\S+)", text)
+    if not m:
+        return "", ""
+    uid = m.group(1).strip()
+    start = text.find(f"- uid: {uid}")
+    if start < 0:
+        return "", ""
+    end = text.find("\n- uid:", start + 1)
+    block = text[start : end if end > 0 else start + 2000]
+    groups_uid = re.search(r"(?m)^\s*groups:\s*(\S+)\s*$", block)
+    rules_uid = re.search(r"(?m)^\s*rules:\s*(\S+)\s*$", block)
+    g = (groups_uid.group(1).strip() + ".yaml") if groups_uid else ""
+    r = (rules_uid.group(1).strip() + ".yaml") if rules_uid else ""
+    return g, r
+
+
+def _group_member_names(text: str, group: str) -> list[str]:
+    """Member names of one selector, in file order. Empty when the group is absent."""
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        m = re.match(r"^\s*- name:\s*(.+?)\s*$", line)
+        if not m:
+            continue
+        name = m.group(1).strip().strip("\"'")
+        if name == group:
+            start = i
+            break
+    if start is None:
+        return []
+    members: list[str] = []
+    in_proxies = False
+    for line in lines[start + 1 :]:
+        if re.match(r"^\s*- name:\s*", line) or (
+            line and not line.startswith(" ") and not line.startswith("-")
+        ):
+            break
+        if re.match(r"^\s+proxies:\s*$", line):
+            in_proxies = True
+            continue
+        if not in_proxies:
+            continue
+        m = re.match(r"^\s+- (.+?)\s*$", line)
+        if m:
+            members.append(m.group(1).strip().strip("\"'"))
+    return members
+
+
+def _inject_group_and_rules_into_runtime_yaml(
+    config_path: Path,
+    *,
+    group: str,
+    nodes: list[str],
+    domains: list[str],
+    replace_members: bool = False,
+) -> bool:
+    """Inject a dedicated selector + domain rules into the clash runtime yaml.
+
+    Returns True if the file was modified. An existing group is left alone
+    unless ``replace_members`` is set, which rewrites that group's member
+    list in place and does not touch any other selector.
+    """
+    path = config_path.expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"clash config not found: {path}")
+    text = path.read_text(encoding="utf-8")
+    original = text
+    group_marker = f"name: {group}"
+    group_marker_q = f'name: "{group}"'
+    has_group = (group_marker in text) or (group_marker_q in text)
+
+    if has_group and replace_members:
+        current = _group_member_names(text, group)
+        if current != list(nodes):
+            lines = text.splitlines(keepends=True)
+            start = None
+            for i, line in enumerate(lines):
+                m = re.match(r"^\s*- name:\s*(.+?)\s*$", line)
+                if m and m.group(1).strip().strip("\"'") == group:
+                    start = i
+                    break
+            if start is None:
+                raise RuntimeError(f"clash group marker present but block missing: {group}")
+            end = len(lines)
+            for j in range(start + 1, len(lines)):
+                line = lines[j]
+                if re.match(r"^\s*- name:\s*", line) or (
+                    line.strip() and not line.startswith(" ") and not line.startswith("-")
+                ):
+                    end = j
+                    break
+            block = _build_group_yaml(group, nodes)
+            if not block.endswith("\n"):
+                block += "\n"
+            text = "".join(lines[:start]) + block + "".join(lines[end:])
+
+    if not has_group:
+        block = _build_group_yaml(group, nodes)
+        # insert after `proxy-groups:` line
+        m = re.search(r"(?m)^proxy-groups:\s*\n", text)
+        if not m:
+            raise RuntimeError("clash config missing proxy-groups:")
+        text = text[: m.end()] + block + text[m.end() :]
+
+    # domain rules — prepend after `rules:` if any missing
+    wanted = _build_domain_rules(domains, group)
+    missing = [r for r in wanted if r not in text]
+    if missing:
+        m = re.search(r"(?m)^rules:\s*\n", text)
+        if not m:
+            raise RuntimeError("clash config missing rules:")
+        inject = "".join(f"- {r}\n" for r in missing)
+        text = text[: m.end()] + inject + text[m.end() :]
+
+    if text == original:
+        return False
+    # backup once per process dir
+    bak = path.with_suffix(path.suffix + ".grok-reg.bak")
+    if not bak.exists():
+        try:
+            bak.write_text(original, encoding="utf-8")
+        except Exception:
+            pass
+    path.write_text(text, encoding="utf-8")
+    return True
+
+
+def _write_verge_enhancement(
+    profiles_dir: Path,
+    groups_uid_file: str,
+    rules_uid_file: str,
+    *,
+    group: str,
+    nodes: list[str],
+    domains: list[str],
+) -> None:
+    """Best-effort: persist into Clash Verge enhancement templates."""
+    profiles_dir = profiles_dir.expanduser()
+    if not profiles_dir.is_dir():
+        return
+    gpath = profiles_dir / groups_uid_file
+    rpath = profiles_dir / rules_uid_file
+    # groups prepend
+    group_entry_lines = [
+        f"  - name: {_yaml_quote(group)}",
+        "    type: select",
+        "    proxies:",
+    ]
+    for n in nodes:
+        group_entry_lines.append(f"      - {_yaml_quote(n)}")
+    groups_yaml = (
+        "# Profile Enhancement Groups Template for Clash Verge\n"
+        "# Managed by grok-register proxy_rotate (GROK-REG domain isolation)\n\n"
+        "prepend:\n"
+        + "\n".join(group_entry_lines)
+        + "\n\nappend: []\n\ndelete: []\n"
+    )
+    rules_lines = ["prepend:"]
+    for r in _build_domain_rules(domains, group):
+        rules_lines.append(f"  - {_yaml_quote(r)}")
+    rules_yaml = (
+        "# Profile Enhancement Rules Template for Clash Verge\n"
+        "# Managed by grok-register proxy_rotate (xAI/Grok -> GROK-REG only)\n\n"
+        + "\n".join(rules_lines)
+        + "\n\nappend: []\n\ndelete: []\n"
+    )
+    try:
+        if groups_uid_file:
+            gpath.write_text(groups_yaml, encoding="utf-8")
+        if rules_uid_file:
+            rpath.write_text(rules_yaml, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _inject_leaf_listeners_into_runtime_yaml(
+    config_path: Path,
+    *,
+    nodes: list[str],
+    base_port: int,
+    listen: str = "127.0.0.1",
+) -> tuple[bool, dict[str, str]]:
+    """Give each allowlisted leaf its own mixed-port listener.
+
+    A selector has one ``now``, so parallel workers on the shared mixed port
+    share one exit. One listener per leaf lets each in-flight attempt dial a
+    different node. Existing listeners are left in place; only a listener
+    whose name is ``reg-leaf-<port>`` is rewritten. Returns
+    ``(changed, {node_name: proxy_url})``.
+    """
+    path = config_path.expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"clash config not found: {path}")
+    if base_port < 1 or base_port > 65535:
+        raise ValueError(f"leaf listener base port out of range: {base_port}")
+    text = path.read_text(encoding="utf-8")
+    original = text
+    mapping: dict[str, str] = {}
+    blocks: list[str] = []
+    for i, name in enumerate(nodes):
+        port = base_port + i
+        if port > 65535:
+            raise ValueError(f"leaf listener port overflow at {name!r}")
+        mapping[name] = f"http://{listen}:{port}"
+        blocks.append(
+            "\n".join(
+                [
+                    f"- name: {_yaml_quote(f'reg-leaf-{port}')}",
+                    "  type: mixed",
+                    f"  port: {port}",
+                    f"  listen: {listen}",
+                    f"  proxy: {_yaml_quote(name)}",
+                ]
+            )
+        )
+    block = "\n".join(blocks) + "\n"
+    m = re.search(r"(?m)^listeners:\s*\n", text)
+    if m is None:
+        text = text.rstrip() + "\n\nlisteners:\n" + block
+    else:
+        # Drop previously managed leaf listeners, then prepend the new set.
+        lines = text.splitlines(keepends=True)
+        # recompute marker against split lines
+        start = None
+        for i, line in enumerate(lines):
+            if re.match(r"^listeners:\s*\n?$", line):
+                start = i
+                break
+        if start is None:
+            raise RuntimeError("listeners: marker missing after match")
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            if lines[j] and not lines[j].startswith(" ") and not lines[j].startswith("-"):
+                end = j
+                break
+        kept: list[str] = []
+        i = start + 1
+        while i < end:
+            line = lines[i]
+            nm = re.match(r"^- name:\s*(.+?)\s*$", line)
+            if nm and nm.group(1).strip().strip("\"'").startswith("reg-leaf-"):
+                i += 1
+                while i < end and not re.match(r"^- \S", lines[i]):
+                    i += 1
+                continue
+            kept.append(line)
+            i += 1
+        text = "".join(lines[: start + 1]) + block + "".join(kept) + "".join(lines[end:])
+    if text == original:
+        return False, mapping
+    path.write_text(text, encoding="utf-8")
+    return True, mapping
+
+
+def clash_force_reload(api: str, config_path: str, *, secret: str = "", timeout: float = 15.0) -> None:
+    path = str(Path(config_path).expanduser())
+    status, body = clash_request(
+        api,
+        "PUT",
+        "/configs?force=true",
+        body={"path": path},
+        secret=secret,
+        timeout=timeout,
+    )
+    if status >= 400:
+        raise RuntimeError(f"clash force reload failed status={status} body={body!r}")
+
+
+def ensure_clash_domain_group(
+    *,
+    api: str,
+    group: str,
+    donor_group: str,
+    domains: list[str],
+    config_path: str,
+    secret: str = "",
+    exclude_re: str = _DEFAULT_CLASH_EXCLUDE,
+    include_re: str = "",
+    allowlist: list[str] | None = None,
+    leaf_base_port: int = 0,
+    profiles_dir: str = "",
+    verge_groups_file: str = "",
+    verge_rules_file: str = "",
+    log: LogFn = None,
+) -> dict[str, Any]:
+    """Ensure dedicated selector + domain rules exist; reload if we patched YAML.
+
+    ``allowlist`` (exact live leaf names) is the pool. When it is set, an
+    existing group whose members differ is rewritten to that list. Donor copy
+    is only the fallback for a group that does not exist yet.
+    """
+    proxies = clash_get_proxies(api, secret=secret)
+    pinned = _leaf_nodes_from_donor(
+        proxies,
+        donor_group,
+        exclude_re=exclude_re,
+        include_re=include_re,
+        allowlist=allowlist,
+    ) if allowlist else []
+    if allowlist and not pinned:
+        raise RuntimeError(
+            f"allowlist 里没有仍在线的叶子节点，拒绝创建/改写 {group!r}"
+        )
+    if group in proxies and str((proxies.get(group) or {}).get("type") or "") in _SELECTOR_TYPES:
+        # still ensure domain rules present in runtime yaml
+        nodes, now, _ = clash_list_nodes(
+            api, group, secret=secret, exclude_re=exclude_re, proxies=proxies
+        )
+        if pinned:
+            nodes = pinned
+        elif not nodes:
+            # group exists but empty — refill from donor
+            nodes = _leaf_nodes_from_donor(
+                proxies,
+                donor_group,
+                exclude_re=exclude_re,
+                include_re=include_re,
+            )
+        changed = _inject_group_and_rules_into_runtime_yaml(
+            Path(config_path),
+            group=group,
+            nodes=nodes or ["DIRECT"],
+            domains=domains,
+            replace_members=bool(pinned),
+        )
+        leaf_map: dict[str, str] = {}
+        if pinned and leaf_base_port:
+            leaf_changed, leaf_map = _inject_leaf_listeners_into_runtime_yaml(
+                Path(config_path), nodes=pinned, base_port=leaf_base_port
+            )
+            changed = changed or leaf_changed
+        if changed:
+            _log(log, f"[*] Clash 已补充域名规则 -> {group}，强制重载配置…")
+            clash_force_reload(api, config_path, secret=secret)
+            proxies = clash_get_proxies(api, secret=secret)
+        return {
+            "group": group,
+            "existed": True,
+            "nodes": len(nodes),
+            "now": str((proxies.get(group) or {}).get("now") or now),
+            "reloaded": changed,
+            "leaf_listeners": leaf_map,
+        }
+
+    nodes = pinned or _leaf_nodes_from_donor(
+        proxies,
+        donor_group,
+        exclude_re=exclude_re,
+        include_re=include_re,
+    )
+    if not nodes:
+        raise RuntimeError(
+            f"无法从策略组 {donor_group!r} 收集可用节点以创建 {group!r}"
+        )
+    _log(
+        log,
+        f"[*] 创建 Clash 专用策略组 {group}（{len(nodes)} 节点）+ 域名规则 {domains}；"
+        f"不修改主组 {donor_group}",
+    )
+    _inject_group_and_rules_into_runtime_yaml(
+        Path(config_path), group=group, nodes=nodes, domains=domains
+    )
+    if profiles_dir and (verge_groups_file or verge_rules_file):
+        _write_verge_enhancement(
+            Path(profiles_dir),
+            verge_groups_file,
+            verge_rules_file,
+            group=group,
+            nodes=nodes,
+            domains=domains,
+        )
+    leaf_map: dict[str, str] = {}
+    if pinned and leaf_base_port:
+        _leaf_changed, leaf_map = _inject_leaf_listeners_into_runtime_yaml(
+            Path(config_path), nodes=pinned, base_port=leaf_base_port
+        )
+    clash_force_reload(api, config_path, secret=secret)
+    proxies2 = clash_get_proxies(api, secret=secret)
+    if group not in proxies2:
+        raise RuntimeError(
+            f"重载后仍找不到策略组 {group!r}；请检查 clash 配置写入权限 / API"
+        )
+    return {
+        "group": group,
+        "existed": False,
+        "nodes": len(nodes),
+        "now": str((proxies2.get(group) or {}).get("now") or ""),
+        "reloaded": True,
+        "leaf_listeners": leaf_map,
+    }
+
+
+class ProxyRotator:
+    """Process-wide proxy / Clash domain-group rotator (thread-safe)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self.mode = "off"
+        self.every = 1
+        self.rotate_on_start = False
+        self.rotate_required = False
+        self.list_pool: list[str] = []
+        self.list_index = 0
+        self.accounts_on_current = 0
+        self.current_proxy = ""
+        self.current_label = ""
+        self.clash_api = DEFAULT_CLASH_API
+        self.clash_secret = ""
+        self.clash_group = DEFAULT_CLASH_GROUP
+        self.clash_donor_group = DEFAULT_CLASH_DONOR_GROUP
+        self.clash_domains: list[str] = list(DEFAULT_GROK_DOMAINS)
+        self.clash_config_path = DEFAULT_CLASH_CONFIG_PATH
+        self.clash_profiles_dir = DEFAULT_CLASH_PROFILES_DIR
+        self.clash_verge_groups_file = ""
+        self.clash_verge_rules_file = ""
+        self.clash_exclude = _DEFAULT_CLASH_EXCLUDE
+        self.clash_include = ""
+        self.clash_allowlist: list[str] = []
+        self.clash_leaf_base_port = 0
+        self.leaf_listeners: dict[str, str] = {}
+        self._held_leaves: set[str] = set()
+        self._leaf_overflow = 0
+        self.clash_flush = True
+        self.clash_restore_on_exit = True
+        self.clash_pin_node = ""
+        self.clash_setup_done = False
+        self.update_cpa_proxy = True
+        self._original_clash_node: str = ""
+        self._clash_dirty = False
+        self._started = False
+        self._last_error = ""
+        self._atexit_registered = False
+        # Refcount of mint jobs that must keep a specific clash leaf (same IP as reg).
+        # While any hold is active, rotate will not leave that node so concurrent
+        # register fail-fast cannot steal the mixed-port leaf mid-mint.
+        # _mint_holds is in-memory only; a leaked hold (mint job killed without
+        # running its release) pins the leaf until process restart. To survive a
+        # release that threw before decrementing, each hold also records the
+        # wall-clock it was created; acquire/sweep drops any hold older than
+        # MINT_HOLD_TTL_SEC (a real mint job is over long before this).
+        self._mint_holds: dict[str, int] = {}
+        self._mint_hold_since: dict[str, float] = {}
+        # Layer ③ hint: the email domain of the in-flight registration, so
+        # the scored-pick block can soft-prefer a node with a known good pair.
+        # Empty when EMAIL_IP_CORRELATION is off or no registration running.
+        self._registration_domain: str = ""
+        # TetherPool (IP-Pool) mode state: per-account anti-sybil lease via
+        # GET /v1/acquire_for_registration + :9101 parametric gateway riding the
+        # shared `leases` table. Control-plane outage falls back to static proxy.
+        self.tp_api_base = ""
+        self.tp_gateway_base = ""
+        self.tp_target_service = "grok_reg"
+        self.tp_tier = "premium"
+        self.tp_region = ""
+        self.tp_egress_type = ""  # cfg tetherpool_egress_type | env TETHERPOOL_EGRESS_TYPE; e.g. native_ipv4 to skip bridge pools
+        self.tp_cooldown = 1800
+        self.tp_fallback_proxy = ""
+        self.tp_timeout = 15.0
+        self.tp_client: Any = None
+        self.tp_account_seq = 0
+        self._tp_current_account = ""
+        self._tp_node = ""
+
+    def configure(self, cfg: dict | None) -> None:
+        cfg = cfg if isinstance(cfg, dict) else {}
+        with self._lock:
+            mode = str(cfg.get("proxy_rotate_mode") or "off").strip().lower()
+            if mode in {"none", "disabled", "0", "false", ""}:
+                mode = "off"
+            # aliases
+            if mode in {"clash_domain", "domain", "rules"}:
+                mode = "clash"
+            if mode in {"tether", "tetherpool", "ip_pool", "ippool"}:
+                mode = "tetherpool"
+            if mode not in {"off", "list", "clash", "tetherpool"}:
+                mode = "off"
+            self.mode = mode
+            self.every = max(1, _as_int(cfg.get("proxy_rotate_every"), 1))
+            default_on_start = mode in {"list", "clash", "tetherpool"}
+            self.rotate_on_start = _truthy(
+                cfg.get("proxy_rotate_on_start"), default=default_on_start
+            )
+            self.rotate_required = _truthy(cfg.get("proxy_rotate_required"), False)
+            self.update_cpa_proxy = _truthy(cfg.get("proxy_rotate_update_cpa"), True)
+
+            base_proxy = str(cfg.get("proxy") or "").strip()
+            pool = parse_proxy_list(cfg.get("proxy_list"))
+            if not pool:
+                pool = parse_proxy_list(cfg.get("proxy_pool"))
+            self.list_pool = pool
+            self.list_index = 0
+            if mode == "list" and pool:
+                self.current_proxy = pool[0]
+            else:
+                self.current_proxy = base_proxy
+            self.current_label = (
+                proxy_log_label(self.current_proxy) or self.current_proxy or "(none)"
+            )
+
+            # TetherPool mode config (env-overridable for prod hosts without config edits)
+            self.tp_api_base = str(
+                cfg.get("tetherpool_api_base")
+                or os.environ.get("TETHERPOOL_API_BASE")
+                or "http://10.144.144.9:9100"
+            ).strip().rstrip("/")
+            self.tp_gateway_base = str(
+                cfg.get("tetherpool_gateway_base")
+                or os.environ.get("TETHERPOOL_GATEWAY_BASE")
+                or "http://10.144.144.9:9101"
+            ).strip().rstrip("/")
+            self.tp_target_service = str(
+                cfg.get("tetherpool_target_service")
+                or os.environ.get("TETHERPOOL_TARGET_SERVICE")
+                or "grok_reg"
+            ).strip() or "grok_reg"
+            _tier_raw = cfg.get("tetherpool_tier", os.environ.get("TETHERPOOL_TIER"))
+            # "" (explicitly cleared in config) means "any tier" — must NOT
+            # fall back to premium, or warp (standard) pools stay unreachable.
+            self.tp_tier = str(_tier_raw).strip() if _tier_raw is not None else "premium"
+            self.tp_region = str(
+                cfg.get("tetherpool_region")
+                or os.environ.get("TETHERPOOL_REGION")
+                or ""
+            ).strip()
+            self.tp_egress_type = str(
+                cfg.get("tetherpool_egress_type")
+                or os.environ.get("TETHERPOOL_EGRESS_TYPE")
+                or ""
+            ).strip()
+            self.tp_cooldown = max(
+                0, _as_int(cfg.get("tetherpool_cooldown"), _as_int(os.environ.get("TETHERPOOL_COOLDOWN"), 1800))
+            )
+            self.tp_fallback_proxy = str(
+                cfg.get("tetherpool_fallback_proxy")
+                or base_proxy
+                or (pool[0] if pool else "")
+            ).strip()
+            self.tp_timeout = max(
+                1.0, float(cfg.get("tetherpool_timeout") or os.environ.get("TETHERPOOL_TIMEOUT") or 15.0)
+            )
+            self.tp_client = None
+            self.tp_account_seq = 0
+            if mode == "tetherpool" and not self.tp_fallback_proxy:
+                raise RuntimeError(
+                    "proxy_rotate_mode=tetherpool 需要 tetherpool_fallback_proxy 或 proxy 作为控制面不可达时的回退出口"
+                )
+
+            self.clash_api = str(
+                cfg.get("clash_api") or cfg.get("clash_controller") or DEFAULT_CLASH_API
+            ).strip() or DEFAULT_CLASH_API
+            self.clash_secret = str(cfg.get("clash_secret") or "").strip()
+            # Dedicated group — NEVER default to main profile group
+            self.clash_group = str(
+                cfg.get("clash_proxy_group") or cfg.get("clash_group") or DEFAULT_CLASH_GROUP
+            ).strip() or DEFAULT_CLASH_GROUP
+            self.clash_donor_group = str(
+                cfg.get("clash_donor_group") or DEFAULT_CLASH_DONOR_GROUP
+            ).strip() or DEFAULT_CLASH_DONOR_GROUP
+            if self.clash_group in {self.clash_donor_group, "GLOBAL", "全球", "宝可梦"}:
+                # hard guard: refuse to use main group as rotate target
+                self.clash_group = DEFAULT_CLASH_GROUP
+            self.clash_domains = parse_domain_list(cfg.get("clash_rule_domains"))
+            self.clash_config_path = str(
+                cfg.get("clash_config_path") or DEFAULT_CLASH_CONFIG_PATH
+            ).strip()
+            self.clash_profiles_dir = str(
+                cfg.get("clash_profiles_dir") or DEFAULT_CLASH_PROFILES_DIR
+            ).strip()
+            self.clash_verge_groups_file = str(
+                cfg.get("clash_verge_groups_file") or ""
+            ).strip()
+            self.clash_verge_rules_file = str(
+                cfg.get("clash_verge_rules_file") or ""
+            ).strip()
+            if self.mode == "clash" and (
+                not self.clash_verge_groups_file or not self.clash_verge_rules_file
+            ):
+                g, r = autodetect_verge_enhancement_files()
+                if not self.clash_verge_groups_file and g:
+                    self.clash_verge_groups_file = g
+                if not self.clash_verge_rules_file and r:
+                    self.clash_verge_rules_file = r
+            self.clash_exclude = (
+                str(cfg.get("clash_node_exclude") or _DEFAULT_CLASH_EXCLUDE).strip()
+                or _DEFAULT_CLASH_EXCLUDE
+            )
+            self.clash_include = str(cfg.get("clash_node_include") or "").strip()
+            raw_allow = cfg.get("clash_node_allowlist")
+            if raw_allow is None or raw_allow == "":
+                raw_allow = os.environ.get("CLASH_NODE_ALLOWLIST") or ""
+            if isinstance(raw_allow, (list, tuple)):
+                self.clash_allowlist = [str(x).strip() for x in raw_allow if str(x).strip()]
+            else:
+                self.clash_allowlist = parse_proxy_list(raw_allow)
+            raw_port = cfg.get("clash_leaf_base_port")
+            if raw_port is None or raw_port == "":
+                raw_port = os.environ.get("CLASH_LEAF_BASE_PORT") or ""
+            self.clash_leaf_base_port = _as_int(raw_port, 0) if str(raw_port).strip() else 0
+            self.leaf_listeners = {}
+            self._held_leaves = set()
+            self._leaf_overflow = 0
+            self.clash_flush = _truthy(cfg.get("clash_flush_connections"), True)
+            self.clash_restore_on_exit = _truthy(cfg.get("clash_restore_on_exit"), True)
+            # Prefer config pin; fall back to GROK_NODE env (start-clash-for-grok.sh).
+            pin = str(
+                cfg.get("clash_pin_node") or cfg.get("grok_node") or os.environ.get("GROK_NODE") or ""
+            ).strip()
+            self.clash_pin_node = pin
+
+            self.accounts_on_current = 0
+            self._original_clash_node = ""
+            self._clash_dirty = False
+            self._started = False
+            self.clash_setup_done = False
+            self._last_error = ""
+            self._mint_holds = {}
+            self._mint_hold_since = {}
+
+            if mode == "clash" and self.clash_restore_on_exit and not self._atexit_registered:
+                atexit.register(_atexit_restore_clash)
+                self._atexit_registered = True
+
+    def apply_to_config(self, cfg: dict) -> None:
+        if not isinstance(cfg, dict):
+            return
+        if self.mode not in {"list", "tetherpool"}:
+            return
+        proxy = self.current_proxy
+        if not proxy:
+            return
+        prev = str(cfg.get("proxy") or "").strip()
+        cfg["proxy"] = proxy
+        if self.update_cpa_proxy:
+            cpa = str(cfg.get("cpa_proxy") or "").strip()
+            if not cpa or cpa == prev or cpa == str(cfg.get("_proxy_rotate_prev") or ""):
+                cfg["cpa_proxy"] = proxy
+        cfg["_proxy_rotate_prev"] = proxy
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            holds = {k: v for k, v in self._mint_holds.items() if v > 0}
+            return {
+                "mode": self.mode,
+                "every": self.every,
+                "accounts_on_current": self.accounts_on_current,
+                "current_proxy": proxy_log_label(self.current_proxy) or self.current_proxy,
+                "current_label": self.current_label,
+                "list_size": len(self.list_pool),
+                "tp_api_base": self.tp_api_base,
+                "tp_gateway_base": self.tp_gateway_base,
+                "tp_tier": self.tp_tier,
+                "tp_target_service": self.tp_target_service,
+                "tp_cooldown": self.tp_cooldown,
+                "tp_current_account": self._tp_current_account,
+                "tp_node": self._tp_node,
+                "clash_api": self.clash_api,
+                "clash_group": self.clash_group,
+                "clash_donor_group": self.clash_donor_group,
+                "clash_domains": list(self.clash_domains),
+                "clash_dirty": self._clash_dirty,
+                "original_clash_node": self._original_clash_node,
+                "last_error": self._last_error,
+                "mint_holds": holds,
+            }
+
+    def _active_mint_holds_locked(self) -> dict[str, int]:
+        return {k: int(v) for k, v in self._mint_holds.items() if int(v) > 0}
+
+    def _sweep_stale_mint_holds_locked(self, log: LogFn = None) -> int:
+        """Drop mint holds older than MINT_HOLD_TTL_SEC. Caller holds self._lock.
+
+        Reaps a leaked hold whose release never decremented (mint job killed
+        before its finally ran, or release itself raised). Returns count reaped.
+        """
+        now_t = time.monotonic()
+        stale: list[str] = []
+        for node, since in self._mint_hold_since.items():
+            cur = int(self._mint_holds.get(node, 0) or 0)
+            if cur > 0 and (now_t - float(since)) > MINT_HOLD_TTL_SEC:
+                stale.append(node)
+        for node in stale:
+            self._mint_holds.pop(node, None)
+            self._mint_hold_since.pop(node, None)
+        if stale:
+            _log(log, f"[!] mint_hold swept stale (>{MINT_HOLD_TTL_SEC}s): {stale}")
+        return len(stale)
+
+    def _primary_mint_hold_locked(self) -> str:
+        holds = self._active_mint_holds_locked()
+        if not holds:
+            return ""
+        # Prefer the most-held node; stable max for multi-mint same-leaf case.
+        return max(holds.items(), key=lambda kv: (kv[1], kv[0]))[0]
+
+    def acquire_mint_egress(self, node: str, log: LogFn = None) -> dict[str, Any]:
+        """Pin clash leaf for a mint job so reg rotate cannot change egress mid-mint."""
+        target = str(node or "").strip()
+        with self._lock:
+            self._sweep_stale_mint_holds_locked(log=log)
+            if self.mode != "clash":
+                # list/off: no shared leaf switch; mint uses its own proxy URL if any
+                return {
+                    "ok": True,
+                    "mode": self.mode,
+                    "node": target,
+                    "pinned": False,
+                    "reason": "mode_not_clash",
+                }
+            if not target:
+                return {"ok": False, "mode": "clash", "reason": "empty_node"}
+            try:
+                self._ensure_clash_setup_locked(log=log)
+                nodes, now, _ = clash_list_nodes(
+                    self.clash_api,
+                    self.clash_group,
+                    secret=self.clash_secret,
+                    exclude_re=self.clash_exclude,
+                    include_re=self.clash_include,
+                )
+            except Exception as exc:
+                self._last_error = str(exc)
+                return {"ok": False, "mode": "clash", "node": target, "error": str(exc)}
+            if target not in nodes:
+                # Soft: still record hold on label for scoring; cannot pin missing leaf
+                self._mint_holds[target] = int(self._mint_holds.get(target, 0) or 0) + 1
+                self._mint_hold_since.setdefault(target, time.monotonic())
+                self.current_label = now or self.current_label
+                _log(
+                    log,
+                    f"[*] mint_hold: node={target!r} not in pool; "
+                    f"hold recorded but leaf stays {now!r}",
+                )
+                return {
+                    "ok": False,
+                    "mode": "clash",
+                    "node": target,
+                    "now": now,
+                    "reason": "node_not_in_pool",
+                    "holds": self._active_mint_holds_locked(),
+                }
+            prev = now
+            if target != now:
+                try:
+                    clash_switch_node(
+                        self.clash_api,
+                        self.clash_group,
+                        target,
+                        secret=self.clash_secret,
+                        flush=self.clash_flush,
+                    )
+                    self._clash_dirty = True
+                except Exception as exc:
+                    self._last_error = str(exc)
+                    return {
+                        "ok": False,
+                        "mode": "clash",
+                        "node": target,
+                        "prev": prev,
+                        "error": str(exc),
+                    }
+            self.current_label = target
+            self._mint_holds[target] = int(self._mint_holds.get(target, 0) or 0) + 1
+            self._mint_hold_since.setdefault(target, time.monotonic())
+            holds = self._active_mint_holds_locked()
+            _log(
+                log,
+                f"[*] mint_hold acquire node={target} prev={prev or '-'} "
+                f"holds={holds} group={self.clash_group}",
+            )
+            return {
+                "ok": True,
+                "mode": "clash",
+                "node": target,
+                "prev": prev,
+                "pinned": target != prev,
+                "holds": holds,
+                "group": self.clash_group,
+            }
+
+    def release_mint_egress(self, node: str, log: LogFn = None) -> dict[str, Any]:
+        """Drop one mint hold; when all holds clear, reg rotate may switch leaf again."""
+        target = str(node or "").strip()
+        with self._lock:
+            self._sweep_stale_mint_holds_locked(log=log)
+            if not target:
+                return {"ok": False, "reason": "empty_node"}
+            cur = int(self._mint_holds.get(target, 0) or 0)
+            if cur <= 1:
+                self._mint_holds.pop(target, None)
+                self._mint_hold_since.pop(target, None)
+            else:
+                self._mint_holds[target] = cur - 1
+            holds = self._active_mint_holds_locked()
+            _log(
+                log,
+                f"[*] mint_hold release node={target} remaining={holds or '{}'}",
+            )
+            return {"ok": True, "node": target, "holds": holds}
+
+    def _due_locked(self, *, force: bool) -> bool:
+        if self.mode == "off":
+            return False
+        if force:
+            return True
+        if not self._started and self.rotate_on_start:
+            return True
+        if not self._started:
+            return False
+        return self.accounts_on_current >= self.every
+
+    def _ensure_clash_setup_locked(self, log: LogFn = None) -> None:
+        if self.clash_setup_done:
+            return
+        ensure_clash_domain_group(
+            api=self.clash_api,
+            group=self.clash_group,
+            donor_group=self.clash_donor_group,
+            domains=self.clash_domains,
+            config_path=self.clash_config_path,
+            secret=self.clash_secret,
+            exclude_re=self.clash_exclude,
+            include_re=self.clash_include,
+            allowlist=self.clash_allowlist or None,
+            leaf_base_port=self.clash_leaf_base_port,
+            profiles_dir=self.clash_profiles_dir,
+            verge_groups_file=self.clash_verge_groups_file,
+            verge_rules_file=self.clash_verge_rules_file,
+            log=log,
+        )
+        if self.clash_leaf_base_port and self.clash_allowlist:
+            # Re-read after reload: listener order follows the allowlist that
+            # survived the live-leaf filter inside ensure_clash_domain_group.
+            proxies_now = clash_get_proxies(
+                self.clash_api, secret=self.clash_secret
+            )
+            live = _leaf_nodes_from_donor(
+                proxies_now,
+                self.clash_donor_group,
+                exclude_re=self.clash_exclude,
+                allowlist=self.clash_allowlist,
+            )
+            self.leaf_listeners = {
+                name: f"http://127.0.0.1:{self.clash_leaf_base_port + i}"
+                for i, name in enumerate(live)
+            }
+        self.clash_setup_done = True
+        # snapshot original node of dedicated group only
+        try:
+            _nodes, now, _ = clash_list_nodes(
+                self.clash_api,
+                self.clash_group,
+                secret=self.clash_secret,
+                exclude_re=self.clash_exclude,
+                include_re=self.clash_include,
+            )
+            if not self._original_clash_node:
+                self._original_clash_node = now
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # TetherPool (IP-Pool) mode: per-account anti-sybil lease + gateway ride
+    # ------------------------------------------------------------------
+
+    def _tp_client_locked(self) -> Any:
+        """Lazily construct the vendored zero-dep TetherPool SDK client."""
+        if self.tp_client is None:
+            try:
+                from vendor.tetherpool_client import TetherPoolClient as _TPC
+            except Exception as exc:  # pragma: no cover - vendor missing
+                raise RuntimeError(f"TetherPool SDK 加载失败: {exc}") from exc
+            self.tp_client = _TPC(
+                api_base=self.tp_api_base,
+                gateway_base=self.tp_gateway_base,
+                timeout=self.tp_timeout,
+            )
+        return self.tp_client
+
+    def _tp_gateway_url_locked(self, account_id: str) -> str:
+        """Gateway URL that rides the shared leases-table binding for account_id.
+
+        Deliberately carries NO type/tier/region tags: a tag that fails the
+        stored binding's constraint check would make the gateway fall back to an
+        ephemeral CRC32 re-selection instead of the registration lease.
+        """
+        client = self._tp_client_locked()
+        return client.get_gateway_proxy_url(
+            account_id,
+            egress_type=None,
+            region=None,
+            service=self.tp_target_service,
+            tier=None,
+            tier_policy=None,
+        )
+
+    def _tp_warm_binding_locked(self, account_id: str, attempts: int = 3) -> bool:
+        """Warm a fresh lease's gateway binding before a browser rides it.
+
+        Observed on TetherPool gateway (:9101): the FIRST request through a
+        newly-bound account_id frequently dies mid-TLS (curl exit 000 /
+        ERR_CONNECTION_CLOSED) while the SAME account_id succeeds from the
+        second request onward (20/20 verified). A browser that boots straight
+        onto a cold binding therefore lands on a Chrome error page and the
+        registerer's fail-fast loop burns the lease instead of retrying it.
+
+        Warm-up: HTTP HEAD to a cheap, always-200 endpoint through the gateway
+        until it answers once (or attempts exhausted). Best-effort — a failure
+        here must not block rotation.
+        """
+        try:
+            import urllib.request
+
+            proxy = self._tp_gateway_url_locked(account_id)
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+            )
+            req = urllib.request.Request(
+                "https://www.bing.com/favicon.ico",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+            )
+            for _ in range(attempts):
+                try:
+                    with opener.open(req, timeout=10) as resp:
+                        if resp.status == 200:
+                            return True
+                except Exception:
+                    continue
+            return False
+        except Exception:
+            return False  # warm-up is best-effort; never block rotation
+
+    def _rotate_tetherpool_locked(self, cfg: dict | None = None) -> dict[str, Any]:
+        client = self._tp_client_locked()
+        self.tp_account_seq += 1
+        account_id = f"grokreg-{int(time.time())}-{self.tp_account_seq}"
+        try:
+            lease = client.acquire_for_registration(
+                account_id=account_id,
+                target_service=self.tp_target_service,
+                cooldown=self.tp_cooldown,
+                region=self.tp_region or None,
+                egress_type=self.tp_egress_type or None,
+                tier=self.tp_tier,
+            )
+        except Exception as exc:
+            # Control-plane outage: fall back to the static proxy instead of
+            # killing the batch (opencode2api Mode B same-shape fallback).
+            self._last_error = str(exc)
+            self._tp_current_account = ""
+            self._tp_node = ""
+            proxy = self.tp_fallback_proxy
+            self.current_proxy = proxy
+            self.current_label = f"tp-fallback({proxy_log_label(proxy) or proxy})"
+            return {
+                "rotated": False,
+                "mode": "tetherpool",
+                "proxy": proxy,
+                "label": self.current_label,
+                "account_id": "",
+                "error": str(exc),
+                "fallback": True,
+                "scope": "browser_only",
+            }
+        self._last_error = ""
+        self._tp_warm_binding_locked(str(lease["account_id"]))
+        proxy = self._tp_gateway_url_locked(lease["account_id"])
+        self.current_proxy = proxy
+        self.current_label = (
+            f"tp:{lease.get('node_name')}({lease.get('exit_ip') or '?'})"
+        )
+        self._tp_current_account = str(lease["account_id"])
+        self._tp_node = str(lease.get("node_name") or "")
+        return {
+            "rotated": True,
+            "mode": "tetherpool",
+            "proxy": proxy,
+            "label": self.current_label,
+            "account_id": lease["account_id"],
+            "node": lease.get("node_name") or "",
+            "exit_ip": lease.get("exit_ip") or "",
+            "pool_size": None,
+            "prev": self.current_label,
+            "scope": "browser_only",
+        }
+
+    def report_tetherpool_battery(self, error_type: str, log: LogFn = None) -> dict[str, Any]:
+        """Report a reg fail-fast (browser_boot / connection dead / 429) upstream.
+
+        Forces the CURRENT account's sticky binding off the failed node; the next
+        maybe_rotate(force=True) acquires a fresh registration lease anyway, so this
+        exists to keep the pool's circuit breaker informed (供给归池边界).
+        Safe no-op outside tetherpool mode or without an active lease account.
+        """
+        with self._lock:
+            if self.mode != "tetherpool":
+                return {"ok": False, "reason": f"mode={self.mode}"}
+            account_id = getattr(self, "_tp_current_account", "")
+        if not account_id:
+            return {"ok": False, "reason": "no_active_account"}
+        try:
+            with self._lock:
+                client = self._tp_client_locked()
+            client.report_battery_error(
+                account_id=account_id,
+                error_type=error_type,
+                service=self.tp_target_service,
+                force_rebind=True,
+            )
+            return {"ok": True, "account_id": account_id}
+        except Exception as exc:
+            _log(log, f"[!] tetherpool battery event skip: {exc}")
+            return {"ok": False, "reason": str(exc)}
+
+    def _rotate_list_locked(self, cfg: dict | None = None) -> dict[str, Any]:
+        if not self.list_pool:
+            raise RuntimeError("proxy_rotate_mode=list 但 proxy_list 为空")
+        prev = self.current_proxy
+        pick_reason = "round_robin"
+        # First claim keeps pool[0] (symmetric to clash on_start_keep_current).
+        if not self._started and self.accounts_on_current == 0:
+            self.list_index = 0
+            proxy = self.list_pool[0]
+        else:
+            nxt = ""
+            try:
+                import node_score as _ns
+
+                if _ns.correlation_enabled(cfg):
+                    dom = (self._registration_domain or "").strip().lower()
+                    if dom:
+                        cand = _ns.preferred_node_for(
+                            dom, self.list_pool, prev or self.list_pool[0], cfg=cfg
+                        )
+                        if cand and cand in self.list_pool:
+                            nxt = cand
+                            pick_reason = "pair_affinity"
+            except Exception:
+                nxt = ""
+                pick_reason = "round_robin"
+            if not nxt or nxt not in self.list_pool:
+                try:
+                    import node_score as _ns
+
+                    if _ns.scoring_enabled(cfg):
+                        nxt = _ns.pick_next(
+                            self.list_pool, prev or self.list_pool[0], cfg=cfg
+                        )
+                        if pick_reason != "pair_affinity":
+                            pick_reason = "node_score"
+                    else:
+                        raise RuntimeError("use round_robin")
+                except Exception:
+                    nxt = ""
+            if nxt and nxt in self.list_pool:
+                self.list_index = self.list_pool.index(nxt)
+                proxy = nxt
+            else:
+                self.list_index = (self.list_index + 1) % len(self.list_pool)
+                proxy = self.list_pool[self.list_index]
+                pick_reason = "round_robin"
+        self.current_proxy = proxy
+        self.current_label = proxy_log_label(proxy) or proxy
+        return {
+            "rotated": True,
+            "mode": "list",
+            "proxy": proxy,
+            "label": self.current_label,
+            "index": self.list_index,
+            "pool_size": len(self.list_pool),
+            "prev": proxy_log_label(prev) or prev,
+            "scope": "browser_only",
+            "pick": pick_reason,
+        }
+
+    def _rotate_clash_locked(
+        self,
+        log: LogFn = None,
+        *,
+        force_advance: bool = False,
+        cfg: dict | None = None,
+    ) -> dict[str, Any]:
+        self._ensure_clash_setup_locked(log=log)
+        # hard guard again
+        if self.clash_group in {self.clash_donor_group, "GLOBAL"}:
+            raise RuntimeError(
+                f"拒绝轮换主策略组 {self.clash_group!r}；请使用专用组 {DEFAULT_CLASH_GROUP}"
+            )
+        nodes, now, _info = clash_list_nodes(
+            self.clash_api,
+            self.clash_group,
+            secret=self.clash_secret,
+            exclude_re=self.clash_exclude,
+            include_re=self.clash_include,
+        )
+        if not nodes:
+            raise RuntimeError(f"clash group {self.clash_group!r} 无可用节点")
+        if not self._original_clash_node:
+            self._original_clash_node = now
+
+        # First due rotate (rotate_on_start): claim current / pin — do NOT advance off
+        # pre-pinned GROK_NODE (smoke bug: TUIC → AnyTLS on worker start).
+        # force_advance (fail-fast path switch): always leave current node.
+        # advance_on_start (opt-in): one-shot runs want a FRESH exit IP — skip the
+        # keep-current/pin branch and advance straight to the next healthy node.
+        advance_on_start = bool(cfg and cfg.get("proxy_rotate_advance_on_start"))
+        if not self._started and advance_on_start and not force_advance:
+            _log(log, f"[*] advance_on_start: 首调用推进到下一节点(新 IP) pool={len(nodes)}")
+        # Per-leaf listeners: each in-flight attempt dials its own node, so
+        # parallel workers do not share the selector's single `now`.
+        if self.leaf_listeners:
+            free = [n for n in nodes if n in self.leaf_listeners and n not in self._held_leaves]
+            if free:
+                nxt_leaf = free[0]
+                self._leaf_overflow = 0
+            else:
+                # Every leaf is still held (or a hold leaked). Round-robin
+                # rather than pinning the rest of the batch to nodes[0].
+                # The first overflow pick is pool[1]: pool[0] is the one a
+                # leaked hold would otherwise keep forever.
+                pool = [n for n in nodes if n in self.leaf_listeners]
+                if pool:
+                    nxt_leaf = pool[(self._leaf_overflow + 1) % len(pool)]
+                    self._leaf_overflow += 1
+                else:
+                    nxt_leaf = ""
+            if nxt_leaf:
+                self._held_leaves.add(nxt_leaf)
+                url = self.leaf_listeners[nxt_leaf]
+                self.current_proxy = url
+                self.current_label = nxt_leaf
+                return {
+                    "rotated": True,
+                    "mode": "clash",
+                    "label": nxt_leaf,
+                    "node": nxt_leaf,
+                    "prev": now,
+                    "reason": "leaf_listener",
+                    "group": self.clash_group,
+                    "pool_size": len(self.leaf_listeners),
+                    "domains": list(self.clash_domains),
+                    "proxy": url,
+                    "scope": "leaf_listener",
+                    "will_restore": False,
+                    "original": self._original_clash_node,
+                }
+
+        if not self._started and not force_advance and not advance_on_start:
+            pin = self.clash_pin_node
+            if pin and pin in nodes and pin != now:
+                clash_switch_node(
+                    self.clash_api,
+                    self.clash_group,
+                    pin,
+                    secret=self.clash_secret,
+                    flush=self.clash_flush,
+                )
+                self._clash_dirty = True
+                self.current_label = pin
+                return {
+                    "rotated": True,
+                    "mode": "clash",
+                    "label": pin,
+                    "node": pin,
+                    "prev": now,
+                    "reason": "pin_current_on_start",
+                    "group": self.clash_group,
+                    "pool_size": len(nodes),
+                    "domains": list(self.clash_domains),
+                    "proxy": proxy_log_label(self.current_proxy) or self.current_proxy,
+                    "scope": "domain_rules_only",
+                    "will_restore": self.clash_restore_on_exit,
+                    "original": self._original_clash_node,
+                }
+            # Keep current node (symmetric to list mode using pool[0] first).
+            claim = pin if pin and pin == now else now
+            if claim not in nodes:
+                claim = now if now in nodes else nodes[0]
+            self.current_label = claim
+            return {
+                "rotated": False,
+                "mode": "clash",
+                "label": claim,
+                "node": claim,
+                "reason": "on_start_keep_current",
+                "group": self.clash_group,
+                "pool_size": len(nodes),
+                "domains": list(self.clash_domains),
+                "proxy": proxy_log_label(self.current_proxy) or self.current_proxy,
+                "scope": "domain_rules_only",
+                "will_restore": self.clash_restore_on_exit,
+                "original": self._original_clash_node,
+            }
+
+        # Mint holds freeze the leaf so concurrent reg fail-fast cannot steal
+        # the shared mixed-port egress while a mint browser/token-poll runs.
+        self._sweep_stale_mint_holds_locked(log=log)
+        hold = self._primary_mint_hold_locked()
+        if hold and hold in nodes:
+            if hold != now:
+                try:
+                    clash_switch_node(
+                        self.clash_api,
+                        self.clash_group,
+                        hold,
+                        secret=self.clash_secret,
+                        flush=self.clash_flush,
+                    )
+                    self._clash_dirty = True
+                except Exception as exc:
+                    self._last_error = str(exc)
+                    _log(log, f"[!] mint_hold re-pin failed: {exc}")
+            self.current_label = hold
+            return {
+                "rotated": hold != now,
+                "mode": "clash",
+                "label": hold,
+                "node": hold,
+                "prev": now,
+                "reason": "mint_hold",
+                "group": self.clash_group,
+                "pool_size": len(nodes),
+                "domains": list(self.clash_domains),
+                "proxy": proxy_log_label(self.current_proxy) or self.current_proxy,
+                "scope": "domain_rules_only",
+                "will_restore": self.clash_restore_on_exit,
+                "original": self._original_clash_node,
+                "holds": self._active_mint_holds_locked(),
+            }
+
+        # Layer ③ pair-affinity nudge (soft): if the in-flight reg domain has a
+        # good, non-cooled pair node, prefer it. OFF / no pair / cooled -> fall
+        # through to scored pick / round-robin unchanged.
+        nxt = ""
+        pick_reason = "round_robin"
+        try:
+            import node_score as _ns  # local module; optional at runtime
+
+            if _ns.correlation_enabled(cfg):
+                dom = (self._registration_domain or "").strip().lower()
+                if dom:
+                    cand = _ns.preferred_node_for(dom, nodes, now, cfg=cfg)
+                    if cand and cand in nodes:
+                        nxt = cand
+                        pick_reason = "pair_affinity"
+        except Exception:
+            nxt = ""
+        if not nxt or nxt not in nodes:
+            try:
+                import node_score as _ns
+
+                if _ns.scoring_enabled(cfg):
+                    got = _ns.pick_next(nodes, now, cfg=cfg)
+                    if got and got in nodes:
+                        nxt = got
+                        if pick_reason != "pair_affinity":
+                            pick_reason = "node_score"
+            except Exception:
+                nxt = ""
+        if not nxt or nxt not in nodes:
+            try:
+                idx = nodes.index(now)
+                nxt = nodes[(idx + 1) % len(nodes)]
+            except ValueError:
+                nxt = nodes[0]
+                if nxt == now and len(nodes) > 1:
+                    nxt = nodes[1]
+            pick_reason = "round_robin"
+        if nxt == now:
+            # force_advance (fail-fast zero-gain path) MUST leave the current
+            # leaf — staying on it defeats the whole point. pick_next returns
+            # `now` only when every other node is cooled and `now` is the sole
+            # active one. In that case force-pick the *least bad* other node
+            # (cooled is better than the same known-dead leaf); if the pool
+            # literally has no other node, signal the caller to reload rather
+            # than silently keep the dead leaf.
+            if force_advance:
+                others = [n for n in nodes if n != now]
+                if not others:
+                    _log(
+                        log,
+                        "[!] force_advance: pool has no node other than "
+                        f"{now!r}; requesting clash reload",
+                    )
+                    self.current_label = now
+                    return {
+                        "rotated": False,
+                        "mode": "clash",
+                        "label": now,
+                        "node": now,
+                        "reason": "force_advance_reload_needed",
+                        "group": self.clash_group,
+                        "pool_size": len(nodes),
+                        "scope": "domain_rules_only",
+                    }
+                try:
+                    import node_score as _ns
+                    nxt = max(
+                        others,
+                        key=lambda n: _ns.get_score(n, cfg=cfg),
+                    )
+                except Exception:
+                    nxt = others[0]
+                pick_reason = "force_advance_best_other"
+            else:
+                self.current_label = now
+                return {
+                    "rotated": False,
+                    "mode": "clash",
+                    "label": now,
+                    "node": now,
+                    "reason": "single_or_same_node",
+                    "group": self.clash_group,
+                    "scope": "domain_rules_only",
+                }
+        clash_switch_node(
+            self.clash_api,
+            self.clash_group,
+            nxt,
+            secret=self.clash_secret,
+            flush=self.clash_flush,
+        )
+        self._clash_dirty = True
+        self.current_label = nxt
+        return {
+            "rotated": True,
+            "mode": "clash",
+            "label": nxt,
+            "node": nxt,
+            "prev": now,
+            "group": self.clash_group,
+            "pool_size": len(nodes),
+            "domains": list(self.clash_domains),
+            "proxy": proxy_log_label(self.current_proxy) or self.current_proxy,
+            "scope": "domain_rules_only",
+            "will_restore": self.clash_restore_on_exit,
+            "original": self._original_clash_node,
+            "pick": pick_reason,
+        }
+
+    def maybe_rotate(
+        self,
+        *,
+        force: bool = False,
+        log: LogFn = None,
+        config: dict | None = None,
+    ) -> dict[str, Any]:
+        """Call once before each account attempt (before browser start)."""
+        with self._lock:
+            if self.mode == "off":
+                self._started = True
+                self.accounts_on_current += 1
+                return {"rotated": False, "mode": "off", "label": self.current_label}
+
+            due = self._due_locked(force=force)
+            if not due:
+                self._started = True
+                self.accounts_on_current += 1
+                return {
+                    "rotated": False,
+                    "mode": self.mode,
+                    "label": self.current_label,
+                    "accounts_on_current": self.accounts_on_current,
+                    "every": self.every,
+                }
+
+            try:
+                if self.mode == "list":
+                    result = self._rotate_list_locked(cfg=config)
+                elif self.mode == "tetherpool":
+                    result = self._rotate_tetherpool_locked(cfg=config)
+                else:
+                    # force=True (fail-fast): advance even on first call / same every window
+                    result = self._rotate_clash_locked(
+                        log=log, force_advance=bool(force), cfg=config
+                    )
+                self._last_error = ""
+            except Exception as exc:
+                self._last_error = str(exc)
+                _log(log, f"[!] 代理轮换失败: {exc}")
+                if self.rotate_required:
+                    raise
+                self._started = True
+                self.accounts_on_current += 1
+                return {
+                    "rotated": False,
+                    "mode": self.mode,
+                    "error": str(exc),
+                    "label": self.current_label,
+                }
+
+            self._started = True
+            self.accounts_on_current = 1
+            if config is not None and self.mode in {"list", "tetherpool"}:
+                self.apply_to_config(config)
+            if result.get("rotated"):
+                if result.get("mode") == "clash":
+                    _log(
+                        log,
+                        f"[*] 代理轮换(仅 {result.get('group')} / 域名 {','.join(self.clash_domains)}): "
+                        f"{result.get('prev') or '-'} -> {result.get('label')}"
+                        f" (pool={result.get('pool_size', '?')}; 主策略组不动)",
+                    )
+                    if result.get("will_restore"):
+                        _log(
+                            log,
+                            f"[*] 会话结束将恢复 {result.get('group')} -> "
+                            f"{result.get('original') or '(unknown)'}",
+                        )
+                else:
+                    _log(
+                        log,
+                        f"[*] 代理轮换(仅注册浏览器): "
+                        f"{result.get('prev') or '-'} -> {result.get('label')}"
+                        f" (pool={result.get('pool_size', '?')})",
+                    )
+            return result
+
+    def restore_clash(self, log: LogFn = None) -> bool:
+        """Restore dedicated GROK-REG node only (never touches main group)."""
+        with self._lock:
+            if not self._clash_dirty:
+                return False
+            if not self.clash_restore_on_exit:
+                return False
+            if not self.clash_api or not self.clash_group or not self._original_clash_node:
+                return False
+            if self.clash_group in {self.clash_donor_group, "GLOBAL"}:
+                _log(log, f"[!] 拒绝恢复：group={self.clash_group} 疑似主组")
+                return False
+            target = self._original_clash_node
+            try:
+                clash_switch_node(
+                    self.clash_api,
+                    self.clash_group,
+                    target,
+                    secret=self.clash_secret,
+                    flush=self.clash_flush,
+                )
+                self._clash_dirty = False
+                self.current_label = target
+                _log(log, f"[*] 已恢复专用组节点: {self.clash_group} -> {target}")
+                return True
+            except Exception as exc:
+                _log(log, f"[!] 恢复专用组节点失败: {exc}")
+                return False
+
+
+_rotator = ProxyRotator()
+_rotator_lock = threading.Lock()
+
+
+def _atexit_restore_clash() -> None:
+    try:
+        _rotator.restore_clash(log=lambda m: print(m, flush=True))
+    except Exception:
+        pass
+
+
+def get_rotator() -> ProxyRotator:
+    return _rotator
+
+
+def configure_proxy_rotation(cfg: dict | None, log: LogFn = None) -> ProxyRotator:
+    with _rotator_lock:
+        _rotator.configure(cfg)
+        if cfg is not None:
+            _rotator.apply_to_config(cfg)
+        st = _rotator.status()
+        if st["mode"] == "list":
+            _log(
+                log,
+                f"[*] 代理轮换已启用(仅注册浏览器): mode=list every={st['every']} "
+                f"pool={st['list_size']} current={st['current_label'] or '-'}",
+            )
+        elif st["mode"] == "tetherpool":
+            _log(
+                log,
+                f"[*] 代理轮换已启用(TetherPool 反女巫租约): mode=tetherpool every={st['every']} "
+                f"api={st['tp_api_base']} gateway={st['tp_gateway_base']} "
+                f"tier={st['tp_tier']} service={st['tp_target_service']} "
+                f"cooldown={st['tp_cooldown']}s fallback={st['current_label'] or '-'}",
+            )
+        elif st["mode"] == "clash":
+            _log(
+                log,
+                f"[*] 代理轮换已启用(域名规则专用组): mode=clash every={st['every']} "
+                f"group={st['clash_group']} domains={','.join(st['clash_domains'])} "
+                f"donor={st['clash_donor_group']}（不改主策略组）",
+            )
+        return _rotator
+
+
+def set_registration_domain(domain: str) -> None:
+    """Layer ③ hint: record the in-flight registration email domain on the
+    rotator so the scored-pick block can soft-prefer a good pair node.
+
+    Normalized to lower-case; empty string clears. No-op cost when the
+    EMAIL_IP_CORRELATION switch is off (the hint is simply never consulted).
+    """
+    with _rotator._lock:
+        raw = str(domain or "").strip().lower()
+        # Accept raw email ("user@Host.com") or bare domain; pair keys use host.
+        if raw and "@" in raw:
+            host = raw.split("@")[-1].strip()
+            raw = host or raw
+        _rotator._registration_domain = raw
+
+
+def clear_registration_domain() -> None:
+    with _rotator._lock:
+        _rotator._registration_domain = ""
+
+
+def maybe_rotate_proxy(
+    *,
+    force: bool = False,
+    log: LogFn = None,
+    config: dict | None = None,
+) -> dict[str, Any]:
+    return _rotator.maybe_rotate(force=force, log=log, config=config)
+
+
+def restore_proxy_rotation(log: LogFn = None) -> bool:
+    return _rotator.restore_clash(log=log)
+
+
+def current_proxy_override() -> str:
+    with _rotator._lock:
+        if _rotator.mode in {"list", "tetherpool"} and _rotator.current_proxy:
+            return _rotator.current_proxy
+        # Leaf listeners are per-attempt. Reading the rotator's current_proxy
+        # here races: the next worker overwrites it before this one copies it.
+        # maybe_rotate already returned the URL for this attempt.
+        return ""
+
+
+def release_leaf(node: str) -> None:
+    """Return a per-leaf listener to the free set after an attempt finishes."""
+    name = str(node or "").strip()
+    if not name:
+        return
+    with _rotator._lock:
+        _rotator._held_leaves.discard(name)
+
+
+def current_egress_label() -> str:
+    """Best-effort current node/proxy label for scoring attribution."""
+    with _rotator._lock:
+        if _rotator.mode == "clash":
+            return str(_rotator.current_label or "").strip()
+        if _rotator.mode in {"list", "tetherpool"}:
+            return (
+                proxy_log_label(_rotator.current_proxy)
+                or _rotator.current_label
+                or _rotator.current_proxy
+                or ""
+            )
+        return str(_rotator.current_label or "").strip()
+
+
+def acquire_mint_egress(node: str, log: LogFn = None) -> dict[str, Any]:
+    """Hold clash leaf for one mint job (same IP as registration for that account)."""
+    return _rotator.acquire_mint_egress(node, log=log)
+
+
+def release_mint_egress(node: str, log: LogFn = None) -> dict[str, Any]:
+    """Release one mint leaf hold after mint finishes (ok or fail)."""
+    return _rotator.release_mint_egress(node, log=log)
+
+
+def report_tetherpool_battery(error_type: str, log: LogFn = None) -> dict[str, Any]:
+    """Report a reg fail-fast upstream to TetherPool (mode=tetherpool only)."""
+    return _rotator.report_tetherpool_battery(error_type, log=log)
+
+
+def note_egress_outcome(
+    kind: str,
+    *,
+    node: str | None = None,
+    log: LogFn = None,
+    config: dict | None = None,
+) -> dict[str, Any]:
+    """Record success/fail for dynamic weight. No-op when NODE_SCORE off or import fails.
+
+    kind: mint_ok | reg_ok | turnstile | browser_boot | other_fail
+    """
+    label = (node or "").strip() or current_egress_label()
+    if not label:
+        return {"ok": False, "reason": "no_label"}
+    try:
+        import node_score as _ns
+
+        return _ns.record(label, kind, cfg=config, log=log)
+    except Exception as exc:
+        _log(log, f"[node_score] record skip: {exc}")
+        return {"ok": False, "reason": str(exc)}
