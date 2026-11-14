@@ -288,8 +288,27 @@ def browser_apply(
         try:
             exec_result = await executor.fill_form(url, data)
             console.print("[bold green]✓ Browser agent finished![/bold green]")
-            console.print(f"Result: {exec_result}")
-            return True
+            # Structured, machine-parsable per-field outcome.
+            console.print(f"Success: {exec_result['success']}")
+            if exec_result.get("failure_reason"):
+                console.print(
+                    f"[red]Failure reason: {exec_result['failure_reason']} "
+                    f"({exec_result.get('error')})[/red]"
+                )
+            for field_result in exec_result.get("field_results", []):
+                status = field_result["status"]
+                color = {
+                    "filled": "green",
+                    "truncated": "yellow",
+                    "label_not_found": "red",
+                    "not_mapped": "dim",
+                    "fill_error": "red",
+                }.get(status, "white")
+                console.print(
+                    f" - [{color}]{status}[/{color}] {field_result['label']!r}"
+                    + (f": {field_result['error']}" if field_result.get("error") else "")
+                )
+            return bool(exec_result["success"])
         except Exception as e:
             console.print(f"[red]Error during browser automation: {e}[/red]")
             return False
