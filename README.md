@@ -160,11 +160,20 @@ When learning finishes, the skill folder looks like this:
 ├── StarRepository.json             # one JSON per command; the LLM decides the split
 └── log_1745553600/
     ├── events.json           # raw DOM events captured from the extension
+    ├── snapshots/            # per-event DOM HTML, referenced from events.json
     ├── normalized.json       # stage 1 output
     ├── resolved.json         # stage 2 output (pruned constellations)
     ├── identified.json       # stage 3 output (retrieval plan, if any)
     └── synthesized.json      # stage 4 output (skill with constellations bound into DSL)
 ```
+
+`events.json` is a complete, ordered record of the capture. Records are
+written in arrival order and carry contiguous ids (`e1`, `e2`, …) that
+match their position in the array. If a DOM snapshot cannot be persisted,
+the event is kept — `snapshot` is `null` and `snapshot_status: "failed"`
+plus `snapshot_error` say why. Stopping a capture waits for events already
+accepted by the bridge, so the returned `events.json` includes them; events
+that arrive after the stop are answered with `recording: false`.
 
 Instead of compressing each click into a brittle CSS selector, `freu-cli`
 captures a **constellation** — the clicked element plus its ancestors,

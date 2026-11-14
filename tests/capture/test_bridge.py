@@ -117,3 +117,69 @@ def test_capture_event_returns_recording_false_when_sink_unset(bridge):
     )
     assert status_code == 200
     assert body == {"ok": True, "recording": False}
+
+
+def test_capture_event_returns_error_when_sink_raises():
+    def _failing_sink(_payload: dict) -> None:
+        raise RuntimeError("snapshot store exploded")
+
+    port = _free_port()
+    handle = start_bridge_server(
+        host="127.0.0.1", port=port, capture_sink=_failing_sink,
+    )
+    try:
+        status_code, body = _post_json(
+            "127.0.0.1", port, "/bridge/capture-event",
+            {"event": {"type": "click"}},
+        )
+    finally:
+        handle.shutdown()
+
+    assert status_code == 500
+    assert body["ok"] is False
+    assert body["recording"] is True
+    assert "snapshot store exploded" in body["error"]
+
+
+def test_capture_event_sink_failure_does_not_set_sink_and_report_unset(bridge):
+    """A sink exception must not be conflated with 'no active session'."""
+    handle, port, _ = bridge
+
+    def _failing_sink(_payload: dict) -> None:
+        raise ValueError("boom")
+
+    handle.state.set_capture_sink(_failing_sink)
+    status_code, body = _post_json(
+        "127.0.0.1", port, "/bridge/capture-event",
+        {"event": {"type": "click"}},
+    )
+    assert status_code == 500
+    assert body["recording"] is True
+    assert body["ok"] is False
+
+
+def test_status_capturing_false_when_sink_unset(bridge):
+    handle, port, _ = bridge
+    handle.state.set_capture_sink(None)
+    status_code, body = _get_json("127.0.0.1", port, "/bridge/status")
+    assert status_code == 200
+    assert body["capturing"] is False
+
+
+def test_wait_for_capture_idle_tracks_in_flight_events():
+    handle = start_bridge_server(
+        host="127.0.0.1", port=_free_port(),
+        capture_sink=lambda _payload: None,
+    )
+    try:
+        assert handle.state.claim_capture_sink() is not None
+        assert handle.state.capture_in_flight() == 1
+        handle.state.set_capture_sink(None)
+        # Already-claimed events still count as in flight after the gate closes.
+        assert handle.state.claim_capture_sink() is None
+        assert handle.state.wait_for_capture_idle(timeout=0.05) is False
+        handle.state.release_capture_sink()
+        assert handle.state.capture_in_flight() == 0
+        assert handle.state.wait_for_capture_idle(timeout=1.0) is True
+    finally:
+        handle.shutdown()

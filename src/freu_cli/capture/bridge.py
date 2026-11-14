@@ -8,10 +8,21 @@ Two jobs:
    the extension to execute.
 
 2. **Capture-event ingestion** — `/bridge/capture-event`. When a capture
-   session is active, the extension POSTs every user action here. We build an
-   `events.json` record and append it to the session's event list (either via
-   a registered sink for in-process capture, or dropped when no session is
-   active).
+   session is active, the extension POSTs every user action here. The payload
+   is handed to the registered capture sink, which builds an `events.json`
+   record.
+
+   The endpoint distinguishes two outcomes that must not be conflated:
+
+   * no active session — `200 {"ok": true, "recording": false}`; the event
+     was not recorded because recording was never on (or has just been
+     switched off at stop);
+   * the active session failed to accept the event — `500 {"ok": false,
+     "recording": true, "error": ...}`; recording was on, the event is lost,
+     and the caller must be able to tell that apart from "not recording".
+
+   In-flight capture requests are counted so that stopping a session can
+   wait for every accepted event to finish before `events.json` is written.
 
 Run directly with `python -m freu_cli.capture.bridge serve --pid-file <path>`.
 """
@@ -21,6 +32,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import logging
 import os
 import signal
 import threading
@@ -33,6 +45,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
@@ -97,6 +111,13 @@ class BridgeState:
     extension_last_poll_at: float | None = None
     last_activity_at: float = field(default_factory=time.time)
     capture_sink: CaptureSink | None = None
+    # Number of capture events currently being handed to the sink. Guarded
+    # by `lock`; the condition wakes shutdown once it drops back to zero.
+    _capture_in_flight: int = 0
+    _capture_idle: threading.Condition = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._capture_idle = threading.Condition(self.lock)
 
     def mark_extension_poll(self) -> None:
         with self.lock:
@@ -137,6 +158,46 @@ class BridgeState:
     def get_capture_sink(self) -> CaptureSink | None:
         with self.lock:
             return self.capture_sink
+
+    def claim_capture_sink(self) -> CaptureSink | None:
+        """Atomically take the active sink and count the event as in flight.
+
+        Returns None when no session is active. The caller must pass a
+        non-None result to `release_capture_sink()` in a `finally` block.
+        """
+        with self.lock:
+            sink = self.capture_sink
+            if sink is not None:
+                self._capture_in_flight += 1
+            return sink
+
+    def release_capture_sink(self) -> None:
+        with self.lock:
+            if self._capture_in_flight > 0:
+                self._capture_in_flight -= 1
+            if self._capture_in_flight == 0:
+                self._capture_idle.notify_all()
+
+    def wait_for_capture_idle(self, timeout: float | None = 30.0) -> bool:
+        """Block until every accepted capture event has left the sink.
+
+        Returns True when idle, False when `timeout` elapsed first.
+        """
+        deadline = None if timeout is None else time.time() + timeout
+        with self._capture_idle:
+            while self._capture_in_flight > 0:
+                if deadline is None:
+                    self._capture_idle.wait()
+                    continue
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return False
+                self._capture_idle.wait(timeout=remaining)
+            return True
+
+    def capture_in_flight(self) -> int:
+        with self.lock:
+            return self._capture_in_flight
 
 
 class BridgeRequestHandler(BaseHTTPRequestHandler):
@@ -241,18 +302,31 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/bridge/capture-event":
                 self.state.mark_activity()
-                sink = self.state.get_capture_sink()
+                # Claiming the sink and counting the request in flight is a
+                # single step: once a session has been obtained here, shutdown
+                # waits for it instead of racing the final flush.
+                sink = self.state.claim_capture_sink()
                 if sink is None:
                     self._send_json(HTTPStatus.OK, {"ok": True, "recording": False})
                     return
                 try:
                     sink(payload)
                 except Exception as exc:  # noqa: BLE001
+                    # A live session failed to accept the event. Return an
+                    # explicit error — do not report recording=false, and do
+                    # not hide the exception from the server log.
+                    logger.exception("capture sink failed to handle event")
                     self._send_json(
                         HTTPStatus.INTERNAL_SERVER_ERROR,
-                        {"ok": False, "error": f"capture sink failed: {exc}"},
+                        {
+                            "ok": False,
+                            "recording": True,
+                            "error": f"capture sink failed: {exc}",
+                        },
                     )
                     return
+                finally:
+                    self.state.release_capture_sink()
                 self._send_json(HTTPStatus.OK, {"ok": True, "recording": True})
                 return
             self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "Not found"})
