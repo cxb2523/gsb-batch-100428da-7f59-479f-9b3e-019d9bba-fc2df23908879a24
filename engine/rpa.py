@@ -418,29 +418,69 @@ class BossRpa:
         max_greet = action.get("max_greet_count", 30)
         greeted_count = 0
 
+        counted_pages = 0          # 实际抓取并处理过的页数（与 stats["page"] 同步）
+        skipped_pages = 0          # 因「翻页未生效」整页跳过的次数
+        empty_page_pos = None      # 空页所在位置（第 N 次翻页尝试）
+        stopped_by_max_greet = False
+        last_page_keys = None      # 上一个有效页的候选人去重键集合
+        end_reason = "达到最大页数"
+
         for page_idx in range(1, max_pages + 1):
             if self.stop_event.is_set():
+                end_reason = "收到停止指令"
                 self.log("收到停止指令，任务结束。")
                 break
-            self.stats["page"] = page_idx
+
+            parsed = self._collect_page(prev_keys=last_page_keys)
+            if self.stop_event.is_set():  # 等待翻页加载期间收到停止指令
+                end_reason = "收到停止指令"
+                self.log("收到停止指令，任务结束。")
+                break
+
+            if not parsed:
+                empty_page_pos = page_idx
+                end_reason = f"空页（第 {page_idx} 页）"
+                self.log(f"⚠️ 第 {page_idx} 页为空页（抓取到 0 个候选人），抓取到此结束，不再继续翻页。")
+                break
+
+            page_keys = self._page_keys(parsed)
+
+            # 翻页后列表仍是同一批人：整页跳过，不重复计入 scanned/matched/greeted
+            if last_page_keys and page_keys and page_keys == last_page_keys:
+                skipped_pages += 1
+                self.log(
+                    f"⚠️ 第 {page_idx} 页：翻页未生效（本页 {len(parsed)} 个候选人与上一页完全相同），"
+                    f"跳过该页，不重复计入 scanned/matched/greeted。"
+                )
+                if page_idx >= max_pages:
+                    end_reason = f"达到最大页数（第 {page_idx} 页翻页未生效）"
+                    break
+                outcome, detail = self._go_next_page(page)
+                if outcome != "advanced":
+                    end_reason = self._log_page_stop(outcome, detail, page_idx, counted_pages)
+                    break
+                continue
+
+            counted_pages += 1
+            self.stats["page"] = counted_pages
             self.push_state()
+            self.log(f"第 {page_idx} 页：抓取到 {len(parsed)} 个候选人。")
+            last_page_keys = page_keys
 
-            rows = self._collect_rows()
-            self.log(f"第 {page_idx} 页：抓取到 {len(rows)} 个候选人。")
-
-            for row in rows:
+            for row, profile in parsed:
                 if self.stop_event.is_set():
                     break
-                profile = self._parse_row(row)
                 if not profile.get("name"):
                     self.stats["skipped"] += 1
                     continue
 
-                key = f"{profile['name']}|{profile.get('position','')}|{profile.get('company','')}"
+                key = self._record_key(profile["name"], profile.get("position"), profile.get("company"))
                 if key in self.greeted_keys:
                     self.log(f"跳过（已打招呼）：{profile['name']}")
                     continue
                 if greeted_count >= max_greet:
+                    stopped_by_max_greet = True
+                    end_reason = f"达到单次打招呼上限（{max_greet}）"
                     self.log(f"已达单次运行打招呼上限（{max_greet}），任务结束。")
                     self.stop_event.set()
                     break
@@ -463,6 +503,14 @@ class BossRpa:
                         self.stats["greeted"] += 1
                         self.greeted_keys.add(key)
                         self.recorder.write(profile, score, reason, "已打招呼", self._record_mode())
+                        if greeted_count >= max_greet:
+                            # 刚好达到上限：不再抓取后续页，汇总日志标记提前停止
+                            stopped_by_max_greet = True
+                            end_reason = f"达到单次打招呼上限（{max_greet}）"
+                            self.log(f"已达单次运行打招呼上限（{max_greet}），任务结束。")
+                            self.stop_event.set()
+                            self.push_state()
+                            break
                     else:
                         self.recorder.write(profile, score, reason, "已匹配未打招呼", self._record_mode())
                 else:
@@ -473,13 +521,31 @@ class BossRpa:
                 # 随机延时模拟真人
                 time.sleep(random.randint(action.get("interval_min_ms", 4000), action.get("interval_max_ms", 8000)) / 1000)
 
-            if self.stop_event.is_set():
+            if stopped_by_max_greet:
                 break
-            if page_idx < max_pages:
-                if not self.goto_next_page(page):
-                    self.log("没有下一页了，抓取结束。")
-                    break
+            if self.stop_event.is_set():
+                end_reason = "收到停止指令"
+                break
+            if page_idx >= max_pages:
+                end_reason = f"达到最大页数（{max_pages} 页）"
+                break
 
+            outcome, detail = self._go_next_page(page)
+            if outcome != "advanced":
+                end_reason = self._log_page_stop(outcome, detail, page_idx, counted_pages)
+                break
+
+        self.log(
+            "📊 多页抓取汇总："
+            f"实际抓取 {counted_pages} 页（stats.page={self.stats['page']}）；"
+            f"因翻页未生效跳过 {skipped_pages} 页；"
+            f"空页结束位置：{('第 %d 页' % empty_page_pos) if empty_page_pos else '无'}；"
+            f"因达到单次打招呼上限提前停止：{'是' if stopped_by_max_greet else '否'}；"
+            f"结束原因：{end_reason}。"
+            f"本次共扫描 {self.stats['scanned']} 人（stats.scanned={self.stats['scanned']}）、"
+            f"匹配 {self.stats['matched']} 人（stats.matched={self.stats['matched']}）、"
+            f"打招呼 {self.stats['greeted']} 人（stats.greeted={self.stats['greeted']}）。"
+        )
         self.log("任务完成。")
 
     # ---------- 沟通页流程：发送常用语 + 求简历 ----------
@@ -710,6 +776,100 @@ class BossRpa:
     def _record_mode(self):
         return "飞书" if self.config.get("recording", {}).get("mode") == "feishu" else "本地Excel"
 
+    # ---------- 翻页 ----------
+    # 翻页后等待列表刷新的最长时间（秒）：超过仍与上一页相同即判定「翻页未生效」
+    PAGE_CHANGE_TIMEOUT = 5.0
+
+    @staticmethod
+    def _page_keys(parsed):
+        """本页候选人的去重键集合（姓名|岗位|公司）。"""
+        return {
+            BossRpa._record_key(p.get("name"), p.get("position"), p.get("company"))
+            for _, p in parsed if p.get("name")
+        }
+
+    def _collect_page(self, prev_keys=None):
+        """抓取当前页候选人，返回 [(row, profile), ...]。
+
+        首页只抓一次（保持单页行为不变）；翻页后若列表与上一页完全相同（含本页为空），
+        会在 PAGE_CHANGE_TIMEOUT 内轮询等待异步刷新，超时仍相同则交给调用方判定结局。
+        """
+        parsed = [(row, self._parse_row(row)) for row in self._collect_rows()]
+        if prev_keys is None:
+            return parsed
+        deadline = time.time() + self.PAGE_CHANGE_TIMEOUT
+        while not self.stop_event.is_set() and time.time() < deadline:
+            keys = self._page_keys(parsed)
+            if keys and keys != prev_keys:
+                return parsed
+            time.sleep(0.8)
+            parsed = [(row, self._parse_row(row)) for row in self._collect_rows()]
+        return parsed
+
+    @staticmethod
+    def _btn_disabled(btn):
+        """按钮是否已禁用（disabled 属性 / disabled class / aria-disabled）。"""
+        try:
+            if btn.is_disabled(timeout=500):
+                return True
+        except Exception:
+            pass
+        try:
+            cls = btn.get_attribute("class") or ""
+            if re.search(r"(^|[-\s])(disabled|is-disable)([-\s]|$)", cls):
+                return True
+            if btn.get_attribute("aria-disabled") == "true":
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _go_next_page(self, page):
+        """尝试翻到下一页。返回 (outcome, detail)：
+
+        - advanced：已点击并完成翻页动作；
+        - no_next ：没有下一页（找不到按钮，或按钮已禁用 = 最后一页）；
+        - failed  ：找到按钮但点击抛异常（翻页失败）。
+        """
+        try:
+            self._op_frame().page.mouse.wheel(0, 5000)
+            time.sleep(1)
+        except Exception:
+            pass
+
+        buttons = []
+        next_btn = self._loc_first(SELECTORS["page"]["next_page"], timeout=1500)
+        if next_btn is not None:
+            buttons.append(("下一页按钮", next_btn))
+        more = self._loc_first(SELECTORS["page"]["load_more"], timeout=1000)
+        if more is not None:
+            buttons.append(("加载更多按钮", more))
+        if not buttons:
+            return "no_next", "未找到下一页 / 加载更多按钮"
+
+        enabled = [(label, btn) for label, btn in buttons if not self._btn_disabled(btn)]
+        if not enabled:
+            return "no_next", "下一页 / 加载更多按钮均已禁用（最后一页）"
+
+        last_err = ""
+        for label, btn in enabled:
+            try:
+                btn.click(timeout=3000)
+                time.sleep(1.5)
+                return "advanced", label
+            except Exception as e:
+                last_err = f"{label}点击异常：{str(e).strip().splitlines()[0]}"
+                continue
+        return "failed", last_err or "翻页按钮点击失败"
+
+    def _log_page_stop(self, outcome, detail, page_pos, counted_pages):
+        """记录翻页动作的两种失败结局，返回写进汇总日志的结束原因。"""
+        if outcome == "no_next":
+            self.log(f"第 {page_pos} 页后翻页结束：没有下一页（{detail}）。")
+            return f"没有下一页（停在第 {page_pos} 页，已抓取 {counted_pages} 页）"
+        self.log(f"⚠️ 第 {page_pos} 页后翻页失败：{detail}。抓取中止。")
+        return f"翻页失败（停在第 {page_pos} 页，已抓取 {counted_pages} 页）"
+
     def _collect_rows(self):
         frame = self._op_frame()
         for sel in SELECTORS["page"]["candidate_row"]:
@@ -822,25 +982,9 @@ class BossRpa:
         return True
 
     def goto_next_page(self, page):
-        self._op_frame().page.mouse.wheel(0, 5000)
-        time.sleep(1)
-        next_btn = self._loc_first(SELECTORS["page"]["next_page"], timeout=1500)
-        if next_btn is not None:
-            try:
-                next_btn.click(timeout=3000)
-                time.sleep(1.5)
-                return True
-            except Exception:
-                return False
-        more = self._loc_first(SELECTORS["page"]["load_more"], timeout=1000)
-        if more is not None:
-            try:
-                more.click(timeout=3000)
-                time.sleep(1.5)
-                return True
-            except Exception:
-                return False
-        return False
+        """兼容旧接口：返回是否成功翻页（细节结局见 _go_next_page）。"""
+        outcome, _ = self._go_next_page(page)
+        return outcome == "advanced"
 
     # ---------- 7. 总入口 ----------
     def run(self):
