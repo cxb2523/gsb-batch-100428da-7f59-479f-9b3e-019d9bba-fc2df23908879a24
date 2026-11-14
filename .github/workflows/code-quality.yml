@@ -1,0 +1,77 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  code-quality:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v3
+
+    - name: Install dependencies
+      run: |
+        uv sync --dev
+
+    - name: Lint and format with ruff
+      run: |
+        uv run ruff check crawl4weibo --output-format=github
+        uv run ruff format crawl4weibo --check --diff
+
+    - name: Security check with bandit
+      run: |
+        uv tool run bandit -r crawl4weibo -f json -o bandit-report.json || true
+
+    - name: Upload bandit report
+      uses: actions/upload-artifact@v4
+      with:
+        name: bandit-report
+        path: bandit-report.json
+
+  dependency-check:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.10"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v3
+
+    - name: Export locked dependencies including optional MCP support
+      run: |
+        uv export --locked --all-extras --group dev --no-emit-project \
+          --format requirements-txt --output-file requirements-audit.txt
+
+    - name: Check locked dependencies for vulnerabilities
+      run: |
+        uv tool run pip-audit==2.10.1 --requirement requirements-audit.txt \
+          --require-hashes --disable-pip --strict \
+          --format json --output pip-audit-report.json
+
+    - name: Upload dependency audit report
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: pip-audit-report
+        path: pip-audit-report.json
+        if-no-files-found: error
