@@ -21,15 +21,23 @@ Python SDK for Muse & Groq bots:
 import argparse
 import asyncio
 import json
+import math
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
+import time
+from collections.abc import Mapping
+from urllib.parse import urlsplit
 
 IS_WINDOWS = sys.platform == "win32"
 MAX_OUT = 8000
+# Minimum spacing between two fetches started against the same hostname
+# (case-insensitive). Different hostnames never wait on each other.
+DEFAULT_BATCH_MIN_INTERVAL_MS = 2000
 SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 VENV_DIR = os.path.join(SCRIPT_DIR, ".venv")
 VENV_BIN = os.path.join(VENV_DIR, "Scripts" if IS_WINDOWS else "bin")
@@ -595,6 +603,174 @@ class HomeBrowser:
         if isinstance(content, list):
             return "\n\n".join(str(c) for c in content if c)
         return str(content)
+
+    @staticmethod
+    def _batch_host_key(url: str) -> str:
+        """Return the lowercased hostname used to group batch requests.
+
+        Applies the exact scheme completion that :meth:`fetch` performs, so a
+        request is grouped by the host that will actually be contacted
+        (``example.com/x`` and ``https://EXAMPLE.com/y`` are the same host).
+        """
+        text = url.strip()
+        if not text.startswith("http://") and not text.startswith("https://"):
+            text = "https://" + text
+        try:
+            host = urlsplit(text).hostname
+        except ValueError:
+            host = None
+        return (host or text).lower()
+
+    @staticmethod
+    def _validate_batch_requests(requests, default_extraction_type):
+        """Validate batch input up-front and normalise it to (url, extraction_type)."""
+        if not isinstance(requests, list):
+            raise ValueError(
+                f"fetch_many expects a list of request dicts, got {type(requests).__name__}"
+            )
+
+        items = []
+        for index, item in enumerate(requests):
+            where = f"fetch_many request at index {index}"
+            if not isinstance(item, Mapping):
+                raise ValueError(f"{where} must be a dict with a 'url' key, got {type(item).__name__}")
+            if "url" not in item:
+                raise ValueError(f"{where} is missing the required 'url' key")
+            url = item["url"]
+            if not isinstance(url, str):
+                raise ValueError(f"{where} has a non-string 'url': {url!r}")
+            if not url.strip():
+                raise ValueError(f"{where} has an empty 'url'")
+
+            extraction_type = item.get("extraction_type")
+            if extraction_type is None:
+                extraction_type = default_extraction_type
+            if not isinstance(extraction_type, str) or not extraction_type.strip():
+                raise ValueError(f"{where} has an invalid 'extraction_type': {extraction_type!r}")
+
+            items.append((url, extraction_type))
+        return items
+
+    def fetch_many(
+        self,
+        requests: list[dict],
+        min_interval_ms: float | None = None,
+        extraction_type: str = "markdown",
+        solve_cloudflare: bool = True,
+        wait: int | None = None,
+        network_idle: bool = True,
+        clock=None,
+        sleep=None,
+    ) -> list[dict]:
+        """Fetch several URLs, spacing out calls to the same hostname.
+
+        Each request is a dict with a required ``url`` and an optional
+        ``extraction_type`` (default: ``"markdown"``). Every request goes
+        through :meth:`fetch`, so URL scheme completion, the Amazon wait and
+        the ``browser_fetch_once`` → ``stealthy_fetch`` fallback behave exactly
+        as for a single fetch.
+
+        Requests for the same hostname (case-insensitive) are issued
+        sequentially with at least ``min_interval_ms`` milliseconds between
+        two consecutive starts. Different hostnames run concurrently and never
+        wait on each other. A failing request is recorded in its result and
+        does not abort the rest of the batch.
+
+        Returns one dict per input request, in input order, containing:
+        ``url`` (as supplied), ``ok``, ``output`` (fetch payload on success,
+        error reason on failure) and ``waited_ms`` (time spent waiting for the
+        host's rate-limit slot before this request was issued).
+
+        Raises ``ValueError`` before any fetch is issued if ``requests`` is not
+        a list, an item lacks a ``url``, or a ``url`` is empty.
+
+        ``clock`` and ``sleep`` exist for tests; they default to
+        ``time.monotonic`` and ``time.sleep``.
+        """
+        if min_interval_ms is None:
+            min_interval_ms = DEFAULT_BATCH_MIN_INTERVAL_MS
+        if isinstance(min_interval_ms, bool) or not isinstance(min_interval_ms, (int, float)):
+            raise ValueError(f"min_interval_ms must be a number, got {min_interval_ms!r}")
+        if not math.isfinite(min_interval_ms) or min_interval_ms < 0:
+            raise ValueError(f"min_interval_ms must be a finite, non-negative number, got {min_interval_ms!r}")
+
+        items = self._validate_batch_requests(requests, extraction_type)
+        if not items:
+            return []
+
+        clock = time.monotonic if clock is None else clock
+        sleep = time.sleep if sleep is None else sleep
+        interval_s = min_interval_ms / 1000.0
+
+        # Group request indexes by hostname, preserving input order inside each group.
+        groups: dict[str, list[int]] = {}
+        for index, (url, _) in enumerate(items):
+            groups.setdefault(self._batch_host_key(url), []).append(index)
+
+        results: list[dict | None] = [None] * len(items)
+
+        def run_group(indices: list[int]) -> None:
+            last_start = None
+            for index in indices:
+                url, item_extraction_type = items[index]
+                wait_start = clock()
+                status: dict = {"url": url, "ok": False, "output": "", "waited_ms": 0.0}
+                try:
+                    now = wait_start
+                    if last_start is not None:
+                        deadline = last_start + interval_s
+                        # Loop: sleep may wake early (signals, coarse clocks), and the
+                        # spacing guarantee is measured between actual fetch starts.
+                        while now < deadline:
+                            before = now
+                            sleep(deadline - now)
+                            now = clock()
+                            if now <= before:
+                                # Clock did not advance; avoid spinning forever and
+                                # fall back to the last observed time.
+                                now = before
+                                break
+                    status["waited_ms"] = max(0.0, round((now - wait_start) * 1000.0, 3))
+                    last_start = now
+
+                    status["output"] = self.fetch(
+                        url.strip(),
+                        extraction_type=item_extraction_type,
+                        solve_cloudflare=solve_cloudflare,
+                        wait=wait,
+                        network_idle=network_idle,
+                    )
+                    status["ok"] = True
+                except Exception as exc:  # a single failure must not abort the batch
+                    status["ok"] = False
+                    status["output"] = f"ERROR: {exc}"
+                results[index] = status
+
+        threads = [
+            threading.Thread(target=run_group, args=(indices,), name=f"hbm-fetch-{host}")
+            for host, indices in groups.items()
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        # Defensive: a group thread should never die before filling its slots.
+        for index, result in enumerate(results):
+            if result is None:
+                results[index] = {
+                    "url": items[index][0],
+                    "ok": False,
+                    "output": "ERROR: batch worker did not produce a result",
+                    "waited_ms": 0.0,
+                }
+        return results
+
+    def fetch_batch(self, *args, **kwargs) -> list[dict]:
+        """Alias for :meth:`fetch_many`."""
+        return self.fetch_many(*args, **kwargs)
+
+    batch_fetch = fetch_batch
 
 
 # =====================================================================

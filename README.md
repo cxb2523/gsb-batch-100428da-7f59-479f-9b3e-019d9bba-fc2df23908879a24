@@ -221,6 +221,44 @@ markdown_content = hb.fetch_markdown("https://amazon.com/s?k=mechanical+keyboard
 print(markdown_content)
 ```
 
+### Batch fetching (rate-limited per hostname)
+
+`fetch_many` fetches a list of URLs in one call. Requests for the same hostname
+are issued with a minimum spacing (default 2000 ms) so a single site does not
+rate-limit you; different hostnames run in parallel and never wait on each
+other. Each item's outcome is recorded independently — one failure does not
+abort the batch.
+
+```python
+from hbm import HomeBrowser
+
+hb = HomeBrowser(host="user@100.x.y.z")
+
+results = hb.fetch_many(
+    [
+        {"url": "https://example.com/a"},
+        {"url": "https://example.com/b", "extraction_type": "markdown"},
+        {"url": "https://other.example/c"},
+    ],
+    min_interval_ms=2000,  # optional; this is the default
+)
+
+for item in results:
+    print(item["url"], item["ok"], item["waited_ms"])
+    if not item["ok"]:
+        print("  error:", item["output"])
+```
+
+Each result contains `url` (as supplied), `ok`, `output` (the fetch payload on
+success, the error reason on failure) and `waited_ms` (how long that item
+waited for its hostname's rate-limit slot). Results are always in input order.
+Invalid input (not a list, an item without `url`, or an empty `url`) raises
+`ValueError` before any fetch starts; an empty list returns `[]`.
+
+Every item goes through the normal `fetch` path, so scheme completion, the
+Amazon settle wait and the `browser_fetch_once` → `stealthy_fetch` fallback are
+unchanged.
+
 ### CLI / Shell Integration for Any Cloud Bot
 ```bash
 export HBM_SSH_HOST="user@100.x.y.z"
