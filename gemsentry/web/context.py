@@ -308,6 +308,18 @@ def run_scraper_thread(keywords, max_pages, sort_order, target_count=None, min_d
                 if extra_tenders:
                     add_log(f"Multi-source portals returned {len(extra_tenders)} unique tenders.")
                     new_count += scraper.ingest_external_tenders(extra_tenders)
+                # Surface the per-source ledger: every failed/timed-out portal
+                # becomes a warning so the run is marked partial and the caller
+                # sees exactly which source was absent and why.
+                for outcome in source_registry.get_last_fetch_outcomes():
+                    if outcome.status == "failed":
+                        warnings.append(
+                            f"External portal '{outcome.source_name}' failed: {outcome.reason}"
+                        )
+                    elif outcome.status == "timeout":
+                        warnings.append(
+                            f"External portal '{outcome.source_name}' timed out: {outcome.reason}"
+                        )
         except Exception as ms_err:
             add_log(f"Multi-source fetch error: {ms_err}")
             warnings.append(f"External portal search did not complete: {ms_err}")

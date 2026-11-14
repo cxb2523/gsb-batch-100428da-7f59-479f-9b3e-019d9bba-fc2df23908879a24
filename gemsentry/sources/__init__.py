@@ -7,9 +7,16 @@ portal is a :class:`~gemsentry.sources.base.BaseAdapter` dispatched by
 
 from gemsentry.sources.attribution import annotate_sources, derive_source
 from gemsentry.sources.base import BaseAdapter, UnsupportedAdapter
-from gemsentry.sources.registry import ENGINES, NATIVE_ENGINES, SourceRegistry
+from gemsentry.sources.registry import (
+    ENGINES,
+    NATIVE_ENGINES,
+    FetchResult,
+    SourceOutcome,
+    SourceRegistry,
+)
 
 __all__ = [
     "BaseAdapter", "UnsupportedAdapter", "SourceRegistry", "ENGINES", "NATIVE_ENGINES",
+    "FetchResult", "SourceOutcome",
     "annotate_sources", "derive_source",
 ]
