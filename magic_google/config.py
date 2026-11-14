@@ -22,4 +22,4 @@ class Config:
     DOMAIN = "www.google.com"
     URL_SEARCH = "https://{domain}/search?hl={language}&q={query}&btnG=Search&gbv=1&cr={country}"
     URL_NUM = URL_SEARCH + "&num={num}"
-    URL_NEXT = URL_NUM + "&num={num}&start={start}"
+    URL_NEXT = URL_SEARCH + "&num={num}&start={start}"
