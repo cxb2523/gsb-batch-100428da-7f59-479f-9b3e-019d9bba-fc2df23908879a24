@@ -1,0 +1,32 @@
+[project]
+name = "njsparser"
+version = "2.16"
+description = "A Python NextJS data parser from HTML"
+authors = [
+    { name = "ae", email = "85891169+novitae@users.noreply.github.com" }
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pythonmonkey (>=1.1.1,<2.0.0); python_version < '4.0'",
+    "rich (>=14.0.0,<15.0.0)",
+    "orjson (>=3.10.18,<4.0.0)",
+    "lxml (>=6.0.0,<7.0.0)",
+    "typer (>=0.16.0,<0.17.0)",
+    "requests (>=2.32.4,<3.0.0)",
+    "pydantic (>=2.10.0,<3.0.0)",
+]
+
+[project.scripts]
+njsparser = "njsparser.cli:app"
+njsp = "njsparser.cli:app"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.1.0",
+    "pytest>=9.0.2",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.0,<0.11.0"]
+build-backend = "uv_build"
