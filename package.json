@@ -1,0 +1,111 @@
+{
+  "name": "deepspider",
+  "version": "1.0.1",
+  "description": "AI-native web scraping and JavaScript reverse-engineering platform powered by DSH, Patchright/CDP, semantic recovery, and verifiable Solvers",
+  "type": "module",
+  "packageManager": "pnpm@11.22.0",
+  "main": "src/dsh/host-plugin.js",
+  "exports": {
+    ".": "./src/dsh/host-plugin.js",
+    "./agent-plugin": "./src/dsh/agent-plugin.js",
+    "./preset-plugin": "./src/dsh/preset-plugin.js",
+    "./mcp": "./src/mcp/server.js",
+    "./cordis.patch.yml": "./dsh/cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./dsh/cordis.patch.yml"
+    }
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "dsh/",
+    "skills/",
+    "README.md",
+    "README_EN.md",
+    "requirements-crypto.txt",
+    ".env.example"
+  ],
+  "bin": {
+    "deepspider": "bin/cli.js",
+    "deepspider-mcp": "src/mcp/server.js"
+  },
+  "scripts": {
+    "mcp": "node src/mcp/server.js",
+    "cli": "node bin/cli.js",
+    "test": "node scripts/run-unit-tests.mjs",
+    "test:integration": "node --test 'test/integration/*.test.js'",
+    "smoke:pack": "node scripts/smoke-packed-cli.mjs",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
+    "setup:crypto": "uv venv .venv --python 3.11 2>/dev/null || true && uv pip install -r requirements-crypto.txt",
+    "postinstall": "patchright install chromium",
+    "prepare": "husky"
+  },
+  "keywords": [
+    "crawler",
+    "web-scraping",
+    "javascript",
+    "reverse-engineering",
+    "deobfuscation",
+    "captcha",
+    "anti-detect",
+    "automation",
+    "dsh",
+    "dsh-plugin"
+  ],
+  "author": "pony-ma",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ma-pony/deepspider.git"
+  },
+  "homepage": "https://github.com/ma-pony/deepspider#readme",
+  "bugs": {
+    "url": "https://github.com/ma-pony/deepspider/issues"
+  },
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis-plugin-group": "^1.0.1",
+    "@deepseek-ai/dsh": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-anonymous-user-id": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-atomic-write": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-bash-local": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-code-runtime": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-compaction": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-fs": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-host-apiproxy": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-invariants": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-llm": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-output-retention": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-sandbox": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-scope": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-session-telemetry": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-session-title-llm": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-shell": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-spill": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-subagent-in-process-driver": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-timeout": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-tools": "~0.1.0-rc.7",
+    "@deepseek-ai/dsh-workflow": "~0.1.0-rc.7",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "acorn": "^8.18.0",
+    "cycletls": "^2.0.5",
+    "patchright": "^1.57.0",
+    "sdenv": "latest",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.8.1",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.2.7"
+  },
+  "lint-staged": {
+    "*.js": "eslint --fix"
+  }
+}
