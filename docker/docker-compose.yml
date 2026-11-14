@@ -1,0 +1,95 @@
+# Build context is repo root (..) so Dockerfile COPY . . includes api/, brave_llm_context.py, app_logging.py, profiles/, etc.
+# Root .dockerignore applies (not docker/.dockerignore).
+# Logs: mount named volume on /app/log so LOG_RETENTION_DAYS / rotation persist across container recreate.
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: supa-chat-api
+    ports:
+      - "8001:8001"
+    env_file:
+      - ../.env
+    volumes:
+      - ../.env:/app/.env:ro
+      - api_logs:/app/log
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Vite (frontend) proxies /api → api:8001. Uvicorn sees the frontend container IP (e.g. 172.x),
+      # not 127.0.0.1 like local npm+python — so SUPA_API_AUTH / API keys would 401 without trust.
+      # Override via .env if your bridge uses a different range.
+      - SUPA_API_TRUST_CIDRS=${SUPA_API_TRUST_CIDRS:-172.16.0.0/12,10.0.0.0/8}
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/api/health', timeout=5).read()",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - crawl-network
+    security_opt:
+      - no-new-privileges
+
+  # explorer:
+  #   build:
+  #     context: ..
+  #     dockerfile: docker/Dockerfile
+  #   container_name: supa-explorer
+  #   ports:
+  #     - "8501:8501"
+  #   env_file:
+  #     - ../.env
+  #   volumes:
+  #     - ../.env:/app/.env:ro
+  #     - api_logs:/app/log
+  #   restart: unless-stopped
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #   working_dir: /app/supabase_explorer
+  #   command: streamlit run supabase_explorer.py --server.address=0.0.0.0
+  #   networks:
+  #     - crawl-network
+  #   security_opt:
+  #     - no-new-privileges
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/frontend.Dockerfile
+    container_name: supa-chat-frontend
+    ports:
+      - "3001:3001"
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      - VITE_API_BASE_URL=http://api:8001
+      - NODE_ENV=development
+      - DOCKER_ENV=true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ../frontend:/app
+      - /app/node_modules
+    networks:
+      - crawl-network
+    security_opt:
+      - no-new-privileges
+
+networks:
+  crawl-network:
+    driver: bridge
+
+volumes:
+  api_logs:
+      

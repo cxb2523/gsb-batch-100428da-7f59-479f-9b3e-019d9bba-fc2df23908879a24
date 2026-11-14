@@ -1,0 +1,97 @@
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: supa-chat-api
+    ports:
+      - "8001:8001"
+    volumes:
+      - ../.env:/app/.env
+    env_file:
+      - ../.env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CRAWL4AI_BASE_URL=http://crawl4ai:11235
+    depends_on:
+      - crawl4ai
+    restart: unless-stopped
+    networks:
+      - crawl-network
+    security_opt:
+      - no-new-privileges
+
+  explorer:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: supa-explorer
+    ports:
+      - "8501:8501"
+    volumes:
+      - ../.env:/app/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+    working_dir: /app/supabase_explorer
+    command: streamlit run supabase_explorer.py --server.address=0.0.0.0
+    restart: unless-stopped
+    networks:
+      - crawl-network
+    security_opt:
+      - no-new-privileges
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/frontend.Dockerfile
+    container_name: supa-chat-frontend
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      - VITE_API_BASE_URL=http://api:8001
+      - NODE_ENV=development
+      - DOCKER_ENV=true
+    volumes:
+      - ../frontend:/app
+      - /app/node_modules
+    networks:
+      - crawl-network
+    security_opt:
+      - no-new-privileges
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  crawl4ai:
+    image: unclecode/crawl4ai:basic-amd64
+    container_name: crawl4ai
+    ports:
+      - "11235:11235"
+      - "9222:9222"
+    env_file:
+      - ../.env
+    volumes:
+      - /dev/shm:/dev/shm
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 1G
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11235/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - crawl-network
+    security_opt:
+      - no-new-privileges
+
+networks:
+  crawl-network:
+    driver: bridge 
