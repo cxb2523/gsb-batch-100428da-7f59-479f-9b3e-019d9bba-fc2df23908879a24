@@ -6,12 +6,14 @@ Weibo Crawler Client - Based on successfully tested code
 
 import random
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import requests
 
 from ..exceptions.base import CrawlError, NetworkError, ParseError, UserNotFoundError
+from ..models.batch import BatchResult, PageFailure, PageFailureReason
 from ..models.comment import Comment
 from ..models.post import Post
 from ..models.user import User
@@ -400,7 +402,9 @@ class WeiboClient:
                         time.sleep(sleep_time)
                         continue
                     else:
-                        raise NetworkError("Encountered 432 anti-crawler block")
+                        raise NetworkError(
+                            "Encountered 432 anti-crawler block", code="BLOCKED_432"
+                        )
                 else:
                     response.raise_for_status()
 
@@ -423,7 +427,12 @@ class WeiboClient:
                     time.sleep(sleep_time)
                     continue
                 else:
-                    raise NetworkError(f"Request failed: {e}")
+                    code = (
+                        "TIMEOUT"
+                        if isinstance(e, requests.exceptions.Timeout)
+                        else "NETWORK_ERROR"
+                    )
+                    raise NetworkError(f"Request failed: {e}", code=code)
 
         raise CrawlError("Maximum retry attempts reached")
 
@@ -783,6 +792,113 @@ class WeiboClient:
         )
         return posts, pagination
 
+    def _classify_page_failure(self, error: Exception) -> PageFailureReason:
+        """
+        Classify a page-level exception into a PageFailureReason so callers
+        can decide whether to re-run failed pages
+
+        Args:
+            error: Exception raised while fetching a single page
+
+        Returns:
+            Classified failure reason
+        """
+        if isinstance(error, ParseError):
+            return PageFailureReason.EMPTY_PARSE
+        if isinstance(error, NetworkError):
+            if error.code == "BLOCKED_432" or "432" in str(error):
+                return PageFailureReason.BLOCKED_432
+            if error.code == "TIMEOUT":
+                return PageFailureReason.TIMEOUT
+            return PageFailureReason.NETWORK_ERROR
+        return PageFailureReason.UNKNOWN
+
+    def _collect_paginated(
+        self,
+        fetch_page: Callable[[int], tuple[list[Any], bool]],
+        max_pages: int | None = None,
+        target_count: int | None = None,
+        max_consecutive_failures: int = 5,
+    ) -> BatchResult[Any]:
+        """
+        Generic batch pagination engine. Fetches pages one by one, keeping
+        all successfully collected items even when individual pages fail.
+        A failed page is recorded in the result and pagination continues
+        with the next page instead of aborting the whole batch.
+
+        Args:
+            fetch_page: Callable taking a 1-based page number and returning
+                (items, exhausted) where exhausted=True means the last page
+                was reached
+            max_pages: Maximum number of pages to fetch (None for unlimited)
+            target_count: Stop once at least this many items were collected
+                (None for no target)
+            max_consecutive_failures: Abort pagination after this many
+                consecutive failed pages (safety net against hammering the
+                API when every page fails)
+
+        Returns:
+            BatchResult with collected items and per-page outcome details
+        """
+        items: list[Any] = []
+        failed_pages: list[PageFailure] = []
+        success_pages = 0
+        consecutive_failures = 0
+        page = 1
+        stop_reason = "exhausted"
+
+        while True:
+            if max_pages and page > max_pages:
+                stop_reason = "max_pages"
+                break
+            if target_count is not None and len(items) >= target_count:
+                stop_reason = "count_reached"
+                break
+
+            try:
+                page_items, exhausted = fetch_page(page)
+            except Exception as e:
+                reason = self._classify_page_failure(e)
+                failed_pages.append(
+                    PageFailure(page=page, reason=reason, message=str(e))
+                )
+                consecutive_failures += 1
+                self.logger.error(
+                    f"Page {page} failed ({reason.value}): {e}. "
+                    "Continuing with next page."
+                )
+                if consecutive_failures >= max_consecutive_failures:
+                    stop_reason = "max_consecutive_failures"
+                    self.logger.warning(
+                        f"Aborting pagination after {consecutive_failures} "
+                        "consecutive failed pages"
+                    )
+                    break
+                page += 1
+                continue
+
+            consecutive_failures = 0
+
+            if not page_items:
+                stop_reason = "exhausted"
+                break
+
+            items.extend(page_items)
+            success_pages += 1
+
+            if exhausted:
+                stop_reason = "exhausted"
+                break
+
+            page += 1
+
+        return BatchResult(
+            items=items,
+            success_pages=success_pages,
+            failed_pages=failed_pages,
+            stop_reason=stop_reason,
+        )
+
     def search_posts_by_count(
         self,
         query: str,
@@ -807,60 +923,74 @@ class WeiboClient:
 
         Returns:
             List of Post objects (may be fewer than count if no more
-            results available)
+            results available). Successfully fetched posts are preserved
+            even if some pages fail.
         """
-        all_posts = []
-        page = 1
+        return self.search_posts_by_count_with_result(
+            query,
+            count,
+            max_pages=max_pages,
+            with_comments=with_comments,
+            comment_limit=comment_limit,
+            use_proxy=use_proxy,
+        ).items
 
+    def search_posts_by_count_with_result(
+        self,
+        query: str,
+        count: int,
+        max_pages: int = 50,
+        with_comments: bool = False,
+        comment_limit: int = 10,
+        use_proxy: bool = True,
+    ) -> BatchResult[Post]:
+        """
+        Search for posts by keyword with automatic pagination until
+        reaching specified count, returning a structured batch result
+
+        Args:
+            query: Search keyword
+            count: Desired number of posts to retrieve
+            max_pages: Maximum number of pages to fetch (safety limit),
+                default 50
+            with_comments: If True, fetch comments for each post
+            comment_limit: Maximum comments per post (default: 10)
+            use_proxy: Whether to use proxy, default True
+
+        Returns:
+            BatchResult containing all successfully fetched Post objects
+            (truncated to count) plus per-page outcome details: successful
+            page count, failed pages with classified reasons, and whether
+            pagination ended normally (count reached, max_pages reached or
+            data exhausted)
+        """
         self.logger.info(
             f"Starting search for '{query}', target count: {count}, "
             f"max pages: {max_pages}"
         )
 
-        while len(all_posts) < count and page <= max_pages:
-            try:
-                posts, pagination = self.search_posts(
-                    query,
-                    page=page,
-                    with_comments=with_comments,
-                    comment_limit=comment_limit,
-                    use_proxy=use_proxy,
-                )
+        def fetch_page(page: int) -> tuple[list[Post], bool]:
+            posts, pagination = self.search_posts(
+                query,
+                page=page,
+                with_comments=with_comments,
+                comment_limit=comment_limit,
+                use_proxy=use_proxy,
+            )
+            if not posts and not pagination:
+                raise ParseError(f"Empty or malformed search response at page {page}")
+            return posts, not pagination.get("has_more", False)
 
-                if not posts:
-                    self.logger.info(
-                        f"No more posts found at page {page}, stopping pagination"
-                    )
-                    break
-
-                all_posts.extend(posts)
-                self.logger.info(
-                    f"Page {page}: fetched {len(posts)} posts, "
-                    f"total: {len(all_posts)}/{count}"
-                )
-
-                if len(all_posts) >= count:
-                    break
-
-                # Check if there are more pages using pagination info
-                if not pagination.get("has_more", False):
-                    self.logger.info(
-                        "Reached last page (cardlistInfo.page is None), stopping"
-                    )
-                    break
-
-                page += 1
-
-            except Exception as e:
-                self.logger.error(f"Error fetching page {page}: {e}")
-                break
-
-        result = all_posts[:count]
-        self.logger.info(
-            f"Search completed for '{query}': returned {len(result)} posts "
-            f"(fetched {len(all_posts)} total from {page} pages)"
+        result = self._collect_paginated(
+            fetch_page, max_pages=max_pages, target_count=count
         )
+        result.items = result.items[:count]
 
+        self.logger.info(
+            f"Search completed for '{query}': returned {len(result.items)} posts "
+            f"({result.success_pages} pages ok, {result.failed_page_count} "
+            f"pages failed, stop: {result.stop_reason})"
+        )
         return result
 
     def search_all_posts(
@@ -884,60 +1014,69 @@ class WeiboClient:
             use_proxy: Whether to use proxy, default True
 
         Returns:
-            List of all available Post objects
+            List of all available Post objects. Successfully fetched posts
+            are preserved even if some pages fail.
         """
-        all_posts = []
-        page = 1
+        return self.search_all_posts_with_result(
+            query,
+            max_pages=max_pages,
+            with_comments=with_comments,
+            comment_limit=comment_limit,
+            use_proxy=use_proxy,
+        ).items
 
+    def search_all_posts_with_result(
+        self,
+        query: str,
+        max_pages: int | None = None,
+        with_comments: bool = False,
+        comment_limit: int = 10,
+        use_proxy: bool = True,
+    ) -> BatchResult[Post]:
+        """
+        Search for all posts by keyword with automatic pagination until
+        reaching the last page (detected by cardlistInfo.page being None),
+        returning a structured batch result
+
+        Args:
+            query: Search keyword
+            max_pages: Maximum number of pages to fetch (safety limit),
+                None for unlimited
+            with_comments: If True, fetch comments for each post
+            comment_limit: Maximum comments per post (default: 10)
+            use_proxy: Whether to use proxy, default True
+
+        Returns:
+            BatchResult containing all successfully fetched Post objects
+            plus per-page outcome details: successful page count, failed
+            pages with classified reasons, and whether pagination ended
+            normally (max_pages reached or data exhausted)
+        """
         self.logger.info(
             f"Starting search for all posts matching '{query}'"
             + (f", max pages: {max_pages}" if max_pages else " (no limit)")
         )
 
-        while True:
-            if max_pages and page > max_pages:
-                self.logger.info(f"Reached max pages limit ({max_pages}), stopping")
-                break
+        def fetch_page(page: int) -> tuple[list[Post], bool]:
+            posts, pagination = self.search_posts(
+                query,
+                page=page,
+                with_comments=with_comments,
+                comment_limit=comment_limit,
+                use_proxy=use_proxy,
+            )
+            if not posts and not pagination:
+                raise ParseError(f"Empty or malformed search response at page {page}")
+            return posts, not pagination.get("has_more", False)
 
-            try:
-                posts, pagination = self.search_posts(
-                    query,
-                    page=page,
-                    with_comments=with_comments,
-                    comment_limit=comment_limit,
-                    use_proxy=use_proxy,
-                )
-
-                if not posts:
-                    self.logger.info(
-                        f"No more posts found at page {page}, stopping pagination"
-                    )
-                    break
-
-                all_posts.extend(posts)
-                self.logger.info(
-                    f"Page {page}: fetched {len(posts)} posts, total: {len(all_posts)}"
-                )
-
-                # Check if there are more pages using pagination info
-                if not pagination.get("has_more", False):
-                    self.logger.info(
-                        "Reached last page (cardlistInfo.page is None), stopping"
-                    )
-                    break
-
-                page += 1
-
-            except Exception as e:
-                self.logger.error(f"Error fetching page {page}: {e}")
-                break
+        result = self._collect_paginated(fetch_page, max_pages=max_pages)
 
         self.logger.info(
-            f"Search completed for '{query}': fetched {len(all_posts)} posts "
-            f"from {page} pages"
+            f"Search completed for '{query}': fetched {len(result.items)} posts "
+            f"({result.success_pages} pages ok, {result.failed_page_count} "
+            f"pages failed, stop: {result.stop_reason})"
         )
-
-        return all_posts
+        return result
 
     def download_post_images(
         self,
@@ -1170,49 +1309,55 @@ class WeiboClient:
             use_proxy: Whether to use proxy, default True
 
         Returns:
-            List of all Comment objects
+            List of all Comment objects. Successfully fetched comments are
+            preserved even if some pages fail.
         """
-        all_comments = []
-        page = 1
-        pages_fetched = 0
+        return self.get_all_comments_with_result(
+            post_id, max_pages=max_pages, use_proxy=use_proxy
+        ).items
 
+    def get_all_comments_with_result(
+        self,
+        post_id: str,
+        max_pages: int | None = None,
+        use_proxy: bool = True,
+    ) -> BatchResult[Comment]:
+        """
+        Get all comments for a specific post with automatic pagination,
+        returning a structured batch result
+
+        Args:
+            post_id: Post ID (numeric ID, not bid)
+            max_pages: Maximum number of pages to fetch (None for all pages)
+            use_proxy: Whether to use proxy, default True
+
+        Returns:
+            BatchResult containing all successfully fetched Comment objects
+            plus per-page outcome details: successful page count, failed
+            pages with classified reasons, and whether pagination ended
+            normally (max_pages reached or data exhausted)
+        """
         self.logger.info(
             f"Starting to fetch all comments for post {post_id}"
             + (f", max pages: {max_pages}" if max_pages else "")
         )
 
-        while True:
-            if max_pages and page > max_pages:
-                self.logger.info(f"Reached max pages limit ({max_pages}), stopping")
-                break
+        def fetch_page(page: int) -> tuple[list[Comment], bool]:
+            comments, pagination = self.get_comments(
+                post_id, page=page, use_proxy=use_proxy
+            )
+            max_page = pagination.get("max", 0)
+            exhausted = max_page > 0 and page >= max_page
+            return comments, exhausted
 
-            try:
-                comments, pagination = self.get_comments(
-                    post_id, page=page, use_proxy=use_proxy
-                )
-
-                if not comments:
-                    self.logger.info(f"No more comments at page {page}, stopping")
-                    break
-
-                all_comments.extend(comments)
-                pages_fetched += 1
-
-                max_page = pagination.get("max", 0)
-                if max_page > 0 and page >= max_page:
-                    self.logger.info(f"Reached last page ({max_page}), stopping")
-                    break
-
-                page += 1
-
-            except Exception as e:
-                self.logger.error(f"Error fetching page {page}: {e}")
-                break
+        result = self._collect_paginated(fetch_page, max_pages=max_pages)
 
         self.logger.info(
-            f"Fetched total {len(all_comments)} comments from {pages_fetched} pages"
+            f"Fetched total {len(result.items)} comments "
+            f"({result.success_pages} pages ok, {result.failed_page_count} "
+            f"pages failed, stop: {result.stop_reason})"
         )
-        return all_comments
+        return result
 
     def _fetch_comments_for_posts(
         self,

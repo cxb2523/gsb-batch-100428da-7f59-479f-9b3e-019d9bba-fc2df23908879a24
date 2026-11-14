@@ -18,6 +18,7 @@ from .exceptions.base import (
     UserNotFoundError,
 )
 from .mcp.server import create_mcp_server
+from .models.batch import BatchResult, PageFailure, PageFailureReason
 from .models.comment import Comment
 from .models.post import Post
 from .models.user import User
@@ -30,6 +31,9 @@ __all__ = [
     "User",
     "Post",
     "Comment",
+    "BatchResult",
+    "PageFailure",
+    "PageFailureReason",
     "ImageDownloader",
     "VideoDownloader",
     "ProxyPoolConfig",
