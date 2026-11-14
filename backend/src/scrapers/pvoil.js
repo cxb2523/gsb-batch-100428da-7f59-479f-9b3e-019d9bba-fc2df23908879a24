@@ -37,7 +37,62 @@ import {
   extractDateFromText,
   extractPvoilPricesFromText,
   mapLineToCanonical,
+  OFFICIAL_PRODUCT_NAMES,
 } from './pvoil-parser.js';
+
+// ─────────────────────────────────────────────────────────────
+// Metadata 4 tầng — gắn vào kết quả để caller biết dữ liệu đến từ đâu.
+// degraded = true khi dữ liệu KHÔNG đến từ pvoil.com.vn (mirror/đối chiếu bên thứ 3).
+// ─────────────────────────────────────────────────────────────
+const TIER_INFO = [
+  { tier: 0, key: 'pvoil-origin-ip',       label: 'IP bypass HTTPS',   degraded: false, sourceUrl: 'https://www.pvoil.com.vn/api/oilprice/load-view' },
+  { tier: 1, key: 'pvoil-direct',          label: 'Direct pvoil.com.vn', degraded: false, sourceUrl: 'https://www.pvoil.com.vn' },
+  { tier: 2, key: 'gxhn-json-api',         label: 'GXHN JSON API',     degraded: true,  sourceUrl: 'https://giaxanghomnay.com/api/pvdate/{date}' },
+  { tier: 3, key: 'petrotimesgroup',       label: 'Petrotimesgroup',   degraded: true,  sourceUrl: 'https://petrotimesgroup.com/site/get-petro' },
+];
+
+// Ngưỡng đủ tin cậy: PVOil niêm yết 5 sản phẩm bán lẻ; nếu còn dưới 3
+// (tức thiếu quá nửa) thì cả batch không đáng tin — đánh dấu isComplete = false.
+const MIN_PRODUCTS_FOR_COMPLETE = 3;
+
+/**
+ * Đối chiếu danh sách giá scrape được với danh mục niêm yết chính thức của PVOil.
+ * @param {Array} prices - mảng { name, price, ... } đã parse
+ * @returns {{ expectedProducts: string[], missingProducts: string[], isComplete: boolean }}
+ */
+function assessPvoilCompleteness(prices) {
+  const present = new Set((Array.isArray(prices) ? prices : []).map((p) => p && p.name).filter(Boolean));
+  const missingProducts = OFFICIAL_PRODUCT_NAMES.filter((name) => !present.has(name));
+  const presentOfficial = OFFICIAL_PRODUCT_NAMES.length - missingProducts.length;
+  return {
+    expectedProducts: [...OFFICIAL_PRODUCT_NAMES],
+    missingProducts,
+    isComplete: presentOfficial >= MIN_PRODUCTS_FOR_COMPLETE,
+  };
+}
+
+/**
+ * Gắn metadata nguồn + độ đầy đủ vào kết quả của một tầng.
+ * Không đụng vào các field hiện hữu (prices, scrapedAt, source, priceDate, ...).
+ */
+function finalizePvoilResult(result, tier) {
+  const info = TIER_INFO[tier];
+  const completeness = assessPvoilCompleteness(result.prices);
+
+  result._tier = tier;                 // giữ tương thích ngược
+  result.tier = tier;                  // tầng thực tế trúng (0-3)
+  result.tierKey = info.key;           // khóa định danh tầng
+  // URL nguồn dữ liệu thực tế của tầng (tier function có thể ghi đè URL cụ thể hơn)
+  if (!result.sourceUrl) result.sourceUrl = info.sourceUrl;
+  result.isDegradedSource = info.degraded; // true = dữ liệu không đến từ PVOil (tầng 2, 3)
+  if (info.degraded) result.blockedByProtection = true; // giữ hành vi hiện hữu
+
+  result.expectedProducts = completeness.expectedProducts;
+  result.missingProducts = completeness.missingProducts;
+  result.isComplete = completeness.isComplete;
+
+  return result;
+}
 
 function httpsGetBypass(url, hostHeader) {
   return new Promise((resolve, reject) => {
@@ -97,6 +152,7 @@ async function scrapeFromOriginIP() {
 
   let html = null;
   let lastErr = null;
+  let hitUrl = null;
 
   for (const targetUrl of TARGETS) {
     try {
@@ -106,6 +162,7 @@ async function scrapeFromOriginIP() {
       // Reject nếu bị Cloudflare JS challenge
       if (text && text.length > 500 && text.includes('<') && !text.includes('__cf_chl') && !text.includes('just a moment')) {
         html = text;
+        hitUrl = targetUrl;
         break;
       }
     } catch (e) { lastErr = e; }
@@ -136,6 +193,7 @@ async function scrapeFromOriginIP() {
     prices: deduplicate(results),
     scrapedAt: new Date().toISOString(),
     source: 'https://www.pvoil.com.vn',
+    sourceUrl: hitUrl,
     priceDate: extractDateFromText(fullText),
     priceDateSource: 'pvoil-origin-ip-http',
     priceAnnouncedAt: null,
@@ -170,6 +228,7 @@ async function scrapeFromPvoilDirect() {
     prices,
     scrapedAt: new Date().toISOString(),
     source: 'https://www.pvoil.com.vn',
+    sourceUrl: 'https://www.pvoil.com.vn',
     priceDate: extractDateFromText(bodyText),
     priceDateSource: 'pvoil-direct-http',
     priceAnnouncedAt: null,
@@ -271,6 +330,7 @@ async function scrapeFromGXHN() {
         prices: deduplicate(results),
         scrapedAt: new Date().toISOString(),
         source: 'https://giaxanghomnay.com',
+        sourceUrl: `${GXHN_BASE}/api/pvdate/${dateStr}`,
         priceDate,
         priceDateSource: 'pvoil-gxhn',
         priceAnnouncedAt: null,
@@ -337,6 +397,7 @@ async function scrapeFromPetrotimesGroup() {
     prices: deduplicate(results),
     scrapedAt: new Date().toISOString(),
     source: 'https://www.pvoil.com.vn',
+    sourceUrl: 'https://petrotimesgroup.com/site/get-petro',
     priceDate: extractDateFromText(bodyText),
     priceDateSource: 'pvoil-petrotimesgroup',
     priceAnnouncedAt: null,
@@ -346,54 +407,50 @@ async function scrapeFromPetrotimesGroup() {
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Orchestrator: 4 táº§ng cascading
 // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-async function scrapePVOil() {
-  console.log('[Scraper:PVOil] Báº¯t Ä‘áº§u cÃ o dá»¯ liá»‡u (chiáº¿n lÆ°á»£c 4 táº§ng)...');
+const DEFAULT_TIER_SCRAPERS = [
+  scrapeFromOriginIP,
+  scrapeFromPvoilDirect,
+  scrapeFromGXHN,
+  scrapeFromPetrotimesGroup,
+];
+
+/**
+ * Cào giá PVOil theo chiến lược 4 tầng.
+ * Kết quả luôn kèm metadata nguồn & độ đầy đủ (không thay đổi các field hiện hữu):
+ *   tier, tierKey, sourceUrl, isDegradedSource,
+ *   expectedProducts, missingProducts, isComplete.
+ *
+ * @param {Object} [options]
+ * @param {Array<Function>} [options.tierScrapers] - inject để test offline;
+ *        mỗi phần tử là hàm async trả về result của 1 tầng (throw = tầng thất bại).
+ */
+async function scrapePVOil(options = {}) {
+  const tierScrapers = Array.isArray(options.tierScrapers) && options.tierScrapers.length
+    ? options.tierScrapers
+    : DEFAULT_TIER_SCRAPERS;
+
+  console.log('[Scraper:PVOil] Bắt đầu cào dữ liệu (chiến lược 4 tầng)...');
   const start   = Date.now();
   const elapsed = () => ((Date.now() - start) / 1000).toFixed(2) + 's';
 
-  // Táº§ng 0: IP bypass HTTP port 80
-  try {
-    const result = await scrapeFromOriginIP();
-    result._tier = 0;
-    console.log(`[Scraper:PVOil] [Táº§ng 0] âœ“ IP bypass HTTP (${elapsed()}) â€” ${result.prices.length} sáº£n pháº©m`);
-    return result;
-  } catch (e) {
-    console.warn(`[Scraper:PVOil] [Táº§ng 0] âœ— ${e.message}`);
+  for (let tier = 0; tier < tierScrapers.length; tier += 1) {
+    const info = TIER_INFO[tier] || { label: `Tier ${tier}` };
+    try {
+      const raw = await tierScrapers[tier]();
+      const result = finalizePvoilResult(raw, tier);
+      const degradeNote = result.isDegradedSource ? ' [nguồn hạ cấp]' : '';
+      const missingNote = result.missingProducts.length
+        ? ` — thiếu: ${result.missingProducts.join(', ')}`
+        : '';
+      console.log(`[Scraper:PVOil] [Tầng ${tier}] ✓ ${info.label} (${elapsed()}) — ${result.prices.length} sản phẩm${degradeNote}${missingNote}`);
+      return result;
+    } catch (e) {
+      const isLastTier = tier === tierScrapers.length - 1;
+      (isLastTier ? console.error : console.warn)(`[Scraper:PVOil] [Tầng ${tier}] ✗ ${e.message}`);
+    }
   }
 
-  // Táº§ng 1: Direct stealth fetch pvoil.com.vn
-  try {
-    const result = await scrapeFromPvoilDirect();
-    result._tier = 1;
-    console.log(`[Scraper:PVOil] [Táº§ng 1] âœ“ Direct pvoil.com.vn (${elapsed()}) â€” ${result.prices.length} sáº£n pháº©m`);
-    return result;
-  } catch (e) {
-    console.warn(`[Scraper:PVOil] [Táº§ng 1] âœ— ${e.message}`);
-  }
-
-  // Táº§ng 2: GXHN JSON API (/api/pvdate/{date}) â€” 4 sáº£n pháº©m PVOil thá»±c táº¿
-  try {
-    const result = await scrapeFromGXHN();
-    result._tier = 2;
-    result.blockedByProtection = true;
-    console.log(`[Scraper:PVOil] [Táº§ng 2] âœ“ GXHN JSON API (${elapsed()}) â€” ${result.prices.length} sáº£n pháº©m`);
-    return result;
-  } catch (e) {
-    console.warn(`[Scraper:PVOil] [Táº§ng 2] âœ— ${e.message}`);
-  }
-
-  // Táº§ng 3: Petrotimesgroup â€” giÃ¡ Petrolimex tham chiáº¿u (3 sáº£n pháº©m trÃ¹ng)
-  try {
-    const result = await scrapeFromPetrotimesGroup();
-    result._tier = 3;
-    result.blockedByProtection = true;
-    console.log(`[Scraper:PVOil] [Táº§ng 3] âœ“ Petrotimesgroup (${elapsed()}) â€” ${result.prices.length} sáº£n pháº©m`);
-    return result;
-  } catch (e) {
-    console.error(`[Scraper:PVOil] [Táº§ng 3] âœ— ${e.message}`);
-    throw new Error('[Scraper:PVOil] Táº¥t cáº£ 4 táº§ng Ä‘á»u tháº¥t báº¡i. Há»‡ thá»‘ng sáº½ dÃ¹ng Stale Cache.');
-  }
+  throw new Error('[Scraper:PVOil] Tất cả 4 tầng đều thất bại. Hệ thống sẽ dùng Stale Cache.');
 }
 
-export { scrapePVOil };
-
+export { scrapePVOil, assessPvoilCompleteness, finalizePvoilResult, TIER_INFO };

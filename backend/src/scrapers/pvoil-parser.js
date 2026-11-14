@@ -23,38 +23,49 @@ import { parsePrice, deduplicate, pickMostLikelyPriceDate } from './utils.js';
 const PRODUCT_SPECS = [
   {
     name: 'Xăng RON 95-III',
+    official: true,
     matcher: /xăng\s*ron\s*95\s*[-–]?\s*iii\b(?!\s*e)/i,  // không match E10 RON 95
   },
   {
     name: 'Xăng E10 RON 95-III',
+    official: true,
     matcher: /xăng\s*e10\s*ron\s*95\s*[-–]?\s*iii\b/i,
   },
   {
     name: 'Xăng E5 RON 92-II',
+    official: true,
     matcher: /xăng\s*e5\s*ron\s*92\s*[-–]?\s*ii\b/i,
   },
   {
     name: 'DO 0,05S-II',
+    official: true,
     // Chuẩn hóa: cả "Dầu DO 0,05S-II" và "DO 0,05S-II" đều map về tên này
     matcher: /(dầu\s*)?do\s*0[,.]?05\s*s?\s*[-–]?\s*ii\b/i,
   },
   {
     name: 'DO 0,001S-V',
+    official: true,
     // Dầu diesel siêu sạch DO 0,001S-V (Euro 5)
     matcher: /(dầu\s*)?do\s*0[,.]?001\s*s?\s*[-–]?\s*v\b/i,
   },
-  // Fallback: có thể PVOil thêm lại sau này
+  // Fallback: có thể PVOil thêm lại sau này (không nằm trong danh mục niêm yết hiện tại)
   {
     name: 'Dầu hỏa 2-K',
+    official: false,
     // "dầu hỏa", "dầu 2-K", "kerosene 2-K", "Dầu KO" (GXHN notation)
     matcher: /(dầu\s*(hỏa|hoa|2\s*[-–]?\s*k|ko)|kerosene\s*2[-–]?k)\b/i,
   },
   {
     name: 'Dầu Mazut 180CST 3.5S',
+    official: false,
     // Chỉ match mazut/FO 180 — không match "3.5S" đơn độc vì trùng với giá DO
     matcher: /(mazut|fo\s*180|180\s*cst)\b/i,
   },
 ];
+
+// Danh mục sản phẩm PVOil đang niêm yết chính thức (5 sản phẩm bán lẻ).
+// Dùng để đối chiếu độ đầy đủ của kết quả scrape ở mọi tầng.
+const OFFICIAL_PRODUCT_NAMES = PRODUCT_SPECS.filter((s) => s.official).map((s) => s.name);
 
 const START_MARKERS = [
   'giá theo pvoil',
@@ -190,12 +201,13 @@ function extractPvoilPricesFromText(text) {
   return finalPrices;
 }
 
-export { 
+export {
   isAntiBotPage,
   extractDateFromText,
   findPvoilSection,
   extractPvoilPricesFromText,
   mapLineToCanonical,
   PRODUCT_SPECS,
+  OFFICIAL_PRODUCT_NAMES,
  };
 
