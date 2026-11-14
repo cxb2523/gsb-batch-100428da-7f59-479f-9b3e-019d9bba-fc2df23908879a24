@@ -40,7 +40,9 @@ from narada.environment import (
     Environment,
     LambdaEnvironment,
     RemoteBrowserEnvironment,
+    SessionDownloadFailure,
     SessionDownloadItem,
+    SessionDownloads,
 )
 from narada.google_drive import GoogleDriveClient
 from narada.utils import download_file, render_html
@@ -86,6 +88,8 @@ __all__ = [
     "render_html",
     "Response",
     "ResponseContent",
+    "SessionDownloadFailure",
     "SessionDownloadItem",
+    "SessionDownloads",
     "UserAbortedError",
 ]

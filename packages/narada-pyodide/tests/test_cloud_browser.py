@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import builtins
 import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
 import pytest
@@ -1316,13 +1318,17 @@ async def test_cloud_browser_downloads_return_presigned_urls(
     )
     files = await env.get_downloaded_files()
 
-    assert files == [
+    assert files.items == [
         env_module.SessionDownloadItem(
             file_name="report.pdf",
             size=42,
             download_url="https://example.com/report.pdf",
         )
     ]
+    assert files.failures == []
+    # The successful-list consumption pattern stays usable.
+    assert list(files) == files.items
+    assert len(files) == 1
     first_call, second_call = pyfetch.await_args_list
     assert first_call.args[0].endswith(
         "/cloud-browser/replay/downloads?session_id=session-123"
@@ -1358,18 +1364,221 @@ async def test_lambda_environment_downloads_return_presigned_urls(
     env._session_id = "session-123"
     files = await env.get_downloaded_files()
 
-    assert files == [
+    assert files.items == [
         env_module.SessionDownloadItem(
             file_name="report.pdf",
             size=42,
             download_url="https://example.com/report.pdf",
         )
     ]
+    assert files.failures == []
     first_call, second_call = pyfetch.await_args_list
     assert first_call.args[0].endswith(
         "/cloud-browser/replay/downloads?session_id=session-123"
     )
     assert "key=downloads%2Fsession-123%2Freport.pdf" in second_call.args[0]
+
+
+_PYODIDE_DOWNLOAD_FILES = [
+    {
+        "file_name": "report.pdf",
+        "key": "downloads/session-1/report.pdf",
+        "size": 101,
+    },
+    {
+        "file_name": "data.csv",
+        "key": "downloads/session-1/data.csv",
+        "size": 202,
+    },
+    {
+        "file_name": "image.png",
+        "key": "downloads/session-1/image.png",
+        "size": 303,
+    },
+]
+
+
+def _make_downloads_pyfetch(
+    *,
+    files: list[dict],
+    failing_keys: dict[str, tuple[int, str]] | None = None,
+) -> tuple[AsyncMock, SimpleNamespace]:
+    """Build a fake pyfetch for the downloads listing + signing flow.
+
+    ``failing_keys`` maps object key to (HTTP status, error body) for signing requests.
+    The returned namespace tracks per-key call counts and peak concurrency so tests can
+    verify signing stays concurrent and never retries a file within the batch.
+    """
+    failing_keys = failing_keys or {}
+    stats = SimpleNamespace(
+        call_count_by_key={},
+        active_signing_calls=0,
+        peak_concurrent_signing_calls=0,
+    )
+
+    async def fake_pyfetch(url: str, **kwargs):
+        parsed = urlsplit(url)
+        if parsed.path.endswith("/cloud-browser/replay/downloads"):
+            return _FakeResponse(json_data={"downloaded_files": files})
+
+        if parsed.path.endswith("/cloud-browser/replay/download-url"):
+            key = parse_qs(parsed.query)["key"][0]
+            stats.call_count_by_key[key] = stats.call_count_by_key.get(key, 0) + 1
+            stats.active_signing_calls += 1
+            stats.peak_concurrent_signing_calls = max(
+                stats.peak_concurrent_signing_calls, stats.active_signing_calls
+            )
+            # Real network calls suspend here; yield so concurrent coroutines overlap.
+            await asyncio.sleep(0)
+            stats.active_signing_calls -= 1
+            if key in failing_keys:
+                status, text = failing_keys[key]
+                return _FakeResponse(ok=False, status=status, text_data=text)
+            return _FakeResponse(
+                json_data={"presigned_url": f"https://example.test/signed/{key}"}
+            )
+
+        raise AssertionError(f"Unexpected fetch URL: {url}")
+
+    return AsyncMock(side_effect=fake_pyfetch), stats
+
+
+@pytest.mark.asyncio
+async def test_cloud_browser_downloads_all_signing_requests_succeed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pyfetch, stats = _make_downloads_pyfetch(files=_PYODIDE_DOWNLOAD_FILES)
+    narada_pkg, env_module = _import_pyodide_narada(monkeypatch, pyfetch=pyfetch)
+
+    env = narada_pkg.RemoteBrowserEnvironment(
+        browser_window_id="browser-window-123",
+        cloud_browser_session_id="session-1",
+        api_key="test-api-key",
+    )
+    result = await env.get_downloaded_files()
+
+    assert result.failures == []
+    assert result.items == [
+        env_module.SessionDownloadItem(
+            file_name=file_entry["file_name"],
+            size=file_entry["size"],
+            download_url=f"https://example.test/signed/{file_entry['key']}",
+        )
+        for file_entry in _PYODIDE_DOWNLOAD_FILES
+    ]
+    # Backward-compatible successful-list consumption.
+    assert list(result) == result.items
+    assert len(result) == 3
+    assert result[1].file_name == "data.csv"
+    # Signing stays concurrent and each file is signed exactly once.
+    assert stats.peak_concurrent_signing_calls == len(_PYODIDE_DOWNLOAD_FILES)
+    assert stats.call_count_by_key == {
+        file_entry["key"]: 1 for file_entry in _PYODIDE_DOWNLOAD_FILES
+    }
+
+
+@pytest.mark.asyncio
+async def test_cloud_browser_downloads_partial_signing_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pyfetch, stats = _make_downloads_pyfetch(
+        files=_PYODIDE_DOWNLOAD_FILES,
+        failing_keys={
+            "downloads/session-1/data.csv": (404, "Not Found"),
+            "downloads/session-1/image.png": (403, "Access Denied"),
+        },
+    )
+    narada_pkg, env_module = _import_pyodide_narada(monkeypatch, pyfetch=pyfetch)
+
+    env = narada_pkg.LambdaEnvironment(api_key="test-api-key")
+    env._session_id = "session-1"
+    result = await env.get_downloaded_files()
+
+    assert result.items == [
+        env_module.SessionDownloadItem(
+            file_name="report.pdf",
+            size=101,
+            download_url="https://example.test/signed/downloads/session-1/report.pdf",
+        )
+    ]
+    assert result.failures == [
+        env_module.SessionDownloadFailure(
+            file_name="data.csv",
+            key="downloads/session-1/data.csv",
+            size=202,
+            error=("Failed to fetch cloud browser download URL: 404 Not Found"),
+            status_code=404,
+        ),
+        env_module.SessionDownloadFailure(
+            file_name="image.png",
+            key="downloads/session-1/image.png",
+            size=303,
+            error=("Failed to fetch cloud browser download URL: 403 Access Denied"),
+            status_code=403,
+        ),
+    ]
+    # Failures must not be disguised as successful entries.
+    assert [item.file_name for item in result] == ["report.pdf"]
+    # No file is signed more than once despite the failures.
+    assert stats.call_count_by_key == {
+        file_entry["key"]: 1 for file_entry in _PYODIDE_DOWNLOAD_FILES
+    }
+
+
+@pytest.mark.asyncio
+async def test_cloud_browser_downloads_all_signing_requests_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pyfetch, stats = _make_downloads_pyfetch(
+        files=_PYODIDE_DOWNLOAD_FILES,
+        failing_keys={
+            file_entry["key"]: (501, "Not Implemented")
+            for file_entry in _PYODIDE_DOWNLOAD_FILES
+        },
+    )
+    narada_pkg, env_module = _import_pyodide_narada(monkeypatch, pyfetch=pyfetch)
+
+    env = narada_pkg.LambdaEnvironment(api_key="test-api-key")
+    env._session_id = "session-1"
+    result = await env.get_downloaded_files()
+
+    assert result.items == []
+    assert len(result) == 0
+    assert list(result) == []
+    assert [failure.file_name for failure in result.failures] == [
+        "report.pdf",
+        "data.csv",
+        "image.png",
+    ]
+    assert all(failure.status_code == 501 for failure in result.failures)
+    assert all(
+        failure.error
+        == "Failed to fetch cloud browser download URL: 501 Not Implemented"
+        for failure in result.failures
+    )
+    assert stats.call_count_by_key == {
+        file_entry["key"]: 1 for file_entry in _PYODIDE_DOWNLOAD_FILES
+    }
+
+
+@pytest.mark.asyncio
+async def test_cloud_browser_downloads_empty_list_returns_empty_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pyfetch, stats = _make_downloads_pyfetch(files=[])
+    narada_pkg, env_module = _import_pyodide_narada(monkeypatch, pyfetch=pyfetch)
+
+    env = narada_pkg.LambdaEnvironment(api_key="test-api-key")
+    env._session_id = "session-1"
+    result = await env.get_downloaded_files()
+
+    assert result == env_module.SessionDownloads()
+    assert result.items == []
+    assert result.failures == []
+    assert len(result) == 0
+    # No signing request is made when there is nothing to sign.
+    assert stats.call_count_by_key == {}
+    assert pyfetch.await_count == 1
 
 
 @pytest.mark.asyncio

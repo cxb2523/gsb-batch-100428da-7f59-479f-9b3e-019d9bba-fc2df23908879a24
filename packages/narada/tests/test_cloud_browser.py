@@ -1,6 +1,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
+from typing import Callable
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
@@ -632,13 +633,15 @@ async def test_lambda_environment_exposes_downloaded_files(
 ) -> None:
     import narada.environment as environment_module
 
-    downloaded_files = [
-        environment_module.SessionDownloadItem(
-            file_name="report.pdf",
-            size=42,
-            download_url="https://example.com/report.pdf",
-        )
-    ]
+    downloaded_files = environment_module.SessionDownloads(
+        items=[
+            environment_module.SessionDownloadItem(
+                file_name="report.pdf",
+                size=42,
+                download_url="https://example.com/report.pdf",
+            )
+        ]
+    )
     get_downloads = AsyncMock(return_value=downloaded_files)
     monkeypatch.setattr(
         environment_module,
@@ -909,3 +912,306 @@ async def test_agent_run_appends_critic_workflow_trace(
         **workflow_trace,
         "children": [{"kind": "sub_workflow", "trace": critic_workflow_trace}],
     }
+
+
+class _DownloadsFakeResponse:
+    ok = True
+
+    def __init__(
+        self,
+        payload: dict | None = None,
+        *,
+        error: Exception | None = None,
+        on_exit: Callable[[], None] | None = None,
+    ):
+        self._payload = payload or {}
+        self._error = error
+        self._on_exit = on_exit
+        self.status = getattr(error, "status", 200)
+
+    async def __aenter__(self):
+        # Real HTTP calls suspend here; yield once so concurrent signing coroutines
+        # actually overlap instead of running to completion inline.
+        await asyncio.sleep(0)
+        return self
+
+    async def __aexit__(self, *args):
+        if self._on_exit is not None:
+            self._on_exit()
+
+    def raise_for_status(self) -> None:
+        if self._error is not None:
+            raise self._error
+
+    async def json(self):
+        return self._payload
+
+
+class _DownloadsFakeClientSession:
+    """Fake aiohttp session for the cloud-browser downloads listing + signing flow."""
+
+    def __init__(
+        self,
+        *,
+        files: list[dict],
+        failing_keys: dict[str, Exception] | None = None,
+    ) -> None:
+        self._files = files
+        self._failing_keys = failing_keys or {}
+        self.requested_keys: list[str] = []
+        self.concurrent_signing_calls = 0
+        self.peak_concurrent_signing_calls = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    def get(self, url: str, **kwargs):
+        if url.endswith("/cloud-browser/replay/downloads"):
+            return _DownloadsFakeResponse({"downloaded_files": self._files})
+        if url.endswith("/cloud-browser/replay/download-url"):
+            key = kwargs["params"]["key"]
+            self.requested_keys.append(key)
+            self.concurrent_signing_calls += 1
+            self.peak_concurrent_signing_calls = max(
+                self.peak_concurrent_signing_calls, self.concurrent_signing_calls
+            )
+            on_exit = self._mark_signing_call_finished
+            if key in self._failing_keys:
+                return _DownloadsFakeResponse(
+                    error=self._failing_keys[key], on_exit=on_exit
+                )
+            return _DownloadsFakeResponse(
+                {"presigned_url": f"https://example.test/signed/{key}"},
+                on_exit=on_exit,
+            )
+        raise AssertionError(f"Unexpected GET URL: {url}")
+
+    def _mark_signing_call_finished(self) -> None:
+        self.concurrent_signing_calls -= 1
+
+
+class _FakeHttpError(Exception):
+    """Mimics an aiohttp client error that carries an HTTP status code."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+_DOWNLOAD_FILES = [
+    {"file_name": "report.pdf", "key": "downloads/session-1/report.pdf", "size": 101},
+    {"file_name": "data.csv", "key": "downloads/session-1/data.csv", "size": 202},
+    {"file_name": "image.png", "key": "downloads/session-1/image.png", "size": 303},
+]
+
+
+def _patch_downloads_session(
+    monkeypatch: pytest.MonkeyPatch, session: _DownloadsFakeClientSession
+) -> None:
+    import narada.environment as environment_module
+
+    monkeypatch.setattr(environment_module.aiohttp, "ClientSession", lambda: session)
+
+
+@pytest.mark.asyncio
+async def test_get_cloud_browser_downloads_all_signing_requests_succeed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import narada.environment as environment_module
+
+    session = _DownloadsFakeClientSession(files=_DOWNLOAD_FILES)
+    _patch_downloads_session(monkeypatch, session)
+
+    result = await environment_module._get_cloud_browser_downloads(
+        base_url="https://api.example.test",
+        auth_headers={"x-api-key": "test-key"},
+        session_id="session-1",
+    )
+
+    assert result.failures == []
+    assert result.items == [
+        environment_module.SessionDownloadItem(
+            file_name="report.pdf",
+            size=101,
+            download_url="https://example.test/signed/downloads/session-1/report.pdf",
+        ),
+        environment_module.SessionDownloadItem(
+            file_name="data.csv",
+            size=202,
+            download_url="https://example.test/signed/downloads/session-1/data.csv",
+        ),
+        environment_module.SessionDownloadItem(
+            file_name="image.png",
+            size=303,
+            download_url="https://example.test/signed/downloads/session-1/image.png",
+        ),
+    ]
+    # Backward-compatible successful-list consumption.
+    assert list(result) == result.items
+    assert len(result) == 3
+    assert result[0] == result.items[0]
+    # Every file is signed exactly once.
+    assert session.requested_keys == [f["key"] for f in _DOWNLOAD_FILES]
+
+
+@pytest.mark.asyncio
+async def test_get_cloud_browser_downloads_partial_signing_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import narada.environment as environment_module
+
+    session = _DownloadsFakeClientSession(
+        files=_DOWNLOAD_FILES,
+        failing_keys={
+            "downloads/session-1/data.csv": _FakeHttpError(503, "Service Unavailable"),
+            "downloads/session-1/image.png": RuntimeError("connection reset"),
+        },
+    )
+    _patch_downloads_session(monkeypatch, session)
+
+    result = await environment_module._get_cloud_browser_downloads(
+        base_url="https://api.example.test",
+        auth_headers={"x-api-key": "test-key"},
+        session_id="session-1",
+    )
+
+    assert result.items == [
+        environment_module.SessionDownloadItem(
+            file_name="report.pdf",
+            size=101,
+            download_url="https://example.test/signed/downloads/session-1/report.pdf",
+        )
+    ]
+    assert result.failures == [
+        environment_module.SessionDownloadFailure(
+            file_name="data.csv",
+            key="downloads/session-1/data.csv",
+            size=202,
+            error="Service Unavailable",
+            status_code=503,
+        ),
+        environment_module.SessionDownloadFailure(
+            file_name="image.png",
+            key="downloads/session-1/image.png",
+            size=303,
+            error="RuntimeError: connection reset",
+            status_code=None,
+        ),
+    ]
+    # Failures must not be disguised as successful entries.
+    assert [item.file_name for item in result] == ["report.pdf"]
+    # No file is signed more than once despite the failures.
+    assert sorted(session.requested_keys) == sorted(f["key"] for f in _DOWNLOAD_FILES)
+
+
+@pytest.mark.asyncio
+async def test_get_cloud_browser_downloads_all_signing_requests_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import narada.environment as environment_module
+
+    session = _DownloadsFakeClientSession(
+        files=_DOWNLOAD_FILES,
+        failing_keys={
+            f["key"]: _FakeHttpError(500, "Internal Server Error")
+            for f in _DOWNLOAD_FILES
+        },
+    )
+    _patch_downloads_session(monkeypatch, session)
+
+    result = await environment_module._get_cloud_browser_downloads(
+        base_url="https://api.example.test",
+        auth_headers={"x-api-key": "test-key"},
+        session_id="session-1",
+    )
+
+    assert result.items == []
+    assert len(result) == 0
+    assert list(result) == []
+    assert [failure.file_name for failure in result.failures] == [
+        "report.pdf",
+        "data.csv",
+        "image.png",
+    ]
+    assert all(failure.status_code == 500 for failure in result.failures)
+    assert all(failure.error == "Internal Server Error" for failure in result.failures)
+    assert sorted(session.requested_keys) == sorted(f["key"] for f in _DOWNLOAD_FILES)
+
+
+@pytest.mark.asyncio
+async def test_get_cloud_browser_downloads_empty_list_returns_empty_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import narada.environment as environment_module
+
+    session = _DownloadsFakeClientSession(files=[])
+    _patch_downloads_session(monkeypatch, session)
+
+    result = await environment_module._get_cloud_browser_downloads(
+        base_url="https://api.example.test",
+        auth_headers={"x-api-key": "test-key"},
+        session_id="session-1",
+    )
+
+    assert result == environment_module.SessionDownloads()
+    assert result.items == []
+    assert result.failures == []
+    assert len(result) == 0
+    # No signing request is made when there is nothing to sign.
+    assert session.requested_keys == []
+    assert session.peak_concurrent_signing_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_get_cloud_browser_downloads_signs_files_concurrently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import narada.environment as environment_module
+
+    session = _DownloadsFakeClientSession(files=_DOWNLOAD_FILES)
+    _patch_downloads_session(monkeypatch, session)
+
+    await environment_module._get_cloud_browser_downloads(
+        base_url="https://api.example.test",
+        auth_headers={"x-api-key": "test-key"},
+        session_id="session-1",
+    )
+
+    # All three signing coroutines must overlap instead of running one at a time.
+    assert session.peak_concurrent_signing_calls == len(_DOWNLOAD_FILES)
+
+
+@pytest.mark.asyncio
+async def test_cloud_browser_environment_downloads_report_partial_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import narada.environment as environment_module
+
+    session = _DownloadsFakeClientSession(
+        files=_DOWNLOAD_FILES,
+        failing_keys={
+            "downloads/session-1/data.csv": _FakeHttpError(404, "Not Found"),
+        },
+    )
+    _patch_downloads_session(monkeypatch, session)
+
+    env = CloudBrowserEnvironment.__new__(CloudBrowserEnvironment)
+    env._base_url = "https://api.example.test"
+    env._auth_headers = {"x-api-key": "test-key"}
+    env._session_id = "session-1"
+
+    result = await env.get_downloaded_files()
+
+    assert [item.file_name for item in result.items] == ["report.pdf", "image.png"]
+    assert result.failures == [
+        environment_module.SessionDownloadFailure(
+            file_name="data.csv",
+            key="downloads/session-1/data.csv",
+            size=202,
+            error="Not Found",
+            status_code=404,
+        )
+    ]

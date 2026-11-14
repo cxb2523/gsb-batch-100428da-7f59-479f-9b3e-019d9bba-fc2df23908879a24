@@ -8,7 +8,7 @@ import os
 import time
 import uuid
 from abc import ABC
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from http import HTTPStatus
 from io import IOBase
 from pathlib import Path
@@ -18,6 +18,7 @@ from typing import (
     Any,
     Awaitable,
     Callable,
+    Iterator,
     Literal,
     Mapping,
     TypedDict,
@@ -223,6 +224,44 @@ class SessionDownloadItem:
     file_name: str
     size: int
     download_url: str
+
+
+@dataclass
+class SessionDownloadFailure:
+    """A downloaded file whose presigned download URL could not be generated.
+
+    Failed entries are never mixed into the successful items: the file is identified by
+    ``file_name``/``key`` and ``error`` retains the underlying status code or error text
+    so callers can decide which files to retry.
+    """
+
+    file_name: str
+    key: str
+    size: int
+    error: str
+    status_code: int | None = None
+
+
+@dataclass
+class SessionDownloads:
+    """Result of listing a cloud session's downloads.
+
+    ``items`` keeps the original successful-list contract (and supports iterating,
+    ``len()`` and indexing directly), while ``failures`` reports files whose presigned
+    URL request failed without dropping the successful entries.
+    """
+
+    items: list[SessionDownloadItem] = field(default_factory=list)
+    failures: list[SessionDownloadFailure] = field(default_factory=list)
+
+    def __iter__(self) -> Iterator[SessionDownloadItem]:
+        return iter(self.items)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, index: int) -> SessionDownloadItem:
+        return self.items[index]
 
 
 class Environment(ABC):
@@ -1010,8 +1049,14 @@ class RemoteBrowserEnvironment(BaseBrowserEnvironment):
             timeout=timeout,
         )
 
-    async def get_downloaded_files(self) -> list[SessionDownloadItem]:
-        """Return files downloaded during this cloud browser session (file name, size, presigned GET URL per file)."""
+    async def get_downloaded_files(self) -> SessionDownloads:
+        """Return files downloaded during this cloud browser session.
+
+        The returned :class:`SessionDownloads` exposes successfully signed entries via
+        ``items`` (it is also directly iterable) and entries whose presigned URL request
+        failed via ``failures``, so a single signing failure no longer drops the rest of
+        the batch.
+        """
         if self._cloud_browser_session_id is None:
             raise ValueError(
                 "Cloud browser session ID is required to get downloaded files"
@@ -1078,8 +1123,14 @@ class CloudBrowserEnvironment(BaseBrowserEnvironment):
                 timeout=timeout,
             )
 
-    async def get_downloaded_files(self) -> list[SessionDownloadItem]:
-        """Return files downloaded during this cloud browser session (file name, size, presigned GET URL per file)."""
+    async def get_downloaded_files(self) -> SessionDownloads:
+        """Return files downloaded during this cloud browser session.
+
+        The returned :class:`SessionDownloads` exposes successfully signed entries via
+        ``items`` (it is also directly iterable) and entries whose presigned URL request
+        failed via ``failures``, so a single signing failure no longer drops the rest of
+        the batch.
+        """
         return await _get_cloud_browser_downloads(
             base_url=self._base_url,
             auth_headers=await self._get_auth_headers(),
@@ -1151,8 +1202,14 @@ class LambdaEnvironment(Environment):
                 timeout=timeout,
             )
 
-    async def get_downloaded_files(self) -> list[SessionDownloadItem]:
-        """Return files downloaded during this lambda session (file name, size, presigned GET URL per file)."""
+    async def get_downloaded_files(self) -> SessionDownloads:
+        """Return files downloaded during this lambda session.
+
+        The returned :class:`SessionDownloads` exposes successfully signed entries via
+        ``items`` (it is also directly iterable) and entries whose presigned URL request
+        failed via ``failures``, so a single signing failure no longer drops the rest of
+        the batch.
+        """
         return await _get_cloud_browser_downloads(
             base_url=self._base_url,
             auth_headers=await self._get_auth_headers(),
@@ -1239,12 +1296,33 @@ async def _fetch_presigned_download_url(
         headers=auth_headers,
     )
     if not fetch_response.ok:
-        raise NaradaError(
+        error = NaradaError(
             "Failed to fetch cloud browser download URL: "
             f"{fetch_response.status} {await fetch_response.text()}"
         )
+        # Retain the underlying HTTP status alongside the error text so signing
+        # failures can be reported with both.
+        error.status = fetch_response.status
+        raise error
     data = await fetch_response.json()
     return data["presigned_url"]
+
+
+def _describe_download_signing_error(error: BaseException) -> tuple[str, int | None]:
+    """Return (error text, HTTP status code) for a presigned-URL signing failure.
+
+    The status code is surfaced separately when the underlying client exposes one;
+    the original error text is retained unchanged since it already includes the
+    status. When no status is available, the exception type is prefixed so non-HTTP
+    failures stay identifiable.
+    """
+    status_code = getattr(error, "status", None)
+    if not isinstance(status_code, int):
+        status_code = None
+    error_text = str(error) or type(error).__name__
+    if status_code is None:
+        error_text = f"{type(error).__name__}: {error_text}"
+    return error_text, status_code
 
 
 async def _get_cloud_browser_downloads(
@@ -1252,7 +1330,14 @@ async def _get_cloud_browser_downloads(
     base_url: str,
     auth_headers: dict[str, str],
     session_id: str,
-) -> list[SessionDownloadItem]:
+) -> SessionDownloads:
+    """GET cloud-browser session downloads and sign each file's presigned GET URL.
+
+    Signing requests run concurrently. A failure for one file is captured as a
+    :class:`SessionDownloadFailure` instead of cancelling the other requests, so
+    successfully signed files are still returned. An empty download list yields an
+    empty :class:`SessionDownloads` rather than an error.
+    """
     fetch_response = await pyfetch_with_retries(
         _build_cloud_browser_url(
             base_url,
@@ -1270,9 +1355,11 @@ async def _get_cloud_browser_downloads(
     data = await fetch_response.json()
     files = data.get("downloaded_files") or []
     if not files:
-        return []
+        return SessionDownloads()
 
-    presigned_urls = await asyncio.gather(
+    # return_exceptions keeps one file's failure from discarding the whole batch;
+    # every file is signed at most once.
+    signing_results = await asyncio.gather(
         *[
             _fetch_presigned_download_url(
                 base_url=base_url,
@@ -1281,16 +1368,33 @@ async def _get_cloud_browser_downloads(
                 key=item["key"],
             )
             for item in files
-        ]
+        ],
+        return_exceptions=True,
     )
-    return [
-        SessionDownloadItem(
-            file_name=item["file_name"],
-            size=item["size"],
-            download_url=presigned_urls[index],
+
+    items: list[SessionDownloadItem] = []
+    failures: list[SessionDownloadFailure] = []
+    for file_entry, result in zip(files, signing_results, strict=True):
+        if isinstance(result, BaseException):
+            error_text, status_code = _describe_download_signing_error(result)
+            failures.append(
+                SessionDownloadFailure(
+                    file_name=file_entry["file_name"],
+                    key=file_entry["key"],
+                    size=file_entry["size"],
+                    error=error_text,
+                    status_code=status_code,
+                )
+            )
+            continue
+        items.append(
+            SessionDownloadItem(
+                file_name=file_entry["file_name"],
+                size=file_entry["size"],
+                download_url=result,
+            )
         )
-        for index, item in enumerate(files)
-    ]
+    return SessionDownloads(items=items, failures=failures)
 
 
 async def _stop_cloud_browser_session(
