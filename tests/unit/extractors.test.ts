@@ -1,0 +1,257 @@
+import {
+  getUsage,
+  extractWithLLM,
+  truncateContent,
+  generateExtractionPrompt,
+} from "../../src/extractors";
+import { ContentFormat } from "../../src/types";
+import { z } from "zod";
+
+function createMockLLM() {
+  return {
+    withStructuredOutput: jest.fn().mockImplementation(() => ({
+      invoke: jest.fn().mockResolvedValue({
+        parsed: { title: "Test Title", content: "Test Content" },
+        raw: {
+          tool_calls: [
+            { args: { title: "Test Title", content: "Test Content" } },
+          ],
+        },
+      }),
+    })),
+  };
+}
+
+describe("extractors", () => {
+  const mockSchema = z.object({
+    title: z.string(),
+    content: z.string(),
+  });
+
+  const mockContent = "Test content";
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+
+  describe("getUsage", () => {
+    it("should extract usage statistics from LLM output", () => {
+      const mockOutput = {
+        llmOutput: {
+          tokenUsage: {
+            promptTokens: 100,
+            completionTokens: 50,
+            totalTokens: 150,
+          },
+        },
+      };
+
+      const usage = getUsage(mockOutput);
+
+      expect(usage.inputTokens).toBe(100);
+      expect(usage.outputTokens).toBe(50);
+    });
+
+    it("should handle missing token usage", () => {
+      const mockOutput = {
+        llmOutput: {},
+      };
+
+      const usage = getUsage(mockOutput);
+
+      expect(usage.inputTokens).toBeUndefined();
+      expect(usage.outputTokens).toBeUndefined();
+    });
+
+    it("should handle missing llmOutput", () => {
+      const mockOutput = {};
+
+      const usage = getUsage(mockOutput);
+
+      expect(usage.inputTokens).toBeUndefined();
+      expect(usage.outputTokens).toBeUndefined();
+    });
+  });
+
+  describe("extractWithLLM", () => {
+    it("should extract data using provided LLM", async () => {
+      const llm = createMockLLM() as any;
+      const result = await extractWithLLM(mockContent, mockSchema, llm);
+
+      expect(result.data).toEqual({
+        title: "Test Title",
+        content: "Test Content",
+      });
+    });
+
+    it("should handle custom prompts", async () => {
+      const llm = createMockLLM() as any;
+      const customPrompt = "Extract the main topic and summary";
+      const result = await extractWithLLM(
+        mockContent,
+        mockSchema,
+        llm,
+        customPrompt
+      );
+
+      expect(result.data).toEqual({
+        title: "Test Title",
+        content: "Test Content",
+      });
+    });
+
+    it("should handle different content formats", async () => {
+      const llm = createMockLLM() as any;
+      const result = await extractWithLLM(
+        mockContent,
+        mockSchema,
+        llm,
+        undefined,
+        ContentFormat.TXT
+      );
+
+      expect(result.data).toEqual({
+        title: "Test Title",
+        content: "Test Content",
+      });
+    });
+
+    it("should handle extraction context", async () => {
+      const llm = createMockLLM() as any;
+      const extractionContext = {
+        title: "Existing Title",
+        content: "",
+      };
+
+      const result = await extractWithLLM(
+        mockContent,
+        mockSchema,
+        llm,
+        undefined,
+        ContentFormat.TXT,
+        undefined,
+        extractionContext
+      );
+
+      expect(result.data).toEqual({
+        title: "Test Title",
+        content: "Test Content",
+      });
+    });
+  });
+
+  describe("truncateContent", () => {
+    it("should not truncate content when full prompt is within limit", () => {
+      const prompt = generateExtractionPrompt({
+        format: ContentFormat.TXT,
+        content: "",
+      });
+      const content = "This is a short test content.";
+      const result = truncateContent({
+        content,
+        maxTokens: (prompt.length + content.length) / 4,
+        format: ContentFormat.TXT,
+      });
+      expect(result).toBe(content);
+    });
+
+    it("should truncate content by excess amount", () => {
+      const prompt = generateExtractionPrompt({
+        format: ContentFormat.TXT,
+        content: "",
+      });
+      // Create a content that will make the full prompt exceed the limit
+      const content = "This is a longer test content that should be truncated.";
+      const result = truncateContent({
+        content,
+        maxTokens: (prompt.length + content.length) / 4 - 1,
+        format: ContentFormat.TXT,
+      });
+      expect(result.length).toBe(content.length - 4);
+    });
+
+    it("should account for extractionContext in prompt size calculation", () => {
+      const prompt = generateExtractionPrompt({
+        format: ContentFormat.TXT,
+        content: "",
+        extractionContext: { a: 1, b: 2 },
+      });
+
+      const content = "This is a test content for enrichment.";
+      const result = truncateContent({
+        content,
+        maxTokens: (prompt.length + content.length) / 4 - 1,
+        format: ContentFormat.TXT,
+        extractionContext: { a: 1, b: 2 },
+      });
+
+      expect(result.length).toBe(content.length - 4);
+    });
+  });
+
+  describe("generateExtractionPrompt", () => {
+    it("should generate a basic extraction prompt without extractionContext", () => {
+      const prompt = generateExtractionPrompt({
+        format: ContentFormat.TXT,
+        content: "Some test content",
+      });
+
+      expect(prompt).toContain("Content information is below:");
+      expect(prompt).toContain("Format: txt");
+      expect(prompt).toContain("Some test content");
+      expect(prompt).toContain("You are a data extraction assistant");
+      expect(prompt).toContain(
+        "Extract ONLY information explicitly stated in the content"
+      );
+      expect(prompt).not.toContain("Extraction context");
+      expect(prompt).toContain(
+        "Return only the structured data in valid JSON format"
+      );
+    });
+
+    it("should generate a context-aware prompt with extractionContext", () => {
+      const extractionContext = {
+        title: "Existing Title",
+        author: "",
+        tags: ["existing"],
+      };
+
+      const prompt = generateExtractionPrompt({
+        format: ContentFormat.MARKDOWN,
+        content: "Some markdown content",
+        extractionContext,
+      });
+
+      expect(prompt).toContain("Content information is below:");
+      expect(prompt).toContain("Format: markdown");
+      expect(prompt).toContain("Some markdown content");
+      expect(prompt).toContain("Extraction context");
+      expect(prompt).toContain(JSON.stringify(extractionContext, null, 2));
+      expect(prompt).toContain(
+        "You are a data extraction assistant that extracts structured information from the above content and context"
+      );
+      expect(prompt).toContain(
+        "If the extraction context contains partial data objects, enrich and update them with information from the content"
+      );
+      expect(prompt).toContain(
+        "Return only the structured data in valid JSON format"
+      );
+    });
+
+    it("should include custom prompt in the instructions", () => {
+      const customPrompt = "Extract only product information and prices";
+      const extractionContext = { products: [] };
+
+      const prompt = generateExtractionPrompt({
+        format: ContentFormat.HTML,
+        content: "<div>Product content</div>",
+        customPrompt,
+        extractionContext,
+      });
+
+      expect(prompt).toContain(customPrompt);
+      expect(prompt).toContain("Extraction context");
+      expect(prompt).toContain(JSON.stringify(extractionContext, null, 2));
+    });
+  });
+});
