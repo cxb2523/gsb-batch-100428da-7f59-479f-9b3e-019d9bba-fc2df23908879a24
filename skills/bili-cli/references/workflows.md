@@ -22,10 +22,13 @@ bili feed recommend --unseen -n 12      # 个性化推荐，--page 2 换一批
 bili hot popular --unseen               # 全站热门
 bili hot search                         # 热搜词 → bili search video "<关键词>"
 bili hot rank --zone tech --unseen      # 分区排行：all/tech/knowledge/game/…
+bili hot rank --zone tech --pages 3 --limit 60 --unseen   # 往后连翻最多 3 页，凑够 60 条
 bili hot weekly                         # 每周必看
 ```
 
 先根据 `title`、`desc`、`reason`、`stat` 粗筛，只对值得的视频调用 `video watch`（它比列表命令贵得多）。`--unseen` 会跳过 `video watch` 看过的视频。
+
+`hot rank` 每页 30 条（原创 `original`、新人 `rookie` 两个榜不分页，只有一页）。`--limit` 数的是 `--unseen` 过滤后的条数，不够就会继续往后翻，最多翻 `--pages` 页。返回里可以核对采集过程：`pages_fetched`（实际请求的页数）、`page_stats`（每页的 `raw` 原始条数、`skipped` 被已看过滤掉的条数、`kept` 留下的条数）、`stop_reason`（`limit` 够数 / `pages` 页数用完 / `no_more` 接口没有更多 / `error` 某页失败）。某页失败时前面采到的条目照常返回，`error.page` 和 `error.code` 说明失败在那一页、是什么错误——不要把它当成空页继续往下翻。
 
 ## 3. 看懂一个视频
 

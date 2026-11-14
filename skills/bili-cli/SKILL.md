@@ -33,7 +33,7 @@ bili auth status          # 已登录 → 继续；not_logged_in → 走下面�
 |---|---|
 | 看有什么新消息（每轮先做） | `bili feed inbox` |
 | 回复别人的评论 | 直接执行 inbox / `feed replies` 里每条附带的 `reply_with` 命令，把 `<回复内容>` 换成你的话 |
-| 刷视频找内容 | `bili feed recommend --unseen`、`bili hot popular --unseen`、`bili hot search`、`bili search video <关键词>` |
+| 刷视频找内容 | `bili feed recommend --unseen`、`bili hot popular --unseen`、`bili hot search`、`bili hot rank --zone tech --pages 3`（连翻最多 3 页，跳过看过的并报告每页采到多少）、`bili search video <关键词>` |
 | 看懂一个视频 | `bili video watch <BV>`（信息 + AI 总结 + 全文 + 热评 + 弹幕高能时刻 + 画面总览图，一次拿全；总览图每帧下方是观众对这个画面的弹幕反应） |
 | 看观众在哪儿反应最大 | `bili video danmaku <BV> --peaks 5`；要画面就 `bili video frames <BV> --peaks 5`（`-q hd` 精确帧） |
 | 发评论 / @ 人 / 带图 | `bili comment post <BV> "内容[笑哭]" --at owner --at 昵称 --image a.png` |

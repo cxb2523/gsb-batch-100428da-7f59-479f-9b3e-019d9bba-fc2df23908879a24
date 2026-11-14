@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### Added
+- `bili hot rank --pages N`：排行榜可连续翻页（默认 1 页，最多 10 页，每页 30 条）。`--limit` 数的是 `--unseen` 过滤后的条数，不够就按序继续往后翻（不并发）；返回里给出实际请求页数 `pages_fetched`、每页的原始条数 / 被已看过滤数 / 留下条数 `page_stats`，以及结束原因 `stop_reason`（`limit` / `pages` / `no_more` / `error`）。某页失败时前面采到的条目照常返回，`error.page` 与 `error.code` 标出失败页和错误码，不会静默当成空页。网页版 `ranking/v2` 一次只给整份榜单、没有页码参数，分页走 App 的 `/x/v2/rank/region`；原创、新人两个榜没有分页接口，仍只有第 1 页。
+
 ## [1.4.0] - 2026-11-14
 
 ### Added

@@ -99,11 +99,11 @@ def build_server():
         _flag(args, "--unseen", unseen)
         return call(args)
 
-    @server.tool(annotations=read, description="热门内容。kind: popular（综合热门）/ hot_search（热搜词）/ weekly（每周必看）/ rank（排行榜，配合 zone：all/tech/knowledge/game/…）。")
-    def trending(kind: Literal["popular", "hot_search", "weekly", "rank"] = "popular", zone: str = "all", unseen: bool = True) -> dict:
+    @server.tool(annotations=read, description="热门内容。kind: popular（综合热门）/ hot_search（热搜词）/ weekly（每周必看）/ rank（排行榜，配合 zone：all/tech/knowledge/game/…；pages 连翻最多几页，每页 30 条）。")
+    def trending(kind: Literal["popular", "hot_search", "weekly", "rank"] = "popular", zone: str = "all", pages: int = 1, unseen: bool = True) -> dict:
         if kind == "hot_search":
             return call(["hot", "search"])
-        args = {"popular": ["hot", "popular"], "weekly": ["hot", "weekly"], "rank": ["hot", "rank", "--zone", zone]}[kind]
+        args = {"popular": ["hot", "popular"], "weekly": ["hot", "weekly"], "rank": ["hot", "rank", "--zone", zone, "--pages", str(pages)]}[kind]
         _flag(args, "--unseen", unseen)
         return call(args)
 
