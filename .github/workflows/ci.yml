@@ -1,0 +1,287 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags:
+      - "*"
+    paths:
+      - .github/**
+      - src/**
+      - tests/**
+      - pyproject.toml
+      - uv.lock
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/**
+      - src/**
+      - tests/**
+      - pyproject.toml
+      - uv.lock
+
+permissions:
+  contents: write # Required for GitHub Release creation
+  id-token: write # Required for PyPI trusted publishing (OIDC)
+
+jobs:
+  # Deploy jobs - only run on valid version tags
+  check-release-tag:
+    name: check-release-tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check-release-tag.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+
+      - name: Validate PEP-440 tag (extract & check) and set output
+        id: check-release-tag
+        # The script derives the candidate from GITHUB_REF and writes version=... to GITHUB_OUTPUT
+        run: |
+          set -euo pipefail
+          uv run --no-project .github/scripts/check-release-tag.py
+
+  pre-commit:
+    runs-on: ubuntu-latest
+    env:
+      LUALS_VERSION: 3.19.1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Run pre-commit on all files
+        run: |
+          # mypy runs from .mypy.ini with `packages = u2mcp`, so the project and
+          # its dependencies must be importable here; that is why this step also
+          # syncs rather than only running pre-commit (the step used to be named
+          # "Sync project environment (for mypy)"). Verify by running the job
+          # before removing it.
+          uv sync --frozen --all-extras
+          uvx pre-commit run --all-files
+
+  test:
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    needs: [pre-commit]
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.13", "3.15"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Run tests
+        run: uv run --frozen --group test pytest --cov=src/u2mcp --cov-branch --cov-report=term-missing --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.11'
+        uses: codecov/codecov-action@v7
+        with:
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: tanbro/uiautomator2-mcp-server
+
+  build:
+    name: Build Distribution
+    runs-on: ubuntu-latest
+    needs: [check-release-tag, pre-commit, test]
+    if: needs.check-release-tag.outputs.version != ''
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Build package
+        run: uv build
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.check-release-tag.outputs.version }}
+
+      - name: Store the distribution packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-package-distributions
+          path: dist/
+
+  build-executable-linux:
+    name: Build Executable (linux-x86_64)
+    runs-on: ubuntu-latest
+    # glibc baseline is pinned by the image family (2.28), not the tag;
+    # latest keeps the build toolchain patched without manual bumps
+    container:
+      image: quay.io/pypa/manylinux_2_28_x86_64
+    needs: [check-release-tag, pre-commit, test]
+    if: needs.check-release-tag.outputs.version != ''
+    env:
+      VERSION: ${{ needs.check-release-tag.outputs.version }}
+      # Rust-style target triple: the third slot is what distinguishes ABIs
+      # (gnu vs a future musl), so adding a target never reshapes the names.
+      TARGET_TRIPLE: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Build executable
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.check-release-tag.outputs.version }}
+        run: uv run --frozen --group pyinstaller pyinstaller u2mcp.spec
+      - name: Package artifacts
+        shell: bash
+        run: |
+          test -n "$VERSION"
+          mkdir -p executables
+          # tar preserves the executable bit that zip would lose on Unix
+          tar -czf "executables/u2mcp-${TARGET_TRIPLE}-${VERSION}.tar.gz" -C dist u2mcp
+      - name: Store the executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: pyinstaller-executables-linux
+          path: executables/
+
+  build-executable:
+    name: Build Executable (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    needs: [check-release-tag, pre-commit, test]
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [windows-latest, macos-latest]
+    if: needs.check-release-tag.outputs.version != ''
+    env:
+      VERSION: ${{ needs.check-release-tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.1.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+      - name: Build executable
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ needs.check-release-tag.outputs.version }}
+        run: uv run --frozen --group pyinstaller pyinstaller u2mcp.spec
+      - name: Package artifacts
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          test -n "$VERSION"
+          mkdir -p executables
+          # tar preserves the executable bit that zip would lose on Unix
+          # Triples are CI's to mint; installers only map uname output to them.
+          # Keep the OS slot as "darwin" (what `uname -s` says), not "macos".
+          tar -czf "executables/u2mcp-aarch64-apple-darwin-${VERSION}.tar.gz" -C dist u2mcp
+      - name: Package artifacts (Windows 7z)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force executables | Out-Null
+          # Invoke with a leading & and a space so 7z resolves from PATH
+          & 7z a -r "executables\u2mcp-x86_64-pc-windows-msvc-$($env:VERSION).zip" "dist\u2mcp"
+      - name: Store the executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: pyinstaller-executables-${{ matrix.os }}
+          path: executables/
+
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    needs: [check-release-tag, build]
+    if: needs.check-release-tag.outputs.version != ''
+    environment:
+      name: pypi
+      url: https://pypi.org/p/uiautomator2-mcp-server
+
+    steps:
+      - name: Download distribution packages
+        uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+          verbose: true
+
+  github-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: [check-release-tag, build, build-executable, build-executable-linux]
+    if: needs.check-release-tag.outputs.version != ''
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download distribution packages
+        uses: actions/download-artifact@v8
+        with:
+          name: python-package-distributions
+          path: dist/
+
+      - name: Download all executable artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: pyinstaller-executables-*
+          merge-multiple: true
+          path: executables/
+
+      # Channel manifest: one "<sha256>  <asset>" line per archive, so installers
+      # match by uname and verify integrity from the same file. Digests are
+      # computed here because this is the only job holding every platform's
+      # archive; basenames only, so the file is also valid `sha256sum -c` input.
+      # --text pins the two-space separator instead of the build's default mode.
+      - name: Build SHA256SUMS channel manifest
+        run: |
+          cd executables
+          sha256sum --text u2mcp-* > SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: v${{ needs.check-release-tag.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            executables/*
+            dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,25 @@
+exclude AGENTS.md
+exclude CLAUDE.md
+exclude MANIFEST.in
+exclude README.*.md
+exclude main.py
+exclude server.json
+exclude server.py
+exclude uv.lock
+
+exclude .mypy.ini
+exclude .pre-commit-config.yaml
+exclude .readthedocs.yaml
+exclude .ruff.toml
+
+prune .claude
+prune .github
+prune skills
+prune assets
+prune htmlcov
+
+global-exclude .DS_Store
+global-exclude .coverage
+global-exclude coverage.*
+global-exclude *.pyc
+global-exclude __pycache__

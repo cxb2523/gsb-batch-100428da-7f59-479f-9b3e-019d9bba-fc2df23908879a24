@@ -1,0 +1,1053 @@
+# uiautomator2-mcp-server
+
+<!--
+mcp-name: io.github.tanbro/uiautomator2-mcp-server
+-->
+
+[![PyPI](https://img.shields.io/pypi/v/uiautomator2-mcp-server)](https://pypi.org/project/uiautomator2-mcp-server/)
+![GitHub Tag](https://img.shields.io/github/v/tag/tanbro/uiautomator2-mcp-server)
+[![GitHub Release](https://img.shields.io/github/v/release/tanbro/uiautomator2-mcp-server)](https://github.com/tanbro/uiautomator2-mcp-server/releases)
+[![CI](https://github.com/tanbro/uiautomator2-mcp-server/actions/workflows/ci.yml/badge.svg)](https://github.com/tanbro/uiautomator2-mcp-server/actions/workflows/ci.yml)
+[![Codecov](https://img.shields.io/codecov/c/gh/tanbro/uiautomator2-mcp-server)](https://codecov.io/gh/tanbro/uiautomator2-mcp-server)
+
+[![MCP Badge](https://lobehub.com/badge/mcp/tanbro-uiautomator2-mcp-server)](https://lobehub.com/mcp/tanbro-uiautomator2-mcp-server)
+
+[![Language](https://img.shields.io/badge/lang-English-blue)](README.md)
+[![Language](https://img.shields.io/badge/lang-中文-red)](README.zh-CN.md)
+
+用 [uiautomator2](https://github.com/openatx/uiautomator2) 控制 Android 设备的 [MCP](https://modelcontextprotocol.io/) 服务器。
+
+> 让 AI 自动化 Android 设备：截图、点击/滑动、管理应用、发送文本等。
+
+## 📺 演示
+
+### 对话驱动的 Android 自动化
+
+**用户说**：*"在抖音搜索萝卜纸巾猫，然后点开刷视频"*
+
+**AI 自动完成**：
+
+![演示 GIF](assets/demo-quick.gif)
+
+[![Bilibili](https://img.shields.io/badge/Bilibili-观看演示-FF69B4?logo=bilibili&logoColor=white)](https://www.bilibili.com/video/BV1wGF4zFEev/)
+[![下载视频](https://img.shields.io/badge/下载-MP4-00C853?logo=video&logoColor=white)](assets/douyin-demo-2x.mp4)
+
+- ✅ 启动应用 → 点击搜索 → 输入关键词 → 执行搜索 → 点击结果 -> 刷视频
+
+**无需编写代码，通过自然语言即可控制 Android 设备**
+
+详细示例：[skills/douyin-search](skills/douyin-search/SKILL.md)
+
+---
+
+## ✨ 特性
+
+- 📱 **多设备** - 一台服务器，多台手机
+- 🔍 **XPath 过滤** - 只 dump 你需要的 UI 元素 — 省 token、响应快
+- 🎛️ **工具过滤** - 只给 AI 看需要的工具 — 幻觉少、效果好
+- ⚡ **零安装** - 用 `uvx` 直接跑，无需手动安装
+- 📦 **独立可执行文件** - 打包成独立应用，目标机器无需 Python 环境
+- 🧰 **70+ 工具** - 点一点、滑一滑、输文字、管应用 — 全都有
+- 🧪 **自带测试** - 开箱即用的 AI 驱动 UI 测试框架
+- 🔄 **两种模式** - STDIO 本地用，HTTP 远程用
+- ⚙️ **配置文件** - 支持 TOML/YAML/JSON 配置文件，自动发现
+- 🔒 **代码干净** - 有类型、有检查、有格式 — 容易扩展
+
+## 🎯 使用场景
+
+| 场景               | 描述                                       |
+| ------------------ | ------------------------------------------ |
+| **🧪 自动化测试** | 使用 AI 驱动的测试框架运行自然语言 UI 测试 |
+| **⚡ 快速原型**    | 无需编写代码即可快速测试 Android 应用交互  |
+| **♿ 无障碍测试**  | 自动验证应用的无障碍功能                   |
+| **📊 健康监控**   | 定期设备健康和状态检查                     |
+| **🤖 任务自动化** | 自动化表单填写、导航等重复性任务           |
+| **🔬 远程调试**   | 远程检查 UI 层级和截图                     |
+
+## 🏗️ 架构
+
+```mermaid
+graph TD
+    AI[AI 助手<br/>Claude/GPT/等] --> MCP[MCP 协议]
+    MCP --> Server[u2mcp 服务器]
+    Server --> uiautomator2[uiautomator2]
+    uiautomator2 --> ADB[ADB]
+    ADB --> Device[Android 设备<br/>真机/模拟器]
+
+    style AI fill:#e1f5ff
+    style MCP fill:#fff4e6
+    style Server fill:#f3e5f5
+    style uiautomator2 fill:#e8f5e9
+    style ADB fill:#fff3e0
+    style Device fill:#fce4ec
+```
+
+## 从 v0.1.x 版本迁移
+
+**如果你正在从 v0.1.3 或更早版本升级：** CLI 现在需要显式指定子命令。请将你的命令从：
+
+```bash
+# 旧版本（v0.1.3 及更早）
+u2mcp
+```
+
+改成:
+
+```bash
+# 新版本（v0.2.0+）
+u2mcp stdio
+```
+
+所有其他命令保持不变（只需添加传输子命令）。
+
+## 前置条件
+
+- [Python][] 3.11+
+- `adb` 在你的 PATH 中（通过 [Android SDK Platform Tools](https://developer.android.com/tools/releases/platform-tools) 安装)
+- Android 设备已开启 **USB 调试**
+
+------
+
+> **💡 工具选择建议：**
+>
+> - **MCP 客户端使用**（Claude Desktop、Cursor 等）：推荐安装 **[uv][]**，使用 `uvx` 直接运行 Python 包
+> - **独立运行/调试**：可以使用 **[uv][]**、**[pip][]** 或 **[pipx][]**
+>
+> 大多数情况下，安装 **uv** 即可满足所有需求。
+
+------
+
+### 安装增强的第三方 Python 包管理器
+
+以下推荐两种可选的增强型包管理器，可仍选其一安装。如果不想使用，可跳过本步骤。
+
+- 安装 `uv`（推荐|可选）
+
+  大多数 MCP 客户端（如 Claude Desktop）使用 `uvx` 来运行 Python MCP 服务器。`uvx` 是 [uv][] 工具套件的一部分。
+
+  > **为什么选择 `uvx`？** `uvx` 可以直接从 PyPI 运行 Python 包，无需手动安装——只需使用 `uvx package-name`，其余的它会自动处理。这使得它非常适合 MCP 客户端配置。
+
+  **macOS / Linux:**
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  ```
+
+  **Windows (PowerShell):**
+  ```powershell
+  powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
+  ```
+
+  或使用 `winget`:
+  ```powershell
+  winget install --id=astral-sh.uv -e
+  ```
+
+  验证安装：
+  ```bash
+  uv --version
+  uvx --version
+  ```
+
+- 安装 `pipx`（可选）
+
+  [pipx][] 是另一个用于在隔离环境中安装和运行 Python CLI 应用程序的工具。
+
+  > **`pipx` vs `uvx`：** 和 `uvx` 一样，`pipx` 也可以通过 `pipx run package-name` 直接运行包。不过 `uvx` 通常更快，在 MCP 生态系统中也更常用。
+
+  **macOS / Linux:**
+  ```bash
+  python3 -m pip install --user pipx
+  python3 -m pipx ensurepath
+  ```
+
+  **Windows:**
+  ```powershell
+  python -m pip install --user pipx
+  python -m pipx ensurepath
+  ```
+
+### 国内可用的镜像源
+
+#### uv 镜像源
+
+安装完毕之后，如果 [uv][] 下载软件包的速度较慢，可以配置国内镜像源:
+
+**方法一：配置文件**
+
+创建或编辑 `~/.config/uv/uv.toml`（macOS/Linux）或 `%APPDATA%\uv\uv.toml`（Windows）：
+
+```toml
+[[index]]
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+```
+
+**方法二：环境变量**
+
+- **macOS/Linux** (添加到 `~/.bashrc`、`~/.zshrc` 等):
+```bash
+export UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
+```
+
+- **Windows** (系统环境变量):
+```
+UV_DEFAULT_INDEX=https://mirrors.aliyun.com/pypi/simple/
+```
+
+#### pip 镜像源
+
+如果使用 [pip][] 或 [pipx][] ，可以这样配置国内镜像源:
+
+**方法一：使用 pip config 命令（推荐）**
+
+```bash
+# 设置（操作系统用户级别的）全局镜像源
+pip config set --user global.index-url https://mirrors.aliyun.com/pypi/simple/
+
+# 验证配置
+pip config list
+```
+
+**方法二：配置文件**
+
+创建或编辑配置文件：
+- **Unix/macOS**: `~/.config/pip/pip.conf` 或 `~/.pip/pip.conf`（旧路径，仍支持）
+- **Windows**: `%APPDATA%\pip\pip.ini`
+
+```ini
+[global]
+index-url = https://mirrors.aliyun.com/pypi/simple/
+```
+
+**方法三：环境变量**
+
+- **macOS/Linux** (添加到 `~/.bashrc`、`~/.zshrc` 等):
+```bash
+export PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+```
+
+- **Windows** (系统环境变量):
+```
+PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+```
+
+此配置对 [pip][] 和 [pipx][] 都生效。
+
+### 镜像源列表
+
+- **阿里云**：`https://mirrors.aliyun.com/pypi/simple/`
+- **腾讯云**：`https://mirrors.cloud.tencent.com/pypi/simple/`
+- **华为云**：`https://mirrors.huaweicloud.com/repository/pypi/simple/`
+- **清华大学**：`https://pypi.tuna.tsinghua.edu.cn/simple/`
+- **中科大**：`https://pypi.mirrors.ustc.edu.cn/simple/`
+
+## 安装
+
+- 下载安装预编译的执行文件(推荐，但国内网络可能无法访问)：
+
+  - macOS / Linux
+
+    ```bash
+    curl -fsSL https://raw.githubusercontent.com/tanbro/uiautomator2-mcp-server/main/scripts/install.sh | bash
+    ```
+
+  - Windows
+
+    ```powershell
+    irm https://raw.githubusercontent.com/tanbro/uiautomator2-mcp-server/main/scripts/install.ps1 | iex
+    ```
+
+  安装后, 命令 `u2mcp` 可用:
+
+  ```bash
+  u2mcp --version
+  ```
+
+  预编译产物的支持平台:
+
+  | 平台 | 发布资产 | 要求 |
+  |------|----------|------|
+  | Linux x86_64 | `u2mcp-x86_64-unknown-linux-gnu-<version>.tar.gz` | glibc; 构建镜像 `quay.io/pypa/manylinux_2_28_x86_64` |
+  | Linux aarch64 | 未发布 | — |
+  | macOS (Apple Silicon) | `u2mcp-aarch64-apple-darwin-<version>.tar.gz` | arm64 Mac |
+  | Windows x64 | `u2mcp-x86_64-pc-windows-msvc-<version>.zip` | x64 Windows (ARM64 经仿真运行) |
+
+  资产名用 Rust 风格的 target triple, 以后换 ABI 是新增一个 triple, 不是改命名规则。
+  Linux 的下限由构建镜像决定, 不在这里维护一个数字 —— 上面那个镜像是个 manylinux profile,
+  名字里就写了它对准的 glibc。musl 系统 (如 Alpine)、比该 profile 更老的发行版
+  (如 CentOS 7 / Debian 9), 以及 Intel Mac 都没有预编译产物, 只能按下面从 PyPI 安装。
+
+- 免安装直接执行
+
+  使用 `uvx` (推荐) 或 `pipx run` 直接一键从 PyPI 下载运行:
+
+  ```bash
+  uvx uiautomator2-mcp-server stdio
+  ```
+
+  或
+
+  ```bash
+  pipx run uiautomator2-mcp-server stdio
+  ```
+
+  **如需全局安装长期使用**, 可以这样安装:
+
+  ```bash
+  # 用 uv (工具模式) 安装
+  uv tool install uiautomator2-mcp-server
+
+  # 或用 pipx 安装
+  pipx install uiautomator2-mcp-server
+
+  # 或者用 pip 安装
+  python -m pip install uiautomator2-mcp-server
+  ```
+
+  安装后, 命令 `u2mcp` 可用:
+
+  ```bash
+  u2mcp --version
+  ```
+
+----
+
+如果不想使用 [uv][], [pipx][] 等第三方包管理器，可以直接使用 [Python][] 默认的包管理器 [pip][] 安装这个软件：
+
+```bash
+python -m pip install uiautomator2-mcp-server
+```
+
+> ℹ️ **注意**: \
+> [pip][] **不支持**免安装直接运行
+
+### 打包为独立可执行文件
+
+你可以将服务器打包为独立应用——目标机器无需安装 Python。
+
+#### PyInstaller（推荐）
+
+构建速度快，无需 C 编译器。
+
+```bash
+# 1. 安装 PyInstaller
+uv sync --group pyinstaller
+
+# 2. 构建
+pyinstaller u2mcp.spec
+```
+
+构建完成后会在 `dist/u2mcp/` 目录生成可执行文件及所有运行时文件。将整个目录作为便携应用分发即可。
+
+#### Nuitka
+
+将 Python 编译为 C，生成原生的 `.so`/`.pyd`/`.dll` 二进制文件——提供基本的源码保护。需要 C/C++ 编译器（Windows 上为 MSVC，Linux/macOS 上为 GCC/Clang）。
+
+构建选项已通过 [Nuitka 项目指令](https://nuitka.net/user-documentation/user-manual.html#nuitka-project-options)预配置在 `main.py` 中：
+
+```bash
+# 1. 安装 Nuitka
+uv sync --group nuitka
+
+# 2. 构建
+nuitka main.py
+```
+
+#### 运行打包后的服务器
+
+无论使用哪种工具：
+
+```bash
+# STDIO 模式（本地 MCP 客户端）
+u2mcp stdio
+
+# HTTP 模式（远程访问）
+u2mcp http -H 0.0.0.0 -p 8000
+```
+
+> **注意：** 输出已包含 Python 运行时和所有 Python 依赖，目标机器不需要安装 Python、pip 或 uv。但系统 PATH 中仍需有 `adb`（或通过 `ADBUTILS_ADB_PATH` 环境变量指定路径）。
+
+### 运行模式
+
+> **注意：** 以下命令使用 `u2mcp`，需要先安装软件包。如果尚未安装，可以直接使用 `uvx uiautomator2-mcp-server` 运行。
+
+MCP 服务器可以两种模式运行：
+
+#### STDIO 模式（用于本地 MCP 客户端）
+
+```bash
+# 如果已安装
+u2mcp stdio
+
+# 或直接运行无需安装
+uvx uiautomator2-mcp-server stdio
+```
+
+此模式通过标准输入/输出通信，通常由直接生成服务器进程的 MCP 客户端使用。
+
+#### HTTP 模式（用于远程/网络访问）
+
+```bash
+# 如果已安装
+u2mcp http -H 0.0.0.0 -p 8000 --no-auth
+
+# 或直接运行无需安装
+uvx uiautomator2-mcp-server http -H 0.0.0.0 -p 8000 --no-auth
+
+# 带认证令牌（如果已安装）
+u2mcp http -H 0.0.0.0 -p 8000 -t YOUR_SECRET_TOKEN
+
+# 或直接运行无需安装
+uvx uiautomator2-mcp-server http -H 0.0.0.0 -p 8000 -t YOUR_SECRET_TOKEN
+```
+
+服务器将监听 `http://localhost:8000/mcp`（或你指定的主机/端口）。
+
+### 配置文件
+
+你可以使用配置文件来代替（或补充）CLI 参数。支持 **TOML**、**YAML** 和 **JSON** 格式。
+
+#### 配置文件位置
+
+服务器会自动在以下平台相关目录中查找配置文件：
+
+| 优先级 | 位置 | 平台示例 |
+|--------|------|----------|
+| 1（最低） | 系统配置目录 | `/etc/u2mcp/`（Linux）、`C:\ProgramData\u2mcp\`（Windows） |
+| 2 | 用户配置目录 | `~/.config/u2mcp/`（Linux）、`%APPDATA%\u2mcp\`（Windows） |
+| 3（最高） | 当前工作目录 | `./` |
+
+在每个目录中，服务器按顺序查找第一个匹配的文件：`u2mcp.toml`、`u2mcp.yaml`、`u2mcp.yml`、`u2mcp.json`（每个目录最多匹配一个文件）。
+
+优先级顺序：**CLI 参数 > 环境变量 > 配置文件（当前目录 > 用户目录 > 系统目录） > 默认值**。
+
+#### 指定配置文件
+
+```bash
+# 通过 CLI 选项
+u2mcp stdio --config-file my-config.toml
+
+# 通过环境变量
+U2MCP_CONFIG_FILE=my-config.toml u2mcp stdio
+```
+
+#### 配置文件结构
+
+配置文件使用命令名作为顶级键：
+
+```toml
+# u2mcp.toml
+[stdio]
+log-level = "debug"
+check-adb = false
+include-tags = ["device:info", "action:touch"]
+exclude-tools = ["shell_command"]
+
+[http]
+host = "0.0.0.0"
+port = 8000
+auth = true
+json-response = true
+```
+
+```yaml
+# u2mcp.yaml
+stdio:
+  log-level: debug
+  check-adb: false
+
+http:
+  host: "0.0.0.0"
+  port: 8000
+  auth: false
+```
+
+```json
+{
+  "stdio": {
+    "log-level": "warning",
+    "print-tags": false
+  }
+}
+```
+
+#### 环境变量
+
+CLI 参数可以通过 `U2MCP_{命令}_{参数}` 格式的环境变量设置：
+
+```bash
+U2MCP_STDIO_LOG_LEVEL=debug u2mcp stdio
+U2MCP_HTTP_HOST=0.0.0.0 U2MCP_HTTP_PORT=9000 u2mcp http
+U2MCP_HTTP_AUTH=false u2mcp http
+```
+
+#### 示例配置文件
+
+参见 [`examples/`](examples/) 目录获取可直接使用的配置文件：
+
+| 文件 | 说明 |
+|------|------|
+| [`config-minimal-stdio.toml`](examples/config-minimal-stdio.toml) | 最小化 stdio 静默配置 |
+| [`config-full.toml`](examples/config-full.toml) | 完整配置，包含 stdio、http 和 doctor 部分 |
+| [`config-filtered-tools.toml`](examples/config-filtered-tools.toml) | 按标签过滤工具 |
+| [`config-http-server.yaml`](examples/config-http-server.yaml) | YAML 格式的 HTTP 服务器配置 |
+| [`config-quiet-mode.json`](examples/config-quiet-mode.json) | JSON 格式的静默模式配置 |
+
+### CLI 实用命令
+
+> **注意：** 以下命令使用 `u2mcp`，需要先安装软件包。如果尚未安装，可以直接使用 `uvx uiautomator2-mcp-server ...` 运行。
+
+`u2mcp` CLI 提供了几个实用命令用于探索可用的工具和标签：
+
+```bash
+# 列出所有可用工具
+u2mcp tools
+
+# 或直接运行
+uvx uiautomator2-mcp-server tools
+
+# 显示特定工具的详细信息
+u2mcp info screenshot
+
+# 显示匹配模式的所有工具（支持通配符）
+u2mcp info "device:*"     # 所有设备工具
+u2mcp info "*screenshot*" # 名称中包含 'screenshot' 的工具
+
+# 列出所有可用的工具标签
+u2mcp tags
+
+# 显示版本信息
+u2mcp --version
+```
+
+### 工具过滤
+
+> **注意：** 以下命令使用 `u2mcp`，需要先安装软件包。如果尚未安装，可以直接使用 `uvx uiautomator2-mcp-server ...` 运行。
+
+你可以使用基于标签的过滤来选择性暴露工具。这会减少 LLM 可用的工具数量，从而提高性能并减少幻觉。
+
+```bash
+# 只暴露设备管理工具
+u2mcp stdio -i device:manage
+
+# 或直接运行
+uvx uiautomator2-mcp-server stdio -i device:manage
+
+# 只暴露触摸和手势操作
+u2mcp stdio -i action:touch -i action:gesture
+
+# 排除屏幕镜像工具
+u2mcp stdio -e screen:mirror
+
+# 只暴露应用生命周期和元素交互工具
+u2mcp stdio -i app:lifecycle -i xpath:interact
+
+# 排除 shell 命令工具（出于安全考虑）
+u2mcp stdio -e device:shell
+
+# 只暴露输入相关工具
+u2mcp stdio -i input:text
+
+# 组合使用 include 和 exclude
+u2mcp stdio -i device:info -i action:touch -e screen:capture
+
+# 裸分类标签暴露整个分类
+u2mcp stdio -i device
+
+# 按工具名过滤（而非标签）
+u2mcp stdio --include-tools click --include-tools screenshot
+
+# 列出所有可用标签
+u2mcp tags
+```
+
+## 快速开始
+
+> **开始之前：** 确保你已经配置了 MCP 客户端（如 Claude Desktop）来使用此服务器。详情请参阅下方的 [MCP 客户端配置](#mcp-客户端配置)。
+
+1. **连接你的 Android 设备**，通过 USB 并启用 USB 调试
+2. **配置你的 MCP 客户端**以使用此服务器（参见 [MCP 客户端配置](#mcp-客户端配置)）
+3. **初始化设备**（首次必需）：
+
+   > "初始化我的 Android 设备"
+
+4. **开始自动化**：
+
+   > "截图"
+   > "点击坐标 500, 1000"
+   > "向上滑动"
+   > "打开 YouTube 应用"
+
+**短选项：**
+
+所有常用选项都支持短标志以方便使用：
+- `-l` / `--log-level` - 设置日志级别
+- `-i` / `--include-tags` - 按标签包含工具
+- `-e` / `--exclude-tags` - 按标签排除工具
+- `-H` / `--host` - 设置主机地址（HTTP 模式）
+- `-p` / `--port` - 设置端口号（HTTP 模式）
+- `-t` / `--token` - 设置认证令牌（HTTP 模式）
+- `-n` / `--no-auth` - 禁用认证（HTTP 模式）
+
+**过滤选项：**
+
+`--include-tags`/`--exclude-tags` 和 `--include-tools`/`--exclude-tools` 通过重复 flag 或配置文件列表传值：
+
+```bash
+# 白名单：只暴露触摸操作和 screenshot 工具
+u2mcp stdio --include-tags action:touch --include-tools screenshot
+
+# 黑名单：暴露全部，但排除 shell 和镜像
+u2mcp stdio --exclude-tags device:shell --exclude-tags screen:mirror
+```
+
+include 过滤是白名单（只暴露匹配的工具）；exclude 过滤在其之后从中扣除，优先级更高。同一方向内，tag 与工具名过滤取并集。
+
+每个工具有两个标签：裸分类（如 `device`）和子分类（如 `device:capture`）。选择裸分类即暴露整个分类下的全部工具。
+
+**可用标签：**
+
+| 标签               | 描述                       |
+| ------------------ | -------------------------- |
+| `device`           | 全部设备工具               |
+| `device:manage`    | 设备连接、初始化和管理     |
+| `device:info`      | 设备信息和状态             |
+| `device:capture`   | 截图和 UI 层级             |
+| `device:shell`     | Shell 命令执行             |
+| `action`           | 全部触摸/手势/按键/屏幕工具 |
+| `action:touch`     | 点击和触摸操作             |
+| `action:gesture`   | 滑动和拖动手势             |
+| `action:key`       | 物理按键操作               |
+| `action:screen`    | 屏幕控制（开/关）          |
+| `app`              | 全部应用管理工具           |
+| `app:manage`       | 安装和卸载应用             |
+| `app:lifecycle`    | 启动和停止应用             |
+| `app:info`         | 应用信息和列表             |
+| `app:config`       | 应用配置（清除数据、权限） |
+| `xpath`            | 全部 XPath 元素工具        |
+| `xpath:wait`       | 等待元素出现/消失          |
+| `xpath:interact`   | 点击和交互元素             |
+| `xpath:query`      | 获取元素信息（文本、边界） |
+| `xpath:gesture`    | 元素特定手势（滑动、滚动） |
+| `xpath:capture`    | 元素截图                   |
+| `gesture`          | 边缘滑动手势               |
+| `gesture:edge`     | 定向边缘滑动               |
+| `input`            | 全部文本输入工具           |
+| `input:text`       | 文本输入、聚焦、清除、键盘 |
+| `clipboard`        | 全部剪贴板工具             |
+| `clipboard:read`   | 读取剪贴板                 |
+| `clipboard:write`  | 写入剪贴板                 |
+| `screen`           | 全部屏幕工具               |
+| `screen:mirror`    | 屏幕镜像（scrcpy）         |
+| `screen:record`    | 屏幕录制                   |
+| `screen:capture`   | 屏幕截图                   |
+| `system`           | 全部系统控制工具           |
+| `system:orientation` | 设备方向控制             |
+| `system:ui`        | 通知、快捷设置、解锁       |
+| `system:toast`     | Toast 消息工具             |
+| `util`             | 实用工具（延迟/休眠）      |
+
+## 测试和调试
+
+### 使用 MCP Inspector
+
+[MCP Inspector](https://github.com/modelcontextprotocol/inspector) 是一个命令行工具，用于测试和调试 MCP 服务器，无需 AI 客户端。
+
+```bash
+# 安装 MCP Inspector
+npm install -g @modelcontextprotocol/inspector
+
+# 在 STDIO 模式下检查服务器
+npx @modelcontextprotocol/inspector u2mcp stdio
+
+# 或在 HTTP 模式下检查服务器
+# 首先启动服务器：u2mcp http --host 0.0.0.0 --port 8000
+# 然后使用 URL 运行 inspector
+npx @modelcontextprotocol/inspector http://localhost:8000/mcp
+```
+
+Inspector 将显示：
+- 可用工具及其参数
+- 服务器资源和提示
+- 实时工具执行结果
+- 请求/响应日志
+
+### 使用 Postman
+
+[Postman](https://www.postman.com/) 具有原生 MCP 支持，用于测试和调试 MCP 服务器。
+
+1. 打开 Postman 并创建一个新的 **MCP Request**
+2. 输入服务器连接详情：
+
+**STDIO 模式：**
+```
+Command: u2mcp
+Arguments: stdio
+```
+
+**HTTP 模式：**
+```
+URL: http://localhost:8000/mcp
+```
+（首先启动服务器：`u2mcp http --host 0.0.0.0 --port 8000`）
+
+3. 点击 **Load Capabilities** 连接并发现可用工具
+4. 使用 **Tools**、**Resources** 和 **Prompts** 标签与服务器交互
+5. 点击 **Run** 执行工具调用并查看响应
+
+有关更多信息，请参阅 [Postman MCP 文档](https://learning.postman.com/docs/postman-ai/mcp-requests/overview/)。
+
+### 使用 cURL
+
+你也可以使用 cURL 通过 JSON-RPC 2.0 请求测试 HTTP 端点：
+
+```bash
+# 1. 首先启动服务器
+u2mcp http --host 0.0.0.0 --port 8000
+
+# 2. 在另一个终端中，发送 MCP 请求
+curl -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/list"
+  }'
+
+# 调用工具（例如，列出设备）
+curl -X POST http://localhost:8000/mcp \
+  -H "Content-Type: application/json" \
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 2,
+    "method": "tools/call",
+    "params": {
+      "name": "device_list",
+      "arguments": {}
+    }
+  }'
+```
+
+## MCP 客户端配置
+
+此 MCP 服务器可与任何兼容 MCP 的客户端一起使用。以下是热门客户端的配置说明。
+
+### Claude Desktop
+
+将以下内容添加到你的 Claude Desktop 配置文件：
+
+**macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+**Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "android": {
+      "command": "uvx",
+      "args": ["uiautomator2-mcp-server", "stdio"]
+    }
+  }
+}
+```
+
+如果你全局安装了该包，也可以使用：
+
+```json
+{
+  "mcpServers": {
+    "android": {
+      "command": "u2mcp",
+      "args": ["stdio"]
+    }
+  }
+}
+```
+
+### Cursor
+
+Cursor 是一个具有原生 MCP 支持的 AI 代码编辑器。
+
+1. 打开 Cursor 设置（Cmd/Ctrl + ,）
+2. 导航到 **MCP Servers**
+3. 添加新服务器：
+
+```json
+{
+  "mcpServers": {
+    "android": {
+      "command": "u2mcp",
+      "args": ["stdio"]
+    }
+  }
+}
+```
+
+### Cherry Studio
+
+[Cherry Studio](https://cherry-ai.com/) 是一个具有完整 MCP 支持的跨平台 AI 桌面客户端。非常适合 Android 设备自动化任务。
+
+1. 下载并安装 [Cherry Studio](https://github.com/CherryHQ/cherry-studio)
+2. 打开设置并导航到 **MCP Servers**
+3. 点击 **Add Server** 并配置：
+
+**选项 A: 使用 uvx（推荐）**
+```
+Command: uvx
+Arguments: uiautomator2-mcp-server stdio
+```
+
+**选项 B: 使用已安装的 u2mcp 命令**
+```
+Command: u2mcp
+Arguments: stdio
+```
+
+**选项 C: HTTP 模式**
+首先启动服务器：
+```bash
+u2mcp http --host 0.0.0.0 --port 8000 --no-auth
+```
+
+然后在 Cherry Studio 中，选择 HTTP 模式并输入：
+```
+URL: http://localhost:8000/mcp
+```
+
+有关 Cherry Studio 中 MCP 配置的详细信息，请参阅[官方文档](https://docs.cherry-ai.com/docs/en-us/advanced-basic/mcp/config)。
+
+### ChatMCP
+
+[ChatMCP](https://github.com/daodao97/chatmcp) 是一个实现 MCP 协议的开源 AI 聊天客户端。支持多个 LLM 提供商（OpenAI、Claude、Ollama）。
+
+1. 下载并安装 [ChatMCP](https://github.com/daodao97/chatmcp)
+2. 打开设置并导航到 **MCP Servers**
+3. 添加新服务器：
+
+**使用 uvx（推荐）**
+```
+Command: uvx
+Arguments: uiautomator2-mcp-server stdio
+```
+
+**使用已安装的 u2mcp 命令**
+```
+Command: u2mcp
+Arguments: stdio
+```
+
+**HTTP 模式**
+首先启动服务器：
+```bash
+u2mcp http --host 0.0.0.0 --port 8000 --no-auth
+```
+
+然后在 ChatMCP 中，选择 HTTP 模式并输入：
+```
+URL: http://localhost:8000/mcp
+```
+
+### Cline
+
+Cline 是一个支持 MCP 的 AI 编码助手扩展。
+
+1. 在 IDE 中打开 Cline 设置
+2. 导航到 **MCP Servers** 部分
+3. 添加服务器配置：
+
+```json
+{
+  "android": {
+    "command": "u2mcp",
+      "args": ["stdio"]
+  }
+}
+```
+
+### Continue
+
+Continue 是 VS Code 和 JetBrains 的 AI 结对程序员扩展。
+
+1. 安装 [Continue 扩展](https://marketplace.visualstudio.com/items?itemName=Continue.continue)
+2. 打开 Continue 设置
+3. 添加到你的 MCP 服务器配置：
+
+```json
+{
+  "mcpServers": {
+    "android": {
+      "command": "u2mcp",
+      "args": ["stdio"]
+    }
+  }
+}
+```
+
+### HTTP 模式配置
+
+对于支持 HTTP 连接的客户端（或用于远程访问），首先启动服务器：
+
+```bash
+u2mcp http -H 0.0.0.0 -p 8000 --no-auth
+```
+
+然后配置你的客户端连接到 `http://localhost:8000/mcp`。
+
+**注意：** 查看客户端的文档以了解 HTTP MCP 服务器配置，因为设置因客户端而异。
+
+### 其他 MCP 客户端
+
+服务器遵循 [Model Context Protocol](https://modelcontextprotocol.io/) 规范，可与任何兼容 MCP 的客户端一起使用，包括：
+
+- **Windsurf** - 具有 MCP 支持的开发环境
+- **Zed** - 具有 MCP 功能的代码编辑器
+- **LibreChat** - 支持 MCP 的聊天界面
+- **Chainlit** - 用于构建 AI 应用程序的平台
+
+有关特定配置详细信息，请参阅你客户端的文档。
+
+## AI 驱动的 UI 测试
+
+> **前置条件：** 要使用 AI 驱动的 UI 测试，你必须先配置 MCP 客户端（如 Claude Desktop、Cursor 或 Cherry Studio）来连接到此服务器。设置说明请参阅上方的 [MCP 客户端配置](#mcp-客户端配置) 部分。
+
+本项目包含一个使用 `skills/` 系统的 AI 驱动 UI 测试框架。`android-ui-test` 技能具有双重用途：
+
+1. **教育示例**：演示 MCP 技能开发的最佳实践
+2. **生产测试**：作为项目的自动化 UI 测试套件，用于 CI/CD
+
+### 技能结构
+
+```
+skills/android-ui-test/
+├── SKILL.md                     # 核心技能定义（YAML 元数据 + 简要描述）
+├── README.md                    # 架构概览和快速入门
+├── examples/                    # 学习资料
+│   └── usage-examples.md        # 详细使用模式和示例
+└── references/                  # 技术规范
+    └── test-specification.md    # 完整测试规范（TC001-TC010）
+```
+
+### 运行 UI 测试
+
+只需让 AI 执行 UI 测试：
+
+```
+在我连接的设备上运行 Android UI 测试套件
+```
+
+AI 将会：
+- 自动检测并连接到第一个可用设备
+- 运行涵盖所有设备操作的全面测试
+- 提供详细的测试报告，包括通过/失败/跳过状态
+
+### 测试覆盖
+
+| 类别     | 测试内容                                    |
+| -------- | ------------------------------------------- |
+| 设备     | 连接、信息、截图、层级、诊断                |
+| 触摸     | 点击、长按、双击                            |
+| 手势     | 滑动、拖拽、按键                            |
+| 应用     | 列表、启动、等待、信息、权限                |
+| 元素     | 等待、存在性检查、边界、获取文本、点击、截图 |
+| 输入     | 文本输入、焦点文本、键盘                    |
+| 剪贴板   | 读取/写入（有已知限制）                     |
+
+### 测试报告示例
+
+```
+Android UI 测试总结
+==================
+
+设备: UGAILFCIU88TT469 (PDKM00, Android 11, SDK 31)
+
+测试用例:
+  [通过] TC001: 设备连接与初始化
+  [通过] TC002: 设备信息与捕获
+  [通过] TC003: 触摸操作
+  [通过] TC004: 手势操作
+  [通过] TC005: 应用管理
+  [通过] TC006: 元素操作
+  [通过] TC007: 输入与键盘
+  [跳过] TC008: 剪贴板操作（Android 安全限制）
+
+总计: 7 通过, 1 跳过, 0 失败
+```
+
+### 创建自定义技能
+
+参考 [`skills/android-ui-test/`](skills/android-ui-test/) 获取完整参考实现。
+
+每个技能目录包含：
+- `SKILL.md` - YAML 前置元数据和轻量级描述
+- `examples/` - 供学习使用的详细使用模式
+- `references/` - 技术规范和测试用例
+
+## 可用工具
+
+服务器提供 **70+ 工具**，按以下类别组织：
+
+| 类别     | 描述                                       |
+| -------- | ------------------------------------------ |
+| **设备** | 连接、信息、截图、层次结构、Shell 命令     |
+| **操作** | 触控、手势、按键、屏幕控制                  |
+| **应用** | 安装、启动、管理、列出应用信息             |
+| **元素** | 基于 XPath 的元素定位和交互（v0.3.0+）     |
+| **输入** | 文本输入、键盘控制、焦点文本               |
+| **剪切板** | 读写剪切板内容                            |
+| **Toast** | Android Toast 消息检测和显示               |
+| **Scrcpy** | 使用 scrcpy 进行屏幕镜像                  |
+
+### 列出工具
+
+运行以下命令探索可用工具：
+
+```bash
+# 列出所有工具
+u2mcp tools
+
+# 显示特定工具的详细信息
+u2mcp info screenshot
+
+# 显示匹配模式的工具（支持通配符）
+u2mcp info "device:*"     # 所有设备工具
+u2mcp info "*screenshot*" # 名称包含 'screenshot' 的工具
+u2mcp info "xpath:*"      # 所有 XPath 工具（v0.3.0+）
+
+# 列出所有工具标签
+u2mcp tags
+```
+
+### 主要特性
+
+- **基于 XPath 的元素交互** - UI 自动化的主要方法，针对 LLM 优化（v0.3.0+）
+- **基于标签的过滤** - 仅向 AI 暴露相关工具，减少混淆
+- **全面覆盖** - 从基础点击到高级元素查询
+
+## 使用示例
+
+```txt
+你: 截图
+Claude: [使用截图工具，显示图像]
+
+你: 安装了哪些应用？
+Claude: [使用 app_list 列出已安装的应用]
+
+你: 打开 YouTube 应用
+Claude: [使用包名调用 app_start]
+
+你: 搜索"cats"
+Claude: [使用 click 点击搜索栏，然后使用 send_text 输入"cats"]
+
+你: 向下滚动
+Claude: [使用 swipe 向下滚动]
+```
+
+## 许可证
+
+Apache-2.0
+
+------
+
+[python]: https://www.python.org/ "Python 是一种编程语言，可以让你快速工作并更有效地集成系统。"
+[pip]: https://pip.pypa.io/ "最流行的安装 Python 包的工具，也是现代版本的 Python 中包含的工具。"
+[pipx]: https://pipx.pypa.io/ "pipx 是一个用于安装和运行 Python 命令行应用程序的工具，不会引起与系统上安装的其他包的依赖冲突。"
+[uv]: https://docs.astral.sh/uv/ "一个极其快速的 Python 包和项目管理器"

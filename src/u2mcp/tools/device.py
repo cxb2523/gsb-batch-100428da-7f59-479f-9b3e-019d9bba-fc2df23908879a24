@@ -1,0 +1,398 @@
+from __future__ import annotations
+
+import argparse
+from base64 import b64encode
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager, closing
+from dataclasses import dataclass
+from io import BytesIO
+from pathlib import Path
+from typing import Any
+
+import uiautomator2 as u2
+from adbutils import AdbError, adb
+from anyio import Lock, to_thread
+from fastmcp.exceptions import ToolError
+from lxml import etree
+from PIL.Image import Image
+
+from ..mcp import get_xpath_timeout, mcp
+from ..typing import ImageFormatType
+
+__all__ = (
+    "activity_wait_appear",
+    "connect",
+    "device_list",
+    "disconnect",
+    "disconnect_all",
+    "dump_hierarchy",
+    "encode_image",
+    "ensure_image",
+    "filter_hierarchy_xml",
+    "info",
+    "init",
+    "save_dump_hierarchy",
+    "save_image",
+    "save_screenshot",
+    "screenshot",
+    "shell_command",
+    "window_size",
+)
+
+
+@dataclass
+class DeviceEntry:
+    lock: Lock
+    device: u2.Device
+    counter: int = 0
+
+
+_devices: dict[str, DeviceEntry] = {}
+_devices_lock = Lock()
+
+
+@asynccontextmanager
+async def use_device(serial: str) -> AsyncGenerator[u2.Device]:
+    connect_failed = False
+
+    def _try_connect():
+        device = u2.connect(serial)
+        # Fire a RPC call to make sure the device is ready
+        _ = device.info
+        return device
+
+    async with _devices_lock:
+        # Only try-connect when create a new device entry
+        if (entry := _devices.get(serial)) is None:
+            try:
+                device = await to_thread.run_sync(_try_connect)
+            except (u2.DeviceError, AdbError) as e:
+                raise ToolError(
+                    f"Failed to connect to device {serial!r}: {e}. "
+                    "Check the serial with the device_list tool, verify USB debugging is enabled and the device is authorized, then retry."
+                ) from e
+            entry = DeviceEntry(lock=Lock(), device=device)
+            _devices[serial] = entry
+        entry.counter += 1
+
+    try:
+        async with entry.lock:
+            entry.device.settings["wait_timeout"] = get_xpath_timeout()
+            yield entry.device
+    except (u2.DeviceError, AdbError):
+        connect_failed = True
+        raise
+    finally:
+        async with _devices_lock:
+            entry.counter -= 1
+            if entry.counter < 0:
+                raise RuntimeError(f"Device {serial!r} reference counter is negative ({entry.counter})")
+            if entry.counter == 0 and connect_failed and _devices.get(serial) is entry:
+                del _devices[serial]
+
+
+def ensure_image(im: Image | None) -> Image:
+    """Validate that a screenshot call returned an image, or raise TypeError."""
+    if not isinstance(im, Image):
+        raise TypeError("Invalid image")
+    return im
+
+
+def encode_image(im: Image, format: str) -> tuple[str, int, int]:
+    """Encode a PIL image as a base64 data URL, returning (data_url, height, width)."""
+    with closing(im):
+        with BytesIO() as fp:
+            im.save(fp, format)
+            im_data = fp.getvalue()
+        return (
+            f"data:image/{format};base64," + b64encode(im_data).decode(),
+            im.height,
+            im.width,
+        )
+
+
+def save_image(im: Image, file: str) -> str:
+    """Save a PIL image to file, creating parent directories. Returns the absolute path."""
+    file_path = Path(file)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(im):
+        im.save(file_path)
+    return file_path.resolve().as_posix()
+
+
+def filter_hierarchy_xml(xml_str: str, xpath: str) -> str:
+    """Filter a hierarchy XML by an XPath expression.
+
+    Returns matching elements as XML strings separated by "===",
+    or an empty string when nothing matches.
+    """
+    root = etree.fromstring(xml_str.encode("utf-8"))
+    nodes = root.xpath(xpath)
+    return "\n===\n".join(etree.tostring(node, encoding="unicode") for node in nodes)
+
+
+@mcp.tool("init", tags={"device", "device:manage"})
+async def init(serial: str = ""):
+    """Install essential resources (minicap, minitouch, uiautomator ...) to device.
+
+    Important:
+        This tool must be run on the Android device before running operation actions.
+
+    Args:
+        serial (str): Android device serialno to initialize. If empty string, all devices will be initialized.
+
+    Returns:
+        None upon successful completion
+        Raises an exception if the subprocess returns a non-zero exit code.
+    """
+    from uiautomator2.__main__ import cmd_init
+
+    args = argparse.Namespace(serial=serial, serial_optional=None)
+    return await to_thread.run_sync(cmd_init, args)
+
+
+@mcp.tool("purge", tags={"device", "device:manage"})
+async def purge(serial: str = ""):
+    """Purge all resources (minicap, minitouch, uiautomator ...) from device.
+
+    Important:
+        This tool must be run on the Android device before running operation actions.
+
+    Args:
+        serial (str): Android device serialno to purge. If empty string, all devices will be purged.
+    """
+    from uiautomator2.__main__ import cmd_purge
+
+    args = argparse.Namespace(serial=serial)
+    return await to_thread.run_sync(cmd_purge, args)
+
+
+@mcp.tool("shell_command", tags={"device", "device:shell"})
+async def shell_command(serial: str, command: str, timeout: float = 60) -> tuple[int, str]:
+    """Run a shell command on an Android device
+
+    Args:
+        serial (str): Android device serialno
+        command (str): Shell command to run
+        timeout (float): Seconds to wait for command to complete.
+
+    Returns:
+        tuple[int,str]: Return code and output of the command
+    """
+    async with use_device(serial) as device:
+        return_value = await to_thread.run_sync(device.adb_device.shell2, command, timeout)
+        return return_value.returncode, return_value.output
+
+
+@mcp.tool("device_list", tags={"device", "device:info"})
+async def device_list() -> list[dict[str, Any]]:
+    """List of Adb Device with state:device
+
+    Returns:
+        list[dict[str,Any]]: List Adb Device information
+    """
+    device_list = await to_thread.run_sync(adb.device_list)
+    return [d.info for d in device_list]
+
+
+@mcp.tool("connect", tags={"device", "device:manage"})
+async def connect(serial: str = "") -> dict[str, Any]:
+    """Connect to an Android device
+
+    Args:
+        serial (str): Android device serial number. If empty string, connects to the unique device if only one device is connected.
+
+    Returns:
+        dict[str,Any]: Device information
+    """
+    async with use_device(serial) as device:
+        result = await to_thread.run_sync(lambda: device.device_info | device.info)
+    return result
+
+
+@mcp.tool("disconnect", tags={"device", "device:manage"})
+async def disconnect(serial: str):
+    """Disconnect from an Android device
+
+    Args:
+        serial (str): Android device serialno
+    """
+    async with _devices_lock:
+        if _devices.pop(serial, None) is None:
+            raise ToolError(f"Device {serial!r} is not connected")
+
+
+@mcp.tool("disconnect_all", tags={"device", "device:manage"})
+async def disconnect_all():
+    """Disconnect from all Android devices"""
+    async with _devices_lock:
+        _devices.clear()
+
+
+@mcp.tool("window_size", tags={"device", "device:info"})
+async def window_size(serial: str) -> dict[str, int]:
+    """Get window size of an Android device
+
+    Args:
+        serial (str): Android device serialno
+
+    Returns:
+        dict[str,int]: Window size object:
+            - "width" (int): Window width
+            - "height" (int): Window height
+    """
+    async with use_device(serial) as device:
+        width, height = await to_thread.run_sync(device.window_size)
+        return {"width": width, "height": height}
+
+
+@mcp.tool("screenshot", tags={"device", "device:capture", "screen", "screen:capture"})
+async def screenshot(serial: str, format: ImageFormatType = "jpeg", display_id: int = -1) -> dict[str, Any]:
+    """
+    Take screenshot of device
+
+    Args:
+        serial (str): Android device serialno.
+        format (ImageFormatType): Image format. Defaults to "jpeg".
+        display_id (int): use specific display if device has multiple screen. Defaults to -1.
+
+    Returns:
+        dict[str,Any]: Screenshot image JPEG data with the following keys:
+            - image (str): Base64 encoded image data in data URL format (data:image/jpeg;base64,...)
+            - height (int): Image height
+            - width (int): Image width
+    """
+    display_id = int(display_id)
+    async with use_device(serial) as device:
+        im = await to_thread.run_sync(lambda: device.screenshot(display_id=display_id if display_id >= 0 else None))
+
+    data_url, height, width = encode_image(ensure_image(im), format)
+    return {"image": data_url, "height": height, "width": width}
+
+
+@mcp.tool("save_screenshot", tags={"device", "device:capture", "screen", "screen:capture"})
+async def save_screenshot(serial: str, file: str, display_id: int = -1) -> str:
+    """
+    Save screenshot of device to file
+
+    Args:
+        serial(str): Android device serial number.
+        file(str): File path to save the screenshot. Supports both absolute and relative paths.
+        display_id(int): Use specific display if device has multiple screens. Defaults to -1 (default display).
+
+    Returns:
+        str: Screenshot save file path
+    """
+    display_id = int(display_id)
+
+    async with use_device(serial) as device:
+        im = await to_thread.run_sync(lambda: device.screenshot(display_id=display_id if display_id >= 0 else None))
+
+    return save_image(ensure_image(im), file)
+
+
+@mcp.tool("dump_hierarchy", tags={"device", "device:capture"})
+async def dump_hierarchy(
+    serial: str,
+    compressed: bool = False,
+    pretty: bool = False,
+    max_depth: int = -1,
+    xpath: str = "",
+) -> str:
+    """Dump window hierarchy.
+
+    Args:
+        serial (str): Android device serialno.
+        compressed (bool): return compressed xml.
+        pretty (bool): pretty print xml.
+        max_depth (int): max depth of hierarchy.
+        xpath (str): optional xpath expression to filter results.
+            If empty, returns the full hierarchy xml.
+            If provided, returns only matching elements, separated by "===".
+
+    Returns:
+        str: xml string of the hierarchy tree.
+            If xpath is provided, returns matching elements separated by "===".
+    """
+    async with use_device(serial) as device:
+        xml_str = await to_thread.run_sync(
+            lambda: device.dump_hierarchy(compressed=compressed, pretty=pretty, max_depth=max_depth if max_depth > 0 else None)
+        )
+
+    if not xpath:
+        return xml_str
+    return filter_hierarchy_xml(xml_str, xpath)
+
+
+@mcp.tool("save_dump_hierarchy", tags={"device", "device:capture"})
+async def save_dump_hierarchy(
+    serial: str,
+    file: str,
+    compressed: bool = False,
+    pretty: bool = True,
+    max_depth: int = -1,
+    xpath: str = "",
+) -> str:
+    """Dump window hierarchy and save to file.
+
+    Args:
+        serial (str): Android device serialno.
+        file (str): File path to save the hierarchy XML. Supports both absolute and relative paths.
+        compressed (bool): return compressed xml.
+        pretty (bool): pretty print xml. Defaults to True for file output.
+        max_depth (int): max depth of hierarchy.
+        xpath (str): optional xpath expression to filter results.
+            If empty, saves the full hierarchy xml.
+            If provided, saves only matching elements, separated by "===".
+
+    Returns:
+        str: absolute path to the saved file.
+    """
+    async with use_device(serial) as device:
+        xml_str = await to_thread.run_sync(
+            lambda: device.dump_hierarchy(compressed=compressed, pretty=pretty, max_depth=max_depth if max_depth > 0 else None)
+        )
+
+    if xpath:
+        xml_str = filter_hierarchy_xml(xml_str, xpath)
+
+    # Convert path to Path object and resolve
+    file_path = Path(file)
+    # Create parent directory if it doesn't exist
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    # Save the xml
+    file_path.write_text(xml_str, encoding="utf-8")
+
+    return file_path.resolve().as_posix()
+
+
+@mcp.tool("info", tags={"device", "device:info"})
+async def info(serial: str) -> dict[str, Any]:
+    """
+    Get device info
+
+    Args:
+        serial (str): Android device serialno
+
+    Returns:
+        dict[str,Any]: Device info
+    """
+
+    async with use_device(serial) as device:
+        return await to_thread.run_sync(lambda: device.info)
+
+
+@mcp.tool("activity_wait_appear", tags={"app", "app:lifecycle"})
+async def activity_wait_appear(serial: str, activity: str, timeout: float) -> bool:
+    """Wait for an activity to appear.
+
+    Args:
+        serial (str): Android device serial number.
+        activity (str): Name of activity to wait for.
+        timeout (float): Maximum wait time in seconds.
+
+    Returns:
+        bool: True if activity appeared, False if timeout.
+    """
+    async with use_device(serial) as device:
+        return await to_thread.run_sync(device.wait_activity, activity, timeout)  # type: ignore[arg-type]

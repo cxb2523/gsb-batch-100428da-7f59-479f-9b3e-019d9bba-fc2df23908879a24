@@ -1,0 +1,77 @@
+[project]
+authors = [{name = "tanbro", email = "tanbro@163.com"}]
+classifiers = [
+  # How mature is this project? Common values are
+  #   3 - Alpha
+  #   4 - Beta
+  #   5 - Production/Stable
+  "Development Status :: 4 - Beta", # Specify the Python versions you support here.
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
+]
+dependencies = [
+  "fastmcp>=4.1.2,<5.0",
+  "cyclopts[yaml]", # included in fastmcp
+  "platformdirs>=4.0",
+  "uiautomator2>=3.5,<4.0",
+  # Declared directly: only reachable via uiautomator2, which places no bound on it.
+  "Pillow>=13.0,<14",
+  "certifi>=2026.10.19",
+  "typing_extensions>=4.12; python_version < '3.12'",
+]
+description = "uiautomator2 mcp server"
+dynamic = ["version"]
+keywords = [
+  "uiautomator2",
+  "mcp",
+  "mcp-server",
+  "fastmcp",
+  "adb",
+  "android",
+  "adbutils",
+  "automation",
+  "testing",
+  "bot",
+  "ai",
+  "artificial-intelligence",
+  "rpa",
+  "test",
+]
+license = "Apache-2.0"
+name = "uiautomator2-mcp-server"
+readme = "README.md"
+requires-python = ">=3.11"
+
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools>=84.1.0", "setuptools-scm>=8"]
+
+[tool.setuptools_scm]
+version_file = "src/u2mcp/version.py"
+
+[project.scripts]
+u2mcp = "u2mcp.__main__:main"
+uiautomator2-mcp = "u2mcp.__main__:main"
+uiautomator2-mcp-server = "u2mcp.__main__:main"
+
+[project.urls]
+changelog = "https://github.com/tanbro/uiautomator2-mcp-server/blob/main/CHANGELOG.md"
+documentation = "https://github.com/tanbro/uiautomator2-mcp-server/blob/main/README.md"
+homepage = "https://github.com/tanbro/uiautomator2-mcp-server"
+issues = "https://github.com/tanbro/uiautomator2-mcp-server/issues"
+repository = "https://github.com/tanbro/uiautomator2-mcp-server.git"
+
+[dependency-groups]
+dev = [
+    {include-group = "typing"},
+    {include-group = "test"},
+    "pytest-mock>=3.15.1",
+]
+nuitka = ["nuitka", "importlib-metadata"]
+pyinstaller = ["PyInstaller"]
+test = ["pytest", "pytest-asyncio", "pytest-cov", "pytest-mock"]
+typing = ["mypy", "types-lxml", "types-retry"]

@@ -1,0 +1,34 @@
+from __future__ import annotations
+
+from anyio import to_thread
+
+from ..mcp import mcp
+from .device import use_device
+
+__all__ = ("read_clipboard", "write_clipboard")
+
+
+@mcp.tool("read_clipboard", tags={"clipboard", "clipboard:read"})
+async def read_clipboard(serial: str) -> str | None:
+    """Read clipboard from device
+
+    Args:
+        serial (str): Android device serialno
+
+    Returns:
+        The actual text in the clip, or None if there is no text.
+    """
+    async with use_device(serial) as device:
+        return await to_thread.run_sync(lambda: device.clipboard)
+
+
+@mcp.tool("write_clipboard", tags={"clipboard", "clipboard:write"})
+async def write_clipboard(serial: str, text: str):
+    """Write clipboard to device
+
+    Args:
+        serial (str): Android device serialno
+        text: The actual text in the clip.
+    """
+    async with use_device(serial) as device:
+        await to_thread.run_sync(device.set_clipboard, text)
