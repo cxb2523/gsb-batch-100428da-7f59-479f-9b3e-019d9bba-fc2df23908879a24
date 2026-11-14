@@ -1,0 +1,66 @@
+# LLM-Reader Configuration File
+# Rename this file to `llm_reader.yaml` or `llm_reader.json` in your project root,
+# or set LLM_READER_CONFIG=/path/to/llm_reader.yaml
+
+# -----------------------------------------------------------------
+# 1. Proxy Configuration
+# -----------------------------------------------------------------
+# Supports residential, mobile, ISP, or datacenter proxies (e.g. Proxy-Seller).
+# Alternatively, set LLM_READER_PROXY="http://user:pass@host:port" in your environment.
+proxy:
+  # Connection format 1 (Recommended): standard URL string
+  # url: "http://login:password@11.55.11.0:49353"
+
+  # Connection format 2: separate host/port and credentials (e.g. from Proxy-Seller order)
+  server: "http://11.55.11.0:49353" # update host and port
+  username: "login"
+  password: "password"
+  bypass: "localhost,127.0.0.1"
+
+# -----------------------------------------------------------------
+# 2. Browser & Anti-Bot Fingerprint
+# -----------------------------------------------------------------
+browser:
+  headless: true
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+  viewport:
+    width: 1920
+    height: 1080
+  # Match these to your proxy country to avoid location-mismatch bot detection:
+  # locale: "en-US"
+  # timezone_id: "America/New_York"
+
+# -----------------------------------------------------------------
+# 3. Bandwidth Optimization (Save Paid Proxy GB Costs)
+# -----------------------------------------------------------------
+performance:
+  block_images: false      # Set true to abort image downloads (data-src URLs will still be extracted!)
+  block_media: true        # Abort streaming video/audio (.mp4, .webm)
+  block_fonts: true        # Abort web font downloads (.woff, .woff2)
+  block_trackers: true     # Abort analytics/ad trackers (GTM, FB Pixel, etc.) for speed
+
+# -----------------------------------------------------------------
+# 4. Navigation & Scraping Behavior
+# -----------------------------------------------------------------
+navigation:
+  timeout: 30000           # Navigation timeout in milliseconds
+  wait_until: "load"       # 'load', 'domcontentloaded', or 'networkidle'
+  post_load_wait: 1.5      # Pause in seconds after load
+  scroll_down: true        # Scroll to trigger lazy-loaded images / infinite scroll
+  scroll_times: 1          # Number of PageDown scrolls
+
+# -----------------------------------------------------------------
+# 5. Content Pre-Processing & Token Optimization
+# -----------------------------------------------------------------
+content:
+  keep_images: true
+  remove_svg_image: true
+  remove_gif_image: true
+  remove_image_types: []   # e.g. [".bmp", ".webp"]
+  keep_webpage_links: true
+  remove_script_tag: true
+  remove_style_tag: true
+  remove_header_footer: false # Set true to strip navbars and footers to save LLM tokens
+  remove_tags: []          # e.g. ["noscript", "iframe"]
+  extract: false
+  max_characters: null     # Set e.g. 40000 to truncate text for LLM context, or null for full text

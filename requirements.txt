@@ -1,0 +1,5 @@
+beautifulsoup4==4.12.3
+inscriptis==2.5.0
+minify_html==0.15.0
+pytest-playwright
+pyyaml
