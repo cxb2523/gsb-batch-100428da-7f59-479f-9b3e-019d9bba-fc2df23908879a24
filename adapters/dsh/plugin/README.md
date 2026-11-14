@@ -61,6 +61,26 @@ It gives up and says so when it cannot: a window with no caption to grab,
 or one a modal dialog has disabled. Set `autoRaise: false` where the agent
 must never change which window the person is looking at.
 
+Every answer says which of these actually happened, so "already in front",
+"moved for you", "would move but pressed nothing" and "could not move it"
+never read alike:
+
+- **window raised to the front first** — a real `hid.click` went to the
+  caption point and a re-enumeration confirmed the window is now the
+  foreground one;
+- **no raise needed** — it was already foreground and visible enough;
+- **would raise the window, but pressed nothing** — it needed raising, but
+  this is a `dryRun` or a `--mock` server, so the intent is reported and no
+  input is sent;
+- **raise skipped (…)** — it needed raising but this session cannot (no
+  caption point, `autoRaise: false`, or the point is off the declared
+  screen); work continues only while enough of the window is still visible.
+
+A raise that genuinely fails — the click is not confirmed, the window
+cannot be read back, comes back as a different window, or still is not in
+front — is an explicit error, never one of the statuses above: a failed
+raise is not reported as a result a caller could mistake for success.
+
 ### Does it actually work?
 
 Five consecutive clicks, each located from a plain-language description by

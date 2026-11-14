@@ -47,7 +47,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 
 import { McpStdioClient } from './lib/mcp-client.js'
 import {
-  Locator, describeResult, LocateError, TargetNotFound,
+  Locator, describeResult, describeRaise, LocateError, TargetNotFound,
   renderWindowLine, notPressedNote,
 } from './lib/locator.js'
 import { refusedCombo } from './lib/keyguard.js'
@@ -289,8 +289,10 @@ function registerTools(ctx, locator, config, log) {
         .map((r) => `${JSON.stringify(r.target)} (${r.screen[0]}, ${r.screen[1]})`)
         .join(' -> ')
       const note = notPressedNote(result)
+      const raise = describeRaise(result.raise)
       const summary = `${verb} ${result.results.length} in ${result.source}: `
         + `${where} [${result.timings.totalMs}ms for the look]`
+        + (raise ? ` — ${raise}` : '')
         + (note ? ` — ${note}` : '')
       log('info', summary)
       return {

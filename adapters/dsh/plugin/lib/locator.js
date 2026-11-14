@@ -65,6 +65,38 @@ const MAX_SEQUENCE = 8
 /** How long to let the window manager finish raising before looking again. */
 const RAISE_SETTLE_MS = 450
 
+/**
+ * The four mutually exclusive outcomes of the reachability check, named so
+ * a summary can never blur two of them together. The wire fields
+ * (`visible_fraction`, `enabled`, `raise_point`) may be missing because the
+ * platform could not measure them; these statuses describe only what THIS
+ * plugin did in response, so "nothing was measured" is carried separately
+ * by `unmeasuredNote` rather than being dressed up as a decision.
+ *
+ *   raised      a real hid.click went out and the re-read confirmed it took
+ *   none        already foreground and visible enough — nothing was needed
+ *   would-raise it needs raising, but this session presses nothing
+ *               (dryRun / --mock): the intent is reported, no input is sent
+ *   degraded    it needs raising but this session cannot — no safe point,
+ *               autoRaise off, or the point is off the declared screen;
+ *               work continues only when enough is still visible
+ *
+ * An actual failed raise does not get a status: it throws a LocateError,
+ * which is the honest form of "raise failed" rather than a result object a
+ * caller could mistake for success.
+ */
+export const RAISE_STATUS = Object.freeze({
+  RAISED: 'raised',
+  NONE: 'none',
+  WOULD_RAISE: 'would-raise',
+  DEGRADED: 'degraded',
+})
+
+/** Build a window result carrying a machine-readable raise outcome. */
+function withRaise(win, status, reason) {
+  return { ...win, raise: { status, ...(reason ? { reason } : {}) } }
+}
+
 export class Locator {
   /**
    * @param {object} opts
@@ -230,6 +262,7 @@ export class Locator {
       return {
         region: ready.rect,
         source: `window "${ready.title}"${unmeasuredNote(ready)}`,
+        raise: ready.raise,
       }
     }
     // `foreground` can be absent from every window: macOS answers it from
@@ -249,6 +282,7 @@ export class Locator {
     return {
       region: ready.rect,
       source: `${what}${unmeasuredNote(ready)}`,
+      raise: ready.raise,
     }
   }
 
@@ -273,29 +307,40 @@ export class Locator {
   async ensureReachable(win) {
     if (win.enabled === false) {
       assertOnTop(win)   // throws with the modal-dialog explanation
-      return win
+      return withRaise(win, RAISE_STATUS.NONE)
     }
     const visible = typeof win.visible_fraction === 'number'
       ? win.visible_fraction : 1
-    if (win.foreground && visible >= MIN_VISIBLE_FRACTION) return win
+    if (win.foreground && visible >= MIN_VISIBLE_FRACTION) {
+      return withRaise(win, RAISE_STATUS.NONE)
+    }
 
     const point = win.raise_point
     if (this.config.autoRaise === false || !Array.isArray(point)) {
-      assertOnTop(win)
-      // Visible enough to work with, just not focused: carry on rather
-      // than refusing over a distinction that may not matter.
-      return win
+      // No safe way (or no permission) to bring it forward. Visible enough
+      // to work with, just not focused: carry on rather than refusing over
+      // a distinction that may not matter — but say the raise was skipped,
+      // and why, so a covered window is never implied to have been lifted.
+      const why = this.config.autoRaise === false
+        ? 'autoRaise is switched off'
+        : 'no caption raise point was reported'
+      return this.asIs(win, why, RAISE_STATUS.DEGRADED)
     }
     // A dry run promises that nothing is pressed, and raising IS a press —
     // a real click on the title bar, which in a browser can open a tab.
-    if (this.config.dryRun) return this.asIs(win, 'dryRun presses nothing')
+    // Report what WOULD happen instead, without sending it.
+    if (this.config.dryRun) {
+      return this.asIs(win, 'dryRun presses nothing', RAISE_STATUS.WOULD_RAISE)
+    }
 
     const bounds = await this.screenBounds()
     // A --mock server "clicks" by logging it. The re-read afterwards would
     // then say the raise did not take, which is true and misleading as to
-    // why.
+    // why. Report the intent and send nothing.
     if (await this.simulated()) {
-      return this.asIs(win, 'clawtouch-mcp is running with --mock (no device)')
+      return this.asIs(
+        win, 'clawtouch-mcp is running with --mock (no device)',
+        RAISE_STATUS.WOULD_RAISE)
     }
     const [rx, ry] = point
     if (bounds && (rx < 0 || ry < 0
@@ -309,8 +354,9 @@ export class Locator {
         `"${win.title}" has a raise point at (${rx}, ${ry}), outside the `
         + `declared screen (${bounds.width}x${bounds.height}). `
         + `${outOfBoundsFix(rx, ry, bounds)} Carrying on without raising.`)
-      assertOnTop(win)
-      return win
+      return this.asIs(
+        win, `the raise point (${rx}, ${ry}) is outside the declared screen`,
+        RAISE_STATUS.DEGRADED)
     }
 
     this.log('info', `raising "${win.title}" by clicking (${rx}, ${ry})`)
@@ -364,7 +410,7 @@ export class Locator {
         + 'that first.')
     }
     assertOnTop(fresh)
-    return fresh
+    return withRaise(fresh, RAISE_STATUS.RAISED)
   }
 
   /**
@@ -372,8 +418,11 @@ export class Locator {
    * raise it: fine when enough of it is showing, refused when it is covered
    * — with the reason no raise was attempted, since the usual remedy
    * ("bring it to the front") is exactly what this session cannot do.
+   *
+   * `status` records which non-raising outcome this is so the summary can
+   * tell "would raise but presses nothing" apart from "cannot raise here".
    */
-  asIs(win, why) {
+  asIs(win, why, status) {
     this.log('info', `${why}: not clicking to bring "${win.title}" forward`)
     try {
       assertOnTop(win)
@@ -383,7 +432,7 @@ export class Locator {
       }
       throw err
     }
-    return win
+    return withRaise(win, status, why)
   }
 
   /** Capture one calibrated screenshot: markers stamped, width bounded. */
@@ -423,7 +472,8 @@ export class Locator {
       targets: [target], window, region, signal,
     })
     return { ...many.results[0], meta: many.meta, answer: many.answer,
-      fit: many.fit, source: many.source, timings: many.timings }
+      fit: many.fit, source: many.source, raise: many.raise,
+      timings: many.timings }
   }
 
   /**
@@ -525,6 +575,11 @@ export class Locator {
       answer,
       fit,
       source: picked.source,
+      // Undefined for an explicit region or full-screen capture: there was
+      // no window reachability check to report. Present for every named or
+      // foreground-window path, so the tool summary can say raised / no
+      // raise needed / would raise / degraded in words the agent can read.
+      raise: picked.raise,
       timings: {
         captureMs: tShot - t0,
         visionMs: tVision - tShot,
@@ -880,7 +935,39 @@ export function describeResult(result, verb = 'clicked') {
     `[scale ${result.fit.x.scale.toFixed(3)}/${result.fit.y.scale.toFixed(3)},`,
     `${result.timings.totalMs}ms]`,
   ]
+  // The window reachability outcome is part of what happened, in words the
+  // agent can act on: a raised window, one that needed no raise, or a raise
+  // that was only planned because this session presses nothing.
+  const raise = describeRaise(result.raise)
+  if (raise) bits.push(`— ${raise}`)
   const note = notPressedNote(result)
   if (note) bits.push(`— ${note}`)
   return bits.filter(Boolean).join(' ')
+}
+
+/**
+ * Render the window-raising outcome so the three states can never be read
+ * as one another. Returns '' for a result that never went through the
+ * reachability check (an explicit region, or a raw point call in tests).
+ *
+ * The phrasing is load-bearing and pinned by the tests: the agent has only
+ * these words to tell a window it really brought forward from one it merely
+ * *would* bring forward in a dry run / mock, and from one it could not
+ * raise at all. A failed raise never reaches here — it throws.
+ */
+export function describeRaise(raise) {
+  if (!raise || typeof raise !== 'object') return ''
+  switch (raise.status) {
+    case RAISE_STATUS.RAISED:
+      return 'window raised to the front first'
+    case RAISE_STATUS.NONE:
+      return 'no raise needed'
+    case RAISE_STATUS.WOULD_RAISE:
+      return 'would raise the window, but pressed nothing'
+        + (raise.reason ? ` (${raise.reason})` : '')
+    case RAISE_STATUS.DEGRADED:
+      return 'raise skipped' + (raise.reason ? ` (${raise.reason})` : '')
+    default:
+      return ''
+  }
 }

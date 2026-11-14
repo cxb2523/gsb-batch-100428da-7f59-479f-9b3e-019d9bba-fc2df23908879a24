@@ -18,7 +18,8 @@ import {
 import { parseAnswer, VisionError } from './lib/vision.js'
 import {
   assertOnTop, unmeasuredNote, outOfBoundsFix, renderWindowLine, sameWindow,
-  LocateError, describeResult, notPressedNote, SIMULATED_NOTE,
+  LocateError, describeResult, describeRaise, RAISE_STATUS,
+  notPressedNote, SIMULATED_NOTE,
 } from './lib/locator.js'
 import { McpStdioClient } from './lib/mcp-client.js'
 import { Locator } from './lib/locator.js'
@@ -1452,6 +1453,225 @@ await asyncTest('dryRun refuses a covered window and says why it was not raised'
         && /in front of it/.test(err.message)
         && /No click was made to raise it: dryRun presses nothing/.test(err.message))
     assert.equal(calls.length, 0)
+  })
+
+// ── the raise outcome is reported, and the states stay distinguishable ──
+//
+// A caller used to get a bare window back, so it could not tell a window
+// that was really brought forward from one that only *would* be, or one
+// that could not be raised at all. Every non-throwing path now carries a
+// `raise` outcome; a failed raise still throws, so it can never be read as
+// success. These pin the four states and the summary that renders them.
+
+await asyncTest('a covered window is raised and the outcome says raised',
+  async () => {
+    // The required end-to-end shape: measured as covered, a real HID click
+    // on the caption point, then a re-read that confirms it is now the
+    // foreground window and no longer covered.
+    const { locator, calls } = locatorWith({
+      'device.info': { json: { info: { connected: true }, screen: { width: 1920, height: 1080, source: 'explicit' } } },
+      'hid.click': { json: { ok: true, clicked: true } },
+      'screen.windows': {
+        json: { window: { ...ONTOP, foreground: true, visible_fraction: 1 } },
+      },
+    })
+    const out = await locator.ensureReachable(
+      { ...ONTOP, foreground: false, visible_fraction: 0.2 })
+    const click = calls.find((c) => c.name === 'hid.click')
+    assert.ok(click, 'a covered window must actually be raised with a click')
+    assert.deepEqual([click.args.x, click.args.y], [40, 8])
+    assert.equal(out.raise.status, RAISE_STATUS.RAISED)
+    assert.equal(out.foreground, true, 'the result is the re-read window')
+  })
+
+await asyncTest('an enabled=false window is refused and nothing is sent',
+  async () => {
+    // A modal-disabled window must be rejected outright with the reason,
+    // never raised and never captured — even though it is fully visible.
+    const { locator, calls } = locatorWith({})
+    await assert.rejects(
+      () => locator.ensureReachable({
+        ...ONTOP, enabled: false, foreground: false, visible_fraction: 1,
+      }),
+      (err) => err instanceof LocateError
+        && /not accepting input/.test(err.message)
+        && /modal/.test(err.message))
+    assert.equal(calls.length, 0, 'a disabled window sends no input at all')
+  })
+
+await asyncTest('a missing raise_point degrades instead of pretending',
+  async () => {
+    // No caption point to grab and the window is merely unfocused, still
+    // visible enough: work with it as-is, but the outcome must say the raise
+    // was degraded rather than silently reading as "no raise needed".
+    const { locator, calls } = locatorWith({})
+    const out = await locator.ensureReachable({
+      ...ONTOP, foreground: false, visible_fraction: 1, raise_point: undefined,
+    })
+    assert.equal(out.title, 'Calc')
+    assert.equal(out.raise.status, RAISE_STATUS.DEGRADED)
+    assert.match(out.raise.reason, /no caption raise point/)
+    assert.equal(calls.length, 0)
+  })
+
+await asyncTest('a covered window with no raise_point is refused, not faked',
+  async () => {
+    // The degraded path must not paper over a window that is genuinely
+    // covered: without a point there is no honest way to fix it, so this is
+    // an error rather than a success carrying a degraded badge.
+    const { locator } = locatorWith({})
+    await assert.rejects(
+      () => locator.ensureReachable({
+        ...ONTOP, foreground: false, visible_fraction: 0, raise_point: undefined,
+      }),
+      (err) => err instanceof LocateError && /in front of it/.test(err.message))
+  })
+
+await asyncTest('dryRun reports "would raise" and never sends a click',
+  async () => {
+    // A dry run presses nothing — but it must still SAY it would raise, so
+    // the caller knows a real run would change which window is in front.
+    // Visible enough to work with but unfocused: that is the case a raise
+    // fixes without any occlusion refusal getting there first.
+    const { locator, calls } = locatorWith({}, { dryRun: true })
+    const out = await locator.ensureReachable(
+      { ...ONTOP, foreground: false, visible_fraction: 1 })
+    assert.equal(out.raise.status, RAISE_STATUS.WOULD_RAISE)
+    assert.match(out.raise.reason, /dryRun presses nothing/)
+    assert.equal(calls.length, 0, 'dry run must not call the HID path')
+    assert.ok(!calls.some((c) => c.name === 'hid.click'))
+  })
+
+await asyncTest('a --mock server reports "would raise" and sends no click',
+  async () => {
+    // Its click would only be logged, and the re-read would then falsely
+    // show a raise that did not take. Report the intent instead.
+    const { locator, calls } = locatorWith({ 'device.info': MOCK_INFO })
+    const out = await locator.ensureReachable(
+      { ...ONTOP, foreground: false, visible_fraction: 1 })
+    assert.equal(out.raise.status, RAISE_STATUS.WOULD_RAISE)
+    assert.match(out.raise.reason, /--mock/)
+    assert.ok(!calls.some((c) => c.name === 'hid.click'))
+  })
+
+await asyncTest('a window already in front needs no raise and says so',
+  async () => {
+    const { locator, calls } = locatorWith({})
+    const out = await locator.ensureReachable(ONTOP)
+    assert.equal(out.raise.status, RAISE_STATUS.NONE)
+    assert.equal(calls.length, 0)
+  })
+
+await asyncTest('autoRaise:false degrades and leaves the screen alone',
+  async () => {
+    const { locator, calls } = locatorWith({}, { autoRaise: false })
+    const out = await locator.ensureReachable({ ...ONTOP, foreground: false })
+    assert.equal(out.raise.status, RAISE_STATUS.DEGRADED)
+    assert.match(out.raise.reason, /autoRaise is switched off/)
+    assert.equal(calls.length, 0)
+  })
+
+test('describeRaise keeps the four states distinguishable', () => {
+  assert.equal(describeRaise(undefined), '')
+  assert.equal(describeRaise(null), '')
+  assert.match(
+    describeRaise({ status: RAISE_STATUS.RAISED }), /window raised to the front/)
+  assert.match(
+    describeRaise({ status: RAISE_STATUS.NONE }), /no raise needed/)
+  const would = describeRaise(
+    { status: RAISE_STATUS.WOULD_RAISE, reason: 'dryRun presses nothing' })
+  assert.match(would, /would raise the window/)
+  assert.match(would, /dryRun presses nothing/)
+  const degraded = describeRaise(
+    { status: RAISE_STATUS.DEGRADED, reason: 'no caption raise point was reported' })
+  assert.match(degraded, /raise skipped/)
+  assert.match(degraded, /no caption raise point/)
+  // The three phrases must be mutually distinct — blurring them is the bug
+  // this reporting exists to prevent.
+  const phrases = [
+    describeRaise({ status: RAISE_STATUS.RAISED }),
+    describeRaise({ status: RAISE_STATUS.NONE }),
+    would,
+    degraded,
+  ]
+  assert.equal(new Set(phrases).size, phrases.length)
+})
+
+test('the raise outcome appears in the human result summary', () => {
+  const base = {
+    screen: [100, 200], source: 'window "Calc"',
+    fit: { x: { scale: 1 }, y: { scale: 1 } },
+    timings: { totalMs: 5 }, answer: { target: {} },
+  }
+  assert.match(
+    describeResult({ ...base, raise: { status: RAISE_STATUS.RAISED } }, 'clicked'),
+    /window raised to the front first/)
+  assert.match(
+    describeResult({ ...base, raise: { status: RAISE_STATUS.NONE } }, 'clicked'),
+    /no raise needed/)
+  assert.match(
+    describeResult({
+      ...base, raise: { status: RAISE_STATUS.WOULD_RAISE, reason: 'dryRun presses nothing' },
+    }, 'would click'),
+    /would raise the window/)
+  // A result with no reachability check (explicit region) stays clean.
+  assert.doesNotMatch(
+    describeResult({ ...base }, 'clicked'), /raise/)
+})
+
+// ── the outcome must survive the whole locate chain ───────────────────
+//
+// ensureReachable attaches it to a window, resolveRegion has to carry it
+// onto the picked region, pointMany onto the look result, and point() onto
+// what the tools actually read. Any one link dropping it silently turns the
+// summary back into a bare coordinate with no word about whether a window
+// was moved — which is the bug this feature exists to fix.
+
+const RAISE_CHAIN_INFO = {
+  json: { info: { connected: true }, screen: { width: 1920, height: 1080, source: 'explicit' } },
+}
+
+await asyncTest('point() carries the raised outcome from the window chain',
+  async () => {
+    const fresh = { ...ONTOP, foreground: true, visible_fraction: 1 }
+    const covered = { ...ONTOP, foreground: false, visible_fraction: 0.2 }
+    let titleCalls = 0
+    const { locator, calls } = locatorWith({
+      'device.info': RAISE_CHAIN_INFO,
+      'hid.click': { json: { ok: true, clicked: true } },
+      'screen.windows': (c) => {
+        const last = c[c.length - 1]
+        if (last?.args?.title) {
+          titleCalls += 1
+          return { json: { window: titleCalls === 1 ? covered : fresh } }
+        }
+        return { json: { windows: [covered] } }
+      },
+    })
+    // Keep the window chain real; stub only the vision look that follows it.
+    const realResolve = locator.resolveRegion.bind(locator)
+    locator.pointMany = async function (opts) {
+      const picked = await realResolve(opts)
+      return {
+        results: [{ screen: [1, 2], image: [1, 2], target: 't' }],
+        meta: {}, answer: { target: {} },
+        fit: { x: { scale: 1 }, y: { scale: 1 } },
+        source: picked.source, raise: picked.raise, timings: { totalMs: 1 },
+      }
+    }
+    const out = await locator.point({ target: 't', window: 'Calc' })
+    assert.equal(out.raise?.status, RAISE_STATUS.RAISED)
+    assert.ok(calls.some((c) => c.name === 'hid.click'), 'a raise click went out')
+    assert.match(describeResult(out, 'clicked'), /window raised to the front first/)
+  })
+
+await asyncTest('an explicit region reports no raise outcome at all',
+  async () => {
+    // There was no window to make reachable, so inventing a status (even
+    // "none") would claim a check that never ran. Absent stays absent.
+    const { locator } = locatorWith({})
+    const picked = await locator.resolveRegion({ region: [0, 0, 10, 10] })
+    assert.equal(picked.raise, undefined)
   })
 
 await asyncTest('a dry-run click sends nothing and says nothing was pressed', async () => {
