@@ -1,0 +1,34 @@
+# general things to ignore
+build/
+dist/
+*.egg-info/
+*.egg
+*.py[cod]
+__pycache__/
+*.so
+*~
+venv/
+.venv/
+.uv-cache/
+.uv-python/
+
+site/
+
+# due to using nox and pytest
+.nox
+.cache
+.pytest_cache/
+.pytest-agent-tmp/
+.pytest-tmp-run/
+.agent-test-temp/
+.coverage
+htmlcov/
+
+downloaded_files/
+.comic_downloader/
+seleniumbase_diagnostics/
+**/geckodriver.log
+**/comic_downloader.log
+
+### VS Code ###
+.vscode/
