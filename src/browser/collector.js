@@ -2,7 +2,13 @@
  * DeepSpider - 环境数据采集器
  * 从真实浏览器动态采集任意环境属性
  */
+import {
+  classifyCollectError,
+  collectFailure,
+} from './collect-contract.js'
 
+// collectPropertyInRealm 会被 toString 后注入 iframe 执行上下文，函数体无法引用
+// 模块级常量或 import，因此错误类别必须使用与 collect-contract.js 常量同值的内联字面量。
 export function collectPropertyInRealm({ path, depth }) {
   const seen = new WeakSet();
 
@@ -81,7 +87,14 @@ export function collectPropertyInRealm({ path, depth }) {
 
   try {
     const value = getByPath(window, path);
-    if (value === undefined) return { success: false, error: `${path} is undefined` };
+    if (value === undefined) {
+      return {
+        success: false,
+        path,
+        errorCategory: 'property_not_found',
+        error: `${path} is undefined`,
+      };
+    }
 
     const parts = path.split('.');
     const propertyName = parts.pop();
@@ -124,7 +137,12 @@ export function collectPropertyInRealm({ path, depth }) {
       functionSource: typeof value === 'function' ? Function.prototype.toString.call(value) : null,
     };
   } catch (error) {
-    return { success: false, error: error.message };
+    return {
+      success: false,
+      path,
+      errorCategory: 'evaluation_failed',
+      error: error.message,
+    };
   }
 }
 
@@ -250,7 +268,12 @@ export class EnvCollector {
       try {
         const value = getByPath(window, path);
         if (value === undefined) {
-          return { success: false, error: `${path} is undefined` };
+          return {
+            success: false,
+            path,
+            errorCategory: 'property_not_found',
+            error: `${path} is undefined`,
+          };
         }
 
         const serialized = serialize(value, 0, depth);
@@ -300,11 +323,16 @@ export class EnvCollector {
           functionSource: typeof value === 'function' ? Function.prototype.toString.call(value) : null
         };
       } catch (e) {
-        return { success: false, error: e.message };
+        return {
+          success: false,
+          path,
+          errorCategory: 'evaluation_failed',
+          error: e.message,
+        };
       }
     }, { path, depth, includeProto });
 
-    // 添加超时
+    // 添加超时：超时与求值异常都归一为带 errorCategory 的失败结果
     let timeoutId;
     const timeoutPromise = new Promise((_, reject) => {
       timeoutId = setTimeout(() => reject(new Error('采集超时')), timeout);
@@ -314,7 +342,7 @@ export class EnvCollector {
     try {
       result = await Promise.race([evaluatePromise, timeoutPromise]);
     } catch (e) {
-      result = { success: false, error: e.message };
+      result = collectFailure(path, classifyCollectError(e), e.message);
     } finally {
       clearTimeout(timeoutId);
     }
