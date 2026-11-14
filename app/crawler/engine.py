@@ -5,12 +5,13 @@ from collections import deque
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models import CrawlJob, Page, CrawlStatus
+from app.models import CrawlJob, Page, CrawlStatus, PageOutcome
 from app.crawler.fetcher import fetch_url
 from app.crawler.parser import parse_html, ParsedPage
 from app.crawler.robots import AsyncRobotsChecker
 from app.crawler.sitemap import discover_sitemap_urls
 from app.crawler.url_utils import normalize_url, is_same_domain
+from sqlalchemy import select
 
 # Global dict for SSE progress
 crawl_progress: dict[int, dict] = {}
@@ -21,13 +22,15 @@ async def run_crawl(job_id: int, session_factory, url: str, max_pages: int, max_
         "status": "starting",
         "pages_crawled": 0,
         "pages_found": 0,
+        "pages_resolved": 0,
         "current_url": "",
         "errors": [],
     }
     crawl_progress[job_id] = progress
 
     parsed_pages: list[ParsedPage] = []
-    visited: set[str] = set()
+    seen: set[str] = set()  # every URL that entered the queue and was claimed once
+    crawled_count = 0  # successful fetches only (outcome == ok)
     queue: deque[tuple[str, int]] = deque()  # (url, depth)
 
     base_url = normalize_url(url) or url
@@ -47,7 +50,7 @@ async def run_crawl(job_id: int, session_factory, url: str, max_pages: int, max_
         sitemap_urls = await discover_sitemap_urls(http_session, base_url, sitemap_refs or None)
         for surl in sitemap_urls:
             norm = normalize_url(surl)
-            if norm and is_same_domain(norm, base_url) and norm not in visited:
+            if norm and is_same_domain(norm, base_url) and norm not in seen:
                 queue.append((norm, 1))
 
         progress["status"] = "crawling"
@@ -55,22 +58,72 @@ async def run_crawl(job_id: int, session_factory, url: str, max_pages: int, max_
 
         sem = asyncio.Semaphore(settings.MAX_CONCURRENT_REQUESTS)
 
-        async def crawl_url(crawl_url_str: str, depth: int):
-            async with sem:
-                if crawl_url_str in visited:
+        async def record_outcome(crawl_url_str: str, depth: int, outcome: PageOutcome, **fields):
+            """Persist exactly one Page row per (job, url).
+
+            The in-memory ``seen`` set already guarantees a single claim per URL
+            across concurrent batches and duplicate queue entries; the existence
+            check plus the unique constraint make the guarantee defensive at the
+            database level as well.
+            """
+            async with session_factory() as db:
+                existing = await db.execute(
+                    select(Page.id).where(
+                        Page.crawl_job_id == job_id,
+                        Page.url == crawl_url_str,
+                    )
+                )
+                if existing.first() is not None:
                     return
-                if len(visited) >= max_pages:
+                db.add(Page(
+                    crawl_job_id=job_id,
+                    url=crawl_url_str,
+                    outcome=outcome,
+                    depth=depth,
+                    **fields,
+                ))
+                await db.commit()
+
+        async def crawl_url(crawl_url_str: str, depth: int):
+            nonlocal crawled_count
+            async with sem:
+                # Atomic claim: concurrent duplicate claims (same URL in several
+                # batches, or present in both sitemap and internal links) lose
+                # here and never produce a second row. Everything up to the
+                # budget reservation is synchronous, so two concurrent workers
+                # can never both reserve the same max_pages slot.
+                if crawl_url_str in seen:
+                    return
+                seen.add(crawl_url_str)
+                progress["pages_resolved"] = len(seen)
+
+                if crawled_count >= max_pages:
+                    await record_outcome(crawl_url_str, depth, PageOutcome.SKIPPED_LIMIT)
                     return
                 if not robots.can_fetch(crawl_url_str, settings.USER_AGENT):
+                    await record_outcome(crawl_url_str, depth, PageOutcome.BLOCKED_BY_ROBOTS)
                     return
 
-                visited.add(crawl_url_str)
+                # Reserve a crawl slot before the first await. Fetch failures do
+                # not count as crawled pages, so the slot is released on error.
+                crawled_count += 1
                 progress["current_url"] = crawl_url_str
 
                 result = await fetch_url(http_session, crawl_url_str)
 
                 if result.error:
+                    crawled_count -= 1
                     progress["errors"].append({"url": crawl_url_str, "error": result.error})
+                    # Fetch failures are traceable rows but do not count as
+                    # crawled pages; status_code stays 0 and the error is kept.
+                    await record_outcome(
+                        crawl_url_str,
+                        depth,
+                        PageOutcome.FETCH_ERROR,
+                        status_code=0,
+                        response_time=result.response_time,
+                        error_message=result.error,
+                    )
                     return
 
                 # Store page in DB
@@ -78,6 +131,7 @@ async def run_crawl(job_id: int, session_factory, url: str, max_pages: int, max_
                     page = Page(
                         crawl_job_id=job_id,
                         url=crawl_url_str,
+                        outcome=PageOutcome.OK,
                         status_code=result.status_code,
                         response_time=result.response_time,
                         depth=depth,
@@ -95,21 +149,21 @@ async def run_crawl(job_id: int, session_factory, url: str, max_pages: int, max_
                         if depth < max_depth:
                             for link in parsed.internal_links:
                                 norm = normalize_url(link)
-                                if norm and norm not in visited and is_same_domain(norm, base_url):
+                                if norm and norm not in seen and is_same_domain(norm, base_url):
                                     queue.append((norm, depth + 1))
-                                    progress["pages_found"] = len(visited) + len(queue)
+                                    progress["pages_found"] = len(seen) + len(queue)
 
                     db.add(page)
                     await db.commit()
 
-                progress["pages_crawled"] = len(visited)
+                progress["pages_crawled"] = crawled_count
                 await asyncio.sleep(settings.POLITENESS_DELAY)
 
-        while queue and len(visited) < max_pages:
+        while queue and crawled_count < max_pages:
             batch = []
             while queue and len(batch) < settings.MAX_CONCURRENT_REQUESTS:
                 u, d = queue.popleft()
-                if u not in visited:
+                if u not in seen:
                     batch.append((u, d))
 
             if not batch:
@@ -117,6 +171,14 @@ async def run_crawl(job_id: int, session_factory, url: str, max_pages: int, max_
 
             tasks = [crawl_url(u, d) for u, d in batch]
             await asyncio.gather(*tasks)
+
+        # The max_pages budget is exhausted: every URL still queued was
+        # discovered but abandoned, so each gets a traceable skipped row.
+        leftover = [(u, d) for u, d in queue if u not in seen]
+        for u, d in leftover:
+            seen.add(u)
+            progress["pages_resolved"] = len(seen)
+            await record_outcome(u, d, PageOutcome.SKIPPED_LIMIT)
 
     progress["status"] = "analyzing"
 
@@ -205,10 +267,13 @@ async def run_crawl(job_id: int, session_factory, url: str, max_pages: int, max_
         job = await db.get(CrawlJob, job_id)
         job.status = CrawlStatus.COMPLETE
         job.overall_score = round(overall, 1)
-        job.pages_crawled = len(visited)
-        job.pages_found = len(visited)
+        job.pages_crawled = crawled_count
+        job.pages_found = len(seen)
         job.completed_at = datetime.datetime.utcnow()
         await db.commit()
 
     progress["status"] = "complete"
+    progress["pages_crawled"] = crawled_count
+    progress["pages_found"] = len(seen)
+    progress["pages_resolved"] = len(seen)
     progress["overall_score"] = round(overall, 1)

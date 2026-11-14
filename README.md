@@ -53,7 +53,7 @@ All detected issues filterable by severity (critical, warning, info) and categor
 ![Issues](screenshots/issues.png)
 
 ### Pages
-Every crawled page with status code, title, word count, and response time.
+Every discovered URL gets one traceable row with its **outcome** — `ok` (fetched successfully), `fetch_error` (kept with `status_code=0` and the error message), `blocked_by_robots`, or `skipped_limit` (dropped because the `max_pages` budget was exhausted). Successful pages also show status code, title, word count, and response time. `pages_crawled` counts only `ok` rows; `pages_found` counts every unique URL discovered.
 
 ![Pages](screenshots/pages.png)
 

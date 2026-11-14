@@ -29,6 +29,7 @@ class CrawlJobResponse(BaseModel):
 class PageResponse(BaseModel):
     id: int
     url: str
+    outcome: str
     status_code: Optional[int] = None
     title: Optional[str] = None
     meta_description: Optional[str] = None
@@ -36,6 +37,7 @@ class PageResponse(BaseModel):
     response_time: Optional[float] = None
     depth: int
     word_count: Optional[int] = None
+    error_message: Optional[str] = None
 
     class Config:
         from_attributes = True

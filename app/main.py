@@ -36,7 +36,7 @@ app.include_router(api_router)
 async def index(request: Request, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(CrawlJob).order_by(CrawlJob.created_at.desc()))
     jobs = result.scalars().all()
-    return templates.TemplateResponse("index.html", {"request": request, "jobs": jobs})
+    return templates.TemplateResponse(request, "index.html", {"jobs": jobs})
 
 
 @app.get("/report/{job_id}", response_class=HTMLResponse)
@@ -44,17 +44,21 @@ async def report_page(request: Request, job_id: int, db: AsyncSession = Depends(
     from app.models import Page, Issue, Fix, CategoryScore
     job = await db.get(CrawlJob, job_id)
     if not job:
-        return templates.TemplateResponse("index.html", {"request": request, "jobs": [], "error": "Not found"})
+        return templates.TemplateResponse(request, "index.html", {"jobs": [], "error": "Not found"})
 
     pages = (await db.execute(select(Page).where(Page.crawl_job_id == job_id))).scalars().all()
     issues = (await db.execute(select(Issue).where(Issue.crawl_job_id == job_id))).scalars().all()
     fixes = (await db.execute(select(Fix).where(Fix.crawl_job_id == job_id))).scalars().all()
     scores = (await db.execute(select(CategoryScore).where(CategoryScore.crawl_job_id == job_id))).scalars().all()
 
-    return templates.TemplateResponse("report.html", {
-        "request": request, "job": job, "pages": pages,
-        "issues": issues, "fixes": fixes, "scores": scores,
-    })
+    return templates.TemplateResponse(
+        request,
+        "report.html",
+        {
+            "job": job, "pages": pages,
+            "issues": issues, "fixes": fixes, "scores": scores,
+        },
+    )
 
 
 @app.get("/export/{job_id}/html")

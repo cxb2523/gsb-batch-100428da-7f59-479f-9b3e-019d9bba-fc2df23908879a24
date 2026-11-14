@@ -83,7 +83,7 @@
                     {% endif %}
                     <div>
                         <a href="/report/{{ job.id }}" class="text-indigo-600 hover:text-indigo-800 font-medium">{{ job.url }}</a>
-                        <p class="text-sm text-gray-500">{{ job.pages_crawled }} pages &middot; {{ job.created_at.strftime('%b %d, %Y %H:%M') }}</p>
+                        <p class="text-sm text-gray-500">{{ job.pages_crawled }}/{{ job.pages_found }} pages crawled &middot; {{ job.created_at.strftime('%b %d, %Y %H:%M') }}</p>
                     </div>
                 </div>
                 <div class="flex items-center gap-3">

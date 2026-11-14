@@ -7,7 +7,7 @@
     <div class="flex items-center justify-between mb-6">
         <div>
             <h1 class="text-2xl font-bold text-gray-900">SEO Report</h1>
-            <p class="text-gray-500">{{ job.url }} &middot; {{ job.pages_crawled }} pages analyzed &middot; {{ job.created_at.strftime('%b %d, %Y') }}</p>
+            <p class="text-gray-500">{{ job.url }} &middot; {{ job.pages_crawled }} pages analyzed &middot; {{ job.pages_found }} URLs discovered &middot; {{ job.created_at.strftime('%b %d, %Y') }}</p>
         </div>
         <div class="flex gap-2">
             <a href="/export/{{ job.id }}/html" class="px-4 py-2 bg-white border rounded-lg text-sm hover:bg-gray-50">Export HTML</a>
@@ -150,6 +150,7 @@
                     <thead class="bg-gray-50">
                         <tr>
                             <th class="px-4 py-2 text-left font-medium text-gray-600">URL</th>
+                            <th class="px-4 py-2 text-left font-medium text-gray-600">Outcome</th>
                             <th class="px-4 py-2 text-left font-medium text-gray-600">Status</th>
                             <th class="px-4 py-2 text-left font-medium text-gray-600">Title</th>
                             <th class="px-4 py-2 text-left font-medium text-gray-600">Words</th>
@@ -161,12 +162,30 @@
                         <tr class="hover:bg-gray-50">
                             <td class="px-4 py-3 text-indigo-600 truncate max-w-xs">{{ page.url }}</td>
                             <td class="px-4 py-3">
-                                <span class="{% if page.status_code == 200 %}text-green-600{% elif page.status_code >= 400 %}text-red-600{% else %}text-yellow-600{% endif %}">
+                                {% set page_outcome = page.outcome.value if page.outcome else 'ok' %}
+                                <span class="inline-flex px-2 py-0.5 rounded-full text-xs font-medium
+                                    {% if page_outcome == 'ok' %}bg-green-100 text-green-700
+                                    {% elif page_outcome == 'fetch_error' %}bg-red-100 text-red-700
+                                    {% elif page_outcome == 'blocked_by_robots' %}bg-yellow-100 text-yellow-700
+                                    {% else %}bg-gray-200 text-gray-600{% endif %}"
+                                    {% if page.error_message %}title="{{ page.error_message }}"{% endif %}>
+                                    {% if page_outcome == 'ok' %}OK
+                                    {% elif page_outcome == 'fetch_error' %}Fetch error
+                                    {% elif page_outcome == 'blocked_by_robots' %}Blocked by robots
+                                    {% elif page_outcome == 'skipped_limit' %}Skipped (limit)
+                                    {% else %}{{ page_outcome }}{% endif %}
+                                </span>
+                                {% if page.error_message %}
+                                <div class="text-xs text-red-500 mt-0.5 truncate max-w-xs">{{ page.error_message }}</div>
+                                {% endif %}
+                            </td>
+                            <td class="px-4 py-3">
+                                <span class="{% if page.status_code == 200 %}text-green-600{% elif page.status_code and page.status_code >= 400 %}text-red-600{% elif page.status_code %}text-yellow-600{% else %}text-gray-400{% endif %}">
                                     {{ page.status_code or '-' }}
                                 </span>
                             </td>
                             <td class="px-4 py-3 truncate max-w-xs text-gray-700">{{ page.title or '-' }}</td>
-                            <td class="px-4 py-3 text-gray-600">{{ page.word_count or '-' }}</td>
+                            <td class="px-4 py-3 text-gray-600">{{ page.word_count if page.word_count is not none else '-' }}</td>
                             <td class="px-4 py-3 text-gray-600">{{ '%.1f'|format(page.response_time) if page.response_time else '-' }}s</td>
                         </tr>
                         {% endfor %}

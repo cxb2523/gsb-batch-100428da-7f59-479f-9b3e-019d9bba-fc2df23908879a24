@@ -47,8 +47,14 @@ function crawlApp() {
                 this.pagesCrawled = data.pages_crawled || 0;
                 this.currentUrl = data.current_url || '';
 
-                if (data.pages_found > 0) {
-                    this.progressPercent = Math.min(95, (data.pages_crawled / data.pages_found) * 100);
+                // The bar tracks how many discovered URLs have been resolved
+                // (fetched, blocked, failed or skipped), not just successful
+                // fetches — otherwise a crawl containing skipped/failed URLs
+                // would never visually reach 100%.
+                const resolved = data.pages_resolved ?? data.pages_crawled ?? 0;
+                const total = data.pages_found > 0 ? data.pages_found : 0;
+                if (total > 0) {
+                    this.progressPercent = Math.min(95, (resolved / total) * 100);
                 }
 
                 if (data.status === 'analyzing') {

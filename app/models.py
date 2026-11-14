@@ -1,5 +1,5 @@
 import datetime
-from sqlalchemy import Column, Integer, String, Float, Text, DateTime, ForeignKey, Enum as SAEnum
+from sqlalchemy import Column, Integer, String, Float, Text, DateTime, ForeignKey, Enum as SAEnum, UniqueConstraint
 from sqlalchemy.orm import relationship
 from app.database import Base
 import enum
@@ -11,6 +11,13 @@ class CrawlStatus(str, enum.Enum):
     ANALYZING = "analyzing"
     COMPLETE = "complete"
     FAILED = "failed"
+
+
+class PageOutcome(str, enum.Enum):
+    OK = "ok"
+    FETCH_ERROR = "fetch_error"
+    BLOCKED_BY_ROBOTS = "blocked_by_robots"
+    SKIPPED_LIMIT = "skipped_limit"
 
 
 class Severity(str, enum.Enum):
@@ -42,10 +49,21 @@ class CrawlJob(Base):
 
 class Page(Base):
     __tablename__ = "pages"
+    __table_args__ = (
+        UniqueConstraint("crawl_job_id", "url", name="uq_pages_job_url"),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     crawl_job_id = Column(Integer, ForeignKey("crawl_jobs.id"), nullable=False)
     url = Column(String, nullable=False)
+    outcome = Column(
+        SAEnum(
+            PageOutcome,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=False,
+        default=PageOutcome.OK,
+    )
     status_code = Column(Integer, nullable=True)
     title = Column(String, nullable=True)
     meta_description = Column(Text, nullable=True)
@@ -53,6 +71,7 @@ class Page(Base):
     response_time = Column(Float, nullable=True)
     depth = Column(Integer, default=0)
     word_count = Column(Integer, nullable=True)
+    error_message = Column(Text, nullable=True)
     crawled_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     crawl_job = relationship("CrawlJob", back_populates="pages")

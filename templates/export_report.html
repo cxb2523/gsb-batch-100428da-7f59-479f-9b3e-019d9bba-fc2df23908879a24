@@ -29,7 +29,9 @@
 <body>
     <h1>SEO Audit Report</h1>
     <p><strong>URL:</strong> {{ job.url }}</p>
-    <p><strong>Pages Analyzed:</strong> {{ pages|length }}</p>
+    <p><strong>Pages Crawled:</strong> {{ job.pages_crawled }}</p>
+    <p><strong>URLs Found:</strong> {{ job.pages_found }}</p>
+    <p><strong>Page Records:</strong> {{ pages|length }}</p>
     <p><strong>Date:</strong> {{ job.created_at.strftime('%B %d, %Y') }}</p>
 
     <div class="overall {% if job.overall_score >= 80 %}score-good{% elif job.overall_score >= 50 %}score-ok{% else %}score-bad{% endif %}" style="padding: 20px; border-radius: 12px; margin: 20px 0;">
@@ -79,14 +81,16 @@
 
     <h2>Pages Analyzed</h2>
     <table>
-        <thead><tr><th>URL</th><th>Status</th><th>Title</th><th>Words</th></tr></thead>
+        <thead><tr><th>URL</th><th>Outcome</th><th>Status</th><th>Title</th><th>Words</th><th>Error</th></tr></thead>
         <tbody>
         {% for page in pages %}
         <tr>
             <td style="max-width: 300px; overflow: hidden; text-overflow: ellipsis;">{{ page.url }}</td>
-            <td>{{ page.status_code or '-' }}</td>
+            <td>{{ page.outcome.value if page.outcome else 'ok' }}</td>
+            <td>{{ page.status_code if page.status_code is not none else '-' }}</td>
             <td>{{ page.title or '-' }}</td>
-            <td>{{ page.word_count or '-' }}</td>
+            <td>{{ page.word_count if page.word_count is not none else '-' }}</td>
+            <td style="max-width: 250px; overflow: hidden; text-overflow: ellipsis;">{{ page.error_message or '-' }}</td>
         </tr>
         {% endfor %}
         </tbody>
