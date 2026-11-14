@@ -23,6 +23,7 @@ function contains (listOrObj, value) {
 }
 
 async function fetchRequest (options, callback) {
+  let responseLike
   try {
     const res = await fetch(options.url, {
       redirect: 'follow',
@@ -30,17 +31,26 @@ async function fetchRequest (options, callback) {
     })
     const arrayBuffer = await res.arrayBuffer()
     const body = Buffer.from(arrayBuffer)
-    const responseLike = {
+    responseLike = {
       statusCode: res.status,
       headers: Object.fromEntries(res.headers.entries()),
       body,
       request: { uri: { href: res.url } },
       _redirect: { redirects: [{ redirectUri: res.url }] }
     }
-    callback.call(responseLike, null, responseLike, body)
   } catch (err) {
     const emptyResponse = { _redirect: { redirects: [] } }
     callback.call(emptyResponse, err, null, null)
+    return
+  }
+  // Invoked outside the try block so that an exception thrown by a consumer
+  // callback is not reported back as a request failure and does not invoke the
+  // callback a second time. It is re-thrown asynchronously, after the crawler has
+  // updated its bookkeeping in the callback's finally block.
+  try {
+    callback.call(responseLike, null, responseLike, responseLike.body)
+  } catch (callbackError) {
+    setTimeout(function () { throw callbackError }, 0)
   }
 }
 const path = require('path')
@@ -167,7 +177,50 @@ function Crawler () {
   this._currentUrlsToCrawl = []
   this._concurrentRequestNumber = 0
 
+  // Host of the crawl root; links are restricted to it and its subdomains
+  this._rootHostname = null
+
+  // Urls reported through onSuccess/onFailure, used to report each page only once
+  this._crawledUrlSet = new Set()
+
+  // Guards against calling onAllFinished more than once per crawl
+  this._finished = false
+
   this.request = fetchRequest
+}
+
+Crawler.prototype._setRootUrl = function (rootUrl) {
+  this._rootHostname = null
+  if (typeof rootUrl === 'string') {
+    try {
+      this._rootHostname = new URL(rootUrl).hostname.toLowerCase()
+    } catch {
+      // Not an absolute URL: keep the historical behaviour and don't restrict by host.
+      this._rootHostname = null
+    }
+  }
+}
+
+/*
+ * A link is in scope when it is an http/https URL on the same host as the crawl root,
+ * or on one of its subdomains. Links that cannot be parsed are rejected once the root
+ * host is known.
+ */
+Crawler.prototype._isUrlInScope = function (link) {
+  let parsed
+  try {
+    parsed = new URL(link)
+  } catch {
+    return this._rootHostname === null
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    return false
+  }
+  if (!this._rootHostname) {
+    return true
+  }
+  const hostname = parsed.hostname.toLowerCase()
+  return hostname === this._rootHostname || hostname.endsWith('.' + this._rootHostname)
 }
 
 Crawler.prototype.configure = function (options) {
@@ -198,6 +251,7 @@ Crawler.prototype._createExecutor = function () {
 }
 
 Crawler.prototype.crawl = function (configParm, onSuccess, onFailure, onAllFinished) {
+  this._finished = false
   this.workExecutor = this._createExecutor()
   this.workExecutor.start()
   let url = configParm.url
@@ -213,10 +267,17 @@ Crawler.prototype.crawl = function (configParm, onSuccess, onFailure, onAllFinis
     onAllFinished = options.finished
     url = options.url
   }
+  this._setRootUrl(url)
   this.onSuccess = onSuccess
   this.onFailure = onFailure
   this.onAllFinished = onAllFinished
   this._crawlUrl(url, null, this.depth)
+
+  // The entry url may not be queueable at all (unsupported protocol, or depth 0).
+  // In that case nothing will ever call _finishedCrawling, so finish explicitly.
+  if (this._currentUrlsToCrawl.length === 0 && this._concurrentRequestNumber === 0) {
+    this._allFinished()
+  }
 
   return this
 }
@@ -230,18 +291,36 @@ Crawler.prototype._startedCrawling = function (url) {
 Crawler.prototype._finishedCrawling = function (url) {
   const indexOfUrl = this._currentUrlsToCrawl.indexOf(url)
 
-  this._currentUrlsToCrawl.splice(indexOfUrl, 1)
-  if (this._currentUrlsToCrawl.length === 0) {
-    this.onAllFinished && this.onAllFinished(this.crawledUrls)
-    this.workExecutor && this.workExecutor.stop()
+  if (indexOfUrl >= 0) {
+    this._currentUrlsToCrawl.splice(indexOfUrl, 1)
   }
+  if (this._currentUrlsToCrawl.length === 0 && this._concurrentRequestNumber === 0) {
+    this._allFinished()
+  }
+}
+
+Crawler.prototype._allFinished = function () {
+  if (this._finished) {
+    return
+  }
+  this._finished = true
+  this.workExecutor && this.workExecutor.stop()
+  this.onAllFinished && this.onAllFinished(this.crawledUrls)
 }
 
 Crawler.prototype._requestUrl = function (options, callback) {
   const self = this
   const url = options.url
 
-  // Do not request a url if it has already been crawled
+  // Keep the crawl on the site it started from: only http(s) urls on the root host
+  // (or one of its subdomains) may enter the queue.
+  if (!self._isUrlInScope(url)) {
+    return
+  }
+
+  // Do not request a url if it is already known, in flight, or already queued.
+  // Checking the queue here (and not only when the executor picks the item up)
+  // keeps duplicates out of the executor and prevents them from being counted.
   if (contains(self._currentUrlsToCrawl, url) || contains(self.knownUrls, url)) {
     return
   }
@@ -250,17 +329,21 @@ Crawler.prototype._requestUrl = function (options, callback) {
   this.workExecutor.submit(function (options, callback) {
     self._concurrentRequestNumber++
     self.request(options, function (error, response, body) {
-      self._redirects = this._redirect.redirects
-      callback(error, response, body)
-      self._finishedCrawling(url)
-      self._concurrentRequestNumber--
+      self._redirects = (this && this._redirect && this._redirect.redirects) || []
+      try {
+        callback(error, response, body)
+      } finally {
+        self._concurrentRequestNumber--
+        self._finishedCrawling(url)
+      }
     })
   }, null, [options, callback], function shouldSkip () {
     const shouldCrawlUrl = self.shouldCrawl(url)
-    if (!shouldCrawlUrl) {
+    if (!shouldCrawlUrl || contains(self.knownUrls, url)) {
       self._finishedCrawling(url)
+      return true
     }
-    return contains(self.knownUrls, url) || !shouldCrawlUrl
+    return false
   })
 }
 
@@ -301,7 +384,11 @@ Crawler.prototype._crawlUrl = function (url, referer, depth) {
     if (!error && (response.statusCode === 200)) {
       // If no redirects, then response.request.uri.href === url, otherwise last url
       const lastUrlInRedirectChain = response.request.uri.href
-      if (self.shouldCrawl(lastUrlInRedirectChain)) {
+      // A same-site url may redirect to another domain, or several urls may resolve to
+      // the same page: such pages are not part of this site's results.
+      if (self.shouldCrawl(lastUrlInRedirectChain) &&
+          self._isUrlInScope(lastUrlInRedirectChain) &&
+          !self._crawledUrlSet.has(lastUrlInRedirectChain)) {
         self.onSuccess({
           url: lastUrlInRedirectChain,
           status: response.statusCode,
@@ -312,7 +399,7 @@ Crawler.prototype._crawlUrl = function (url, referer, depth) {
           referer: referer || ''
         })
         self.knownUrls[lastUrlInRedirectChain] = true
-        self.crawledUrls.push(lastUrlInRedirectChain)
+        self._recordCrawledUrl(lastUrlInRedirectChain)
         if (self.shouldCrawlLinksFrom(lastUrlInRedirectChain) && depth > 1 && isTextContent) {
           self._crawlUrls(self._getAllUrls(lastUrlInRedirectChain, body), lastUrlInRedirectChain, depth - 1)
         }
@@ -327,9 +414,16 @@ Crawler.prototype._crawlUrl = function (url, referer, depth) {
         body: body,
         referer: referer || ''
       })
-      self.crawledUrls.push(url)
+      self._recordCrawledUrl(url)
     }
   })
+}
+
+Crawler.prototype._recordCrawledUrl = function (url) {
+  if (!this._crawledUrlSet.has(url)) {
+    this._crawledUrlSet.add(url)
+    this.crawledUrls.push(url)
+  }
 }
 
 Crawler.prototype._isTextContent = function (response) {
@@ -391,7 +485,7 @@ Crawler.prototype._getAllUrls = function (defaultBaseUrl, body) {
   })
   const uniq = [...new Set(mapped)]
   return uniq.filter(function (link) {
-    return self._isLinkProtocolSupported(link) && self.shouldCrawl(link)
+    return self._isUrlInScope(link) && self._isLinkProtocolSupported(link) && self.shouldCrawl(link)
   })
 }
 

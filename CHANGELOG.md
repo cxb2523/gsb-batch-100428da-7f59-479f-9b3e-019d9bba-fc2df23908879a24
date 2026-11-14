@@ -1,5 +1,17 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Local crawler test suite (`test/crawler.test.js`, run via `npm test` / `node --test`) using a local HTTP server and generated HTML.
+
+### Fixed
+
+- **Crawler:** Links pointing at another host (or a different protocol) are no longer queued; only `http(s)` URLs on `crawler.url`'s hostname or its subdomains are followed. A same-host URL that redirects off-site is not reported as a result.
+- **Crawler:** URLs already crawled, in flight, or queued are not submitted again, so duplicate links are requested once and link loops terminate.
+- **Crawler:** `onAllFinished` fires once per crawl, and only when the queue is empty and no request is in flight; `crawledUrls` contains each page once.
+
 ## [2.0.1] - 2025-02-17
 
 ### Changed

@@ -105,7 +105,7 @@ When using Gumo as a dependency (e.g. `require('gumo')` with no `config.json` in
 | -------- | ------------------------------------ |
 | `npm run dev` | Run the crawler (`node index.js`).   |
 | `npm run lint` | Run [ESLint](https://eslint.org/) on the project (see `eslint.config.js`). |
-| `npm test`    | Run tests (placeholder until tests are added). |
+| `npm test`    | Run the local test suite (`node --test`), including crawler tests that use a local HTTP server. |
 
 CI runs on [GitHub Actions](https://github.com/nvk681/Gumo/actions) (Node 24, lint + test) on push/PR to `main`/`master`.
 
@@ -124,6 +124,8 @@ The behavior of the crawler can be customized by passing a custom configuration 
 | crawler.whiteList             | Array(string) |                  | If populated, only these URLs will be traversed                                            | [] (empty array)        | All URLs with the same hostname as the "url" attribute will be traversed |
 | crawler.blackList             | Array(string) |                  | If populated, these URLs will ignored                                                      | [] (empty array)        |                                                                          |
 | crawler.depth                 | int           | range: 1 to 999  | Depth up to which nested hyperlinks will be followed                                       | 3                       |                                                                          |
+
+The crawler stays on the site it started from: links whose host differs from `crawler.url`'s hostname (subdomains of it are allowed) and non-`http(s)` links are skipped, and every URL is queued at most once. Pages are reported once, and `onAllFinished` is called exactly once, when nothing is queued or in flight.
 | * elastic.url                   | string        |                  | URI of the ElasticSearch instance to connect to                                            | "http://localhost:9200" |                                                                          |
 | * elastic.index                 | string        |                  | The name of the ElasticSearch index to store results in                                    | "myIndex"               |                                                                          |
 | * neo4j.url                     | string        |                  | The URI of a running Neo4J instance (uses the Bolt driver to connect)                      | "neo4j://localhost"     |                                                                          |
