@@ -1,0 +1,182 @@
+"""元学习：跨任务经验记忆。
+
+- 执行轨迹持久化（JSONL）：任务目标、步骤、成败，供后续任务检索参考
+- 词汇映射学习：用户描述 ↔ 实际控件名（如 "乘号" ↔ "Multiply by"），
+  成功后自动记录，下次直接命中策略链第 0 级
+- 结构化逐步轨迹（TraceRecorder）：每步落盘「元素表 + 决策 + 结果」，
+  是 desktop-jev 小模型 SFT 的原料（research/desktop-jev/TRAINING.md §1）
+
+存储位置：~/.screen_use/（可用 SCREEN_USE_HOME 环境变量覆盖）
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import time
+from pathlib import Path
+
+
+def _default_home() -> Path:
+    return Path(os.environ.get("SCREEN_USE_HOME", Path.home() / ".screen_use"))
+
+
+def _tokenize(text: str) -> set[str]:
+    """中英混合分词：英文按词，中文按字（简单够用）。"""
+    text = text.lower()
+    words = set(re.findall(r"[a-z0-9]+", text))
+    chars = set(re.findall(r"[一-鿿]", text))
+    return words | chars
+
+
+class ExperienceStore:
+    def __init__(self, home: Path | None = None):
+        self.home = home or _default_home()
+        self.home.mkdir(parents=True, exist_ok=True)
+        self.traces_path = self.home / "traces.jsonl"
+        self.vocab_path = self.home / "vocab.json"
+
+    # ---- 执行轨迹 ----
+
+    def record_trace(self, goal: str, result: dict) -> None:
+        """任务结束后记录轨迹（只存摘要，不存截图）。"""
+        entry = {
+            "ts": time.time(),
+            "goal": goal,
+            "done": result["done"],
+            "result": result["result"],
+            "steps": [
+                {"action": s["action"], "args": s["args"], "ok": s["ok"]}
+                for s in result["steps"]
+            ],
+        }
+        with open(self.traces_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def recall(self, goal: str, limit: int = 3) -> list[dict]:
+        """按关键词重叠度检索相似历史任务（简单有效，零依赖）。"""
+        if not self.traces_path.exists():
+            return []
+        query = _tokenize(goal)
+        if not query:
+            return []
+        scored = []
+        with open(self.traces_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                overlap = len(query & _tokenize(entry.get("goal", "")))
+                if overlap > 0:
+                    # 成功的经验优先，其次按重叠度
+                    scored.append((entry.get("done", False), overlap, entry))
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return [e for _, _, e in scored[:limit]]
+
+    # ---- 词汇映射 ----
+
+    def _load_vocab(self) -> dict:
+        if not self.vocab_path.exists():
+            return {}
+        try:
+            return json.loads(self.vocab_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def learn_mapping(self, description: str, element_name: str, control_type: str = "") -> None:
+        """记录 描述→控件名 的成功映射（重复成功会累计置信度）。"""
+        key = description.strip().lower()
+        if not key or not element_name:
+            return
+        vocab = self._load_vocab()
+        entry = vocab.get(key, {"name": "", "control_type": "", "hits": 0})
+        entry["name"] = element_name
+        if control_type:
+            entry["control_type"] = control_type
+        entry["hits"] = entry.get("hits", 0) + 1
+        vocab[key] = entry
+        self.vocab_path.write_text(
+            json.dumps(vocab, ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+
+    def recall_mapping(self, description: str) -> dict | None:
+        """查找已学到的映射。返回 {"name": ..., "control_type": ..., "hits": ...}。"""
+        return self._load_vocab().get(description.strip().lower())
+
+    # ---- 统计 ----
+
+    def stats(self) -> dict:
+        traces = 0
+        successes = 0
+        if self.traces_path.exists():
+            with open(self.traces_path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        entry = json.loads(line)
+                        traces += 1
+                        successes += bool(entry.get("done"))
+                    except json.JSONDecodeError:
+                        continue
+        return {
+            "traces": traces,
+            "successes": successes,
+            "vocab_size": len(self._load_vocab()),
+        }
+
+
+# ---- 结构化逐步轨迹（desktop-jev 阶段 0：SFT 原料采集） ----
+
+
+class TraceRecorder:
+    """结构化逐步轨迹采集器。
+
+    每个任务一个 JSONL 文件（traces_full/{task_id}.jsonl），每步一行：
+    {goal, step_idx, foreground_title, elements, action, args, ok, detail, ts}
+
+    与 ExperienceStore.record_trace 的区别：record_trace 只存任务级摘要
+    （action+args+ok），供检索；这里存的是**每步的完整观测**（UIA 元素表），
+    是 desktop-jev 小模型的训练原料（research/desktop-jev/TRAINING.md §1）。
+    不存截图（体积可控；需要时按 bbox 重截）。
+    """
+
+    def __init__(self, home: Path | str | None = None):
+        self.dir = (Path(home) if home else _default_home()) / "traces_full"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self._path: Path | None = None
+        self._goal: str = ""
+
+    def start_task(self, goal: str) -> str:
+        """开始一个任务的采集，返回 task_id（时间戳 + goal 短哈希，文件名安全）。"""
+        digest = hashlib.sha1(goal.encode("utf-8")).hexdigest()[:8]
+        task_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{digest}"
+        self._path = self.dir / f"{task_id}.jsonl"
+        self._goal = goal
+        return task_id
+
+    def record_step(self, step_idx: int, foreground_title: str,
+                    elements: list[dict], action: str, args: dict,
+                    ok: bool, detail: str = "", source: str = "vlm_trace") -> None:
+        """落盘一步观测+决策。须在 start_task 之后调用。
+
+        source 标注这一步的决策来源（vlm_trace = 大模型驾驶 / jev = 小模型快路径），
+        训练侧据此分层报告指标（TRAINING §1：合成准确率再高也不算数）。
+        """
+        if self._path is None:
+            raise RuntimeError("record_step 前请先 start_task")
+        entry = {
+            "goal": self._goal,
+            "step_idx": step_idx,
+            "foreground_title": foreground_title,
+            "elements": elements,
+            "action": action,
+            "args": args,
+            "ok": ok,
+            "detail": detail,
+            "source": source,
+            "ts": time.time(),
+        }
+        with open(self._path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")

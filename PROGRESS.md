@@ -1,0 +1,112 @@
+# PROGRESS — screen-use / desktop-jev
+
+> 最后更新：2026-11-09（补记 09-19 的 v3 全流程结果 —— 一个**负结果**；并修掉右键语义 bug）。
+> 下次会话：先读本文 + `research/desktop-jev/BENCH.md` §7.3，再按下面的方向修正继续。
+
+## 一句话状态
+
+**v3 那条"补数据分布"的路已经跑完并且失败**：mock v3 留出集 joint_acc 0.630、mock 基准
+coverage 0.46，但**真实域裸 joint_acc 0.167（v0 是 0.17）、升级率 98.3%、部署 coverage 1.7%**
+——元素中位做到 86（对齐真实 84）也没用，尺度不是瓶颈。真实域 op_acc 0.63–0.83 而 joint 0.17，
+说明**瓶颈在元素落地**：真实 goal 不引用控件名，而 tight 格式把 AutomationId/快捷键/HelpText/
+层级分组全砍了，纯文本观测里没有可落的语义线索。另外真实域 p95 时延 **10.3s**，
+"0.1s/步"的前提在长表上不成立。详见 BENCH.md §7.3。
+
+上一阶段（09-19）的成果仍然有效：Jev 接进 VisualLoop 快路径、mock 域 1.74×、
+三环 cascade 协议、观测格式 v2（会话级稳定 id + 状态位）。
+
+## 已完成（倒序）
+
+| 日期 | 内容 | 位置 |
+|---|---|---|
+| 11-09 | **速度预算实测 + 决策 285→180ms**：`attn_implementation="eager"`（本机比 sdpa 快 1.5×，mask 形态无关）+ `inference_mode` + 加载后预热（消掉 p95 10.3s 的首次前向税）。同时量出整条链路的地板：观测 137ms / 决策 180ms / 注入 0.03ms，结构化路线物理地板 ~20–65ms 一步 | `training/serve.py`、`scripts/bench_latency_budget.py`、`scripts/probe_model_opts.py`、`research/desktop-jev/LATENCY.md` |
+| 11-09 | **右键语义修正 + 负结果收档**：①`click_element_id` 原先只有左键，`RIGHT_CLICK/DOUBLE_CLICK` 带 id 的决策被静默降级成"左键单击"（CATIA 上下文菜单永远出不来）→ `executor.click(button="right")` 统一走按住路径，`DEFAULT_RIGHT_HOLD_MS` 常量 + tools/do_actions/MCP 全透传 `hold_ms`；②把 09-19 v3 全流程的**负结果**写进 BENCH §7.3（之前只在 `assets/bench/` 里躺着，没人读就会重跑一遍） | `executor.py`、`tools.py`、`agent.py`、`mcp_server.py`、`tests/test_executor.py`、`tests/test_tools.py`、BENCH §7.3 |
+| 09-19 | **撤回"尺度对齐"并重修**（owner 一句「我没看到纯图标」牵出来的）：①**项目里有两个估算器**——`densify` 判"够了"用的是粗糙的 `estimate_elements`（把折叠树节点/子菜单项/视口外单元格全算上，虚报 **+31/回合**），验收报数用的是另一个；②`_observe` 按几何矩形捞外来元素，**owner 的终端窗口**（窗口标题就是对话名）贡献 3160 个元素、泄漏确认框 604 个，把假象坐实；③于是"报 87 / 实际 52 / 看到 86"三者互相佐证了一个不存在的对齐。修法：估算器只剩**一条真源**且改成**照 Qt 可见性数**、元素带 `pid` 只留本进程窗口、按真实构成（**76% 是按钮**）重做布局预算（按钮池 25→78、网格 3→8 行、窗口 1200×740）、加运行时自检（只认实测） | `scripts/mock_v3.py`、`scripts/mock_env.py`、`screen_use/perception/uia_tree.py`、`tests/test_mock_v3.py`、BENCH.md §7.1/§7.2 |
+| 09-19 | **真画图标**（owner 报「我没看到纯图标」）：v3 所谓"图标按钮"其实是 `QPushButton("")` **空白方块**；真实那批是窗口按钮 ─ □ ✕（实测 945/9284=10.2% 无名、全是 ButtonControl、bbox 69×60 贴右上角）。现 `_glyph_icon()` 画通用几何图形（**刻意不画语义图标**，免得诱导 VLM 点错污染对照）+ 「无名比例归零」告警护栏 | `scripts/mock_env.py`、`scripts/mock_v3.py`、`tests/test_mock_windows.py`、BENCH.md §8.7 |
+| 09-19 | **修训练集标签污染**：`iter_samples` 的 docstring 写着「跳过…执行失败步」，代码里**没有这个判断** → 失败步（`args` 为空）被当成「CLICK 无目标元素」的**正样本**。实测 v3 14/290、v2 68/3100、真实 25/105 都中招（**v0 那轮就吃进去了**）。修后 v3 样本 290→276 | `training/common.py`、`tests/test_training_common.py`（+5 测试） |
+| 09-19 | **修窗口卡死事故**（owner 报障「哪个 mock 卡住了显示未响应」）：确认框是 QDialog 且**故意与主窗口同标题**，有些范式流程结束时把它留在打开状态，而 `win.close()` 只隐藏主窗口、关不掉独立顶层窗口 → 那个框赖在 owner 屏幕上，生成器进 idle-gate 阻塞事件循环后被 Windows 标成「(未响应)」。现 `MockWindow.teardown()` 按层收（弹层→确认框→本体）+ 回合边界 `sweep_stale_windows()` 兜底；进闸门前必清场 | `scripts/mock_env.py`、`scripts/mock_v3.py`、`tests/test_mock_windows.py`（+4 测试） |
+| 09-19 | **v3 流水线开跑**（1000 回合 / 2 epoch，idle-gate 60s，你离开电脑才动） | `scripts/run_pipeline.py`、`assets/bench/logs/pipeline_*.log` |
+| 09-19 | **修流水线评测域**：第 5 步 mock 基准漏传 `--data` → 会拿 v2（14 元素）考 v3（90 元素）模型，低分会被误读成"训练搞坏了" | `scripts/run_pipeline.py` |
+| 09-19 | **修校准小样本崩溃**：哈希分半可能把留出文件全分到一侧 → `torch.cat([])` 报错看不懂；现按文件整体挪一个 + 明确错误信息 | `training/calibrate.py`、`tests/test_calibrate.py`（+6 测试） |
+| 09-19 | **图标无文字分布对齐**：真实 11% 元素无名 → v3 掺无名图标按钮 + 无重名保护 | `scripts/mock_v3.py`、`tests/test_mock_v3.py`、BENCH.md §8.7/8.8 |
+| 09-19 | **人类基线工具**（8 个可验证日常任务，人/agent 同口径对照） | `scripts/baseline.py`、`tests/test_baseline.py` |
+| 09-19 | **mock v3 生成器 + 一条命令流水线**（尺度/语义/双语对齐真实分布） | `scripts/mock_v3.py`、`scripts/run_pipeline.py`、`tests/test_mock_v3.py` |
+| 09-19 | **真实域泛化首测（R4）**：joint_acc 0.17 / 升级率 90% → 加训练分布门控 | `screen_use/jev_bridge.py::ood_check`、`training/calibrate.py::train_stats`、`assets/bench/offline_eval_realdomain.json` |
+| 09-19 | **后台窗口元素表缓存 + 点击前 bbox 校验**（观测 326ms → 153ms） | `screen_use/perception/uia_tree.py`、`tools.py::_fresh_element` |
+| 09-19 | **阶段 4 接入 + 北极星首测**（1.74×，报告见 BENCH.md） | `screen_use/jev_bridge.py`、`agent.py`、`scripts/bench_jev.py`、`scripts/eval_offline.py`、`scripts/smoke_jev_loop.py`、`scripts/bench_gui.py` |
+| 09-19 | 修校准接入 bug：等张断点落盘 + serve 侧插值；留出集再分半（半拟合/半选 τ）；重校准 τ=0.77 | `training/{calibrate,serve}.py`、`checkpoints/jev-Qwen3-0.6B-e3/calibration.json` |
+| 09-19 | serve 补 TYPE 的 goal-copy 文本（span 头解码） | `training/serve.py` |
+| 09-19 | SFT v0（Qwen3-0.6B，3100 步，3 epochs）+ 校准 + serve.py | `checkpoints/jev-Qwen3-0.6B-e3/` |
+| 09-19 | mock v2 合成器：零干扰 + 15 类交互范式（54/54 oracle） | `scripts/mock_env.py`（--episodes/--seed/--start 断点续跑） |
+| 09-18 | cascade protocol 阶段 A：`get_capabilities` + EscalationResult 带地图退 | `screen_use/capabilities.py`、`tools.py::run_task` |
+| 09-18 | 阶段 0 轨迹采集（TraceRecorder）+ 阶段 1 首测（覆盖率 73.8-90.5% 成立） | `memory.py`、`scripts/analyze_traces.py` |
+| 09-18 | 研究文档：desktop-jev 五件 + cascade-protocol | `research/desktop-jev/`、`research/cascade-protocol/` |
+| 09-18 | 线上问题修复×4：焦点抢占/窗口激活验证/fail-safe复位/UIA配额 | `agent.py`、`tools.py`、`executor.py`、`uia_tree.py` |
+
+测试：**269 passed**（`./.venv/Scripts/python.exe -m pytest tests/ -q`，118 → 155 → 230 → 269，
+新增右键按住/按钮语义路由的回归）。注意：**单独跑 `tests/test_agent.py` 会因 COM 未 CoInitialize 报
+`WinError -2147221008`**，那是子集执行的顺序问题，全量跑绿——不要当成回归。
+
+## 关键指标（09-19 首测，mock；原始数据 `assets/bench/`）
+
+| 指标 | 值 | 备注 |
+|---|---|---|
+| 端到端（每任务） | 纯 VLM 17.7s → **Jev 混合 10.2s（1.74×）** | 4 个回合配对，观测/执行用本机实测常量 |
+| Jev 决策时延 | p50 **43ms** / mean 47ms（另一轮 300 样本单跑 p50 116ms，GPU 时钟与元素表规模不同） | 目标 <100ms 基本达标 |
+| VLM 决策时延 | p50 **5978ms** / mean 6200ms（n=10，真 API） | 对照组 |
+| 离线 op_acc | **0.962 ± 0.018**（3 个 10% 切片） | 训练日志 0.945 同量级 |
+| 离线 joint_acc | **0.758 ± 0.061** | 切片方差大；单切片（如 0.688）不可当结论 |
+| 部署侧覆盖率 @τ=0.77 | **0.677**（n=300 等距抽样）· 升级率 **0.323** | 校准文件里的 0.759 是 10% 切片，偏乐观 |
+| 推荐 τ | **0.72**（覆盖率 0.743） | 零训练成本，改 `calibration.json` 即可 |
+| mock 数据 | 1125 文件 / 3100 步 gold | 前 656 个是 v1 合成器（6 类），后 469 是 v2（15 类） |
+| 真实数据 | 9 文件 / 105 步 silver | 仍太少；剔除失败步与动作集外的步后**只有 72 条可训**（见 09-19 标签污染修复） |
+
+## 关键资产位置
+
+- 模型：`checkpoints/jev-Qwen3-0.6B-e3/`（backbone + heads.pt + calibration.json 含 isotonic 断点）
+- 推理：`training/serve.py` → `JevDecision(ckpt).decide(goal, foreground, elements, history)`
+  → `{action, element_id, text, confidence, confidence_raw, escalate, latency_ms}`
+- 桥接：`screen_use/jev_bridge.py`（OPS 单一真源 / 动作翻译 / history 同构 / 引擎懒加载）
+- 接入开关：`.env` 里 `JEV_CHECKPOINT=checkpoints/jev-Qwen3-0.6B-e3`（**默认留空 = 纯 VLM**）
+- 基准：`scripts/bench_jev.py`（无头 replay）· `scripts/eval_offline.py`（多切片+部署曲线）·
+  `scripts/smoke_jev_loop.py`（真桌面 dry-run 冒烟，零鼠标零外发）
+- 报告：`research/desktop-jev/BENCH.md` · 原始 JSON/MD：`assets/bench/`
+
+## 下一步（方向已按 §7.3 的负结果修正）
+
+- **A 改观测量：让候选元素"可落地"（当前第一优先级）**。
+  真实域 joint 0.17 而 op_acc 0.83 → 动作对、元素错，缺的是元素侧的语义线索。
+  做法：`observation.format_element` 的 tight 格式按预算补 `AutomationId / AcceleratorKey /
+  HelpText / 所属分组标题`（每条都要先量 token 增量，目标是 +2~4 token/元素以内），
+  再用 `scripts/eval_offline.py --data traces_full` 直接在 72 条真实样本上看 joint_acc 有没有动。
+  **离线可验、不用开窗、不用重训**——先用现成 v3 权重当探针，能抬起来再谈重训。
+- **B 改决策形态：学出来的候选压缩**（原 §9.2）。字符串短名单已证伪（recall@10 = 0%），
+  只能学。大表（84–150 元素）先压到 ~20 候选，顺带把 p95 10.3s 打下来。
+- **C 评估口径先修干净**：`traces_full` 现在同时在训练集里（§8.10），
+  想要能对外引用的绝对数，必须训练时不喂它、留作零样本测试集。B/A 的收益都要靠这个口径才能宣称。
+- **D 真 GUI 端到端 + 人类基线**：`scripts/bench_gui.py --allow-gui`、`scripts/baseline.py`
+  ——**只能在 owner 离开电脑时跑**；没有人类基线就不能说"快于人类"。
+- **E 攒真实数据**：日常 run_task 自然攒 `traces_full`，这是 A/C 两项的共同前提。
+
+## 环境备忘（坑都踩过了）
+
+- venv：`./.venv/Scripts/python.exe`（系统 python 无依赖）；PySide6/torch 都在 venv 里
+- HF 下载：必须 `HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1`（直连不通 + xet 401）
+- GPU：RTX 5070 Ti Laptop（16GB）。**两个 torch 进程同时跑会互相拖慢**（实测 Jev 时延翻倍），
+  基准测量必须串行；`scripts/eval_offline.py` 与 `bench_jev.py` 别并发
+- mock 量产**绝不能在 owner 用电脑时跑**（弹层抓鼠标；窗口虽在角落但可见）
+- 本机 **PATH 里没有 git**（`git` 命令不存在）→ 用 `C:\Program Files\Git\cmd\git.exe`
+- **别用 PowerShell 的 `Get-Content | Set-Content` 改 UTF-8 源码**：PS5.1 按 ANSI(GBK) 读，
+  中文会变乱码且部分字节不可逆（本次毁过一次测试文件，只能整份重写）。改文件一律用编辑工具，
+  或 python 显式 `encoding="utf-8"` 读写。
+- PowerShell 传多行脚本给 `python -c` 会丢引号：写成临时 .py 文件再跑
+- 两个 torch 进程同时跑会互相拖慢（基准测量必须串行）
+
+## 未 commit / git 备忘
+
+- 已提交到本地 `main`（`git log` 看提交信息）；**owner 定的 push 闸门：做到成品
+  （常用 GUI 通用可用 + 端到端快于人类基线）并经 owner 确认才 push** —— 当前 ahead of origin。
+- `git` 不在 PATH，二进制在 `C:\Program Files\Git\cmd\git.exe`。
+- `.gitignore` 忽略 `checkpoints/`（权重太大）→ **`calibration.json` 的 τ=0.72 不在版本控制里**，
+  换机/重训后要重新 `training.calibrate --tau 0.72`（参数已支持）。
+- `*.log` 也被忽略，基准日志在 `assets/bench/logs/`（本地留存，不入库）。
