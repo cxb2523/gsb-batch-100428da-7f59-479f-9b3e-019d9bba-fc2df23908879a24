@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/
+logs/
+.ruff_cache/
+*.sqlite*
+twitter_cookies.json
+*.log
+.idea/
+.vscode/
+node_modules/
+*.pem
+*.key
