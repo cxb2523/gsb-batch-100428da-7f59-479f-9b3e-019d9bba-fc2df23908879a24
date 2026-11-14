@@ -1,0 +1,342 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type'
+        required: true
+        default: 'draft'
+        type: choice
+        options:
+          - draft
+          - prerelease
+          - release
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # 代码质量检查
+  quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 8
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '21'
+          cache: 'pnpm'
+
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      - name: Lint frontend code
+        run: pnpm lint
+
+      - name: Type check
+        run: pnpm exec tsc --noEmit
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3 
+
+      - name: Install Python dependencies and run tests
+        run: |
+          cd src-python
+          uv sync --dev
+          uv run python src/test/run_all_tests.py
+
+  # 多平台构建
+  build:
+    name: Build ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            os: windows-latest
+            rust_target: x86_64-pc-windows-msvc
+            
+          - platform: macos-arm64
+            os: [self-hosted, macOS, ARM64]
+            rust_target: aarch64-apple-darwin
+            
+          - platform: linux-x64
+            os: ubuntu-latest
+            rust_target: x86_64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 8
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '21'
+          cache: 'pnpm'
+
+      - name: Install uv
+        if: ${{ !contains(matrix.os, 'self-hosted') }}
+        uses: astral-sh/setup-uv@v3
+
+      - name: Verify uv (self-hosted)
+        if: ${{ contains(matrix.os, 'self-hosted') }}
+        run: |
+          echo "Using pre-installed uv:"
+          uv --version
+          which uv
+
+      - name: Setup Python with uv
+        run: |
+          echo "Setting up Python 3.11 with uv..."
+          # uv will automatically install Python 3.11 if needed, no sudo required
+          uv python install 3.11
+          echo "Python 3.11 installed via uv:"
+          uv run --python 3.11 python --version
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+          # 为self-hosted runner添加特定的cache key避免权限冲突
+          key: ${{ matrix.platform }}-${{ hashFiles('**/Cargo.lock') }}
+
+      # Linux specific dependencies
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux-x64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev
+
+      # Install frontend dependencies
+      - name: Install frontend dependencies
+        run: pnpm install
+
+      # Build Python backend
+      - name: Build Python backend
+        run: |
+          cd src-python
+          uv sync
+          uv run python build_binary.py
+
+      # Build Tauri app (automatically includes frontend build)
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'FlowExcel v${{ github.ref_name }}'
+          releaseBody: |
+            ## FlowExcel ${{ github.ref_name }} 发布
+            
+            ### 支持平台
+            - Windows x64 (.msi 安装包 + .zip 便携包)
+            - macOS Apple Silicon (ARM64) (.dmg 磁盘映像)
+            - Linux x64 (AppImage + .deb 包)
+            
+            ### 便携版说明
+            - 便携版仅提供Windows版本，无需安装，解压后可直接运行
+            - Windows: 解压 `.zip` 文件，双击 `FlowExcel.exe`
+            
+            ### macOS 用户注意事项
+            - 首次运行可能会出现"已损坏"的安全警告，这是正常现象
+            - 解决方案：在终端中运行 `sudo xattr -cr /Applications/FlowExcel.app`
+            - 或者参考详细的 [macOS安全指南](https://github.com/${{ github.repository }}/blob/main/docs/macos-security-guide.md)
+            
+            ### 更新内容
+            请查看 [提交历史](https://github.com/${{ github.repository }}/commits/${{ github.ref_name }}) 了解详细更新。
+            
+            ---
+            ** 首次使用请查看 [使用说明](https://github.com/${{ github.repository }}#readme)**
+          releaseDraft: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.release_type == 'draft') || github.event_name == 'push' }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_type == 'prerelease' }}
+          includeDebug: false
+          includeRelease: true
+
+      # Fix macOS app signing to prevent "damaged" error
+      - name: Fix macOS app signing
+        if: matrix.platform == 'macos-arm64'
+        run: |
+          # Find the .app bundle
+          APP_PATH=$(find src-tauri/target/release/bundle/macos -name "*.app" | head -1)
+          if [ -n "$APP_PATH" ]; then
+            echo "[INFO] Found app at: $APP_PATH"
+            
+            # Remove quarantine attribute and re-sign with ad-hoc signature
+            xattr -cr "$APP_PATH"
+            codesign --force --deep --sign - "$APP_PATH"
+            
+            # Verify signing
+            codesign --verify --deep --strict "$APP_PATH"
+            echo "[INFO] macOS app successfully signed with ad-hoc signature"
+          else
+            echo "[ERROR] Could not find .app bundle"
+          fi
+
+      # Fix file permissions before cache cleanup (macOS only)
+      - name: Fix file permissions for cleanup
+        if: matrix.platform == 'macos-arm64' && always()
+        run: |
+          echo "[INFO] Fixing file permissions for cleanup..."
+          
+          # Reset ownership and permissions for target directory
+          if [ -d "src-tauri/target" ]; then
+            chown -R $(whoami):staff src-tauri/target || true
+            chmod -R u+w src-tauri/target || true
+            echo "[INFO] Fixed src-tauri/target permissions"
+          fi
+          
+          # Reset permissions for any Python related files created by uv
+          if [ -d "$HOME/.local/share/uv" ]; then
+            chown -R $(whoami):staff "$HOME/.local/share/uv" || true
+            chmod -R u+w "$HOME/.local/share/uv" || true
+            echo "[INFO] Fixed uv cache permissions"
+          fi
+          
+          # Reset permissions for any files created during build
+          find . -type f -not -perm -u+w -exec chmod u+w {} \; 2>/dev/null || true
+          find . -type d -not -perm -u+w -exec chmod u+w {} \; 2>/dev/null || true
+          
+          echo "[INFO] File permissions cleanup completed"
+
+      # Create portable packages for Windows only
+      - name: Create portable packages
+        if: matrix.platform == 'windows-x64'
+        shell: pwsh
+        run: |
+          # Create output directory
+          New-Item -ItemType Directory -Force -Path "portable-packages"
+          
+          # Set version name
+          $VERSION = "${{ github.ref_name }}"
+          if ($VERSION -like "refs/heads/*") {
+            $gitHash = git rev-parse --short HEAD
+            $VERSION = "dev-$gitHash"
+          }
+          $VERSION = $VERSION -replace '^v', ''  # Remove 'v' prefix if present
+          
+          Write-Host "Creating Windows portable package, version: $VERSION"
+          
+          # Windows: Create ZIP with executable and dependencies
+          Set-Location "src-tauri/target/release"
+          
+          Write-Host "Current directory: $(Get-Location)"
+          Write-Host "Contents of current directory:"
+          Get-ChildItem -Force
+          
+          # Create temporary directory for packaging
+          New-Item -ItemType Directory -Force -Path "FlowExcel-portable"
+          
+          # Copy main executable
+          if (Test-Path "FlowExcel.exe") {
+            Copy-Item "FlowExcel.exe" "FlowExcel-portable/"
+            Write-Host "[INFO] Copied FlowExcel.exe"
+          } elseif (Test-Path "flowexcel.exe") {
+            Copy-Item "flowexcel.exe" "FlowExcel-portable/FlowExcel.exe"
+            Write-Host "[INFO] Copied flowexcel.exe as FlowExcel.exe"
+          } else {
+            Write-Host "[ERROR] FlowExcel.exe not found!"
+            exit 1
+          }
+          
+          # Copy backend binaries directory (must be at same level as executable)
+          if (Test-Path "../../binaries") {
+            Copy-Item "../../binaries" "FlowExcel-portable/" -Recurse
+            Write-Host "[INFO] Copied binaries directory"
+            Write-Host "Contents of binaries directory:"
+            Get-ChildItem "../../binaries" -Force
+          } else {
+            Write-Host "[ERROR] binaries directory not found at ../../binaries"
+            exit 1
+          }
+          
+          # Show final structure
+          Write-Host "Final portable structure:"
+          Get-ChildItem "FlowExcel-portable" -Recurse -File | Select-Object -First 20 | ForEach-Object { $_.FullName }
+          
+          # Create ZIP
+          Compress-Archive -Path "FlowExcel-portable/*" -DestinationPath "../../../portable-packages/FlowExcel-$VERSION-windows-x64-portable.zip" -Force
+          
+          # Cleanup
+          Remove-Item "FlowExcel-portable" -Recurse -Force
+          
+          # List created packages
+          Write-Host "Created packages:"
+          Get-ChildItem "../../../portable-packages" -Force
+
+      # Upload portable packages as artifacts (Windows only)
+      - name: Upload portable packages
+        if: matrix.platform == 'windows-x64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-windows-x64
+          path: portable-packages/*
+          retention-days: 30
+
+      # Upload portable packages to GitHub Release (only on tag push, Windows only)
+      - name: Upload portable packages to release
+        if: startsWith(github.ref, 'refs/tags/v') && matrix.platform == 'windows-x64'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: portable-packages/*
+          draft: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.release_type == 'draft') || github.event_name == 'push' }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_type == 'prerelease' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # 发布通知
+  notify:
+    name: Release Notification
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Send notification
+        run: |
+          echo "FlowExcel ${{ github.ref_name }} 已成功构建和发布！"
+          echo "下载地址: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}" 

@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# src/workspace/*
+*.spec
+workspace/*
+
+src/test/test_results/*
+src/test/.benchmarks/*
+src/test/.pytest_cache/*
+.coverage
+
