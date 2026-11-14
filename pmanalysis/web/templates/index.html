@@ -1,0 +1,220 @@
+{% extends "base.html" %}
+{% block title %}Terminal — PolyScripts - Polymarket Analysis{% endblock %}
+{% block head %}
+<script src="/static/vendor/lightweight-charts.standalone.production.js"></script>
+{% endblock %}
+{% block body %}
+{% include "partials/topbar.html" %}
+
+<main class="app-layout" id="app-layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-head">
+      <span>Markets</span>
+      <span class="sidebar-head-hint">Live</span>
+    </div>
+    <div id="market-nav" class="market-nav"></div>
+    {% include "partials/sidebar_foot.html" %}
+  </aside>
+  <div class="sidebar-backdrop" id="sidebar-backdrop" hidden></div>
+
+  <section class="workspace">
+    <div class="workspace-lead">
+    <div class="workspace-toolbar">
+      <div class="workspace-identity">
+        <div class="workspace-title-row">
+          <button
+            type="button"
+            id="sidebar-toggle"
+            class="sidebar-toggle"
+            title="Hide markets panel"
+            aria-label="Hide markets panel"
+            aria-expanded="true"
+          ><span class="sidebar-toggle-icon" aria-hidden="true">‹</span><span class="sidebar-toggle-text">Markets</span></button>
+          <h1 id="sel-title">BTC Up or Down · 5m</h1>
+          <p id="window-range" class="window-range">—</p>
+        </div>
+      </div>
+      <div class="slug-row" role="group" aria-label="Window controls">
+        <label for="slug-select" class="slug-label">Window</label>
+        <select id="slug-select" class="slug-select"></select>
+        <input
+          id="slug-input"
+          class="slug-input"
+          type="text"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="btc-updown-5m-…"
+        />
+        <button id="slug-load-btn" class="slug-load-btn" type="button">Load</button>
+        <button id="slug-live-btn" class="slug-live-btn is-live" type="button">Live</button>
+      </div>
+      <p id="form-notice" class="form-notice" hidden></p>
+    </div>
+
+    <div class="metric-hud" aria-label="Market metrics">
+      <div class="price-metrics">
+        <div class="price-block initial-block">
+          <div class="price-label">Initial TWAP <button type="button" class="tip-btn" data-help="initial_twap"><svg class="icon"><use href="#i-info"/></svg></button></div>
+          <div id="hero-initial" class="price-value">—</div>
+        </div>
+        <div class="hud-divider" aria-hidden="true"></div>
+        <div class="price-block current-block">
+          <div class="price-label current-label">Chainlink <button type="button" class="tip-btn" data-help="chainlink"><svg class="icon"><use href="#i-info"/></svg></button></div>
+          <div id="hero-current" class="price-value current-value">—</div>
+        </div>
+        <div class="hud-divider" aria-hidden="true"></div>
+        <div class="price-block twap-block">
+          <div class="price-label twap-label"><span id="hero-twap-label">TWAP 60s</span> <button type="button" class="tip-btn" data-help="twap"><svg class="icon"><use href="#i-info"/></svg></button></div>
+          <div id="hero-twap" class="price-value twap-value">—</div>
+        </div>
+        <div class="hud-divider" aria-hidden="true"></div>
+        <div class="price-block diff-block">
+          <div class="price-label">Difference <button type="button" class="tip-btn" data-help="difference"><svg class="icon"><use href="#i-info"/></svg></button></div>
+          <div id="hero-diff" class="price-delta">—</div>
+        </div>
+      </div>
+      <div id="countdown" class="countdown poly-countdown">
+        <div class="countdown-caption">Time left</div>
+        <div id="countdown-timer" class="countdown-timer">
+          <div class="countdown-unit">
+            <span id="countdown-mins" class="countdown-digit">—</span>
+            <span class="countdown-label">MIN</span>
+          </div>
+          <span class="countdown-sep" aria-hidden="true">:</span>
+          <div class="countdown-unit">
+            <span id="countdown-secs" class="countdown-digit">—</span>
+            <span class="countdown-label">SEC</span>
+          </div>
+        </div>
+        <span id="countdown-outcome" class="countdown-outcome" hidden></span>
+      </div>
+    </div>
+
+    <div class="edge-strip" aria-label="Fair value, order book and Binance lead">
+      <div class="edge-cell">
+        <span class="edge-label">Fair YES <button type="button" class="tip-btn" data-help="fair_yes"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="edge-fair" class="edge-value">—</span>
+      </div>
+      <div class="edge-cell">
+        <span class="edge-label">YES edge <button type="button" class="tip-btn" data-help="yes_edge"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="edge-yes" class="edge-value">—</span>
+      </div>
+      <div class="edge-cell">
+        <span class="edge-label">NO edge <button type="button" class="tip-btn" data-help="no_edge"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="edge-no" class="edge-value">—</span>
+      </div>
+      <div class="edge-cell">
+        <span class="edge-label">σ /√s <button type="button" class="tip-btn" data-help="sigma"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="edge-sigma" class="edge-value">—</span>
+      </div>
+      <div class="edge-cell">
+        <span class="edge-label">YES ask size · depth <button type="button" class="tip-btn" data-help="yes_book"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="book-yes" class="edge-value">—</span>
+      </div>
+      <div class="edge-cell">
+        <span class="edge-label">NO ask size · depth <button type="button" class="tip-btn" data-help="no_book"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="book-no" class="edge-value">—</span>
+      </div>
+      <div class="edge-cell">
+        <span class="edge-label">Volume <button type="button" class="tip-btn" data-help="volume"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="book-volume" class="edge-value">—</span>
+      </div>
+      <div class="edge-cell">
+        <span class="edge-label">Binance lead <button type="button" class="tip-btn" data-help="lead_lag"><svg class="icon"><use href="#i-info"/></svg></button></span><span id="lead-lag" class="edge-value">—</span>
+      </div>
+      <button type="button" id="alerts-toggle" class="alerts-toggle" aria-pressed="false">Alerts: off</button>
+    </div>
+    </div>
+
+    <div class="chart-panel oracle-panel">
+      <div class="chart-head">
+        <div class="chart-head-left">
+          <span id="oracle-chart-title" class="chart-title">Price</span>
+          <div class="chart-legend" aria-hidden="true">
+            <span class="legend-item legend-binance">Binance spot</span>
+            <span class="legend-item legend-chainlink">Chainlink</span>
+            <span class="legend-item legend-twap" id="legend-twap">TWAP 60s</span>
+            <span class="legend-item legend-target">Target</span>
+          </div>
+        </div>
+        <a
+          id="poly-link-oracle"
+          class="poly-market-btn"
+          href="#"
+          target="_blank"
+          rel="noopener noreferrer"
+        >Open market ↗</a>
+      </div>
+      <div id="chart-oracle" class="chart-box"></div>
+    </div>
+
+    <div class="chart-panel">
+      <div class="chart-head">
+        <div class="chart-head-left">
+          <span class="chart-title">Probability</span>
+          <div class="chart-legend" aria-hidden="true">
+            <span class="legend-item legend-yes">YES ask</span>
+            <span class="legend-item legend-no">NO ask</span>
+            <span class="legend-item legend-fair">Fair YES</span>
+          </div>
+        </div>
+        <div class="chart-head-right">
+          <span id="prob-last" class="chart-val">—</span>
+          <a
+            id="poly-link-prob"
+            class="poly-market-btn"
+            href="#"
+            target="_blank"
+            rel="noopener noreferrer"
+          >Open market ↗</a>
+        </div>
+      </div>
+      <div id="chart-prob" class="chart-box chart-box-sm"></div>
+    </div>
+
+    <div class="chart-panel candle-panel">
+      <div class="chart-head">
+        <div class="chart-head-left">
+          <span id="candle-chart-title" class="chart-title">5m candles</span>
+          <div class="chart-legend" aria-hidden="true">
+            <span class="legend-item legend-candle-up">UP</span>
+            <span class="legend-item legend-candle-down">DOWN</span>
+            <span class="legend-item legend-target">vs initial TWAP</span>
+          </div>
+        </div>
+        <span id="candle-last" class="chart-val">—</span>
+      </div>
+      <div id="chart-candles" class="chart-box chart-box-candles"></div>
+    </div>
+  </section>
+
+  <aside class="metrics-panel preview-panel">
+    <div class="preview-head">
+      <div class="preview-title">Recent markets</div>
+      <div id="preview-subtitle" class="preview-sub">BTC · 5m</div>
+      <div class="preview-pager">
+        <button type="button" id="preview-prev" class="btn-pager preview-pager-btn" disabled title="Older markets" aria-label="Older markets">&lt;&lt;</button>
+        <span id="preview-page-label" class="preview-page-label">—</span>
+        <button type="button" id="preview-next" class="btn-pager preview-pager-btn" disabled title="Newer markets" aria-label="Newer markets">&gt;&gt;</button>
+      </div>
+    </div>
+    <div id="recent-previews" class="preview-list">
+      <div class="preview-empty">Select a market…</div>
+    </div>
+  </aside>
+</main>
+<div id="alert-stack" class="alert-stack" aria-live="polite"></div>
+
+<script>
+  window.PM_CONFIG = {
+    assets: {{ assets | tojson }},
+    intervals: {{ intervals | tojson }},
+    intervalSeconds: {{ interval_seconds | tojson }},
+    preselect: {
+      asset: {{ preselect_asset|default("BTC") | tojson }},
+      interval: {{ preselect_interval|default("5m") | tojson }},
+    },
+  };
+</script>
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/lib/format.js?v=term49"></script>
+<script src="/static/js/lib/ws.js?v=term44"></script>
+<script src="/static/js/lib/analytics.js?v=term1"></script>
+<script src="/static/js/lib/help_tips.js?v=tip1"></script>
+<script src="/static/js/lib/charts.js?v=term67"></script>
+<script src="/static/js/dashboard.js?v=term57"></script>
+{% endblock %}

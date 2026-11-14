@@ -1,0 +1,136 @@
+{% extends "base.html" %}
+{% block title %}History - Polymarket Analysis{% endblock %}
+{% block body %}
+{% include "partials/topbar.html" %}
+<div class="page-container">
+  <div class="history-head">
+    <h1>Database History</h1>
+  </div>
+
+  <div class="history-stats" id="history-stats">Loading counts…</div>
+
+  <div class="win-rate-panel">
+    <div class="win-rate-label">UP win rate</div>
+    <div class="history-stats win-rate-stats" id="win-rate-stats">Loading win rates…</div>
+  </div>
+
+  <section class="download-panel" id="download-panel" aria-labelledby="download-title">
+    <div class="download-head">
+      <h2 id="download-title" class="download-title">
+        <svg class="icon"><use href="#i-download"/></svg> Download historical data
+      </h2>
+      <p class="download-limit">
+        <svg class="icon"><use href="#i-calendar"/></svg>
+        Last {{ download.lookback_days }} days (UTC, from {{ download.earliest_start[:10] }})
+      </p>
+    </div>
+
+    <div class="download-body">
+      <div class="download-contents">
+        <p class="download-lead">One zip file for the markets and dates you pick, ready for backtesting a bot:</p>
+        <ul class="download-list">
+          <li>
+            <svg class="icon"><use href="#i-file"/></svg>
+            <span><strong>windows.parquet</strong>: one row per round, with start/end time, target (initial TWAP),
+            final TWAP, strike, outcome (UP/DOWN) and whether it came from Polymarket or our inference.</span>
+          </li>
+          <li>
+            <svg class="icon"><use href="#i-file"/></svg>
+            <span><strong>ticks/…/date=YYYY-MM-DD.parquet</strong>: one row per second, with Chainlink and Binance
+            prices, live TWAP and TWAP gap, YES/NO bid and ask, mids, spread, YES+NO, seconds left, order-book size
+            and 2¢ depth, last trades, USDC traded and the model's fair YES.</span>
+          </li>
+          <li>
+            <svg class="icon"><use href="#i-file"/></svg>
+            <span><strong>manifest.json</strong>: what is inside, row counts and SHA-256 checksums.</span>
+          </li>
+        </ul>
+        <p class="download-contact">
+          <svg class="icon"><use href="#i-mail"/></svg>
+          Need data older than {{ download.lookback_days }} days or a longer range?
+          <a href="{{ download.contact }}" target="_blank" rel="noopener noreferrer">Contact the owner
+            <svg class="icon"><use href="#i-external"/></svg></a>
+        </p>
+      </div>
+
+      <form class="download-form" id="download-form" novalidate>
+        <fieldset>
+          <legend>Markets</legend>
+          <div class="download-checks">
+            {% for asset in download.assets %}
+            <label><input type="checkbox" name="asset" value="{{ asset }}" checked> {{ asset }}</label>
+            {% endfor %}
+          </div>
+          <div class="download-checks">
+            {% for interval in download.intervals %}
+            <label><input type="checkbox" name="interval" value="{{ interval }}" checked> {{ interval }}</label>
+            {% endfor %}
+          </div>
+        </fieldset>
+        <div class="download-dates">
+          <label>From
+            <input type="date" name="start" required min="{{ download.earliest_start[:10] }}">
+          </label>
+          <label>To
+            <input type="date" name="end" required min="{{ download.earliest_start[:10] }}">
+          </label>
+        </div>
+        <button type="submit" class="download-btn" id="download-btn">
+          <svg class="icon"><use href="#i-download"/></svg> <span>Build &amp; download</span>
+        </button>
+        <p class="download-status" id="download-status" role="status" aria-live="polite"></p>
+      </form>
+    </div>
+  </section>
+
+  <div class="history-tabs" id="history-tabs">
+    <button type="button" class="history-tab active" data-tab="windows">Windows</button>
+    <button type="button" class="history-tab hidden" data-tab="binance" data-raw="1">Binance</button>
+    <button type="button" class="history-tab hidden" data-tab="oracle" data-raw="1">Chainlink / Oracle</button>
+    <button type="button" class="history-tab hidden" data-tab="clob" data-raw="1">Orderbook (CLOB)</button>
+  </div>
+
+  <div class="history-toolbar">
+    <div class="filters" id="history-filters">
+      <select id="filter-asset">
+        <option value="">All assets</option>
+        <option>BTC</option><option>ETH</option><option>SOL</option>
+      </select>
+      <select id="filter-interval">
+        <option value="">All intervals</option>
+        <option>5m</option><option>15m</option>
+      </select>
+      <select id="filter-side" class="hidden">
+        <option value="">All sides</option>
+        <option>YES</option><option>NO</option>
+      </select>
+      <select id="filter-source" class="hidden">
+        <option value="">All sources</option>
+        <option value="chainlink">chainlink</option>
+        <option value="binance">binance</option>
+        <option value="binance_rest">binance_rest</option>
+      </select>
+    </div>
+    <div class="history-pager" id="history-pager">
+      <button type="button" id="page-prev" class="btn-pager">Prev</button>
+      <span id="page-label">—</span>
+      <button type="button" id="page-next" class="btn-pager">Next</button>
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <table class="data-table" id="history-table">
+      <thead></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script src="/static/js/lib/format.js?v=term49"></script>
+<script>
+  window.PM_DOWNLOAD = {{ download | tojson }};
+</script>
+<script src="/static/js/history.js?v=term52"></script>
+<script src="/static/js/history_download.js?v=dl1"></script>
+{% endblock %}
