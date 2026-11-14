@@ -1,0 +1,12 @@
+state/staged_articles.json
+state/classified_articles.json
+__pycache__/
+.env
+_site/
+.jekyll-cache/
+.superpowers/
+.claude/
+.ruff_cache/
+site/Gemfile.lock
+site/.jekyll-cache/
+site/_site/

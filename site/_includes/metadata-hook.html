@@ -1,0 +1,51 @@
+<!-- ── Author / creator metadata ── -->
+<meta name="author" content="Zeyad AbuLaban">
+<meta name="creator" content="Zeyad AbuLaban">
+<meta name="copyright" content="© Zeyad AbuLaban">
+<link rel="author" href="https://github.com/zAbuQasem">
+<link rel="me" href="https://github.com/zAbuQasem">
+<link rel="me" href="https://www.linkedin.com/in/zeyad-abulaban/">
+
+<!-- Open Graph / structured authorship -->
+<meta property="article:author" content="https://github.com/zAbuQasem">
+<meta property="og:site_name" content="Daily Security Feed">
+
+<!-- Schema.org WebSite + Person -->
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "WebSite",
+  "name": "Daily Security Feed",
+  "url": "{{ site.url }}{{ site.baseurl }}",
+  "author": {
+    "@type": "Person",
+    "name": "Zeyad AbuLaban",
+    "alternateName": "zAbuQasem",
+    "url": "https://github.com/zAbuQasem",
+    "sameAs": [
+      "https://github.com/zAbuQasem",
+      "https://www.linkedin.com/in/zeyad-abulaban/"
+    ]
+  }
+}
+</script>
+
+<!-- ── Custom spacing overrides for short summary posts ── -->
+<style>
+  /* Shrink the gap between the post header block and the content */
+  article > header { margin-bottom: 0.5rem !important; }
+  article > header h1 + .post-meta { margin-top: 0.75rem !important; }
+  article .post-meta { margin-bottom: 0 !important; padding-bottom: 0 !important; }
+  article .post-meta .d-flex { margin-top: 0.25rem !important; }
+
+  /* Collapse any top margin on the first element of content */
+  article .content { margin-top: 0.75rem !important; }
+  article .content > :first-child { margin-top: 0 !important; padding-top: 0 !important; }
+  article .content > hr:first-child { display: none; }
+
+  /* Tighten the "Read original article" button spacing */
+  article .content .btn.btn-primary { margin-top: 0.75rem; }
+
+  /* Give related-posts / post-nav a little less room */
+  .post-tail-wrapper { margin-top: 3rem !important; }
+</style>

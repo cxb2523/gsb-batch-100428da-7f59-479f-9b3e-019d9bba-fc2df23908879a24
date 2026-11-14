@@ -1,0 +1,95 @@
+theme: jekyll-theme-chirpy
+
+lang: en
+timezone: Asia/Amman
+
+title: Daily Security Feed
+tagline: AI-curated security research — auto-updated daily
+description: >-
+  Daily Security Feed — an AI-curated stream of security research. New articles
+  classified and published daily from 300+ security blogs, researchers, and vendors.
+
+url: "https://zabuqasem.github.io"
+baseurl: "/daily-security-feed"
+
+avatar: "/assets/img/rss-icon.png"
+
+social:
+  name: Daily Security Feed
+  links:
+    - https://github.com/zAbuQasem/daily-security-feed
+
+github:
+  username: zAbuQasem
+
+analytics:
+  google:
+    id:
+
+comments:
+  provider:
+
+assets:
+  self_host:
+    enabled: false
+
+toc: true
+
+paginate: 500
+
+permalink: /posts/:title/
+
+collections:
+  tabs:
+    output: true
+    sort_by: order
+
+plugins:
+  - jekyll-archives
+
+jekyll-archives:
+  enabled: [categories, tags]
+  layouts:
+    category: category
+    tag: tag
+  permalinks:
+    tag: /tags/:name/
+    category: /categories/:name/
+
+kramdown:
+  syntax_highlighter: rouge
+  syntax_highlighter_opts:
+    css_class: highlight
+    span:
+      line_numbers: false
+    block:
+      line_numbers: true
+
+compress_html:
+  clippings: all
+  comments: all
+  endings: all
+  profile: false
+  blanklines: false
+
+exclude:
+  - Gemfile
+  - Gemfile.lock
+  - "*.gem"
+  - node_modules
+
+defaults:
+  - scope:
+      path: ""
+      type: posts
+    values:
+      layout: post
+      comments: false
+      toc: true
+      pin: false
+  - scope:
+      path: ""
+      type: tabs
+    values:
+      layout: page
+      permalink: /:title/

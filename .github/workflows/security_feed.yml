@@ -1,0 +1,144 @@
+name: daily-security-feed-bot
+
+on:
+  schedule:
+    - cron: "0 23 * * *"
+      timezone: "Asia/Amman"
+  workflow_dispatch:
+    inputs:
+      max_articles:
+        description: "Max articles to process per run (default: 30)"
+        required: false
+        default: "30"
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  SAFE_CHAIN_MINIMUM_PACKAGE_AGE_HOURS: 0
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f  # v6.3.0
+        with:
+          node-version: "23"
+
+      - name: Install safe-chain
+        run: curl -fsSL https://github.com/AikidoSec/safe-chain/releases/latest/download/install-safe-chain.sh | sh -s -- --ci
+
+      - name: Install Defuddle
+        run: npm install -g defuddle
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+
+      - name: Install Python dependencies
+        run: uv sync
+
+      - name: Install Copilot CLI
+        if: vars.SKIP_CLASSIFY != 'true' && vars.CLASSIFIER_BACKEND != 'claude'
+        run: npm i -g @github/copilot
+
+      - name: Cache Copilot CLI tokens
+        if: vars.SKIP_CLASSIFY != 'true' && vars.CLASSIFIER_BACKEND != 'claude'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
+        with:
+          path: ~/.config/github-copilot
+          key: copilot-cli-${{ runner.os }}
+
+      - name: Install anthropic SDK
+        if: vars.SKIP_CLASSIFY != 'true' && vars.CLASSIFIER_BACKEND == 'claude'
+        run: uv sync --extra claude
+
+      - name: Init state dirs
+        run: |
+          mkdir -p state logs site/_posts
+          if [ ! -f state/processed_urls.json ]; then
+            echo '{"processed_urls": [], "last_updated": null}' > state/processed_urls.json
+          fi
+
+      - name: Step 1 — Fetch feeds + extract content
+        run: uv run python pipeline/fetch_feeds.py
+        env:
+          MAX_ARTICLES: ${{ github.event.inputs.max_articles || '30' }}
+
+      - name: Step 2 — Classify articles
+        timeout-minutes: 50
+        run: uv run python pipeline/classify.py
+        env:
+          CLASSIFIER_BACKEND: ${{ vars.CLASSIFIER_BACKEND || 'copilot' }}
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || '' }}
+          COPILOT_MODEL: ${{ vars.COPILOT_MODEL || '' }}
+          SKIP_CLASSIFY: ${{ vars.SKIP_CLASSIFY || 'false' }}
+
+      - name: Step 3 — Write vault notes
+        run: uv run python pipeline/write_vault.py
+
+      - name: Step 4 — Persist feed state
+        run: uv run python pipeline/persist_state.py
+
+      - name: Upload staging artifacts (for debugging)
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
+        with:
+          name: pipeline-state-${{ github.run_id }}
+          path: |
+            state/classified_articles.json
+            site/_posts/
+          retention-days: 1
+
+      - name: Notify Discord — success
+        if: success()
+        run: uv run python pipeline/notify_discord.py success
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          NOTIFY_CHANNELS: ${{ vars.NOTIFY_CHANNELS || 'both' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PAGES_URL: ${{ vars.PAGES_URL || format('https://{0}.github.io/{1}/', github.repository_owner, github.event.repository.name) }}
+
+      - name: Notify Slack — success
+        if: success()
+        run: uv run python pipeline/notify_slack.py success
+        env:
+          NOTIFY_CHANNELS: ${{ vars.NOTIFY_CHANNELS || 'both' }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PAGES_URL: ${{ vars.PAGES_URL || format('https://{0}.github.io/{1}/', github.repository_owner, github.event.repository.name) }}
+
+      - name: Notify Discord — failure
+        if: failure()
+        run: uv run python pipeline/notify_discord.py failure --step "$FAILED_STEP"
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          NOTIFY_CHANNELS: ${{ vars.NOTIFY_CHANNELS || 'both' }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PAGES_URL: ${{ vars.PAGES_URL || format('https://{0}.github.io/{1}/', github.repository_owner, github.event.repository.name) }}
+          FAILED_STEP: ${{ github.job }}
+
+      - name: Notify Slack — failure
+        if: failure()
+        run: uv run python pipeline/notify_slack.py failure --step "$FAILED_STEP"
+        env:
+          NOTIFY_CHANNELS: ${{ vars.NOTIFY_CHANNELS || 'both' }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PAGES_URL: ${{ vars.PAGES_URL || format('https://{0}.github.io/{1}/', github.repository_owner, github.event.repository.name) }}
+          FAILED_STEP: ${{ github.job }}
