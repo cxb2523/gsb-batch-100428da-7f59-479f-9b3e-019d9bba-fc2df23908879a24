@@ -219,6 +219,21 @@ def search_share(keyword):
 
 
 def update_share_history_item(share, last_update: bool = True, days=None, batch_size=100):
+    """Incrementally fetch and persist the daily history of one share.
+
+    Existing records are detected per date instead of stopping at the first
+    already-stored date, so an out-of-order upstream response (or a date that
+    was missing on a previous run) neither blocks later dates nor creates
+    duplicates. Running the function repeatedly on the same data is
+    idempotent.
+
+    On failure, only the records already written are kept and ``last_update``
+    advances to the last successfully written date, so the next run resumes
+    from there instead of re-fetching every stored date.
+
+    Returns a dict with ``inserted`` (new days written) and ``skipped``
+    (already-present days ignored) counters.
+    """
     if days is None:
         days = (timezone.now() - share.last_update).days + 1 if share.last_update else 0
 
@@ -226,7 +241,14 @@ def update_share_history_item(share, last_update: bool = True, days=None, batch_
                               url=f'https://cdn.tsetmc.com/api/ClosingPrice/GetClosingPriceDailyList/{share.id}/{days}',
                               headers=get_tse_new_site_headers(), retry_on_html_response=True, timeout=25)
 
-    share_histories = []
+    inserted_count = 0
+    skipped_count = 0
+    pending_histories = []
+    seen_dates = set()
+    last_inserted_date = None
+    candidate_dates = []
+    rows = []
+
     for row in response.json()['closingPriceDaily']:
         data = {'share': share,
                 'date': date(*convert_integer_to_parts(row['dEven'])),
@@ -243,19 +265,83 @@ def update_share_history_item(share, last_update: bool = True, days=None, batch_
         if data['count'] == 0:
             continue
 
-        if DailyHistory.objects.filter(share=share, date=data['date']).exists():
-            break
+        rows.append(data)
+        candidate_dates.append(data['date'])
 
-        share_histories.append(DailyHistory(**data))
+    existing_dates = set(
+        DailyHistory.objects.filter(share=share, date__in=candidate_dates).values_list('date', flat=True)
+    ) if candidate_dates else set()
+
+    def flush(histories):
+        DailyHistory.objects.bulk_create(histories, batch_size=batch_size)
+
+    def mark_written(histories):
+        nonlocal last_inserted_date
+        batch_latest = max(item.date for item in histories)
+        last_inserted_date = batch_latest if last_inserted_date is None else max(last_inserted_date, batch_latest)
+
+    flush_failed = False
+    try:
+        for data in rows:
+            if data['date'] in existing_dates or data['date'] in seen_dates:
+                skipped_count += 1
+                continue
+
+            pending_histories.append(DailyHistory(**data))
+            seen_dates.add(data['date'])
+
+            if len(pending_histories) >= batch_size:
+                try:
+                    flush(pending_histories)
+                except Exception:
+                    flush_failed = True
+                    raise
+                inserted_count += len(pending_histories)
+                mark_written(pending_histories)
+                pending_histories = []
+
+        if pending_histories:
+            try:
+                flush(pending_histories)
+            except Exception:
+                flush_failed = True
+                raise
+            inserted_count += len(pending_histories)
+            mark_written(pending_histories)
+            pending_histories = []
+    except Exception:
+        # Keep whatever was already persisted; only commit progress up to the
+        # last successfully written date so the next run resumes from there.
+        if pending_histories and not flush_failed:
+            try:
+                flush(pending_histories)
+            except Exception:
+                logger.exception(f"{share.ticker}: failed to flush partial history batch.")
+            else:
+                inserted_count += len(pending_histories)
+                mark_written(pending_histories)
+            pending_histories = []
+
+        if last_inserted_date is not None:
+            # Always update the in-memory attribute; callers running in batch
+            # mode persist it themselves via bulk_update.
+            share.last_update = timezone.make_aware(datetime.combine(last_inserted_date, datetime.min.time()))
+            if last_update:
+                share.save(update_fields=['last_update'])
+        logger.exception(
+            f"{share.ticker}: history update failed after writing {inserted_count} new day(s); "
+            f"last written date is {last_inserted_date}."
+        )
+        raise
 
     share.last_update = timezone.now()
-
-    DailyHistory.objects.bulk_create(share_histories, batch_size=batch_size)
     if last_update:
-        share.save()
+        share.save(update_fields=['last_update'])
 
-    if share_histories:
-        logger.info(f"history of {share.ticker} in {len(share_histories)} days added.")
+    if inserted_count:
+        logger.info(f"history of {share.ticker} in {inserted_count} days added, {skipped_count} days skipped.")
+
+    return {'inserted': inserted_count, 'skipped': skipped_count}
 
 
 @log_time
