@@ -1,0 +1,211 @@
+// ============================================================================
+// @aitofy/browser-profiles - Main Entry Point
+// ============================================================================
+
+/**
+ * @aitofy/browser-profiles
+ *
+ * Anti-detect browser profiles for Puppeteer & Playwright.
+ * Multi-account browser automation with fingerprint protection.
+ *
+ * @example Basic usage
+ * ```typescript
+ * import { BrowserProfiles } from '@aitofy/browser-profiles';
+ *
+ * const profiles = new BrowserProfiles();
+ *
+ * // Create profile
+ * const profile = await profiles.create({
+ *   name: 'My Profile',
+ *   proxy: { type: 'http', host: 'proxy.example.com', port: 8080 },
+ *   timezone: 'America/New_York',
+ * });
+ *
+ * // Launch browser
+ * const { wsEndpoint, close } = await profiles.launch(profile.id);
+ * ```
+ *
+ * @example With Puppeteer
+ * ```typescript
+ * import { withPuppeteer } from '@aitofy/browser-profiles/puppeteer';
+ *
+ * const { browser, page, close } = await withPuppeteer({
+ *   profile: 'my-profile-id',
+ * });
+ *
+ * await page.goto('https://example.com');
+ * await close();
+ * ```
+ *
+ * @example With ExTower
+ * ```typescript
+ * import { ExTowerClient } from '@aitofy/browser-profiles/extower';
+ *
+ * const client = new ExTowerClient();
+ * const { puppeteer } = await client.launchBrowser('user-id');
+ * ```
+ *
+ * @packageDocumentation
+ */
+
+// Core exports
+export { BrowserProfiles } from './profile-manager';
+export {
+    launchChrome,
+    closeBrowser,
+    closeAllBrowsers,
+    getChromePath,
+    buildProxyUrl,
+    detectTimezoneFromIP,
+    autoDetectTimezone,
+    // v0.2.0: Standalone Chrome launch
+    launchChromeStandalone,
+} from './chrome-launcher';
+
+// Chrome launcher types
+export type {
+    StandaloneLaunchOptions,
+    StandaloneLaunchResult,
+} from './chrome-launcher';
+
+// Fingerprint protection scripts (for custom use)
+export {
+    WEBRTC_PROTECTION_SCRIPT,
+    CANVAS_PROTECTION_SCRIPT,
+    WEBGL_PROTECTION_SCRIPT,
+    AUDIO_PROTECTION_SCRIPT,
+    getAllProtectionScripts,
+    getProfileProtectionScripts,
+    createNavigatorScript,
+    createWebGLScript,
+    createWorkerSpoofScript,
+    pickWebGLForPlatform,
+    // v0.2.0: Fingerprint generation
+    generateFingerprint,
+    getFingerprintScripts,
+} from './fingerprint';
+
+// Fingerprint types
+export type {
+    GenerateFingerprintOptions,
+    GeneratedFingerprint,
+    WebGLSpoofConfig,
+} from './fingerprint';
+
+// User-Agent helpers (UA always matches the running Chrome's major version)
+export {
+    buildUserAgent,
+    buildBrands,
+    buildUserAgentMetadata,
+    parseChromeVersion,
+    resolveUserAgent,
+} from './user-agent';
+export type { ChromeVersion, ResolvedUserAgent, UserAgentMetadata } from './user-agent';
+
+// Types
+export type {
+    // Result type (no try-catch needed!)
+    Result,
+    BrowserError,
+    BrowserErrorCode,
+
+    // Profile types
+    ProfileConfig,
+    StoredProfile,
+    ProfileGroup,
+    BrowserProfilesOptions,
+
+    // Launch types
+    LaunchOptions,
+    LaunchResult,
+    FingerprintEngine,
+    ResolvedEngine,
+    SpoofEngine,
+
+    // Proxy & Cookie types
+    ProxyConfig,
+    ProfileCookie,
+
+    // Fingerprint types
+    FingerprintConfig,
+    ProfileFingerprint,
+    RealFingerprint,
+    FingerprintGenerateOptions,
+    ScreenConfig,
+    WebGLConfig,
+
+    // ExTower types
+    ExTowerCreateOptions,
+    ExTowerProfile,
+    ExTowerLaunchResult,
+} from './types';
+
+// Result helpers
+export { Ok, Err } from './types';
+
+// ============================================================================
+// Command registry (one definition drives the library, the CLI and MCP)
+// ============================================================================
+
+export {
+    commands,
+    getCommand,
+    runCommand,
+    createCommandContext,
+    resolveStoragePath,
+} from './commands/registry';
+
+export type {
+    AnyCommandDef,
+    CommandContext,
+    CommandDef,
+} from './commands/registry';
+
+export { parseProxyUrl, formatProxyUrl } from './commands/proxy-url';
+
+export { createLogger } from './log';
+export type { Logger } from './log';
+
+// ============================================================================
+// Puppeteer Integration (re-exported for convenience)
+// ============================================================================
+// Users can now use:
+//   import { quickLaunch } from '@aitofy/browser-profiles'
+// Instead of:
+//   import { quickLaunch } from '@aitofy/browser-profiles/puppeteer'
+
+export {
+    withPuppeteer,
+    quickLaunch,
+    connectPuppeteer,
+    patchPage,
+    createSession,
+} from './integrations/puppeteer';
+
+export type {
+    WithPuppeteerOptions,
+    WithPuppeteerResult,
+    QuickLaunchOptions,
+    PatchPageOptions,
+    CreateSessionOptions,
+    SessionResult,
+    // v0.2.5: Native type re-exports for full API access
+    PuppeteerPage,
+    PuppeteerBrowser,
+    HTTPRequest,
+    HTTPResponse,
+    Cookie,
+} from './integrations/puppeteer';
+
+// Playwright type re-exports (for users who import from main entry)
+export type {
+    PlaywrightPage,
+    PlaywrightBrowser,
+    PlaywrightContext,
+    PlaywrightRequest,
+    PlaywrightResponse,
+    Route,
+} from './integrations/playwright';
+
+// Version
+export const VERSION = '0.5.0';

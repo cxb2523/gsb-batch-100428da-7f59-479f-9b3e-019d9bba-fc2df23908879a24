@@ -1,0 +1,262 @@
+# @aitofy/browser-profiles
+
+Self-hosted anti-detect browser profiles. The open-source alternative to AdsPower and Multilogin.
+One package, three faces: a TypeScript library, a CLI, and an MCP server for AI agents.
+npm: @aitofy/browser-profiles. License MIT. Node >= 18. Zero telemetry.
+
+## Index
+
+This file is the whole story in one page. The same material, split up, lives next to it:
+
+  docs/library.md             Library API: quickLaunch, BrowserProfiles, Puppeteer, Playwright, command registry.
+  docs/cli.md                 Every CLI command, alias and flag, the --json contract, keepAlive, --detached.
+  docs/mcp.md                 MCP setup per client, the tools table, error shape, browser ownership.
+  docs/playwright-mcp.md      Hand a wsEndpoint to Playwright MCP or any CDP client.
+  docs/configuration.md       Storage path precedence, Chrome path, logging, on-disk layout.
+  docs/anti-detect.md         What is protected, per-tab injection, scores, honest limits.
+  docs/benchmark.md           Measured scores next to AdsPower, GPM Login and Multilogin, and how to rerun them.
+  docs/browser-lifecycle.md   Who owns the browser, reuse, cross-process close, detached trade-offs.
+  docs/troubleshooting.md     Common failures with their exact message and the fix.
+  docs/adr/0001-command-registry.md  Why one registry generates the CLI, the MCP server and the library API.
+  examples/                   Runnable files: quick launch, proxy profile, Playwright, JSON pipeline, MCP.
+  README.md                   Landing page. CONTRIBUTING.md, SECURITY.md, CHANGELOG.md as usual.
+
+## What it does
+
+Stores browser profiles locally (proxy, timezone, fingerprint, cookies, Chrome user data) and
+launches real Chrome with anti-detect. engine=auto (the default) uses kernel mode when the
+executable is fingerprint-chromium (engine-level spoof from a per-profile seed, no JavaScript
+hooks) and JavaScript injection over CDP otherwise. Inject mode covers
+WebRTC, Canvas, WebGL, Audio, navigator, workers, timezone, Intl locale. The user agent and Client Hints are
+built from the major version of the Chrome that is actually running, read with Browser.getVersion
+at launch; a pinned fingerprint.userAgent wins and logs a warning when its major differs. Kernel
+mode ignores a pinned user agent so the UA stays the binary's own version. The WebGL
+vendor/renderer is picked once per profile, consistent with its platform, and stored in
+fingerprint.webgl (inject mode; the kernel derives the GPU from the seed). Every worker target
+(dedicated, module, shared, service) runs the same spoof as the main thread. Authenticated proxies are handled by a local relay.
+Profiles persist between runs, so logins survive. A profile created with fingerprint=real
+(stored as fingerprint: {mode: "real"}) launches with Chrome's own identity: no engine, no user
+agent or Client Hints override, no injected script, no timezone or locale change unless the
+profile sets one. Use it for accounts signed in by hand; a real profile refuses engine kernel/inject.
+
+Benchmark (docs/benchmark.md, scripts/measure.mjs): kernel mode scores 100% on browserscan and passes
+a Cloudflare challenge, like AdsPower; inject mode scores 85% and creepjs flags its hooks.
+
+## Installation
+
+npm install @aitofy/browser-profiles rebrowser-puppeteer-core
+npm install -g @aitofy/browser-profiles   # for the CLI and the MCP server
+
+## MCP server
+
+Start command: `browser-profiles mcp` (also installed as the bin `browser-profiles-mcp`).
+Transport: stdio. Flags: --storage-path <dir>, --verbose.
+
+Client config (Claude Desktop, Cursor, any MCP client that takes a command):
+
+  {"mcpServers": {"browser-profiles": {"command": "npx", "args": ["-y", "@aitofy/browser-profiles", "mcp"]}}}
+
+Claude Code one-liner:
+
+  claude mcp add browser-profiles -- npx -y @aitofy/browser-profiles mcp
+
+### The flow an agent should follow
+
+1. profile_create {name: "Acme Main", id: "acme-main", proxy: "http://user:pass@host:8080"}
+   -> a StoredProfile with an id.
+2. browser_open {idOrName: "acme-main"}
+   -> {profileId, wsEndpoint, port, pid, reused}.
+3. Use wsEndpoint. It is a CDP WebSocket URL:
+   - Playwright MCP: start it with --cdp-endpoint <wsEndpoint>
+   - Puppeteer: puppeteer.connect({browserWSEndpoint: wsEndpoint})
+   - Playwright: chromium.connectOverCDP(wsEndpoint)
+   Tabs opened by that client are protected as well; the launcher re-applies the injections to
+   every new page target.
+4. browser_close {idOrName: "acme-main"} when done.
+
+Calling browser_open twice for the same profile does not start a second Chrome: it returns the
+running endpoint with reused: true.
+
+### MCP tools
+
+profile_list        List stored profiles.
+                    args: groupId? (string, exact match), tag? (string, exact match)
+                    out: StoredProfile[]
+profile_get         Show one profile with proxy and fingerprint.
+                    args: idOrName (string, required)
+                    out: StoredProfile
+profile_create      Create a profile with its own storage, proxy and fingerprint.
+                    args: name (required), id?, proxy?, timezone?, fingerprint? ("generated" | "real"),
+                          language?, platform?, tags?, notes?
+                    out: StoredProfile
+profile_update      Change fields of a profile; omitted fields stay as they are.
+                    args: idOrName (required), name?, proxy? (null removes the proxy), timezone?,
+                          fingerprint?, language?, platform?, tags?, notes?
+                    out: StoredProfile
+profile_delete      Delete a profile and all of its browser data. Irreversible.
+                    args: idOrName (required), force? (boolean, closes a running browser first)
+                    out: {id, deleted: true}
+profile_duplicate   Copy a profile's settings into a new profile with a new id.
+                    args: idOrName (required), name? (defaults to "<source name> (Copy)")
+                    out: StoredProfile
+browser_open        Open Chrome with a stored profile and return its CDP endpoint.
+                    args: idOrName (required), headless? (default false), startUrl? (absolute URL),
+                          detached? (default false; true = Chrome outlives the caller, reduced protection),
+                          engine? ("auto" | "kernel" | "inject"; a real profile accepts only "auto"),
+                          port? (fixed DevTools port; a running browser keeps its own)
+                    out: {profileId, wsEndpoint, port, pid, reused, detached, engine}
+                         engine is "kernel", "inject", or "real" (Chrome's own fingerprint)
+browser_launch      Throwaway Chrome with a random fingerprint and no saved profile. Nothing persists.
+                    args: proxy?, headless? (default false), randomFingerprint? (default true), detached? (default false)
+                    out: {profileId, wsEndpoint, port, pid, temporary: true}
+browser_close       Close the browser of a profile, from any process (reads its lock file).
+                    args: idOrName (required; also accepts a tmp-... id from browser_launch)
+                    out: {profileId, closed}
+browser_close_all   Close every browser started from this storage path, temporary ones included.
+                    args: none
+                    out: {closed: string[]}
+browser_status      Running browsers with their CDP endpoints. Stale lock files are cleaned up.
+                    args: none
+                    out: {running: [{profileId, pid, port, wsEndpoint, startedAt, temporary, engine}]}
+storage_path        Directory where profiles and browser data are stored.
+                    args: none
+                    out: {path}
+
+### Argument formats
+
+idOrName    A profile id ("acme-main", or a random 16-hex-character id) or the exact profile name,
+            case-insensitive ("Acme Main"). Ids are tried first. Use profile_list to discover both.
+id          1-64 characters of letters, digits, hyphen or underscore. Must not already exist.
+proxy       A URL with an explicit port: <scheme>://[user:pass@]host:port
+            Schemes: http, https, socks5 (socks and socks5h are normalised to socks5).
+            Percent-encode reserved characters in credentials: "http://bob:p%40ss@10.0.0.1:8080".
+timezone    IANA id, e.g. "America/New_York". Match it to the proxy exit country.
+fingerprint "generated" (default, spoofed) or "real" (Chrome's own identity, for hand-made logins).
+            A real profile rejects platform. Switching to real keeps only the language and drops
+            the stored timezone unless timezone is passed in the same update.
+language    BCP 47 tag, e.g. "en-US", "vi-VN". Default "en-US".
+platform    Exactly one of "Win32", "MacIntel", "Linux x86_64". Must agree with the user agent.
+tags        Array of strings, e.g. ["facebook", "client-acme"].
+notes       Free-form string stored with the profile. Not sent to the browser.
+startUrl    Absolute URL opened in the first tab.
+
+### Errors
+
+Tools never throw. A failure comes back as an error result carrying a code and a message:
+PROFILE_NOT_FOUND (the message suggests close matches), INVALID_CONFIG, CHROME_NOT_FOUND,
+LAUNCH_FAILED, STORAGE_ERROR, INTERNAL.
+
+## CLI
+
+Command tree, with the short top-level alias in brackets. Every command accepts --json,
+--storage-path <dir> and --verbose.
+
+browser-profiles profile list [list, ls]            --group-id <id> --tag <tag>
+browser-profiles profile get <idOrName> [info]
+browser-profiles profile create <name> [create]     --id --proxy --timezone --fingerprint --language --platform --tags --notes
+browser-profiles profile update <idOrName> [update] --name --proxy --timezone --fingerprint --language --platform --tags --notes
+browser-profiles profile delete <idOrName> [delete, rm]  --force
+browser-profiles profile duplicate <idOrName> [duplicate] --name
+browser-profiles browser open <idOrName> [open]     --headless --start-url <url> --detached --engine
+browser-profiles browser launch [launch]            --proxy --headless --no-random-fingerprint --detached
+browser-profiles browser close <idOrName> [close]
+browser-profiles browser close-all [close-all]
+browser-profiles browser status [status, ps]
+browser-profiles storage path [path]
+browser-profiles mcp                                --storage-path <dir> --verbose
+
+--tags can be repeated or take a comma-separated list. --json prints exactly the command output
+object on stdout, nothing else, so it can be piped into jq. On failure the CLI writes
+{"error":{"code":"...","message":"..."}} to stderr and exits non-zero.
+
+Example pipeline:
+
+  browser-profiles create "Acme Main" --id acme-main --proxy http://user:pass@proxy.com:8080 --json
+  sleep 300 | browser-profiles open acme-main --json >/tmp/open.json &   # keeps stdin open
+  WS=$(jq -r .wsEndpoint /tmp/open.json)
+  npx -y @playwright/mcp@latest --cdp-endpoint "$WS"
+  browser-profiles close acme-main
+
+## Configuration
+
+Storage path precedence: --storage-path <dir> > BROWSER_PROFILES_HOME > ~/.aitofy/browser-profiles.
+On Windows the default is C:\Users\<user>\.aitofy\browser-profiles.
+
+Diagnostics go to stderr only, so stdout stays clean for --json and for the MCP stdio protocol.
+They are silent unless DEBUG=browser-profiles* is set or --verbose is passed.
+
+## Browser lifecycle
+
+The process that launches Chrome owns it: the authenticated-proxy relay and the anti-detect
+injections live there.
+- MCP server: browser_open returns immediately, the server keeps the browser protected while it
+  runs, and closes every browser it opened when it exits. A browser it only reused (reused: true)
+  belongs to another process and is left running.
+- CLI: browser open and browser launch print the endpoint and then stay in the foreground so the
+  browser keeps its protection. Ctrl+C, SIGTERM, or the CLI's stdin closing closes the browser and
+  exits. In a script, background it with a stdin that stays open, or read the endpoint from
+  browser_status instead.
+- detached opts out: CLI --detached, MCP detached: true, library profiles.launch(id, {detached: true}).
+  Chrome outlives the caller. Inject mode keeps flag-level protection only, no authenticated-proxy
+  relay, injections on the first tab only. Kernel mode keeps the spoof (it is a process flag); the
+  relay limit is the same. Use for one-shot scripts: browser-profiles open acme --detached --json.
+- browser_close / browser close works from any process by reading the profile lock file.
+
+## Library API
+
+Everything below is imported from '@aitofy/browser-profiles'.
+
+quickLaunch({proxy, timezone, fingerprint})   Launch an anti-detect browser, no saved profile.
+                                              Returns {browser, page, close}.
+withPuppeteer({profile})                      Launch a stored profile and connect Puppeteer.
+withPlaywright({profile})                     Same for Playwright ('@aitofy/browser-profiles/playwright').
+createSession({temporary, randomFingerprint}) Throwaway session with a random fingerprint.
+patchPage(page, options)                      Apply anti-detect patches to a page you already have.
+generateFingerprint(options)                  Build a consistent random fingerprint.
+getFingerprintScripts(fingerprint)            Injection scripts for that fingerprint.
+getAllProtectionScripts(options)              The full bundle: webrtc, canvas, webgl, audio,
+                                              navigator, workers.
+getProfileProtectionScripts(fingerprint)      That bundle for a profile fingerprint. The launcher
+                                              and both integrations inject exactly this.
+createWebGLScript({vendor, renderer})         WebGL spoof for one GPU, stable across page loads.
+createWorkerSpoofScript(prelude)              Wrap Worker/SharedWorker to run the prelude first.
+pickWebGLForPlatform(platform)                A GPU consistent with that navigator.platform.
+buildUserAgent(platform, major)               Reduced Chrome UA. buildBrands(major) for Sec-CH-UA.
+buildUserAgentMetadata(platform, version)     Payload for Network.setUserAgentOverride.
+parseChromeVersion(text)                      Version out of a UA or a Browser.getVersion product.
+resolveUserAgent(pinned, platform, running)   {userAgent, version, mismatch}.
+launchChromeStandalone(options)               Launch Chrome with no profile management.
+parseProxyUrl(url) / formatProxyUrl(config)   Proxy URL <-> ProxyConfig.
+createLogger(namespace)                       stderr logger used by the package.
+
+BrowserProfiles class:
+  new BrowserProfiles({storagePath?, chromePath?, defaultTimezone?, defaultProxy?})
+  create(config), get(id), getByName(name), getByIdOrName(idOrName), list(options?),
+  update(id, updates), delete(id), duplicate(id, name?), export(id), import(json),
+  launch(id, options?), launchByName(name, options?), launchByIdOrName(idOrName, options?),
+  close(id), closeAll(), createGroup(name, description?), moveToGroup(id, groupId), listGroups()
+
+Command registry (the same definitions the CLI and MCP are generated from):
+  createCommandContext({storagePath?, verbose?}), getCommand('browser.open'), commands,
+  runCommand(ctx, def, input) -> Result<O, BrowserError>, resolveStoragePath(explicit?)
+
+Commands return a Result ({ok: true, data} or {ok: false, error}) and never throw.
+
+Minimal library example:
+
+  import { BrowserProfiles } from '@aitofy/browser-profiles';
+  const profiles = new BrowserProfiles();
+  const profile = await profiles.create({ name: 'Acme Main', timezone: 'America/New_York' });
+  const { wsEndpoint, close } = await profiles.launch(profile.id);
+  await close();
+
+## Use cases
+
+Multi-account management, web scraping behind rotating proxies, testing with different browser
+configurations, and letting an AI agent run isolated browser sessions through MCP.
+
+## Links
+
+npm: https://www.npmjs.com/package/@aitofy/browser-profiles
+GitHub: https://github.com/aitofy-dev/browser-profiles
+Docs: https://aitofy.dev/browser-profiles

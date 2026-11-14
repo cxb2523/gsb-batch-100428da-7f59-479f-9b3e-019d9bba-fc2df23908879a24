@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Test files
+.test-profiles/
+.browser-profiles/
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Package
+*.tgz
+
+# Claude Code worktrees
+.claude/
+
+# Benchmark captures (screenshots can show the host locale)
+measurements/
+
+# Competitor research stays local, out of the public repo
+docs/reverse-engineering.md
+scripts/research/
