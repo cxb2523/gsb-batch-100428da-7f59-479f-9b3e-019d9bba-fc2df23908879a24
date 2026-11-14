@@ -28,7 +28,8 @@ JSpider V2.1 expands secret detection and refines the reconnaissance suite with 
 ### ✨ Key Features:
 - **Sensitive Path Prober**: Automated checks for **500+ critical paths** including `.env`, `.git/config`, `phpinfo.php`, backups, and cloud configurations. Features live response length filtering, instantaneous stop controls, and one-click inspection for 200/403 responses.
 - **Parameter Discovery**: Dedicated extraction and grouping of URL parameters to identify potential injection points.
-- **Recursive Discovery Engine**: Full website crawling capability (Depth 1) with deep script analysis to find hidden routes.
+- **Recursive Discovery Engine**: Full website crawling capability (Depth 1) with deep script analysis to find hidden routes. Same-origin scripts referenced by pages are crawled; cross-origin scripts are kept as file findings instead of being queued.
+- **Verifiable Crawl Outcomes**: Every queued URL gets exactly one outcome — **Success**, **HTTP error**, **Proxy/network failure**, **Timeout**, or **Not executed** (after a manual stop). The status area ends with a Success / Failed / Not executed summary, plus an expandable per-URL list. Failed and not-executed URLs never count as scanned successes.
 - **Precision Secret Detection**: High-fidelity regex for **42 patterns** including AWS, Google Cloud, Stripe, OpenAI, Anthropic (Claude), Supabase, Slack/Discord Webhooks, JWT, Telegram, Twilio, and more.
 - **Live Results & Real Progress**: Findings appear while the scan runs, with a live `[done/total]` URL counter and an accurate progress bar.- **Smart Grouping**: Duplicate findings in the same file collapse into one row with a "found in N places" badge, and the Parameters tab lists **unique parameter names** with counts - click one to filter.
 - **One-Click Actions**: Open any endpoint in a new tab, copy it as a full URL, or copy it as a ready-to-run `curl` command (includes your Cookie / Authorization headers).
@@ -56,8 +57,9 @@ It extracts data from external JS files, inline scripts, and HTML source code - 
 | Feature | Description |
 |------|-------------|
 | 🔑 **Secret Detection** | High-fidelity detection for 42 patterns including AWS, Google, Stripe, OpenAI, Anthropic (Claude), Supabase, Slack/Discord Webhooks, JWT, Telegram, Twilio, and more. |
-| 🕷️ **Recursive Scan** | Depth-limited (V2.1: Depth 1) crawling of internal links. |
-| 📊 **Real-time Stats** | Live dashboard tracking Scanned URLs, Endpoints, Parameters, Secrets, and Files. |
+| 🕷️ **Recursive Scan** | Depth-limited (V2.1: Depth 1) crawling of internal links; same-origin scripts are crawled, cross-origin scripts are reported as files. |
+| 📊 **Real-time Stats** | Live dashboard tracking Scanned (OK) URLs, Endpoints, Parameters, Secrets, and Files. Only successfully fetched (2xx) URLs count as Scanned. |
+| 🧾 **Outcome Summary** | On completion or stop: Success / Failed / Not executed totals plus a per-URL outcome list (HTTP error, proxy/network failure, timeout, not executed). |
 | ⚡ **Live Results** | Results render while the scan runs, with a real `[done/total]` progress counter. || 🧩 **Smart Grouping** | Duplicates collapse into one row with a "found in N places" badge; unique parameter names are listed with counts. |
 | 🖱️ **One-Click Actions** | Open, copy full URL, or copy as `curl` (with your auth headers) for every endpoint, file, and parameter. |
 | 🛡️ **Path Prober** | Automated check for 500+ paths with live response lengths, status filters, include/exclude length filtering, and stop controls. |
@@ -98,9 +100,10 @@ JSpider automatically excludes architectural noise to focus on valuable recon:
 2. Enter a target URL (e.g., `https://example.com`).
 3. Click **Scan Page** for a quick analysis or **Full Scan** for recursive domain discovery.
 4. Monitor the **Dashboard** and the live results list - findings appear as each URL is scanned, with a `[done/total]` progress counter.
-5. Use the **Category Tabs** to filter results and the **Global Search** for specific keywords. In the **Parameters** tab, click a parameter name to filter by it.
-6. Use the buttons on each result to **Copy**, **Open**, copy the **Full URL**, or copy as **curl**.
-7. **Export** your findings in `.txt`, `.json`, `.csv`, or `.md` formats.
+5. When the scan finishes or you press **Stop Scan**, the status area shows **Success / Failed / Not executed** counts. Expand *Per-URL crawl outcomes* to see exactly which URL returned what — so "no findings" is distinguishable from "could not fetch".
+6. Use the **Category Tabs** to filter results and the **Global Search** for specific keywords. In the **Parameters** tab, click a parameter name to filter by it.
+7. Use the buttons on each result to **Copy**, **Open**, copy the **Full URL**, or copy as **curl**.
+8. **Export** your findings in `.txt`, `.json`, `.csv`, or `.md` formats.
 
 ### 🛡️ Sensitive Path Prober
 1. Switch to the **Sensitive Path Prober** tab from the header menu.

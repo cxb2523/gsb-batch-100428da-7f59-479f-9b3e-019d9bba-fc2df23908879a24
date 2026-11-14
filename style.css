@@ -1052,6 +1052,126 @@ body {
   color: var(--accent-orange);
 }
 
+/* ==================== SCAN OUTCOME SUMMARY ==================== */
+.scan-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-sm);
+  margin-top: var(--space-sm);
+}
+
+.scan-summary-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border-radius: var(--radius-full);
+  font-size: 0.8rem;
+  font-weight: 500;
+  border: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.scan-summary-chip b {
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.scan-summary-chip.chip-success i {
+  color: var(--success-light);
+}
+
+.scan-summary-chip.chip-failed i {
+  color: var(--danger-light);
+}
+
+.scan-summary-chip.chip-not-executed i {
+  color: var(--text-dim);
+}
+
+.outcome-details {
+  margin-top: var(--space-sm);
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.outcome-details summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 4px 0;
+  user-select: none;
+}
+
+.outcome-details summary:hover {
+  color: var(--text-secondary);
+}
+
+.outcome-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 260px;
+  overflow-y: auto;
+  margin-top: var(--space-sm);
+  padding: var(--space-sm);
+  border-radius: var(--radius-sm);
+  background: rgba(0, 0, 0, 0.18);
+  border: 1px solid var(--glass-border);
+}
+
+.outcome-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-sm);
+  padding: 2px 0;
+  font-size: 0.78rem;
+  word-break: break-all;
+}
+
+.outcome-badge {
+  flex-shrink: 0;
+  min-width: 148px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: var(--radius-full);
+  text-align: center;
+  border: 1px solid var(--glass-border);
+}
+
+.outcome-success .outcome-badge {
+  color: var(--success-light);
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.35);
+}
+
+.outcome-http-error .outcome-badge,
+.outcome-network-error .outcome-badge,
+.outcome-timeout .outcome-badge {
+  color: var(--danger-light);
+  background: rgba(239, 68, 68, 0.12);
+  border-color: rgba(239, 68, 68, 0.35);
+}
+
+.outcome-not-executed .outcome-badge {
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.outcome-url {
+  color: var(--text-secondary);
+  flex: 1 1 auto;
+}
+
+.outcome-detail {
+  flex: 0 0 auto;
+  color: var(--text-dim);
+  font-size: 0.72rem;
+}
+
 /* ==================== FILTER SECTION ==================== */
 .filter-section {
   padding: var(--space-lg);

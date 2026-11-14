@@ -660,6 +660,51 @@ const directoryfyUrl = (url) => {
   return url;
 };
 
+/* ── CRAWL OUTCOMES ──
+   Every queued URL ends with exactly one outcome so the UI can distinguish
+   "nothing found" from "could not be fetched". */
+const OUTCOME = {
+    SUCCESS: "success",
+    HTTP_ERROR: "http-error",
+    NETWORK_ERROR: "network-error",
+    TIMEOUT: "timeout",
+    NOT_EXECUTED: "not-executed"
+};
+
+const OUTCOME_LABELS = {
+    [OUTCOME.SUCCESS]: "Success",
+    [OUTCOME.HTTP_ERROR]: "HTTP error",
+    [OUTCOME.NETWORK_ERROR]: "Proxy/network failure",
+    [OUTCOME.TIMEOUT]: "Timeout",
+    [OUTCOME.NOT_EXECUTED]: "Not executed"
+};
+
+const isTimeoutError = (e) => {
+    if (!e) return false;
+    if (e.name === "TimeoutError" || e.name === "AbortError" || e.code === 23) return true;
+    return /timed?\s*out|timeout/i.test(String(e.message || ""));
+};
+
+// Statuses that a CORS proxy itself emits (payload cap, gateway errors, and the
+// Cloudflare origin 52x range). These must never be mistaken for the target
+// page's own HTTP status. Ambiguous codes like 503 are left out on purpose:
+// if every proxy reports the same one, the target most likely returned it.
+const PROXY_LEVEL_STATUS = new Set([413, 502, 504, 520, 521, 522, 523, 524, 525, 526, 527, 530]);
+
+const STATUS_TEXT = {
+    400: "Bad Request",
+    401: "Unauthorized",
+    403: "Forbidden",
+    404: "Not Found",
+    410: "Gone",
+    418: "I'm a teapot",
+    429: "Too Many Requests",
+    500: "Internal Server Error",
+    501: "Not Implemented",
+    503: "Service Unavailable",
+    505: "HTTP Version Not Supported"
+};
+
 /* ── CORS PROXY — try multiple, return first success ── */
 const CLOUDFLARE_PROXY = (url) => `https://aged-unit-e2e8.iamshafayat.workers.dev/?url=${encodeURIComponent(url)}`;
 
@@ -685,7 +730,11 @@ const PROXY_LIST_LARGE = [
 async function proxyFetch(url, options = {}, large = false) {
     const list = large ? PROXY_LIST_LARGE : PROXY_LIST;
     let lastError;
+    let attempts = 0;
+    let timeouts = 0;
+    const rejectedResponses = [];
     for (const buildUrl of list) {
+        attempts++;
         try {
             const proxied = buildUrl(url);
             const res = await fetch(proxied, {
@@ -693,17 +742,53 @@ async function proxyFetch(url, options = {}, large = false) {
                 signal: AbortSignal.timeout(20000)
             });
             if (res.status >= 500 || res.status === 413) {
-                lastError = new Error(`Proxy ${res.status}`);
+                // A proxy-level failure: remember the response so we can tell a
+                // genuine target 5xx (all proxies agree) from a broken proxy.
+                rejectedResponses.push(res.status);
+                lastError = new Error(`Proxy responded ${res.status}`);
+                lastError.name = "ProxyResponseError";
+                lastError.proxyStatus = res.status;
                 continue;
             }
             return res;
         } catch (e) {
+            if (isTimeoutError(e)) timeouts++;
             lastError = e;
             continue;
         }
     }
-    throw lastError;
+    // If every proxy answered with the *same* non-proxy status, the target itself
+    // most likely returned it — surface it as an HTTP response instead of hiding
+    // a real non-2xx page behind "proxy/network failure". Gateway/payload statuses
+    // (502/503/504/413) are proxy-level by nature and stay in the failure bucket.
+    if (rejectedResponses.length === attempts && attempts > 0 &&
+        rejectedResponses.every(status => status === rejectedResponses[0]) &&
+        !PROXY_LEVEL_STATUS.has(rejectedResponses[0])) {
+        const status = rejectedResponses[0];
+        lastError = null;
+        return new Response(null, { status, statusText: "" });
+    }
+    if (lastError && attempts > 0 && timeouts === attempts) {
+        lastError.allTimedOut = true;
+    }
+    throw lastError || new Error("All CORS proxies failed");
 }
+
+// Turn a proxyFetch rejection into a crawl outcome without losing the cause.
+const classifyFetchError = (e) => {
+    // A proxy answering 5xx/413 is a proxy failure, not the target's HTTP status,
+    // so it stays in the "proxy/network failure" bucket — but keep the code visible.
+    if (e?.proxyStatus != null) {
+        return {
+            outcome: OUTCOME.NETWORK_ERROR,
+            detail: `CORS proxies failed (last status ${e.proxyStatus})`
+        };
+    }
+    if (isTimeoutError(e) || e?.allTimedOut) {
+        return { outcome: OUTCOME.TIMEOUT, detail: e?.allTimedOut ? "Timed out on every proxy" : (e?.message || "Request timed out") };
+    }
+    return { outcome: OUTCOME.NETWORK_ERROR, detail: e?.message || "Proxy/network failure" };
+};
 
 const endpointRegex = new RegExp(
   `(?:"|')((?:[a-zA-Z]{1,10}:\\/\\/|\\/\\/)[^"']*?|(?:\\/|\\.\\/|\\.\\.\\/)[^"'\\s<>]+|[a-zA-Z0-9_\\-/]+\\.[a-z]{1,5}(?:\\?[^"'\\s]*)?)(?:"|')`,
@@ -806,7 +891,6 @@ const stopScanBtn = document.getElementById("stopScanBtn");
 
 // Global State
 const state = {
-  scanned: 0,
   endpoints: new Set(),
   secrets: new Set(),
   files: new Set(),
@@ -814,7 +898,8 @@ const state = {
   allData: [], // { source, type, value, line }
   scannedUrls: new Set(),
   queued: new Set(), // every in-scope URL discovered so far (scanned + pending)
-  completed: 0,
+  outcomes: new Map(), // normalized URL -> { url, outcome, detail, httpStatus, depth }
+  completed: 0, // URLs whose request finished (success + failure)
   currentUrl: "",
   isScanning: false,
   isCrawlerStopped: false
@@ -837,9 +922,129 @@ const scheduleRender = () => {
 
 const isInScope = (url, targetHost) => {
   try {
-    const host = new URL(url).hostname;
-    return host === targetHost || host.endsWith("." + targetHost);
+    const host = new URL(url).hostname.replace(/^www\./i, "");
+    const target = String(targetHost || "").replace(/^www\./i, "");
+    if (!target) return false;
+    return host === target || host.endsWith("." + target);
   } catch { return false; }
+};
+
+/* ── OUTCOME BOOKKEEPING ── */
+let outcomeCountsCache = null;
+
+const recordOutcome = (url, outcome, info = {}) => {
+  state.outcomes.set(url, {
+    url,
+    outcome,
+    detail: info.detail || "",
+    httpStatus: info.httpStatus ?? null,
+    depth: info.depth ?? null
+  });
+  outcomeCountsCache = null;
+};
+
+const computeOutcomeCounts = () => {
+  if (outcomeCountsCache) return outcomeCountsCache;
+  const counts = {
+    success: 0,
+    failed: 0,
+    notExecuted: 0,
+    httpError: 0,
+    networkError: 0,
+    timeout: 0,
+    total: state.outcomes.size
+  };
+  for (const record of state.outcomes.values()) {
+    switch (record.outcome) {
+      case OUTCOME.SUCCESS: counts.success++; break;
+      case OUTCOME.NOT_EXECUTED: counts.notExecuted++; break;
+      case OUTCOME.HTTP_ERROR: counts.failed++; counts.httpError++; break;
+      case OUTCOME.NETWORK_ERROR: counts.failed++; counts.networkError++; break;
+      case OUTCOME.TIMEOUT: counts.failed++; counts.timeout++; break;
+      default: counts.failed++;
+    }
+  }
+  outcomeCountsCache = counts;
+  return counts;
+};
+
+// Every queued URL that never produced a result becomes NOT_EXECUTED (never success/failure).
+const finalizeCrawlOutcomes = () => {
+  for (const rawUrl of state.queued) {
+    const normUrl = normalizeUrl(rawUrl);
+    if (state.outcomes.has(normUrl)) continue;
+    recordOutcome(normUrl, OUTCOME.NOT_EXECUTED, {
+      detail: state.isCrawlerStopped
+        ? "Scan stopped before this URL was processed"
+        : "Not processed"
+    });
+  }
+};
+
+const renderOutcomeDetails = (force = false) => {
+  const list = document.getElementById("outcome-list");
+  const details = document.getElementById("outcome-details");
+  const summary = document.getElementById("outcome-summary");
+  if (!list || !details || !summary) return;
+
+  const counts = computeOutcomeCounts();
+  details.style.display = counts.total ? "block" : "none";
+  summary.innerText = `Per-URL crawl outcomes (${counts.total} URL${counts.total === 1 ? "" : "s"})`;
+
+  // Keep the per-URL table lazy: rebuilding it on every fetch is wasted work
+  // unless the user actually has it expanded (or we are rendering the final state).
+  if (!force && !details.open) return;
+
+  list.innerHTML = "";
+  const ordered = [...state.outcomes.values()];
+  const orderRank = (o) => Object.values(OUTCOME).indexOf(o);
+  ordered.sort((a, b) => orderRank(a.outcome) - orderRank(b.outcome) || a.url.localeCompare(b.url));
+
+  ordered.forEach(record => {
+    const row = document.createElement("div");
+    row.className = `outcome-row outcome-${record.outcome}`;
+
+    const badge = document.createElement("span");
+    badge.className = "outcome-badge";
+    badge.innerText = OUTCOME_LABELS[record.outcome];
+
+    const urlSpan = document.createElement("span");
+    urlSpan.className = "outcome-url";
+    urlSpan.innerText = record.url;
+
+    const detailSpan = document.createElement("span");
+    detailSpan.className = "outcome-detail";
+    const parts = [];
+    if (record.httpStatus != null) parts.push(`HTTP ${record.httpStatus}`);
+    if (record.detail && record.detail !== "Fetched") parts.push(record.detail);
+    detailSpan.innerText = parts.join(" · ");
+
+    row.appendChild(badge);
+    row.appendChild(urlSpan);
+    row.appendChild(detailSpan);
+    list.appendChild(row);
+  });
+};
+
+document.getElementById("outcome-details")?.addEventListener("toggle", (e) => {
+  if (e.target.open) renderOutcomeDetails(true);
+});
+
+const updateScanSummary = (forceDetails = false) => {
+  const counts = computeOutcomeCounts();
+  const container = document.getElementById("scan-summary");
+  if (container) {
+    const set = (id, value) => {
+      const el = document.getElementById(id);
+      if (el) el.innerText = value;
+    };
+    set("summary-success", counts.success);
+    set("summary-failed", counts.failed);
+    set("summary-not-executed", counts.notExecuted);
+    container.style.display = "flex";
+  }
+  renderOutcomeDetails(forceDetails);
+  return counts;
 };
 
 const updateProgress = () => {
@@ -851,7 +1056,8 @@ const updateProgress = () => {
 };
 
 const updateStats = () => {
-  document.getElementById("stat-scanned").innerText = state.scanned;
+  const counts = computeOutcomeCounts();
+  document.getElementById("stat-scanned").innerText = counts.success;
   document.getElementById("stat-endpoints").innerText = state.endpoints.size;
   document.getElementById("stat-secrets").innerText = state.secrets.size;
   document.getElementById("stat-files").innerText = state.files.size;
@@ -884,7 +1090,6 @@ const startScan = async (maxDepth) => {
   if (!/^https?:\/\//i.test(siteUrl)) siteUrl = "https://" + siteUrl;
   siteUrl = normalizeUrl(siteUrl);
 
-  state.scanned = 0;
   state.endpoints.clear();
   state.secrets.clear();
   state.files.clear();
@@ -893,9 +1098,12 @@ const startScan = async (maxDepth) => {
   state.scannedUrls.clear();
   state.queued.clear();
   state.queued.add(siteUrl);
+  state.outcomes.clear();
+  outcomeCountsCache = null;
   state.completed = 0;
   state.currentUrl = "";
   updateStats();
+  updateScanSummary();
 
   scanBtn.style.display = "none";
   document.getElementById("fullScanBtn").style.display = "none";
@@ -911,22 +1119,31 @@ const startScan = async (maxDepth) => {
   status.innerText = maxDepth === 0 ? "Scanning single page..." : "Starting full recursive scan...";
   updateProgress();
 
+  let scanError = null;
   try {
     await recursiveScan(siteUrl, maxDepth);
-    if (!state.isCrawlerStopped) {
-      status.innerText = `Scan complete! ${state.completed} URLs scanned.`;
-    } else {
-      status.innerText = `Scan stopped manually. ${state.completed}/${state.queued.size} URLs scanned.`;
-    }
-    setProgress(100);
-    exportActions.style.display = "flex";
   } catch (e) {
     console.error(e);
-    if (!state.isCrawlerStopped) {
-      status.innerText = "Scan failed. Check console.";
-    }
+    scanError = e;
   }
+
+  // Any queued URL without an outcome was never processed (manual stop or abort).
+  finalizeCrawlOutcomes();
   state.isScanning = false;
+  updateStats();
+  const counts = updateScanSummary(true);
+  if (scanError && !state.isCrawlerStopped) {
+    status.innerText = `Scan aborted unexpectedly. Success: ${counts.success} · Failed: ${counts.failed} · Not executed: ${counts.notExecuted} (${counts.total} queued)`;
+  } else {
+    status.innerText = state.isCrawlerStopped
+      ? `Scan stopped manually. Success: ${counts.success} · Failed: ${counts.failed} · Not executed: ${counts.notExecuted} (${counts.total} queued)`
+      : `Scan complete! Success: ${counts.success} · Failed: ${counts.failed} · Not executed: ${counts.notExecuted} (${counts.total} queued)`;
+  }
+  // Progress reflects only URLs that actually reached a definite outcome; on a
+  // manual stop the remaining URLs stay counted as not executed instead of 100%.
+  setProgress(counts.total ? ((counts.success + counts.failed) / counts.total) * 100 : 100);
+  exportActions.style.display = "flex";
+
   clearTimeout(renderTimer);
   renderTimer = null;
   renderCurrentView();
@@ -957,9 +1174,7 @@ async function recursiveScan(url, maxDepth, currentDepth = 0, targetHost = null)
   if (currentDepth > maxDepth || state.scannedUrls.has(normUrl)) return;
   state.scannedUrls.add(normUrl);
   state.queued.add(normUrl);
-  state.scanned++;
   state.currentUrl = normUrl;
-  updateStats();
   updateProgress();
 
   let links = [];
@@ -976,44 +1191,91 @@ async function recursiveScan(url, maxDepth, currentDepth = 0, targetHost = null)
       headersObj["X-JSpider-Auth"] = crawlerAuth;
     }
 
-    const res = await proxyFetch(normUrl, { headers: headersObj }, true);
-    if (!res.ok) return;
-    const content = await res.text();
+    let res;
+    try {
+      res = await proxyFetch(normUrl, { headers: headersObj }, true);
+    } catch (e) {
+      const failure = classifyFetchError(e);
+      recordOutcome(normUrl, failure.outcome, { detail: failure.detail, depth: currentDepth });
+      console.warn(`Failed to scan ${normUrl} (${failure.outcome}):`, e);
+      return;
+    }
 
-    // Extract data with line numbers
-    const foundEndpoints = extractEndpointsWithLines(content);
-    const foundSecrets = extractSecretsWithLines(content);
-    const foundFiles = extractFilesWithLines(content);
+    if (!res.ok) {
+      recordOutcome(normUrl, OUTCOME.HTTP_ERROR, {
+        detail: res.statusText || STATUS_TEXT[res.status] || "Non-2xx response",
+        httpStatus: res.status,
+        depth: currentDepth
+      });
+      return;
+    }
 
-    foundEndpoints.forEach(e => {
-      addResult(normUrl, "endpoint", e.value, e.line);
-      // Sync - if endpoint looks like a file, add it to files tab too
-      if (isInterestingFile(e.value)) {
-        addResult(normUrl, "file", e.value, e.line);
-      }
-      // Parameter Discovery (Full endpoint with query)
-      if (e.value.includes("?")) {
-        addResult(normUrl, "parameter", e.value, e.line);
-      }
-    });
+    let content;
+    try {
+      content = await res.text();
+    } catch (e) {
+      // Body read failed after a 2xx header — still a failed fetch, not "not executed".
+      const failure = classifyFetchError(e);
+      recordOutcome(normUrl, failure.outcome, { detail: failure.detail, depth: currentDepth });
+      console.warn(`Failed to read body from ${normUrl} (${failure.outcome}):`, e);
+      return;
+    }
 
-    foundSecrets.forEach(s => addResult(normUrl, "secret", s.value, s.line));
+    // Extraction is best-effort: a parser error should not mark a fetched page as failed.
+    try {
+      // Extract data with line numbers
+      const foundEndpoints = extractEndpointsWithLines(content);
+      const foundSecrets = extractSecretsWithLines(content);
+      const foundFiles = extractFilesWithLines(content);
 
-    foundFiles.forEach(f => {
-      addResult(normUrl, "file", f.value, f.line);
-    });
+      foundEndpoints.forEach(e => {
+        addResult(normUrl, "endpoint", e.value, e.line);
+        // Sync - if endpoint looks like a file, add it to files tab too
+        if (isInterestingFile(e.value)) {
+          addResult(normUrl, "file", e.value, e.line);
+        }
+        // Parameter Discovery (Full endpoint with query)
+        if (e.value.includes("?")) {
+          addResult(normUrl, "parameter", e.value, e.line);
+        }
+      });
 
-    // Discover more links/scripts
-    scripts = extractScriptUrls(content, normUrl);
-    links = currentDepth < maxDepth ? extractInternalLinks(content, normUrl) : [];
+      foundSecrets.forEach(s => addResult(normUrl, "secret", s.value, s.line));
+
+      foundFiles.forEach(f => {
+        addResult(normUrl, "file", f.value, f.line);
+      });
+
+      // Discover more links/scripts
+      const scriptScope = extractScriptUrls(content, normUrl, targetHost);
+      scripts = scriptScope.inScope;
+      // Cross-origin scripts are not crawl targets, but they are still valuable
+      // findings — keep them visible in the Files tab instead of dropping them.
+      // Skip ones the generic file regex already captured (protocol-relative or
+      // absolute forms) so the same script does not appear twice.
+      const knownFileUrls = new Set(foundFiles.map(f => {
+        const resolved = resolveUrl(f.value, normUrl);
+        return resolved || f.value;
+      }));
+      scriptScope.external.forEach(item => {
+        if (knownFileUrls.has(item.url)) return;
+        knownFileUrls.add(item.url);
+        addResult(normUrl, "file", item.url, item.line);
+      });
+      links = currentDepth < maxDepth ? extractInternalLinks(content, normUrl) : [];
+    } catch (parseError) {
+      console.warn(`Parsing issues on ${normUrl}:`, parseError);
+    }
+
+    recordOutcome(normUrl, OUTCOME.SUCCESS, { detail: "Fetched", depth: currentDepth });
     [...scripts, ...links].forEach(u => {
       const n = normalizeUrl(u);
       if (isInScope(n, targetHost)) state.queued.add(n);
     });
-  } catch (e) {
-    console.warn(`Failed to scan ${normUrl}:`, e);
   } finally {
     state.completed++;
+    updateStats();
+    updateScanSummary();
     updateProgress();
   }
 
@@ -1116,26 +1378,39 @@ function extractInternalLinks(html, baseUrl) {
   return [...new Set(links)];
 }
 
-function extractScriptUrls(html, baseUrl) {
+function extractScriptUrls(html, baseUrl, rootHost = null) {
   const directoryBase = directoryfyUrl(baseUrl);
   const currentUrlObj = new URL(directoryBase);
-  const targetHost = currentUrlObj.hostname.replace(/^www\./, "");
+  // Scope against the crawl root when known so "crawlable" here matches exactly
+  // what recursiveScan will accept; otherwise fall back to the page's own host.
+  const targetHost = rootHost || currentUrlObj.hostname.replace(/^www\./, "");
 
   const re = /<script[^>]+src=["']([^"']+)["']/gi;
-  const scripts = [];
+  const inScope = [];
+  const external = [];
   let match;
   while ((match = re.exec(html)) !== null) {
     try {
       const url = new URL(match[1], directoryBase);
-      const scriptHost = url.hostname.replace(/^www\./, "");
+      if (!/^https?:$/i.test(url.protocol)) continue;
+      const normalized = normalizeUrl(url.href);
+      const line = getLineNumber(html, match.index);
 
-      // Flexible Domain Matching for Scripts
-      if (scriptHost === targetHost || url.hostname.endsWith("." + targetHost) || !url.hostname) {
-        scripts.push(normalizeUrl(url.href));
+      // Only same-domain scripts are crawl targets. Cross-origin scripts are
+      // returned separately so callers can surface them without inflating the queue.
+      if (isInScope(normalized, targetHost)) {
+        inScope.push(normalized);
+      } else {
+        external.push({ url: normalized, line });
       }
     } catch { }
   }
-  return [...new Set(scripts)];
+  return {
+    inScope: [...new Set(inScope)],
+    external: external.filter((item, index, all) =>
+      all.findIndex(other => other.url === item.url) === index
+    )
+  };
 }
 
 // Navigation & Tool Switching

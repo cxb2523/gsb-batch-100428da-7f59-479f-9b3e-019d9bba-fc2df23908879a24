@@ -161,7 +161,7 @@
             <i class="fas fa-file-code"></i>
           </div>
           <div class="stat-content">
-            <span class="stat-label">Scanned</span>
+            <span class="stat-label">Scanned (OK)</span>
             <span id="stat-scanned" class="stat-value">0</span>
           </div>
         </div>
@@ -274,6 +274,27 @@
             <i class="fas fa-spinner fa-spin"></i>
             <span>Ready to scan...</span>
           </div>
+          <div id="scan-summary" class="scan-summary" style="display: none;" role="status" aria-live="polite">
+            <span class="scan-summary-chip chip-success">
+              <i class="fas fa-circle-check"></i>
+              <span>Success</span>
+              <b id="summary-success">0</b>
+            </span>
+            <span class="scan-summary-chip chip-failed">
+              <i class="fas fa-circle-xmark"></i>
+              <span>Failed</span>
+              <b id="summary-failed">0</b>
+            </span>
+            <span class="scan-summary-chip chip-not-executed">
+              <i class="fas fa-circle-minus"></i>
+              <span>Not executed</span>
+              <b id="summary-not-executed">0</b>
+            </span>
+          </div>
+          <details id="outcome-details" class="outcome-details" style="display: none;">
+            <summary id="outcome-summary">Per-URL crawl outcomes</summary>
+            <div id="outcome-list" class="outcome-list"></div>
+          </details>
         </div>
       </section>
 
