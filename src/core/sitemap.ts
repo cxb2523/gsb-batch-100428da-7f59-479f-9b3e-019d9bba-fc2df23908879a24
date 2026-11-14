@@ -53,6 +53,20 @@ export interface SitemapOptions {
    * @default false
    */
   includeSitemapCategories?: boolean;
+
+  /**
+   * If true, the return value includes a `sitemapSummary` describing what the
+   * traversal actually covered: how many child sitemaps were fetched, how many
+   * were skipped because they were cross-origin, whether collection stopped early
+   * because `maxUrls` or `maxSitemaps` was reached, and the outcome of every
+   * discovered child sitemap.
+   *
+   * When the root document is a plain urlset, the summary reports that there were
+   * no child sitemaps. When this option is false (the default) the return value is
+   * unchanged.
+   * @default false
+   */
+  includeSitemapSummary?: boolean;
 }
 
 /**
@@ -235,15 +249,70 @@ export async function getSitemapIndexCategories(
   };
 }
 
+/**
+ * Outcome of a child sitemap discovered while traversing a sitemap index.
+ * - `fetched`: the child sitemap was fetched (and its URLs collected).
+ * - `cross-origin`: skipped because it was on a different origin than the root.
+ * - `limit-exceeded`: never fetched because `maxUrls` or `maxSitemaps` stopped
+ *   the traversal first.
+ */
+export interface SitemapChildSitemapResult {
+  /** Resolved URL of the child sitemap. */
+  url: string;
+  status: 'fetched' | 'cross-origin' | 'limit-exceeded';
+  /** Which limit stopped this child from being fetched (only when status is `limit-exceeded`). */
+  limit?: 'maxUrls' | 'maxSitemaps';
+}
+
+/** Type of the root sitemap document that was fetched. */
+export type SitemapRootType = 'sitemapindex' | 'urlset' | 'unknown';
+
+/**
+ * Describes what a single `fetchSitemapUrls` call actually covered.
+ */
+export interface SitemapFetchSummary {
+  /** Type of the root document. `urlset` means the root listed page URLs directly. */
+  rootType: SitemapRootType;
+  /** True when the root document listed at least one child sitemap. */
+  hasChildSitemaps: boolean;
+  /** Number of child sitemaps actually fetched. */
+  childSitemapsFetched: number;
+  /** Total sitemap documents fetched, including the root document. */
+  sitemapsFetched: number;
+  /** Number of child sitemaps skipped because they were cross-origin. */
+  childSitemapsSkippedCrossOrigin: number;
+  /** Number of child sitemaps never fetched because a limit was reached. */
+  childSitemapsSkippedLimit: number;
+  /** True when collection stopped early due to either `maxUrls` or `maxSitemaps`. */
+  truncated: boolean;
+  /** True when `maxUrls` was exhausted. */
+  truncatedByMaxUrls: boolean;
+  /** True when `maxSitemaps` was reached. */
+  truncatedByMaxSitemaps: boolean;
+  /** Number of page URLs collected. */
+  urlsCollected: number;
+  /** One record per distinct child sitemap, in discovery order (empty for a urlset root). */
+  childSitemaps: SitemapChildSitemapResult[];
+}
+
 export type FetchSitemapUrlsResult =
   | string[]
-  | { urls: string[]; sitemapCategories: SitemapIndexCategories };
+  | { urls: string[]; sitemapCategories: SitemapIndexCategories }
+  | { urls: string[]; sitemapSummary: SitemapFetchSummary }
+  | {
+      urls: string[];
+      sitemapCategories: SitemapIndexCategories;
+      sitemapSummary: SitemapFetchSummary;
+    };
 
 /**
  * Recursively fetches sitemap(s) and collects all page URLs.
  * Handles sitemap index files and deduplicates by normalized URL.
  * When includeSitemapCategories is true and the root is a sitemap index, returns
  * { urls, sitemapCategories } with a per-category count (e.g. products, pages, blogs, collections).
+ * When includeSitemapSummary is true, the result also carries a sitemapSummary
+ * describing traversal coverage (child sitemaps fetched/skipped, truncation flags
+ * and the outcome of every child sitemap). The default return value is unchanged.
  */
 export async function fetchSitemapUrls(
   sitemapUrl: string,
@@ -255,6 +324,7 @@ export async function fetchSitemapUrls(
   const sameOriginOnly = options.sameOriginOnly ?? true;
   const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
   const includeSitemapCategories = options.includeSitemapCategories ?? false;
+  const includeSitemapSummary = options.includeSitemapSummary ?? false;
 
   const baseParsed = new URL(sitemapUrl);
   const origin = baseParsed.origin;
@@ -262,6 +332,11 @@ export async function fetchSitemapUrls(
   const collected: string[] = [];
   let sitemapsFetched = 0;
   let rootCategories: SitemapIndexCategories | undefined;
+  let rootType: SitemapRootType = 'unknown';
+  const childSitemaps: SitemapChildSitemapResult[] = [];
+  const childSitemapsByKey = new Map<string, SitemapChildSitemapResult>();
+  // Pre-seeded with the root so a self-referencing index never re-fetches it.
+  const seenChildKeys = new Set<string>([normalizeUrl(sitemapUrl)]);
 
   function isSameOrigin(href: string): boolean {
     try {
@@ -281,22 +356,28 @@ export async function fetchSitemapUrls(
     collected.push(resolved);
   }
 
-  const queue: string[] = [sitemapUrl];
+  const queue: { url: string; key: string }[] = [
+    { url: sitemapUrl, key: normalizeUrl(sitemapUrl) },
+  ];
 
   while (queue.length > 0 && collected.length < maxUrls && sitemapsFetched < maxSitemaps) {
     const current = queue.shift()!;
     const isRoot = sitemapsFetched === 0;
     sitemapsFetched++;
 
-    const xml = await fetchXml(current, {
+    const xml = await fetchXml(current.url, {
       timeout,
       headers: options.headers,
       signal: options.signal,
       maxRedirects,
     });
 
-    const base = current.replace(/\/[^/]*$/, '/');
+    const base = current.url.replace(/\/[^/]*$/, '/');
     const parsed = parseSitemapXml(xml, base);
+
+    if (isRoot) {
+      rootType = parsed.type;
+    }
 
     if (parsed.type === 'sitemapindex') {
       if (includeSitemapCategories && isRoot) {
@@ -313,10 +394,46 @@ export async function fetchSitemapUrls(
         rootCategories = { categories, totalSitemaps: parsed.urls.length };
       }
       for (const u of parsed.urls) {
-        if (sitemapsFetched + queue.length >= maxSitemaps) break;
         const resolved = resolveUrl(u, base);
-        if (sameOriginOnly && !isSameOrigin(resolved)) continue;
-        queue.push(resolved);
+        const key = normalizeUrl(resolved);
+        // A child sitemap is only fetched and reported once, even if it appears
+        // multiple times in one index or across several indexes.
+        if (seenChildKeys.has(key)) continue;
+        seenChildKeys.add(key);
+
+        // A cross-origin child could never be fetched, so report it as such even
+        // if the cap was also reached by the time we got to it.
+        if (sameOriginOnly && !isSameOrigin(resolved)) {
+          const child: SitemapChildSitemapResult = {
+            url: resolved,
+            status: 'cross-origin',
+          };
+          childSitemapsByKey.set(key, child);
+          childSitemaps.push(child);
+          continue;
+        }
+
+        // The original traversal stops queueing once this many sitemaps are
+        // already fetched or queued. Keep that ordering and cap, and record why
+        // each remaining child was left unfetched.
+        if (sitemapsFetched + queue.length >= maxSitemaps) {
+          const child: SitemapChildSitemapResult = {
+            url: resolved,
+            status: 'limit-exceeded',
+            limit: 'maxSitemaps',
+          };
+          childSitemapsByKey.set(key, child);
+          childSitemaps.push(child);
+          continue;
+        }
+
+        const child: SitemapChildSitemapResult = {
+          url: resolved,
+          status: 'fetched',
+        };
+        childSitemapsByKey.set(key, child);
+        childSitemaps.push(child);
+        queue.push({ url: resolved, key });
       }
     } else {
       for (const u of parsed.urls) {
@@ -324,6 +441,73 @@ export async function fetchSitemapUrls(
         if (collected.length >= maxUrls) break;
       }
     }
+  }
+
+  // `maxUrls` is considered exhausted once we hold exactly that many URLs, even
+  // if there happened to be nothing else to collect.
+  const truncatedByMaxUrls =
+    Number.isFinite(maxUrls) && collected.length >= maxUrls;
+
+  // Anything still queued when the loop stopped was never fetched. Attribute it
+  // to whichever cap ended the traversal; `maxUrls` is checked first because the
+  // loop condition short-circuits on it.
+  const remainingReason: 'maxUrls' | 'maxSitemaps' = truncatedByMaxUrls
+    ? 'maxUrls'
+    : 'maxSitemaps';
+  for (const item of queue) {
+    const child = childSitemapsByKey.get(item.key);
+    if (!child) continue;
+    child.status = 'limit-exceeded';
+    child.limit = remainingReason;
+  }
+
+  // `maxSitemaps` truncated the traversal if a child was never queued because of
+  // it. If work is still queued and `maxUrls` is not the cause, the sitemap cap
+  // is the only other way the loop can have exited (`maxSitemaps: 0`).
+  const truncatedByMaxSitemaps =
+    (queue.length > 0 && !truncatedByMaxUrls) ||
+    childSitemaps.some(
+      (child) =>
+        child.status === 'limit-exceeded' && child.limit === 'maxSitemaps',
+    );
+
+  function buildSummary(): SitemapFetchSummary {
+    let childSitemapsFetched = 0;
+    let childSitemapsSkippedCrossOrigin = 0;
+    let childSitemapsSkippedLimit = 0;
+
+    for (const child of childSitemaps) {
+      if (child.status === 'fetched') childSitemapsFetched++;
+      else if (child.status === 'cross-origin')
+        childSitemapsSkippedCrossOrigin++;
+      else childSitemapsSkippedLimit++;
+    }
+
+    return {
+      rootType,
+      hasChildSitemaps: childSitemaps.length > 0,
+      childSitemapsFetched,
+      sitemapsFetched,
+      childSitemapsSkippedCrossOrigin,
+      childSitemapsSkippedLimit,
+      truncated: truncatedByMaxUrls || truncatedByMaxSitemaps,
+      truncatedByMaxUrls,
+      truncatedByMaxSitemaps,
+      urlsCollected: collected.length,
+      childSitemaps: childSitemaps.map((child) => ({ ...child })),
+    };
+  }
+
+  if (includeSitemapSummary) {
+    const summary = buildSummary();
+    if (includeSitemapCategories && rootCategories) {
+      return {
+        urls: collected,
+        sitemapCategories: rootCategories,
+        sitemapSummary: summary,
+      };
+    }
+    return { urls: collected, sitemapSummary: summary };
   }
 
   if (includeSitemapCategories && rootCategories) {

@@ -376,7 +376,7 @@ const result = await crawler.arun("https://store.example.com/product/123", {
 <details>
 <summary>🗺️ <strong>Sitemap Crawling</strong></summary>
 
-Crawl all pages listed in a sitemap (or sitemap index) in one call. Sitemaps are fetched over HTTP with timeouts and redirect limits; optional category counts (e.g. products, pages, blogs, collections) are supported.
+Crawl all pages listed in a sitemap (or sitemap index) in one call. Sitemaps are fetched over HTTP with timeouts and redirect limits; optional category counts (e.g. products, pages, blogs, collections) are supported. An opt-in fetch summary reports how many child sitemaps were fetched or skipped, whether `maxUrls`/`maxSitemaps` cut the run short, and the outcome of each child sitemap.
 
 ```typescript
 import {
@@ -418,6 +418,42 @@ const out = await crawler.crawlFromSitemap(
 if (!Array.isArray(out)) {
   console.log("Categories:", out.sitemapCategories.categories);
   // out.results = crawl results
+}
+
+// Option E: Ask a fetch to report what it actually covered
+const fetchOut = await fetchSitemapUrls("https://www.flyrank.com/sitemap.xml", {
+  maxUrls: 500,
+  maxSitemaps: 10,
+  includeSitemapSummary: true,
+});
+if (!Array.isArray(fetchOut) && "sitemapSummary" in fetchOut) {
+  const summary = fetchOut.sitemapSummary;
+  console.log(
+    `${summary.childSitemapsFetched} sitemaps fetched, ` +
+      `${summary.childSitemapsSkippedCrossOrigin} cross-origin skipped`
+  );
+  if (summary.truncated) {
+    console.log(
+      "Stopped early:",
+      summary.truncatedByMaxUrls ? "maxUrls" : "",
+      summary.truncatedByMaxSitemaps ? "maxSitemaps" : ""
+    );
+  }
+  // Every discovered child sitemap, in discovery order:
+  for (const child of summary.childSitemaps) {
+    console.log(child.status, child.url);
+  }
+}
+
+// The summary is also returned alongside crawl results for an index root.
+const crawlOut = await crawler.crawlFromSitemap(
+  "https://www.flyrank.com/sitemap.xml",
+  { jsExecution: false },
+  { includeSitemapSummary: true }
+);
+if (!Array.isArray(crawlOut) && "sitemapSummary" in crawlOut) {
+  console.log("Coverage:", crawlOut.sitemapSummary);
+  // crawlOut.results = crawl results
 }
 ```
 

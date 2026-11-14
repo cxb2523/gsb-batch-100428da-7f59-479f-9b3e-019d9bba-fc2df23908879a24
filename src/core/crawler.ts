@@ -24,6 +24,7 @@ import { extractLinks, extractMedia, extractMetadata } from '../utils/dom';
 import { normalizeUrl } from '../utils/url';
 import { fetchSitemapUrls } from './sitemap';
 import type {
+  SitemapFetchSummary,
   SitemapIndexCategories,
   SitemapOptions,
 } from './sitemap';
@@ -178,7 +179,49 @@ export class AsyncWebCrawler {
    * When sitemapOptions.includeSitemapCategories is true and the root is a sitemap
    * index, returns { results, sitemapCategories } with per-category counts (e.g.
    * products, pages, blogs, collections).
+   * When sitemapOptions.includeSitemapSummary is true, the returned object also
+   * carries a sitemapSummary describing what the sitemap traversal covered
+   * (child sitemaps fetched/skipped, truncation by maxUrls/maxSitemaps and the
+   * outcome of every child sitemap). The default array return value is unchanged.
+   *
+   * The overloads keep the return type unchanged for callers that leave the
+   * summary switch off, so existing narrowing code keeps compiling.
    */
+  async crawlFromSitemap(
+    sitemapUrl: string,
+    crawlOptions?: Partial<CrawlOptions>,
+    sitemapOptions?: SitemapOptions & { includeSitemapSummary?: false },
+  ): Promise<
+    | CrawlResult[]
+    | { results: CrawlResult[]; sitemapCategories: SitemapIndexCategories }
+  >;
+  async crawlFromSitemap(
+    sitemapUrl: string,
+    crawlOptions: Partial<CrawlOptions> | undefined,
+    sitemapOptions: SitemapOptions & { includeSitemapSummary: true },
+  ): Promise<
+    | CrawlResult[]
+    | { results: CrawlResult[]; sitemapSummary: SitemapFetchSummary }
+    | {
+        results: CrawlResult[];
+        sitemapCategories: SitemapIndexCategories;
+        sitemapSummary: SitemapFetchSummary;
+      }
+  >;
+  async crawlFromSitemap(
+    sitemapUrl: string,
+    crawlOptions?: Partial<CrawlOptions>,
+    sitemapOptions?: SitemapOptions,
+  ): Promise<
+    | CrawlResult[]
+    | { results: CrawlResult[]; sitemapCategories: SitemapIndexCategories }
+    | { results: CrawlResult[]; sitemapSummary: SitemapFetchSummary }
+    | {
+        results: CrawlResult[];
+        sitemapCategories: SitemapIndexCategories;
+        sitemapSummary: SitemapFetchSummary;
+      }
+  >;
   async crawlFromSitemap(
     sitemapUrl: string,
     crawlOptions: Partial<CrawlOptions> = {},
@@ -186,19 +229,40 @@ export class AsyncWebCrawler {
   ): Promise<
     | CrawlResult[]
     | { results: CrawlResult[]; sitemapCategories: SitemapIndexCategories }
+    | { results: CrawlResult[]; sitemapSummary: SitemapFetchSummary }
+    | {
+        results: CrawlResult[];
+        sitemapCategories: SitemapIndexCategories;
+        sitemapSummary: SitemapFetchSummary;
+      }
   > {
     const raw = await fetchSitemapUrls(sitemapUrl, sitemapOptions);
-    const urls = Array.isArray(raw) ? raw : raw.urls;
-    if (urls.length === 0) {
-      if (!Array.isArray(raw) && raw.sitemapCategories) {
-        return { results: [], sitemapCategories: raw.sitemapCategories };
-      }
-      return [];
+    if (Array.isArray(raw)) {
+      return await this.arunMany(raw, crawlOptions);
     }
-    const results = await this.arunMany(urls, crawlOptions);
-    if (!Array.isArray(raw)) {
-      return { results, sitemapCategories: raw.sitemapCategories };
+
+    const results = raw.urls.length
+      ? await this.arunMany(raw.urls, crawlOptions)
+      : [];
+    const categories =
+      'sitemapCategories' in raw ? raw.sitemapCategories : undefined;
+    // The summary is surfaced with the crawl results only when the root document
+    // was a sitemap index; a urlset root keeps the historical array return value.
+    const summary =
+      'sitemapSummary' in raw && raw.sitemapSummary.rootType === 'sitemapindex'
+        ? raw.sitemapSummary
+        : undefined;
+
+    if (categories && summary) {
+      return { results, sitemapCategories: categories, sitemapSummary: summary };
     }
+    if (categories) {
+      return { results, sitemapCategories: categories };
+    }
+    if (summary) {
+      return { results, sitemapSummary: summary };
+    }
+    // Nothing extra to report, so keep the historical plain-array return value.
     return results;
   }
 
