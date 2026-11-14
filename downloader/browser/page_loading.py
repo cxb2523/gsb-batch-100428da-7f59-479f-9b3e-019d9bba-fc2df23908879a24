@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from io import StringIO
 from pathlib import Path
@@ -69,14 +70,19 @@ class PageLoader:
     def __init__(self) -> None:
         self.parser = etree.HTMLParser()
 
-    def load(self, request: PageLoadRequest, adapters: PageLoadAdapters) -> PageLoadResult:
+    def load(
+        self, request: PageLoadRequest, adapters: PageLoadAdapters, *, attempt: int = 1
+    ) -> PageLoadResult:
         if request.browser_mode == SELENIUMBASE_MODE:
-            return self._load_with_seleniumbase(request, adapters.browsers.get(SELENIUMBASE_MODE))
+            return self._load_with_seleniumbase(
+                request, adapters.browsers.get(SELENIUMBASE_MODE), attempt=attempt
+            )
         if request.browser_mode == CLOAKBROWSER_MODE:
             return self._load_with_webdriver(
                 request,
                 adapters.browsers.get(CLOAKBROWSER_MODE),
                 CLOAKBROWSER_MODE,
+                attempt=attempt,
             )
 
         method = request.method.upper()
@@ -115,7 +121,7 @@ class PageLoader:
         ):
             browser = adapters.browsers.get(SELENIUMBASE_MODE)
             if browser is not None:
-                return self._load_with_seleniumbase(request, browser)
+                return self._load_with_seleniumbase(request, browser, attempt=attempt)
             return PageLoadResult(
                 failure_reason='browser_adapter_required',
                 status_code=status_code,
@@ -129,7 +135,9 @@ class PageLoader:
             browser_mode=request.browser_mode,
         )
 
-    def _load_with_seleniumbase(self, request: PageLoadRequest, browser: Any) -> PageLoadResult:
+    def _load_with_seleniumbase(
+        self, request: PageLoadRequest, browser: Any, *, attempt: int = 1
+    ) -> PageLoadResult:
         if browser is None:
             return PageLoadResult(
                 failure_reason='browser_adapter_required',
@@ -150,10 +158,17 @@ class PageLoader:
                 browser_mode=SELENIUMBASE_MODE,
             )
         except Exception as e:
-            return self.browser_failure_result(request, browser, e, SELENIUMBASE_MODE)
+            return self.browser_failure_result(
+                request, browser, e, SELENIUMBASE_MODE, attempt=attempt
+            )
 
     def _load_with_webdriver(
-        self, request: PageLoadRequest, browser: Any, browser_mode: BrowserModeName
+        self,
+        request: PageLoadRequest,
+        browser: Any,
+        browser_mode: BrowserModeName,
+        *,
+        attempt: int = 1,
     ) -> PageLoadResult:
         if browser is None:
             return PageLoadResult(
@@ -176,7 +191,7 @@ class PageLoader:
                 browser_mode=browser_mode,
             )
         except Exception as e:
-            return self.browser_failure_result(request, browser, e, browser_mode)
+            return self.browser_failure_result(request, browser, e, browser_mode, attempt=attempt)
 
     def browser_failure_result(
         self,
@@ -194,6 +209,7 @@ class PageLoader:
             failure_reason='browser_load_failed',
             error_message=str(error),
             required_browser_mode=browser_mode,
+            recoverable=True,
             browser_mode=browser_mode,
             diagnostic_paths=diagnostic_paths,
         )
@@ -240,7 +256,7 @@ class PageLoader:
     def _record_browser_failure_diagnostics(
         self, browser: Any, request: PageLoadRequest, error: Exception, attempt: int
     ) -> dict[str, str | None]:
-        base_path = self._diagnostic_base_path(request)
+        base_path = self._diagnostic_base_path(request, attempt)
         html_path = self._save_page_source_diagnostic(browser, base_path)
         screenshot_path = self._save_screenshot_diagnostic(browser, base_path)
         metadata = {
@@ -264,15 +280,19 @@ class PageLoader:
             'metadata': metadata_path,
         }
 
-    def _diagnostic_base_path(self, request: PageLoadRequest) -> Path:
+    def _diagnostic_base_path(self, request: PageLoadRequest, attempt: int) -> Path:
         diagnostic_dir = Path(request.diagnostics_dir or 'seleniumbase_diagnostics')
         diagnostic_dir.mkdir(parents=True, exist_ok=True)
         slug = re.sub(r'[^A-Za-z0-9_-]+', '_', request.url.split('?', 1)[0]).strip('_')
         slug = slug[-80:] or 'page'
         url_hash = hashlib.sha256(request.url.encode('utf-8')).hexdigest()[:10]
         timestamp = time.strftime('%Y%m%d-%H%M%S')
-        unique_suffix = f'{time.time_ns() % 1_000_000_000:09d}'
-        return diagnostic_dir / f'{timestamp}-{unique_suffix}-{slug}-{url_hash}'
+        # time.time_ns() can be coarse on some platforms (e.g. Windows), so it
+        # cannot guarantee unique names for rapid retries; add a random suffix.
+        # Keep the attempt number right after the timestamp so that sorting the
+        # diagnostic directory lists attempts in chronological order.
+        unique_suffix = f'{time.time_ns() % 1_000_000_000:09d}-{uuid.uuid4().hex[:8]}'
+        return diagnostic_dir / f'{timestamp}-attempt{attempt}-{unique_suffix}-{slug}-{url_hash}'
 
     def _save_page_source_diagnostic(self, browser: Any, base_path: Path) -> str | None:
         try:

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
@@ -42,8 +43,12 @@ class SeleniumBaseDiagnosticsMixin:
         slug = slug[-80:] or 'page'
         url_hash = hashlib.sha256(url.encode('utf-8'), usedforsecurity=False).hexdigest()[:10]
         timestamp = time.strftime('%Y%m%d-%H%M%S')
-        unique_suffix = f'{time.time_ns() % 1_000_000_000:09d}'
-        filename = f'{timestamp}-{unique_suffix}-attempt{attempt}-{slug}-{url_hash}'
+        # time.time_ns() can be coarse on some platforms (e.g. Windows), so it
+        # cannot guarantee unique names for rapid retries; add a random suffix.
+        # Keep the attempt number right after the timestamp so that sorting the
+        # diagnostic directory lists attempts in chronological order.
+        unique_suffix = f'{time.time_ns() % 1_000_000_000:09d}-{uuid.uuid4().hex[:8]}'
+        filename = f'{timestamp}-attempt{attempt}-{unique_suffix}-{slug}-{url_hash}'
         return diagnostic_dir / filename
 
     def _save_seleniumbase_page_source_diagnostic(self, sb: Any, base_path: Path) -> str | None:

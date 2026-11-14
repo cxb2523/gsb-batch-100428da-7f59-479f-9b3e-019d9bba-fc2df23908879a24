@@ -429,11 +429,24 @@ class HtmlParsingMixin(HtmlExtractionMixin, SeleniumBaseDiagnosticsMixin):
 
         adapters = self._page_load_adapters()
         result = loader.load(request, adapters)
-        if result.failure_reason != 'browser_adapter_required':
-            return result
-        if result.required_browser_mode != SELENIUMBASE_MODE:
-            return result
-        return self._load_with_temporary_seleniumbase_context(request, loader)
+        if result.failure_reason == 'browser_adapter_required':
+            if result.required_browser_mode != SELENIUMBASE_MODE:
+                return result
+            return self._load_with_temporary_seleniumbase_context(request, loader)
+        if (
+            result.failure_reason == 'browser_load_failed'
+            and request.method.upper() == 'GET'
+            and result.recoverable
+        ):
+            logger.warning(
+                'Browser HTML load failed (attempt 1/{}); retrying in {}s: {}',
+                SELENIUMBASE_HTML_MAX_ATTEMPTS,
+                SELENIUMBASE_RETRY_BACKOFF_SECONDS,
+                request.url,
+            )
+            time.sleep(SELENIUMBASE_RETRY_BACKOFF_SECONDS)
+            result = loader.load(request, adapters, attempt=2)
+        return result
 
     def _load_with_temporary_seleniumbase_context(
         self, request: PageLoadRequest, loader: PageLoader
@@ -461,7 +474,7 @@ class HtmlParsingMixin(HtmlExtractionMixin, SeleniumBaseDiagnosticsMixin):
                 else:
                     retry_adapters = self._page_load_adapters()
                     retry_adapters.browsers[SELENIUMBASE_MODE] = seleniumbase_browser
-                    last_result = loader.load(retry_request, retry_adapters)
+                    last_result = loader.load(retry_request, retry_adapters, attempt=attempt)
 
             if last_result.ok:
                 return last_result

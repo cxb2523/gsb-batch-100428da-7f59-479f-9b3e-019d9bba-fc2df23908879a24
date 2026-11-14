@@ -670,3 +670,259 @@ def test_seleniumbase_image_download_uses_driver(tmp_path):
     assert result.status == 'downloaded'
     assert result.downloaded_count == 1
     assert result.archive_path is not None
+
+
+def test_blocked_get_fallback_is_not_sticky_and_next_request_uses_requests_first(
+    monkeypatch, tmp_path
+):
+    html = '<html><body><main class="page-main"><h1>Fallback</h1></main></body></html>'
+    contexts = []
+
+    def fake_context(self):
+        context = FakeSeleniumBase(html)
+        contexts.append(context)
+        return context
+
+    monkeypatch.setattr(BrowserHtmlSource, '_seleniumbase_context', fake_context)
+
+    http = StatusHttp(403)
+    source = BrowserHtmlSource(str(tmp_path), cast(Any, http), None)
+    source.browser_mode = REQUESTS_MODE
+
+    first_root = source.__parse_html__('https://example.test/first')
+
+    assert first_root is not None
+    assert source.browser_mode == REQUESTS_MODE
+
+    second_root = source.__parse_html__('https://example.test/second')
+
+    assert second_root is not None
+    assert second_root.xpath('string(//h1)') == 'Fallback'
+    # The next request still starts in requests mode: both pages hit HTTP first.
+    assert [call[0] for call in http.get_calls] == [
+        'https://example.test/first',
+        'https://example.test/second',
+    ]
+    assert source.browser_mode == REQUESTS_MODE
+    assert source.configured_browser_mode() == REQUESTS_MODE
+    assert len(contexts) == 2
+    assert [context.activated_url for context in contexts] == [
+        'https://example.test/first',
+        'https://example.test/second',
+    ]
+    assert source.last_page_load_result is not None
+    assert source.last_page_load_result.browser_mode == SELENIUMBASE_MODE
+
+
+class BlockedPostHttp:
+    def __init__(self, status_code):
+        self.status_code = status_code
+        self.post_calls = []
+
+    def post(self, url, **kwargs):
+        self.post_calls.append((url, kwargs))
+        return FakeResponse(self.status_code, '<html><body>blocked</body></html>')
+
+
+@pytest.mark.parametrize('status_code', [403, 429])
+def test_blocked_post_is_unrecoverable_and_does_not_fall_back_to_browser(
+    monkeypatch, tmp_path, status_code
+):
+    def fail_context(self):
+        raise AssertionError('POST block must not fall back to the browser')
+
+    monkeypatch.setattr(BrowserHtmlSource, '_seleniumbase_context', fail_context)
+
+    http = BlockedPostHttp(status_code)
+    source = BrowserHtmlSource(str(tmp_path), cast(Any, http), None)
+    source.browser_mode = REQUESTS_MODE
+
+    root = source.__parse_html__('https://example.test/search', 'POST', data={'k': '漫画'})
+
+    assert root is None
+    assert http.post_calls == [
+        (
+            'https://example.test/search',
+            {
+                'data': {'k': '漫画'},
+                'timeout': 30,
+                'headers': {'referer': 'https://example.test'},
+            },
+        )
+    ]
+    result = source.last_page_load_result
+    assert result is not None
+    assert result.ok is False
+    assert result.failure_reason == 'unsupported_fallback_method'
+    assert result.status_code == status_code
+    assert result.recoverable is False
+
+
+def test_blocked_get_browser_failure_records_sanitized_diagnostics(monkeypatch, tmp_path):
+    contexts = []
+    sleep_calls = []
+
+    class FailingCdp:
+        def get_page_source(self):
+            return '<html><body><h1>Bad Gateway</h1></body></html>'
+
+    class FailingSeleniumBase:
+        def __init__(self):
+            self.cdp = FailingCdp()
+            self.current_url = 'https://example.test/comic#blocked'
+            self.activated_urls = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def activate_cdp_mode(self, url):
+            self.activated_urls.append(url)
+            raise RuntimeError('Bad Gateway')
+
+        def sleep(self, seconds):
+            pass
+
+        def solve_captcha(self):
+            pass
+
+        def save_screenshot(self, name, folder=None, selector=None):
+            screenshot_path = os.path.join(folder or '', name)
+            with open(screenshot_path, 'wb') as f:
+                f.write(b'fake-png')
+
+    def fake_context(self):
+        context = FailingSeleniumBase()
+        contexts.append(context)
+        return context
+
+    monkeypatch.setattr(BrowserHtmlSource, '_seleniumbase_context', fake_context)
+    monkeypatch.setattr(
+        page_loading_module.time, 'sleep', lambda seconds: sleep_calls.append(seconds)
+    )
+    monkeypatch.setenv('HTTPS_PROXY', 'http://user:secret@example.proxy:8080')
+
+    http = StatusHttp(403)
+    source = BrowserHtmlSource(str(tmp_path), cast(Any, http), None)
+    source.browser_mode = REQUESTS_MODE
+
+    root = source.__parse_html__('https://example.test/comic')
+
+    assert root is None
+    assert len(contexts) == 2
+    assert sleep_calls == [3.0]
+    result = source.last_page_load_result
+    assert result is not None
+    assert result.failure_reason == 'browser_load_failed'
+    assert result.error_message == 'Bad Gateway'
+
+    diagnostic_dir = tmp_path / 'seleniumbase_diagnostics'
+    html_paths = list(diagnostic_dir.glob('*.html'))
+    screenshot_paths = list(diagnostic_dir.glob('*.png'))
+    metadata_paths = list(diagnostic_dir.glob('*.json'))
+
+    # Both the first failure and the retry keep their own diagnostic files.
+    assert len(html_paths) == 2
+    assert len(screenshot_paths) == 2
+    assert len(metadata_paths) == 2
+
+    metadata_by_attempt = {}
+    for path in metadata_paths:
+        metadata = json.loads(path.read_text(encoding='utf-8'))
+        metadata_by_attempt[metadata['attempt']] = metadata
+
+    assert set(metadata_by_attempt) == {1, 2}
+    for metadata in metadata_by_attempt.values():
+        assert metadata['original_url'] == 'https://example.test/comic'
+        assert metadata['final_url'] == 'https://example.test/comic#blocked'
+        assert metadata['error_type'] == 'RuntimeError'
+        assert metadata['error_message'] == 'Bad Gateway'
+        assert metadata['proxy_environment']['HTTPS_PROXY'] == {
+            'set': True,
+            'value': 'http://<credentials>@example.proxy:8080',
+        }
+        assert metadata['html_path'] is not None
+        assert metadata['screenshot_path'] is not None
+
+    for path in metadata_paths:
+        assert 'secret' not in path.read_text(encoding='utf-8')
+
+
+def test_blocked_get_fallback_with_persistent_driver_retries_and_keeps_first_diagnostics(
+    monkeypatch, tmp_path
+):
+    html = '<html><body><main class="page-main"><h1>Recovered</h1></main></body></html>'
+    sleep_calls = []
+
+    class FlakyCdp:
+        def find(self, selector, timeout=None):
+            pass
+
+        def get_page_source(self):
+            return html
+
+    class FlakyPersistentSeleniumBase:
+        is_seleniumbase_driver = True
+
+        def __init__(self):
+            self.cdp = FlakyCdp()
+            self.activated_urls = []
+            self.current_url = None
+
+        def activate_cdp_mode(self, url):
+            self.activated_urls.append(url)
+            self.current_url = url + '#gateway'
+            if len(self.activated_urls) == 1:
+                raise RuntimeError('Bad Gateway')
+
+        def sleep(self, seconds):
+            pass
+
+        def solve_captcha(self):
+            pass
+
+        def save_screenshot(self, name, folder=None, selector=None):
+            with open(os.path.join(folder or '', name), 'wb') as f:
+                f.write(b'fake-png')
+
+    def fail_context(self):
+        raise AssertionError('persistent driver should be used before a temporary context')
+
+    monkeypatch.setattr(BrowserHtmlSource, '_seleniumbase_context', fail_context)
+    monkeypatch.setattr(
+        page_loading_module.time, 'sleep', lambda seconds: sleep_calls.append(seconds)
+    )
+
+    driver = FlakyPersistentSeleniumBase()
+    http = StatusHttp(403)
+    source = BrowserHtmlSource(str(tmp_path), cast(Any, http), driver)
+    source.browser_mode = REQUESTS_MODE
+
+    root = source.__parse_html__('https://example.test/comic')
+
+    assert root is not None
+    assert root.xpath('string(//h1)') == 'Recovered'
+    assert driver.activated_urls == [
+        'https://example.test/comic',
+        'https://example.test/comic',
+    ]
+    assert sleep_calls == [3.0]
+    assert source.browser_mode == REQUESTS_MODE
+
+    # The first failed attempt's diagnostics survive the successful retry.
+    diagnostic_dir = tmp_path / 'seleniumbase_diagnostics'
+    html_paths = list(diagnostic_dir.glob('*.html'))
+    screenshot_paths = list(diagnostic_dir.glob('*.png'))
+    metadata_paths = list(diagnostic_dir.glob('*.json'))
+    assert len(html_paths) == 1
+    assert len(screenshot_paths) == 1
+    assert len(metadata_paths) == 1
+
+    metadata = json.loads(metadata_paths[0].read_text(encoding='utf-8'))
+    assert metadata['attempt'] == 1
+    assert metadata['original_url'] == 'https://example.test/comic'
+    assert metadata['final_url'] == 'https://example.test/comic#gateway'
+    assert metadata['error_type'] == 'RuntimeError'
+    assert metadata['error_message'] == 'Bad Gateway'
