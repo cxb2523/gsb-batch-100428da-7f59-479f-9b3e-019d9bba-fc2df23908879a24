@@ -1,4 +1,5 @@
 import os
+import shutil
 
 project_type = "{{cookiecutter.project_type | lower}}"
 
@@ -19,3 +20,7 @@ for f in config["remove"]:
 
 if config["use"]:
     os.rename(os.path.join("{{cookiecutter.bot_id}}", config["use"]), os.path.join("{{cookiecutter.bot_id}}", "bot.py"))
+
+# The web crawler tests only apply to the Web project type.
+if project_type != "web":
+    shutil.rmtree("tests", ignore_errors=True)
