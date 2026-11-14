@@ -1,0 +1,1253 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JobHunter AI - Busqueda de empleo automatizada con IA</title>
+    <meta name="description" content="Herramienta open source que automatiza tu busqueda de empleo. Escanea LinkedIn, genera CVs personalizados con IA, y envia aplicaciones a reclutadores.">
+
+    <!-- Open Graph -->
+    <meta property="og:title" content="JobHunter AI - Busqueda de empleo automatizada con IA">
+    <meta property="og:description" content="Escanea LinkedIn, genera CVs personalizados con IA, y envia aplicaciones a reclutadores. Todo desde tu terminal.">
+    <meta property="og:image" content="https://dev-gaspar.github.io/jobhunter/imagen-og.png">
+    <meta property="og:url" content="https://dev-gaspar.github.io/jobhunter/">
+    <meta property="og:type" content="website">
+    <meta property="og:site_name" content="JobHunter AI">
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="JobHunter AI - Busqueda de empleo automatizada con IA">
+    <meta name="twitter:description" content="Escanea LinkedIn, genera CVs personalizados con IA, y envia aplicaciones a reclutadores. Todo desde tu terminal.">
+    <meta name="twitter:image" content="https://dev-gaspar.github.io/jobhunter/imagen-og.png">
+
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect width='100' height='100' rx='20' fill='%23fff'/><text x='50' y='72' font-size='60' text-anchor='middle' fill='%23000'>J</text></svg>">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800;900&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #000000;
+            --bg-secondary: #0a0a0a;
+            --bg-card: #111111;
+            --border: rgba(255,255,255,0.08);
+            --border-hover: rgba(255,255,255,0.15);
+            --text: #fafafa;
+            --text-secondary: #a1a1a1;
+            --text-muted: #666666;
+            --glow: rgba(255,255,255,0.06);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html {
+            scroll-behavior: smooth;
+            overflow-x: hidden;
+        }
+
+        body {
+            font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.6;
+            overflow-x: hidden;
+            width: 100%;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
+        }
+
+        /* Grain overlay */
+        body::after {
+            content: '';
+            position: fixed;
+            inset: 0;
+            z-index: 9999;
+            pointer-events: none;
+            opacity: 0.025;
+            background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='1'/%3E%3C/svg%3E");
+            background-repeat: repeat;
+            background-size: 256px 256px;
+        }
+
+        a { color: inherit; text-decoration: none; }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 2rem;
+        }
+
+        /* ── Scroll Reveal ── */
+        .reveal {
+            opacity: 0;
+            transform: translateY(32px);
+            transition: opacity 0.8s cubic-bezier(0.16, 1, 0.3, 1), transform 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+        .reveal.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        /* ── Navbar ── */
+        nav {
+            position: fixed;
+            top: 0;
+            width: 100%;
+            z-index: 100;
+            background: rgba(0,0,0,0.6);
+            backdrop-filter: blur(24px) saturate(180%);
+            -webkit-backdrop-filter: blur(24px) saturate(180%);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .nav-inner {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 1.25rem;
+            height: 60px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 1rem;
+        }
+
+        .nav-logo {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.05rem;
+            font-weight: 700;
+            letter-spacing: -0.03em;
+            transition: opacity 0.2s;
+            white-space: nowrap;
+            min-width: 0;
+        }
+
+        .nav-logo:hover { opacity: 0.8; }
+
+        .nav-logo-icon {
+            width: 28px;
+            height: 28px;
+            background: var(--text);
+            border-radius: 7px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .nav-logo-icon svg { width: 16px; height: 16px; color: var(--bg); }
+
+        .nav-links {
+            display: flex;
+            gap: 2.5rem;
+            align-items: center;
+        }
+
+        .nav-links a {
+            color: var(--text-muted);
+            font-size: 0.875rem;
+            font-weight: 500;
+            transition: color 0.3s;
+            position: relative;
+        }
+
+        .nav-links a:not(.btn-nav):hover { color: var(--text); }
+
+        .nav-links a:not(.btn-nav)::after {
+            content: '';
+            position: absolute;
+            bottom: -4px;
+            left: 0;
+            width: 0;
+            height: 1px;
+            background: var(--text);
+            transition: width 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .nav-links a:not(.btn-nav):hover::after { width: 100%; }
+
+        .btn-nav {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1.1rem;
+            background: var(--text);
+            color: var(--bg);
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 0.85rem;
+            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+            flex-shrink: 0;
+        }
+
+        .btn-nav:hover { transform: translateY(-1px); box-shadow: 0 4px 20px rgba(255,255,255,0.15); }
+
+        .btn-nav svg { width: 16px; height: 16px; }
+
+        .btn-nav-text { }
+
+        /* Hamburger */
+        .nav-hamburger {
+            display: none;
+            background: none;
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 0.4rem;
+            border-radius: 6px;
+            cursor: pointer;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .nav-hamburger svg { width: 20px; height: 20px; }
+
+        /* Mobile menu overlay */
+        .nav-mobile {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.95);
+            backdrop-filter: blur(24px);
+            -webkit-backdrop-filter: blur(24px);
+            z-index: 200;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 2rem;
+        }
+
+        .nav-mobile.open { display: flex; }
+
+        .nav-mobile a {
+            color: var(--text);
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.5rem;
+            font-weight: 600;
+            letter-spacing: -0.02em;
+            transition: opacity 0.2s;
+        }
+
+        .nav-mobile a:hover { opacity: 0.6; }
+
+        .nav-mobile .btn-nav {
+            font-size: 1rem;
+            padding: 0.7rem 1.5rem;
+            margin-top: 1rem;
+        }
+
+        .nav-close {
+            position: absolute;
+            top: 1.25rem;
+            right: 1.25rem;
+            background: none;
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 0.4rem;
+            border-radius: 6px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .nav-close svg { width: 20px; height: 20px; }
+
+        /* ── Hero ── */
+        .hero {
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            text-align: center;
+            padding: 8rem 2rem 4rem;
+            position: relative;
+            overflow: hidden;
+        }
+
+        /* Radial glow */
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: -20%;
+            left: 50%;
+            transform: translateX(-50%);
+            width: min(900px, 200vw);
+            height: 600px;
+            background: radial-gradient(ellipse at center, rgba(255,255,255,0.04) 0%, rgba(255,255,255,0.01) 40%, transparent 70%);
+            pointer-events: none;
+        }
+
+        /* Grid pattern */
+        .hero::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background-image:
+                linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+            background-size: 64px 64px;
+            mask-image: radial-gradient(ellipse at center, black 20%, transparent 70%);
+            -webkit-mask-image: radial-gradient(ellipse at center, black 20%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .hero > * { position: relative; z-index: 1; }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.6rem;
+            padding: 0.4rem 1rem;
+            border: 1px solid var(--border);
+            border-radius: 100px;
+            font-size: 0.8rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            margin-bottom: 2.5rem;
+            background: rgba(255,255,255,0.02);
+            backdrop-filter: blur(10px);
+            animation: fadeInDown 0.8s cubic-bezier(0.16, 1, 0.3, 1) both;
+        }
+
+        .badge-dot {
+            width: 6px;
+            height: 6px;
+            background: #22c55e;
+            border-radius: 50%;
+            box-shadow: 0 0 8px rgba(34,197,94,0.4);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; box-shadow: 0 0 8px rgba(34,197,94,0.4); }
+            50% { opacity: 0.5; box-shadow: 0 0 16px rgba(34,197,94,0.2); }
+        }
+
+        @keyframes fadeInDown {
+            from { opacity: 0; transform: translateY(-16px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes fadeInUp {
+            from { opacity: 0; transform: translateY(24px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: clamp(3rem, 7vw, 5.5rem);
+            font-weight: 800;
+            line-height: 1.02;
+            margin-bottom: 1.5rem;
+            letter-spacing: -0.05em;
+            animation: fadeInUp 0.8s cubic-bezier(0.16, 1, 0.3, 1) 0.1s both;
+        }
+
+        h1 .line-accent {
+            background: linear-gradient(135deg, var(--text) 0%, var(--text-secondary) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero-sub {
+            font-size: 1.15rem;
+            color: var(--text-secondary);
+            max-width: 520px;
+            margin-bottom: 3rem;
+            line-height: 1.75;
+            animation: fadeInUp 0.8s cubic-bezier(0.16, 1, 0.3, 1) 0.2s both;
+        }
+
+        .hero-actions {
+            display: flex;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+            justify-content: center;
+            margin-bottom: 3rem;
+            animation: fadeInUp 0.8s cubic-bezier(0.16, 1, 0.3, 1) 0.3s both;
+        }
+
+        .btn-primary {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.75rem 1.6rem;
+            background: var(--text);
+            color: var(--bg);
+            border-radius: 10px;
+            font-weight: 600;
+            font-size: 0.95rem;
+            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+            position: relative;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 32px rgba(255,255,255,0.15);
+        }
+
+        .btn-outline {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.75rem 1.6rem;
+            background: rgba(255,255,255,0.03);
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            font-weight: 600;
+            font-size: 0.95rem;
+            transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .btn-outline:hover {
+            border-color: var(--border-hover);
+            background: rgba(255,255,255,0.05);
+            transform: translateY(-2px);
+        }
+
+        .btn-outline svg, .btn-primary svg { width: 18px; height: 18px; }
+
+        /* ── Install Box ── */
+        .install-wrapper {
+            max-width: 540px;
+            width: 100%;
+            animation: fadeInUp 0.8s cubic-bezier(0.16, 1, 0.3, 1) 0.4s both;
+        }
+
+        .os-tabs {
+            display: flex;
+            gap: 0;
+            width: 100%;
+        }
+
+        .os-tab {
+            flex: 1;
+            padding: 0.65rem 1rem;
+            background: transparent;
+            border: 1px solid var(--border);
+            border-bottom: none;
+            color: var(--text-muted);
+            font-size: 0.8rem;
+            font-weight: 600;
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.45rem;
+        }
+
+        .os-tab:first-child { border-radius: 12px 0 0 0; }
+        .os-tab:last-child { border-radius: 0 12px 0 0; }
+
+        .os-tab.active {
+            background: var(--bg-secondary);
+            color: var(--text);
+            border-bottom-color: var(--bg-secondary);
+        }
+
+        .os-tab:not(.active):hover { color: var(--text-secondary); background: rgba(255,255,255,0.02); }
+
+        .os-tab svg { width: 14px; height: 14px; }
+
+        .install-box {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border);
+            border-top: none;
+            border-radius: 0 0 12px 12px;
+            padding: 1rem 1.2rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            font-size: 0.85rem;
+        }
+
+        .install-box .prompt {
+            color: #22c55e;
+            user-select: none;
+            flex-shrink: 0;
+            font-weight: 500;
+        }
+
+        .install-box code {
+            color: var(--text-secondary);
+            flex: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .copy-btn {
+            background: none;
+            border: 1px solid var(--border);
+            color: var(--text-muted);
+            padding: 0.35rem;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+        }
+
+        .copy-btn:hover { border-color: var(--text-secondary); color: var(--text); background: rgba(255,255,255,0.05); }
+
+        .copy-btn svg { width: 16px; height: 16px; }
+
+        /* ── Terminal ── */
+        .terminal-wrapper {
+            max-width: min(740px, 100%);
+            width: 100%;
+            margin: 4rem auto 0;
+            animation: fadeInUp 0.8s cubic-bezier(0.16, 1, 0.3, 1) 0.5s both;
+            position: relative;
+        }
+
+        /* Terminal glow */
+        .terminal-wrapper::before {
+            content: '';
+            position: absolute;
+            inset: -1px;
+            border-radius: 14px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.08) 0%, rgba(255,255,255,0.02) 100%);
+            z-index: -1;
+        }
+
+        .terminal {
+            background: #0c0c0c;
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 13px;
+            overflow: hidden;
+            box-shadow:
+                0 0 0 1px rgba(255,255,255,0.05),
+                0 20px 60px -12px rgba(0,0,0,0.8),
+                0 0 100px rgba(255,255,255,0.02);
+        }
+
+        .terminal-bar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 16px 20px;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+            background: rgba(255,255,255,0.02);
+        }
+
+        .terminal-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }
+
+        .terminal-dot:nth-child(1) { background: #ff5f57; }
+        .terminal-dot:nth-child(2) { background: #febc2e; }
+        .terminal-dot:nth-child(3) { background: #28c840; }
+
+        .terminal-title {
+            flex: 1;
+            text-align: center;
+            font-family: 'Plus Jakarta Sans', sans-serif;
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            margin-right: 44px;
+        }
+
+        .terminal-body {
+            padding: 1.5rem 1.75rem 1.75rem;
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            font-size: 0.8rem;
+            line-height: 2;
+            color: var(--text-muted);
+            text-align: left;
+        }
+
+        .terminal-body .cmd { color: #22c55e; }
+        .terminal-body .flag { color: #60a5fa; }
+        .terminal-body .ok { color: var(--text); }
+        .terminal-body .accent { color: #a78bfa; }
+        .terminal-body .dim { opacity: 0.35; }
+        .terminal-body .warn { color: #fbbf24; }
+        .terminal-body .line-phase {
+            color: var(--text-secondary);
+            border-left: 2px solid rgba(255,255,255,0.1);
+            padding-left: 12px;
+            margin-left: 2px;
+        }
+
+        /* Typing cursor */
+        .terminal-cursor {
+            display: inline-block;
+            width: 8px;
+            height: 16px;
+            background: var(--text);
+            vertical-align: text-bottom;
+            animation: blink 1s step-end infinite;
+            margin-left: 2px;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
+        }
+
+        /* ── Section shared ── */
+        .section-label {
+            text-align: center;
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.15em;
+            color: var(--text-muted);
+            margin-bottom: 1rem;
+        }
+
+        .section-title {
+            font-family: 'Outfit', sans-serif;
+            text-align: center;
+            font-size: clamp(2rem, 4.5vw, 3rem);
+            font-weight: 800;
+            margin-bottom: 1rem;
+            letter-spacing: -0.04em;
+        }
+
+        .section-sub {
+            text-align: center;
+            color: var(--text-secondary);
+            font-size: 1.05rem;
+            margin-bottom: 4.5rem;
+            max-width: 480px;
+            margin-left: auto;
+            margin-right: auto;
+            line-height: 1.7;
+        }
+
+        /* ── Features ── */
+        .features {
+            padding: 8rem 0;
+            border-top: 1px solid var(--border);
+            position: relative;
+        }
+
+        .features::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 50%;
+            transform: translateX(-50%);
+            width: min(600px, 200vw);
+            height: 400px;
+            background: radial-gradient(ellipse, rgba(255,255,255,0.02) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1px;
+            background: var(--border);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            overflow: hidden;
+        }
+
+        .feature-card {
+            background: var(--bg);
+            padding: 2.5rem 2rem;
+            transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+            position: relative;
+        }
+
+        .feature-card::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(circle at 50% 0%, rgba(255,255,255,0.04) 0%, transparent 60%);
+            opacity: 0;
+            transition: opacity 0.4s;
+        }
+
+        .feature-card:hover { background: var(--bg-secondary); }
+        .feature-card:hover::before { opacity: 1; }
+
+        .feature-icon {
+            width: 44px;
+            height: 44px;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 1.5rem;
+            background: rgba(255,255,255,0.02);
+            transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .feature-card:hover .feature-icon {
+            border-color: rgba(255,255,255,0.15);
+            background: rgba(255,255,255,0.05);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+        }
+
+        .feature-icon svg { width: 20px; height: 20px; color: var(--text); }
+
+        .feature-card h3 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.05rem;
+            font-weight: 700;
+            margin-bottom: 0.6rem;
+            letter-spacing: -0.02em;
+        }
+
+        .feature-card p {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            line-height: 1.65;
+        }
+
+        /* ── How it Works ── */
+        .how-section {
+            padding: 8rem 0;
+            border-top: 1px solid var(--border);
+        }
+
+        .timeline {
+            max-width: 600px;
+            margin: 0 auto;
+            position: relative;
+        }
+
+        /* Vertical connector line */
+        .timeline::before {
+            content: '';
+            position: absolute;
+            left: 19px;
+            top: 24px;
+            bottom: 24px;
+            width: 1px;
+            background: linear-gradient(to bottom, var(--border), rgba(255,255,255,0.12), var(--border));
+        }
+
+        .timeline-progress {
+            position: absolute;
+            left: 19px;
+            top: 24px;
+            width: 1px;
+            height: 0;
+            background: linear-gradient(to bottom, rgba(255,255,255,0.5), rgba(255,255,255,0.1));
+            transition: height 1.2s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        .step {
+            display: flex;
+            gap: 1.75rem;
+            align-items: flex-start;
+            padding: 1.75rem 0;
+            position: relative;
+        }
+
+        .step-num {
+            width: 40px;
+            height: 40px;
+            min-width: 40px;
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'Outfit', sans-serif;
+            font-weight: 700;
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            background: var(--bg);
+            transition: all 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+            z-index: 1;
+        }
+
+        .step.active .step-num {
+            border-color: rgba(255,255,255,0.25);
+            color: var(--text);
+            background: rgba(255,255,255,0.05);
+            box-shadow: 0 0 20px rgba(255,255,255,0.05);
+        }
+
+        .step-content {
+            padding-top: 0.35rem;
+        }
+
+        .step h3 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.05rem;
+            font-weight: 700;
+            margin-bottom: 0.35rem;
+            letter-spacing: -0.02em;
+            transition: color 0.4s;
+        }
+
+        .step.active h3 { color: var(--text); }
+
+        .step p {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            line-height: 1.65;
+            transition: color 0.4s;
+        }
+
+        .step.active p { color: var(--text-secondary); }
+
+        /* ── Open Source ── */
+        .oss {
+            padding: 10rem 0;
+            text-align: center;
+            border-top: 1px solid var(--border);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .oss::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: min(700px, 200vw);
+            height: 400px;
+            background: radial-gradient(ellipse, rgba(255,255,255,0.03) 0%, transparent 70%);
+            pointer-events: none;
+        }
+
+        .oss > * { position: relative; z-index: 1; }
+
+        .oss h2 {
+            font-family: 'Outfit', sans-serif;
+            font-size: clamp(2.2rem, 4.5vw, 3.2rem);
+            font-weight: 800;
+            margin-bottom: 1rem;
+            letter-spacing: -0.04em;
+        }
+
+        .oss p {
+            color: var(--text-secondary);
+            font-size: 1.05rem;
+            max-width: 400px;
+            margin: 0 auto 2.5rem;
+            line-height: 1.7;
+        }
+
+        .oss .btn-primary { font-size: 1rem; padding: 0.85rem 2rem; }
+
+        /* ── Footer ── */
+        footer {
+            padding: 2.5rem 2rem;
+            text-align: center;
+            border-top: 1px solid var(--border);
+            color: var(--text-muted);
+            font-size: 0.8rem;
+        }
+
+        footer a {
+            color: var(--text-secondary);
+            transition: color 0.3s;
+        }
+        footer a:hover { color: var(--text); }
+
+        /* ── Tablet (<=768px) ── */
+        @media (max-width: 768px) {
+            .nav-links a:not(.btn-nav) { display: none; }
+            .nav-links { gap: 0; }
+            .btn-nav-text { display: none; }
+            .btn-nav { padding: 0.45rem; border-radius: 7px; }
+            .nav-hamburger { display: none; }
+            .hero { padding: 5.5rem 1.25rem 3rem; min-height: auto; }
+            .hero-sub { font-size: 1rem; }
+            .features-grid { grid-template-columns: 1fr; }
+            .feature-card { padding: 2rem 1.5rem; }
+            .install-wrapper { max-width: 100%; }
+            .install-box code { font-size: 0.72rem; }
+            .os-tab { font-size: 0.72rem; padding: 0.55rem 0.5rem; }
+            .os-tab svg { width: 12px; height: 12px; }
+            .terminal-wrapper { margin-top: 3rem; }
+            .terminal-body { padding: 1.25rem; font-size: 0.72rem; line-height: 1.7; overflow-x: auto; }
+            .terminal-title { display: none; }
+            .section-sub { margin-bottom: 3rem; }
+            .features { padding: 5rem 0; }
+            .how-section { padding: 5rem 0; }
+            .oss { padding: 5rem 0; }
+            .container { padding: 0 1.25rem; }
+            .timeline { max-width: 100%; }
+        }
+
+        /* ── Mobile (<=480px) ── */
+        @media (max-width: 480px) {
+            .hero { padding: 5rem 1rem 2.5rem; }
+            h1 { font-size: 2.2rem; }
+            .hero-sub { font-size: 0.9rem; margin-bottom: 2rem; }
+            .hero-actions { flex-direction: column; align-items: center; width: 100%; gap: 0.5rem; }
+            .btn-primary, .btn-outline { width: 100%; justify-content: center; }
+            .badge { font-size: 0.72rem; padding: 0.3rem 0.75rem; margin-bottom: 1.5rem; }
+            .install-wrapper { margin-top: 0; }
+            .os-tab { font-size: 0.65rem; padding: 0.5rem 0.2rem; gap: 0.2rem; }
+            .install-box { padding: 0.7rem; gap: 0.4rem; }
+            .install-box code { font-size: 0.58rem; }
+            .install-box .prompt { font-size: 0.7rem; }
+            .terminal-wrapper { margin-top: 2rem; }
+            .terminal-body { padding: 0.85rem; font-size: 0.6rem; line-height: 1.6; }
+            .terminal-bar { padding: 10px 12px; }
+            .terminal-dot { width: 9px; height: 9px; }
+            .section-label { font-size: 0.7rem; }
+            .section-title { font-size: 1.5rem; }
+            .section-sub { font-size: 0.9rem; margin-bottom: 2.5rem; }
+            .feature-card { padding: 1.5rem 1.25rem; }
+            .feature-card h3 { font-size: 0.95rem; }
+            .feature-card p { font-size: 0.85rem; }
+            .feature-icon { width: 36px; height: 36px; border-radius: 9px; }
+            .feature-icon svg { width: 18px; height: 18px; }
+            .timeline::before, .timeline-progress { left: 15px; }
+            .step-num { width: 32px; height: 32px; min-width: 32px; font-size: 0.8rem; border-radius: 10px; }
+            .step { gap: 1.25rem; padding: 1.25rem 0; }
+            .step h3 { font-size: 0.95rem; }
+            .step p { font-size: 0.85rem; }
+            .oss h2 { font-size: 1.7rem; }
+            .oss p { font-size: 0.9rem; }
+            .oss .btn-primary { font-size: 0.9rem; padding: 0.7rem 1.5rem; width: 100%; justify-content: center; }
+            .container { padding: 0 1rem; }
+            footer { padding: 2rem 1rem; }
+        }
+    </style>
+</head>
+<body>
+
+<!-- Nav -->
+<nav>
+    <div class="nav-inner">
+        <a href="#" class="nav-logo">
+            <div class="nav-logo-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            </div>
+            JobHunter AI
+        </a>
+        <div class="nav-links">
+            <a href="#features">Caracteristicas</a>
+            <a href="#how-it-works">Como funciona</a>
+            <a href="https://github.com/dev-gaspar/jobhunter" target="_blank" class="btn-nav">
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+                <span class="btn-nav-text">GitHub</span>
+            </a>
+        </div>
+    </div>
+</nav>
+
+<!-- Hero -->
+<section class="hero">
+    <div class="badge">
+        <div class="badge-dot"></div>
+        Codigo abierto
+    </div>
+
+    <h1>Automatiza tu<br><span class="line-accent">busqueda de empleo</span></h1>
+
+    <p class="hero-sub">
+        Escanea LinkedIn, genera CVs personalizados con IA,
+        y envia aplicaciones a reclutadores automaticamente.
+        App de escritorio para Windows o CLI para tu terminal.
+    </p>
+
+    <div class="hero-actions">
+        <a href="https://github.com/dev-gaspar/jobhunter/releases/latest/download/JobHunterSetup-x64.exe" class="btn-primary">
+            <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M0 3.449L9.75 2.1v9.451H0m10.949-9.602L24 0v11.4H10.949M0 12.6h9.75v9.451L0 20.699M10.949 12.6H24V24l-12.9-1.801"/></svg>
+            Descargar para Windows
+        </a>
+        <a href="guia.html" class="btn-outline">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="18" height="18"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+            Guia para no tecnicos
+        </a>
+        <a href="https://github.com/dev-gaspar/jobhunter" class="btn-outline" target="_blank">
+            <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+            Ver en GitHub
+        </a>
+    </div>
+
+    <p style="font-size:0.75rem;color:var(--text-muted);margin:-0.8rem 0 2rem;max-width:520px;margin-left:auto;margin-right:auto;">
+        La primera vez Windows puede mostrar el aviso azul de SmartScreen (instalador sin firma):
+        pulsa <b>Mas informacion</b> y luego <b>Ejecutar de todas formas</b>.
+        Sin dependencias — no necesitas Python, Git ni terminal.
+    </p>
+
+    <p style="font-size:0.8rem;color:var(--text-secondary);margin-bottom:0.8rem;">¿Prefieres la consola? Instala el CLI:</p>
+    <div id="install" class="install-wrapper">
+        <div class="os-tabs">
+            <button class="os-tab active" onclick="switchOS('mac')">
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.8-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>
+                macOS
+            </button>
+            <button class="os-tab" onclick="switchOS('linux')">
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12.504 0c-.155 0-.315.008-.48.021-4.226.333-3.105 4.807-3.17 6.298-.076 1.092-.3 1.953-1.05 3.02-.885 1.051-2.127 2.75-2.716 4.521-.278.832-.41 1.684-.287 2.489a.424.424 0 00-.11.135c-.26.268-.45.6-.663.839-.199.199-.485.267-.797.4-.313.136-.658.269-.864.68-.09.189-.136.394-.132.602 0 .199.027.4.055.536.058.399.116.728.04.97-.249.68-.28 1.145-.106 1.484.174.334.535.47.94.601.81.2 1.91.135 2.774.6.926.466 1.866.67 2.616.47.526-.116.97-.464 1.208-.946.587-.003 1.23-.269 2.26-.334.699-.058 1.574.267 2.577.2.025.134.063.198.114.333l.003.003c.391.778 1.113 1.368 1.884 1.43.199.023.395-.003.564-.068a.468.468 0 00.292-.032c.218-.032.439-.2.574-.381.202-.27.328-.611.4-.934.075-.392.07-.773.003-1.075-.155-.693-.675-1.116-.655-1.737.039-.626.326-1.458.596-2.291.273-.831.547-1.593.6-2.204.052-.64-.064-1.089-.434-1.397-.18-.166-.415-.257-.655-.286-.12-.015-.24-.02-.36-.017-.313.013-.639.105-.955.246-.43.197-.826.494-1.185.796-.358.302-.672.602-.846.746-.105.09-.186.143-.23.161-.043.02-.091.013-.152-.023-.12-.074-.241-.252-.373-.503-.132-.258-.262-.595-.372-.953-.11-.358-.2-.74-.253-1.132-.054-.392-.074-.798-.06-1.2.014-.408.053-.812.111-1.202.058-.392.134-.773.232-1.135.198-.741.466-1.41.806-1.961.342-.548.756-.977 1.204-1.22a2.92 2.92 0 011.57-.34c.376.025.754.117 1.065.294.315.179.564.434.72.752.197.4.257.885.151 1.396-.105.516-.379 1.058-.79 1.582-.414.526-.963 1.029-1.611 1.479-.648.448-1.394.84-2.168 1.158l-.012.006c-.043.018-.088.037-.133.054a8.85 8.85 0 00-.143.06l-.012.004a.244.244 0 00-.071.04.164.164 0 00-.04.056c-.008.023-.013.047-.006.075a.164.164 0 00.048.078.35.35 0 00.181.08c.238.043.57.004.942-.113.372-.116.787-.31 1.201-.56a10.24 10.24 0 001.573-1.15c.568-.5 1.067-1.072 1.452-1.685.387-.61.66-1.265.78-1.909.119-.643.078-1.278-.15-1.84-.227-.556-.614-1.04-1.108-1.386a3.765 3.765 0 00-1.453-.497 4.165 4.165 0 00-1.714.108z"/></svg>
+                Linux
+            </button>
+            <button class="os-tab" onclick="switchOS('windows')">
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M0 3.449L9.75 2.1v9.451H0m10.949-9.602L24 0v11.4H10.949M0 12.6h9.75v9.451L0 20.699M10.949 12.6H24V24l-12.9-1.801"/></svg>
+                Windows
+            </button>
+        </div>
+        <div class="install-box">
+            <span class="prompt" id="install-prompt">$</span>
+            <code id="install-cmd">curl -sSL https://raw.githubusercontent.com/dev-gaspar/jobhunter/main/install.sh | bash</code>
+            <button class="copy-btn" onclick="copyInstall()" title="Copiar">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            </button>
+        </div>
+    </div>
+
+    <!-- Terminal -->
+    <div class="terminal-wrapper">
+        <div class="terminal">
+            <div class="terminal-bar">
+                <div class="terminal-dot"></div>
+                <div class="terminal-dot"></div>
+                <div class="terminal-dot"></div>
+                <span class="terminal-title">jobhunter &mdash; bash</span>
+            </div>
+            <div class="terminal-body" id="terminal-body">
+                <div><span class="cmd">$</span> <span class="ok">jobhunter</span> <span class="flag">run</span> <span class="flag">--time month</span></div>
+                <br>
+                <div class="dim">  Buscando en LinkedIn...</div>
+                <div class="ok">  135 posts  |  90 con email  |  45 sin email (omitidos)</div>
+                <br>
+                <div class="dim">  Analizando ofertas...</div>
+                <div class="ok">  28 ofertas  |  24 con email  |  3 duplicadas</div>
+                <br>
+                <div class="dim">  Generando y enviando...</div>
+                <br>
+                <div>  <span class="accent">1</span><span class="dim">/3</span> Senior Engineer <span class="dim">&rarr;</span> Infotree  <span class="ok">&gt; Enviado</span> <span class="dim">&rarr; recruiter@infotree.com</span></div>
+                <div>  <span class="accent">2</span><span class="dim">/3</span> Full Stack Developer <span class="dim">&rarr;</span> Empresa  <span class="ok">&gt; Enviado</span> <span class="dim">&rarr; hr@empresa.com</span></div>
+                <div>  <span class="accent">3</span><span class="dim">/3</span> Backend Engineer <span class="dim">&rarr;</span> Infobase  <span class="ok">&gt; Enviado</span> <span class="dim">&rarr; jobs@infobase.io</span></div>
+                <br>
+                <div class="ok">  3 enviados  |  0 errores <span class="terminal-cursor"></span></div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Caracteristicas -->
+<section class="features" id="features">
+    <div class="container">
+        <div class="reveal">
+            <p class="section-label">Caracteristicas</p>
+            <h2 class="section-title">Todo lo que necesitas</h2>
+            <p class="section-sub">Un sistema multi-agente de IA que automatiza cada paso de tu busqueda de empleo</p>
+        </div>
+
+        <div class="features-grid reveal">
+            <div class="feature-card">
+                <div class="feature-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+                </div>
+                <h3>Scraping inteligente</h3>
+                <p>Escanea publicaciones de LinkedIn con Playwright, expande el texto completo, y extrae emails de reclutadores.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a4 4 0 0 0-4 4v2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V10a2 2 0 0 0-2-2h-2V6a4 4 0 0 0-4-4z"/><circle cx="12" cy="15" r="1"/></svg>
+                </div>
+                <h3>3 Agentes de IA</h3>
+                <p>Agente filtrador, agente de CV, y agente de email. Cada uno especializado con Gemini AI para maxima precision.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+                </div>
+                <h3>CVs personalizados</h3>
+                <p>Genera un CV unico por oferta, reescribiendo tu experiencia y habilidades para que encajen perfectamente.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/></svg>
+                </div>
+                <h3>Emails que suenan humanos</h3>
+                <p>Emails cortos, directos, con logros concretos y numeros. Sin frases de plantilla.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                </div>
+                <h3>Filtrado de duplicados</h3>
+                <p>No envia el mismo cargo dos veces a la misma empresa. Diferentes cargos a la misma empresa si se permiten.</p>
+            </div>
+            <div class="feature-card">
+                <div class="feature-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                </div>
+                <h3>Cualquier sector</h3>
+                <p>Funciona para tecnologia, marketing, ventas, diseno, administracion, salud, educacion y mas.</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Como funciona -->
+<section class="how-section" id="how-it-works">
+    <div class="container">
+        <div class="reveal">
+            <p class="section-label">Como funciona</p>
+            <h2 class="section-title">De cero a aplicaciones en minutos</h2>
+            <p class="section-sub">Un comando para instalar, despues la IA hace el resto</p>
+        </div>
+
+        <div class="timeline reveal" id="timeline">
+            <div class="timeline-progress" id="timeline-progress"></div>
+            <div class="step" data-step="1">
+                <div class="step-num">1</div>
+                <div class="step-content">
+                    <h3>Instalar</h3>
+                    <p>Un solo comando. Se instala globalmente como <code>jobhunter</code> en tu terminal.</p>
+                </div>
+            </div>
+            <div class="step" data-step="2">
+                <div class="step-num">2</div>
+                <div class="step-content">
+                    <h3>Configurar</h3>
+                    <p>Wizard interactivo: sube tu CV, configura Gmail, elige plantilla, define idiomas y tipo de empleo, e inicia sesion en LinkedIn. Todo en un solo flujo.</p>
+                </div>
+            </div>
+            <div class="step" data-step="3">
+                <div class="step-num">3</div>
+                <div class="step-content">
+                    <h3>Ejecutar</h3>
+                    <p>El sistema escanea LinkedIn, filtra con IA, genera CVs personalizados, escribe emails, y los envia al reclutador.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- Codigo abierto -->
+<section class="oss">
+    <div class="container reveal">
+        <p class="section-label">Codigo abierto</p>
+        <h2>Gratis para siempre</h2>
+        <p>Codigo abierto, self-hosted, sin rastreo. Contribuye, haz fork, hazlo tuyo.</p>
+        <a href="https://github.com/dev-gaspar/jobhunter" class="btn-primary" target="_blank">
+            <svg viewBox="0 0 24 24" fill="currentColor" width="18" height="18"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+            Ver repositorio
+        </a>
+    </div>
+</section>
+
+<!-- Footer -->
+<footer>
+    <p>Hecho por <a href="https://github.com/dev-gaspar" target="_blank">dev-gaspar</a></p>
+</footer>
+
+<script>
+/* ── OS Tab Switching ── */
+const commands = {
+    mac: { prompt: '$', cmd: 'curl -sSL https://raw.githubusercontent.com/dev-gaspar/jobhunter/main/install.sh | bash' },
+    linux: { prompt: '$', cmd: 'curl -sSL https://raw.githubusercontent.com/dev-gaspar/jobhunter/main/install.sh | bash' },
+    windows: { prompt: '>', cmd: 'irm https://raw.githubusercontent.com/dev-gaspar/jobhunter/main/install.ps1 | iex' }
+};
+
+let currentOS = 'mac';
+
+function switchOS(os) {
+    currentOS = os;
+    document.getElementById('install-cmd').textContent = commands[os].cmd;
+    document.getElementById('install-prompt').textContent = commands[os].prompt;
+    document.querySelectorAll('.os-tab').forEach(t => t.classList.remove('active'));
+    event.currentTarget.classList.add('active');
+}
+
+// Auto-detect OS
+(function() {
+    const ua = navigator.userAgent.toLowerCase();
+    if (ua.includes('win')) autoSelect('windows');
+    else if (ua.includes('linux') && !ua.includes('android')) autoSelect('linux');
+    function autoSelect(os) {
+        const tabs = document.querySelectorAll('.os-tab');
+        const idx = os === 'mac' ? 0 : os === 'linux' ? 1 : 2;
+        tabs.forEach(t => t.classList.remove('active'));
+        tabs[idx].classList.add('active');
+        currentOS = os;
+        document.getElementById('install-cmd').textContent = commands[os].cmd;
+        document.getElementById('install-prompt').textContent = commands[os].prompt;
+    }
+})();
+
+/* ── Copy ── */
+function copyInstall() {
+    const cmd = commands[currentOS].cmd;
+    navigator.clipboard.writeText(cmd).then(() => {
+        const btn = document.querySelector('.copy-btn');
+        btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+        btn.style.color = '#22c55e';
+        btn.style.borderColor = '#22c55e';
+        setTimeout(() => {
+            btn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
+            btn.style.color = '';
+            btn.style.borderColor = '';
+        }, 2000);
+    });
+}
+
+/* ── Scroll Reveal ── */
+const observer = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+        if (entry.isIntersecting) {
+            entry.target.classList.add('visible');
+        }
+    });
+}, { threshold: 0.1, rootMargin: '0px 0px -60px 0px' });
+
+document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+
+/* ── Timeline Animation ── */
+const timelineObserver = new IntersectionObserver((entries) => {
+    entries.forEach(entry => {
+        if (entry.isIntersecting) {
+            animateTimeline();
+            timelineObserver.unobserve(entry.target);
+        }
+    });
+}, { threshold: 0.2 });
+
+const timeline = document.getElementById('timeline');
+if (timeline) timelineObserver.observe(timeline);
+
+function animateTimeline() {
+    const steps = document.querySelectorAll('.step');
+    const progress = document.getElementById('timeline-progress');
+    const totalHeight = timeline.querySelector('.step:last-child').offsetTop - timeline.querySelector('.step').offsetTop;
+
+    steps.forEach((step, i) => {
+        setTimeout(() => {
+            step.classList.add('active');
+            const pct = i / (steps.length - 1);
+            progress.style.height = (pct * totalHeight) + 'px';
+        }, i * 300);
+    });
+}
+
+/* ── Nav shrink on scroll ── */
+let lastScroll = 0;
+window.addEventListener('scroll', () => {
+    const nav = document.querySelector('nav');
+    const scrollY = window.scrollY;
+    if (scrollY > 100) {
+        nav.style.borderBottomColor = 'rgba(255,255,255,0.1)';
+    } else {
+        nav.style.borderBottomColor = '';
+    }
+    lastScroll = scrollY;
+}, { passive: true });
+</script>
+
+</body>
+</html>

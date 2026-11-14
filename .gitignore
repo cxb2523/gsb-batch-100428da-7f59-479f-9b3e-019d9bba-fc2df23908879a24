@@ -1,0 +1,35 @@
+# Sensitive config (contains API keys and passwords)
+config.json
+
+# Knowledge base (personal application history)
+knowledge.json
+
+# Session data
+.session/
+
+# Generated output
+output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+config.json.bak
+
+# Build de la app desktop (generados por gen_assets.py / PyInstaller / Inno)
+build/
+dist/
+desktop/packaging/icon.ico
+desktop/packaging/wizard-side.bmp
+desktop/packaging/wizard-small.bmp
+desktop/packaging/MicrosoftEdgeWebView2Setup.exe
+cv_*.pdf
