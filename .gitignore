@@ -1,0 +1,17 @@
+# Local
+.DS_Store
+*.local
+*.log*
+.env
+.npm/
+
+# Dist
+node_modules
+dist/
+storybook-static
+coverage/
+
+# IDE
+.vscode/*
+!.vscode/extensions.json
+.idea
