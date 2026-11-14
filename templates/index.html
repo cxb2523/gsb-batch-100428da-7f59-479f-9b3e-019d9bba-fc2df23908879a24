@@ -13,23 +13,58 @@
             <button type="submit" class="btn-primary">Start Crawling</button>
         </form>
 
-        {% if results %}
+        {% if results is mapping %}
+            {# 失败结局：结构化错误信封，绝不能按书籍条目渲染 #}
+            <div class="results">
+                <h2>采集失败</h2>
+                <div class="error-box" role="alert">
+                    <p class="error-reason">
+                        <strong>原因：</strong>{{ results.reason or '未知错误' }}
+                    </p>
+                    <p class="error-status">
+                        <strong>错误类型：</strong>
+                        {% set status_labels = {
+                            'timeout': '运行超时',
+                            'subprocess_failed': '子进程失败',
+                            'no_output': '无输出文件',
+                            'json_decode_error': 'JSON 解析失败'
+                        } %}
+                        {{ status_labels.get(results.status, results.status or 'unknown') }}
+                    </p>
+                    {% if results.detail %}
+                        <p class="error-detail-label"><strong>错误详情：</strong></p>
+                        <pre class="error-detail">{{ results.detail }}</pre>
+                    {% endif %}
+                </div>
+            </div>
+        {% elif results is string %}
+            {# 兼容兜底：若返回值仍为纯文本，原样展示，不进入书籍列表 #}
+            <div class="results">
+                <h2>采集结果</h2>
+                <div class="error-box" role="alert">
+                    <pre class="error-detail">{{ results }}</pre>
+                </div>
+            </div>
+        {% elif results %}
             <div class="results">
                 <h2>Results:</h2>
-                {% if results is string %}
-                    <pre>{{ results }}</pre>  <!-- error message or raw text -->
-                {% else %}
-                    <ul class="results-list">
-                        {% for item in results %}
-    <li>
-        <strong>{{ item.title or 'N/A' }}</strong> -
-        {{ item.price or 'N/A' }} -
-        {{ item.availability or 'N/A' }}
-    </li>
-{% endfor %}
-
-                    </ul>
-                {% endif %}
+                <ul class="results-list">
+                    {% for item in results %}
+                        <li>
+                            <strong>{{ item.get('title') or 'N/A' }}</strong> -
+                            {{ item.get('price') or 'N/A' }} -
+                            {{ item.get('availability') or 'N/A' }}
+                        </li>
+                    {% endfor %}
+                </ul>
+            </div>
+        {% elif results is defined and results is not none %}
+            {# 爬虫成功但抓到 0 条数据：空列表也应给出明确结局说明 #}
+            <div class="results">
+                <h2>采集完成</h2>
+                <div class="info-box">
+                    <p>本次采集运行成功，但没有获取到任何书籍数据（返回 0 条记录）。</p>
+                </div>
             </div>
         {% endif %}
     </div>
