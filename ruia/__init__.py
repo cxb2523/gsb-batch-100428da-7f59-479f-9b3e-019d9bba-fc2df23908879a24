@@ -9,6 +9,7 @@ from .exceptions import IgnoreThisItem
 from .field import AttrField, BaseField, ElementField, HtmlField, RegexField, TextField
 from .item import Item
 from .middleware import Middleware
+from .record import RequestOutcome, RequestRecord, RequestRecordStore
 from .request import Request
 from .response import Response
 from .spider import Spider

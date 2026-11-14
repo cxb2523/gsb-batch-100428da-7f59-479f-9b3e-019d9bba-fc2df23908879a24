@@ -72,3 +72,56 @@ class MySpider(ruia.Spider):
 
 `Spider` will read links in `start_urls`, and maintains a asynchronous queue.
 The queue is a producer consumer model, and the loop will run until no more request functions.
+
+## Per-request outcome records
+
+By default a spider only keeps the cumulative `success_counts` / `failed_counts`
+statistics. If you need to know what happened to one specific page (succeeded,
+succeeded after retries, or abandoned after exhausting retries), enable the
+per-request records:
+
+```python
+import ruia
+
+
+class MySpider(ruia.Spider):
+    start_urls = ['https://news.ycombinator.com']
+    record_requests = True
+
+    async def parse(self, res):
+        pass
+
+
+spider = MySpider.start()
+record = spider.get_request_record('https://news.ycombinator.com')
+print(record.outcome, record.attempts, record.status)
+```
+
+Every `Request` leaving the queue produces one record with:
+
+- `url`: request URL
+- `method`: HTTP method
+- `outcome`: `success`, `retried_success` (failed at least once, then
+  succeeded) or `failed` (retries exhausted, abandoned)
+- `attempts`: how many HTTP requests were actually sent
+- `status`: final status code (`-1` when the request was abandoned)
+- `error`: error message when the request was abandoned
+- `callback`: name of the callback which produced the request
+- `parent_url`: URL of the parent request for requests yielded by a callback,
+  so a broken pagination chain can be traced
+
+Querying the records:
+
+```python
+spider.get_request_record(url)                    # last record of one URL
+spider.get_request_records(url=url)               # all records of one URL
+spider.get_request_records(outcome='failed')      # records by outcome
+spider.get_outcome_counts()                       # {'success': 1, 'retried_success': 1, 'failed': 1}
+```
+
+`success` + `retried_success` equals `success_counts`, while `failed` equals
+`failed_counts`.
+
+The feature is disabled by default: without `record_requests = True` the
+crawling behaviour and the statistics stay exactly the same as before.
+

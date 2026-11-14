@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import contextvars
 import sys
 import typing
 
@@ -25,6 +26,7 @@ from aiohttp import ClientSession
 from ruia.exceptions import NothingMatchedError, NotImplementedParseError
 from ruia.item import Item
 from ruia.middleware import Middleware
+from ruia.record import RequestOutcome, RequestRecord, RequestRecordStore
 from ruia.request import Request
 from ruia.response import Response
 from ruia.spider_hook import SpiderHook
@@ -64,6 +66,10 @@ class Spider(SpiderHook):
     failed_counts: int = 0
     success_counts: int = 0
 
+    # Enable per-request outcome records. When it is False the crawling
+    # behaviour and the statistics are exactly the same as before.
+    record_requests: bool = False
+
     # Concurrency control
     worker_numbers: int = 2
     concurrency: int = 3
@@ -80,6 +86,7 @@ class Spider(SpiderHook):
         loop=None,
         is_async_start: bool = False,
         cancel_tasks: bool = True,
+        record_requests: bool = None,
         **spider_kwargs,
     ):
         """
@@ -87,6 +94,7 @@ class Spider(SpiderHook):
         :param middleware: a list of or a single Middleware
         :param loop: asyncio event llo
         :param is_async_start: start spider by using async
+        :param record_requests: enable per-request outcome records
         :param spider_kwargs
         """
         if not self.start_urls or not isinstance(
@@ -107,13 +115,31 @@ class Spider(SpiderHook):
         self.aiohttp_kwargs = self.aiohttp_kwargs or {}
         self.spider_kwargs = spider_kwargs
         self.request_config = self.request_config or {}
-        try:
-            self.request_session = getattr(self, "request_session")
-        except Exception as _:
-            self.request_session = ClientSession()
+        # The aiohttp session is created on first use: recent aiohttp versions
+        # require a running event loop to build a ClientSession, while a
+        # spider object is usually created before the loop is running.
+        self._request_session = None
+        # A subclass may provide a session as a class attribute; honour it.
+        subclass_session = getattr(type(self), "request_session", None)
+        if isinstance(subclass_session, ClientSession):
+            self._request_session = subclass_session
 
         self.cancel_tasks = cancel_tasks
         self.is_async_start = is_async_start
+
+        # Per-request outcome records (opt-in feature)
+        if record_requests is None:
+            record_requests = self.record_requests
+        self._record_requests = bool(record_requests)
+        self.record_requests = self._record_requests
+        self.request_records = RequestRecordStore()
+        # Friendly alias of ``request_records``
+        self.records = self.request_records
+        # The request currently being processed by a callback. It is used to
+        # link a yielded Request to the request which produced it.
+        self._current_request = contextvars.ContextVar(
+            f"ruia_current_request_{id(self)}", default=None
+        )
 
         # set logger
         self.logger = get_logger(name=self.name)
@@ -130,14 +156,34 @@ class Spider(SpiderHook):
         # semaphore, used for concurrency control
         self.sem = asyncio.Semaphore(self.concurrency)
 
+    @property
+    def request_session(self):
+        """The aiohttp session, created on first use inside the event loop"""
+        if self._request_session is None:
+            self._request_session = ClientSession()
+        return self._request_session
+
+    @request_session.setter
+    def request_session(self, value):
+        self._request_session = value
+
     async def _process_async_callback(
         self, callback_result: AsyncGeneratorType, response: Response = None
     ):
+        # Remember which request produced these callback results, so that any
+        # Request yielded below can be linked to its parent request.
+        token = None
+        if self.record_requests:
+            parent_request = getattr(response, "_request", None) if response else None
+            if parent_request is None:
+                parent_request = self._current_request.get()
+            token = self._current_request.set(parent_request)
         try:
             async for each_callback in callback_result:
                 if isinstance(each_callback, AsyncGeneratorType):
                     await self._process_async_callback(each_callback)
                 elif isinstance(each_callback, Request):
+                    self._bind_parent_request(each_callback)
                     self.request_queue.put_nowait(
                         self.handle_request(request=each_callback)
                     )
@@ -157,6 +203,104 @@ class Spider(SpiderHook):
             self.logger.error(error_info)
         except Exception as e:
             self.logger.error(e)
+        finally:
+            if token is not None:
+                self._current_request.reset(token)
+
+    def _bind_parent_request(self, request: Request):
+        """
+        Bind a Request yielded by a callback to the request which produced it,
+        so that the pagination chain stays traceable.
+        """
+        if not self.record_requests:
+            return
+        parent_request = self._current_request.get()
+        if parent_request is None:
+            return
+        if getattr(request, "parent_url", None) is None:
+            request.parent_url = parent_request.url
+        if getattr(request, "parent_request", None) is None:
+            request.parent_request = parent_request
+        if getattr(request, "producer_callback", None) is None:
+            request.producer_callback = parent_request.request_callback_name
+
+    def _record_request(
+        self,
+        request: Request,
+        response: Response = None,
+        *,
+        error: str = None,
+    ):
+        """
+        Build and store the outcome record of ``request``.
+        """
+        if not self.record_requests:
+            return None
+
+        attempts = int(getattr(request, "attempts", 0) or 0)
+        status = getattr(response, "status", None)
+        ok = bool(response) and bool(getattr(response, "ok", False)) and status != -1
+        if ok:
+            outcome = (
+                RequestOutcome.SUCCESS
+                if attempts <= 1
+                else RequestOutcome.RETRIED_SUCCESS
+            )
+        else:
+            outcome = RequestOutcome.FAILED
+            # The abandoned request is returned as an empty response whose
+            # status is -1; keep the real status when the response did carry
+            # one (e.g. a VALID hook rejected an otherwise normal response).
+            status = getattr(response, "status", None)
+            if status is None:
+                status = -1
+            if error is None:
+                error = getattr(request, "last_error", None)
+            if error is None and status != -1:
+                error = f"Request url failed with status {status}!"
+            if error is None:
+                error = "request was abandoned"
+
+        record = RequestRecord(
+            url=request.url,
+            method=getattr(request, "method", "GET"),
+            outcome=outcome,
+            attempts=attempts,
+            status=status,
+            error=error,
+            callback=(
+                getattr(request, "producer_callback", None)
+                or request.request_callback_name
+            ),
+            request_callback=request.request_callback_name,
+            parent_url=getattr(request, "parent_url", None),
+        )
+        self.request_records.add(record)
+        request._recorded = True
+        return record
+
+    def get_request_records(self, url: str = None, outcome: str = None) -> list:
+        """
+        Return the per-request outcome records.
+
+        :param url: only return the records of this URL
+        :param outcome: only return the records with this outcome
+            (``success`` / ``retried_success`` / ``failed``)
+        """
+        return self.request_records.find(url=url, outcome=outcome)
+
+    def get_request_record(self, url: str, default=None):
+        """Return the last outcome record of ``url``"""
+        return self.request_records.get(url, default)
+
+    def get_outcome_counts(self) -> dict:
+        """
+        Return the number of records per outcome.
+
+        Successful records (``success`` + ``retried_success``) match
+        ``success_counts``, ``failed`` matches ``failed_counts``.
+        """
+        return self.request_records.counts()
 
     async def _process_response(self, request: Request, response: Response):
         """
@@ -167,10 +311,14 @@ class Spider(SpiderHook):
             if response.ok:
                 # Process succeed response
                 self.success_counts += 1
+                if self.record_requests:
+                    self._record_request(request, response)
                 await self.process_succeed_response(request, response)
             else:
                 # Process failed response
                 self.failed_counts += 1
+                if self.record_requests:
+                    self._record_request(request, response)
                 await self.process_failed_response(request, response)
 
     async def _run_request_middleware(self, request: Request):
@@ -233,8 +381,8 @@ class Spider(SpiderHook):
         finally:
             # Run hook after spider finished crawling
             await self._run_spider_hook(before_stop)
-            if self.request_session is not None:
-                await self.request_session.close()
+            if self._request_session is not None:
+                await self._request_session.close()
             # Display logs about this crawl task
             end_time = datetime.now()
             self.logger.info(
@@ -351,9 +499,19 @@ class Spider(SpiderHook):
         """
         callback_result, response = None, None
 
+        if self.record_requests:
+            # A request fetched directly inside a callback (e.g. through
+            # ``multiple_request``) is a child of the request being processed.
+            # Queued requests run in the worker context, where no parent is
+            # set, so they are not affected here.
+            self._bind_parent_request(request)
         try:
             await self._run_request_middleware(request)
             callback_result, response = await request.fetch_callback(self.sem)
+            if response is not None and self.record_requests:
+                # Let the callback processing know which request produced this
+                # response, so yielded requests can be linked to their parent.
+                response._request = request
             await self._run_response_middleware(request, response)
             await self._process_response(request=request, response=response)
         except NotImplementedParseError as e:
@@ -363,6 +521,16 @@ class Spider(SpiderHook):
             self.logger.error(error_info)
         except Exception as e:
             self.logger.error(f"<Callback[{request.callback.__name__}]: {e}")
+        finally:
+            if self.record_requests and not getattr(request, "_recorded", False):
+                # Make sure every request entering the queue leaves a record,
+                # even when something went wrong before the response could be
+                # processed. Such an exceptional request never reaches the
+                # success/failed counting above, so count it as failed here to
+                # keep the statistics and the records consistent.
+                if response is None:
+                    self.failed_counts += 1
+                self._record_request(request, response)
 
         return callback_result, request, response
 

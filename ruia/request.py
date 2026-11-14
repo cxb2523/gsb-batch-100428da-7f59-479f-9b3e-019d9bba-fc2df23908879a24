@@ -95,6 +95,55 @@ class Request:
         self.logger = get_logger(name=self.name)
         self.retry_times = self.request_config.get("RETRIES", 3)
 
+        # Information about the attempts actually performed for this request.
+        # It is a plain dict so that it can be shared with the retry chain
+        # (``RETRY_FUNC`` may return a brand new ``Request``).
+        self._attempt_info = {
+            "attempts": 0,
+            "errors": [],
+            "last_error": None,
+            "last_status": None,
+        }
+
+        # Link to the request which yielded this one, used by ``Spider`` to
+        # build a traceable pagination chain.
+        self.parent_url = None
+        self.parent_request = None
+        # Name of the callback which produced this request.
+        self.producer_callback = None
+
+    @property
+    def attempts(self) -> int:
+        """How many HTTP requests have actually been sent for this request"""
+        return self._attempt_info["attempts"]
+
+    @property
+    def attempt_count(self) -> int:
+        """Alias of :attr:`attempts`"""
+        return self.attempts
+
+    @property
+    def last_error(self):
+        """The error message of the last failed attempt"""
+        return self._attempt_info["last_error"]
+
+    @property
+    def last_status(self):
+        """The status code returned by the last attempt"""
+        return self._attempt_info["last_status"]
+
+    @property
+    def request_callback_name(self):
+        """Name of the callback used to process the response"""
+        callback = self.callback
+        if callback is None:
+            return None
+        return getattr(callback, "__name__", None) or str(callback)
+
+    def _add_attempt(self):
+        """Mark one actual HTTP request as sent"""
+        self._attempt_info["attempts"] += 1
+
     @property
     def current_request_session(self):
         """Get current aiohttp session"""
@@ -119,6 +168,7 @@ class Request:
         timeout = self.request_config.get("TIMEOUT", 10)
         try:
             async with async_timeout.timeout(timeout):
+                self._add_attempt()
                 resp = await self._make_request()
             try:
                 resp_encoding = resp.get_encoding()
@@ -142,15 +192,21 @@ class Request:
             aws_valid_response = self.request_config.get("VALID")
             if aws_valid_response and iscoroutinefunction(aws_valid_response):
                 response = await aws_valid_response(response)
+            self._attempt_info["last_status"] = response.status
             if response.ok:
+                self._attempt_info["last_error"] = None
                 return response
             else:
-                return await self._retry(
-                    error_msg=f"Request url failed with status {response.status}!"
-                )
+                error_msg = f"Request url failed with status {response.status}!"
+                self._attempt_info["last_error"] = error_msg
+                return await self._retry(error_msg=error_msg)
         except asyncio.TimeoutError:
+            self._attempt_info["last_status"] = -1
+            self._attempt_info["last_error"] = "timeout"
             return await self._retry(error_msg="timeout")
         except Exception as e:
+            self._attempt_info["last_status"] = -1
+            self._attempt_info["last_error"] = str(e) or type(e).__name__
             return await self._retry(error_msg=e)
 
     async def fetch_callback(
@@ -202,14 +258,22 @@ class Request:
             self.logger.info(
                 f"<Retry url: {self.url}>, Retry times: {retry_times}, Retry message: {error_msg}>"
             )
+            self._attempt_info["errors"].append(str(error_msg))
             self.retry_times -= 1
             retry_func = self.request_config.get("RETRY_FUNC")
             if retry_func and iscoroutinefunction(retry_func):
                 request_ins = await retry_func(weakref.proxy(self))
                 if isinstance(request_ins, Request):
+                    # The retry function may build a brand new Request,
+                    # keep the attempt information on the same chain.
+                    request_ins._attempt_info = self._attempt_info
                     return await request_ins.fetch(delay=False)
             return await self.fetch(delay=False)
         else:
+            # Retries are exhausted: build an empty response with status -1.
+            # Spider is expected to treat it as a failure, not a success.
+            if self._attempt_info["last_error"] is None:
+                self._attempt_info["last_error"] = str(error_msg)
             response = Response(
                 url=self.url,
                 method=self.method,
