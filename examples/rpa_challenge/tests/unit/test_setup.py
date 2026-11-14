@@ -6,6 +6,7 @@ Unit tests for setup.py steps (OpenChallengePage, DownloadInputData, StartChalle
 These tests use mocked browser objects to avoid requiring actual Playwright.
 """
 
+import os
 import urllib.error
 from unittest.mock import Mock, patch
 
@@ -17,6 +18,10 @@ from steps.setup import (
     DownloadInputData,
     StartChallenge,
     DEFAULT_XLSX_URL,
+    DOWNLOAD_CLICK_TIMEOUT_STATE_KEY,
+    DOWNLOAD_SOURCE_BROWSER,
+    DOWNLOAD_SOURCE_DIRECT,
+    DOWNLOAD_SOURCE_STATE_KEY,
     _validate_xlsx_url,
 )
 from steps._utils import DEFAULT_TIMEOUTS
@@ -224,6 +229,121 @@ class TestDownloadInputData:
                 mock_urlretrieve.assert_called_once()
                 mock_load_wb.assert_called_once()
 
+    def test_direct_download_records_direct_source_without_browser_download(self):
+        """A successful direct download records 'direct' and never opens expect_download."""
+        with patch("steps.setup.urllib.request.urlretrieve") as mock_urlretrieve, \
+             patch("steps.setup.openpyxl.load_workbook") as mock_load_wb:
+            mock_urlretrieve.return_value = ("test.xlsx", Mock())
+            mock_wb = Mock()
+            mock_wb.active = Mock()
+            mock_wb.active.iter_rows.return_value = iter([
+                ("First Name", "Last Name", "Company Name",
+                 "Role in Company", "Address", "Email", "Phone Number"),
+                ("John", "Doe", "ACME", "Engineer",
+                 "123 Main St", "john@example.com", "555-1234"),
+            ])
+            mock_load_wb.return_value = mock_wb
+
+            step = DownloadInputData("download_input_data", 1)
+            step.execute(self.mock_ctx)
+
+            assert self.mock_ctx.state[DOWNLOAD_SOURCE_STATE_KEY] == DOWNLOAD_SOURCE_DIRECT
+            assert DOWNLOAD_CLICK_TIMEOUT_STATE_KEY not in self.mock_ctx.state
+            assert len(self.mock_ctx.state["rows"]) == 1
+            self.mock_page.expect_download.assert_not_called()
+            self.mock_page.click.assert_not_called()
+
+    def test_browser_fallback_records_source_and_click_timeout(self, tmp_path, monkeypatch):
+        """A successful browser fallback records the source and the click timeout used."""
+        click_timeout_ms = 4321
+        self.mock_ctx.config = {
+            **DEFAULT_CONFIG,
+            "xlsx_url": "http://example.com/file.xlsx",
+            "timeout_click": click_timeout_ms,
+        }
+        tmp_file = tmp_path / "download.xlsx"
+        fd = os.open(str(tmp_file), os.O_RDWR | os.O_CREAT)
+        monkeypatch.setattr("steps.setup.tempfile.mkstemp", lambda **_kwargs: (fd, str(tmp_file)))
+
+        with patch("steps.setup.urllib.request.urlretrieve") as mock_urlretrieve, \
+             patch("steps.setup.openpyxl.load_workbook") as mock_load_wb:
+            mock_urlretrieve.side_effect = urllib.error.URLError("Download failed")
+            mock_wb = Mock()
+            mock_wb.active = Mock()
+            mock_wb.active.iter_rows.return_value = iter([
+                ("First Name", "Last Name", "Company Name",
+                 "Role in Company", "Address", "Email", "Phone Number"),
+                ("John", "Doe", "ACME", "Engineer",
+                 "123 Main St", "john@example.com", "555-1234"),
+            ])
+            mock_load_wb.return_value = mock_wb
+
+            mock_download = Mock()
+            mock_context_mgr = Mock()
+            mock_context_mgr.value = mock_download
+            mock_context_mgr.__enter__ = Mock(return_value=mock_context_mgr)
+            mock_context_mgr.__exit__ = Mock(return_value=None)
+            self.mock_page.expect_download = Mock(return_value=mock_context_mgr)
+
+            step = DownloadInputData("download_input_data", 1)
+            step.execute(self.mock_ctx)
+
+            assert self.mock_ctx.state[DOWNLOAD_SOURCE_STATE_KEY] == DOWNLOAD_SOURCE_BROWSER
+            assert self.mock_ctx.state[DOWNLOAD_CLICK_TIMEOUT_STATE_KEY] == click_timeout_ms
+            assert len(self.mock_ctx.state["rows"]) == 1
+            self.mock_page.expect_download.assert_called_once()
+            self.mock_page.click.assert_called_once_with(
+                'a:has-text("Download Excel")',
+                timeout=click_timeout_ms,
+            )
+            mock_download.save_as.assert_called_once()
+            assert not tmp_file.exists()
+
+    def test_browser_fallback_click_failure_leaves_no_rows_or_source(self, tmp_path, monkeypatch):
+        """A failed fallback click raises, cleans up, and records no state."""
+        tmp_file = tmp_path / "download.xlsx"
+        fd = os.open(str(tmp_file), os.O_RDWR | os.O_CREAT)
+        monkeypatch.setattr("steps.setup.tempfile.mkstemp", lambda **_kwargs: (fd, str(tmp_file)))
+
+        with patch("steps.setup.urllib.request.urlretrieve") as mock_urlretrieve:
+            mock_urlretrieve.side_effect = urllib.error.URLError("Download failed")
+            mock_context_mgr = Mock()
+            mock_context_mgr.__enter__ = Mock(return_value=mock_context_mgr)
+            mock_context_mgr.__exit__ = Mock(return_value=None)
+            mock_context_mgr.value = Mock()
+            self.mock_page.expect_download = Mock(return_value=mock_context_mgr)
+            self.mock_page.click.side_effect = Exception("Timeout 10000ms exceeded")
+
+            step = DownloadInputData("download_input_data", 1)
+
+            with pytest.raises(SystemException) as exc_info:
+                step.execute(self.mock_ctx)
+
+            assert "Failed to download Excel file" in str(exc_info.value)
+            assert "Timeout 10000ms exceeded" in str(exc_info.value)
+            assert not tmp_file.exists()
+            assert "rows" not in self.mock_ctx.state
+            assert DOWNLOAD_SOURCE_STATE_KEY not in self.mock_ctx.state
+            assert DOWNLOAD_CLICK_TIMEOUT_STATE_KEY not in self.mock_ctx.state
+
+    def test_browser_fallback_path_still_rejects_disallowed_url(self):
+        """Fallback never bypasses xlsx_url host or private-IP validation."""
+        self.mock_ctx.config = {
+            **DEFAULT_CONFIG,
+            "xlsx_url": "http://192.168.1.1/challenge.xlsx",
+            "xlsx_allowed_hosts": ["192.168.1.1"],
+        }
+
+        step = DownloadInputData("download_input_data", 1)
+
+        with pytest.raises(SystemException) as exc_info:
+            step.execute(self.mock_ctx)
+
+        assert "must not be a private" in str(exc_info.value)
+        self.mock_page.expect_download.assert_not_called()
+        self.mock_page.click.assert_not_called()
+        assert DOWNLOAD_SOURCE_STATE_KEY not in self.mock_ctx.state
+
     def test_uses_configured_xlsx_url(self):
         """Test that DownloadInputData uses custom xlsx_url from config."""
         self.mock_ctx.config = {
@@ -348,6 +468,8 @@ class TestDownloadInputData:
                 assert "Failed to parse Excel file" in str(exc_info.value)
                 # Verify state was not populated on failure
                 assert "rows" not in self.mock_ctx.state
+                assert DOWNLOAD_SOURCE_STATE_KEY not in self.mock_ctx.state
+                assert DOWNLOAD_CLICK_TIMEOUT_STATE_KEY not in self.mock_ctx.state
                 # Verify temp file was cleaned up
                 mock_urlretrieve.assert_called_once()
                 mock_unlink.assert_called_once_with(missing_ok=True)

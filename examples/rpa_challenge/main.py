@@ -20,7 +20,15 @@ from rpacore import (
 
 from steps.row import FillRow, SubmitRow
 from steps.score import RecordScore
-from steps.setup import DownloadInputData, OpenChallengePage, StartChallenge
+from steps.setup import (
+    DOWNLOAD_CLICK_TIMEOUT_STATE_KEY,
+    DOWNLOAD_SOURCE_BROWSER,
+    DOWNLOAD_SOURCE_DIRECT,
+    DOWNLOAD_SOURCE_STATE_KEY,
+    DownloadInputData,
+    OpenChallengePage,
+    StartChallenge,
+)
 from steps._utils import find_row_value
 
 logger = get_logger(__name__)
@@ -69,6 +77,20 @@ def _validate_config(config: dict[str, object]) -> dict[str, object]:
                 action="main",
             )
     return validated
+
+
+def _format_download_source(source: object, click_timeout_ms: object = None) -> str:
+    """Render the workbook provenance recorded by DownloadInputData for operators."""
+    if source == DOWNLOAD_SOURCE_DIRECT:
+        return "Input workbook source: direct download (urllib)"
+    if source == DOWNLOAD_SOURCE_BROWSER:
+        if click_timeout_ms is None:
+            return 'Input workbook source: browser fallback ("Download Excel" click)'
+        return (
+            "Input workbook source: browser fallback "
+            f'("Download Excel" click, timeout={click_timeout_ms} ms)'
+        )
+    return f"Input workbook source: unknown ({source!r})"
 
 
 def _format_failed_steps(tx: Transaction) -> str:
@@ -165,6 +187,12 @@ def main() -> None:
         print(
             f"Configuration: max_retries={config['max_retries']}, "
             f"transaction_db_path={_display_path(transaction_db_path)}"
+        )
+        print(
+            _format_download_source(
+                setup_tx.state.get(DOWNLOAD_SOURCE_STATE_KEY),
+                setup_tx.state.get(DOWNLOAD_CLICK_TIMEOUT_STATE_KEY),
+            )
         )
 
         # Read durable rows from transaction state (persisted by DownloadInputData)

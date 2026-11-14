@@ -24,6 +24,10 @@ from steps.setup import (
     DownloadInputData,
     StartChallenge,
     DEFAULT_XLSX_URL,
+    DOWNLOAD_CLICK_TIMEOUT_STATE_KEY,
+    DOWNLOAD_SOURCE_BROWSER,
+    DOWNLOAD_SOURCE_DIRECT,
+    DOWNLOAD_SOURCE_STATE_KEY,
 )
 from steps.row import FillRow, SubmitRow
 from steps.score import RecordScore
@@ -92,6 +96,8 @@ class TestFullWorkflow:
             # Verify DownloadInputData populated durable state
             assert ctx.state.get("rows") is not None
             assert len(ctx.state["rows"]) == 2
+            assert ctx.state[DOWNLOAD_SOURCE_STATE_KEY] == DOWNLOAD_SOURCE_DIRECT
+            assert DOWNLOAD_CLICK_TIMEOUT_STATE_KEY not in ctx.state
 
     def test_workflow_uses_custom_config(self):
         """Test that workflow respects custom configuration."""
@@ -143,6 +149,9 @@ class TestFullWorkflow:
             mock_page.expect_download.assert_called_once()
             mock_page.click.assert_called_once()
             mock_download.save_as.assert_called_once()
+            # Verify provenance is recorded for the fallback path
+            assert ctx.state[DOWNLOAD_SOURCE_STATE_KEY] == DOWNLOAD_SOURCE_BROWSER
+            assert ctx.state[DOWNLOAD_CLICK_TIMEOUT_STATE_KEY] == 10_000
 
     def test_workflow_handles_parse_errors(self):
         """Test that workflow handles Excel parse errors."""

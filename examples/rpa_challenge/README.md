@@ -32,6 +32,7 @@ INFO | step_completed | Step completed | step_name=download_input_data step_stat
 INFO | step_started | Step started | step_name=start_challenge
 INFO | step_completed | Step completed | step_name=start_challenge step_status=successful
 INFO | transaction_completed | Transaction completed | transaction_reference=rpa-challenge-setup transaction_status=successful
+Input workbook source: direct download (urllib)
 INFO | transaction_started | Transaction started | transaction_reference=rpa-row-...
 INFO | step_started | Step started | step_name=fill_row
 INFO | step_completed | Step completed | step_name=fill_row step_status=successful
@@ -81,11 +82,34 @@ Each run submits all rows in one active browser session. Row transactions are pe
 | Step | Purpose |
 |-------|---------|
 | `OpenChallengePage` | Launch Playwright, navigate to the challenge site, and store runtime handles in `ctx.resources` |
-| `DownloadInputData` | Download and parse the workbook, then store JSON-safe rows in `ctx.state` |
+| `DownloadInputData` | Download and parse the workbook, then store JSON-safe rows plus the actual download source in `ctx.state` |
 | `StartChallenge` | Click the Start button and wait for the randomized form |
 | `FillRow` | Map visible labels to input IDs and fill one row |
 | `SubmitRow` | Submit one row and wait for the next round or results page |
 | `RecordScore` | Parse and persist the final score in `ctx.state` |
+
+`DownloadInputData` tries a direct `urllib` download first. If that fails, it
+clicks the site's **Download Excel** button and saves the browser download to the
+same temporary path. After download, parsing, header, and required-field checks
+all pass, it records the provenance in transaction state:
+
+| State key | Meaning |
+|-----------|---------|
+| `download_source` | `direct` for a successful `urllib` download, `browser_fallback` for the browser click |
+| `download_click_timeout_ms` | Timeout used for the **Download Excel** click; present only for `browser_fallback` |
+
+`main.py` prints one readable line for this after a successful setup:
+
+```text
+Input workbook source: direct download (urllib)
+Input workbook source: browser fallback ("Download Excel" click, timeout=10000 ms)
+```
+
+The fallback is not a validation bypass: `xlsx_url` still has to pass the host
+allowlist and the private/loopback/link-local rejection before any download
+starts. If the fallback click fails, the step raises `SystemException`, removes
+the temporary file, and writes neither `rows` nor the source fields, so a failed
+run cannot look like a successful download.
 
 ## External Dependencies
 

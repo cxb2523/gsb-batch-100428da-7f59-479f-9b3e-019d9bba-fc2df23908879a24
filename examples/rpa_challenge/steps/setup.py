@@ -19,6 +19,14 @@ DEFAULT_XLSX_URL = "https://www.rpachallenge.com/assets/downloadFiles/challenge.
 DEFAULT_XLSX_ALLOWED_HOSTS = {"www.rpachallenge.com"}
 _ALLOWED_URL_SCHEMES = {"http", "https"}
 
+# Durable state keys describing how the workbook was fetched. Written only after
+# download, parse, header, and required-field validation all succeed so a failed
+# run never records a misleading source.
+DOWNLOAD_SOURCE_STATE_KEY = "download_source"
+DOWNLOAD_CLICK_TIMEOUT_STATE_KEY = "download_click_timeout_ms"
+DOWNLOAD_SOURCE_DIRECT = "direct"
+DOWNLOAD_SOURCE_BROWSER = "browser_fallback"
+
 # Selectors verified via: playwright-cli snapshot
 #   open https://www.rpachallenge.com --headed
 #   playwright-cli snapshot
@@ -149,11 +157,18 @@ class DownloadInputData(Step):
         def _cleanup():
             Path(tmp_path).unlink(missing_ok=True)
 
+        # Track how the workbook was actually obtained. Recorded in durable
+        # state only after download, parsing, and validation all succeed.
+        download_source = DOWNLOAD_SOURCE_DIRECT
+        download_click_timeout_ms: int | None = None
+
         # Try direct download first
         try:
             urllib.request.urlretrieve(xlsx_url, tmp_path)
         except (urllib.error.URLError, OSError):
-            # Fallback: download via browser (site rate-limits direct requests)
+            # Fallback: download via browser (site rate-limits direct requests).
+            # The validated xlsx_url still governs the run: the browser only
+            # clicks the site's own Download Excel button on the opened page.
             page = ctx.resources.get("page")
             if page is None:
                 _cleanup()
@@ -162,14 +177,20 @@ class DownloadInputData(Step):
                     action=self.name,
                 )
             try:
+                click_timeout_ms = get_timeout(ctx.config, "click")
                 with page.expect_download() as dl_info:
-                    page.click('a:has-text("Download Excel")', timeout=get_timeout(ctx.config, "click"))
+                    page.click(
+                        'a:has-text("Download Excel")',
+                        timeout=click_timeout_ms,
+                    )
                 download = dl_info.value
                 download.save_as(tmp_path)
             except Exception as exc:
                 _cleanup()
                 raise SystemException(f"Failed to download Excel file: {exc}", action=self.name) from exc
-        
+            download_source = DOWNLOAD_SOURCE_BROWSER
+            download_click_timeout_ms = click_timeout_ms
+
         try:
             wb = openpyxl.load_workbook(tmp_path)
             ws = wb.active
@@ -214,7 +235,12 @@ class DownloadInputData(Step):
         # Cleanup temporary file
         _cleanup()
 
+        # Record provenance last: a failed run must not leave rows or source
+        # fields behind that would read as a successful download.
         ctx.state["rows"] = rows
+        ctx.state[DOWNLOAD_SOURCE_STATE_KEY] = download_source
+        if download_click_timeout_ms is not None:
+            ctx.state[DOWNLOAD_CLICK_TIMEOUT_STATE_KEY] = download_click_timeout_ms
 
 
 class StartChallenge(Step):

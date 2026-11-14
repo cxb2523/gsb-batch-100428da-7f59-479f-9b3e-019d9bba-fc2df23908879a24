@@ -10,7 +10,19 @@ import pytest
 
 import main as rpa_main
 from rpacore import Status, SystemException
-from main import _browser_page_available, _display_path, _format_failed_steps, _stop_playwright
+from main import (
+    _browser_page_available,
+    _display_path,
+    _format_download_source,
+    _format_failed_steps,
+    _stop_playwright,
+)
+from steps.setup import (
+    DOWNLOAD_CLICK_TIMEOUT_STATE_KEY,
+    DOWNLOAD_SOURCE_BROWSER,
+    DOWNLOAD_SOURCE_DIRECT,
+    DOWNLOAD_SOURCE_STATE_KEY,
+)
 from steps.row import FillRow, SubmitRow
 
 pytestmark = pytest.mark.unit
@@ -85,6 +97,29 @@ def test_format_failed_steps_keeps_registered_name_when_class_differs():
     assert _format_failed_steps(Mock(failed_steps=lambda: [step])) == (
         "custom_registered_step(Mock)"
     )
+
+
+def test_format_download_source_describes_direct_download():
+    assert _format_download_source(DOWNLOAD_SOURCE_DIRECT) == (
+        "Input workbook source: direct download (urllib)"
+    )
+
+
+def test_format_download_source_describes_browser_fallback_with_click_timeout():
+    assert _format_download_source(DOWNLOAD_SOURCE_BROWSER, 10_000) == (
+        'Input workbook source: browser fallback ("Download Excel" click, timeout=10000 ms)'
+    )
+
+
+def test_format_download_source_describes_browser_fallback_without_timeout():
+    assert _format_download_source(DOWNLOAD_SOURCE_BROWSER) == (
+        'Input workbook source: browser fallback ("Download Excel" click)'
+    )
+
+
+def test_format_download_source_flags_unknown_values():
+    assert _format_download_source(None) == "Input workbook source: unknown (None)"
+    assert _format_download_source("bogus") == "Input workbook source: unknown ('bogus')"
 
 
 def test_validate_config_accepts_required_keys():
@@ -265,6 +300,7 @@ def test_main_shares_browser_resources_across_transactions(monkeypatch, tmp_path
             run_order.append(ctx.transaction.reference)
             if ctx.transaction.reference == "rpa-challenge-setup":
                 ctx.resources["page"] = page
+                ctx.transaction.state[DOWNLOAD_SOURCE_STATE_KEY] = DOWNLOAD_SOURCE_DIRECT
                 ctx.transaction.state["rows"] = [
                     {
                         "First Name": "Jane",
@@ -299,7 +335,62 @@ def test_main_shares_browser_resources_across_transactions(monkeypatch, tmp_path
         "rpa-challenge-score",
     ]
     assert observed_pages == [page, page]
-    assert "Final score: 100%" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "Final score: 100%" in output
+    assert "Input workbook source: direct download (urllib)" in output
+
+
+def test_main_reports_browser_fallback_source_and_click_timeout(monkeypatch, tmp_path, capsys):
+    config = {
+        "max_retries": 2,
+        "log_level": "INFO",
+        "transaction_db_path": "transactions.db",
+        "screenshot_dir": "",
+        "headless": True,
+    }
+    page = Mock()
+    page.is_closed.return_value = False
+
+    class FakeEngine:
+        def __init__(self, max_retries=0, **_kwargs):
+            self.max_retries = max_retries
+
+        def run(self, ctx):
+            if ctx.transaction.reference == "rpa-challenge-setup":
+                ctx.resources["page"] = page
+                ctx.transaction.state[DOWNLOAD_SOURCE_STATE_KEY] = DOWNLOAD_SOURCE_BROWSER
+                ctx.transaction.state[DOWNLOAD_CLICK_TIMEOUT_STATE_KEY] = 7_000
+                ctx.transaction.state["rows"] = [
+                    {
+                        "First Name": "Jane",
+                        "Last Name": "Doe",
+                        "Company Name": "ACME",
+                        "Role in Company": "Engineer",
+                        "Address": "1 Test St",
+                        "Email": "jane@example.com",
+                        "Phone Number": "555-0100",
+                    }
+                ]
+            elif ctx.transaction.reference == "rpa-challenge-score":
+                ctx.transaction.state["score"] = "100%"
+            ctx.transaction.status = Status.SUCCESSFUL
+
+    monkeypatch.setattr(
+        rpa_main, "load_config", lambda _path, *, require_file: config
+    )
+    monkeypatch.setattr(rpa_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(rpa_main, "configure_logger", lambda **_kwargs: None)
+    monkeypatch.setattr(rpa_main, "Engine", FakeEngine)
+    monkeypatch.setattr(rpa_main, "save_transaction", lambda *_args, **_kwargs: None)
+
+    rpa_main.main()
+
+    output = capsys.readouterr().out
+    assert (
+        'Input workbook source: browser fallback ("Download Excel" click, timeout=7000 ms)'
+        in output
+    )
+    assert "Final score: 100%" in output
 
 
 def test_main_continues_when_transaction_persistence_warns(monkeypatch, tmp_path, capsys):
