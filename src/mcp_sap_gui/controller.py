@@ -12,7 +12,7 @@ import re
 import time
 from datetime import datetime
 from functools import lru_cache
-from typing import Any, Dict, FrozenSet, Iterator, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
 
 from .models import (
     SAPGUIError,
@@ -192,6 +192,12 @@ class SAPGUIControllerBase:
         # sapgui/user_scripting_force_notification (SAP GUI Scripting
         # Security Guide), so it is called once per entry, not per tool call.
         self._rot_engines: Dict[str, Any] = {}
+        # How the last discovery reached each ROT entry (one record per
+        # entry tried, plus rot_enum_failed), so a recovered engine is
+        # visible in list_connections instead of only in the log.
+        self._last_discovery: Dict[str, Any] = {
+            "rot_enum_failed": False, "engines": [],
+        }
         # Scripting engine the bound connection came from (SAP Logon or a
         # SAP GUI server process); session-lookup helpers walk this one.
         self._application = None
@@ -280,20 +286,32 @@ class SAPGUIControllerBase:
                 logger.debug("Skipping unreadable ROT entry: %s", e)
         return names
 
-    def _get_engine_from_rot(self, rot_name: str):
+    def _get_engine_from_rot(self, rot_name: str,
+                             record: Optional[Dict[str, Any]] = None):
         """Resolve a ROT entry to its scripting engine, or None on failure.
 
         A cached engine is reused while it still answers; one that does not
         (SAP Logon or the GUI server process restarted) is dropped and the
-        entry resolved again.
+        entry resolved again. *record*, when given, is filled with how the
+        entry fared: ``cache_hit`` (the cached engine was reused),
+        ``dropped_stale`` (the cached engine failed its probe and was
+        discarded) and ``resolve_failed`` (the entry could not be resolved
+        to an engine).
         """
+        if record is not None:
+            record.update(cache_hit=False, dropped_stale=False,
+                          resolve_failed=False)
         cached = self._rot_engines.get(rot_name)
         if cached is not None:
             try:
                 cached.Children.Count
+                if record is not None:
+                    record["cache_hit"] = True
                 return cached
             except Exception as e:
                 logger.debug("Cached scripting engine %s is gone: %s", rot_name, e)
+                if record is not None:
+                    record["dropped_stale"] = True
                 del self._rot_engines[rot_name]
         try:
             gui = self._win32com.GetObject(rot_name)
@@ -306,28 +324,45 @@ class SAPGUIControllerBase:
                 e,
                 exc_info=logger.isEnabledFor(logging.DEBUG),
             )
+            if record is not None:
+                record["resolve_failed"] = True
             return None
         if engine is None:
             logger.debug("ROT entry %s returned no scripting engine", rot_name)
+            if record is not None:
+                record["resolve_failed"] = True
         else:
             self._rot_engines[rot_name] = engine
         return engine
 
-    def _iter_scripting_engines(self) -> Iterator[Tuple[str, str, Any]]:
-        """Yield ``(host, rot_name, engine)`` for every reachable SAP GUI.
+    def _discover_engines(self) -> Tuple[List[Tuple[str, str, Any]], Dict[str, Any]]:
+        """Resolve every reachable SAP GUI engine, with a record of how.
 
-        Order: SAP Logon (``SAPGUI``) first, then every process-specific
-        ``SAPGUISERVER-<hexPID>`` entry sorted by name. The unsuffixed
-        ``SAPGUISERVER`` is used only when no suffixed entry exists, since
-        it always points at the first GUI server process. Failures on single
-        entries are skipped; if the ROT cannot be enumerated, only SAP Logon
-        is tried.
+        Returns ``(engines, discovery)``. ``engines`` are ``(host, rot_name,
+        engine)`` tuples: SAP Logon (``SAPGUI``) first, then every
+        process-specific ``SAPGUISERVER-<hexPID>`` entry sorted by name. The
+        unsuffixed ``SAPGUISERVER`` is used only when no suffixed entry
+        exists, since it always points at the first GUI server process.
+        Failures on single entries are skipped; if the ROT cannot be
+        enumerated, only SAP Logon is tried.
+
+        ``discovery`` holds one record per ROT entry tried — its ``host``
+        (saplogon or sapguiserver), ``rot_entry``, ``cache_hit``,
+        ``dropped_stale`` and ``resolve_failed`` — and ``rot_enum_failed``
+        when the ROT itself could not be enumerated. list_connections
+        attaches it to every connection, so an engine recovery (a dropped
+        stale engine, re-resolved) is checkable without the log.
         """
         self._ensure_com_initialized()
 
-        engine = self._get_engine_from_rot("SAPGUI")
+        engines: List[Tuple[str, str, Any]] = []
+        discovery: Dict[str, Any] = {"rot_enum_failed": False, "engines": []}
+
+        record: Dict[str, Any] = {"host": "saplogon", "rot_entry": "SAPGUI"}
+        engine = self._get_engine_from_rot("SAPGUI", record)
+        discovery["engines"].append(record)
         if engine is not None:
-            yield "saplogon", "SAPGUI", engine
+            engines.append(("saplogon", "SAPGUI", engine))
 
         try:
             names = self._list_rot_names()
@@ -337,7 +372,13 @@ class SAPGUIControllerBase:
                 e,
                 exc_info=logger.isEnabledFor(logging.DEBUG),
             )
-            return
+            discovery["rot_enum_failed"] = True
+            discovery["note"] = (
+                "The COM Running Object Table could not be enumerated; only "
+                "SAP Logon (SAPGUI) was used. SAP GUI server processes (SAP "
+                "Business Client, embedded SAP GUI) are not listed."
+            )
+            return engines, discovery
 
         server_names = sorted({n for n in names if _SAPGUISERVER_ROT_RE.fullmatch(n)})
         if not server_names and "SAPGUISERVER" in names:
@@ -347,20 +388,25 @@ class SAPGUIControllerBase:
             del self._rot_engines[stale]
 
         for rot_name in server_names:
-            engine = self._get_engine_from_rot(rot_name)
+            record = {"host": "sapguiserver", "rot_entry": rot_name}
+            engine = self._get_engine_from_rot(rot_name, record)
+            discovery["engines"].append(record)
             if engine is not None:
-                yield "sapguiserver", rot_name, engine
+                engines.append(("sapguiserver", rot_name, engine))
+        return engines, discovery
 
     def _discover_connections(self) -> List[Tuple[str, str, Any, Any]]:
         """Return ``(host, rot_name, engine, connection)`` across all engines.
 
         The list position is the global connection index used by
-        list_connections() and connect_to_existing_session().
+        list_connections() and connect_to_existing_session(). The discovery
+        record of the run is kept on ``self._last_discovery`` (also when
+        this raises), so a caller can report how each engine was reached.
 
         Raises:
             SAPGUINotAvailableError: If no scripting engine is reachable.
         """
-        engines = list(self._iter_scripting_engines())
+        engines, self._last_discovery = self._discover_engines()
         if not engines:
             raise SAPGUINotAvailableError(_NOT_AVAILABLE_MESSAGE + ".")
 
@@ -931,6 +977,11 @@ class SAPGUIControllerBase:
         Covers SAP Logon as well as SAP GUI server processes (SAP Business
         Client, embedded SAP GUI). ``index`` is the global connection index
         accepted by connect_to_existing_session().
+
+        Every connection carries ``discovery``: how this run reached each
+        ROT entry (host, rot_entry, cache_hit, dropped_stale,
+        resolve_failed) and ``rot_enum_failed`` when the ROT itself could
+        not be enumerated and only SAP Logon was used.
         """
         connections = []
         for i, (host, rot_name, _engine, conn) in enumerate(
@@ -1001,6 +1052,7 @@ class SAPGUIControllerBase:
                 "host": host,
                 "rot_entry": rot_name,
                 "scripting_disabled": scripting_disabled,
+                "discovery": self._last_discovery,
             }
             if scripting_disabled:
                 entry["note"] = _SCRIPTING_DISABLED_NOTE

@@ -1464,7 +1464,10 @@ async def sap_list_connections(ctx: Context) -> dict:
     `scripting_disabled: true` means the server parameter sapgui/user_scripting
     is off, so no session can be read. Each session has its system, client,
     user, transaction, `session_number` (the "(2)" in "DEV(2)") and window
-    `title`."""
+    `title`. Each connection also carries `discovery`: how the engines were
+    reached this run (per ROT entry `cache_hit`, `dropped_stale`,
+    `resolve_failed`) and `rot_enum_failed` when only SAP Logon could be
+    used — so an engine recovery after a SAP GUI restart is checkable here."""
     c = _ctrl(ctx)
     connections = await _com(c.list_connections)
     return {"connections": connections}

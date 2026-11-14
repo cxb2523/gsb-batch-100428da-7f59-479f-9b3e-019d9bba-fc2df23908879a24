@@ -1887,6 +1887,16 @@ class TestEngineDiscovery:
             "host": "saplogon",
             "rot_entry": "SAPGUI",
             "scripting_disabled": False,
+            "discovery": {
+                "rot_enum_failed": False,
+                "engines": [{
+                    "host": "saplogon",
+                    "rot_entry": "SAPGUI",
+                    "cache_hit": False,
+                    "dropped_stale": False,
+                    "resolve_failed": False,
+                }],
+            },
         }]
 
     def test_business_client_server_connection_is_listed_and_attachable(self):
