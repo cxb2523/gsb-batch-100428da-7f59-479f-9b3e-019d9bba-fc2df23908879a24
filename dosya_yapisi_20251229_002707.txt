@@ -1,0 +1,26 @@
+============================================================
+DOSYA YAPISI TARAMASI
+============================================================
+Tarih: 29.12.2025 00:27:07
+Başlangıç Dizini: C:\Users\gcmsx\Desktop\archive\backend
+============================================================
+
+📁 backend/
+├── 📁 crawler/
+│   └── 📄 main.py (1.18 KB)
+├── 📁 discovery/
+│   ├── 📄 discovery_engine.py (6.71 KB)
+│   ├── 📄 google_scraper.py (11.89 KB)
+│   └── 📄 run_discovery.py (3.69 KB)
+├── 📄 dosya_yapisi_20251229_002707.txt (0.00 B)
+├── 📄 requirements.txt (220.00 B)
+├── 📁 supabase/
+│   └── 📄 schema.sql (1.31 KB)
+├── 📄 tara.py (4.26 KB)
+└── 📁 utils/
+    ├── 📄 config.py (792.00 B)
+    └── 📄 logger.py (551.00 B)
+
+============================================================
+Tarama tamamlandı!
+============================================================
