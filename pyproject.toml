@@ -1,0 +1,57 @@
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["endpointscanner*"]
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "endpointscanner"
+version = "7.5.3"
+readme = "README.md"
+description = "Extremely accurate open-source website endpoint scanner and rate limit tester that can bypass simple anti-bot software. Built for cybersecurity red teamers to perform reconnaissance on websites."
+requires-python = ">=3.9"
+
+authors = [
+    { name = "SphericalFlower52811", email = "sphericalflower52811@gmail.com" }
+]
+
+keywords = [
+    "web-crawler",
+    "rate-limiting",
+    "bug-bounty",
+    "web-crawler-python",
+    "pentest-tool",
+    "endpoint-discovery",
+    "crawler-python",
+    "bugbounty-tool",
+    "web-reconnaissance",
+    "web-recon-tool",
+    "cybersecurity-tools",
+    "endpoint-extraction",
+    "spa-crawler",
+    "reconnaissance",
+    "directory-crawler",
+    "directory-discoverer",
+    "directory-enumeration"
+]
+
+dependencies = [
+    "curl_cffi",
+    "beautifulsoup4",
+    "playwright",
+    "playwright-stealth",
+    "httpx[http2]>=0.27.0",
+    "colorama>=0.4.6"
+]
+
+[project.scripts]
+# pyprojectthing
+endpointscanner = "endpointscanner.enumerateendpoint:main"
+
+[project.urls]
+Repository = "https://github.com/SphericalFlower52811/endpointscanner"
+Issues = "https://github.com/SphericalFlower52811/endpointscanner/issues"
+Docs = "https://sphericalflower52811.github.io/endpointscanner/"
+

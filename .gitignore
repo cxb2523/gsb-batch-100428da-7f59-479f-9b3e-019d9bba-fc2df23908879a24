@@ -1,0 +1,10 @@
+__pycache__/
+.qodo/
+.DS_Store
+*.egg-info/
+todos.md
+.vscode
+dist
+.ipynb_checkpoints
+rfpwwt.md
+
