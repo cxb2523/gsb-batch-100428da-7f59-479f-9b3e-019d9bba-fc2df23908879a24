@@ -13,7 +13,7 @@ import ijson
 
 from .accounts_pool import AccountsPool
 from .logger import logger
-from .models import Query, ScrapingResult
+from .models import Query, ScrapingResult, TimelineLegTrace
 from .response import FacebookGraphQLParser
 from .worker_pool import WorkerPool
 
@@ -222,6 +222,7 @@ class FacebookScraper:
         media_manifest: str | None = None,
         media_concurrency: int = 8,
         include_thumbnails: bool = False,
+        leg_trace: list[TimelineLegTrace] | None = None,
         # Other mode-specific tuning knobs (pagination_count, scroll_burst_every,
         # max_paginations, etc.) are accepted as kwargs; allowed keys live in
         # Query.ENDPOINT_REGISTRY. Anything left as None gets the registry default.
@@ -280,6 +281,21 @@ class FacebookScraper:
                   --from-manifest <path>`), keeping the scrape loop fast.
             media_concurrency: Concurrent media fetches per batch (default 8).
             include_thumbnails: Also fetch / queue video thumbnails.
+            leg_trace: Optional list that receives one `TimelineLegTrace` per
+                  submitted leg, in submission order. The merged
+                  `ScrapingResult` is unchanged (same fields and semantics as
+                  without a trace); the trace is the only way to see how many
+                  cursor_reset legs a target ran, each leg's own result, the
+                  per-leg post count, the count that survived cross-leg dedup,
+                  the `end_date` actually submitted per leg, and whether a
+                  `cursor_reset` caused another leg to be submitted. Pass a
+                  *separate* list per target in a batch — each call only
+                  appends to its own list, so concurrent targets never
+                  overwrite each other. When None (default) no trace is
+                  recorded and behavior is identical to calls without it.
+                  On an unreadable `resume_from`, the fresh-scrape fallback is
+                  preserved and leg 0's trace is marked
+                  `resume_cursor_used=False`.
             **params: other mode-specific tuning knobs. Allowed keys and
                   defaults live in Query.ENDPOINT_REGISTRY[("UserTimeline", mode)]["params"].
                   Pass `None` (or omit) to use the registry default.
@@ -315,6 +331,7 @@ class FacebookScraper:
         # below so flatten-based dedup catches anything the interceptor misses.
         initial_cursor = ""
         saved_post_ids: list[str] = []
+        resume_read_failed = False
         if resume_from is not None:
             # Sidecar fast-path, else streamed via ijson on a thread so
             # concurrent --continue targets don't serialize on the event loop.
@@ -337,6 +354,10 @@ class FacebookScraper:
                     f"({type(e).__name__}: {e}); scraping fresh (no resume)"
                 )
                 initial_cursor, saved_post_ids = "", []
+                # Surfaced on leg 0's TimelineLegTrace so a batch caller can
+                # tell a resume-less leg caused by an unreadable file apart
+                # from a call that never requested a resume.
+                resume_read_failed = True
 
         # Multi-leg resume loop. Each leg is a single submit→await; if a leg
         # comes back with `result='cursor_reset'` we adjust `end_date` back
@@ -361,6 +382,12 @@ class FacebookScraper:
         seen_post_ids: set[str] = set(saved_post_ids)
         accumulated_posts: list[dict] = []
         legs: list[ScrapingResult] = []
+        # Optional per-leg trajectory. A caller-supplied list is mutated in
+        # place (one TimelineLegTrace per submitted leg); a fresh internal
+        # list keeps the bookkeeping uniform when tracing is off. Each
+        # user_timeline call owns its own list, so batch targets running
+        # concurrently can't clobber each other's traces.
+        trace: list[TimelineLegTrace] = leg_trace if leg_trace is not None else []
         final_result: str | None = None
 
         for leg_idx in range(MAX_CURSOR_RESET_RESUMES + 1):
@@ -417,6 +444,25 @@ class FacebookScraper:
                 f"(new={new_count}), accumulated={len(accumulated_posts)}"
             )
 
+            # Record the leg's trajectory before any terminal branch can
+            # break the loop. cursor_reset_continued is flipped to True below
+            # on the only path that submits another leg.
+            leg_entry = TimelineLegTrace(
+                leg_index=leg_idx,
+                result=leg.result,
+                leg_post_count=len(leg.data),
+                new_post_count=new_count,
+                end_date=current_end_date,
+                cursor_reset_continued=False,
+                # Only leg 0 can carry a resume cursor, and only when the
+                # resume file actually yielded one. A failed resume read
+                # (fresh-scrape fallback) leaves this False and sets
+                # resume_read_failed instead.
+                resume_cursor_used=(leg_idx == 0 and bool(initial_cursor)),
+                resume_read_failed=(leg_idx == 0 and resume_read_failed),
+            )
+            trace.append(leg_entry)
+
             if leg.result != "cursor_reset":
                 final_result = leg.result
                 break
@@ -468,6 +514,11 @@ class FacebookScraper:
                 f"{leg_idx}; resuming with end_date={new_end_date} "
                 f"(was {current_end_date})"
             )
+            # Another leg is actually submitted only while iterations remain;
+            # a reset on the final allowed leg ends via the for-else
+            # (`cursor_reset_max_retries`) and must not read as continued.
+            if leg_idx < MAX_CURSOR_RESET_RESUMES:
+                leg_entry.cursor_reset_continued = True
             current_end_date = new_end_date
         else:
             final_result = "cursor_reset_max_retries"

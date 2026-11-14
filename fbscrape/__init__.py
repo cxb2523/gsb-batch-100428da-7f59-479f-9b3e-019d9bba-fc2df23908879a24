@@ -14,7 +14,7 @@ from .downloaders import (
 )
 from .response import ResponseInterceptor, FacebookGraphQLParser
 from .scraper import FacebookScraper
-from .models import ScrapingResult
+from .models import ScrapingResult, TimelineLegTrace
 from .utils import parse_facebook_date, internet_good, is_post_url, extract_post_id, gather
 
 __all__ = [
@@ -24,6 +24,7 @@ __all__ = [
     'FacebookGraphQLParser',
     'FacebookScraper',
     'ScrapingResult',
+    'TimelineLegTrace',
     'append_media_manifest',
     'download_media_from_manifest',
     'download_media_from_posts',

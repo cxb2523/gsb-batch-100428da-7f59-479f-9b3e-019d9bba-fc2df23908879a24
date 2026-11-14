@@ -629,6 +629,57 @@ class ScrapeOutcome:
 
 
 @dataclass
+class TimelineLegTrace:
+    """Per-leg trajectory of one `FacebookScraper.user_timeline` call.
+
+    The high-level call may span several submitted tasks ("legs"): when a leg
+    comes back `cursor_reset`, the scraper advances `end_date` backward to the
+    oldest collected post's day and submits another leg. The merged
+    `ScrapingResult` hides that loop; an opt-in trace list records one entry
+    per leg so a batch caller can see how many legs each target ran and why
+    each one stopped.
+
+    Fields:
+        leg_index: Zero-based position of the leg in this call (leg 0 is the
+            first submission; it is the only leg that can carry a resume
+            cursor).
+        result: The leg's own `ScrapingResult.result` string (e.g. "success",
+            "max_posts_reached", "cursor_reset", "end_of_feed", ...).
+        leg_post_count: Number of posts the leg itself returned
+            (`len(leg.data)`).
+        new_post_count: Posts from this leg that survived cross-leg dedup and
+            were actually added to the merged result. Posts whose flattened
+            `post_id` was already seen — including IDs seeded from a resume
+            file — are not counted.
+        end_date: The `end_date` this leg was actually submitted with (after
+            any cursor-reset adjustment; None when the call had no upper
+            bound).
+        cursor_reset_continued: True when this leg returned `cursor_reset`
+            and another leg was submitted because of it. False for the final
+            leg of every call — including a terminal `cursor_reset` (no upper
+            bound, no posts to advance on, no date progress, retries
+            exhausted).
+        resume_cursor_used: True only for leg 0 when a resume cursor read
+            from `resume_from` was actually threaded into the submitted Query.
+            False when no `resume_from` was given, when the resume file
+            read failed (the call then falls back to a fresh scrape), or for
+            every leg after leg 0 (post-reset legs start fresh by design).
+        resume_read_failed: True only for leg 0 when `resume_from` was given
+            but its state could not be read; the call then falls back to a
+            fresh scrape (the pre-trace behavior, unchanged) and this leg did
+            not use a resume cursor. False otherwise.
+    """
+    leg_index: int
+    result: str
+    leg_post_count: int
+    new_post_count: int
+    end_date: str | None
+    cursor_reset_continued: bool
+    resume_cursor_used: bool
+    resume_read_failed: bool = False
+
+
+@dataclass
 class ScrapingResult:
     """Result of a Facebook scraping operation.
 
