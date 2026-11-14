@@ -16,7 +16,8 @@ import { execFileSync } from "node:child_process";
 import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { dataKeyForSlug, dataFileForDataKey, validateDiscoveryMap } from "../lib/discovery-map.js";
-import { safeFetchText, extractSearchableText } from "../lib/ssrf-guard.js";
+import { safeFetchText } from "../lib/ssrf-guard.js";
+import { evaluateFetchedEvidence } from "../lib/evidence-verify.js";
 
 const ROOT = process.cwd();
 const OUT_DIR = path.join(ROOT, ".discovery");
@@ -91,6 +92,9 @@ type VerifyFlag =
   | { status: "cooccurrence-miss"; detail: string }
   | { status: "unreachable"; detail: string }
   | { status: "pdf-unverifiable"; detail: string }
+  // Fetch succeeded but the body carried no text at all (empty / whitespace-only). This is a
+  // READABILITY limitation, not evidence the score is absent — it must not read as a co-occurrence miss.
+  | { status: "content-unreadable"; detail: string }
   | { status: "skipped" };
 
 interface SurvivingAdd {
@@ -253,39 +257,22 @@ function normKey(name: string, score: number | null): string {
   return `${name.toLowerCase().replace(/\s+/g, " ").trim()}::${score ?? "null"}`;
 }
 
-function longestToken(name: string): string {
-  const toks = name.match(/[A-Za-z0-9]{3,}/g) ?? [];
-  return toks.sort((a, b) => b.length - a.length)[0] ?? "";
-}
-
 async function softVerify(entry: Omit<Entry, "rank">, noFetch: boolean): Promise<VerifyFlag> {
   if (noFetch) return { status: "skipped" };
   const f = await safeFetchText(entry.sourceUrl, { timeoutMs: 12_000 });
   if (!f.ok) return { status: "unreachable", detail: f.reason };
   // Route PDF bodies through pdftotext; raw includes() over compressed PDF bytes false-negatives
   // (a PDF source can genuinely contain score+name yet report hasName:false -> wrong dismissal).
-  const body = await extractSearchableText(f.bytes, f.contentType);
-  if (body === null)
-    return {
-      status: "pdf-unverifiable",
-      detail: "PDF source; pdftotext unavailable or failed — text not extracted",
-    };
-  const num = entry.scoreValue != null ? String(entry.scoreValue) : "";
-  const token = longestToken(entry.systemName);
-  const hasNum = num !== "" && body.includes(num);
-  // Short system names (e.g. "o3") yield no 3+ char token — longestToken returns "". Do NOT pass
-  // attribution trivially in that case: require the FULL systemName to co-occur with the score, else
-  // flag a co-occurrence miss (the number may belong to a different row in an unlabelled table).
-  const name = entry.systemName.toLowerCase().trim();
-  const hasName =
-    token !== ""
-      ? body.toLowerCase().includes(token.toLowerCase())
-      : name !== "" && body.toLowerCase().includes(name);
-  if (hasNum && hasName) return { status: "verified" };
-  return {
-    status: "cooccurrence-miss",
-    detail: `fetched body did not contain both score "${num}" and system token "${token}"`,
-  };
+  // A body we cannot read (PDF without a text layer, or an empty/whitespace-only page) is a TOOLING
+  // limitation, not evidence of absence — surface it as its own status so it never reads as a miss.
+  const v = await evaluateFetchedEvidence(
+    f.bytes,
+    f.contentType,
+    entry.scoreValue,
+    entry.systemName
+  );
+  if (v.status === "verified") return { status: "verified" };
+  return { status: v.status, detail: v.detail ?? "" };
 }
 
 function verifyEmoji(v: VerifyFlag): string {
@@ -296,6 +283,8 @@ function verifyEmoji(v: VerifyFlag): string {
       return `⚠️ co-occurrence miss — ${v.detail}`;
     case "pdf-unverifiable":
       return `⚠️ pdf-unverifiable — ${v.detail}`;
+    case "content-unreadable":
+      return `⚠️ content-unreadable — ${v.detail} (not evidence the score is absent; verify by hand)`;
     case "unreachable":
       return `⚠️ unreachable — ${v.detail}`;
     case "skipped":

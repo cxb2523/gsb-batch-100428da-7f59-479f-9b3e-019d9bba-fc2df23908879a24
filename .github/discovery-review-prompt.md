@@ -10,20 +10,23 @@ You HAVE tools — but they are HARD-SCOPED by `.github/discovery-review-setting
 - You may WRITE/EDIT only files under `.discovery/reviewed/`. You may NEVER touch `src/data/`,
   `src/lib/`, `src/scripts/`, `src/pages/`, `src/components/`, `.github/`, `package.json`,
   `CLAUDE.md`, or `.env`. The deterministic `apply` step owns ALL writes to `src/data` and all git/gh.
-- You may fetch the network ONLY through the SSRF-guarded verify wrapper:
-  `./.github/discovery-verify.sh <url> <scoreValue> <systemName>` → JSON
-  `{status:"verified"|"cooccurrence-miss"|"unreachable"|"pdf-unverifiable", hasNum, hasName, fetchedBytes}`.
+- You may fetch the network ONLY through the SSRF-guarded verify wrapper
+  `./.github/discovery-verify.sh <url> <scoreValue> <systemName>`. It prints JSON with `status`,
+  `hasNum`, `hasName`, and `fetchedBytes`; `status` is one of `verified`, `cooccurrence-miss`,
+  `unreachable`, `pdf-unverifiable`, `content-unreadable`.
   This is the ONLY permitted fetch path. Every interpreter (`node`, `bun`, `python`, …) is DENIED, and
   `curl`/`wget`/`fetch` are DENIED — so the wrapper is the sole way to reach a URL, and it forces every
   hop through the SSRF guard (http(s)-only; private, loopback, link-local, and 169.254.169.254 metadata
   IPs blocked). Do not attempt any other network access.
   - **Interpreting the status:** `verified` means only that score and system-name text co-occur;
     it does not prove table-row attribution or independent reproduction. `cooccurrence-miss`
-    is *evidence the attribution may be wrong* — investigate (it is grounds to downgrade). But
-    `unreachable` and `pdf-unverifiable` are **tooling limitations, NOT evidence of mis-attribution** —
-    a transient fetch failure or a PDF the wrapper's text extractor could not read. Do NOT
-    `recommend-dismiss` an add *solely* because the status is `unreachable` or `pdf-unverifiable`;
-    decide on the add's other evidence (`quotedEvidence`, source tier, comparability) instead.
+    is _evidence the attribution may be wrong_ — investigate (it is grounds to downgrade). But
+    `unreachable`, `pdf-unverifiable`, and `content-unreadable` are **tooling limitations, NOT evidence
+    of mis-attribution** — a transient/blocked fetch, a PDF the wrapper's text extractor could not
+    read, or a fetched page whose body was empty/whitespace-only (e.g. JS-rendered, no text layer).
+    Do NOT `recommend-dismiss` an add _solely_ because the status is `unreachable`,
+    `pdf-unverifiable`, or `content-unreadable`; decide on the add's other evidence
+    (`quotedEvidence`, source tier, comparability) instead.
 - NEVER read or print secrets (`.env`, `printenv`, `env`, `/proc`, `*$TOKEN*`, `*ANTHROPIC*`,
   `*ZAI*`, `*GITHUB_ENV*`). Those commands are denied.
 - NEVER run `git commit/push`, `gh pr create/merge`. You open no PRs and merge nothing.

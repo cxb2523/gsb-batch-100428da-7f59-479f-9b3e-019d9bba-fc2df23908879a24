@@ -17,9 +17,17 @@ import path from "node:path";
 const execFileP = promisify(execFile);
 
 // Upper bound on a fetched body's size (bytes). Guards the soft evidence re-fetch against a
-// multi-GB response OOMing the process before pdftotext/UTF-8 decoding can run. Header-based: a
-// chunked response without Content-Length is not pre-capped (acceptable for an SSRF-validated source).
+// multi-GB response OOMing the process before pdftotext/UTF-8 decoding can run. Enforced BOTH
+// against Content-Length (cheap pre-check) AND while the body is being consumed: a chunked/streamed
+// response without Content-Length is counted as it is read and aborted the moment the running total
+// crosses the cap, so a hostile page can never be fully buffered first.
 const MAX_FETCH_BYTES = 16 * 1024 * 1024; // 16 MiB
+// Redirect-chain diagnostics: reasons are surfaced in PR bodies / verify JSON, so keep the URLs short.
+const MAX_URL_IN_REASON = 160;
+
+function shortUrl(u: string): string {
+  return u.length > MAX_URL_IN_REASON ? `${u.slice(0, MAX_URL_IN_REASON - 3)}...` : u;
+}
 
 export type SsrfVerdict = { ok: true } | { ok: false; reason: string };
 
@@ -62,25 +70,94 @@ export type SafeFetchResult =
   | { ok: true; status: number; text: string; contentType: string; bytes: Uint8Array }
   | { ok: false; reason: string };
 
+// Read a response body with a hard streaming cap. Content-Length (when present and honest) is a
+// cheap pre-check, but chunked responses often carry no length at all — so we ALSO count bytes as the
+// body is consumed and abort the instant the running total crosses MAX_FETCH_BYTES. We deliberately
+// never call res.arrayBuffer()/res.text(): those buffer the entire payload first, which is exactly the
+// OOM this cap exists to prevent.
+async function readBodyCapped(
+  res: Response
+): Promise<{ ok: true; bytes: Uint8Array } | { ok: false; reason: string }> {
+  const declared = Number(res.headers.get("content-length") ?? NaN);
+  if (Number.isFinite(declared) && declared > MAX_FETCH_BYTES) {
+    await res.body?.cancel().catch(() => {});
+    return {
+      ok: false,
+      reason: `body too large: server declared ${declared} bytes > ${MAX_FETCH_BYTES} byte cap — size limit exceeded before reading`,
+    };
+  }
+  if (!res.body) return { ok: true, bytes: new Uint8Array(0) };
+  const hadUsableLength = Number.isFinite(declared) && declared >= 0;
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || value.byteLength === 0) continue;
+      total += value.byteLength;
+      if (total > MAX_FETCH_BYTES) {
+        await reader.cancel().catch(() => {});
+        return {
+          ok: false,
+          reason: `body too large: response exceeded the ${MAX_FETCH_BYTES} byte cap after ${total} bytes read — counted while streaming and aborted mid-stream, not buffered (${
+            hadUsableLength
+              ? "server's Content-Length was smaller than the actual body"
+              : "no Content-Length (chunked/streamed response)"
+          })`,
+        };
+      }
+      chunks.push(value);
+    }
+  } catch (e) {
+    await reader.cancel().catch(() => {});
+    return { ok: false, reason: `fetch failed while reading body: ${(e as Error).message}` };
+  } finally {
+    reader.releaseLock();
+  }
+  // Copy into one contiguous buffer only after the cap held — at most MAX_FETCH_BYTES is ever held.
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    bytes.set(c, offset);
+    offset += c.byteLength;
+  }
+  return { ok: true, bytes };
+}
+
+// Test seam: production callers MUST NOT set these. They exist so the guard's own tests can point it
+// at a loopback HTTP server (which the real per-hop private-IP check correctly rejects) and at a
+// stubbed fetch, without weakening the defaults every real caller gets.
+export interface SafeFetchDeps {
+  fetchImpl?: typeof fetch;
+  checkHost?: (host: string) => Promise<SsrfVerdict>;
+}
+
 // Fetch a URL as text with SSRF protection on EVERY hop: validate scheme/creds, resolve + check
 // the host's IPs, fetch with redirect:"manual", and re-validate each Location before following.
-// Bounded to maxHops (default 3). Never follows a redirect to a private/metadata host.
+// Bounded to maxHops (default 3) redirects. Never follows a redirect to a private/metadata host.
+// Failure reasons are human-facing (they land in PR bodies and verify JSON), so they state exactly
+// what happened: which hop the chain stopped on, or that the byte cap was exceeded.
 export async function safeFetchText(
   rawUrl: string,
-  opts: { timeoutMs?: number; maxHops?: number } = {}
+  opts: { timeoutMs?: number; maxHops?: number; deps?: SafeFetchDeps } = {}
 ): Promise<SafeFetchResult> {
   const maxHops = opts.maxHops ?? 3;
   const timeoutMs = opts.timeoutMs ?? 12_000;
+  const fetchImpl = opts.deps?.fetchImpl ?? fetch;
+  const checkHost = opts.deps?.checkHost ?? assertSafeHost;
   let current = rawUrl;
-  for (let hop = 0; hop <= maxHops; hop++) {
+  let redirects = 0; // redirect responses followed so far (not counting the initial request)
+  for (;;) {
     const urlCheck = assertSafePublicUrl(current);
     if (!urlCheck.ok) return { ok: false, reason: urlCheck.reason };
     const url = new URL(current);
-    const hostCheck = await assertSafeHost(url.hostname);
+    const hostCheck = await checkHost(url.hostname);
     if (!hostCheck.ok) return { ok: false, reason: hostCheck.reason };
     let res: Response;
     try {
-      res = await fetch(current, {
+      res = await fetchImpl(current, {
         redirect: "manual",
         signal: AbortSignal.timeout(timeoutMs),
         headers: { "user-agent": "leaderboard-discovery-apply/1.0 (+verify)" },
@@ -90,39 +167,52 @@ export async function safeFetchText(
     }
     // 2xx -> done. 3xx -> validate + follow one hop. Anything else -> unreachable (soft miss).
     if (res.status >= 200 && res.status < 300) {
-      // Reject oversized bodies before buffering: res.arrayBuffer() materializes the whole response,
-      // so a multi-GB file OOMs the process before pdftotext/decoding runs. (A missing/zero
-      // Content-Length — e.g. chunked — is not pre-capped; the source is already SSRF-validated.)
-      const cl = Number(res.headers.get("content-length") ?? 0);
-      if (cl && cl > MAX_FETCH_BYTES) {
-        return { ok: false, reason: `body too large (${cl} bytes > ${MAX_FETCH_BYTES})` };
-      }
       // Capture raw bytes (+ content-type) so PDF bodies can be routed through pdftotext instead of
       // a naive substring search (res.text() UTF-8-decodes compressed PDF streams -> false negatives).
-      const ab = await res.arrayBuffer().catch(() => null);
-      if (ab === null) return { ok: false, reason: "empty/undecodable response body" };
-      const bytes = new Uint8Array(ab);
+      const body = await readBodyCapped(res);
+      if (!body.ok) return { ok: false, reason: body.reason };
       return {
         ok: true,
         status: res.status,
         contentType: res.headers.get("content-type") ?? "",
-        bytes,
-        text: Buffer.from(bytes).toString("utf8"),
+        bytes: body.bytes,
+        text: Buffer.from(body.bytes).toString("utf8"),
       };
     }
     if (res.status >= 300 && res.status < 400) {
+      // A redirect body is never used; drop it so the socket can be reused/closed promptly.
+      await res.body?.cancel().catch(() => {});
       const location = res.headers.get("location");
-      if (!location) return { ok: false, reason: `redirect ${res.status} without Location` };
-      try {
-        current = new URL(location, current).toString(); // resolve relative redirects
-      } catch {
-        return { ok: false, reason: `redirect Location unparseable: ${location.slice(0, 80)}` };
+      if (!location) {
+        return {
+          ok: false,
+          reason: `redirect ${res.status} without Location at ${shortUrl(current)} (after ${redirects} redirect(s))`,
+        };
       }
+      let next: string;
+      try {
+        next = new URL(location, current).toString(); // resolve relative redirects
+      } catch {
+        return {
+          ok: false,
+          reason: `redirect Location unparseable at ${shortUrl(current)}: ${location.slice(0, 80)}`,
+        };
+      }
+      redirects++;
+      if (redirects > maxHops) {
+        // Names the real chain length and the exact hop that pushed it over the limit, plus where
+        // that hop pointed — otherwise "exceeded N redirects" gives no way to diagnose the source.
+        return {
+          ok: false,
+          reason: `redirect limit exceeded: ${redirects} redirect(s) encountered (max ${maxHops}); last hop ${shortUrl(current)} -> ${shortUrl(next)}`,
+        };
+      }
+      current = next;
       continue;
     }
-    return { ok: false, reason: `HTTP ${res.status}` };
+    await res.body?.cancel().catch(() => {});
+    return { ok: false, reason: `HTTP ${res.status} at ${shortUrl(current)}` };
   }
-  return { ok: false, reason: `exceeded ${maxHops} redirects` };
 }
 
 // True when a fetched body is a PDF — by content-type, or the %PDF- magic bytes (some servers omit
@@ -138,13 +228,22 @@ export function isPdfBody(contentType: string, bytes: Uint8Array): boolean {
   );
 }
 
+// Outcomes of turning a fetched body into searchable text. Distinct failure statuses matter because
+// the caller's verdict feeds dismissals: "cooccurrence-miss" reads as EVIDENCE THE SCORE IS ABSENT,
+// while "we could not read the page" must not be treated as such. Two non-miss statuses:
+//   - pdf-unverifiable: PDF whose text layer could not be extracted (pdftotext missing/failed, or an
+//     image-only/scanned/encrypted PDF yielding no text).
+//   - content-unreadable: the HTTP fetch SUCCEEDED but the body was empty or whitespace-only (e.g. a
+//     JS-rendered page, a 204-style placeholder, or a truncated/misconfigured response). There is
+//     simply no text to search, so reporting "score missing" would be wrong.
+export type TextExtraction =
+  | { ok: true; text: string }
+  | { ok: false; status: "pdf-unverifiable" | "content-unreadable"; detail: string };
+
 // Extract text suitable for substring attribution checks. HTML/text -> UTF-8 decode. PDF ->
 // pdftotext, because raw `includes()` over compressed PDF bytes false-negatives: a source can
 // genuinely contain the score + system name yet report hasName:false (verified 2026-06-28 on an
-// openreview.net PDF). Returns null for a PDF we could not extract (pdftotext missing/failed) OR whose
-// extraction yielded no text (image-only/scanned/encrypted) — so callers emit a distinct
-// "pdf-unverifiable" verdict instead of a misleading "cooccurrence-miss" (which reads as evidence the
-// score is absent when really we just couldn't read the page).
+// openreview.net PDF).
 //
 // Security: `bytes` come from an already-SSRF-validated fetch. pdftotext reads a temp file whose name
 // is process-generated; fetched text is NEVER placed in argv (fixed args ["-q", file, "-"]), so an
@@ -152,8 +251,18 @@ export function isPdfBody(contentType: string, bytes: Uint8Array): boolean {
 export async function extractSearchableText(
   bytes: Uint8Array,
   contentType: string
-): Promise<string | null> {
-  if (!isPdfBody(contentType, bytes)) return Buffer.from(bytes).toString("utf8");
+): Promise<TextExtraction> {
+  if (!isPdfBody(contentType, bytes)) {
+    const text = Buffer.from(bytes).toString("utf8");
+    if (text.trim() === "") {
+      return {
+        ok: false,
+        status: "content-unreadable",
+        detail: `fetch succeeded but body was empty or whitespace-only (${bytes.length} byte(s), content-type "${contentType || "unknown"}")`,
+      };
+    }
+    return { ok: true, text };
+  }
   const file = path.join(tmpdir(), `dv-${process.pid}-${bytes.length}.pdf`);
   try {
     await writeFile(file, bytes);
@@ -162,10 +271,21 @@ export async function extractSearchableText(
       timeout: 20_000,
     });
     // pdftotext exits 0 with "" on an image-only/scanned/encrypted PDF (no extractable text layer).
-    // Treat an empty/whitespace extraction like a failure -> pdf-unverifiable, not cooccurrence-miss.
-    return stdout.trim() === "" ? null : stdout;
-  } catch {
-    return null; // pdftotext missing or failed -> caller marks pdf-unverifiable
+    if (stdout.trim() === "") {
+      return {
+        ok: false,
+        status: "pdf-unverifiable",
+        detail:
+          "PDF source; pdftotext extracted no text (image-only/scanned/encrypted) — text not extractable",
+      };
+    }
+    return { ok: true, text: stdout };
+  } catch (e) {
+    return {
+      ok: false,
+      status: "pdf-unverifiable",
+      detail: `PDF source; pdftotext unavailable or failed — text not extracted (${(e as Error).message})`,
+    };
   } finally {
     await unlink(file).catch(() => {});
   }

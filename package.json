@@ -15,7 +15,8 @@
     "discover:judge": "tsc -p tsconfig.script.json && node dist/scripts/discover-judge.js",
     "discover:apply": "tsc -p tsconfig.script.json && node dist/scripts/discover-apply.js",
     "discover:verify": "tsc -p tsconfig.script.json && node dist/scripts/discover-verify.js",
-    "test:charts": "tsx --test tests/model-classification.test.ts"
+    "test:charts": "tsx --test tests/model-classification.test.ts",
+    "test:ssrf": "tsx --test tests/ssrf-guard.test.ts"
   },
   "dependencies": {
     "@astrojs/react": "^4.4.2",
