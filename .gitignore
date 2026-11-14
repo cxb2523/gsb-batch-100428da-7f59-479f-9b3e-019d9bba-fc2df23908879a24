@@ -1,0 +1,10 @@
+# IDE/Editor Junk:
+.sonarlint/
+.vscode/
+.idea/
+
+# Node Stuff:
+node_modules
+
+# Temporary Directories:
+output
