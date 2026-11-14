@@ -1,0 +1,13 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+  # Python deps use lower bounds on purpose (wider compatibility for users), so no
+  # routine "raise the minimum" PRs; GitHub security updates still open PRs when needed.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 0

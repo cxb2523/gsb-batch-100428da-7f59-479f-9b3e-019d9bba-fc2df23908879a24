@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# never commit credentials
+credential.json
+pending_login.json
+login_qrcode.png
+
+# third-party avatar pictures used to render assets/origin.png
+assets/avatars/
