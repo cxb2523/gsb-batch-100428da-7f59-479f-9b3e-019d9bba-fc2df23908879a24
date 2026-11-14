@@ -36,6 +36,28 @@ First you need to install [vcredist_x64.exe](https://www.microsoft.com/en-gb/dow
 
 Please also consider rewriting the functions in `personalized_config.py`: `fetch_new_emails_by_date`, `fetch_new_emails_by_id`, and `url_rewrite`. The two first functions should match your implemetation for fetching newly reported emails, and `url_rewrite` is designed to extract and return a decoded URL from a given string. In case the URLs within the messages are rewritten (e.g., rewritten by Microsoft's Safe Links or Proofpoint's URL Defense), you might need to decode these URLs before loading them by the crawler.
 
+#### Inbox contract
+The fetchers must return a list of dictionaries, one per reported email, with exactly these keys:
+
+| Key | Meaning |
+| --- | --- |
+| `phish_id` | Identifier of the reported email. It is also the in-batch deduplication key and the `phish_id` passed to the parser. |
+| `rawUrl` | URL from which the raw `.eml` file is downloaded. |
+
+The key names are exported as `INBOX_ID_KEY` and `INBOX_RAW_URL_KEY` in `personalized_config.py`; fetching, de-duplication, outcome reporting and parsing all use the same `phish_id` (there is no separate `id` key).
+
+#### Per-email outcomes
+`crawlerbox.analyzer.analyze(inbox)` downloads and parses every email independently and returns one `EmailOutcome` per inbox entry, in inbox order:
+
+* `status`: `success`, `download_failed`, `duplicate_skipped`, `parse_failed` or `invalid_entry`;
+* `phish_id` and `raw_url`: the entry concerned;
+* `reason`: human readable failure reason (e.g. `HTTP 404 Not Found`, `connection error ...`, `empty response body`).
+
+A failing download (connection error, non-2xx status, empty body) or a crashing parser only affects that email; the rest of the batch keeps going. Entries sharing a `phish_id` inside one batch are parsed once, later ones are reported as `duplicate_skipped` (no cross-batch persistence). Downloads use a finite connect/read timeout (`DEFAULT_DOWNLOAD_TIMEOUT`, override with `--timeout`).
+
+The CLI prints the per-email outcomes after each batch; `main()`, `run_crawler()` and `scheduler()` also return them when called from Python.
+
+
 
 ### Running *CrawlerBox*
 You can run *CrawlerBox* in three manners. 

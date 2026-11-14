@@ -715,6 +715,14 @@ def parse_structure(rawemail,structure,phish_id,session):
 
 
 def parse_data(phish_id,rawemail_inbytes):
+    '''Parse one raw EML and store the results.
+
+    Returns True when the email was parsed (or was already in the database),
+    False when the analysis had to be skipped because of an unrecoverable
+    error. Errors are logged; the caller (crawlerbox.analyzer) records the
+    per-email outcome.
+    '''
+    parsed=False
     try:
         #update DB
         session,db=phishdb_layer.open_session()
@@ -750,5 +758,7 @@ def parse_data(phish_id,rawemail_inbytes):
                 logger.critical('[!] Analysis skipped for phish_id %s :: %s',str(phish_id),str(e))
             logger.info('[+] End parsing phish email id %s',str(phish_id))
         phishdb_layer.close(session,db)
+        parsed=True
     except Exception as e:
         logger.error('[!] Analysis skipped for %s, please inverstigate :: %s',str(phish_id), str(e))
+    return parsed
