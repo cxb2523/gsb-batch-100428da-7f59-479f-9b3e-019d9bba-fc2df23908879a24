@@ -12,8 +12,15 @@ prints the final text to stdout. This server only:
 
   1. receives an HTTP request,
   2. shells out to `osascript check.applescript ...`,
-  3. parses check.applescript's stdout protocol (first line `OK:` / `ERR:`),
+  3. parses check.applescript's stdout protocol (first line `OK:` / `ERR:`;
+     failures may append a `META: outcome=… elapsed=… polls=…` trailer line),
   4. maps success/errors to HTTP responses.
+
+Failure outcomes (the META `outcome=` values) are mapped to HTTP status +
+a `retryable` flag by _OUTCOME_HTTP below, so /chat, /v1/chat/completions and
+/v1/messages all give the same semantics for the same failure:
+  timeout / empty_result  -> 504, retryable   (page still generating / not rendered yet)
+  selector_missing etc.   -> 502, not retryable (selectors/injection broken; retry is useless)
 
 Escaping responsibility:
   * Python -> osascript is an argv boundary (subprocess list, no shell), so the
@@ -40,8 +47,8 @@ from pathlib import Path
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 # --------------------------------------------------------------------------- #
@@ -121,6 +128,104 @@ _call_lock = threading.Lock()
 
 
 # --------------------------------------------------------------------------- #
+# Failure outcomes: check.applescript ERR protocol -> HTTP mapping
+# --------------------------------------------------------------------------- #
+# On failure check.applescript prints:
+#   ERR:\n<reason>\nMETA: outcome=<category> elapsed=<seconds> polls=<n>
+# The META line is optional — output from an older script simply maps to the
+# "unknown" outcome. `elapsed`/`polls` are the script's own measurements (how
+# long this collection actually waited, how many poll rounds it ran).
+#
+# outcome           HTTP  retryable  meaning
+# timeout           504   yes        poll budget exhausted; page still generating
+# empty_result      504   yes        no result nodes / empty body; page may appear later
+# selector_missing  502   no         input/button selector did not match; retry is useless
+# injection_failed  502   no         `do JavaScript` failed while injecting the prompt
+# script_error      502   no         AppleScript runtime error (Safari, tab, arguments)
+# unknown           502   no         no META line or unrecognized outcome (conservative)
+_OUTCOME_HTTP: dict[str, tuple[int, bool]] = {
+    "timeout": (504, True),
+    "empty_result": (504, True),
+    "selector_missing": (502, False),
+    "injection_failed": (502, False),
+    "script_error": (502, False),
+}
+
+
+class CollectionError(Exception):
+    """A failed check.applescript run, classified for a consistent HTTP mapping.
+
+    Raised by _run_applescript; converted to a JSON response by the
+    CollectionError exception handler registered on the app, so all three
+    entries (/chat, /v1/chat/completions, /v1/messages) report the same
+    failure identically.
+    """
+
+    def __init__(
+        self,
+        outcome: str,
+        reason: str,
+        *,
+        elapsed: Optional[float] = None,
+        polls: Optional[int] = None,
+    ):
+        super().__init__(reason)
+        if outcome not in _OUTCOME_HTTP:
+            outcome = "unknown"
+        self.outcome = outcome
+        self.reason = reason
+        self.status_code, self.retryable = _OUTCOME_HTTP.get(outcome, (502, False))
+        self.elapsed = elapsed
+        self.polls = polls
+
+
+_META_PREFIX = "META:"
+
+
+def _parse_meta_line(line: str) -> dict:
+    """Parse 'META: outcome=timeout elapsed=183 polls=60' into a dict."""
+    meta: dict = {}
+    for token in line[len(_META_PREFIX):].split():
+        key, sep, value = token.partition("=")
+        if sep and key:
+            meta[key] = value
+    return meta
+
+
+def _split_reason_meta(rest: str) -> tuple[str, dict]:
+    """Split an ERR body into (reason, meta).
+
+    The META line, when present, is the last non-empty line; everything before
+    it is the human-readable reason. Older scripts have no META line, in which
+    case the whole body is the reason and meta is empty.
+    """
+    body = rest.strip("\r\n")
+    if not body:
+        return "", {}
+    lines = body.split("\n")
+    tail = lines[-1].strip()
+    if tail.startswith(_META_PREFIX):
+        reason = "\n".join(lines[:-1]).strip()
+        return reason, _parse_meta_line(tail)
+    return body, {}
+
+
+def _meta_numbers(meta: dict) -> tuple[Optional[float], Optional[int]]:
+    """Coerce the META elapsed/polls strings, tolerating junk values."""
+    elapsed: Optional[float] = None
+    polls: Optional[int] = None
+    try:
+        elapsed = float(meta.get("elapsed", ""))
+    except (TypeError, ValueError):
+        pass
+    try:
+        polls = int(meta.get("polls", ""))
+    except (TypeError, ValueError):
+        pass
+    return elapsed, polls
+
+
+# --------------------------------------------------------------------------- #
 # Core: invoke check.applescript and parse its protocol
 # --------------------------------------------------------------------------- #
 
@@ -165,7 +270,10 @@ def _run_applescript(
     result_selector: str,
     button_selector: str,
 ) -> str:
-    """Run check.applescript and return its final text, raising HTTPException on error."""
+    """Run check.applescript and return its final text.
+
+    Raises CollectionError (classified, HTTP-mapped) on any failure.
+    """
     args = _applescript_args(
         prompt, input_selector, result_selector, button_selector, CONTINUE_SELECTOR
     )
@@ -178,14 +286,18 @@ def _run_applescript(
             timeout=OSASCRIPT_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        raise HTTPException(
-            status_code=504,
-            detail=f"osascript timed out after {OSASCRIPT_TIMEOUT}s",
+        # The subprocess timeout exceeds the script's own poll window, so this
+        # means osascript itself hung — the page may still be generating.
+        raise CollectionError(
+            "timeout",
+            f"osascript timed out after {OSASCRIPT_TIMEOUT}s "
+            "(page may still be generating; safe to retry)",
+            elapsed=float(OSASCRIPT_TIMEOUT),
         )
 
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "unknown osascript error").strip()
-        raise HTTPException(status_code=502, detail=f"osascript failed: {detail}")
+        raise CollectionError("script_error", f"osascript failed: {detail}")
 
     raw = proc.stdout or ""
     first_line, sep, rest = raw.partition("\n")
@@ -194,19 +306,25 @@ def _run_applescript(
     if marker == "OK:":
         result = rest.rstrip("\r\n")
         if not result:
-            raise HTTPException(
-                status_code=502,
-                detail="check.applescript returned an empty result",
+            raise CollectionError(
+                "empty_result",
+                "check.applescript returned an empty result",
             )
         return result
 
     if marker == "ERR:":
-        detail = rest.strip() or "unknown error"
-        raise HTTPException(status_code=502, detail=detail)
+        reason, meta = _split_reason_meta(rest)
+        elapsed, polls = _meta_numbers(meta)
+        raise CollectionError(
+            meta.get("outcome", "unknown"),
+            reason or "unknown error",
+            elapsed=elapsed,
+            polls=polls,
+        )
 
-    raise HTTPException(
-        status_code=502,
-        detail=f"unexpected output from check.applescript: {raw.strip()[:500]}",
+    raise CollectionError(
+        "script_error",
+        f"unexpected output from check.applescript: {raw.strip()[:500]}",
     )
 
 
@@ -275,6 +393,30 @@ app = FastAPI(
     description="HTTP API over the check.applescript Safari automation script.",
     version="1.0.0",
 )
+
+
+@app.exception_handler(CollectionError)
+async def _collection_error_handler(request: Request, exc: CollectionError):
+    """One failure -> one response shape, identical across /chat,
+    /v1/chat/completions and /v1/messages.
+
+    `detail` stays a plain human-readable string (as FastAPI's HTTPException
+    responses always had), so existing clients keep parsing; the structured
+    classification lives in the added `error` object.
+    """
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "detail": exc.reason,
+            "error": {
+                "type": "collection_error",
+                "outcome": exc.outcome,
+                "retryable": exc.retryable,
+                "elapsed_seconds": exc.elapsed,
+                "polls": exc.polls,
+            },
+        },
+    )
 
 
 class ChatRequest(BaseModel):
