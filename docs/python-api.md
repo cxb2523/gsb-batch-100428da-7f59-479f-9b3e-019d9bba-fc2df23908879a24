@@ -22,10 +22,15 @@ Search an area and return one row per place (see [Output format](output-format.m
 | `client` | new client | a `GMapsClient` to reuse |
 | `boundary` | Nominatim lookup | `(area_box, filter_box)` as two `AreaBoundary` objects, to skip the lookup |
 
-The result is a `list` of dicts with a `stats` dict: `cells_total`, `cells_searched`, `search_requests_failed`,
-`places_found`, `places_outside_area`, `hours_requested`, `hours_found`, `hours_failed`.
+The result is a `list` of dicts with a `stats` dict: `cells_total`, `cells_searched`, `cells_rate_limited`,
+`cells_failed`, `cells_not_searched`, `search_requests_failed`, `places_found`, `places_outside_area`,
+`hours_requested`, `hours_found`, `hours_failed`, `hours_rate_limited`. A cell that fails is skipped and the
+collection keeps what the other cells found: `cells_rate_limited` counts cells that failed with HTTP 429,
+`cells_failed` cells that failed with any other request error, and `cells_not_searched` the cells never reached
+(e.g. `max_results` stopped early). `hours_rate_limited` is the part of `hours_failed` caused by HTTP 429.
 
-Raises `BoundaryError` when the area cannot be resolved and `RequestError` when every search request failed.
+Raises `BoundaryError` when the area cannot be resolved and `RequestError` when every search request failed
+(`RateLimitError` when every failure was HTTP 429).
 
 ## `GMapsClient`
 

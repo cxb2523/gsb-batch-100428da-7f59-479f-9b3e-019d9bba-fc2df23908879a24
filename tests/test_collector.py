@@ -4,7 +4,7 @@ import httpx
 import pytest
 from conftest import fixture_text
 
-from gmaps_extractor import FIELDS, GMapsClient, RequestError, collect
+from gmaps_extractor import FIELDS, GMapsClient, RateLimitError, RequestError, collect
 from gmaps_extractor.collector import to_row
 from gmaps_extractor.geo import AreaBoundary
 
@@ -34,11 +34,15 @@ def place(n, lat=30.27, lng=-97.74, **extra):
 
 
 class FakeClient:
-    def __init__(self, pages, hours=None, fail_search=False, fail_hours=()):
+    def __init__(self, pages, hours=None, fail_search=False, fail_hours=(),
+                 search_error=None, hours_error=None):
         self.pages = pages  # list returned for every cell, page 0
         self.hours = hours or {"monday": "9 AM-5 PM"}
+        # fail_search: True, or a callable(lat, lng) -> falsy / True / the exception to raise
         self.fail_search = fail_search
         self.fail_hours = set(fail_hours)
+        self.search_error = search_error or RequestError("blocked")
+        self.hours_error = hours_error or RequestError("blocked")
         self.search_calls = []
         self.hours_calls = []
         self.lock = threading.Lock()
@@ -46,15 +50,16 @@ class FakeClient:
     def search_page(self, query, lat, lng, offset=0, **kwargs):
         with self.lock:
             self.search_calls.append((query, lat, lng, offset))
-        if self.fail_search:
-            raise RequestError("blocked")
+        fail = self.fail_search(lat, lng) if callable(self.fail_search) else self.fail_search
+        if fail:
+            raise fail if isinstance(fail, Exception) else self.search_error
         return list(self.pages) if offset == 0 else []
 
     def place_hours(self, hex_id, name=None, lat=0.0, lng=0.0, ftid=None):
         with self.lock:
             self.hours_calls.append(hex_id)
         if hex_id in self.fail_hours:
-            raise RequestError("blocked")
+            raise self.hours_error
         return dict(self.hours)
 
 
@@ -114,6 +119,79 @@ def test_all_searches_failing_raises():
     fake = FakeClient([], fail_search=True)
     with pytest.raises(RequestError):
         collect("Austin", "coffee", client=fake, boundary=BOUNDARY, cell_size_meters=10_000)
+
+
+def fail_first_calls(errors, default=False):
+    """Return a fail_search predicate: raise the queued errors in call order, then ``default``."""
+    todo = list(errors)
+    lock = threading.Lock()
+
+    def predicate(lat, lng):
+        with lock:
+            return todo.pop(0) if todo else default
+
+    return predicate
+
+
+def test_some_cells_rate_limited_returns_rows_and_counts():
+    fake = FakeClient(
+        [place(1)],
+        fail_search=fail_first_calls([RateLimitError("HTTP 429"), RateLimitError("HTTP 429")]),
+    )
+    rows = collect("Austin", "coffee", client=fake, boundary=BOUNDARY, cell_size_meters=2_000, workers=2)
+    assert [r["place_id"] for r in rows] == ["ChIJ0001"]
+    stats = rows.stats
+    assert stats["cells_rate_limited"] == 2
+    assert stats["cells_failed"] == 0
+    assert stats["cells_not_searched"] == 0
+    assert stats["cells_searched"] == stats["cells_total"] > 2
+    assert stats["search_requests_failed"] == 2
+
+
+def test_some_cells_failing_mixed_counts_each_cause():
+    fake = FakeClient(
+        [place(1)],
+        fail_search=fail_first_calls([RateLimitError("HTTP 429"), RequestError("empty answer")]),
+    )
+    rows = collect("Austin", "coffee", client=fake, boundary=BOUNDARY, cell_size_meters=2_000, workers=2)
+    assert len(rows) == 1
+    assert rows.stats["cells_rate_limited"] == 1
+    assert rows.stats["cells_failed"] == 1
+
+
+def test_all_cells_rate_limited_raises_rate_limit_error():
+    fake = FakeClient([], fail_search=True, search_error=RateLimitError("HTTP 429"))
+    with pytest.raises(RateLimitError):
+        collect("Austin", "coffee", client=fake, boundary=BOUNDARY, cell_size_meters=2_000, workers=3)
+
+
+def test_all_cells_failing_mixed_raises_plain_request_error():
+    fake = FakeClient(
+        [],
+        fail_search=fail_first_calls([RateLimitError("HTTP 429")], default=RequestError("empty answer")),
+    )
+    with pytest.raises(RequestError) as excinfo:
+        collect("Austin", "coffee", client=fake, boundary=BOUNDARY, cell_size_meters=2_000, workers=3)
+    assert not isinstance(excinfo.value, RateLimitError)
+
+
+def test_rate_limited_hours_leave_none_and_are_counted():
+    fake = FakeClient([place(1), place(2)], fail_hours={"0x2:0x2"}, hours_error=RateLimitError("HTTP 429"))
+    rows = collect("Austin", "coffee", client=fake, boundary=BOUNDARY, cell_size_meters=10_000)
+    by_id = {r["place_id"]: r for r in rows}
+    assert by_id["ChIJ0001"]["hours"] == {"monday": "9 AM-5 PM"}
+    assert by_id["ChIJ0002"]["hours"] is None
+    assert rows.stats["hours_failed"] == 1
+    assert rows.stats["hours_rate_limited"] == 1
+    assert rows.stats["hours_found"] == 1
+
+
+def test_max_results_leaves_cells_not_searched():
+    fake = FakeClient([place(n) for n in range(1, 6)])
+    rows = collect("Austin", "coffee", client=fake, boundary=BOUNDARY, cell_size_meters=1_000, max_results=3,
+                   workers=2)
+    stats = rows.stats
+    assert stats["cells_not_searched"] == stats["cells_total"] - stats["cells_searched"] > 0
 
 
 def test_empty_area_is_not_an_error():

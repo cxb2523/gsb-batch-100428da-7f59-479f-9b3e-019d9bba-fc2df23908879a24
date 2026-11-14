@@ -105,7 +105,11 @@ the command line so the login stays out of your shell history. There is no confi
 - With hours on, one place request per place.
 - At most one request every `min_interval` seconds (default 0.5) per client, `workers` (default 4) in parallel.
 - A failed request (network error, error status, consent page, empty answer) is retried once after 2 seconds.
-  When every search request fails, `collect()` raises `RequestError` instead of returning an empty list.
+  A cell that still fails is skipped and the collection goes on with what it found; `stats` counts those cells as
+  `cells_rate_limited` (HTTP 429) or `cells_failed` (any other request error), `cells_not_searched` counts the
+  cells never reached (e.g. `--max-results` stopped early), and `hours_rate_limited` counts opening-hours
+  requests that hit HTTP 429 (those rows keep `hours: null`). When every search request fails, `collect()`
+  raises `RateLimitError` if it was all HTTP 429, else `RequestError`, instead of returning an empty list.
 
 ## Limits
 

@@ -91,6 +91,31 @@ def test_cli_error_exit_code(monkeypatch, capsys):
     assert "error:" in capsys.readouterr().err
 
 
+def test_cli_stats_line_shows_rate_limited_and_unsearched_cells(monkeypatch, capsys):
+    stats = {
+        "cells_total": 9,
+        "cells_searched": 6,
+        "cells_rate_limited": 2,
+        "cells_failed": 1,
+        "cells_not_searched": 3,
+        "hours_rate_limited": 1,
+        "places_found": 1,
+    }
+    monkeypatch.setattr(cli, "collect", lambda *a, **k: CollectionResult([ROW], stats))
+    assert cli.main(["Austin", "coffee"]) == 0
+    err = capsys.readouterr().err
+    printed = json.loads(err.strip().splitlines()[-1])
+    assert printed["cells_rate_limited"] == 2
+    assert printed["cells_failed"] == 1
+    assert printed["cells_not_searched"] == 3
+    assert printed["hours_rate_limited"] == 1
+
+
+def test_cli_quiet_prints_no_stats(fake_collect, capsys):
+    assert cli.main(["Austin", "coffee", "-q"]) == 0
+    assert capsys.readouterr().err == ""
+
+
 def test_cli_has_no_review_options(capsys):
     with pytest.raises(SystemExit):
         cli.main(["--help"])

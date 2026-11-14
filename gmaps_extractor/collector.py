@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, Tuple
 
 from .client import GMapsClient, resolve_proxy
-from .exceptions import GMapsExtractorError, RequestError
+from .exceptions import GMapsExtractorError, RateLimitError, RequestError
 from .geo import AreaBoundary, GridCell, generate_grid, get_area_boundary, is_in_boundary
 from .urls import google_maps_url
 
@@ -38,8 +38,10 @@ class CollectionResult(list):
     """The rows of one collection (a plain ``list`` of dicts) plus run statistics.
 
     ``stats`` holds ``area``, ``query``, ``cells_total``, ``cells_searched``,
+    ``cells_rate_limited``, ``cells_failed``, ``cells_not_searched``,
     ``search_requests_failed``, ``places_found``, ``places_outside_area``,
-    ``hours_requested``, ``hours_found`` and ``hours_failed``.
+    ``hours_requested``, ``hours_found``, ``hours_failed`` and
+    ``hours_rate_limited``.
     """
 
     def __init__(self, rows: List[Dict[str, Any]], stats: Dict[str, Any]) -> None:
@@ -62,10 +64,14 @@ def _place_key(place: Dict[str, Any]) -> Optional[str]:
 
 def _search_cell(
     client: GMapsClient, query: str, cell: GridCell, max_pages: int
-) -> Tuple[List[Dict[str, Any]], int, bool]:
-    """Search one cell page by page. Returns ``(places, failed_requests, any_success)``."""
+) -> Tuple[List[Dict[str, Any]], int, int, bool]:
+    """Search one cell page by page.
+
+    Returns ``(places, failed_requests, rate_limited_failures, any_success)``.
+    """
     places: List[Dict[str, Any]] = []
     failed = 0
+    rate_limited = 0
     ok = False
     for page in range(max_pages):
         try:
@@ -78,6 +84,11 @@ def _search_cell(
                 max_radius=MAX_RADIUS_METERS,
                 viewport_dist=VIEWPORT_DIST,
             )
+        except RateLimitError as exc:
+            logger.warning("cell %d: %s", cell.cell_id, exc)
+            failed += 1
+            rate_limited += 1
+            break
         except RequestError as exc:
             logger.warning("cell %d: %s", cell.cell_id, exc)
             failed += 1
@@ -86,12 +97,15 @@ def _search_cell(
         places.extend(batch)
         if len(batch) < RESULTS_PER_PAGE:
             break
-    return places, failed, ok
+    return places, failed, rate_limited, ok
 
 
-def _fetch_hours(client: GMapsClient, place: Dict[str, Any]) -> Tuple[Optional[Dict[str, str]], bool]:
+def _fetch_hours(
+    client: GMapsClient, place: Dict[str, Any]
+) -> Tuple[Optional[Dict[str, str]], bool, bool]:
+    """Fetch one place's hours. Returns ``(hours, ok, rate_limited)``."""
     if not place.get("hex_id"):
-        return None, False
+        return None, False, False
     try:
         hours = client.place_hours(
             place["hex_id"],
@@ -100,10 +114,13 @@ def _fetch_hours(client: GMapsClient, place: Dict[str, Any]) -> Tuple[Optional[D
             place.get("longitude") or 0.0,
             place.get("ftid"),
         )
-        return hours, True
+        return hours, True, False
+    except RateLimitError as exc:
+        logger.warning("hours for %r: %s", place.get("name"), exc)
+        return None, False, True
     except RequestError as exc:
         logger.warning("hours for %r: %s", place.get("name"), exc)
-        return None, False
+        return None, False, False
 
 
 def collect(
@@ -148,6 +165,8 @@ def collect(
     Raises:
         BoundaryError: the area name could not be resolved.
         RequestError: every search request failed (usually a block or no network).
+        RateLimitError: every search request failed with HTTP 429; another
+            proxy or a slower rate may help.
     """
     if not query or not query.strip():
         raise GMapsExtractorError("query is empty")
@@ -163,12 +182,16 @@ def collect(
         "query": query,
         "cells_total": len(cells),
         "cells_searched": 0,
+        "cells_rate_limited": 0,
+        "cells_failed": 0,
+        "cells_not_searched": 0,
         "search_requests_failed": 0,
         "places_found": 0,
         "places_outside_area": 0,
         "hours_requested": 0,
         "hours_found": 0,
         "hours_failed": 0,
+        "hours_rate_limited": 0,
     }
 
     own_client = client is None
@@ -181,9 +204,14 @@ def collect(
             for start in range(0, len(cells), workers):
                 batch = cells[start : start + workers]
                 results = pool.map(lambda c: _search_cell(client, query, c, max_pages_per_cell), batch)
-                for places, failed, ok in results:
+                for places, failed, rate_limited, ok in results:
                     stats["cells_searched"] += 1
                     stats["search_requests_failed"] += failed
+                    if not ok:
+                        if rate_limited:
+                            stats["cells_rate_limited"] += 1
+                        else:
+                            stats["cells_failed"] += 1
                     any_success = any_success or ok
                     for place in places:
                         key = _place_key(place)
@@ -198,7 +226,12 @@ def collect(
                 if max_results and len(found) >= max_results:
                     break
 
+            stats["cells_not_searched"] = len(cells) - stats["cells_searched"]
             if not any_success:
+                if stats["cells_rate_limited"] == stats["cells_searched"] and stats["cells_searched"]:
+                    raise RateLimitError(
+                        "every search request hit HTTP 429 (rate limited); try another proxy or a slower rate"
+                    )
                 raise RequestError("every search request failed; Google may be blocking this connection")
 
             places = list(found.values())[:max_results] if max_results else list(found.values())
@@ -207,17 +240,19 @@ def collect(
                 stats["hours_requested"] = len(places)
                 fetched = list(pool.map(lambda p: _fetch_hours(client, p), places))
             else:
-                fetched = [(None, True)] * len(places)
+                fetched = [(None, True, False)] * len(places)
     finally:
         if own_client:
             client.close()
 
     rows = []
-    for place, (place_hours, ok) in zip(places, fetched):
+    for place, (place_hours, ok, rate_limited) in zip(places, fetched):
         if hours:
             if place_hours:
                 stats["hours_found"] += 1
             if not ok:
                 stats["hours_failed"] += 1
+            if rate_limited:
+                stats["hours_rate_limited"] += 1
         rows.append(to_row(place, place_hours))
     return CollectionResult(rows, stats)

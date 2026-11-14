@@ -33,7 +33,10 @@ details and opening hours. This release breaks the 2.x API; see [docs/migration.
 - `gmaps-collect AREA QUERY` with JSON, JSON Lines or CSV output, `--max-results`, `--no-hours`, `--proxy`.
 - `google_maps_url`, a public Maps URLs link built from the name and `place_id`.
 - `RequestError` / `RateLimitError`: when every search request fails, `collect()` raises instead of returning an
-  empty list.
+  empty list — `RateLimitError` when every failure was HTTP 429, so callers can switch proxy and retry.
+- Partial failures are tolerated and counted: a cell whose search fails is skipped and the collection returns
+  what the other cells found. New `stats` counters: `cells_rate_limited`, `cells_failed`, `cells_not_searched`
+  (e.g. `max_results` stopped early) and `hours_rate_limited` (the HTTP 429 part of `hours_failed`).
 
 ### Changed
 
