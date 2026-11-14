@@ -43,6 +43,35 @@ test("MCP schemas, canonical disabled aliases and dry-run hold through batch", {
     for (const [tool, args] of [["computer_browser_start", { exe: "Z:/missing.exe" }], ["computer_browser_click", { selector: "body" }], ["computer_browser_eval", { expression: "document.body.remove()" }]]) {
       assert.equal((await call(tool, args)).data.dryRun, true);
     }
+    // Сухой прогон действует и на мутирующие браузерные шаги внутри пакета.
+    const { data: dryBatch } = await call("computer_batch", { steps: [{ tool: "computer_browser_click", args: { selector: "#x" } }] });
+    assert.equal(dryBatch.allOk, true);
+    assert.equal(dryBatch.steps[0].data.dryRun, true);
+  } finally { await client.close(); }
+});
+
+test("browser steps in a batch fail per-step with typed codes, not one vague error", { skip: process.platform !== "win32", timeout: 90_000 }, async () => {
+  const client = new Client({ name: "batch-browser-codes", version: "1" });
+  try {
+    const transport = new StdioClientTransport({ command: process.execPath, args: [script], stderr: "pipe" });
+    let diagnostic = "";
+    transport.stderr?.on("data", (d) => diagnostic += d);
+    try { await client.connect(transport); }
+    catch (e) { throw new Error(e.message + "\n" + diagnostic); }
+    // Браузер на 9222 не поднят: оба шага обязаны ответить своим кодом
+    // (ConnectionClosed без браузера, TabNotFound если он вдруг есть, но такой
+    // вкладки в нём нет), а не свалить пакет одной общей ошибкой.
+    const r = await client.callTool({ name: "computer_batch", arguments: { steps: [
+      { tool: "computer_browser_eval", args: { url: "desk-mcp-no-such-tab-zzz", expression: "1" }, stopOnError: false },
+      { tool: "browser_eval", args: { url: "desk-mcp-no-such-tab-zzz", expression: "2" }, stopOnError: false },
+    ] } });
+    const data = JSON.parse(r.content[0].text);
+    assert.equal(data.allOk, false);
+    assert.equal(data.executed, 2);
+    for (const s of data.steps) {
+      assert.equal(s.ok, false);
+      assert.match(s.code, /^(ConnectionClosed|TabNotFound)$/, JSON.stringify(s));
+    }
   } finally { await client.close(); }
 });
 

@@ -251,6 +251,10 @@ PowerShell `ControlType` элемента читается как `Pane`, а в 
 
 ```
 server.mjs      Node: MCP-сервер, CDP-клиент, circuit breaker, runBatch, отключение тулов
+lib/browser.mjs Браузерные шаги пакета и обработчики computer_browser_*: общий код
+                для прямых вызовов, computer_batch и тестов на локальном WS-стенде
+lib/batch.mjs   Подстановка ${steps.N.путь} и общий цикл пакета runBatchSteps
+lib/cdp.mjs     CDP-клиент: сокеты с переподключением, коды TabNotFound/ConnectionClosed
 worker.ps1      PowerShell 5.1: P/Invoke, MSAA, OCR, PrintWindow, диспетчер тулов, дельты
 uia-native.cs   C# 5: STA-пул, отменяемый обход дерева UIA, действия, таблицы, select
 smoke.mjs       Автопрогон: 68 проверок, курсор не двигает, отдельные серверы для

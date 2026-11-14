@@ -92,7 +92,9 @@ For example, pass this to `computer_batch`:
 }
 ```
 
-Batches support up to 50 worker-tool steps, validate each step, and stop on errors unless `stopOnError: false` is set. Exact references preserve their value's type. Inspect `allOk` and each step's `code`; earlier actions are not rolled back. The default total deadline is 45 seconds; set `timeoutMs` (100–120000 ms) below your client’s timeout. Deadline expiry or client cancellation stops remaining steps, even with `stopOnError: false`. Browser tools and nested batches are not supported in a batch.
+Batches support up to 50 worker-tool steps, validate each step, and stop on errors unless `stopOnError: false` is set. Exact references preserve their value's type. Inspect `allOk` and each step's `code`; earlier actions are not rolled back. The default total deadline is 45 seconds; set `timeoutMs` (100–120000 ms) below your client’s timeout. Deadline expiry or client cancellation stops remaining steps, even with `stopOnError: false`. Nested batches are not supported.
+
+Browser tools (`computer_browser_list`, `computer_browser_tree`, `computer_browser_descendants`, `computer_browser_click`, `computer_browser_eval`) also run as batch steps — the locate → read → click/eval cycle fits in one call. Every step reports its own `code`: `TabNotFound` when the tab was closed between steps, `ConnectionClosed` when the CDP connection dropped (the next step reconnects on its own), `EvaluateError` for a page-side exception, `InvalidArgument` for a missing or failed-step reference. Steps that depend on a vanished tab fail explicitly; they are never silently skipped.
 
 For smaller trees, use `maxDepth: 4, interactiveOnly: true, compact: true`. For repeated reads, use `mode: auto` and pass the last `token` as `since` with the same options. A stale baseline or a diff larger than the full view returns the full view. Check `truncated` and `searchIncomplete` before concluding that something is absent.
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Run browser tools (`browser_list`, `browser_tree`, `browser_descendants`, `browser_click`, `browser_eval`) as `computer_batch` steps; every step reports its own outcome and error code instead of stopping the batch on a generic error.
+- Distinguish batch/CDP failures by code: `TabNotFound` (tab closed between steps; dependent steps fail explicitly, never skipped silently), `ConnectionClosed` (dropped CDP connection; the next step reconnects instead of reusing the dead socket), `EvaluateError`, `CDPHttp`, `InvalidArgument` (missing field or failed-step reference — the step is refused and nothing reaches the action).
+- Reconnect the CDP socket when the cached one is no longer open; evict dead sockets on send. Keep `${steps.N.path}` references typed (number/boolean/array) through batch schema validation.
+- Cover a vanishing tab mid-batch, connection re-establishment and missing references with tests against a local WebSocket stand-in for the browser; existing CDP and batch suites unchanged.
+
 ## 1.5.2 — 2026-11-14
 
 - Move to click coordinates before pressing; focus the exact requested hwnd and verify foreground ownership. Use the selected hwnd for resize, close, desktop routing and OCR capture too.

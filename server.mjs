@@ -13,7 +13,8 @@ import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { cdp } from "./lib/cdp.mjs";
-import { resolveArgs } from "./lib/batch.mjs";
+import { runBatchSteps } from "./lib/batch.mjs";
+import { BROWSER_STEPS, browserInputSchemas, browserSteps } from "./lib/browser.mjs";
 import { Worker } from "./lib/worker.mjs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -482,8 +483,13 @@ reg(
       "задано stopOnError: false. Аргумент вида \"${steps.0.element.name}\" подставляет " +
       "значение из результата более раннего шага того же пакета, поэтому цикл " +
       "«прочитал, решил, нажал» укладывается в один вызов вместо трёх кругов к агенту. " +
-      "Ссылка на шаг вперёд или на непройденный путь даёт отказ с кодом InvalidArgument, " +
-      "а не пустую строку.",
+      "Ссылка на шаг вперёд, на провалившийся шаг или на непройденный путь даёт отказ " +
+      "с кодом InvalidArgument, а не пустую строку. Браузерные шаги (browser_list, " +
+      "browser_tree, browser_descendants, browser_click, browser_eval) идут в том же " +
+      "пакете: каждый отвечает за себя кодом — TabNotFound (вкладка закрылась между " +
+      "шагами), ConnectionClosed (CDP оборвался; следующий шаг переподключится сам), " +
+      "EvaluateError. Зависимые шаги после исчезнувшей вкладки падают явно, а не " +
+      "пропускаются молча.",
     inputSchema: {
       timeoutMs: z.number().int().min(100).max(120000).default(45000).describe("Общий бюджет пакета; дедлайн клиента должен быть больше"),
       steps: z.array(z.object({
@@ -524,64 +530,38 @@ const TOOL_ALIAS = {
 // русским именем поля молча не сматчилась бы, а её текст ушёл бы в действие.
 
 async function runBatch(steps, budgetMs = 45_000, signal) {
-  const expires = Date.now() + budgetMs;
-  const out = [];
-  let stoppedAt = null;
-  for (let i = 0; i < steps.length; i++) {
-    const s = steps[i] || {};
-    const given = String(s.tool ?? "");
-    let tool = given;
-    if (TOOL_ALIAS[tool]) tool = TOOL_ALIAS[tool];
-    else if (tool.startsWith("computer_")) tool = tool.slice("computer_".length);
-    let args = s.args ?? {};
-    const stopOnError = s.stopOnError !== false;
-    if (!WORKER_TOOLS.has(tool)) {
-      out.push({
-        index: i, tool: given, ok: false, code: "InvalidArgument",
-        error: `Неизвестный инструмент: '${given}'. Доступны: ${[...WORKER_TOOLS].join(", ")}`,
-      });
-      if (stopOnError) { stoppedAt = i; break; }
-      continue;
-    }
-    // Отключённый через DESK_DISABLE_TOOLS инструмент batch тоже не выполняет:
-    // иначе список отключённых обходится одной пачкой, и защита дырявится.
-    const canonical = Object.keys(TOOL_ALIAS).find((name) => TOOL_ALIAS[name] === tool) ?? `computer_${tool}`;
-    if (isDisabled(canonical)) {
-      out.push({
-        index: i, tool: given, ok: false,
-        code: "NotSupported",
-        error: `Инструмент '${given}' отключён через DESK_DISABLE_TOOLS`,
-      });
-      if (stopOnError) { stoppedAt = i; break; }
-      continue;
-    }
-    try {
-      if (signal?.aborted) throw errWith("Пакет отменён клиентом", "Cancelled");
-      args = resolveArgs(args, out);
-      const parsed = toolSchemas.get(canonical)?.safeParse(args);
-      if (!parsed?.success) throw errWith("Некорректные аргументы " + canonical + ": " + (parsed?.error?.message ?? "нет схемы"), "InvalidArgument");
-      args = parsed.data;
-      const remaining = expires - Date.now();
-      if (remaining <= 0) throw errWith("Бюджет computer_batch исчерпан", "Timeout");
+  return runBatchSteps(steps, {
+    budgetMs,
+    signal,
+    resolveTool: (given) => {
+      let tool = given;
+      if (TOOL_ALIAS[tool]) tool = TOOL_ALIAS[tool];
+      else if (tool.startsWith("computer_")) tool = tool.slice("computer_".length);
+      const canonical = Object.keys(TOOL_ALIAS).find((name) => TOOL_ALIAS[name] === tool) ?? `computer_${tool}`;
+      return { tool, canonical };
+    },
+    isKnown: (tool) => WORKER_TOOLS.has(tool) || BROWSER_STEPS.has(tool),
+    knownList: () => [...WORKER_TOOLS, ...BROWSER_STEPS].join(", "),
+    isDisabled,
+    schemaFor: (canonical) => toolSchemas.get(canonical),
+    execute: async (tool, args, remaining) => {
+      // Браузерные шаги идут в CDP напрямую, воркер им не нужен. Сухой прогон
+      // не должен мутировать страницу и из пакета тоже — как и при прямом вызове.
+      if (BROWSER_STEPS.has(tool)) {
+        if (process.env.DESK_DRY_RUN === "1" && (tool === "browser_click" || tool === "browser_eval")) {
+          return { ok: true, dryRun: true, tool: `computer_${tool}`, would: args };
+        }
+        return browserSteps[tool](args);
+      }
       const budget = tool === "wait" ? args.ms + 1000
         : tool === "wait_window" ? args.timeoutSec * 1000 + 5000
         : tool === "wait_element" ? args.timeoutMs + 2000
         : UI_TOOLS.has(tool) ? UI_TIMEOUT_MS : 60_000;
-      const data = UI_TOOLS.has(tool)
-        ? await callUi(tool, args, Math.min(remaining, Math.max(UI_TIMEOUT_MS, budget)), { signal })
-        : await worker.call(tool, args, Math.min(remaining, budget), { signal });
-      out.push({ index: i, tool: given, ok: true, data });
-    } catch (e) {
-      out.push({ index: i, tool: given, ok: false, code: e.code || "WorkerError", error: e.message });
-      if (stopOnError || e.code === "Cancelled" || Date.now() >= expires) { stoppedAt = i; break; }
-    }
-  }
-  return {
-    executed: out.length,
-    stoppedAt,
-    allOk: out.every((x) => x.ok),
-    steps: out,
-  };
+      return UI_TOOLS.has(tool)
+        ? callUi(tool, args, Math.min(remaining, Math.max(UI_TIMEOUT_MS, budget)), { signal })
+        : worker.call(tool, args, Math.min(remaining, budget), { signal });
+    },
+  });
 }
 
 reg(
@@ -884,88 +864,8 @@ reg(
 // UIA и MSAA для Chromium — костыль: Chromium отдаёт обрезанное дерево, обвязанное
 // безымянными PANEL'ами. CDP даёт настоящий DOM: стабильные селекторы, текст,
 // роли из accessibility tree самого браузера. Это единственный способ работать с
-// веб-контентом не по пикселям.
-
-const PROBE_JS = `(() => {
-  window.__deskProbe = [];
-  if (!window.__deskProbeHooked) {
-    window.__deskProbeHooked = true;
-    document.addEventListener("click", (e) => {
-      const el = e.target;
-      window.__deskProbe.push({
-        tag: el.tagName,
-        text: (el.innerText || el.value || el.getAttribute("aria-label") || "").toString().slice(0, 120),
-        id: el.id || null,
-        testid: el.getAttribute("data-testid"),
-        matchesTarget: !!el.closest(window.__deskProbeSelector),
-        trusted: e.isTrusted
-      });
-    }, true);
-  }
-  return "armed";
-})()`;
-
-const READ_PROBE_JS = `JSON.stringify(window.__deskProbe || [])`;
-
-const TREE_JS = `(() => {
-  const SEL = 'a,button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem],[role=checkbox],[role=switch],[role=combobox],[contenteditable=true],[onclick]';
-  // a:nth-of-type(9) вне контекста родителя не находит ничего — индекс
-  // считается среди соседей конкретного родителя. Поэтому строим абсолютный
-  // путь вверх через :nth-child, он работает в document.querySelector.
-  const pathOf = (el) => {
-    const parts = [];
-    let cur = el;
-    for (let i = 0; cur && cur.nodeType === 1 && i < 6; i++) {
-      const parent = cur.parentElement;
-      if (!parent) { parts.unshift(cur.tagName.toLowerCase()); break; }
-      const idx = [...parent.children].indexOf(cur) + 1;
-      parts.unshift(cur.tagName.toLowerCase() + ":nth-child(" + idx + ")");
-      if (cur === document.body) break;
-      cur = parent;
-    }
-    return parts.join(" > ");
-  };
-  const out = [];
-  for (const el of document.querySelectorAll(SEL)) {
-    const r = el.getBoundingClientRect();
-    if (r.width < 2 || r.height < 2) continue;
-    if (r.bottom < 0 || r.top > innerHeight) continue;
-    const testid = el.getAttribute("data-testid");
-    const selector = el.id
-      ? "#" + CSS.escape(el.id)
-      : (testid ? '[data-testid="' + testid.replace(/"/g, '\\\\"') + '"]' : pathOf(el));
-    out.push({
-      tag: el.tagName.toLowerCase(),
-      role: el.getAttribute("role") || null,
-      text: (el.innerText || el.value || el.getAttribute("aria-label") || el.title || "").toString().trim().slice(0, 120),
-      selector,
-      matches: document.querySelectorAll(selector).length,
-      id: el.id || null,
-      testid: testid || null,
-      name: el.getAttribute("name") || null,
-      value: (el.value ?? null),
-      checked: el.checked ?? null,
-      disabled: !!el.disabled,
-      rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }
-    });
-    if (out.length >= 400) break;
-  }
-  return JSON.stringify(out);
-})()`;
-
-const DESCENDANTS_JS = (selector) => `(() => {
-  const root = document.querySelector(${JSON.stringify(selector)});
-  if (!root) return "NULL";
-  const out = [];
-  for (const el of root.querySelectorAll("*")) {
-    const r = el.getBoundingClientRect();
-    const text = (el.innerText || "").toString().trim().slice(0, 80);
-    if (r.width < 2 || r.height < 2) continue;
-    out.push({ tag: el.tagName.toLowerCase(), role: el.getAttribute("role") || null, text, rect: { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) } });
-    if (out.length >= 200) break;
-  }
-  return JSON.stringify({ root: { tag: root.tagName.toLowerCase(), text: (root.innerText || "").toString().trim().slice(0, 300) }, children: out });
-})()`;
+// веб-контентом не по пикселям. Обработчики и JS-зонды живут в lib/browser.mjs:
+// их же шагами исполняет computer_batch, и их же гоняют тесты против WS-стенда.
 
 reg(
   "computer_browser_start",
@@ -1075,12 +975,9 @@ reg(
   {
     title: "Вкладки CDP",
     description: "Список вкладок браузера с CDP: заголовок, URL, id. Плюс версия браузера.",
-    inputSchema: {},
+    inputSchema: browserInputSchemas.browser_list,
   },
-  R(async () => {
-    const [v, t] = [await cdp.version(), await cdp.targets()];
-    return ok({ browser: v.Browser, port: cdp.port, tabs: t.map((x) => ({ id: x.id, title: x.title, url: x.url })) });
-  }),
+  R(async () => ok(await browserSteps.browser_list())),
 );
 
 reg(
@@ -1091,19 +988,9 @@ reg(
       "Настоящее DOM-дерево: интерактивные элементы с готовым CSS-селектором, текстом, " +
       "role, value, checked и границами. В отличие от UIA/MSAA для Chromium это точные " +
       "данные без прокладок. Селектор сразу годится для computer_browser_click.",
-    inputSchema: {
-      url: z.string().optional().describe("подстрока URL вкладки; пусто — первая"),
-      timeoutMs: z.number().int().optional().default(2000).describe("сколько ждать готовности документа перед разбором DOM"),
-    },
+    inputSchema: browserInputSchemas.browser_tree,
   },
-  R(async (a) => {
-    const target = await cdp.pickTarget(a.url);
-    const client = await cdp.socket(target);
-    const ready = await cdp.waitReady(client, a.timeoutMs ?? 2000);
-    const raw = await cdp.evaluate(client, TREE_JS);
-    const items = JSON.parse(raw);
-    return ok({ url: target.url, title: target.title, count: items.length, ready: ready.ready, elements: items });
-  }),
+  R(async (a) => ok(await browserSteps.browser_tree(a))),
 );
 
 reg(
@@ -1112,15 +999,9 @@ reg(
     title: "Поддерево элемента",
     description: "Содержимое контейнера по CSS-селектору: до 200 потомков с границами. " +
       "Нужен, чтобы понять структуру блока, списка или модалки перед кликом.",
-    inputSchema: { selector: z.string(), url: z.string().optional() },
+    inputSchema: browserInputSchemas.browser_descendants,
   },
-  R(async (a) => {
-    const target = await cdp.pickTarget(a.url);
-    const client = await cdp.socket(target);
-    const raw = await cdp.evaluate(client, DESCENDANTS_JS(a.selector));
-    if (raw === "NULL") throw errWith(`Селектор не найден: ${a.selector}`, "ElementNotFound");
-    return ok({ url: target.url, ...JSON.parse(raw) });
-  }),
+  R(async (a) => ok(await browserSteps.browser_descendants(a))),
 );
 
 reg(
@@ -1131,87 +1012,9 @@ reg(
       "Кликает по CSS-селектору ЧЕРЕЗ CDP и проверяет результат: перед кликом в страницу " +
       "ставится проба, которая ловит событие, после клика читается, что именно приняло удар. " +
       "Возвращает verified true только если событие дошло до элемента.",
-    inputSchema: {
-      selector: z.string(),
-      url: z.string().optional(),
-      button: z.enum(["left", "middle", "right"]).optional().default("left"),
-      clickCount: z.number().int().min(1).max(3).optional().default(1),
-    },
+    inputSchema: browserInputSchemas.browser_click,
   },
-  R(async (a) => {
-    const target = await cdp.pickTarget(a.url);
-    const client = await cdp.socket(target);
-
-    const locate = () => cdp.evaluate(client, `(() => {
-        const el = document.querySelector(${JSON.stringify(a.selector)});
-        if (!el) return "NULL";
-        el.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-        const r = el.getBoundingClientRect();
-        return JSON.stringify({ x: r.x + r.width / 2, y: r.y + r.height / 2 });
-      })()`);
-
-    const strike = async () => {
-      for (let i = 0; i < a.clickCount; i++) {
-        await client.send("Input.dispatchMouseEvent", {
-          type: "mousePressed", x: BOX.x, y: BOX.y, button: a.button, clickCount: i + 1,
-        });
-        await client.send("Input.dispatchMouseEvent", {
-          type: "mouseReleased", x: BOX.x, y: BOX.y, button: a.button, clickCount: i + 1,
-        });
-        if (i + 1 < a.clickCount) await new Promise((r) => setTimeout(r, 60));
-      }
-    };
-
-    await cdp.evaluate(client, "window.__deskProbeSelector = " + JSON.stringify(a.selector));
-    await cdp.evaluate(client, PROBE_JS);
-    const before = await cdp.evaluate(client, "location.href");
-
-    // Без bringToFront Chrome отбрасывает синтетический ввод, если вкладка не
-    // на переднем плане: Input.dispatchMouseEvent молча уходит в никуда, а
-    // модель получает verified:false и гадает почему.
-    try {
-      await client.send("Page.enable");
-      await client.send("Page.bringToFront");
-      await new Promise((r) => setTimeout(r, 250));
-    } catch { /* браузер может быть в другой вкладке — не критично */ }
-
-    let raw = await locate();
-    if (raw === "NULL") throw errWith(`Селектор не найден: ${a.selector}`, "ElementNotFound");
-    let BOX = JSON.parse(raw);
-    await strike();
-    await new Promise((r) => setTimeout(r, 350));
-    let hits = JSON.parse(await cdp.evaluate(client, READ_PROBE_JS));
-    let after = await cdp.evaluate(client, "location.href");
-    let navigated = before !== after;
-    let retried = false;
-
-    // Промах по координате после плавной прокрутки — обычное дело: элемент
-    // уехал между замером и кликом. Один ретрай с перезамером дешевле, чем
-    // выдавать модели ложь verified:false.
-    if (hits.length === 0 && !navigated) {
-      retried = true;
-      raw = await locate();
-      if (raw !== "NULL") {
-        BOX = JSON.parse(raw);
-        await strike();
-        await new Promise((r) => setTimeout(r, 400));
-        hits = JSON.parse(await cdp.evaluate(client, READ_PROBE_JS));
-        after = await cdp.evaluate(client, "location.href");
-        navigated = before !== after;
-      }
-    }
-
-    return ok({
-      ok: true,
-      selector: a.selector,
-      verified: hits.some((hit) => hit.matchesTarget === true),
-      via: hits.some((hit) => hit.matchesTarget === true) ? "probe" : navigated ? "navigation" : "none",
-      retried,
-      hit: hits.find((hit) => hit.matchesTarget === true) ?? hits[0] ?? null,
-      urlBefore: before,
-      urlAfter: after,
-    });
-  }),
+  R(async (a) => ok(await browserSteps.browser_click(a))),
 );
 
 reg(
@@ -1221,13 +1024,9 @@ reg(
     description:
       "Выполняет произвольный JS в контексте страницы (await поддерживается) и возвращает " +
       "значение. Для чтения того, что не отдаёт DOM-дерево, и для проверок в консоли.",
-    inputSchema: { expression: z.string(), url: z.string().optional() },
+    inputSchema: browserInputSchemas.browser_eval,
   },
-  R(async (a) => {
-    const target = await cdp.pickTarget(a.url);
-    const client = await cdp.socket(target);
-    return ok({ url: target.url, value: await cdp.evaluate(client, a.expression) });
-  }),
+  R(async (a) => ok(await browserSteps.browser_eval(a))),
 );
 
 // --- запуск -------------------------------------------------------------------
