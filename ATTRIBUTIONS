@@ -1,0 +1,66 @@
+Attributions for ComputerAutopilot
+
+ComputerAutopilot incorporates the following third-party modules, each with its own license:
+
+AI and Language Processing:
+    litellm: Licensed under MIT license
+        Source: https://github.com/BerriAI/litellm
+    tiktoken: Licensed under MIT license
+        Source: https://github.com/openai/tiktoken
+    langdetect: Licensed under Apache-2.0 license
+        Source: https://github.com/Mimino666/langdetect
+
+Windows Automation:
+    pywinauto: Licensed under BSD-3-Clause license
+        Source: https://pywinauto.readthedocs.io/en/latest/contents.html
+    pyautogui: Licensed under BSD-3-Clause license
+        Source: https://github.com/asweigart/pyautogui
+    pygetwindow: Licensed under BSD-3-Clause license
+        Source: https://github.com/asweigart/pygetwindow
+    PyWin32 (win32com, win32gui, win32con, win32api, win32process, winreg): 
+        Licensed under PSF license
+        Source: https://github.com/mhammond/pywin32
+    uiautomation: Licensed under Apache-2.0 license
+        Source: https://github.com/yinkaisheng/Python-UIAutomation-for-Windows
+
+GUI and Interface:
+    PySide6: Licensed under LGPL-3.0 license
+        Source: https://doc.qt.io/qtforpython-6/
+    pynput: Licensed under LGPL-3.0 license
+        Source: https://github.com/moses-palmer/pynput
+
+Image Processing:
+    Pillow (PIL): Licensed under HPND license
+        Source: https://python-pillow.org/
+    pytesseract: Licensed under Apache License 2.0
+        Source: https://github.com/madmaze/pytesseract
+
+Audio and Speech:
+    speech_recognition: Licensed under BSD-3-Clause, GPL-2.0 licenses
+        Source: https://github.com/Uberi/speech_recognition#readme
+    gTTS (Google Text-to-Speech): Licensed under MIT license
+        Source: https://github.com/pndurette/gTTS
+    pygame: Licensed under LGPL GNU Library or Lesser General Public License
+        Source: https://www.pygame.org/news
+    pyAudio: Licensed under MIT license
+        Source: https://people.csail.mit.edu/hubert/pyaudio/
+
+System and Utilities:
+    psutil: Licensed under BSD-3-Clause license
+        Source: https://github.com/giampaolo/psutil
+    fuzzywuzzy: Licensed under GPL-2.0 license
+        Source: https://github.com/seatgeek/fuzzywuzzy
+    schedule: Licensed under MIT license
+        Source: https://github.com/dbader/schedule
+    keyboard: Licensed under MIT license
+        Source: https://github.com/boppreh/keyboard
+
+Development Tools:
+    setuptools: Licensed under MIT license
+        Source: https://github.com/pypa/setuptools
+    pyinstaller: Licensed under GPL-2.0 license
+        Source: https://github.com/pyinstaller/pyinstaller
+
+Each module is the property of its respective owners, and ComputerAutopilot is not affiliated with these modules. All rights belong to their respective owners. Users must comply with the license terms of each module when using ComputerAutopilot.
+
+For detailed license information and terms of use, please visit the provided source links.
