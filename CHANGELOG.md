@@ -14,6 +14,7 @@
 - **Mock 模式**：无 Windows / 无影刀环境也可体验全部工具，兼任全量自动化测试替身
 - **Windows 一键安装脚本**：Python 探测、虚拟环境、token 生成、防火墙（仅放行 Tailscale 网段）、登录自启计划任务、401 自检
 - **run_robot 日志竞态重试**：影刀异步刷日志导致的瞬时任务 `launched:false` 误报已修复（有界重试，不无限等待）
+- **run_robot 启动观测与产出回收解耦**：产出目录缺失等回收失败不再让整个调用报错；`launched`/`state`/`evidence` 启动结论照常返回，回收失败单独落在 `output_error`（code + 中文说明 + 下一步提示），此时 `output_files` 为 null，两侧结果互不掩盖
 - **统一错误契约**：所有工具错误返回 `code + 中文 message + hint`，永不向协议层抛异常
 - 示例配置（`examples/`）、CI（ubuntu + windows 双矩阵）
 

@@ -71,6 +71,8 @@ def build_server(config: Config, gateway: ShadowBotGateway | None = None) -> Fas
         传 output_dir 时返回运行窗口内新增/修改的产出文件；output_dir 未配置时
         output_files 为 null。
         launched=true 表示日志中观测到启动（含瞬间跑完的情况）；是否仍在运行看 state。
+        产出回收与启动结论互不掩盖：产出目录缺失等回收失败不影响 launched/state/evidence，
+        错误放在 output_error（code + 中文说明 + 下一步提示），此时 output_files 为 null。
         ⚠️ 启动前请先与用户确认机器人身份（用 list_robots 的结果）。"""
         try:
             started = time.time()
@@ -88,14 +90,27 @@ def build_server(config: Config, gateway: ShadowBotGateway | None = None) -> Fas
                     await asyncio.sleep(2.0)
             # 空字符串视为未传
             out_dir = Path(output_dir) if output_dir else config.output_dir
-            output_files = list_new_files(out_dir, started) if out_dir else None
-            return ok({
+            # 产出回收与启动观测解耦：回收失败只写 output_error，绝不吞掉启动结论
+            output_files: list[str] | None = None
+            output_error: dict | None = None
+            if out_dir:
+                try:
+                    output_files = list_new_files(out_dir, started)
+                except ToolError as e:
+                    output_error = error_payload(e)
+                except Exception as e:  # 产出侧兜底：与工具边界同口径，但不升级为整个调用失败
+                    output_error = error_payload(
+                        ToolError(INTERNAL, f"产出文件回收失败: {e}", "查看 server stderr 日志"))
+            payload = {
                 "uuid": uuid,
                 "launched": status.state != STATE_UNKNOWN,
                 "state": status.state,
                 "evidence": status.evidence,
                 "output_files": output_files,
-            })
+            }
+            if output_error is not None:
+                payload["output_error"] = output_error
+            return ok(payload)
         except ToolError as e:
             return fail(e)
         except Exception as e:

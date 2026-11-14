@@ -161,6 +161,15 @@ tailscale set --accept-dns=false
 </details>
 
 <details>
+<summary><b>产出目录不存在，怎么判断机器人到底起没起？</b></summary>
+
+`run_robot` 把「启动是否被观测到」和「产出文件回收」分开交代。产出目录缺失不会让整个调用失败：
+`launched` / `state` / `evidence` 照常反映启动结论，回收失败单独放在 `output_error`
+（含 `code`、中文说明与下一步提示），此时 `output_files` 为 `null`。先按 `output_error.hint`
+修正 `output_dir`，再据 `launched` 判断是否需要重新启动——两件事互不掩盖。
+</details>
+
+<details>
 <summary><b>AI 侧报 404 Session not found</b></summary>
 
 网关进程在 AI 客户端两次调用之间被重启过（比如 PC 重启后计划任务拉起了新进程）。

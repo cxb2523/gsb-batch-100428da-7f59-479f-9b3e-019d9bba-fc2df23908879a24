@@ -57,7 +57,7 @@ ShadowBotGateway   ←—— 全项目唯一的架构接缝（5 个动作：scan
 | 工具 | 契约 |
 |---|---|
 | `list_robots()` | `[{uuid, name, path, mtime, version, description}]`，按 mtime 降序，`_temp` 目录跳过；名称匹配由客户端 LLM 完成（不提供 search 工具） |
-| `run_robot(uuid, params?, output_dir?)` | `{launched, state, evidence, output_files}`；动作后等待验证（真实 5s / mock 0s，可配置），状态未知时有界重试（影刀异步刷日志竞态）；`output_dir` 内运行窗口新增/修改的文件随结果返回 |
+| `run_robot(uuid, params?, output_dir?)` | `{launched, state, evidence, output_files, output_error?}`；动作后等待验证（真实 5s / mock 0s，可配置），状态未知时有界重试（影刀异步刷日志竞态），重试耗尽仍 unknown 时 `launched:false` 并保留 evidence；`output_dir` 内运行窗口新增/修改的文件随结果返回。启动观测与产出回收互不掩盖：产出目录缺失等回收失败不使整个调用报错，而是返回 `output_error: {code, message(中文), hint}` 且 `output_files: null`，`launched`/`state`/`evidence` 照常给出 |
 | `get_status(uuid?)` | `{state: running\|exited\|unknown, exit_code?, evidence}`；省略 uuid 时汇总当日日志中出现过的全部机器人 |
 | `stop_robot()` | `{stopped, running_before, running_after, evidence}`；Ctrl+Alt+Q **全局停止**（影响所有运行中机器人，工具描述强制警告）；无运行中机器人时 `stopped:false` 不谎报 |
 | `tail_log(n)` | 当日日志最后 n 行（1-500）；无日志返回空并附 `note` 原因 |

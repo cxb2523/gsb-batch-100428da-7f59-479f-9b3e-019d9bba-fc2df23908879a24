@@ -136,7 +136,9 @@ async def test_run_robot_output_dir_new_files(tmp_path):
 
     async with Client(build_server(cfg, gateway=SlowMock(seed()))) as client:
         data = (await client.call_tool("run_robot", {"uuid": "uuid-a", "params": {}})).data
+    assert data["launched"] is True
     assert data["output_files"] == [str(out / "report_今日.xlsx")]
+    assert "output_error" not in data  # 回收成功不附带产出错误字段
 
 
 async def test_run_robot_output_files_none_when_unconfigured():
@@ -146,11 +148,43 @@ async def test_run_robot_output_files_none_when_unconfigured():
     assert data["output_files"] is None  # 未配置产出目录 → null（区别于 []）
 
 
-async def test_run_robot_output_dir_missing_is_error(tmp_path):
+async def test_run_robot_output_dir_missing_keeps_launch_conclusion(tmp_path):
+    """产出目录缺失不再吞掉整个调用：启动结论照常返回，回收失败仅落在 output_error。"""
     cfg = Config(mock=True, wait_seconds=0.0, output_dir=tmp_path / "nope")
     async with Client(build_server(cfg, gateway=MockGateway(seed()))) as client:
         data = (await client.call_tool("run_robot", {"uuid": "uuid-a", "params": {}})).data
-    assert data["error"]["code"] == "OUTPUT_DIR_NOT_FOUND"
+    # 启动侧：机器人确实被观测到启动，结论必须保留
+    assert data["launched"] is True
+    assert data["state"] == "running"
+    assert data["evidence"]
+    assert "error" not in data  # 整个调用不再失败
+    # 产出侧：可区分的错误结构（code + 中文说明 + 下一步提示），文件清单为 null
+    assert data["output_files"] is None
+    assert data["output_error"]["code"] == "OUTPUT_DIR_NOT_FOUND"
+    assert data["output_error"]["message"]  # 中文说明
+    assert data["output_error"]["hint"]  # 下一步提示
+
+
+async def test_run_robot_output_dir_missing_with_unknown_launch_reports_both(tmp_path):
+    """两侧同时失败时互不掩盖：重试耗尽 unknown + 产出目录缺失，两份真实结论都要在。"""
+
+    class NeverSeenGateway(LaggyLogGateway):
+        async def status(self, uuid=None):
+            self.calls += 1
+            return {"u": RobotStatus(uuid="u", state="unknown", evidence=["日志中未出现"])}
+
+    cfg = Config(mock=True, wait_seconds=0.0, output_dir=tmp_path / "nope")
+    gw = NeverSeenGateway()
+    async with Client(build_server(cfg, gateway=gw)) as client:
+        data = (await client.call_tool("run_robot", {"uuid": "u"})).data
+    # 启动侧如实为 false，evidence 保留
+    assert data["launched"] is False
+    assert data["state"] == "unknown"
+    assert data["evidence"] == ["日志中未出现"]
+    # 产出侧错误同样保留，不被启动侧结论掩盖
+    assert data["output_files"] is None
+    assert data["output_error"]["code"] == "OUTPUT_DIR_NOT_FOUND"
+    assert "error" not in data
 
 
 async def test_stop_no_robot_running_reports_false():
@@ -222,6 +256,7 @@ async def test_run_robot_retries_while_log_record_pending():
         data = (await client.call_tool("run_robot", {"uuid": "u"})).data
     assert data["launched"] is True
     assert data["state"] == "exited"
+    assert data["evidence"] == ["已退出"]  # 观测证据随结论保留
     assert gw.calls == 3  # 首查 + 2 次重试
 
 
@@ -239,4 +274,6 @@ async def test_run_robot_unknown_after_retries_reports_false():
         data = (await client.call_tool("run_robot", {"uuid": "u"})).data
     assert data["launched"] is False
     assert data["state"] == "unknown"
+    assert data["evidence"] == ["日志中未出现"]  # 失败也保留 evidence，便于排障
+    assert "error" not in data  # 未观测到启动不是工具错误，仍是结构化结论
     assert gw.calls == 3  # 首查 + 2 次重试后放弃
