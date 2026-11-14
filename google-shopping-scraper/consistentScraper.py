@@ -31,8 +31,29 @@ Environment Variables
 - GOOGLE_QUERY: Search query (default: "pc wireless gaming headset")
 - OUT_JSON: Output file name (default: "google_shopping_results.json")
 - MAX_PAGES: Maximum pages to scrape (default: 0 = unlimited)
-- PAUSE_SECONDS: Delay between requests (default: 1.0)
+- PAUSE_SECONDS: Delay between requests, also used between retries (default: 1.0)
+- MAX_RETRIES: Retries per failed request after the first attempt (default: 2,
+  so up to 3 attempts total). Pages that still fail are recorded with their
+  start offset and error, and are NOT counted as empty pages.
 """
+
+# -----------------------------
+# Stop reasons (bilingual, human-readable)
+# -----------------------------
+STOP_REASON_NO_NEW_PRODUCTS = "no_new_products"
+STOP_REASON_INTERRUPTED = "interrupted_by_failed_pages"
+
+STOP_REASON_TEXT = {
+    STOP_REASON_NO_NEW_PRODUCTS: (
+        "无新产品：成功请求确认页面已无商品，采集正常结束 "
+        "(no new products: confirmed by successfully fetched empty pages)"
+    ),
+    STOP_REASON_INTERRUPTED: (
+        "因失败页中断：部分页面在有限次重试后仍请求失败，结果可能被网络错误截断 "
+        "(interrupted by failed pages: requests kept failing after retries, "
+        "results may be truncated)"
+    ),
+}
 
 # -----------------------------
 # Config
@@ -50,6 +71,13 @@ PAGE_SIZE       = int(os.getenv("PAGE_SIZE", "10"))
 MAX_PAGES       = int(os.getenv("MAX_PAGES", "0"))  # 0 = unlimited
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 PAUSE_SECONDS   = float(os.getenv("PAUSE_SECONDS", "1.0"))
+# Number of retries after the first failed attempt. Kept small on purpose so a
+# flaky proxy is retried but a dead page does not stall the whole run.
+MAX_RETRIES     = int(os.getenv("MAX_RETRIES", "2"))
+# Stop a pass only after this many CONSECUTIVE pages where the request
+# succeeded but the page genuinely contained no products. Failed pages never
+# contribute to this counter.
+EMPTY_PAGE_LIMIT = 3
 
 # -----------------------------
 # HTTP helper
@@ -61,6 +89,36 @@ def scrape_do(url: str, session: requests.Session) -> requests.Response:
     r = session.get(api)
     r.raise_for_status()
     return r
+
+
+def request_with_retries(label: str, url: str, session: requests.Session, fetch):
+    """
+    Call ``fetch(url, session)`` with a bounded number of retries.
+
+    The first attempt plus up to MAX_RETRIES retries are made, waiting
+    PAUSE_SECONDS between attempts. The Scrape.do call itself is unchanged;
+    this only adds the retry loop around it.
+
+    Returns:
+        (result, None) on success
+        (None, last_error) once every attempt has failed
+    """
+    last_error = None
+    max_attempts = MAX_RETRIES + 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fetch(url, session), None
+        except requests.RequestException as e:
+            last_error = e
+            if attempt < max_attempts:
+                print(
+                    f"[retry] {label} attempt {attempt}/{max_attempts} failed: {e}; "
+                    f"retrying in {PAUSE_SECONDS:g}s"
+                )
+                time.sleep(PAUSE_SECONDS)
+            else:
+                print(f"[retry] {label} failed after {max_attempts} attempts: {e}")
+    return None, last_error
 
 # -----------------------------
 # Parsing helpers
@@ -284,6 +342,107 @@ def parse_async_batch(snippets, ei=None):
         total_found += batch_total
     return products, total_found
 
+
+def _fetch_async_with_retry(async_url, session):
+    """Retry wrapper around the async pagination endpoint."""
+    return request_with_retries("async page", async_url, session, fetch_async_snippets)
+
+
+def _fetch_plain_with_retry(plain_url, session, ei):
+    """Retry wrapper around the plain (non-async) fallback page."""
+    def _fetch(url, sess):
+        resp = scrape_do(url, sess)
+        return extract_product_data(BeautifulSoup(resp.content, "html.parser"), ei)
+
+    return request_with_retries("fallback plain page", plain_url, session, _fetch)
+
+
+def fetch_result_page(session, ei, basejs, basecss, basecomb, start):
+    """
+    Fetch one result page and classify the outcome explicitly.
+
+    Three outcomes are returned as the ``status`` field so callers never
+    confuse a network failure with a genuinely empty page:
+
+    - "ok":     at least one request path succeeded and products were found.
+    - "empty":  every attempted request SUCCEEDED, but the page contained no
+                products. Safe to count towards the consecutive-empty stop.
+    - "failed": one or more request paths failed after all retries. The page
+                is recorded (with start offset + error) and must NOT be
+                counted as empty.
+
+    Returns:
+        dict with keys:
+            status, products, page_total, start,
+            async_error, fallback_error, note
+    """
+    result = {
+        "status": "failed",
+        "products": [],
+        "page_total": 0,
+        "start": start,
+        "async_error": None,
+        "fallback_error": None,
+        "note": "",
+    }
+
+    # --- Path 1: async pagination endpoint, with bounded retries ---
+    async_url = build_async_url(ei, basejs, basecss, basecomb, QUERY, start)
+    snippets, async_error = _fetch_async_with_retry(async_url, session)
+
+    if async_error is not None:
+        result["async_error"] = repr(async_error)
+
+    async_products = []
+    async_total = 0
+    if snippets:
+        async_products, async_total = parse_async_batch(snippets, ei)
+
+    if async_products:
+        result.update(status="ok", products=async_products, page_total=async_total)
+        return result
+
+    # The async path produced no products. Try the plain page fallback so we
+    # can tell "the page is truly empty" apart from "the async endpoint broke".
+    plain_url = (
+        f"https://www.google.com/search?q={urllib.parse.quote_plus(QUERY)}"
+        f"&udm=28&start={start}"
+    )
+    plain_result, plain_error = _fetch_plain_with_retry(plain_url, session, ei)
+
+    if plain_error is not None:
+        result["fallback_error"] = repr(plain_error)
+
+    if plain_result is not None:
+        plain_products, plain_total = plain_result
+        if plain_products:
+            result.update(status="ok", products=plain_products, page_total=plain_total)
+            if async_error is not None:
+                # Async failed but the fallback saved the page: still surface
+                # the async error for visibility, without marking the page failed.
+                result["note"] = "async request failed; products recovered via plain fallback"
+            elif not snippets:
+                result["note"] = "async returned no snippets; products recovered via plain fallback"
+            return result
+
+        # Fallback request succeeded but genuinely has no products.
+        if async_error is None:
+            # Both request paths succeeded and both are empty -> a real empty page.
+            result["status"] = "empty"
+            return result
+        # Async failed after retries; even though the fallback succeeded empty,
+        # we never received a successful response for this offset's full slice,
+        # so treat it as a failed page rather than a confirmed-empty one.
+        result["note"] = "async failed after retries; plain fallback succeeded but had no products"
+        return result
+
+    # Fallback itself failed after retries.
+    if async_error is None:
+        result["note"] = "async succeeded with no products; plain fallback request failed"
+    else:
+        result["note"] = "both async and plain fallback requests failed after retries"
+    return result
+
 def build_product_detail_url(params: dict, query: str):
     """Build URL for product detail popup."""
     if not params:
@@ -361,20 +520,23 @@ def fetch_product_details(session: requests.Session, params: dict, query: str):
 def run_extraction(session, existing_products=None):
     """
     Run a single product extraction pass.
-    
+
     Args:
         session: requests.Session
         existing_products: dict keyed by (title, price) of products already found
-    
+
     Returns:
-        tuple: (new_products_dict, new_count) where new_products_dict is dict of products found in this pass,
-               and new_count is number of new products added
+        tuple: (new_products_dict, new_count, failed_pages) where
+               new_products_dict is dict of products found in this pass,
+               new_count is number of new products added, and failed_pages is
+               a list of dicts describing pages whose requests failed after
+               all retries (each carries the start offset and error info).
     """
     if existing_products is None:
         existing_products = {}
-    
+
     print("\n[extraction] Starting...")
-    
+
     # Initial page: only used to extract tokens required for async pagination.
     # We intentionally do NOT parse products from this HTML, to keep all
     # product collection consistent with the async responses.
@@ -388,29 +550,42 @@ def run_extraction(session, existing_products=None):
     pass_products = {}
     total_all = 0
 
+    # Only pages where the request SUCCEEDED but no products were returned
+    # count towards this stop counter. Failed pages never touch it.
     consecutive_empty_pages = 0
+    # Pages that could not be fetched even after retries. Recorded with their
+    # start offset and the underlying errors so the caller can report them.
+    failed_pages = []
     page_limit = MAX_PAGES if MAX_PAGES > 0 else 999
-    
+
     for page_idx in range(0, page_limit + 1):
         start = PAGE_SIZE * page_idx
 
-        # Try async endpoint
-        async_url = build_async_url(ei, basejs, basecss, basecomb, QUERY, start)
-        try:
-            snippets = fetch_async_snippets(session, async_url)
-        except requests.HTTPError as e:
-            snippets = []
+        # One call now distinguishes: failed request vs. genuinely empty page.
+        page = fetch_result_page(session, ei, basejs, basecss, basecomb, start)
+        new_batch = page["products"]
+        page_total = page["page_total"]
+        status = page["status"]
 
-        new_batch, page_total = parse_async_batch(snippets, ei) if snippets else ([], 0)
-
-        # Fallback to plain page
-        if not new_batch:
-            plain_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(QUERY)}&udm=28&start={start}"
-            try:
-                r2 = scrape_do(plain_url, session)
-                new_batch, page_total = extract_product_data(BeautifulSoup(r2.content, "html.parser"), ei)
-            except requests.HTTPError:
-                new_batch, page_total = [], 0
+        if status == "failed":
+            # Do not count this as an empty page: record it and move on to the
+            # next offset, per the requirement to keep trying later pages.
+            entry = {
+                "page": page_idx + 1,
+                "start": start,
+                "async_error": page["async_error"],
+                "fallback_error": page["fallback_error"],
+                "error": page["async_error"] or page["fallback_error"],
+                "note": page["note"],
+            }
+            failed_pages.append(entry)
+            print(
+                f"[page {page_idx + 1}] REQUEST FAILED (start={start}); "
+                f"not counted as empty. async_error={page['async_error']} "
+                f"fallback_error={page['fallback_error']} ({page['note']})"
+            )
+            time.sleep(PAUSE_SECONDS)
+            continue
 
         # Add all products (with or without detail params)
         page_added = 0
@@ -426,23 +601,34 @@ def run_extraction(session, existing_products=None):
         total_all += page_total
 
         print(f"[page {page_idx + 1}] found {page_total} products, {page_added} new ({with_params} with detail params)")
-        
-        # Stopping logic: stop after 3 consecutive pages that return no products at all.
-        # We deliberately look at page_total (not page_added) so that we keep
-        # going through pages even if they only contain products we've already seen.
+
+        # Stopping logic: stop after N consecutive pages where the request
+        # SUCCEEDED but the page genuinely returned no products. We look at
+        # page_total (not page_added) so pages full of already-seen products
+        # still count as non-empty and keep pagination going.
         if page_total == 0:
             consecutive_empty_pages += 1
-            if consecutive_empty_pages >= 3:
+            if consecutive_empty_pages >= EMPTY_PAGE_LIMIT:
+                print(
+                    f"[extraction] Stopping after {EMPTY_PAGE_LIMIT} consecutive "
+                    f"successfully-fetched empty pages"
+                )
                 break
         else:
             consecutive_empty_pages = 0
 
         time.sleep(PAUSE_SECONDS)
-    
+
     new_count = len(pass_products)
-    print(f"[extraction] Found {new_count} new products in this pass")
-    
-    return pass_products, new_count
+    if failed_pages:
+        print(
+            f"[extraction] Found {new_count} new products in this pass; "
+            f"{len(failed_pages)} page(s) failed and were skipped"
+        )
+    else:
+        print(f"[extraction] Found {new_count} new products in this pass")
+
+    return pass_products, new_count, failed_pages
 
 def main():
     session = requests.Session()
@@ -450,38 +636,72 @@ def main():
     print(f"[scraper] Starting Google Shopping scraper")
     print(f"[scraper] Query: {QUERY}")
     print(f"[scraper] Max pages: {MAX_PAGES if MAX_PAGES > 0 else 'unlimited'}")
-    
+    print(f"[scraper] Max retries per request: {MAX_RETRIES} (up to {MAX_RETRIES + 1} attempts)")
+
     # Multi-run extraction: keep running until no new products found
     all_products_dict = {}
     run_index = 0
-    
+    # Failed pages accumulated across all runs, tagged with the run number so
+    # the final report can point at exactly which offset failed when.
+    all_failed_pages = []
+    stop_reason = None
+
     while True:
         run_index += 1
-        
+
         print(f"\n{'='*80}")
         print(f"[scraper] Extraction run #{run_index}")
         print(f"{'='*80}")
-        
-        pass_products, new_count = run_extraction(session, all_products_dict)
-        
+
+        pass_products, new_count, failed_pages = run_extraction(session, all_products_dict)
+
         # Merge new products into global dict
         for key, product in pass_products.items():
             all_products_dict[key] = product
-        
-        print(f"[scraper] Run #{run_index} complete: {new_count} new products, {len(all_products_dict)} total")
-        
-        # Stop when no new products found
+
+        for fp in failed_pages:
+            fp_with_run = dict(fp)
+            fp_with_run["run"] = run_index
+            all_failed_pages.append(fp_with_run)
+
+        print(
+            f"[scraper] Run #{run_index} complete: {new_count} new products, "
+            f"{len(all_products_dict)} total, {len(failed_pages)} failed page(s)"
+        )
+
+        # Stop when no new products were found in a run. Distinguish a real
+        # end-of-results from truncation: if any page failed in that run, zero
+        # new products cannot be trusted as "everything was scraped".
         if new_count == 0:
-            print(f"[scraper] No new products found in run #{run_index}, stopping multi-run extraction")
+            if failed_pages:
+                stop_reason = STOP_REASON_INTERRUPTED
+                print(
+                    f"[scraper] No new products in run #{run_index} but {len(failed_pages)} "
+                    f"page(s) failed; stopping as interrupted rather than claiming completion"
+                )
+            else:
+                stop_reason = STOP_REASON_NO_NEW_PRODUCTS
+                print(f"[scraper] No new products found in run #{run_index}, stopping multi-run extraction")
             break
-        
+
         time.sleep(PAUSE_SECONDS)
-    
+
     all_products = list(all_products_dict.values())
-    
+
+    # Honest end-of-run accounting: readable reason plus every failed page.
     print(f"\n[scraper] Extraction summary:")
     print(f"[scraper] Total unique products: {len(all_products)}")
     print(f"[scraper] Total extraction runs: {run_index}")
+    print(f"[scraper] Stop reason: {STOP_REASON_TEXT[stop_reason]}")
+    print(f"[scraper] Failed pages: {len(all_failed_pages)}")
+    if all_failed_pages:
+        print("[scraper] Failed page details (start offset + error):")
+        for fp in all_failed_pages:
+            print(
+                f"  - run #{fp.get('run')} page {fp['page']} start={fp['start']} "
+                f"async_error={fp['async_error']} fallback_error={fp['fallback_error']}"
+                + (f" [{fp['note']}]" if fp.get("note") else "")
+            )
 
     # Count how many have detail params for OAPV fetching
     products_with_params = [p for p in all_products if p.get("product_params")]
@@ -542,6 +762,18 @@ def main():
     print(f"[scraper] Total reviews: {total_reviews}")
     print(f"[scraper] Total forums: {total_forums}")
     print(f"[scraper] Products with descriptions: {products_with_desc}/{len(all_products)}")
+
+    # Structured result for programmatic callers. The JSON file itself keeps
+    # the original product-only schema; failure/stop metadata is reported here
+    # and via the console, not injected into product records.
+    return {
+        "products": all_products,
+        "stop_reason": stop_reason,
+        "stop_reason_text": STOP_REASON_TEXT[stop_reason],
+        "total_runs": run_index,
+        "failed_pages": all_failed_pages,
+        "output_file": OUT_JSON,
+    }
 
 if __name__ == "__main__":
     main()

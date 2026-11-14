@@ -54,11 +54,21 @@ Prints parsed product details (brand, rating, description, offers, reviews, foru
    QUERY = "pc wireless gaming headset"
    ```
 
-   Also configurable via env vars: `SCRAPE_DO_TOKEN`, `GOOGLE_QUERY`, `OUT_JSON`, `MAX_PAGES`, `PAUSE_SECONDS`.
+   Also configurable via env vars: `SCRAPE_DO_TOKEN`, `GOOGLE_QUERY`, `OUT_JSON`, `MAX_PAGES`, `PAUSE_SECONDS`, `MAX_RETRIES`.
 
 2. Run: `python consistentScraper.py`
 
 Output → `google_shopping_results.json` — each product has card-level fields (title, price, image, seller) plus detail fields when available (brand, description, offers, reviews, forums).
+
+### Failure-aware pagination
+
+Network failures are never silently treated as "no more products". For every result offset the script distinguishes three outcomes:
+
+1. **Async pagination request failed** — retried up to `MAX_RETRIES` times (default `2`, i.e. 3 attempts total), waiting `PAUSE_SECONDS` between attempts.
+2. **Plain-page fallback also failed** — the same retry budget applies to the fallback. If both paths are exhausted, the page is recorded with its `start` offset and error, pagination **continues with the next offset**, and the page is **not** counted as empty.
+3. **Request succeeded but the page has no products** — only these pages count towards the consecutive-empty stop (3 in a row ends a pass).
+
+A multi-run loop that produces zero new products therefore ends with an explicit, readable stop reason — either **no new products** (a clean finish confirmed by successful empty pages) or **interrupted by failed pages** (results may be truncated) — together with the full failed-page list. The JSON output keeps the original product-only schema; failure metadata is printed to the console and returned programmatically from `main()`, never injected into product records.
 
 ## How to Use: `serpApiShopping.py`
 
@@ -114,7 +124,7 @@ Google Shopping responses come in two flavors:
 - **Missing `data-*` attributes**: Google doesn't always include the five required detail parameters on every card. Promoted and aggregated listings are especially inconsistent. Card-level data still gets extracted.
 - **Expired `ei` tokens**: These are session-specific and short-lived. Don't hardcode async URLs — use the scripts to build them from fresh tokens each run.
 - **Fewer products than expected**: Try setting `PAGE_SIZE = 1` to surface more product slices per async page.
-- **403/429 errors**: Check your token and credits. Use the `PAUSE_SECONDS` setting to add delays between requests.
+- **403/429 errors**: Check your token and credits. Use the `PAUSE_SECONDS` setting to add delays between requests; failed requests are retried `MAX_RETRIES` times before the page is recorded as failed (without being mistaken for an empty result).
 
 ---
 
