@@ -3,6 +3,8 @@ import heapq
 import logging
 import os
 import pickle
+from collections.abc import Mapping
+from dataclasses import dataclass
 from multiprocessing import Pool
 
 from tqdm import tqdm
@@ -12,6 +14,33 @@ from document_rater import DocumentRater
 from wandb_logger import WandbLogger
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ResumeState:
+    """Verifiable starting point returned by ``Crawler.init_or_resume_state``.
+
+    Attributes:
+        iter_num: iteration from which the crawl should continue.
+        num_selected_docs: cumulative number of docs already selected.
+        queue_size: actual number of docs in the restored (and possibly
+            recomputed) queue.
+        dropped_docs: docs dropped while recomputing scores because their
+            content could not be fetched; 0 when no recomputation happened.
+        raters_recomputed: whether queue scores were recomputed because the
+            rater set in the state file did not match the current raters.
+    """
+
+    iter_num: int
+    num_selected_docs: int
+    queue_size: int
+    dropped_docs: int = 0
+    raters_recomputed: bool = False
+
+    def __iter__(self):
+        # Backwards-compatible unpacking: ``iter_num, num_selected_docs = ...``
+        yield self.iter_num
+        yield self.num_selected_docs
 
 
 class Crawler:
@@ -169,47 +198,271 @@ class Crawler:
                 fout.write(f"{docid}\n")
 
     def save_state(self, iter_num: int, num_selected_docs: int) -> None:
+        # ``iter_num`` is stored inside the state so resume no longer has to
+        # infer it from the file name. The ``state_<n:06d>.pkl`` naming is
+        # kept unchanged and old state files without this key remain readable
+        # (the iteration falls back to being parsed from the file name).
         state = {
             "queue": self.queue,
             "visited": self.visited,
             "num_selected_docs": num_selected_docs,
+            "iter_num": iter_num,
         }
         with open(os.path.join(self.output_dir, f"state_{iter_num:06d}.pkl"), "wb") as fout:
             pickle.dump(state, fout)
 
-    def init_or_resume_state(self, state_file: str | None) -> tuple[int, int]:
+    @staticmethod
+    def _iter_num_from_state_path(state_file: str) -> int:
+        """Parse the iteration number from a ``state_<n>.pkl`` file name."""
+        basename = os.path.basename(state_file)
+        error_msg = (
+            f"Cannot infer iteration number from state file name '{state_file}': "
+            "expected a name of the form state_<n>.pkl (e.g. state_000042.pkl). "
+            "Re-save the state with Crawler.save_state or pass a correctly named file."
+        )
+        parts = basename.split("_")
+        if len(parts) < 2:
+            raise ValueError(error_msg)
+        num_part = parts[-1].split(".")[0]
+        if not num_part.isdigit():
+            raise ValueError(error_msg)
+        return int(num_part)
+
+    @staticmethod
+    def _infer_rater_names(queue: list) -> set[str]:
+        """Infer the set of annotation (scoring) keys from queue entries.
+
+        Every queue entry is an ``(annotations, docid)`` tuple whose
+        annotations expose the scoring keys of the raters used when the entry
+        was scored (normalized rater keys are included alongside their base
+        key). All entries must carry the same key set, otherwise the rater set
+        cannot be determined unambiguously.
+        """
+        if not isinstance(queue, list) or not queue:
+            raise ValueError("Cannot infer quality raters from an empty queue.")
+        first_annotations = queue[0][0]
+        if not isinstance(first_annotations, Mapping) or not first_annotations:
+            raise ValueError(
+                "Cannot infer quality rater set from the queue: the first entry "
+                f"has no scoring annotations: {queue[0]!r}."
+            )
+        rater_names = set(first_annotations.keys())
+        for index, entry in enumerate(queue[1:], start=1):
+            try:
+                annotations = entry[0]
+            except (TypeError, IndexError):
+                raise ValueError(
+                    f"Malformed queue entry at index {index}: expected an "
+                    f"(annotations, docid) tuple, got {entry!r}."
+                )
+            if not isinstance(annotations, Mapping) or not annotations:
+                raise ValueError(
+                    f"Cannot infer quality rater set: queue entry at index {index} "
+                    f"has no scoring annotations: {entry!r}."
+                )
+            if set(annotations.keys()) != rater_names:
+                raise ValueError(
+                    "Queue entries carry inconsistent scoring keys, so the quality "
+                    f"rater set cannot be inferred unambiguously. First entry keys: "
+                    f"{sorted(rater_names)}; entry {index} keys: "
+                    f"{sorted(annotations.keys())}."
+                )
+        return rater_names
+
+    @staticmethod
+    def _base_rater_names(annotation_keys: set[str]) -> set[str]:
+        """Strip normalizer-derived keys from an annotation key set.
+
+        Each rater writes one base key (its ``get_name()``) plus, when a
+        normalizer is configured, a derived ``<name>_<normalizer>_normalized``
+        key. Rater identity is therefore the set of keys that do not end in
+        ``_normalized``; comparing base keys avoids recomputing merely because
+        a normalizer produced extra annotation keys.
+        """
+        return {key for key in annotation_keys if not key.endswith("_normalized")}
+
+    def _verify_resume_against_outputs(self, iter_num: int, num_selected_docs: int) -> None:
+        """Cross-check the resumed counters against the iter_*.docids.txt files.
+
+        This only reads already-written output files and never raises: a
+        mismatch means the counters are not trustworthy and is surfaced as a
+        warning rather than silently ignored.
+        """
+        if not self.output_dir:
+            return
+        output_files = [
+            name
+            for name in os.listdir(self.output_dir)
+            if name.startswith("iter_") and name.endswith(".docids.txt")
+        ]
+        if not output_files:
+            logger.warning(
+                "Resuming with no iter_<n>.docids.txt output files found in "
+                f"'{self.output_dir}'; the resumed counters cannot be cross-checked "
+                "against written outputs."
+            )
+            return
+        num_lines = 0
+        num_files = 0
+        for name in output_files:
+            path = os.path.join(self.output_dir, name)
+            try:
+                with open(path, "r") as fin:
+                    num_lines += sum(1 for line in fin if line.strip())
+                num_files += 1
+            except OSError as error:
+                logger.warning(f"Could not read output file '{path}' for verification: {error}")
+        expected_path = os.path.join(self.output_dir, f"iter_{iter_num - 1}.docids.txt")
+        if not os.path.exists(expected_path):
+            logger.warning(
+                f"Resume expects the next iteration to be {iter_num}, but the "
+                f"preceding output file '{expected_path}' does not exist."
+            )
+        if num_lines != num_selected_docs:
+            logger.warning(
+                f"Resumed num_selected_docs={num_selected_docs} does not match the "
+                f"{num_lines} docids found across {num_files} output file(s) in "
+                f"'{self.output_dir}'."
+            )
+        else:
+            logger.info(
+                f"Verified resumed counters against {num_files} output file(s): "
+                f"{num_lines} selected docids match num_selected_docs."
+            )
+
+    def init_or_resume_state(self, state_file: str | None) -> ResumeState:
         if state_file is None:
             logger.info("Starting from scratch")
-            return 0, 0
+            return ResumeState(
+                iter_num=0, num_selected_docs=0, queue_size=0, dropped_docs=0
+            )
         logger.info(f"Resuming from state file: {state_file}")
-        iter_num = int(state_file.split("_")[-1].split(".")[0])
         with open(state_file, "rb") as fin:
             state = pickle.load(fin)
+        if not isinstance(state, Mapping) or "queue" not in state or "visited" not in state:
+            raise ValueError(
+                f"State file '{state_file}' is malformed: expected a mapping with "
+                "'queue' and 'visited' entries."
+            )
+        if "num_selected_docs" not in state:
+            raise ValueError(
+                f"State file '{state_file}' is missing the 'num_selected_docs' entry."
+            )
+
         self.queue, self.visited = state["queue"], state["visited"]
         num_selected_docs = state["num_selected_docs"]
-        original_quality_raters = set(self.queue[0][0].keys())
+
+        # Prefer the iteration stored inside the state; fall back to the file
+        # name for legacy state files saved before this key existed.
+        if "iter_num" in state:
+            iter_num = state["iter_num"]
+        else:
+            logger.info(
+                "State file does not store an iteration number (legacy format); "
+                "inferring it from the file name."
+            )
+            iter_num = self._iter_num_from_state_path(state_file)
+
+        if not isinstance(self.queue, list) or len(self.queue) == 0:
+            raise ValueError(
+                f"Cannot resume from '{state_file}': the queue in the state file is "
+                "empty, so there is no document to continue crawling from."
+            )
+        if not isinstance(self.visited, set):
+            raise ValueError(
+                f"Cannot resume from '{state_file}': 'visited' must be a set, got "
+                f"{type(self.visited).__name__}."
+            )
+
+        original_annotation_keys = self._infer_rater_names(self.queue)
+        original_quality_raters = self._base_rater_names(original_annotation_keys)
         current_quality_raters = set(
             quality_rater.get_name() for quality_rater in self.quality_raters
         )
         gc.collect()
+
+        raters_recomputed = False
+        dropped_docs = 0
         if original_quality_raters != current_quality_raters:
+            raters_recomputed = True
             logger.info("Quality raters mismatch")
             logger.info(
-                f"Quality raters in state file: {original_quality_raters}, "
-                f"current quality raters: {current_quality_raters}"
+                f"Quality raters in state file: {sorted(original_quality_raters)}, "
+                f"current quality raters: {sorted(current_quality_raters)}"
             )
             logger.info("Current first item in the queue:")
             logger.info(self.queue[0])
             logger.info("Recomputing scores for all docs in the queue")
-            recomputed = self.get_scores_for_docs([docid for _, docid in self.queue])
-            assert len(recomputed) == len(self.queue)
+            docids_to_score = [docid for _, docid in self.queue]
+            recomputed = self.get_scores_for_docs(docids_to_score)
+            # Content fetching may fail for some docs, which get_scores_for_docs
+            # silently drops. Track how many disappeared instead of asserting
+            # equality, and rebuild the queue only from docs that survived.
+            recomputed_by_docid = {doc.docid: doc for doc in recomputed}
+            dropped_docids = [
+                docid for docid in docids_to_score if docid not in recomputed_by_docid
+            ]
+            dropped_docs = len(dropped_docids)
+            if dropped_docs:
+                logger.warning(
+                    f"{dropped_docs} of {len(docids_to_score)} queued docs could not "
+                    "be fetched during score recomputation and were dropped from the "
+                    f"queue: {dropped_docids[:10]}{' ...' if dropped_docs > 10 else ''}"
+                )
+            if not recomputed:
+                raise ValueError(
+                    "Score recomputation dropped every document in the queue (no doc "
+                    "content could be fetched); refusing to resume with an empty queue."
+                )
             logger.info("Constructing new queue")
             new_queue = []
-            for doc, (_, docid) in zip(recomputed, self.queue):
-                assert doc.docid == docid
+            for docid in docids_to_score:
+                doc = recomputed_by_docid.get(docid)
+                if doc is None:
+                    continue  # Dropped: content unavailable during recomputation.
                 new_queue.append((doc.annotations, docid))
             self.queue = new_queue
             heapq.heapify(self.queue)
             logger.info("After recomputation, first item in the queue:")
             logger.info(self.queue[0])
-        return iter_num, num_selected_docs
+            # Recompute guarantees every surviving doc carries current rater keys.
+            final_base_keys = self._base_rater_names(set(self.queue[0][0].keys()))
+            missing = current_quality_raters - final_base_keys
+            if missing:
+                raise ValueError(
+                    "Recomputed queue annotations are missing keys for the current "
+                    f"raters: {sorted(missing)}."
+                )
+        else:
+            # Raters match: keep the stored queue untouched and only verify that
+            # every entry is consistent, so no scoring work is redone.
+            self._infer_rater_names(self.queue)
+            stored_base_keys = self._base_rater_names(
+                set(self.queue[0][0].keys())
+            )
+            missing = current_quality_raters - stored_base_keys
+            if missing:
+                raise ValueError(
+                    "Queue annotations claim to match the current raters but are "
+                    f"missing keys: {sorted(missing)}."
+                )
+            logger.info(
+                "Quality raters match the state file; reusing the stored queue "
+                "without recomputing scores."
+            )
+
+        self._verify_resume_against_outputs(iter_num, num_selected_docs)
+        resume_state = ResumeState(
+            iter_num=iter_num,
+            num_selected_docs=num_selected_docs,
+            queue_size=len(self.queue),
+            dropped_docs=dropped_docs,
+            raters_recomputed=raters_recomputed,
+        )
+        logger.info(
+            f"Resume point: continue at iteration {iter_num}, "
+            f"{num_selected_docs} docs already selected, queue size "
+            f"{resume_state.queue_size}"
+            + (f", {dropped_docs} docs dropped during recomputation" if dropped_docs else "")
+        )
+        return resume_state

@@ -208,8 +208,23 @@ def main():
         return
 
     logger.info(f"Target number of docs: {args.max_num_docs}")
-    iter_num, num_selected_docs = crawler.init_or_resume_state(args.resume_from_state)
-    logger.info(f"Starting from iteration {iter_num}, total selected docs: {num_selected_docs}")
+    resume_state = crawler.init_or_resume_state(args.resume_from_state)
+    iter_num = resume_state.iter_num
+    num_selected_docs = resume_state.num_selected_docs
+    logger.info(
+        f"Starting from iteration {iter_num}, total selected docs: {num_selected_docs}, "
+        f"queue size: {resume_state.queue_size}"
+    )
+    if resume_state.raters_recomputed:
+        logger.info(
+            "Queue scores were recomputed because the configured quality raters differ "
+            "from the state file"
+            + (
+                f"; {resume_state.dropped_docs} docs were dropped during recomputation"
+                if resume_state.dropped_docs
+                else ""
+            )
+        )
     if iter_num == 0:
         logger.info("Initializing seed docs")
         seed_docids = []
