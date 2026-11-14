@@ -1,0 +1,14 @@
+/.idea
+/test
+/debugging-moodle
+__pycache__
+/venv
+/.venv
+.ruff_cache
+/build
+/dist
+config.json
+MoodleDownloader.log
+MoodleDL.log
+/moodle_dl.egg-info
+/.vscode/launch.json
