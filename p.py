@@ -17,6 +17,10 @@ DEFAULT_KEYWORD = "测试工程师"
 DEFAULT_OUTPUT = "jobs.xlsx"
 DEFAULT_TIMEOUT = 30
 
+# 1 is used by CrawlerError failures and 2 by argument validation; a partial
+# export that still wrote a workbook needs its own distinguishable exit code.
+PARTIAL_EXPORT_EXIT_CODE = 3
+
 SEARCH_INPUT_SELECTORS = (
     "input[name='query']",
     "input.ipt-search",
@@ -53,6 +57,26 @@ class CrawlerError(RuntimeError):
 
 class SecurityVerificationRequired(CrawlerError):
     """BOSS requires the user to complete a security verification."""
+
+
+def _format_error_chain(exc):
+    """Flatten an exception chain into one readable line.
+
+    A re-raised CrawlerError often hides the original timeout/click failure in
+    its ``__cause__``; users need that original message to understand the stop.
+    """
+    parts = []
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = str(current).strip()
+        if text:
+            parts.append(text)
+        current = current.__cause__ or current.__context__
+    if parts:
+        return " | 原始错误: ".join(parts)
+    return f"{type(exc).__name__}: {exc!r}"
 
 
 def _clean_text(value):
@@ -119,6 +143,9 @@ class BossZhipinSpider:
         self.timeout = timeout
         self.wait_for_verification = wait_for_verification
         self.data_list = []
+        # Set when pagination stops before all planned pages were processed;
+        # None means a normal finish (last page reached or no next button).
+        self.stop_reason = None
 
     @property
     def city_url(self):
@@ -385,23 +412,56 @@ class BossZhipinSpider:
 
     async def main(self):
         browser = await self._launch_browser()
+        self.stop_reason = None
         try:
             page = await browser.newPage()
             await self._prepare_page(page)
             await self._search(page)
 
             for page_number in range(1, self.max_pages + 1):
-                await self._wait_for_selector(page, JOB_CARD_SELECTORS, "职位列表")
-                rows = self.parse_html(etree.HTML(await page.content()))
+                try:
+                    await self._wait_for_selector(page, JOB_CARD_SELECTORS, "职位列表")
+                    rows = self.parse_html(etree.HTML(await page.content()))
+                except CrawlerError as exc:
+                    if page_number == 1:
+                        # First screen failed: nothing salvageable, keep the
+                        # original fail-fast behaviour without a workbook.
+                        raise
+                    self.stop_reason = (
+                        f"在第 {page_number} 页等待职位卡片失败，已停止继续翻页"
+                        f"（原因: {_format_error_chain(exc)}）"
+                    )
+                    break
                 print(f"第 {page_number} 页：提取 {len(rows)} 条")
-                if page_number == self.max_pages or not await self._next_page(page):
+                if page_number == self.max_pages:
+                    break
+                try:
+                    has_next = await self._next_page(page)
+                except CrawlerError as exc:
+                    # page_number == 1 here means the turn onto page 2 failed:
+                    # page 1's records are already parsed, so salvage them.
+                    self.stop_reason = (
+                        f"在第 {page_number + 1} 页翻页失败，已停止继续翻页"
+                        f"（原因: {_format_error_chain(exc)}）"
+                    )
+                    break
+                if not has_next:
                     break
 
             if not self.data_list:
-                raise CrawlerError("页面未提取到职位数据；请检查关键词、地区或安全验证状态。")
+                raise CrawlerError(
+                    "页面未提取到职位数据；请检查关键词、地区或安全验证状态。"
+                )
             self.output.parent.mkdir(parents=True, exist_ok=True)
             pd.DataFrame(self.data_list).to_excel(self.output, index=False)
-            print(f"已写入 {len(self.data_list)} 条数据：{self.output}")
+            if self.stop_reason:
+                print(
+                    f"警告：{self.stop_reason}；已将 {len(self.data_list)} 条已采集数据写入 "
+                    f"{self.output}",
+                    file=sys.stderr,
+                )
+            else:
+                print(f"已写入 {len(self.data_list)} 条数据：{self.output}")
             return len(self.data_list)
         finally:
             await browser.close()
@@ -447,22 +507,27 @@ def cli(argv=None):
     if args.chrome and not Path(args.chrome).expanduser().is_file():
         print(f"Chrome 可执行文件不存在：{args.chrome}", file=sys.stderr)
         return 2
+    spider = BossZhipinSpider(
+        city=args.city,
+        city_code=args.city_code,
+        keyword=args.keyword,
+        output=args.output,
+        max_pages=args.max_pages,
+        headless=not args.headful,
+        executable_path=args.chrome,
+        user_data_dir=args.user_data_dir,
+        timeout=args.timeout,
+        wait_for_verification=args.wait_for_verification,
+    )
     try:
-        BossZhipinSpider(
-            city=args.city,
-            city_code=args.city_code,
-            keyword=args.keyword,
-            output=args.output,
-            max_pages=args.max_pages,
-            headless=not args.headful,
-            executable_path=args.chrome,
-            user_data_dir=args.user_data_dir,
-            timeout=args.timeout,
-            wait_for_verification=args.wait_for_verification,
-        ).run()
+        spider.run()
     except CrawlerError as exc:
         print(f"抓取失败：{exc}", file=sys.stderr)
         return 1
+    # A workbook was written but pagination stopped early; distinct from a full
+    # success (0), a crawler failure (1) and argument validation (2).
+    if spider.stop_reason:
+        return PARTIAL_EXPORT_EXIT_CODE
     return 0
 
 
