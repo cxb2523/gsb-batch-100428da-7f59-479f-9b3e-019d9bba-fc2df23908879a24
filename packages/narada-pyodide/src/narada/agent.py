@@ -1,0 +1,703 @@
+from __future__ import annotations
+
+from functools import partial
+from typing import IO, Any, Generic, Literal, Mapping, TypeVar, overload
+
+from narada_core.actions.critic import merge_critic_workflow_trace, run_critic
+from narada_core.actions.models import (
+    DEFAULT_HITL_TIMEOUT_SECONDS,
+    AgenticMatchingSelectorsFinderRequest,
+    AgenticMatchingSelectorsFinderResponse,
+    AgenticMouseAction,
+    AgenticMouseActionRequest,
+    AgenticMouseActionResponse,
+    AgenticSelectorAction,
+    AgenticSelectorRequest,
+    AgenticSelectorResponse,
+    AgenticSelectors,
+    AgentResponse,
+    AgentUsage,
+    AppendGoogleSheetRowRequest,
+    AppendGoogleSheetRowResponse,
+    CloseTabRequest,
+    CloseTabResponse,
+    CriticResult,
+    ExecuteJavaScriptOnPageRequest,
+    ExecuteJavaScriptOnPageResponse,
+    GetFullHtmlRequest,
+    GetFullHtmlResponse,
+    GetScreenshotRequest,
+    GetScreenshotResponse,
+    GetSimplifiedHtmlRequest,
+    GetSimplifiedHtmlResponse,
+    GetUrlRequest,
+    GetUrlResponse,
+    GoToUrlRequest,
+    JsonValue,
+    PressKeyEventItem,
+    PressKeyRequest,
+    PrintMessageRequest,
+    PromptForUserFileRequest,
+    PromptForUserFileResponse,
+    PromptForUserInputRequest,
+    PromptForUserInputResponse,
+    PromptForUserInputVariable,
+    ReadExcelSheetRequest,
+    ReadExcelSheetResponse,
+    ReadGoogleSheetRequest,
+    ReadGoogleSheetResponse,
+    RecordedClick,
+    SavePdfFileRequest,
+    SavePdfFileResponse,
+    UserApprovalRequest,
+    UserApprovalResponse,
+    WaitForElementRequest,
+    WaitForElementResponse,
+    WriteExcelSheetRequest,
+    WriteGoogleSheetRequest,
+)
+from narada_core.models import (
+    AgentKind,
+    AgentSpeed,
+    CriticConfig,
+    File,
+    McpServer,
+    ReasoningEffort,
+    RemoteDispatchChatHistoryItem,
+    Response,
+    UserResourceCredentials,
+    VectorStore,
+)
+from narada_core.tracing.model import parse_action_trace
+from pydantic import BaseModel
+
+from narada.environment import (
+    BaseBrowserEnvironment,
+    Environment,
+    InputRequiredCallback,
+)
+
+from . import _trace
+
+_StructuredOutput = TypeVar("_StructuredOutput", bound=BaseModel)
+
+
+class Agent(Generic[_StructuredOutput]):
+    def __init__(
+        self,
+        *,
+        environment: Environment,
+        kind: AgentKind | str = AgentKind.OPERATOR,
+    ) -> None:
+        self.environment = environment
+        self.kind = kind
+
+    @overload
+    async def run(
+        self,
+        prompt: str,
+        *,
+        reasoning: ReasoningEffort | None = None,
+        speed: AgentSpeed | None = None,
+        clear_chat: bool | None = None,
+        generate_gif: bool | None = None,
+        output_schema: None = None,
+        previous_request_id: str | None = None,
+        chat_history: list[RemoteDispatchChatHistoryItem] | None = None,
+        additional_context: dict[str, str] | None = None,
+        attachment: File | IO[Any] | None = None,
+        time_zone: str = "America/Los_Angeles",
+        user_resource_credentials: UserResourceCredentials | None = None,
+        mcp_servers: list[McpServer] | None = None,
+        vector_stores: list[VectorStore] | None = None,
+        secret_variables: dict[str, str] | None = None,
+        input_variables: Mapping[str, Any] | None = None,
+        callback_url: str | None = None,
+        callback_secret: str | None = None,
+        callback_headers: Mapping[str, Any] | None = None,
+        on_input_required: InputRequiredCallback | None = None,
+        critic: CriticConfig | None = None,
+        require_execution_trace: bool = False,
+        timeout: int = 1000,
+    ) -> AgentResponse[dict[str, Any]]: ...
+
+    @overload
+    async def run(
+        self,
+        prompt: str,
+        *,
+        reasoning: ReasoningEffort | None = None,
+        speed: AgentSpeed | None = None,
+        clear_chat: bool | None = None,
+        generate_gif: bool | None = None,
+        output_schema: type[_StructuredOutput],
+        previous_request_id: str | None = None,
+        chat_history: list[RemoteDispatchChatHistoryItem] | None = None,
+        additional_context: dict[str, str] | None = None,
+        attachment: File | IO[Any] | None = None,
+        time_zone: str = "America/Los_Angeles",
+        user_resource_credentials: UserResourceCredentials | None = None,
+        mcp_servers: list[McpServer] | None = None,
+        vector_stores: list[VectorStore] | None = None,
+        secret_variables: dict[str, str] | None = None,
+        input_variables: Mapping[str, Any] | None = None,
+        callback_url: str | None = None,
+        callback_secret: str | None = None,
+        callback_headers: Mapping[str, Any] | None = None,
+        on_input_required: InputRequiredCallback | None = None,
+        critic: CriticConfig | None = None,
+        require_execution_trace: bool = False,
+        timeout: int = 1000,
+    ) -> AgentResponse[_StructuredOutput]: ...
+
+    async def run(
+        self,
+        prompt: str,
+        *,
+        reasoning: ReasoningEffort | None = None,
+        speed: AgentSpeed | None = None,
+        clear_chat: bool | None = None,
+        generate_gif: bool | None = None,
+        output_schema: type[BaseModel] | None = None,
+        previous_request_id: str | None = None,
+        chat_history: list[RemoteDispatchChatHistoryItem] | None = None,
+        additional_context: dict[str, str] | None = None,
+        attachment: File | IO[Any] | None = None,
+        time_zone: str = "America/Los_Angeles",
+        user_resource_credentials: UserResourceCredentials | None = None,
+        mcp_servers: list[McpServer] | None = None,
+        vector_stores: list[VectorStore] | None = None,
+        secret_variables: dict[str, str] | None = None,
+        input_variables: Mapping[str, Any] | None = None,
+        callback_url: str | None = None,
+        callback_secret: str | None = None,
+        callback_headers: Mapping[str, Any] | None = None,
+        on_input_required: InputRequiredCallback | None = None,
+        critic: CriticConfig | None = None,
+        require_execution_trace: bool = False,
+        timeout: int = 1000,
+    ) -> AgentResponse:
+        """Invokes an agent in the bound Narada environment."""
+        if reasoning is not None and not isinstance(self.kind, AgentKind):
+            raise ValueError(
+                "`reasoning` is only supported for built-in `AgentKind` values; "
+                "named Agent Studio agents own reasoning per workflow step"
+            )
+        if speed is not None and not isinstance(self.kind, AgentKind):
+            raise ValueError(
+                "`speed` is only supported for built-in `AgentKind` values; "
+                "named Agent Studio agents own speed per workflow step"
+            )
+        remote_dispatch_response = await self._dispatch_request(
+            prompt=prompt,
+            clear_chat=clear_chat,
+            generate_gif=generate_gif,
+            output_schema=output_schema,
+            previous_request_id=previous_request_id,
+            chat_history=chat_history,
+            additional_context=additional_context,
+            attachment=attachment,
+            time_zone=time_zone,
+            user_resource_credentials=user_resource_credentials,
+            mcp_servers=mcp_servers,
+            vector_stores=vector_stores,
+            secret_variables=secret_variables,
+            input_variables=input_variables,
+            callback_url=callback_url,
+            callback_secret=callback_secret,
+            callback_headers=callback_headers,
+            on_input_required=on_input_required,
+            reasoning=reasoning,
+            require_execution_trace=require_execution_trace,
+            speed=speed,
+            timeout=timeout,
+        )
+        response_content = remote_dispatch_response["response"]
+        assert response_content is not None
+
+        action_trace_raw = response_content.get("actionTrace")
+        action_trace = (
+            parse_action_trace(action_trace_raw)
+            if action_trace_raw is not None
+            else None
+        )
+        workflow_trace = response_content.get("workflowTrace")
+        parent_request_id = self.environment._current_parent_request_id()
+
+        critic_result: CriticResult | None = None
+        if critic is not None:
+            critic_result = await run_critic(
+                dispatch_request=partial(
+                    self._dispatch_request,
+                    require_execution_trace=require_execution_trace,
+                ),
+                original_prompt=prompt,
+                response_content=response_content,
+                action_trace_raw=action_trace_raw,
+                critic=critic,
+                time_zone=time_zone,
+                timeout=timeout,
+            )
+            workflow_trace = merge_critic_workflow_trace(
+                workflow_trace=workflow_trace,
+                critic_result=critic_result,
+            )
+
+        # Preserve the response contract for direct callers, but avoid adding a second
+        # child node when the backend will stitch the child request into the parent row.
+        if workflow_trace is not None and parent_request_id is None:
+            _trace.emit_sub_workflow(workflow_trace=workflow_trace)
+
+        return AgentResponse(
+            request_id=remote_dispatch_response["requestId"],
+            status=remote_dispatch_response["status"],
+            text=response_content["text"],
+            output=response_content.get("output"),
+            structured_output=response_content.get("structuredOutput"),
+            usage=AgentUsage.model_validate(remote_dispatch_response["usage"]),
+            action_trace=action_trace,
+            workflow_trace=workflow_trace,
+            critic_result=critic_result,
+            execution_trace_context=response_content.get("executionTraceContext"),
+        )
+
+    async def _dispatch_request(
+        self,
+        *,
+        prompt: str,
+        agent: AgentKind | str | None = None,
+        reasoning: ReasoningEffort | None = None,
+        speed: AgentSpeed | None = None,
+        clear_chat: bool | None = None,
+        generate_gif: bool | None = None,
+        output_schema: type[BaseModel] | None = None,
+        previous_request_id: str | None = None,
+        chat_history: list[RemoteDispatchChatHistoryItem] | None = None,
+        additional_context: dict[str, str] | None = None,
+        attachment: File | IO[Any] | None = None,
+        time_zone: str = "America/Los_Angeles",
+        user_resource_credentials: UserResourceCredentials | None = None,
+        mcp_servers: list[McpServer] | None = None,
+        vector_stores: list[VectorStore] | None = None,
+        secret_variables: dict[str, str] | None = None,
+        input_variables: Mapping[str, Any] | None = None,
+        callback_url: str | None = None,
+        callback_secret: str | None = None,
+        callback_headers: Mapping[str, Any] | None = None,
+        on_input_required: InputRequiredCallback | None = None,
+        critic_context: dict[str, Any] | None = None,
+        require_execution_trace: bool = False,
+        timeout: int = 1000,
+    ) -> Response:
+        dispatch_agent = self.kind if agent is None else agent
+        return await self.environment._dispatch_request(
+            prompt=prompt,
+            agent=dispatch_agent,
+            reasoning=reasoning,
+            speed=speed,
+            clear_chat=clear_chat,
+            generate_gif=generate_gif,
+            output_schema=output_schema,
+            previous_request_id=previous_request_id,
+            chat_history=chat_history,
+            additional_context=additional_context,
+            attachment=attachment,
+            time_zone=time_zone,
+            user_resource_credentials=user_resource_credentials,
+            mcp_servers=mcp_servers,
+            vector_stores=vector_stores,
+            secret_variables=secret_variables,
+            input_variables=input_variables,
+            callback_url=callback_url,
+            callback_secret=callback_secret,
+            callback_headers=callback_headers,
+            on_input_required=on_input_required,
+            critic_context=critic_context,
+            require_execution_trace=require_execution_trace,
+            timeout=timeout,
+        )
+
+    def _browser_environment(self) -> BaseBrowserEnvironment:
+        if not isinstance(self.environment, BaseBrowserEnvironment):
+            raise ValueError(
+                f"{type(self.environment).__name__} does not support browser actions"
+            )
+        return self.environment
+
+    async def agentic_selector(
+        self,
+        *,
+        action: AgenticSelectorAction,
+        selectors: AgenticSelectors,
+        fallback_operator_query: str,
+        fallback_agent: AgentKind = AgentKind.OPERATOR,
+        fallback_speed: Literal["standard", "fast", "ultrafast"] = "standard",
+        verification_description: str | None = None,
+        verification_delay_ms: int = 500,
+        # Larger default timeout because Operator can take a bit to run.
+        timeout: int | None = 300,
+    ) -> AgenticSelectorResponse:
+        """Performs an action on an element specified by the given selectors, falling back to the
+        configured Operator agent and speed if the selectors fail to match a unique element.
+
+        Use {"text_content": "Save"} for the innermost text match, or combine it with
+        {"tag_name": "button"} to target the containing button. Role and class_name
+        can constrain text too. ID and path fields are independent fallback strategies.
+        Explicit empty or whitespace-only text_content raises ValueError before dispatch;
+        omit text_content when no text constraint is intended.
+
+        Returns AgenticSelectorResponse with the value for read actions and the verification status
+        when verification_description is provided.
+        """
+        if fallback_agent not in {AgentKind.OPERATOR, AgentKind.OPERATOR_MINI}:
+            raise ValueError("fallback_agent must be OPERATOR or OPERATOR_MINI")
+        if fallback_agent is AgentKind.OPERATOR_MINI and fallback_speed == "ultrafast":
+            raise ValueError("ultrafast speed is not supported by Operator Mini")
+
+        request = AgenticSelectorRequest(
+            action=action,
+            selectors=selectors,
+            fallback_operator_query=fallback_operator_query,
+            fallback_agent_type=(
+                "operatorMini"
+                if fallback_agent is AgentKind.OPERATOR_MINI
+                else "operator"
+            ),
+            fallback_speed=fallback_speed,
+            verification_description=verification_description,
+            verification_delay_ms=verification_delay_ms,
+        )
+        response_model = (
+            AgenticSelectorResponse
+            if action["type"] in {"get_text", "get_property"}
+            or request.verification_description is not None
+            else None
+        )
+
+        result = await self._browser_environment()._run_extension_action(
+            request,
+            response_model,
+            timeout=timeout,
+        )
+
+        if result is None:
+            return AgenticSelectorResponse(value=None)
+
+        return result
+
+    async def agentic_matching_selectors_finder(
+        self,
+        *,
+        prompt: str,
+        timeout: int | None = 300,
+    ) -> list[AgenticSelectors]:
+        """Finds all visible targets matching a prompt and returns selectors."""
+        result = await self._browser_environment()._run_extension_action(
+            AgenticMatchingSelectorsFinderRequest(prompt=prompt),
+            AgenticMatchingSelectorsFinderResponse,
+            timeout=timeout,
+        )
+        return result.selectors
+
+    async def press_key(
+        self,
+        *,
+        events: list[PressKeyEventItem | Mapping[str, Any]],
+        timeout: int | None = 60,
+    ) -> None:
+        """Dispatch keyboard events on the active tab through the extension."""
+        if not events:
+            raise ValueError("press_key requires a non-empty events= list")
+
+        normalized_events = [
+            event
+            if isinstance(event, PressKeyEventItem)
+            else PressKeyEventItem.model_validate(event)
+            for event in events
+        ]
+        return await self._browser_environment()._run_extension_action(
+            PressKeyRequest(events=normalized_events),
+            timeout=timeout,
+        )
+
+    async def agentic_mouse_action(
+        self,
+        *,
+        action: AgenticMouseAction,
+        recorded_click: RecordedClick,
+        fallback_operator_query: str,
+        resize_window: bool = True,
+        verification_description: str | None = None,
+        verification_delay_ms: int = 500,
+        timeout: int | None = 60,
+    ) -> bool | None:
+        """Performs a mouse action at the specified click coordinates, falling back to using
+        the Operator agent if the click fails. Returns the verification status when
+        verification_description is provided and the verifier produced a status.
+        """
+        request = AgenticMouseActionRequest(
+            action=action,
+            recorded_click=recorded_click,
+            resize_window=resize_window,
+            fallback_operator_query=fallback_operator_query,
+            verification_description=verification_description,
+            verification_delay_ms=verification_delay_ms,
+        )
+        if request.verification_description is None:
+            await self._browser_environment()._run_extension_action(
+                request,
+                timeout=timeout,
+            )
+            return None
+
+        result = await self._browser_environment()._run_extension_action(
+            request,
+            AgenticMouseActionResponse,
+            timeout=timeout,
+        )
+        return result.verified
+
+    async def go_to_url(
+        self, *, url: str, new_tab: bool = False, timeout: int | None = None
+    ) -> None:
+        """Navigates the active page in this window to the given URL."""
+        return await self._browser_environment()._run_extension_action(
+            GoToUrlRequest(url=url, new_tab=new_tab), timeout=timeout
+        )
+
+    async def close_tab(self, *, timeout: int | None = None) -> None:
+        """Closes the active browser tab."""
+        environment = self._browser_environment()
+        response = await environment._run_extension_action(
+            CloseTabRequest(), CloseTabResponse, timeout=timeout
+        )
+        if response.closes_window:
+            environment._mark_browser_window_closed()
+
+    async def wait_for_element(
+        self,
+        *,
+        selectors: AgenticSelectors,
+        state: Literal["visible", "hidden"],
+        timeout: int,
+    ) -> bool:
+        """Waits for an element matching the given selectors to reach the specified state.
+
+        Text selectors work alone or with tag/attribute constraints, as in agentic_selector.
+        Explicit empty or whitespace-only text_content raises ValueError before dispatch.
+
+        Returns True if the element was found, False if no selector matched before timeout.
+        """
+        result = await self._browser_environment()._run_extension_action(
+            WaitForElementRequest(selectors=selectors, state=state, timeout=timeout),
+            WaitForElementResponse,
+            timeout=timeout // 1000 + 30,
+        )
+        if result is None:
+            return False
+        return result.found
+
+    async def get_url(self, *, timeout: int | None = None) -> GetUrlResponse:
+        """Gets the URL of the current active page."""
+        result = await self._browser_environment()._run_extension_action(
+            GetUrlRequest(),
+            GetUrlResponse,
+            timeout=timeout,
+        )
+        return result
+
+    async def execute_javascript_on_page(
+        self, *, code: str, timeout: int | None = None
+    ) -> JsonValue:
+        """Executes JavaScript on the current active page and returns its JSON result."""
+        result = await self._browser_environment()._run_extension_action(
+            ExecuteJavaScriptOnPageRequest(code=code),
+            ExecuteJavaScriptOnPageResponse,
+            timeout=timeout,
+        )
+        return result.result
+
+    async def print_message(self, *, message: str, timeout: int | None = None) -> None:
+        """Prints a message in the Narada extension side panel chat."""
+        return await self._browser_environment()._run_extension_action(
+            PrintMessageRequest(message=message), timeout=timeout
+        )
+
+    async def prompt_for_user_input(
+        self,
+        *,
+        variables: list[PromptForUserInputVariable],
+        prompt_message: str | None = None,
+        timeout: int | None = DEFAULT_HITL_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        """Prompts the user for one or more input values in the extension UI."""
+        result = await self._browser_environment()._run_extension_action(
+            PromptForUserInputRequest(
+                prompt_message=prompt_message, variables=variables
+            ),
+            PromptForUserInputResponse,
+            timeout=timeout,
+        )
+        return result.values_by_name
+
+    async def prompt_for_user_file(
+        self,
+        *,
+        variable_name: str,
+        prompt_message: str | None = None,
+        timeout: int | None = DEFAULT_HITL_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        """Prompts the user for a file in the extension UI."""
+        result = await self._browser_environment()._run_extension_action(
+            PromptForUserFileRequest(
+                variable_name=variable_name,
+                prompt_message=prompt_message,
+            ),
+            PromptForUserFileResponse,
+            timeout=timeout,
+        )
+        return result.file
+
+    async def user_approval(
+        self,
+        *,
+        prompt_message: str,
+        approve_label: str,
+        reject_label: str,
+        timeout: int | None = DEFAULT_HITL_TIMEOUT_SECONDS,
+    ) -> bool:
+        """Prompts the user to approve or reject in the extension UI."""
+        result = await self._browser_environment()._run_extension_action(
+            UserApprovalRequest(
+                prompt_message=prompt_message,
+                approve_label=approve_label,
+                reject_label=reject_label,
+            ),
+            UserApprovalResponse,
+            timeout=timeout,
+        )
+        return result.approved
+
+    async def read_google_sheet(
+        self,
+        *,
+        spreadsheet_id: str,
+        range: str,
+        timeout: int | None = None,
+    ) -> ReadGoogleSheetResponse:
+        """Reads a range of cells from a Google Sheet."""
+        return await self._browser_environment()._run_extension_action(
+            ReadGoogleSheetRequest(spreadsheet_id=spreadsheet_id, range=range),
+            ReadGoogleSheetResponse,
+            timeout=timeout,
+        )
+
+    async def append_google_sheet_row(
+        self,
+        *,
+        spreadsheet_id: str,
+        header_range: str,
+        row: Mapping[str, str | int | float | bool | None],
+        timeout: int | None = None,
+    ) -> AppendGoogleSheetRowResponse:
+        """Appends an object as a row using the selected range's first row as headers."""
+        return await self._browser_environment()._run_extension_action(
+            AppendGoogleSheetRowRequest(
+                spreadsheet_id=spreadsheet_id,
+                header_range=header_range,
+                row=dict(row),
+            ),
+            AppendGoogleSheetRowResponse,
+            timeout=timeout,
+        )
+
+    async def read_excel_sheet(
+        self,
+        *,
+        workbook_url: str,
+        range: str,
+        microsoft_account_email: str,
+        timeout: int | None = None,
+    ) -> ReadExcelSheetResponse:
+        """Reads a range of cells from a Microsoft Excel workbook."""
+        return await self._browser_environment()._run_extension_action(
+            ReadExcelSheetRequest(
+                workbook_url=workbook_url,
+                range=range,
+                microsoft_account_email=microsoft_account_email,
+            ),
+            ReadExcelSheetResponse,
+            timeout=timeout,
+        )
+
+    async def write_google_sheet(
+        self,
+        *,
+        spreadsheet_id: str,
+        range: str,
+        values: list[list[str]],
+        timeout: int | None = None,
+    ) -> None:
+        """Writes a range of cells to a Google Sheet."""
+        return await self._browser_environment()._run_extension_action(
+            WriteGoogleSheetRequest(
+                spreadsheet_id=spreadsheet_id, range=range, values=values
+            ),
+            timeout=timeout,
+        )
+
+    async def write_excel_sheet(
+        self,
+        *,
+        workbook_url: str,
+        range: str,
+        microsoft_account_email: str,
+        values: list[list[str]],
+        timeout: int | None = None,
+    ) -> None:
+        """Writes a range of cells to a Microsoft Excel workbook."""
+        return await self._browser_environment()._run_extension_action(
+            WriteExcelSheetRequest(
+                workbook_url=workbook_url,
+                range=range,
+                microsoft_account_email=microsoft_account_email,
+                values=values,
+            ),
+            timeout=timeout,
+        )
+
+    async def get_full_html(self, *, timeout: int | None = None) -> GetFullHtmlResponse:
+        """Gets the full HTML content of the current page."""
+        return await self._browser_environment()._run_extension_action(
+            GetFullHtmlRequest(),
+            GetFullHtmlResponse,
+            timeout=timeout,
+        )
+
+    async def get_simplified_html(
+        self, *, timeout: int | None = None
+    ) -> GetSimplifiedHtmlResponse:
+        """Gets the simplified HTML content of the current page."""
+        return await self._browser_environment()._run_extension_action(
+            GetSimplifiedHtmlRequest(),
+            GetSimplifiedHtmlResponse,
+            timeout=timeout,
+        )
+
+    async def save_pdf_file(self, *, timeout: int | None = None) -> SavePdfFileResponse:
+        """Saves the PDF file displayed in the current browser page."""
+        return await self._browser_environment()._run_extension_action(
+            SavePdfFileRequest(),
+            SavePdfFileResponse,
+            timeout=timeout,
+        )
+
+    async def get_screenshot(
+        self, *, timeout: int | None = None
+    ) -> GetScreenshotResponse:
+        """Takes a screenshot of the current browser window."""
+        return await self._browser_environment()._run_extension_action(
+            GetScreenshotRequest(),
+            GetScreenshotResponse,
+            timeout=timeout,
+        )

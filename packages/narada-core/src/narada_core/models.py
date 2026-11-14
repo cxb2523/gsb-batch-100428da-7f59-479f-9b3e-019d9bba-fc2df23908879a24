@@ -1,0 +1,559 @@
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum, StrEnum
+from typing import Annotated, Any, Generic, Literal, NotRequired, TypedDict, TypeVar
+
+from pydantic import BaseModel, Field
+
+from narada_core.actions.models import HitlInputMetadata
+
+
+class AgentKind(Enum):
+    PRODUCTIVITY = 1
+    OPERATOR = 2
+    CORE_AGENT = 3
+    OPERATOR_MINI = 4
+    CORE_AGENT_MINI = 5
+
+    def prompt_prefix(self) -> str:
+        match self:
+            case AgentKind.PRODUCTIVITY:
+                return ""
+            case AgentKind.OPERATOR:
+                return "/Operator "
+            case AgentKind.CORE_AGENT:
+                return "/coreAgent "
+            case AgentKind.OPERATOR_MINI:
+                return "/OperatorMini "
+            case AgentKind.CORE_AGENT_MINI:
+                return "/CoreAgentMini "
+
+
+class ReasoningEffort(StrEnum):
+    """Controls how much reasoning a built-in Narada agent uses before responding."""
+
+    NONE = "none"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    XHIGH = "xhigh"
+
+
+class AgentSpeed(StrEnum):
+    """Controls the processing tier used for built-in Narada agent responses."""
+
+    STANDARD = "standard"
+    FAST = "fast"
+    ULTRAFAST = "ultrafast"
+
+
+class UserResourceCredentials(TypedDict, total=False):
+    salesforce: dict[str, str]
+    jira: dict[str, str]
+
+
+class AuthenticationType(StrEnum):
+    NONE = "none"
+    BEARER_TOKEN = "bearer-token"
+    CUSTOM_HEADERS = "custom-headers"
+
+
+class CustomHeader(BaseModel):
+    key: str
+    value: str
+
+
+class AuthenticationNone(BaseModel):
+    type: Literal[AuthenticationType.NONE] = AuthenticationType.NONE
+
+
+class AuthenticationBearerToken(BaseModel):
+    type: Literal[AuthenticationType.BEARER_TOKEN] = AuthenticationType.BEARER_TOKEN
+    bearerToken: str
+
+
+class AuthenticationCustomHeaders(BaseModel):
+    type: Literal[AuthenticationType.CUSTOM_HEADERS] = AuthenticationType.CUSTOM_HEADERS
+    customHeaders: list[CustomHeader]
+
+
+Authentication = Annotated[
+    AuthenticationNone | AuthenticationBearerToken | AuthenticationCustomHeaders,
+    Field(discriminator="type"),
+]
+
+
+class McpServer(BaseModel):
+    url: str
+    label: str | None = None
+    description: str | None = None
+    authentication: Authentication
+    selectedTools: list[str] | None = None
+
+
+class ManagedVectorStore(BaseModel):
+    id: str
+    name: str | None = None
+    path: str | None = None
+    description: str | None = None
+    fileCount: int | None = None
+    updatedAt: datetime | None = None
+    isExternal: Literal[False] = False
+
+
+class BedrockCredentials(BaseModel):
+    accessKeyId: str
+    secretAccessKey: str
+    region: str
+
+
+class BedrockConnectionConfig(BaseModel):
+    type: Literal["bedrock"] = "bedrock"
+    credentials: BedrockCredentials
+    knowledgeBaseId: str
+
+
+class ExternalVectorStore(BaseModel):
+    id: str
+    name: str
+    description: str
+    connection: BedrockConnectionConfig
+    isExternal: Literal[True] = True
+
+
+VectorStore = ManagedVectorStore | ExternalVectorStore
+
+
+def _connected_vector_store_to_wire(
+    vector_store: VectorStore,
+) -> dict[str, Any]:
+    if isinstance(vector_store, ManagedVectorStore):
+        return {"id": vector_store.id, "isExternal": False}
+    return vector_store.model_dump(mode="json", exclude_none=True)
+
+
+class CriticConfig(TypedDict, total=False):
+    prompt: str
+    output_schema: type[BaseModel]
+    mcp_servers: list[McpServer]
+    vector_stores: list[VectorStore]
+
+
+class RemoteDispatchChatHistoryItem(TypedDict):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+_MaybeStructuredOutput = TypeVar("_MaybeStructuredOutput", bound=BaseModel | None)
+
+
+class OperatorActionTraceItem(TypedDict):
+    url: str
+    action: str
+    startTs: str
+    endTs: str
+    durationMs: int
+
+
+class GoToUrlTrace(TypedDict):
+    step_type: Literal["goToUrl"]
+    url: str
+    description: str
+
+
+class GetUrlTrace(TypedDict):
+    step_type: Literal["getUrl"]
+    url: str
+    description: str
+
+
+class PrintTrace(TypedDict):
+    step_type: Literal["print"]
+    url: str
+    message: str
+
+
+class AgentTrace(TypedDict):
+    step_type: Literal["agent"]
+    url: str
+    agent_type: str  # e.g., 'operator', 'productivity', 'coreAgent', etc.
+    action_trace: ActionTrace
+    text: str  # For non-operator agents
+
+
+class ForLoopTrace(TypedDict):
+    step_type: Literal["for"]
+    url: str
+    loop_type: Literal["nTimes", "forEachRowInDataTable", "forEachItemsInArray"]
+    description: str
+    iterations: list[APAActionTrace]
+
+
+class WhileLoopTrace(TypedDict):
+    step_type: Literal["while"]
+    url: str
+    condition: str
+    iterations: list[APAActionTrace]
+    total_iterations: int
+
+
+class AgenticSelectorTrace(TypedDict):
+    step_type: Literal["agenticSelector"]
+    url: str
+    description: str
+    action_trace: ActionTrace  # For operator agent fallback
+
+
+class AgenticMouseActionTrace(TypedDict):
+    step_type: Literal["agenticMouseAction"]
+    url: str
+    description: str
+    verificationStatus: NotRequired[bool]
+    verificationStatusVariableName: NotRequired[str]
+    action_trace: ActionTrace  # For operator agent fallback
+
+
+class WaitForElementTrace(TypedDict):
+    step_type: Literal["waitForElement"]
+    url: str
+    description: str
+
+
+class PressKeysTrace(TypedDict):
+    step_type: Literal["pressKeys"]
+    url: str
+    description: str
+
+
+class ListGoogleDriveFilesTrace(TypedDict):
+    step_type: Literal["listGoogleDriveFiles"]
+    description: str
+
+
+class DownloadGoogleDriveFileTrace(TypedDict):
+    step_type: Literal["downloadGoogleDriveFile"]
+    description: str
+
+
+class ReadGoogleSheetTrace(TypedDict):
+    step_type: Literal["readGoogleSheet"]
+    url: str
+    description: str
+
+
+class ReadExcelSheetTrace(TypedDict):
+    step_type: Literal["readExcelSheet"]
+    url: str
+    description: str
+
+
+class WriteGoogleSheetTrace(TypedDict):
+    step_type: Literal["writeGoogleSheet"]
+    url: str
+    description: str
+
+
+class WriteExcelSheetTrace(TypedDict):
+    step_type: Literal["writeExcelSheet"]
+    url: str
+    description: str
+
+
+class DataTableExportAsCsvTrace(TypedDict):
+    step_type: Literal["dataTableExportAsCsv"]
+    url: str
+    description: str
+
+
+class PythonTrace(TypedDict):
+    step_type: Literal["python"]
+    url: str
+    description: str
+
+
+class ReadCsvTrace(TypedDict):
+    step_type: Literal["readCsv"]
+    url: str
+    description: str
+
+
+class OutputTrace(TypedDict):
+    step_type: Literal["output"]
+    description: str
+
+
+class StartTrace(TypedDict):
+    step_type: Literal["start"]
+    url: str
+    description: str
+
+
+class EndTrace(TypedDict):
+    step_type: Literal["end"]
+    url: str
+    description: str
+
+
+class GetFullHtmlTrace(TypedDict):
+    step_type: Literal["getFullHtml"]
+    url: str
+    description: str
+
+
+class GetSimplifiedHtmlTrace(TypedDict):
+    step_type: Literal["getSimplifiedHtml"]
+    url: str
+    description: str
+
+
+class GetScreenshotTrace(TypedDict):
+    step_type: Literal["getScreenshot"]
+    url: str
+    description: str
+
+
+class ObjectExportAsJsonTrace(TypedDict):
+    step_type: Literal["objectExportAsJson"]
+    url: str
+    description: str
+
+
+class RunCustomAgentTrace(TypedDict):
+    step_type: Literal["runCustomAgent"]
+    url: str
+    workflow_id: str
+    workflow_name: str
+    status: Literal["success", "error"]
+    error_message: NotRequired[str]
+    children: NotRequired[ActionTrace]
+
+
+class IfTrace(TypedDict):
+    step_type: Literal["if"]
+    url: str
+    description: str
+
+
+class SetVariableTrace(TypedDict):
+    step_type: Literal["setVariable"]
+    url: str
+    description: str
+
+
+class WaitTrace(TypedDict):
+    step_type: Literal["wait"]
+    url: str
+    description: str
+
+
+class DataTableInsertRowTrace(TypedDict):
+    step_type: Literal["dataTableInsertRow"]
+    url: str
+    description: str
+
+
+class DataTableUpdateCellValueTrace(TypedDict):
+    step_type: Literal["dataTableUpdateCellValue"]
+    url: str
+    description: str
+
+
+class ObjectSetPropertiesTrace(TypedDict):
+    step_type: Literal["objectSetProperties"]
+    url: str
+    description: str
+
+
+class PythonStdoutEvent(TypedDict):
+    kind: Literal["stdout"]
+    ts: int
+    text: str
+
+
+class PythonStderrEvent(TypedDict):
+    kind: Literal["stderr"]
+    ts: int
+    text: str
+
+
+class PythonSubAgentCallEvent(TypedDict):
+    kind: Literal["subAgentCall"]
+    ts_start: int
+    ts_end: int
+    agent_type: str
+    prompt: str
+    status: Literal["success", "error", "timeout"]
+    request_id: NotRequired[str]
+    text: NotRequired[str]
+    error_message: NotRequired[str]
+    action_trace: NotRequired[ActionTrace]
+    execution_trace_context: NotRequired[dict[str, object]]
+
+
+class PythonExtensionActionEvent(TypedDict):
+    kind: Literal["extensionAction"]
+    ts_start: int
+    ts_end: int
+    action_execution_id: NotRequired[str]
+    action_name: str
+    request_summary: dict[str, object]
+    result_summary: NotRequired[dict[str, object]]
+    status: Literal["success", "error", "timeout"]
+    error_message: NotRequired[str]
+
+
+class PythonSideEffectEvent(TypedDict):
+    kind: Literal["sideEffect"]
+    ts: int
+    effect_type: Literal["download_file", "render_html"]
+    description: str
+
+
+type PythonTraceEvent = (
+    PythonStdoutEvent
+    | PythonStderrEvent
+    | PythonSubAgentCallEvent
+    | PythonExtensionActionEvent
+    | PythonSideEffectEvent
+)
+
+
+class PythonAgentRunTrace(TypedDict):
+    step_type: Literal["pythonAgentRun"]
+    url: str
+    status: Literal["success", "error", "aborted"]
+    duration_ms: int
+    events: list[PythonTraceEvent]
+    error_message: NotRequired[str]
+
+
+ApaStepTrace = (
+    GoToUrlTrace
+    | GetUrlTrace
+    | PrintTrace
+    | AgentTrace
+    | ForLoopTrace
+    | WhileLoopTrace
+    | AgenticSelectorTrace
+    | AgenticMouseActionTrace
+    | WaitForElementTrace
+    | PressKeysTrace
+    | ReadCsvTrace
+    | ListGoogleDriveFilesTrace
+    | DownloadGoogleDriveFileTrace
+    | ReadGoogleSheetTrace
+    | ReadExcelSheetTrace
+    | WriteGoogleSheetTrace
+    | WriteExcelSheetTrace
+    | DataTableExportAsCsvTrace
+    | ObjectExportAsJsonTrace
+    | PythonTrace
+    | StartTrace
+    | EndTrace
+    | GetFullHtmlTrace
+    | GetSimplifiedHtmlTrace
+    | GetScreenshotTrace
+    | RunCustomAgentTrace
+    | OutputTrace
+    | IfTrace
+    | SetVariableTrace
+    | WaitTrace
+    | DataTableInsertRowTrace
+    | DataTableUpdateCellValueTrace
+    | ObjectSetPropertiesTrace
+    | PythonAgentRunTrace
+)
+
+
+type OperatorActionTrace = list[OperatorActionTraceItem]
+type APAActionTrace = list[ApaStepTrace]
+type ActionTrace = OperatorActionTrace | APAActionTrace
+
+
+class TextResponseOutput(TypedDict):
+    type: Literal["text"]
+    content: str
+
+
+class StructuredResponseOutput(TypedDict, Generic[_MaybeStructuredOutput]):
+    type: Literal["structured"]
+    content: _MaybeStructuredOutput
+
+
+class ResponseContent(TypedDict, Generic[_MaybeStructuredOutput]):
+    text: str
+    output: TextResponseOutput | StructuredResponseOutput[_MaybeStructuredOutput]
+    structuredOutput: _MaybeStructuredOutput
+    actionTrace: NotRequired[ActionTrace]
+    executionTraceContext: NotRequired[dict[str, object]]
+    workflowTrace: NotRequired[dict[str, Any]]
+
+
+class Usage(TypedDict):
+    actions: int
+    credits: float
+
+
+class Response(TypedDict, Generic[_MaybeStructuredOutput]):
+    requestId: str
+    status: Literal["success", "error", "input-required"]
+    response: ResponseContent[_MaybeStructuredOutput] | None
+    createdAt: str
+    completedAt: str | None
+    usage: Usage
+    hitlInputMetadata: HitlInputMetadata | None
+
+
+class _RemoteDispatchPollResponse(TypedDict):
+    requestId: str
+    status: Literal["pending", "input-required", "success", "error"]
+    response: dict[str, Any] | None
+    createdAt: str
+    completedAt: str | None
+    usage: Usage | None
+    hitlInputMetadata: HitlInputMetadata | None
+
+
+class GoogleDriveAuth(TypedDict):
+    """Google Drive access mode. Currently only public sharing is supported."""
+
+    type: Literal["public"]
+
+
+class GoogleDriveFile(TypedDict):
+    """A directly contained Google Drive file, usable as a download reference."""
+
+    id: str
+    name: str
+    mimeType: str
+    url: str
+    resourceKey: NotRequired[str]
+
+
+class InMemoryFileVariable(TypedDict):
+    """Downloaded content in the Agent Studio file-variable format."""
+
+    source: Literal["inMemoryFile"]
+    filename: str
+    mimeType: str
+    base64: str
+
+
+class File(TypedDict):
+    key: str
+
+
+############################################################
+# Internal models. Do not use these if you're an end user. #
+############################################################
+
+type _PackageName = Literal["narada", "narada-pyodide"]
+
+
+class _PackageConfig(BaseModel):
+    min_required_version: str
+
+
+class _SdkConfig(BaseModel):
+    packages: dict[_PackageName, _PackageConfig]

@@ -1,0 +1,652 @@
+from __future__ import annotations
+
+from typing import (
+    Annotated,
+    Any,
+    Generic,
+    Literal,
+    NotRequired,
+    Self,
+    TypedDict,
+    TypeVar,
+    cast,
+    override,
+)
+from uuid import uuid4
+
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
+
+from narada_core.tracing import model as tracing_model
+
+# There is no `AgentRequest` because the `agent` action delegates to the `dispatch_request` method
+# under the hood.
+
+DEFAULT_HITL_TIMEOUT_SECONDS = 300
+
+_StructuredOutputT = TypeVar("_StructuredOutputT")
+type JsonValue = (
+    str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
+)
+
+
+def _generate_hitl_step_id() -> str:
+    return uuid4().hex
+
+
+class AgentUsage(BaseModel):
+    actions: int
+    credits: float
+
+
+class TextOutput(BaseModel):
+    type: Literal["text"]
+    content: str
+
+
+class StructuredOutput(BaseModel, Generic[_StructuredOutputT]):
+    type: Literal["structured"]
+    content: _StructuredOutputT
+
+
+class CriticResult(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    request_id: str | None = None
+    execution_trace_context: dict[str, Any] | None = Field(
+        default=None, alias="executionTraceContext"
+    )
+    validation_passed: bool
+    structured_output: Any
+    usage: AgentUsage
+    action_trace: tracing_model.ActionTrace | None = None
+    workflow_trace: dict[str, Any] | None = Field(default=None, alias="workflowTrace")
+
+
+class AgentResponse(BaseModel, Generic[_StructuredOutputT]):
+    model_config = ConfigDict(populate_by_name=True)
+
+    request_id: str
+    status: Literal["success", "error", "input-required"]
+    text: str
+    structured_output: _StructuredOutputT | None
+    output: Annotated[
+        TextOutput | StructuredOutput[_StructuredOutputT],
+        Field(discriminator="type"),
+    ]
+    usage: AgentUsage
+    action_trace: tracing_model.ActionTrace | None = None
+    workflow_trace: dict[str, Any] | None = Field(default=None, alias="workflowTrace")
+    critic_result: CriticResult | None = None
+    execution_trace_context: dict[str, Any] | None = Field(
+        default=None, alias="executionTraceContext"
+    )
+
+
+class AgenticSelectorClickAction(TypedDict):
+    type: Literal["click"]
+
+
+class AgenticSelectorRightClickAction(TypedDict):
+    type: Literal["right_click"]
+
+
+class AgenticSelectorDoubleClickAction(TypedDict):
+    type: Literal["double_click"]
+
+
+class AgenticSelectorHoverAction(TypedDict):
+    type: Literal["hover"]
+
+
+class AgenticSelectorFillAction(TypedDict):
+    type: Literal["fill"]
+    value: str
+    press_enter: NotRequired[bool]
+
+
+class AgenticSelectorSelectOptionByIndexAction(TypedDict):
+    type: Literal["select_option_by_index"]
+    value: int
+
+
+class AgenticSelectorSelectOptionByValueAction(TypedDict):
+    type: Literal["select_option_by_value"]
+    value: str
+
+
+class AgenticSelectorGetTextAction(TypedDict):
+    type: Literal["get_text"]
+
+
+class AgenticSelectorGetPropertyAction(TypedDict):
+    type: Literal["get_property"]
+    property_name: str
+
+
+AgenticSelectorAction = (
+    AgenticSelectorClickAction
+    | AgenticSelectorRightClickAction
+    | AgenticSelectorDoubleClickAction
+    | AgenticSelectorHoverAction
+    | AgenticSelectorFillAction
+    | AgenticSelectorSelectOptionByIndexAction
+    | AgenticSelectorSelectOptionByValueAction
+    | AgenticSelectorGetTextAction
+    | AgenticSelectorGetPropertyAction
+)
+
+
+def _dump_agentic_selector_action(action: AgenticSelectorAction) -> dict[str, Any]:
+    match action["type"]:
+        case "click":
+            return cast(dict[str, Any], action)
+        case "right_click":
+            return {"type": "rightClick"}
+        case "double_click":
+            return {"type": "doubleClick"}
+        case "hover":
+            return {"type": "hover"}
+        case "fill":
+            return {
+                "type": "fill",
+                "value": action["value"],
+                "pressEnter": action.get("press_enter", False),
+            }
+        case "select_option_by_index":
+            return {"type": "selectOptionByIndex", "value": action["value"]}
+        case "select_option_by_value":
+            return {"type": "selectOptionByValue", "value": action["value"]}
+        case "get_text":
+            return {"type": "getText"}
+        case "get_property":
+            return {
+                "type": "getProperty",
+                "propertyName": action["property_name"],
+            }
+
+
+class _AgenticSelectors(TypedDict, total=False):
+    """Optional selector fields shared by browser actions.
+
+    Text alone targets the innermost matching element. Combining text with a tag,
+    role, or class retains that constrained element. ID and path selectors remain
+    independent fallback strategies; omit them when text must determine the target.
+    """
+
+    id: str
+    data_testid: str
+    name: str
+    aria_label: str
+    role: str
+    type: str
+    text_content: str
+    tag_name: str
+    class_name: str
+    dom_path: str
+    xpath: str
+
+
+def _validate_selector_text(selectors: _AgenticSelectors) -> _AgenticSelectors:
+    if "text_content" in selectors and not selectors["text_content"].strip():
+        raise ValueError(
+            "text_content must not be empty or whitespace-only; "
+            "omit the field to select without a text constraint"
+        )
+    return selectors
+
+
+type AgenticSelectors = Annotated[
+    _AgenticSelectors, AfterValidator(_validate_selector_text)
+]
+
+
+def _dump_agentic_selectors(selectors: AgenticSelectors) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    if id := selectors.get("id"):
+        result["id"] = {"value": id}
+    if data_testid := selectors.get("data_testid"):
+        result["dataTestId"] = {"value": data_testid}
+    if name := selectors.get("name"):
+        result["name"] = {"value": name}
+    if aria_label := selectors.get("aria_label"):
+        result["ariaLabel"] = {"value": aria_label}
+    if role := selectors.get("role"):
+        result["role"] = {"value": role}
+    if type := selectors.get("type"):
+        result["type"] = {"value": type}
+    if text_content := selectors.get("text_content"):
+        result["textContent"] = {"value": text_content}
+    if tag_name := selectors.get("tag_name"):
+        result["tagName"] = {"value": tag_name}
+    if class_name := selectors.get("class_name"):
+        result["className"] = {"value": class_name}
+    if dom_path := selectors.get("dom_path"):
+        result["domPath"] = {"value": dom_path}
+    if xpath := selectors.get("xpath"):
+        result["xpath"] = {"value": xpath}
+    return result
+
+
+class AgenticSelectorRequest(BaseModel):
+    name: Literal["agentic_selector"] = "agentic_selector"
+    action: AgenticSelectorAction
+    selectors: AgenticSelectors
+    fallback_operator_query: str
+    fallback_agent_type: Literal["operator", "operatorMini"] = "operator"
+    fallback_speed: Literal["standard", "fast", "ultrafast"] = "standard"
+    verification_description: str | None = None
+    verification_delay_ms: int | None = None
+
+    @model_validator(mode="after")
+    def _normalize_verification_fields(self) -> Self:
+        if (
+            self.fallback_agent_type == "operatorMini"
+            and self.fallback_speed == "ultrafast"
+        ):
+            raise ValueError("ultrafast speed is not supported by Operator Mini")
+
+        if self.verification_description is None:
+            self.verification_delay_ms = None
+            return self
+
+        verification_description = self.verification_description.strip()
+        if not verification_description:
+            self.verification_description = None
+            self.verification_delay_ms = None
+            return self
+
+        self.verification_description = verification_description
+        return self
+
+    @override
+    def model_dump(self) -> dict[str, Any]:
+        result = {
+            "name": self.name,
+            "action": _dump_agentic_selector_action(self.action),
+            "selectors": _dump_agentic_selectors(self.selectors),
+            "fallback_operator_query": self.fallback_operator_query,
+            "fallback_agent_type": self.fallback_agent_type,
+            "fallback_speed": self.fallback_speed,
+        }
+        if self.verification_description is not None:
+            result["verification_description"] = self.verification_description
+            result["verification_delay_ms"] = self.verification_delay_ms
+        return result
+
+
+class AgenticSelectorResponse(BaseModel):
+    value: str | None = None
+    verified: bool | None = None
+
+
+class AgenticMatchingSelectorsFinderRequest(BaseModel):
+    name: Literal["agentic_matching_selectors_finder"] = (
+        "agentic_matching_selectors_finder"
+    )
+    prompt: str
+
+
+class AgenticMatchingSelectorsFinderResponse(BaseModel):
+    selectors: list[AgenticSelectors]
+
+
+class WaitForElementRequest(BaseModel):
+    name: Literal["wait_for_element"] = "wait_for_element"
+    selectors: AgenticSelectors
+    state: Literal["visible", "hidden"]
+    timeout: int  # milliseconds
+
+    @override
+    def model_dump(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "selectors": _dump_agentic_selectors(self.selectors),
+            "state": self.state,
+            "timeout": self.timeout,
+        }
+
+
+class WaitForElementResponse(BaseModel):
+    found: bool
+
+
+class Viewport(TypedDict):
+    width: int
+    height: int
+
+
+class RecordedClick(TypedDict):
+    x: int
+    y: int
+    viewport: Viewport
+
+
+class AgenticMouseClickAction(TypedDict):
+    type: Literal["click"]
+
+
+class AgenticMouseRightClickAction(TypedDict):
+    type: Literal["right_click"]
+
+
+class AgenticMouseDoubleClickAction(TypedDict):
+    type: Literal["double_click"]
+
+
+class AgenticMouseFillAction(TypedDict):
+    type: Literal["fill"]
+    text: str
+    press_enter: NotRequired[bool]
+
+
+class AgenticMouseScrollAction(TypedDict):
+    type: Literal["scroll"]
+    horizontal: int
+    vertical: int
+
+
+AgenticMouseAction = (
+    AgenticMouseClickAction
+    | AgenticMouseRightClickAction
+    | AgenticMouseDoubleClickAction
+    | AgenticMouseFillAction
+    | AgenticMouseScrollAction
+)
+
+
+def _dump_agentic_mouse_action(action: AgenticMouseAction) -> dict[str, Any]:
+    match action["type"]:
+        case "click":
+            return {"type": "click"}
+        case "right_click":
+            return {"type": "rightClick"}
+        case "double_click":
+            return {"type": "doubleClick"}
+        case "fill":
+            return {
+                "type": "fill",
+                "text": action["text"],
+                "pressEnter": action.get("press_enter", False),
+            }
+        case "scroll":
+            return {
+                "type": "scroll",
+                "deltaX": action["horizontal"],
+                "deltaY": action["vertical"],
+            }
+
+
+class AgenticMouseActionRequest(BaseModel):
+    name: Literal["agentic_mouse_action"] = "agentic_mouse_action"
+    action: AgenticMouseAction
+    recorded_click: RecordedClick
+    fallback_operator_query: str
+    resize_window: bool = False
+    verification_description: str | None = None
+    verification_delay_ms: int | None = None
+
+    @model_validator(mode="after")
+    def _normalize_verification_fields(self) -> Self:
+        if self.verification_description is None:
+            self.verification_delay_ms = None
+            return self
+
+        verification_description = self.verification_description.strip()
+        if not verification_description:
+            self.verification_description = None
+            self.verification_delay_ms = None
+            return self
+
+        self.verification_description = verification_description
+        return self
+
+    @override
+    def model_dump(self) -> dict[str, Any]:
+        result = {
+            "name": self.name,
+            "action": _dump_agentic_mouse_action(self.action),
+            "recorded_click": self.recorded_click,
+            "resize_window": self.resize_window,
+            "fallback_operator_query": self.fallback_operator_query,
+        }
+        if self.verification_description is not None:
+            result["verification_description"] = self.verification_description
+            result["verification_delay_ms"] = self.verification_delay_ms
+        return result
+
+
+class AgenticMouseActionResponse(BaseModel):
+    verified: bool | None = None
+
+
+class CloseWindowRequest(BaseModel):
+    name: Literal["close_window"] = "close_window"
+
+
+class CloseTabRequest(BaseModel):
+    name: Literal["close_tab"] = "close_tab"
+
+
+class CloseTabResponse(BaseModel):
+    closes_window: bool
+
+
+class GoToUrlRequest(BaseModel):
+    name: Literal["go_to_url"] = "go_to_url"
+    url: str
+    new_tab: bool
+
+
+class PrintMessageRequest(BaseModel):
+    name: Literal["print_message"] = "print_message"
+    message: str
+
+
+class ReadGoogleSheetRequest(BaseModel):
+    name: Literal["read_google_sheet"] = "read_google_sheet"
+    spreadsheet_id: str
+    range: str
+
+
+class ReadGoogleSheetResponse(BaseModel):
+    values: list[list[str]]
+
+
+class AppendGoogleSheetRowRequest(BaseModel):
+    name: Literal["append_google_sheet_row"] = "append_google_sheet_row"
+    spreadsheet_id: str
+    header_range: str
+    row: dict[str, str | int | float | bool | None]
+
+
+class AppendGoogleSheetRowResponse(BaseModel):
+    updated_range: str = Field(alias="updatedRange")
+
+
+class ReadExcelSheetRequest(BaseModel):
+    name: Literal["read_excel_sheet"] = "read_excel_sheet"
+    workbook_url: str
+    range: str
+    microsoft_account_email: str
+
+
+class ReadExcelSheetResponse(BaseModel):
+    values: list[list[str]]
+
+
+class WriteGoogleSheetRequest(BaseModel):
+    name: Literal["write_google_sheet"] = "write_google_sheet"
+    spreadsheet_id: str
+    range: str
+    values: list[list[str]]
+
+
+class WriteExcelSheetRequest(BaseModel):
+    name: Literal["write_excel_sheet"] = "write_excel_sheet"
+    workbook_url: str
+    range: str
+    microsoft_account_email: str
+    values: list[list[str]]
+
+
+class GetFullHtmlRequest(BaseModel):
+    name: Literal["get_full_html"] = "get_full_html"
+
+
+class GetFullHtmlResponse(BaseModel):
+    html: str
+
+
+class GetSimplifiedHtmlRequest(BaseModel):
+    name: Literal["get_simplified_html"] = "get_simplified_html"
+
+
+class GetSimplifiedHtmlResponse(BaseModel):
+    html: str
+
+
+class SavePdfFileRequest(BaseModel):
+    name: Literal["save_pdf_file"] = "save_pdf_file"
+
+
+class SavePdfFileResponse(BaseModel):
+    base64_content: str = Field(exclude=True)
+    name: str
+    mime_type: str
+    timestamp: str
+
+
+class GetScreenshotRequest(BaseModel):
+    name: Literal["get_screenshot"] = "get_screenshot"
+
+
+class GetScreenshotResponse(BaseModel):
+    base64_content: str
+    name: str
+    mime_type: str
+    timestamp: str
+
+
+class GetUrlRequest(BaseModel):
+    name: Literal["get_url"] = "get_url"
+
+
+class GetUrlResponse(BaseModel):
+    url: str
+
+
+class ExecuteJavaScriptOnPageRequest(BaseModel):
+    name: Literal["execute_javascript_on_page"] = "execute_javascript_on_page"
+    code: str
+
+
+class ExecuteJavaScriptOnPageResponse(BaseModel):
+    result: JsonValue
+
+
+class PromptForUserInputVariable(BaseModel):
+    name: str
+    type: Literal["string", "number", "boolean", "enum", "dataTable", "object", "array"]
+    required: bool
+    enum_values: list[str] | None = None
+
+
+class PromptForUserInputRequest(BaseModel):
+    name: Literal["prompt_for_user_input"] = "prompt_for_user_input"
+    step_id: str = Field(default_factory=_generate_hitl_step_id)
+    variables: list[PromptForUserInputVariable]
+    prompt_message: str | None = None
+
+
+class PromptForUserInputResponse(BaseModel):
+    values_by_name: dict[str, Any]
+
+
+class PromptForUserFileRequest(BaseModel):
+    name: Literal["prompt_for_user_file"] = "prompt_for_user_file"
+    step_id: str = Field(default_factory=_generate_hitl_step_id)
+    variable_name: str
+    prompt_message: str | None = None
+
+
+class PromptForUserFileResponse(BaseModel):
+    file: dict[str, Any]
+
+
+class UserApprovalRequest(BaseModel):
+    name: Literal["user_approval"] = "user_approval"
+    step_id: str = Field(default_factory=_generate_hitl_step_id)
+    prompt_message: str
+    approve_label: str
+    reject_label: str
+
+
+class UserApprovalResponse(BaseModel):
+    approved: bool
+
+
+class KeyEventModifiers(TypedDict, total=False):
+    ctrl: bool
+    shift: bool
+    alt: bool
+    meta: bool
+
+
+class PressKeyEventItem(BaseModel):
+    type: Literal["keyDown", "keyUp", "press"] = "keyDown"  # noqa: A003
+    code: str
+    key: str | None = None
+    modifiers: KeyEventModifiers | None = None
+
+
+class PressKeyRequest(BaseModel):
+    """Wire payload: key events for the extension to replay on the active tab."""
+
+    name: Literal["press_key"] = "press_key"
+    events: list[PressKeyEventItem]
+
+
+HitlInputAction = Annotated[
+    PromptForUserFileRequest | PromptForUserInputRequest | UserApprovalRequest,
+    Field(discriminator="name"),
+]
+
+
+class HitlInputMetadata(BaseModel):
+    input_id: str = Field(alias="inputId")
+    action: HitlInputAction
+
+
+type ExtensionActionRequest = (
+    AgenticMatchingSelectorsFinderRequest
+    | AgenticMouseActionRequest
+    | AgenticSelectorRequest
+    | CloseTabRequest
+    | AppendGoogleSheetRowRequest
+    | CloseWindowRequest
+    | ExecuteJavaScriptOnPageRequest
+    | SavePdfFileRequest
+    | GetFullHtmlRequest
+    | GetScreenshotRequest
+    | GetSimplifiedHtmlRequest
+    | GetUrlRequest
+    | GoToUrlRequest
+    | PressKeyRequest
+    | PrintMessageRequest
+    | PromptForUserFileRequest
+    | PromptForUserInputRequest
+    | ReadExcelSheetRequest
+    | ReadGoogleSheetRequest
+    | UserApprovalRequest
+    | WaitForElementRequest
+    | WriteExcelSheetRequest
+    | WriteGoogleSheetRequest
+)
+
+
+class ExtensionActionResponse(BaseModel):
+    status: Literal["success", "error", "aborted"]
+    error: str | None = None
+    data: str | None = None
+    action_trace: tracing_model.ActionTrace | None = None
+    workflowTrace: dict[str, Any] | None = None

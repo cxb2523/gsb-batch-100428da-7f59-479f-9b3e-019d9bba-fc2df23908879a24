@@ -1,0 +1,41 @@
+import asyncio
+
+from narada import Agent, BrowserEnvironment, CriticConfig
+from pydantic import BaseModel, Field
+
+
+class SearchCriticOutput(BaseModel):
+    search_query_used: str = Field(description="The exact search query the agent used")
+    result_count: int = Field(description="The number of results the agent found")
+
+
+async def main() -> None:
+    env = BrowserEnvironment()
+    agent = Agent(environment=env)
+
+    try:
+        # Define a critic that verifies the agent completed the task and extracts
+        # additional structured information from the agent's actions.
+        critic = CriticConfig(
+            prompt=(
+                "Verify that the agent successfully searched Google and found results. "
+                "Extract the exact search query the agent used and the number of results found."
+            ),
+            output_schema=SearchCriticOutput,
+        )
+
+        # Run a task with the critic. After the main agent finishes, the critic
+        # evaluates whether the task was completed successfully.
+        response = await agent.run(
+            prompt='Search Google for "Narada AI" and tell me how many results were found.',
+            critic=critic,
+        )
+
+        print("Agent response:", response.text)
+        print("Critic result:", response.critic_result.validation_passed)
+    finally:
+        await env.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
