@@ -9,20 +9,29 @@ import PuppeteerPlugin from '../lib/index.js';
 const directory = './test/tmp';
 const SERVE_WEBSITE_PORT = 4567;
 
+// CI/development machines may not have a Chrome downloaded by puppeteer itself
+// (e.g. install scripts disabled). Allow pointing the tests at another
+// Chromium-compatible executable without touching the plugin code.
+const launchOptions = process.env.PUPPETEER_EXECUTABLE_PATH
+	? { executablePath: process.env.PUPPETEER_EXECUTABLE_PATH }
+	: {};
+
 describe('Puppeteer plugin test', () => {
-	let result, content, server;
+	let result, content, server, plugin;
 
 	before('start webserver', () => server = startWebserver(SERVE_WEBSITE_PORT));
 	after('stop webserver', () => server.close())
 
 	describe('Dynamic content', () => {
 		before('scrape website', async () => {
+			plugin = new PuppeteerPlugin({
+				launchOptions,
+				scrollToBottom: { timeout: 50, viewportN: 10 }
+			});
 			result = await scrape({
 				urls: [`http://localhost:${SERVE_WEBSITE_PORT}`],
 				directory: directory,
-				plugins: [ new PuppeteerPlugin({
-					scrollToBottom: { timeout: 50, viewportN: 10 }
-				}) ]
+				plugins: [ plugin ]
 			});
 		});
 		before('get content from file', () => {
@@ -40,6 +49,11 @@ describe('Puppeteer plugin test', () => {
 
 		it('should render special characters correctly', async () => {
 			expect(content).to.contain('<div id="special-characters-test">7년 동안 한국에서 살았어요. Слава Україні!</div>');
+		});
+
+		it('should report no rejected cookies when the browser accepts every cookie', () => {
+			expect(plugin.getRejectedCookies()).to.eql([]);
+			expect(plugin.getRejectedCookiesSummary()).to.eql('No cookies were rejected by the browser.');
 		});
 	});
 
@@ -65,6 +79,7 @@ describe('Puppeteer plugin test', () => {
 				},
 				urlFilter: url => url.startsWith(`http://localhost:${SESSION_SERVER_PORT}`),
 				plugins: [ new PuppeteerPlugin({
+					launchOptions,
 					// wait for the session-rotating fetch() to complete before the page is closed
 					gotoOptions: { waitUntil: 'networkidle0' }
 				}) ]
@@ -103,22 +118,28 @@ describe('Puppeteer plugin test', () => {
 	// are only visible through the cookie jar - not in the final response.
 	describe('Cookie set on a redirect hop', () => {
 		const REDIRECT_SERVER_PORT = 4569;
-		let redirectServer, homeContent;
+		let redirectServer, homeContent, redirectPlugin;
 
 		before('start redirecting webserver', () => redirectServer = startRedirectingWebserver(REDIRECT_SERVER_PORT));
 		after('stop redirecting webserver', () => redirectServer.close());
 
 		before('scrape website', async () => {
+			redirectPlugin = new PuppeteerPlugin({ launchOptions });
 			await scrape({
 				urls: [`http://localhost:${REDIRECT_SERVER_PORT}/`],
 				directory: directory,
+				recursive: true,
+				maxDepth: 1,
 				request: {
 					headers: { Cookie: 'session=token-1' }
 				},
-				plugins: [ new PuppeteerPlugin() ]
+				urlFilter: url => url.startsWith(`http://localhost:${REDIRECT_SERVER_PORT}`),
+				plugins: [ redirectPlugin ]
 			});
 		});
 		before('get content from file', () => {
+			// the scraped resource is '/', so website-scraper stores the rendered
+			// redirect target as index.html
 			homeContent = fs.readFileSync(`${directory}/index.html`).toString();
 		});
 		after('delete dir', () => fs.removeSync(directory));
@@ -139,10 +160,40 @@ describe('Puppeteer plugin test', () => {
 			expect(homeContent).to.contain('<h1>session=token-2</h1>');
 		});
 
-		it('should ignore a cookie rejected by the browser', () => {
-			// the scrape completed (see before hook) despite the __Secure- cookie
-			// sent over http, and the valid cookie was kept
+		it('should use the redirect cookie for a subsequent plain request too', () => {
+			// /home.html links to /next.html, which website-scraper fetches
+			// with got after the page was rendered - no stale token-1 allowed
+			const requests = redirectServer.requestLog.filter(request => request.url === '/next.html' && !request.fromBrowser);
+			expect(requests).to.have.lengthOf(1);
+			expect(requests[0].cookie).to.eql('session=token-2');
+		});
+
+		it('should finish the scrape despite a cookie rejected by the browser', () => {
+			// the __Secure- cookie sent over http is rejected, but neither the
+			// scrape nor any other cookie was affected
 			expect(homeContent).to.contain('<h1>session=token-2</h1>');
+		});
+
+		it('should keep the valid cookies when one cookie was rejected', () => {
+			const homeRequests = redirectServer.requestLog.filter(request => request.url === '/home.html');
+			expect(homeRequests.length).to.be.greaterThan(0);
+			for (const request of homeRequests) {
+				expect(request.cookie).to.contain('session=token-2');
+			}
+		});
+
+		it('should expose the rejected cookie with its name, domain and reason', () => {
+			const rejected = redirectPlugin.getRejectedCookies();
+			expect(rejected).to.have.lengthOf(1);
+			expect(rejected[0].name).to.eql('__Secure-tracking');
+			expect(rejected[0].domain).to.eql('localhost');
+			expect(rejected[0].path).to.eql('/');
+			expect(rejected[0].reason.length).to.be.greaterThan(0);
+
+			const summary = redirectPlugin.getRejectedCookiesSummary();
+			expect(summary).to.contain('__Secure-tracking');
+			expect(summary).to.contain('localhost');
+			expect(summary).to.contain(rejected[0].reason);
 		});
 	});
 
@@ -153,7 +204,7 @@ describe('Puppeteer plugin test', () => {
 			plainResult = await scrape({
 				urls: [`http://localhost:${SERVE_WEBSITE_PORT}`],
 				directory: directory,
-				plugins: [ new PuppeteerPlugin({ exclusiveRendering: false }) ]
+				plugins: [ new PuppeteerPlugin({ launchOptions, exclusiveRendering: false }) ]
 			});
 		});
 		before('get content from file', () => {
@@ -173,7 +224,7 @@ describe('Puppeteer plugin test', () => {
 			cjkResult = await scrape({
 				urls: [`http://localhost:${SERVE_WEBSITE_PORT}/cjk.html`],
 				directory: directory,
-				plugins: [ new PuppeteerPlugin() ]
+				plugins: [ new PuppeteerPlugin({ launchOptions }) ]
 			});
 		});
 		before('get content from file', () => {
@@ -265,6 +316,9 @@ function startSessionRotatingWebserver (port) {
 
 // Simulates a website which sets a new session cookie while redirecting
 // (like login flows do): GET / -> 302 Location: /home.html + Set-Cookie.
+// /home.html links to /next.html so website-scraper sends a further plain
+// request after the page was rendered, and also sets a __Secure- cookie
+// without the Secure attribute, which Chrome refuses to store.
 function startRedirectingWebserver (port) {
 	const requestLog = [];
 
@@ -282,8 +336,12 @@ function startRedirectingWebserver (port) {
 		}
 
 		res.setHeader('Content-Type', 'text/html');
-		// __Secure- prefixed cookies must have the Secure attribute, Chrome rejects this one
-		res.setHeader('Set-Cookie', '__Secure-tracking=1; Path=/');
+		if (req.url === '/home.html') {
+			// __Secure- prefixed cookies must have the Secure attribute, Chrome rejects this one
+			res.setHeader('Set-Cookie', '__Secure-tracking=1; Path=/');
+			res.end(`<html><body><h1>${req.headers.cookie || 'no cookie'}</h1><a href="/next.html">next</a></body></html>`);
+			return;
+		}
 		res.end(`<html><body><h1>${req.headers.cookie || 'no cookie'}</h1></body></html>`);
 	});
 

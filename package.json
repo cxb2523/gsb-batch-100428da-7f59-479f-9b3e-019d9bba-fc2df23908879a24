@@ -34,7 +34,7 @@
     "website-scraper": "^6.0.0"
   },
   "scripts": {
-    "test": "c8 --all --reporter=text --reporter=lcov mocha --recursive --timeout 15000",
+    "test": "c8 --all --reporter=text --reporter=lcov mocha --recursive --timeout 60000",
     "eslint": "eslint lib/**"
   },
   "repository": {

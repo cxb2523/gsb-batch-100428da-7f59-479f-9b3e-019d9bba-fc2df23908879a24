@@ -80,6 +80,25 @@ await scrape({
 });
 ```
 
+### Rejected cookies
+A cookie the browser refuses to store (for example a value longer than 4096 bytes, or a `__Secure-`/`__Host-` prefixed cookie with wrong attributes) does not fail the scrape: only that cookie is dropped, every other cookie is stored and the scrape continues.
+The cookies rejected during a scrape are collected on the plugin instance:
+
+```javascript
+const plugin = new PuppeteerPlugin();
+await scrape({ /* ... */, plugins: [ plugin ] });
+
+plugin.getRejectedCookies();
+// [ { name: '__Secure-tracking', domain: 'example.com', path: '/',
+//     reason: '__Secure- prefixed cookies must be set with the Secure attribute' } ]
+// [] when no cookie was rejected
+
+plugin.getRejectedCookiesSummary();
+// human-readable multiline summary, or 'No cookies were rejected by the browser.'
+```
+
+Each entry contains at least the cookie `name`, its `domain` and the rejection `reason` (plus `path`). Cookies set by `Set-Cookie` on a redirect hop are stored in the same jar and used by the redirect target, subsequent plain requests and page renders alike.
+
 ## How it works
 It starts Chromium in headless mode which just opens page and waits until page is loaded.
 It is far from ideal because probably you need to wait until some resource is loaded or click some button or log in. Currently this module doesn't support such functionality.

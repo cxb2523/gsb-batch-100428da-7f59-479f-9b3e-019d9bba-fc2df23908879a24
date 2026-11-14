@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { parseCookieHeader, parseSetCookieHeader, cookieMatchesUrl, serializeCookies, createBrowserCookieJar, ensureLeadingDot, getCookieHeader, deleteCookieHeader } from '../lib/cookies.js';
+import { parseCookieHeader, parseSetCookieHeader, cookieMatchesUrl, serializeCookies, createBrowserCookieJar, createCookieRejectionTracker, getLocalRejectionReason, storeBrowserCookie, ensureLeadingDot, getCookieHeader, deleteCookieHeader } from '../lib/cookies.js';
 
 describe('Cookies', () => {
 	describe('parseCookieHeader', () => {
@@ -216,13 +216,172 @@ describe('Cookies', () => {
 			expect(await jar.getCookieString('http://example.com/')).to.eql('');
 		});
 
-		it('should ignore cookies rejected by the browser', async () => {
+		it('should record cookies rejected by the browser without failing', async () => {
 			const rejectingBrowser = {
 				cookies: async () => [],
 				setCookie: async () => { throw new Error('Protocol error (Storage.setCookies): Invalid cookie fields'); }
 			};
 			const jar = createBrowserCookieJar(rejectingBrowser);
-			await jar.setCookie('__Secure-a=1', 'http://example.com/');
+			await jar.setCookie('a=1; Path=/', 'http://example.com/');
+
+			const rejected = jar.getRejectedCookies();
+			expect(rejected).to.have.lengthOf(1);
+			expect(rejected[0]).to.include({ name: 'a', domain: 'example.com' });
+			expect(rejected[0].reason).to.contain('Invalid cookie fields');
+			// the scrape continues: the jar still answers cookie requests afterwards
+			expect(await jar.getCookieString('http://example.com/')).to.eql('');
+		});
+
+		it('should keep storing other cookies when one is rejected', async () => {
+			const stored = [];
+			const browser = {
+				cookies: async () => stored,
+				setCookie: async cookie => {
+					if (cookie.name === 'bad') {
+						throw new Error('Invalid cookie fields');
+					}
+					stored.push(cookie);
+				}
+			};
+			const jar = createBrowserCookieJar(browser);
+
+			await jar.setCookie('bad=1; Path=/', 'https://example.com/');
+			await jar.setCookie('good=2; Path=/', 'https://example.com/');
+
+			expect(jar.getRejectedCookies().map(cookie => cookie.name)).to.eql(['bad']);
+			expect(stored.map(cookie => cookie.name)).to.eql(['good']);
+			expect(await jar.getCookieString('https://example.com/')).to.eql('good=2');
+		});
+
+		it('should invalidate the cached jar snapshot even when the cookie was rejected', async () => {
+			let reads = 0;
+			const jar = createBrowserCookieJar({
+				cookies: async () => { reads++; return []; },
+				setCookie: async () => { throw new Error('Invalid cookie fields'); }
+			});
+			await jar.getCookieString('http://example.com/');
+			await jar.setCookie('bad=1; Path=/', 'http://example.com/');
+			await jar.getCookieString('http://example.com/');
+			expect(reads).to.eql(2);
+		});
+
+		it('should expose an empty rejection list and an explicit empty summary', () => {
+			const jar = createBrowserCookieJar({
+				cookies: async () => [],
+				setCookie: async () => {}
+			});
+			expect(jar.getRejectedCookies()).to.eql([]);
+			expect(jar.getRejectedCookiesSummary()).to.eql('No cookies were rejected by the browser.');
+		});
+
+		it('should build a readable summary of every rejected cookie', async () => {
+			const jar = createBrowserCookieJar({
+				cookies: async () => [],
+				setCookie: async () => { throw new Error('Invalid cookie fields'); }
+			});
+			await jar.setCookie('a=1; Path=/', 'http://example.com/');
+
+			const summary = jar.getRejectedCookiesSummary();
+			expect(summary).to.contain('1 cookie(s) rejected');
+			expect(summary).to.contain('a (domain: example.com');
+			expect(summary).to.contain('Invalid cookie fields');
+		});
+
+		it('should share the rejection tracker passed in the options', async () => {
+			const tracker = createCookieRejectionTracker();
+			const jar = createBrowserCookieJar({
+				cookies: async () => [],
+				setCookie: async () => { throw new Error('boom'); }
+			}, { rejectionTracker: tracker });
+			await jar.setCookie('a=1; Path=/', 'http://example.com/');
+			expect(tracker.getRejectedCookies()).to.have.lengthOf(1);
+			expect(jar.getRejectedCookies()).to.eql(tracker.getRejectedCookies());
+		});
+	});
+
+	describe('createCookieRejectionTracker', () => {
+		it('should start empty and say so explicitly', () => {
+			const tracker = createCookieRejectionTracker();
+			expect(tracker.getRejectedCookies()).to.eql([]);
+			expect(tracker.getRejectedCookiesSummary()).to.eql('No cookies were rejected by the browser.');
+		});
+
+		it('should record name, domain, path and reason for every rejected cookie', () => {
+			const tracker = createCookieRejectionTracker();
+			tracker.record({ name: 'a', domain: 'example.com', path: '/' }, 'too large');
+			tracker.record({ name: 'b', domain: '.example.com', path: '/shop' }, 'bad prefix');
+
+			expect(tracker.getRejectedCookies()).to.eql([
+				{ name: 'a', domain: 'example.com', path: '/', reason: 'too large' },
+				{ name: 'b', domain: '.example.com', path: '/shop', reason: 'bad prefix' }
+			]);
+			expect(tracker.getRejectedCookiesSummary()).to.contain('2 cookie(s) rejected');
+		});
+
+		it('should return copies so the internal list cannot be mutated', () => {
+			const tracker = createCookieRejectionTracker();
+			tracker.record({ name: 'a', domain: 'example.com', path: '/' }, 'reason');
+			const rejected = tracker.getRejectedCookies();
+			rejected[0].name = 'tampered';
+			rejected.pop();
+			expect(tracker.getRejectedCookies()[0].name).to.eql('a');
+		});
+	});
+
+	describe('getLocalRejectionReason', () => {
+		it('should reject values exceeding the browser size limit', () => {
+			const reason = getLocalRejectionReason({ name: 'big', value: 'x'.repeat(4097), domain: 'example.com', path: '/' });
+			expect(reason).to.contain('4096');
+			expect(getLocalRejectionReason({ name: 'ok', value: 'x'.repeat(4096), domain: 'example.com', path: '/' })).to.eql(null);
+		});
+
+		it('should reject __Secure- prefixed cookies without the Secure attribute', () => {
+			expect(getLocalRejectionReason({ name: '__Secure-a', value: '1', domain: 'example.com', path: '/' })).to.contain('__Secure-');
+			expect(getLocalRejectionReason({ name: '__Secure-a', value: '1', domain: 'example.com', path: '/', secure: true })).to.eql(null);
+		});
+
+		it('should reject __Host- prefixed cookies with wrong attributes', () => {
+			expect(getLocalRejectionReason({ name: '__Host-a', value: '1', domain: 'example.com', path: '/' })).to.contain('Secure');
+			expect(getLocalRejectionReason({ name: '__Host-a', value: '1', domain: '.example.com', path: '/', secure: true })).to.contain('Domain');
+			expect(getLocalRejectionReason({ name: '__Host-a', value: '1', domain: 'example.com', path: '/shop', secure: true })).to.contain('Path=/');
+			expect(getLocalRejectionReason({ name: '__Host-a', value: '1', domain: 'example.com', path: '/', secure: true })).to.eql(null);
+		});
+
+		it('should accept ordinary cookies', () => {
+			expect(getLocalRejectionReason({ name: 'session', value: 'abc', domain: 'example.com', path: '/' })).to.eql(null);
+		});
+	});
+
+	describe('storeBrowserCookie', () => {
+		it('should store accepted cookies and leave the rejection tracker empty', async () => {
+			const stored = [];
+			const tracker = createCookieRejectionTracker();
+			await storeBrowserCookie({ setCookie: async cookie => stored.push(cookie) }, { name: 'a', value: '1', domain: 'example.com', path: '/' }, tracker);
+			expect(stored).to.have.lengthOf(1);
+			expect(tracker.getRejectedCookies()).to.eql([]);
+		});
+
+		it('should record locally known rejections without calling the browser', async () => {
+			let called = false;
+			const tracker = createCookieRejectionTracker();
+			await storeBrowserCookie(
+				{ setCookie: async () => { called = true; } },
+				{ name: '__Secure-a', value: '1', domain: 'example.com', path: '/' },
+				tracker
+			);
+			expect(called).to.eql(false);
+			expect(tracker.getRejectedCookies()[0]).to.include({ name: '__Secure-a', domain: 'example.com' });
+			expect(tracker.getRejectedCookies()[0].reason).to.contain('Secure');
+		});
+
+		it('should record the browser error when it rejects an otherwise valid cookie', async () => {
+			const tracker = createCookieRejectionTracker();
+			await storeBrowserCookie(
+				{ setCookie: async () => { throw new Error('Protocol error: boom'); } },
+				{ name: 'a', value: '1', domain: 'example.com', path: '/' },
+				tracker
+			);
+			expect(tracker.getRejectedCookies()[0].reason).to.eql('Protocol error: boom');
 		});
 	});
 });
