@@ -11,6 +11,7 @@ import os
 import re
 import sys
 import time
+from urllib.parse import unquote, urlsplit
 
 from playwright.sync_api import Page, TimeoutError
 
@@ -20,8 +21,8 @@ _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from core.exceptions import ExtractionError
-from core.models import CompanyData, ReviewData
+from core.exceptions import DetailPageLoadError, ExtractionError, ReviewsTimeoutError
+from core.models import CompanyData, CrawlResults, ResultOutcome, ResultStatus, ReviewData
 
 logger = logging.getLogger(__name__)
 
@@ -67,24 +68,49 @@ class MapsExtractor:
     # The outer container that holds the reviews section
     REVIEWS_SECTION_SELECTOR = "div.m6QErb.WNBkOb.XiKgde"
 
-    def __init__(self, page: Page, selector_timeout: int = 15000) -> None:
+    def __init__(
+        self,
+        page: Page,
+        selector_timeout: int = 15000,
+        reviews_timeout: int = 10000,
+    ) -> None:
         """Initialize the MapsExtractor.
 
         Args:
             page: The Playwright Page object.
             selector_timeout: Timeout for selector waits in milliseconds.
+            reviews_timeout: Total budget (milliseconds) for waiting on the
+                reviews section to appear.  If the reviews never load within
+                this window, the position is recorded as ``reviews_timeout``
+                and the crawl continues.
         """
         self._page = page
         self._selector_timeout = selector_timeout
+        self._reviews_timeout = reviews_timeout
+        self._last_outcomes: list[ResultOutcome] = []
 
-    def extract_all(self, track_reviews: bool = True) -> list[CompanyData]:
+    @property
+    def outcomes(self) -> list[ResultOutcome]:
+        """Get the per-position outcomes of the most recent ``extract_all``.
+
+        Returns:
+            A list of ResultOutcome objects ordered by result position.
+        """
+        return self._last_outcomes
+
+    def extract_all(self, track_reviews: bool = True) -> CrawlResults:
         """Extract all company data from the current Google Maps search results page.
+
+        Every position in the result feed gets an outcome record (success,
+        detail page failure, reviews timeout or duplicate).  The returned
+        value is a :class:`CrawlResults` list, so existing code that treats it
+        as a plain list of companies keeps working.
 
         Args:
             track_reviews: Whether to extract reviews for each company.
 
         Returns:
-            A list of CompanyData objects.
+            A CrawlResults list of CompanyData objects carrying outcomes.
 
         Raises:
             ExtractionError: If the extraction process fails.
@@ -93,12 +119,19 @@ class MapsExtractor:
             result_links = self._collect_result_links()
             if not result_links:
                 logger.warning("No result links found on the page")
-                return []
+                self._last_outcomes = []
+                return CrawlResults([])
 
             logger.info("Found %d result links to process (track_reviews=%s)", len(result_links), track_reviews)
-            companies = self._process_links(result_links, track_reviews=track_reviews)
-            logger.info("Successfully extracted %d companies", len(companies))
-            return companies
+            results = self._process_links(result_links, track_reviews=track_reviews)
+            self._last_outcomes = results.outcomes
+            logger.info(
+                "Extracted %d companies from %d positions (%s)",
+                len(results),
+                len(result_links),
+                ", ".join(f"{status}={count}" for status, count in results.counts_by_status().items()) or "no outcomes",
+            )
+            return results
 
         except Exception as e:
             raise ExtractionError(
@@ -107,10 +140,14 @@ class MapsExtractor:
             ) from e
 
     def _collect_result_links(self) -> list[str]:
-        """Collect all valid result links from the Google Maps feed.
+        """Collect all result links from the Google Maps feed.
+
+        The links are returned in feed order, *including* duplicates, because
+        every link corresponds to one result position that needs an outcome.
+        Duplicate detection happens later, on normalized place links.
 
         Returns:
-            A list of unique Google Maps place URLs.
+            A list of Google Maps place URLs in result order.
         """
         parent_element = self._wait_for_feed()
         if not parent_element:
@@ -118,8 +155,7 @@ class MapsExtractor:
 
         self._scroll_through_results()
 
-        links = self._extract_links_from_feed(parent_element)
-        return self._remove_duplicate_links(links)
+        return self._extract_links_from_feed(parent_element)
 
     def _wait_for_feed(self):
         """Wait for the results feed to appear.
@@ -190,41 +226,200 @@ class MapsExtractor:
     def _remove_duplicate_links(links: list[str]) -> list[str]:
         """Remove duplicate links while preserving order.
 
+        Duplicates are detected on the normalized place link (see
+        :meth:`_normalize_place_url`).
+
         Args:
             links: A list of URLs.
 
         Returns:
-            A list of unique URLs.
+            A list of unique URLs, in their original form and order.
         """
-        return list(dict.fromkeys(links))
+        seen: set[str] = set()
+        unique: list[str] = []
+        for link in links:
+            key = MapsExtractor._normalize_place_url(link)
+            if key not in seen:
+                seen.add(key)
+                unique.append(link)
+        return unique
 
-    def _process_links(self, links: list[str], track_reviews: bool = True) -> list[CompanyData]:
-        """Process each link and extract company data.
+    @staticmethod
+    def _normalize_place_url(url: str) -> str:
+        """Normalize a Google Maps place link for duplicate detection.
+
+        Google Maps emits the same place with different tracking/query
+        parameters and encodings.  The normalized form ignores the scheme,
+        a leading ``www.``, the query string, the fragment and trailing
+        slashes, and decodes percent-escapes/case differences in the path.
 
         Args:
-            links: A list of Google Maps place URLs.
+            url: A Google Maps place URL.
+
+        Returns:
+            A normalized key that is equal for equivalent place links.
+        """
+        if not url:
+            return ""
+
+        try:
+            parts = urlsplit(url.strip())
+        except ValueError:
+            return url.strip().lower()
+
+        host = parts.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+
+        path = unquote(parts.path)
+        # Google Maps encodes spaces in the place segment as "+".
+        path = path.replace("+", " ")
+        path = re.sub(r"\s+", " ", path)
+        # Drop the volatile "/data=!..." segment that differs between the
+        # search-results link and a later navigation to the same place.
+        path = re.sub(r"/?data=.*$", "", path, flags=re.IGNORECASE)
+        path = re.sub(r"/+\s*$", "", path).lower()
+
+        return f"{host}{path}"
+
+    @staticmethod
+    def _name_from_url(url: str) -> str:
+        """Derive a readable place name from a Google Maps place URL.
+
+        Used to identify duplicates and failed positions even when no detail
+        page could be read.
+
+        Args:
+            url: A Google Maps place URL.
+
+        Returns:
+            The decoded place name, or an empty string if none can be found.
+        """
+        if not url:
+            return ""
+
+        match = re.search(r"/maps/place/([^/@?]+)", url, re.IGNORECASE)
+        if not match:
+            return ""
+
+        return unquote(match.group(1).replace("+", " ")).strip()
+
+    def _process_links(self, links: list[str], track_reviews: bool = True) -> CrawlResults:
+        """Process each link and extract company data, recording an outcome per position.
+
+        Positions are zero-based indexes into the collected result feed.
+        A position is only considered "covered" after it was successfully
+        extracted; later positions with the same normalized place link are
+        skipped and marked as duplicates of that successful position.
+
+        Args:
+            links: A list of Google Maps place URLs in result order.
             track_reviews: Whether to extract reviews for each company.
 
         Returns:
-            A list of CompanyData objects.
+            A CrawlResults list of successfully extracted CompanyData objects
+            (same meaning and order as before) carrying the outcomes.
         """
-        companies = []
+        companies: list[CompanyData] = []
+        outcomes: list[ResultOutcome] = []
+        # normalized place link -> position that was successfully extracted
+        covered_by: dict[str, int] = {}
 
         for i, url in enumerate(links):
-            try:
-                company = self._extract_company_details(url, i, track_reviews=track_reviews)
-                if company:
-                    companies.append(company)
-                # Small delay between requests
-                time.sleep(0.3 + (i % 5) * 0.1)
+            normalized = self._normalize_place_url(url)
 
-            except Exception as e:
-                logger.warning("Failed to extract company from %s: %s", url, e)
+            if normalized and normalized in covered_by:
+                covering_position = covered_by[normalized]
+                logger.info(
+                    "Skipping duplicate result at position %d (same place as position %d)",
+                    i,
+                    covering_position,
+                )
+                outcomes.append(
+                    ResultOutcome(
+                        position=i,
+                        status=ResultStatus.DUPLICATE,
+                        url=url,
+                        name=self._name_from_url(url),
+                        reason=f"Duplicate of successful position {covering_position}",
+                        duplicate_of=covering_position,
+                    )
+                )
                 continue
 
-        return companies
+            try:
+                company, review_warning = self._extract_company_details(
+                    url, i, track_reviews=track_reviews
+                )
+            except DetailPageLoadError as e:
+                logger.warning("Detail page failed at position %d (%s): %s", i, url, e)
+                outcomes.append(
+                    ResultOutcome(
+                        position=i,
+                        status=ResultStatus.DETAIL_PAGE_FAILED,
+                        url=url,
+                        name=self._name_from_url(url),
+                        reason=str(e),
+                    )
+                )
+                continue
+            except Exception as e:
+                # Unexpected errors must not abort the whole crawl either.
+                logger.warning("Failed to extract company from %s: %s", url, e)
+                outcomes.append(
+                    ResultOutcome(
+                        position=i,
+                        status=ResultStatus.DETAIL_PAGE_FAILED,
+                        url=url,
+                        name=self._name_from_url(url),
+                        reason=f"Unexpected extraction error: {e}",
+                    )
+                )
+                continue
 
-    def _extract_company_details(self, url: str, index: int, track_reviews: bool = True) -> CompanyData | None:
+            if company is None:
+                outcomes.append(
+                    ResultOutcome(
+                        position=i,
+                        status=ResultStatus.DETAIL_PAGE_FAILED,
+                        url=url,
+                        name=self._name_from_url(url),
+                        reason="No company data could be extracted",
+                    )
+                )
+                continue
+
+            if normalized:
+                covered_by[normalized] = i
+
+            companies.append(company)
+
+            if review_warning:
+                status = ResultStatus.REVIEWS_TIMEOUT
+                reason = review_warning
+            else:
+                status = ResultStatus.SUCCESS
+                reason = ""
+
+            outcomes.append(
+                ResultOutcome(
+                    position=i,
+                    status=status,
+                    url=url,
+                    name=company.name,
+                    reason=reason,
+                    company=company,
+                )
+            )
+
+            # Small delay between requests
+            time.sleep(0.3 + (i % 5) * 0.1)
+
+        return CrawlResults(companies, outcomes)
+
+    def _extract_company_details(
+        self, url: str, index: int, track_reviews: bool = True
+    ) -> tuple[CompanyData, str | None]:
         """Navigate to a company page and extract its details.
 
         Args:
@@ -233,7 +428,14 @@ class MapsExtractor:
             track_reviews: Whether to extract reviews for this company.
 
         Returns:
-            A CompanyData object or None if extraction fails.
+            A tuple of (CompanyData, review_warning). ``review_warning`` is
+            ``None`` when everything was extracted, or a reason string when
+            the company details were read but the reviews timed out. In the
+            latter case the company is still returned (without reviews).
+
+        Raises:
+            DetailPageLoadError: If the page cannot be opened or the company
+                name cannot be found on it.
         """
         try:
             self._page.goto(url, timeout=25000, wait_until="domcontentloaded")
@@ -241,9 +443,12 @@ class MapsExtractor:
             # Wait for the company name to confirm the page loaded
             try:
                 self._page.wait_for_selector(self.NAME_SELECTOR, timeout=15000)
-            except TimeoutError:
-                logger.debug("Company name selector not found, skipping this result")
-                return None
+            except TimeoutError as e:
+                raise DetailPageLoadError(
+                    message="Company name not found on detail page",
+                    url=url,
+                    cause=e,
+                ) from e
 
             # Build details dictionary
             details: dict = {
@@ -266,18 +471,43 @@ class MapsExtractor:
                 "attributes": self._extract_attributes(),
             }
 
+            review_warning: str | None = None
+
             # Only extract reviews if track_reviews is True
             if track_reviews:
-                details["reviews"] = self._extract_reviews()
+                try:
+                    details["reviews"] = self._extract_reviews()
+                except ReviewsTimeoutError as e:
+                    # Reviews failing to load must not discard the company or
+                    # abort the crawl - record it and move on.
+                    review_warning = str(e)
+                    details["reviews"] = []
+                    logger.warning("Reviews timed out at position %d (%s)", index, url)
+                except Exception as e:
+                    # Unexpected review errors are equally non-fatal.
+                    review_warning = f"Error extracting reviews: {e}"
+                    details["reviews"] = []
+                    logger.warning("Error extracting reviews at position %d (%s): %s", index, url, e)
             else:
                 details["reviews"] = []
                 logger.debug("Review tracking disabled for company at index %d", index)
 
-            return CompanyData(**details)
+            return CompanyData(**details), review_warning
 
+        except DetailPageLoadError:
+            raise
+        except TimeoutError as e:
+            raise DetailPageLoadError(
+                message="Timed out loading detail page",
+                url=url,
+                cause=e,
+            ) from e
         except Exception as e:
-            logger.warning("Error extracting company details from %s: %s", url, e)
-            return None
+            raise DetailPageLoadError(
+                message=f"Error extracting company details: {e}",
+                url=url,
+                cause=e,
+            ) from e
 
     def _extract_rating(self) -> str:
         """Extract the company rating and review count.
@@ -408,68 +638,79 @@ class MapsExtractor:
 
         Returns:
             A list of ReviewData objects.
+
+        Raises:
+            ReviewsTimeoutError: If the reviews tab could be activated but the
+                reviews section did not appear within the configured reviews
+                timeout.  When no reviews tab exists at all (a place without
+                reviews), an empty list is returned.  Individual review parsing
+                errors do not raise; they only skip that review.
         """
         reviews = []
 
-        try:
-            # Step 1: Click the Reviews tab button
-            self._click_reviews_tab()
+        # Step 1: Click the Reviews tab button. If there is no reviews tab at
+        # all, the place simply has no reviews to load.
+        if not self._click_reviews_tab():
+            logger.debug("No reviews tab found; place likely has no reviews")
+            return []
 
-            # Step 2: Wait for the reviews scroll container to appear
+        # Step 2: Wait for the reviews scroll container to appear
+        try:
+            self._page.wait_for_selector(
+                self.REVIEWS_SCROLL_CONTAINER_SELECTOR,
+                timeout=self._reviews_timeout,
+            )
+            logger.info("Reviews scroll container found")
+        except TimeoutError:
+            logger.warning("Reviews scroll container not found, trying fallback")
+            # Fallback: wait for any review items, with a shorter budget
             try:
                 self._page.wait_for_selector(
-                    self.REVIEWS_SCROLL_CONTAINER_SELECTOR,
-                    timeout=10000,
+                    self.REVIEW_ITEM_SELECTOR,
+                    timeout=max(2000, self._reviews_timeout // 3),
                 )
-                logger.info("Reviews scroll container found")
-            except TimeoutError:
-                logger.warning("Reviews scroll container not found, trying fallback")
-                # Fallback: wait for any review items
-                try:
-                    self._page.wait_for_selector(
-                        self.REVIEW_ITEM_SELECTOR,
-                        timeout=5000,
-                    )
-                except TimeoutError:
-                    logger.warning("No review items found after waiting")
-                    return []
+            except TimeoutError as e:
+                raise ReviewsTimeoutError(
+                    message="Reviews did not load within the timeout",
+                    cause=e,
+                ) from e
 
-            # Additional wait for animations to complete
-            self._page.wait_for_timeout(1000)
+        # Additional wait for animations to complete
+        self._page.wait_for_timeout(1000)
 
-            # Step 3: Scroll through reviews to load all
-            self._scroll_through_reviews()
+        # Step 3: Scroll through reviews to load all
+        self._scroll_through_reviews()
 
-            # Step 4: Extract reviews ONLY from the reviews scroll container
-            review_container = self._page.query_selector(self.REVIEWS_SCROLL_CONTAINER_SELECTOR)
-            if review_container:
-                review_elements = review_container.query_selector_all(self.REVIEW_ITEM_SELECTOR)
-                logger.info("Found %d review elements in scroll container", len(review_elements))
-            else:
-                # Fallback: try to find reviews in the page
-                review_elements = self._page.query_selector_all(self.REVIEW_ITEM_SELECTOR)
-                logger.info("Scroll container not found, using page-wide search: %d reviews", len(review_elements))
+        # Step 4: Extract reviews ONLY from the reviews scroll container
+        review_container = self._page.query_selector(self.REVIEWS_SCROLL_CONTAINER_SELECTOR)
+        if review_container:
+            review_elements = review_container.query_selector_all(self.REVIEW_ITEM_SELECTOR)
+            logger.info("Found %d review elements in scroll container", len(review_elements))
+        else:
+            # Fallback: try to find reviews in the page
+            review_elements = self._page.query_selector_all(self.REVIEW_ITEM_SELECTOR)
+            logger.info("Scroll container not found, using page-wide search: %d reviews", len(review_elements))
 
-            for idx, elem in enumerate(review_elements[:max_reviews]):
-                try:
-                    review = self._parse_single_review(elem)
-                    if review and review.review_text != "N/A":
-                        reviews.append(review)
-                except Exception as e:
-                    logger.warning("Failed to parse review %d: %s", idx, e)
-                    continue
+        for idx, elem in enumerate(review_elements[:max_reviews]):
+            try:
+                review = self._parse_single_review(elem)
+                if review and review.review_text != "N/A":
+                    reviews.append(review)
+            except Exception as e:
+                logger.warning("Failed to parse review %d: %s", idx, e)
+                continue
 
-            logger.info("Successfully extracted %d reviews", len(reviews))
-
-        except Exception as e:
-            logger.warning("Error extracting reviews: %s", e)
+        logger.info("Successfully extracted %d reviews", len(reviews))
 
         return reviews
 
-    def _click_reviews_tab(self) -> None:
+    def _click_reviews_tab(self) -> bool:
         """Click the Reviews tab button to show the reviews section.
 
         Uses the specific Google Maps tab structure with role="tab" buttons.
+
+        Returns:
+            True if a reviews tab was found and clicked, False otherwise.
         """
         clicked = False
 
@@ -499,6 +740,8 @@ class MapsExtractor:
 
         if not clicked:
             logger.debug("Reviews tab button not found or click failed")
+
+        return clicked
 
     def _scroll_through_reviews(self) -> None:
         """Scroll through the reviews section to load all reviews.

@@ -24,7 +24,14 @@ __version__ = "2.0.0"
 __author__ = "GoogleMapsCrawler Contributors"
 
 from core.crawler import GoogleMapsCrawler, run_crawler
-from core.models import CompanyData, CrawlerConfig, ViewPort
+from core.models import (
+    CompanyData,
+    CrawlResults,
+    CrawlerConfig,
+    ResultOutcome,
+    ResultStatus,
+    ViewPort,
+)
 from core.exceptions import (
     CrawlerBaseException,
     BrowserInitializationError,
@@ -38,7 +45,10 @@ __all__ = [
     # Classes
     "GoogleMapsCrawler",
     "CompanyData",
+    "CrawlResults",
     "CrawlerConfig",
+    "ResultOutcome",
+    "ResultStatus",
     "ViewPort",
     # Functions
     "run_crawler",

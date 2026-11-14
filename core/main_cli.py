@@ -108,6 +108,27 @@ def main() -> None:
         )
         logger.info("Crawler completed successfully. Found %d companies.", len(results))
 
+        # Surface per-position outcomes so skipped/failed positions are visible.
+        outcomes = getattr(results, "outcomes", [])
+        for outcome in outcomes:
+            if outcome.status.value != "success":
+                logger.warning(
+                    "Position %d: %s - %s (%s)",
+                    outcome.position,
+                    outcome.status.value,
+                    outcome.name or "unknown",
+                    outcome.url,
+                )
+        if outcomes:
+            counts = {}
+            for outcome in outcomes:
+                counts[outcome.status.value] = counts.get(outcome.status.value, 0) + 1
+            logger.info(
+                "Outcome summary: %s",
+                ", ".join(f"{status}={count}" for status, count in counts.items()),
+            )
+
+
     except KeyboardInterrupt:
         logger.info("Crawler interrupted by user")
         sys.exit(1)

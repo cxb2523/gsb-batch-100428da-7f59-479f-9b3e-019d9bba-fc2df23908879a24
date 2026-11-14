@@ -264,7 +264,30 @@ with GoogleMapsCrawler(config) as crawler:
 for company in results:
     if isinstance(company, CompanyData):
         print(f"{company.name}: {company.rating} stars ({company.reviews_count} reviews)")
+
+# `results` is a normal list of companies, and additionally carries one
+# outcome per Google Maps result position (0-based):
+for outcome in results.outcomes:
+    print(outcome.position, outcome.status.value, outcome.name, outcome.url)
 ```
+
+### Result Outcomes
+
+`crawl()` returns a `CrawlResults` list: it behaves exactly like the previous
+list of companies (same items, same order), plus `.outcomes` describes what
+happened at every position in the results feed:
+
+| Status | Meaning |
+| --- | --- |
+| `success` | Company extracted successfully |
+| `detail_page_failed` | The detail page could not be opened or the company name was missing |
+| `reviews_timeout` | Company extracted, but reviews did not load in time (returned without reviews) |
+| `duplicate` | Same normalized place link as an earlier successful position; not fetched again (`duplicate_of` points at that position) |
+| `no_valid_website` | Company extracted but filtered out because it has no valid HTTP(S) website |
+| `duplicate_company` | Removed by the name+website de-duplication step (`duplicate_of` points at the kept position) |
+
+Failed positions never abort the crawl; the remaining positions are still
+processed.
 
 ### Custom Search at Runtime
 
