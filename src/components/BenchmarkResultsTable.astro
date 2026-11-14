@@ -1,0 +1,290 @@
+---
+import type { BenchmarkResultRow, BenchmarkScope } from "../lib/benchmark-hub";
+import { benchmarkScopeLabels } from "../lib/benchmark-hub";
+
+interface Props {
+  rows: BenchmarkResultRow[];
+  scope: BenchmarkScope;
+  heading?: string;
+  slug?: string;
+}
+
+const { rows, scope, heading = "Leaderboard", slug = "" } = Astro.props;
+
+const collapseLimit = 12;
+const shouldCollapse = rows.length > collapseLimit;
+const hiddenCount = rows.length - collapseLimit;
+
+function repoLabel(repoUrl: string): string {
+  if (repoUrl.includes("github.com")) return "GitHub repository";
+  if (repoUrl.includes("huggingface.co")) return "Hugging Face repository";
+  return "Repository";
+}
+
+function formatReportedDate(reportedAt?: string): string {
+  if (!reportedAt) return "—";
+
+  const dateInput = /^\d{4}-\d{2}$/.test(reportedAt) ? `${reportedAt}-01` : reportedAt;
+  const date = new Date(`${dateInput}T00:00:00Z`);
+  if (Number.isNaN(date.getTime())) return reportedAt;
+
+  return date.toLocaleDateString("en-US", {
+    month: "short",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+}
+---
+
+<section
+  data-static-results-table
+  class:list={["table-shell w-full", shouldCollapse && "is-collapsed"]}
+>
+  <div class="lb-module-head flex items-center gap-3 px-3 py-2">
+    <h2 class="m-0 text-sm font-normal uppercase tracking-[-0.02em] text-[var(--color-accent)]">
+      {heading || "Leaderboard"}
+    </h2>
+    <div class="lb-head-lines" aria-hidden="true">
+      <span></span>
+      <span></span>
+      <span></span>
+      <span></span>
+      <span></span>
+    </div>
+    <span class="hidden text-xs font-bold uppercase text-[var(--color-accent)] sm:inline"
+      >{benchmarkScopeLabels[scope]} scope</span
+    >
+  </div>
+  <div class="overflow-x-auto p-4 md:p-6">
+    <table class="w-full min-w-[640px] border-collapse text-xs">
+      <thead
+        class="lb-header text-left text-[0.6875rem] uppercase tracking-[0.025em] text-[var(--color-text-dim)]"
+      >
+        <tr>
+          <th class="px-3 py-2 font-semibold">System / Submission</th>
+          <th class="px-3 py-2 font-semibold">
+            <span class="inline-flex items-center gap-1.5">
+              Score
+              <span class="score-triangle" aria-hidden="true"></span>
+            </span>
+          </th>
+          <th class="px-3 py-2 font-semibold">Organization</th>
+          <th class="px-3 py-2 font-semibold">Reported</th>
+          <th class="px-3 py-2 font-semibold">Source</th>
+        </tr>
+      </thead>
+      <tbody>
+        {
+          rows.map((row, index) => {
+            return (
+              <tr class="lb-row group align-middle">
+                <td class="px-3 py-3 text-[var(--color-text-strong)]">
+                  <div class="flex flex-wrap items-center gap-2">
+                    <span class="system-name">{row.systemName}</span>
+                    {row.isNew && <span class="badge badge-accent">New</span>}
+                    {row.repoUrl && (
+                      <a
+                        href={row.repoUrl}
+                        target="_blank"
+                        rel="noopener"
+                        class="repo-source-link"
+                        aria-label={`${row.systemName} ${repoLabel(row.repoUrl)}`}
+                        title={repoLabel(row.repoUrl)}
+                      >
+                        {row.repoUrl.includes("huggingface.co") ? (
+                          <img
+                            src="/hf-logo.png"
+                            alt=""
+                            width="16"
+                            height="16"
+                            aria-hidden="true"
+                            class="h-4 w-4 object-contain"
+                          />
+                        ) : row.repoUrl.includes("github.com") ? (
+                          <img
+                            src="/github-logo.svg"
+                            alt=""
+                            width="13"
+                            height="13"
+                            aria-hidden="true"
+                            class="h-[13px] w-[13px] object-contain"
+                          />
+                        ) : (
+                          <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            width="16"
+                            height="16"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            aria-hidden="true"
+                          >
+                            <path d="M15 3h6v6" />
+                            <path d="M10 14 21 3" />
+                            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+                          </svg>
+                        )}
+                      </a>
+                    )}
+                    {row.notesShort && (
+                      <span class="note-tooltip relative inline-flex">
+                        <button
+                          type="button"
+                          class="note-trigger"
+                          aria-label={`Note for ${row.systemName}`}
+                          aria-describedby={`note-${slug}-${index + 1}`}
+                        >
+                          <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            width="16"
+                            height="16"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            aria-hidden="true"
+                          >
+                            <circle cx="12" cy="12" r="10" />
+                            <path d="M12 16v-4" />
+                            <path d="M12 8h.01" />
+                          </svg>
+                        </button>
+                        <div
+                          id={`note-${slug}-${index + 1}`}
+                          role="tooltip"
+                          popover="manual"
+                          class="note-bubble"
+                        >
+                          {row.notesShort}
+                        </div>
+                      </span>
+                    )}
+                  </div>
+                </td>
+                <td class="px-3 py-3 font-semibold text-[var(--color-accent)]">
+                  {row.scoreDisplay}
+                </td>
+                <td class="px-3 py-3 text-[var(--color-text-dim)]">{row.organization}</td>
+                <td class="px-3 py-3 whitespace-nowrap muted">
+                  {row.reportedAt ? (
+                    <time datetime={row.reportedAt}>{formatReportedDate(row.reportedAt)}</time>
+                  ) : (
+                    "—"
+                  )}
+                </td>
+                <td class="px-3 py-3">
+                  <a href={row.sourceUrl} target="_blank" rel="noopener">
+                    Source
+                  </a>
+                </td>
+              </tr>
+            );
+          })
+        }
+      </tbody>
+    </table>
+  </div>
+  {
+    shouldCollapse && (
+      <button type="button" class="lb-expand-btn" aria-expanded="false">
+        <span class="lb-expand-label-collapsed">Expand to see {hiddenCount} more</span>
+        <span class="lb-expand-label-expanded">Show less</span>
+        <span class="score-triangle lb-expand-triangle" aria-hidden="true" />
+      </button>
+    )
+  }
+</section>
+
+<script>
+  document
+    .querySelectorAll<HTMLButtonElement>("[data-static-results-table] .lb-expand-btn")
+    .forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const shell = btn.closest<HTMLElement>(".table-shell");
+        if (!shell) return;
+        shell.classList.toggle("is-collapsed");
+        btn.setAttribute("aria-expanded", String(!shell.classList.contains("is-collapsed")));
+      });
+    });
+
+  document.querySelectorAll<HTMLButtonElement>(".note-trigger").forEach((trigger) => {
+    const id = trigger.getAttribute("aria-describedby");
+    if (!id) return;
+    const bubble = document.getElementById(id) as HTMLElement | null;
+    if (!bubble || typeof bubble.showPopover !== "function") return;
+
+    const MARGIN = 8;
+    const HIDE_DELAY_MS = 120;
+    let hideTimer: number | undefined;
+    let isOpen = false;
+
+    const position = (): void => {
+      const triggerRect = trigger.getBoundingClientRect();
+      const bubbleRect = bubble.getBoundingClientRect();
+      const viewportW = document.documentElement.clientWidth;
+      const viewportH = document.documentElement.clientHeight;
+
+      let top = triggerRect.top - bubbleRect.height - MARGIN;
+      let left = triggerRect.left + triggerRect.width / 2 - bubbleRect.width / 2;
+
+      if (top < MARGIN) top = triggerRect.bottom + MARGIN;
+      if (left < MARGIN) left = MARGIN;
+      if (left + bubbleRect.width > viewportW - MARGIN) {
+        left = viewportW - bubbleRect.width - MARGIN;
+      }
+      if (top + bubbleRect.height > viewportH - MARGIN) {
+        top = Math.max(MARGIN, viewportH - bubbleRect.height - MARGIN);
+      }
+
+      bubble.style.top = `${top}px`;
+      bubble.style.left = `${left}px`;
+    };
+
+    const onScrollOrResize = (): void => position();
+
+    const open = (): void => {
+      if (hideTimer !== undefined) {
+        window.clearTimeout(hideTimer);
+        hideTimer = undefined;
+      }
+      if (isOpen) return;
+      isOpen = true;
+      bubble.showPopover();
+      position();
+      window.addEventListener("scroll", onScrollOrResize, true);
+      window.addEventListener("resize", onScrollOrResize);
+    };
+
+    const close = (): void => {
+      if (!isOpen) return;
+      isOpen = false;
+      bubble.hidePopover();
+      window.removeEventListener("scroll", onScrollOrResize, true);
+      window.removeEventListener("resize", onScrollOrResize);
+    };
+
+    const scheduleClose = (): void => {
+      if (hideTimer !== undefined) window.clearTimeout(hideTimer);
+      hideTimer = window.setTimeout(close, HIDE_DELAY_MS);
+    };
+
+    const cancelClose = (): void => {
+      if (hideTimer !== undefined) {
+        window.clearTimeout(hideTimer);
+        hideTimer = undefined;
+      }
+    };
+
+    trigger.addEventListener("mouseenter", open);
+    trigger.addEventListener("mouseleave", scheduleClose);
+    trigger.addEventListener("focus", open);
+    trigger.addEventListener("blur", close);
+    bubble.addEventListener("mouseenter", cancelClose);
+    bubble.addEventListener("mouseleave", scheduleClose);
+  });
+</script>

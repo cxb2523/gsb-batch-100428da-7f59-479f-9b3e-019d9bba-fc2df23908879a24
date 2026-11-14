@@ -1,0 +1,229 @@
+---
+import Layout from "../layouts/Layout.astro";
+import FaqList from "../components/FaqList.astro";
+import HomeLeaderboardExplorer from "../components/HomeLeaderboardExplorer";
+import { getChartBenchmarks } from "../lib/benchmark-charts";
+import { getAllBenchmarkPages, getTopResult, homeFaqs } from "../lib/benchmark-hub";
+
+const pages = getAllBenchmarkPages();
+const chartBenchmarks = getChartBenchmarks();
+
+const benchmarkIndexSchema = JSON.stringify({
+  "@context": "https://schema.org",
+  "@type": "ItemList",
+  name: "AI Benchmark Hub",
+  description:
+    "Benchmark hub with canonical leaderboard pages for web agents, computer use, research, and coding.",
+  url: "https://leaderboard.steel.dev/",
+  numberOfItems: pages.length,
+  itemListElement: pages.map((page, index) => ({
+    "@type": "ListItem",
+    position: index + 1,
+    item: {
+      "@type": "WebPage",
+      name: `${page.meta.name} leaderboard`,
+      url: `https://leaderboard.steel.dev/leaderboards/${page.meta.slug}/`,
+    },
+  })),
+});
+
+const faqSchema = JSON.stringify({
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  mainEntity: homeFaqs.map((item) => ({
+    "@type": "Question",
+    name: item.q,
+    acceptedAnswer: {
+      "@type": "Answer",
+      text: item.a.replace(/<[^>]+>/g, ""),
+    },
+  })),
+});
+---
+
+<Layout
+  title="AI Agent Benchmark Leaderboards: Browser, Coding & Computer Use | Steel.dev"
+  description="Compare AI agent benchmark leaderboards for browser agents, computer use, research, and coding, with sourced scores and methodology notes."
+  structuredData={[benchmarkIndexSchema, faqSchema]}
+  markdownUrl="/index.md"
+>
+  <article class="home-shell mx-auto w-full py-8">
+    <header class="home-hero">
+      <div class="flex items-center gap-4">
+        <img
+          src="/cursor.svg"
+          alt=""
+          width="56"
+          height="56"
+          aria-hidden="true"
+          class="hero-cursor shrink-0"
+        />
+        <h1
+          class="m-0 text-[2rem] font-medium leading-10 tracking-[-0.045em] text-(--color-text-strong)"
+        >
+          Browser Agent Leaderboards
+        </h1>
+      </div>
+      <p class="mb-0 mt-4 max-w-3xl text-sm leading-6 muted">
+        Track the best-performing AI agents and models across browser agent benchmarks, computer
+        use, research, and coding. Each leaderboard page includes methodology notes, scope labels,
+        and source-linked benchmark results.
+      </p>
+    </header>
+
+    <section id="performance" class="mt-10 scroll-mt-8" aria-label="Explore benchmark performance">
+      <HomeLeaderboardExplorer benchmarks={chartBenchmarks} client:load />
+    </section>
+
+    <section id="benchmarks" class="mt-16 scroll-mt-8" aria-labelledby="all-benchmarks-title">
+      <h2
+        id="all-benchmarks-title"
+        class="mb-6 text-xl font-medium tracking-tight text-(--color-text-strong)"
+      >
+        All benchmarks
+      </h2>
+      <div class="home-card-grid">
+        {
+          pages.map((page) => {
+            const topRows = page.results.slice(0, 3);
+            const top = getTopResult(page.results);
+            return (
+              <article class="leaderboard-card">
+                <div class="lb-module-head flex items-center gap-3 px-3 py-2">
+                  <h3 class="m-0 text-sm font-normal tracking-[-0.02em] text-(--color-accent)">
+                    {page.meta.name}
+                  </h3>
+                  <div class="lb-head-lines" aria-hidden="true">
+                    <span />
+                    <span />
+                    <span />
+                    <span />
+                    <span />
+                  </div>
+                </div>
+
+                <div class="p-4">
+                  <p class="m-0 min-h-18 text-xs leading-5 muted">{page.meta.about[0]}</p>
+
+                  <table class="mt-7 w-full border-collapse text-xs">
+                    <thead class="lb-header text-left text-[0.625rem] uppercase tracking-wide text-(--color-text-dim)">
+                      <tr>
+                        <th class="py-2 pr-3 font-semibold">Model</th>
+                        <th class="py-2 pl-3 text-right font-semibold">
+                          <span class="inline-flex items-center gap-1.5">
+                            Score
+                            <span class="score-triangle" aria-hidden="true" />
+                          </span>
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {topRows.map((row) => (
+                        <tr class="lb-row">
+                          <td class="py-2 pr-3 text-(--color-text-strong)">
+                            <span class="mr-2 inline-block h-1.5 w-1.5 rounded-full bg-(--color-text-dim) align-middle" />
+                            {row.systemName}
+                          </td>
+                          <td class="py-2 pl-3 text-right font-semibold text-(--color-accent)">
+                            {row.scoreDisplay}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+
+                  {top && (
+                    <p class="mb-0 mt-3 text-[0.6875rem] dim">
+                      Current leader:{" "}
+                      <span class="text-(--color-text-muted)">{top.systemName}</span>
+                    </p>
+                  )}
+                </div>
+
+                <a href={`/leaderboards/${page.meta.slug}/`} class="leaderboard-card-link">
+                  View Full Leaderboard page
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="12"
+                    height="12"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                    class="leaderboard-card-link-icon"
+                  >
+                    <path d="M7 7h10v10" />
+                    <path d="M7 17 17 7" />
+                  </svg>
+                </a>
+              </article>
+            );
+          })
+        }
+      </div>
+    </section>
+
+    <section id="faq" class="mt-16 scroll-mt-8">
+      <FaqList items={homeFaqs} />
+    </section>
+  </article>
+</Layout>
+
+<style>
+  .home-shell {
+    max-width: 67.5rem;
+  }
+
+  .home-hero {
+    max-width: 43rem;
+  }
+
+  .home-card-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+  }
+
+  .leaderboard-card {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    border: 1px solid var(--color-border);
+    border-radius: 3px;
+    background: var(--color-bg);
+    font-family: var(--font-mono);
+  }
+
+  .leaderboard-card > .p-4 {
+    flex: 1 1 auto;
+  }
+
+  .leaderboard-card-link {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    border-top: 1px solid var(--color-border);
+    background: color-mix(in srgb, var(--color-surface) 58%, var(--color-bg));
+    color: var(--color-text);
+    padding: 0.75rem 1rem;
+    font-size: 0.75rem;
+    text-align: center;
+    text-decoration: none;
+  }
+
+  .leaderboard-card-link:hover {
+    background: color-mix(in srgb, var(--color-surface-strong) 76%, var(--color-bg));
+    color: var(--color-text-strong);
+    text-decoration: none;
+  }
+
+  @media (min-width: 768px) {
+    .home-card-grid {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+</style>

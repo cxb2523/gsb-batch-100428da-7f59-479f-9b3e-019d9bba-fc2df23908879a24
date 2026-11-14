@@ -1,0 +1,255 @@
+---
+import Layout from "../../layouts/Layout.astro";
+import BenchmarkResultsTable from "../../components/BenchmarkResultsTable.astro";
+import CopyMarkdownButton from "../../components/CopyMarkdownButton.astro";
+import FaqList from "../../components/FaqList.astro";
+import TocObserver from "../../components/TocObserver.astro";
+import AtlasCallout from "../../components/AtlasCallout.astro";
+import LeaderboardExplorer from "../../components/LeaderboardExplorer";
+import { getBenchmarkChartRows } from "../../lib/benchmark-charts";
+import { getAtlasNote } from "../../lib/atlas";
+import {
+  benchmarkScopeLabels,
+  buildBenchmarkFaqFacts,
+  generateBenchmarkFaq,
+  getAllBenchmarkPages,
+  getBenchmarkPage,
+  renderBenchmarkDescription,
+  renderBenchmarkTitle,
+} from "../../lib/benchmark-hub";
+
+export function getStaticPaths() {
+  return getAllBenchmarkPages().map((page) => ({
+    params: { slug: page.meta.slug },
+  }));
+}
+
+const slug = Astro.params.slug ?? "";
+const page = getBenchmarkPage(slug);
+
+if (!page) {
+  return Astro.redirect("/");
+}
+
+const faqItems = generateBenchmarkFaq(page.meta, buildBenchmarkFaqFacts(page));
+const atlasNote = getAtlasNote(page.meta.slug);
+const pageUrl = `https://leaderboard.steel.dev/leaderboards/${page.meta.slug}/`;
+const pageTitle = page.meta.seoTitle ?? renderBenchmarkTitle(page.meta);
+const pageDescription = page.meta.seoDescription ?? renderBenchmarkDescription(page.meta);
+const chartRows = getBenchmarkChartRows(page.meta.slug, page.results);
+
+const faqSchema = JSON.stringify({
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  mainEntity: faqItems.map((item) => ({
+    "@type": "Question",
+    name: item.q,
+    acceptedAnswer: {
+      "@type": "Answer",
+      text: item.a.replace(/<[^>]+>/g, ""),
+    },
+  })),
+});
+
+const itemListSchema = JSON.stringify({
+  "@context": "https://schema.org",
+  "@type": "ItemList",
+  name: `${page.meta.name} leaderboard`,
+  description: pageDescription,
+  url: pageUrl,
+  numberOfItems: page.results.length,
+  itemListElement: page.results.map((result) => ({
+    "@type": "ListItem",
+    position: result.rank,
+    item: {
+      "@type": "Thing",
+      name: result.systemName,
+      url: result.sourceUrl,
+    },
+  })),
+});
+
+const breadcrumbSchema = JSON.stringify({
+  "@context": "https://schema.org",
+  "@type": "BreadcrumbList",
+  itemListElement: [
+    {
+      "@type": "ListItem",
+      position: 1,
+      name: "Benchmark Hub",
+      item: "https://leaderboard.steel.dev/",
+    },
+    {
+      "@type": "ListItem",
+      position: 2,
+      name: "Leaderboards Hub",
+      item: "https://leaderboard.steel.dev/",
+    },
+    {
+      "@type": "ListItem",
+      position: 3,
+      name: page.meta.name,
+      item: pageUrl,
+    },
+  ],
+});
+---
+
+<Layout
+  ogImage={`/og/${page.meta.slug}.png`}
+  title={pageTitle}
+  description={pageDescription}
+  structuredData={[faqSchema, itemListSchema, breadcrumbSchema]}
+  markdownUrl={`/leaderboards/${page.meta.slug}.md`}
+>
+  <div class="benchmark-detail-layout">
+    <aside class="toc-rail benchmark-sidebar" aria-label="On this page">
+      <h1
+        class="m-0 text-[2rem] font-medium leading-9 tracking-[-0.045em] text-[var(--color-text-strong)]"
+      >
+        {page.meta.name} Leaderboard
+      </h1>
+      <p class="mb-0 mt-4 text-sm leading-6 muted">
+        {page.meta.description}
+      </p>
+      <p class="mb-0 mt-3 text-xs">
+        <span class="dim">Last updated:</span>
+        {page.meta.lastUpdated}
+      </p>
+      <div class="mt-4 flex flex-wrap gap-2">
+        <span class="badge">{page.meta.scope} scope</span>
+      </div>
+
+      <ol class="toc-list">
+        <li><a href="#leaderboard" aria-current="true">Leaderboard</a></li>
+        <li><a href="#about">About this benchmark</a></li>
+        <li><a href="#example-tasks">Example tasks</a></li>
+        <li><a href="#methodology">Methodology</a></li>
+        <li><a href="#links">Links</a></li>
+        <li><a href="#faq">FAQ</a></li>
+      </ol>
+      <div class="mt-5">
+        <CopyMarkdownButton rows={page.results} heading={`${page.meta.name} Leaderboard`} />
+      </div>
+    </aside>
+
+    <article class="article-shell benchmark-content-panel">
+      <section id="leaderboard" class="scroll-mt-8">
+        {
+          chartRows ? (
+            <LeaderboardExplorer
+              rows={chartRows}
+              benchmark={page.meta.name}
+              scope={benchmarkScopeLabels[page.meta.scope]}
+              compact
+              client:load
+            />
+          ) : (
+            <BenchmarkResultsTable
+              rows={page.results}
+              scope={page.meta.scope}
+              heading="Leaderboard"
+              slug={page.meta.slug}
+            />
+          )
+        }
+      </section>
+
+      {atlasNote && <AtlasCallout note={atlasNote} class="mt-6" />}
+
+      <section id="about" class="mt-6 scroll-mt-8 text-sm leading-6 muted">
+        <h2 class="m-0 text-xl font-medium tracking-[-0.03em] text-[var(--color-text-strong)]">
+          About this benchmark
+        </h2>
+        <div class="mt-4">
+          {page.meta.about.map((paragraph) => <p class="mb-4 last:mb-0">{paragraph}</p>)}
+        </div>
+
+        {
+          page.meta.importantNotes.length > 0 && (
+            <div class="dashed-frame mt-5 p-4">
+              {page.meta.importantNotes.map((note) => (
+                <p class="mb-3 text-sm muted last:mb-0">{note}</p>
+              ))}
+            </div>
+          )
+        }
+      </section>
+
+      <section id="example-tasks" class="mt-8 scroll-mt-8">
+        <h2 class="m-0 text-xl font-medium tracking-[-0.03em] text-[var(--color-text-strong)]">
+          Example tasks
+        </h2>
+        <p class="mb-0 mt-3 text-sm leading-6 muted">
+          Three public tasks quoted from benchmark sources:
+        </p>
+        <ul class="m-0 mt-4 list-disc space-y-2 pl-5">
+          {
+            page.meta.taskExamples.map((item) => (
+              <li class="text-sm leading-6 muted">
+                <span class="text-[var(--color-text-strong)]">&quot;{item.quote}&quot;</span>{" "}
+                <a href={item.sourceUrl} target="_blank" rel="noopener">
+                  Citation: {item.sourceLabel}
+                </a>
+              </li>
+            ))
+          }
+        </ul>
+      </section>
+
+      <section id="methodology" class="mt-8 scroll-mt-8">
+        <h2 class="m-0 text-xl font-medium tracking-[-0.03em] text-[var(--color-text-strong)]">
+          Methodology
+        </h2>
+        <ul class="m-0 mt-4 list-disc space-y-2 pl-5">
+          {page.meta.methodology.map((item) => <li class="text-sm leading-6 muted">{item}</li>)}
+        </ul>
+      </section>
+
+      <section id="links" class="mt-8 scroll-mt-8">
+        <h2 class="m-0 text-xl font-medium tracking-[-0.03em] text-[var(--color-text-strong)]">
+          Links
+        </h2>
+        <ul class="m-0 mt-4 list-disc space-y-2 pl-5">
+          {
+            page.meta.links.map((link) => (
+              <li class="text-sm">
+                <a href={link.url} target="_blank" rel="noopener">
+                  {link.label}
+                </a>
+              </li>
+            ))
+          }
+        </ul>
+      </section>
+
+      {
+        page.meta.relatedBenchmarks.length > 0 && (
+          <section class="section-frame mt-8 w-full p-4">
+            <h2 class="m-0 text-base font-semibold text-[var(--color-text-strong)]">
+              Related benchmarks
+            </h2>
+            <p class="mb-0 mt-2 text-sm muted">
+              Compare this benchmark with related pages from the hub:
+            </p>
+            <div class="mt-3 flex flex-wrap gap-2">
+              {page.meta.relatedBenchmarks.map((relatedSlug) => (
+                <a class="badge no-underline" href={`/leaderboards/${relatedSlug}/`}>
+                  {relatedSlug}
+                </a>
+              ))}
+            </div>
+            <p class="mb-0 mt-3 text-sm">
+              <a href="/">Back to benchmark hub</a>
+            </p>
+          </section>
+        )
+      }
+
+      <section id="faq" class="mt-8 scroll-mt-8">
+        <FaqList items={faqItems} />
+      </section>
+    </article>
+  </div>
+  <TocObserver />
+</Layout>

@@ -1,0 +1,35 @@
+# build output
+dist/
+
+# generated types
+.astro/
+
+# dependencies
+node_modules/
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# environment variables
+.env
+.env.production
+
+# macOS-specific files
+.DS_Store
+
+# local plans and working files
+/tmp/
+
+# jetbrains setting folder
+.idea/
+
+# local data extraction scripts (top-level only, not src/scripts)
+/scripts/
+.vercel
+
+# discovery pipeline: raw run transcripts are large (51 MB, grows
+# each sweep) and regenerable; everything else is versioned
+.discovery/atlas-runs/

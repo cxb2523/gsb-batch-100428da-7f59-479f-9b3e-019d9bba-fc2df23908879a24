@@ -1,0 +1,151 @@
+{
+  "tauBench": [
+    {
+      "rank": 1,
+      "systemName": "Step-3.5-Flash",
+      "organization": "StepFun",
+      "scoreDisplay": "88.2%",
+      "scoreValue": 88.2,
+      "sourceUrl": "https://arxiv.org/abs/2602.10604",
+      "notesShort": "Direct technical report; Step-3.5 architecture optimized for high-consistency tool use.",
+      "reportedAt": "2026-01-29"
+    },
+    {
+      "rank": 2,
+      "systemName": "GLM-4.7",
+      "organization": "Z.ai",
+      "scoreDisplay": "87.4%",
+      "scoreValue": 87.4,
+      "sourceUrl": "https://docs.z.ai/guides/llm/glm-4.7",
+      "notesShort": "Official Z.ai Developer docs; Introduces enhanced agentic policy compliance for enterprise retail/airline workflows.",
+      "reportedAt": "2025-12-22"
+    },
+    {
+      "rank": 3,
+      "systemName": "MiMo-V2-Flash",
+      "organization": "Xiaomi",
+      "scoreDisplay": "80.3%",
+      "scoreValue": 80.3,
+      "sourceUrl": "https://arxiv.org/abs/2601.02780",
+      "notesShort": "Technical Report; MoE model with 309B total/15B active params and hybrid attention for long-horizon agent tasks.",
+      "reportedAt": "2026-01-06"
+    },
+    {
+      "rank": 4,
+      "systemName": "GLM-4.7-Flash",
+      "organization": "Z.ai",
+      "scoreDisplay": "79.5%",
+      "scoreValue": 79.5,
+      "sourceUrl": "https://inference-docs.cerebras.ai/resources/glm-47-migration",
+      "notesShort": "Verified via Cerebras & Z.ai; SOTA performance for a lightweight flash-tier model in tool-use consistency.",
+      "reportedAt": "2025-12-22"
+    },
+    {
+      "rank": 5,
+      "systemName": "Claude Fable 5.1 (OpenRouter run)",
+      "organization": "Anthropic",
+      "scoreDisplay": "79.3%",
+      "scoreValue": 79.3,
+      "sourceUrl": "https://openrouter.ai/anthropic/claude-fable-5.1",
+      "notesShort": "OpenRouter provider eval on the airline split (tau_bench_verified_airline, run_count 1, 32-day lookback, AutoExacto mode) for the Anthropic first-party endpoint; the UI label hides the split. Azure scored 74.7 and Google Vertex 76.7 on the same split.",
+      "reportedAt": "2026-09",
+      "isNew": true
+    },
+    {
+      "rank": 6,
+      "systemName": "Claude Opus 5 (OpenRouter run)",
+      "organization": "Anthropic",
+      "scoreDisplay": "78.0%",
+      "scoreValue": 78.0,
+      "sourceUrl": "https://openrouter.ai/anthropic/claude-opus-5",
+      "notesShort": "OpenRouter provider eval on the Anthropic-direct route; provider spread 77.4-80.5 across ten routes (auto-routing 80.5, AWS 79.8, Bedrock 79.2, Azure 79.0). Split and metric not stated on the page.",
+      "reportedAt": "2026-09",
+      "isNew": true
+    },
+    {
+      "rank": 7,
+      "systemName": "MiniMax M2",
+      "organization": "MiniMax",
+      "scoreDisplay": "77.2%",
+      "scoreValue": 77.2,
+      "sourceUrl": "https://github.com/MiniMax-AI/MiniMax-M2",
+      "notesShort": "Official repository; M2 specifically models 'thinking' content to handle complex multi-turn toolchains.",
+      "reportedAt": "2025-10-27",
+      "isNew": false
+    },
+    {
+      "rank": 8,
+      "systemName": "Claude Opus 4.5",
+      "organization": "Anthropic",
+      "scoreDisplay": "70.2%",
+      "scoreValue": 70.2,
+      "sourceUrl": "https://taubench.com",
+      "notesShort": "Sierra Research Evaluation; Measured using the 'High' user simulator and GPT-5.2 judge protocol.",
+      "reportedAt": "2025-11-24"
+    },
+    {
+      "rank": 9,
+      "systemName": "GPT-5.2",
+      "organization": "OpenAI",
+      "scoreDisplay": "69.9%",
+      "scoreValue": 69.9,
+      "sourceUrl": "https://taubench.com",
+      "notesShort": "Sierra Research Evaluation; Results based on the standardized Sierra simulation harness.",
+      "reportedAt": "2025-12-11",
+      "isNew": false
+    },
+    {
+      "rank": 10,
+      "systemName": "Qwen3.5-397B-A17B",
+      "organization": "Alibaba",
+      "scoreDisplay": "68.4%",
+      "scoreValue": 68.4,
+      "sourceUrl": "https://qwen.ai/blog?id=qwen3.5",
+      "notesShort": "Official Qwen Blog; Native multimodal agent capabilities with sparse MoE architecture (17B active params).",
+      "reportedAt": "2026-02-16",
+      "isNew": false
+    },
+    {
+      "rank": 11,
+      "systemName": "Gemini 3 Flash",
+      "organization": "Google DeepMind",
+      "scoreDisplay": "67.8%",
+      "scoreValue": 67.8,
+      "sourceUrl": "https://storage.googleapis.com/deepmind-media/gemini/gemini_3_pro_model_evaluation.pdf",
+      "notesShort": "DeepMind Technical Report; Evaluation includes performance across retail, airline, and telecom domains.",
+      "reportedAt": "2025-12-17",
+      "isNew": false
+    },
+    {
+      "rank": 12,
+      "systemName": "Gemini 3 Pro",
+      "organization": "Google DeepMind",
+      "scoreDisplay": "65.8%",
+      "scoreValue": 65.8,
+      "sourceUrl": "https://storage.googleapis.com/deepmind-media/gemini/gemini_3_pro_model_evaluation.pdf",
+      "notesShort": "DeepMind Technical Report; Frontier reasoning performance for enterprise customer service simulations.",
+      "reportedAt": "2025-11-18",
+      "isNew": false
+    },
+    {
+      "rank": 13,
+      "systemName": "GLM-5",
+      "organization": "Zhipu AI",
+      "scoreDisplay": "63.2%",
+      "scoreValue": 63.2,
+      "sourceUrl": "https://taubench.com/",
+      "notesShort": "τ-bench overall pass^1 (gpt-5.2 user sim, reasoning enabled); reported on taubench.com.",
+      "reportedAt": "2026-02-11"
+    },
+    {
+      "rank": 14,
+      "systemName": "Claude Sonnet 4.5",
+      "organization": "Anthropic",
+      "scoreDisplay": "62.9%",
+      "scoreValue": 62.9,
+      "sourceUrl": "https://taubench.com/",
+      "notesShort": "τ-bench overall pass^1 (gpt-5.2 user sim, reasoning enabled); reported on taubench.com.",
+      "reportedAt": "2025-09-29"
+    }
+  ]
+}

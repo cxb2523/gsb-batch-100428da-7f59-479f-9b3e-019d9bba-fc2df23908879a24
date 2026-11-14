@@ -1,0 +1,10 @@
+{
+  "extends": "astro/tsconfigs/strict",
+  "include": [".astro/types.d.ts", "**/*"],
+  "exclude": ["dist", "tmp"],
+  "compilerOptions": {
+    "target": "es2022",
+    "jsx": "react-jsx",
+    "jsxImportSource": "react"
+  }
+}
