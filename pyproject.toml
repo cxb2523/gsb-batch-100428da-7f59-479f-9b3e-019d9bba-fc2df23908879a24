@@ -1,0 +1,123 @@
+[build-system]
+# Hatchling instead of setuptools — eliminates the egg-info legacy that
+# put version-embedded paths (build/bdist.<platform>/wheel/<pkg>-<ver>-
+# pyX.Y.egg-info) in the source tree, which broke fresh `pip install`
+# on macOS once any prior `pip install -e .` or `python -m build` had
+# polluted the working copy (FileNotFoundError on the stale path the
+# new build no longer matches). Hatchling builds to an isolated temp
+# tree, sdists default to `git ls-files` so .gitignore is automatically
+# respected, and editable installs don't drop an egg-info on disk.
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "clawtouch-mcp"
+version = "0.6.0"
+description = "MCP stdio server exposing HID mouse/keyboard tools backed by ClawTouch Pico hardware."
+readme = "README.md"
+# PEP 639 SPDX expression form (modern packaging). Avoid the deprecated
+# `license = { text = "MIT" }` table form and the legacy
+# `License :: OSI Approved :: MIT License` classifier.
+license = "MIT"
+license-files = ["LICENSE", "LICENSE.zh-CN.md", "NOTICE", "TRADEMARKS.md"]
+authors = [
+    { name = "Tinqiao Technology", email = "support@tinqiao.com" },
+]
+requires-python = ">=3.10"
+dependencies = [
+    "pyserial>=3.5",
+]
+# 关键字保留 openclaw / hermes — 目标用户搜这些 LLM agent 名也能找到
+keywords = ["mcp", "hid", "clawtouch", "openclaw", "hermes", "claude", "agent", "tool-use"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Hardware",
+]
+
+[project.optional-dependencies]
+# Screenshot capture uses mss (pure-Python; loads under macOS hardened-runtime
+# library validation). Pillow adds JPEG encoding + higher-quality Retina
+# downscaling, but its native _imaging extension is rejected by some hardened-
+# runtime hosts (different Team ID) — there the server auto-falls back to the
+# 'mss-png' backend (pure-Python PNG, integer-decimated to logical resolution).
+#   screenshot-min : mss only — works everywhere, PNG output.
+#   screenshot     : mss + Pillow — JPEG + LANCZOS resize when _imaging loads.
+screenshot-min = ["mss>=10.2"]
+screenshot = ["mss>=10.2", "Pillow>=10.0"]
+# `screen.windows` needs nothing extra on Windows (ctypes/user32 is stdlib).
+# macOS reads the window list through Quartz, which is pyobjc — an optional
+# install rather than a base dependency, because the tool is opt-in behind
+# --allow-screenshot and every other platform gets a clear "unsupported"
+# answer instead of an ImportError.
+window = ["pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'"]
+# Test deps. pytest-asyncio is REQUIRED — the suite has async tests that
+# silently skip (false-green) without it. CI and CONTRIBUTING use this extra.
+test = ["pytest>=7", "pytest-asyncio>=0.23"]
+
+[project.urls]
+Homepage = "https://clawtouch.cn"
+Source = "https://github.com/tinqiao-oss/clawtouch-mcp"
+Issues = "https://github.com/tinqiao-oss/clawtouch-mcp/issues"
+Changelog = "https://github.com/tinqiao-oss/clawtouch-mcp/blob/master/CHANGELOG.md"
+Documentation = "https://github.com/tinqiao-oss/clawtouch-mcp/tree/master/docs"
+
+[project.scripts]
+clawtouch-mcp = "clawtouch_mcp.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["clawtouch_mcp"]
+
+[tool.hatch.build.targets.sdist]
+# Defaults to `git ls-files`; we set this explicitly so the sdist
+# contract is auditable from pyproject alone and survives a
+# tarball-from-zip workflow where .git isn't present. build/, dist/,
+# .pytest_cache/, *.egg-info/ are not in the list; __pycache__/ inside an
+# included dir (e.g. examples/) is dropped by hatchling's default excludes
+# (VCS-ignored paths + bytecode caches), not by the include list alone, so
+# stale artefacts can't poison the release.
+include = [
+    "clawtouch_mcp/",
+    "tests/",
+    "docs/",
+    "examples/",
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "LICENSE",
+    "LICENSE.zh-CN.md",
+    "NOTICE",
+    "TRADEMARKS.md",
+    "pyproject.toml",
+]
+
+[tool.ruff.lint]
+# Stated explicitly rather than inherited from ruff's default set, because
+# that default changes between ruff releases: 0.16 switched on rule
+# families (UP, BLE, S, I, SIM, RUF, TRY) that flagged 101 pre-existing
+# lines and turned a green release red with no change on our side. CI
+# installs ruff unpinned on purpose so it keeps getting fixes; what it
+# checks should be this project's choice, not whatever the current default
+# happens to be.
+#
+# Some of those families would also be wrong here. The broad
+# `except Exception` around each individual probe is deliberate — one
+# unreadable sample must not lose a whole measurement, and one
+# unanswerable window must not abort the enumeration — which is exactly
+# what BLE001 / S110 / S112 exist to discourage.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.pytest.ini_options]
+# Async tests use pytest-asyncio. "auto" runs every `async def test_` (the
+# suite also marks them explicitly). Install via the test extra —
+# `pip install -e ".[test]"`; a missing pytest-asyncio is caught loudly in
+# tests/conftest.py instead of silently skipping the async tests.
+asyncio_mode = "auto"
+# importlib import mode so the combined monorepo run
+# (`pytest oss/clawtouch-mcp/tests oss/clawtouch-hid/tests`) doesn't hit an
+# "import file mismatch" on the identically-named tests/__init__.py. It does
+# NOT make same-named test modules safe: with a tests/test_protocol.py in both
+# packages the combined run collected this package's twice and clawtouch-hid's
+# never (fixed 2026-11-14 by renaming theirs). Keep test file names distinct.
+addopts = "--import-mode=importlib"
