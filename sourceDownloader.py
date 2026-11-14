@@ -10,6 +10,7 @@ Respects server trust boundaries.
 
 import os
 import sys
+import socket
 import argparse
 import hashlib
 import threading
@@ -22,9 +23,121 @@ from urllib.error import HTTPError, URLError
 from bs4 import BeautifulSoup, FeatureNotFound
 
 
+# Windows consoles may use a legacy code page (e.g. GBK/cp1252) that cannot
+# encode the status glyphs. Reconfigure stdout to UTF-8 with replacement so
+# a console encoding issue never aborts a crawl.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+
 USER_AGENT = "Mozilla/5.0 (Educational Website Crawler)"
 TIMEOUT = 10
 visited_lock = threading.Lock()
+
+FAILURE_REPORT_NAME = "failures.txt"
+
+
+# -----------------------------
+# Failure tracking
+# -----------------------------
+
+def _safe_str(value) -> str:
+    """Stringify an exception detail without crashing on legacy code pages."""
+    try:
+        return str(value)
+    except Exception:
+        try:
+            return repr(value)
+        except Exception:
+            return value.__class__.__name__
+
+
+def classify_error(exc: Exception) -> tuple[str, str]:
+    """Map a download exception to a stable (category, detail) pair."""
+    if isinstance(exc, HTTPError):
+        return "http-error", f"HTTP {exc.code}"
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return "timeout", _safe_str(exc) or "request timed out"
+    if isinstance(exc, URLError):
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, (socket.timeout, TimeoutError)):
+            return "timeout", _safe_str(reason) or "request timed out"
+        return "connection-error", _safe_str(reason)
+    if isinstance(exc, (ConnectionError, OSError)):
+        return "connection-error", _safe_str(exc) or exc.__class__.__name__
+    return "download-error", _safe_str(exc) or exc.__class__.__name__
+
+
+class FailureTracker:
+    """Thread-safe record of every failed asset and failed page.
+
+    Every failure is bound to the page that owned the request, so
+    concurrent workers can never attribute an object to the wrong page.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        # page_url -> list of (asset_url, category, detail)
+        self.asset_failures: dict[str, list[tuple[str, str, str]]] = {}
+        # page_url -> list of (category, detail)
+        self.page_failures: dict[str, list[tuple[str, str]]] = {}
+
+    def record_asset_failure(self, page_url: str, asset_url: str, exc: Exception) -> tuple[str, str]:
+        category, detail = classify_error(exc)
+        with self._lock:
+            self.asset_failures.setdefault(page_url, []).append(
+                (asset_url, category, detail)
+            )
+        return category, detail
+
+    def record_page_failure(self, page_url: str, exc: Exception) -> tuple[str, str]:
+        category, detail = classify_error(exc)
+        with self._lock:
+            self.page_failures.setdefault(page_url, []).append((category, detail))
+        return category, detail
+
+    def has_failures(self) -> bool:
+        with self._lock:
+            return bool(self.asset_failures or self.page_failures)
+
+    def render_report(self) -> list[str]:
+        """Build the failure manifest lines (identical for file and terminal)."""
+        with self._lock:
+            asset_snapshot = {
+                page: sorted(entries) for page, entries in self.asset_failures.items()
+            }
+            page_snapshot = {
+                page: sorted(entries) for page, entries in self.page_failures.items()
+            }
+
+        total_assets = sum(len(entries) for entries in asset_snapshot.values())
+        total_pages = sum(len(entries) for entries in page_snapshot.values())
+
+        lines = [
+            "Failure report",
+            f"Total failed resources: {total_assets}",
+            f"Total failed pages: {total_pages}",
+        ]
+
+        for page_url in sorted(set(asset_snapshot) | set(page_snapshot)):
+            lines.append("")
+            lines.append(f"Page: {page_url}")
+
+            assets = asset_snapshot.get(page_url, [])
+            pages = page_snapshot.get(page_url, [])
+            lines.append(
+                f"  Failed resources: {len(assets)} | Failed page entries: {len(pages)}"
+            )
+
+            for asset_url, category, detail in assets:
+                lines.append(f"  [resource] {asset_url} -> {category} ({detail})")
+            for category, detail in pages:
+                lines.append(f"  [page] {category} ({detail})")
+
+        return lines
 
 
 # -----------------------------
@@ -95,7 +208,18 @@ def sanitize_path(url: str, base_dir: str, content_type: str | None = None) -> s
     return os.path.join(base_dir, path)
 
 
-def save_file(url: str, base_dir: str) -> str | None:
+def save_file(
+    url: str,
+    base_dir: str,
+    page_url: str | None = None,
+    failures: FailureTracker | None = None,
+) -> str | None:
+    """Download and save one asset.
+
+    On any HTTP error, timeout or connection failure the failure is
+    recorded against ``page_url`` and ``None`` is returned, so the rest
+    of the page's resources keep being processed.
+    """
     try:
         response = safe_request(url)
         content_type = response.headers.get("Content-Type", "")
@@ -108,8 +232,16 @@ def save_file(url: str, base_dir: str) -> str | None:
 
         return local_path
 
-    except (HTTPError, URLError):
-        return None
+    except Exception as exc:
+        # Network-level failures only: the file-write above happens after
+        # this point and is left to propagate like the original behavior.
+        if isinstance(exc, (HTTPError, URLError, OSError)):
+            if failures is not None and page_url is not None:
+                failures.record_asset_failure(page_url, url, exc)
+            return None
+        raise
+
+
 # -----------------------------
 # HTML processing
 # -----------------------------
@@ -248,8 +380,8 @@ def rewrite_links(
 # -----------------------------
 
 def crawl_page(args):
-    url, depth, base_url, project_dir, min_depth, max_depth, no_download = args
-    
+    url, depth, base_url, project_dir, min_depth, max_depth, no_download, failures = args
+
     with visited_lock:
         if url in visited or depth > max_depth:
             return []
@@ -290,7 +422,9 @@ def crawl_page(args):
                 assets = extract_assets(soup, url)
                 asset_map = {}
                 for asset in assets:
-                    local_path = save_file(asset, project_dir)
+                    # A failed download is recorded inside save_file and
+                    # never interrupts the remaining assets of this page.
+                    local_path = save_file(asset, project_dir, url, failures)
                     if local_path:
                         asset_map[asset] = local_path
 
@@ -308,6 +442,9 @@ def crawl_page(args):
         return new_links
 
     except Exception as e:
+        # The page itself could not be fetched/parsed: record it and do
+        # NOT write any local file for this page.
+        failures.record_page_failure(url, e)
         print(f"[!] Error at {url}: {e}")
         return []
 
@@ -315,10 +452,36 @@ def crawl_page(args):
 def crawl_website(base_url: str, min_depth: int, max_depth: int, export_urls: bool = False, no_download: bool = False, threads: int = 1):
     global visited
     visited = set()
-    
+
     parsed = urlparse(base_url)
-    project_dir = parsed.netloc.replace(".", "_")
+    # Replace characters that are illegal in directory names (e.g. the
+    # colon of a port such as 127.0.0.1:8000). Ordinary hostnames keep
+    # their original dot-to-underscore layout.
+    safe_netloc = parsed.netloc.replace(".", "_")
+    for illegal_char in ':?*<>|"':
+        safe_netloc = safe_netloc.replace(illegal_char, "_")
+    project_dir = safe_netloc
     os.makedirs(project_dir, exist_ok=True)
+
+    # Shared, thread-safe failure ledger. Every entry is bound to the
+    # page that owned the request, so concurrent workers cannot mix up
+    # ownership or double-count.
+    failures = FailureTracker()
+
+    # URLs already sitting in the queue, so two concurrent pages linking
+    # to the same target cannot enqueue it twice (which would process and
+    # count that page twice). `visited` still tracks actually-processed
+    # pages and keeps its original export/guard semantics.
+    queued = {base_url}
+
+    def enqueue(link: str, link_depth: int) -> None:
+        if link_depth > max_depth:
+            return
+        with visited_lock:
+            if link in visited or link in queued:
+                return
+            queued.add(link)
+        queue.append((link, link_depth))
 
     queue = deque([(base_url, 0)])
 
@@ -331,19 +494,22 @@ def crawl_website(base_url: str, min_depth: int, max_depth: int, export_urls: bo
         else:
             batch.append(queue.popleft())
 
+        page_args = [
+            (url, depth, base_url, project_dir, min_depth, max_depth, no_download, failures)
+            for url, depth in batch
+        ]
+
         if threads > 1 and len(batch) > 1:
             with ThreadPoolExecutor(max_workers=len(batch)) as executor:
-                futures = [executor.submit(crawl_page, (url, depth, base_url, project_dir, min_depth, max_depth, no_download)) for url, depth in batch]
+                futures = [executor.submit(crawl_page, args) for args in page_args]
                 for future in as_completed(futures):
                     for link, depth in future.result():
-                        if link not in visited and depth <= max_depth:
-                            queue.append((link, depth))
+                        enqueue(link, depth)
         else:
-            for url, depth in batch:
-                results = crawl_page((url, depth, base_url, project_dir, min_depth, max_depth, no_download))
+            for args in page_args:
+                results = crawl_page(args)
                 for link, d in results:
-                    if link not in visited and d <= max_depth:
-                        queue.append((link, d))
+                    enqueue(link, d)
 
     if export_urls:
         urls_file = os.path.join(project_dir, "urls.txt")
@@ -351,6 +517,15 @@ def crawl_website(base_url: str, min_depth: int, max_depth: int, export_urls: bo
             for url in sorted(visited):
                 f.write(url + "\n")
         print(f"[✓] Exported {len(visited)} URLs to {urls_file}")
+
+    if failures.has_failures():
+        report_lines = failures.render_report()
+        report_path = os.path.join(project_dir, FAILURE_REPORT_NAME)
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(report_lines) + "\n")
+        # The terminal output is the exact same content as the manifest.
+        print("\n".join(report_lines))
+        print(f"[✓] Failure report written to {report_path}")
 
 
 # -----------------------------
