@@ -5,6 +5,7 @@ import retryRequest from "retry-request";
 import getLink from "get-link";
 import wildcard from "wildcard-named";
 import setPrototypeOf from "setprototypeof";
+import { withAttemptCounter, createRequestError } from "./error";
 
 const defaultOptions = {
   noResponseRetries: 0,
@@ -42,12 +43,23 @@ export default {
    */
   get(uri: string, opts: Object = defaultOptions): Promise<*> {
     uri = this.normalizeUri(uri);
-    opts = { ...opts, request: this.request };
+
+    // Each `retryRequest` invocation gets a fresh tracked request so the
+    // attempt counter reflects retries of this single `get` call:
+    const trackedRequest = withAttemptCounter(this.request);
+    opts = { ...opts, request: trackedRequest };
 
     return new Promise((resolve, reject) => {
       retryRequest(uri, opts, (error, response) => {
-        if (error || response.statusCode !== 200) {
-          return reject(error || uri);
+        if (error || !response || response.statusCode !== 200) {
+          return reject(
+            createRequestError(
+              uri,
+              error,
+              response,
+              trackedRequest.attempts || 0
+            )
+          );
         }
 
         const req: Object = {};
@@ -81,6 +93,7 @@ export default {
    */
   normalizeUri(uri: string): string {
     if (!uri.startsWith(this.base)) {
+      // eslint-disable-next-line node/no-deprecated-api
       uri = url.resolve(this.base, uri);
     }
 

@@ -2,6 +2,7 @@
 
 import { BloomFilter } from "bloomfilter";
 import Queue from "queue-promise";
+import { toSpiderError } from "../routing/error";
 
 export default {
   /**
@@ -76,12 +77,15 @@ export default {
               this.callActions(url, req, res);
               this.parseAnchors(req, res);
             } catch (error) {
-              reject(error);
+              // Rejection values are always `SpiderError` instances carrying
+              // the target uri, so queue "error" listeners never receive a
+              // bare uri string:
+              return reject(toSpiderError(url, error));
             }
 
             resolve(url);
           })
-          .catch(reject);
+          .catch(error => reject(toSpiderError(url, error)));
       });
   }
 };

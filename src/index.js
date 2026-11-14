@@ -3,7 +3,6 @@
 import mixin from "merge-descriptors";
 import request from "request";
 import EventEmitter from "events";
-import setPrototypeOf from "setprototypeof";
 import SpiderQueue from "./queue/promise";
 import SpiderRouter from "./routing/router";
 import SpiderRequest from "./routing/request";
@@ -28,7 +27,12 @@ function createCrawler(base: string, options: Object = {}): Object {
   // Will be used by retry-request:
   const requestJar = request.jar();
   const requestObj = request.defaults({ jar: requestJar, ...config });
-  setPrototypeOf(requestObj, requestJar);
+
+  // Expose the cookie jar on the request wrapper without replacing its
+  // prototype: `setprototypeof` used to swap the wrapper's prototype for the
+  // jar's, which removed stream/function methods (e.g. `destroy`) and broke
+  // modern Node.js stream internals:
+  Object.assign(requestObj, requestJar);
 
   // Crawler base:
   const crawler: Object = {
