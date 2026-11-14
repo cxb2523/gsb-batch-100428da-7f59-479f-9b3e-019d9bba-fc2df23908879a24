@@ -1,0 +1,7 @@
+.crawl4ai/
+node_modules/
+.DS_Store
+*.log
+.pi/
+.secret
+context.md

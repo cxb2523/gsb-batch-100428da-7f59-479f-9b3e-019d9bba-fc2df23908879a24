@@ -1,0 +1,62 @@
+{
+  "name": "pi-crawl4ai",
+  "version": "0.3.2",
+  "description": "Crawl4AI extension for pi with token-efficient Trafilatura extraction",
+  "keywords": [
+    "pi-package",
+    "crawl4ai",
+    "trafilatura",
+    "web-crawling",
+    "data-extraction",
+    "scraping",
+    "markdown"
+  ],
+  "license": "MIT",
+  "author": {
+    "name": "Roman",
+    "url": "https://rozenberger.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/romek-rozen/pi-crawl4ai.git"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "prepublishOnly": "npm test"
+  },
+  "homepage": "https://github.com/romek-rozen/pi-crawl4ai#readme",
+  "bugs": {
+    "url": "https://github.com/romek-rozen/pi-crawl4ai/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "agents/",
+    "extensions/",
+    "prompts/",
+    "AGENTS.md",
+    "CHANGELOG.md",
+    "ROADMAP.md",
+    "TODO.md",
+    "LICENSE",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/crawl4ai"
+    ],
+    "agents": [
+      "./agents"
+    ],
+    "prompts": [
+      "./prompts"
+    ]
+  }
+}

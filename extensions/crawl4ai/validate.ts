@@ -1,0 +1,99 @@
+/**
+ * validate.ts
+ *
+ * Pure, dependency-free validation of crawl requests.
+ *
+ * Kept free of any runtime imports (only a type-only import, erased at build/run
+ * time) so it can be unit-tested in isolation without loading the pi runtime.
+ *
+ * Related: GitHub issue #1 — "JSON output fails for deep crawl (NoneType error)".
+ * Crawl4AI cannot produce JSON output during a deep crawl, so we reject that
+ * combination with a clear message *before* spawning the crawler instead of
+ * surfacing an opaque "Exited with code 1".
+ */
+
+import type { CrawlParamsType } from "./types.js";
+
+/**
+ * Validates a crawl request. Returns a human-readable error string if the
+ * request is invalid, or `null` if it is safe to run.
+ */
+export function validateCrawlRequest(params: CrawlParamsType): string | null {
+	const bm25Query = params.bm25_query?.trim();
+	if (params.bm25_threshold !== undefined && !bm25Query) {
+		return "bm25_threshold requires a non-empty bm25_query.";
+	}
+	if (params.bm25_threshold !== undefined && (!Number.isFinite(params.bm25_threshold) || params.bm25_threshold < 0)) {
+		return "bm25_threshold must be a finite number greater than or equal to 0.";
+	}
+	if (params.bm25_query !== undefined && !bm25Query) {
+		return "bm25_query must not be empty.";
+	}
+	if (bm25Query) {
+		if (params.question || params.json_extract || params.schema_path || params.extraction_config) {
+			return "bm25_query cannot be combined with question or structured JSON extraction.";
+		}
+		if (params.deep_crawl) {
+			return "bm25_query currently supports a single page only; deep_crawl is not supported.";
+		}
+		if (params.output_format && !["markdown", "markdown-fit", "md", "md-fit", "text"].includes(params.output_format)) {
+			return "bm25_query supports Markdown or Trafilatura text output only.";
+		}
+	}
+
+	if (params.extractor === "trafilatura") {
+		if (params.deep_crawl) {
+			return "extractor=trafilatura currently supports a single page only; deep_crawl is not supported.";
+		}
+		if (params.question || params.json_extract || params.schema_path || params.extraction_config) {
+			return (
+				"extractor=trafilatura cannot be combined with question or structured JSON extraction. " +
+				"Use Trafilatura for readable Markdown/text, or remove extractor for JSON/question workflows."
+			);
+		}
+		if (params.output_format && !["markdown", "md", "text"].includes(params.output_format)) {
+			return "extractor=trafilatura supports output_format=markdown, md, or text.";
+		}
+		if (params.output_format === "text" && (params.include_links || params.include_formatting)) {
+			return "include_links and include_formatting require Trafilatura Markdown output, not text.";
+		}
+	} else {
+		if (params.output_format === "text") {
+			return "output_format=text requires extractor=trafilatura.";
+		}
+		if (
+			params.include_links ||
+			params.include_formatting ||
+			params.include_images ||
+			params.include_tables !== undefined
+		) {
+			return "include_links, include_formatting, include_images, and include_tables require extractor=trafilatura.";
+		}
+	}
+
+	if (params.output_format === "json") {
+		// Deep crawl + JSON is unsupported by Crawl4AI itself (issue #1).
+		// Check this first so the user gets the most relevant reason, even when
+		// no extraction strategy was provided.
+		if (params.deep_crawl) {
+			return (
+				"output_format=json with deep_crawl is not supported by Crawl4AI. " +
+				"Use markdown output for deep crawls, or crawl a single page with JSON extraction."
+			);
+		}
+
+		const hasLlmExtraction = Boolean(params.json_extract?.trim());
+		const hasSchemaExtraction = Boolean(
+			params.schema_path?.trim() && params.extraction_config?.trim(),
+		);
+		if (!hasLlmExtraction && !hasSchemaExtraction) {
+			return (
+				"output_format=json requires an extraction strategy. " +
+				"Use json_extract (LLM) or schema_path + extraction_config (CSS/XPath). " +
+				"Example extraction_config YAML:\n" +
+				"type: json-css\nparams:\n  verbose: true"
+			);
+		}
+	}
+	return null;
+}

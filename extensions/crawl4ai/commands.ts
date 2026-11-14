@@ -1,0 +1,291 @@
+/**
+ * commands.ts
+ *
+ * Registration of slash commands available to the user:
+ *   /crawl4ai-install       – installs Crawl4AI and Trafilatura in isolated local venvs
+ *   /crawl4ai-test          – smoke-tests the Crawl4AI → Trafilatura pipeline
+ *   /crawl4ai-status        – shows the detected binary path
+ *   /crawl4ai-clear-cache   – clears local crawl4ai cache
+ *   /crawl4ai-setup-agents  – symlinks agent definitions for use with subagent/run
+ */
+
+import { join, dirname, isAbsolute, resolve } from "node:path";
+import { execFileSync, execSync } from "node:child_process";
+import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, readlinkSync, unlinkSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { findCrwl, findTrafilatura, getCrawl4AiFolder, getVenvEnv } from "./resolve.js";
+
+/**
+ * Registers all commands related to crawl4ai.
+ *
+ * @param pi        extension API
+ * @param onInstall callback invoked after successful Crawl4AI + Trafilatura installation
+ */
+export function registerCommands(pi: ExtensionAPI, onInstall: (path: string) => void) {
+	pi.registerCommand("crawl4ai-install", {
+		description: "[crawl4ai] Install/update Crawl4AI + Trafilatura (project, user, or custom scope)",
+		handler: async (args, ctx) => {
+			const requested = args.trim();
+			let installRoot = join(ctx.cwd, ".pi", "extensions", "crawl4ai");
+			let scopeLabel = "project";
+
+			if (requested === "project") {
+				installRoot = join(ctx.cwd, ".pi", "extensions", "crawl4ai");
+				scopeLabel = "project";
+			} else if (requested === "user" || requested === "global") {
+				installRoot = join(homedir(), ".pi", "extensions", "crawl4ai");
+				scopeLabel = "user";
+			} else if (requested) {
+				installRoot = isAbsolute(requested) ? requested : resolve(ctx.cwd, requested);
+				scopeLabel = "custom";
+			} else {
+				if (!ctx.hasUI) {
+					ctx.ui.notify(
+						"[crawl4ai] Choose a scope: /crawl4ai-install project, /crawl4ai-install user, or /crawl4ai-install <directory>.",
+						"warning",
+					);
+					return;
+				}
+				const choice = await ctx.ui.select("Install Crawl4AI + Trafilatura:", [
+					"Project — current repository only",
+					"User — shared by all projects",
+					"Custom — choose an installation directory",
+				]);
+				if (!choice) return;
+				if (choice.startsWith("Project")) {
+					installRoot = join(ctx.cwd, ".pi", "extensions", "crawl4ai");
+					scopeLabel = "project";
+				} else if (choice.startsWith("User")) {
+					installRoot = join(homedir(), ".pi", "extensions", "crawl4ai");
+					scopeLabel = "user";
+				} else {
+					const custom = await ctx.ui.input("Custom installation directory:", "/absolute/path/crawl4ai");
+					if (!custom?.trim()) return;
+					installRoot = isAbsolute(custom.trim()) ? custom.trim() : resolve(ctx.cwd, custom.trim());
+					scopeLabel = "custom";
+				}
+			}
+
+			const venvDir = join(installRoot, ".venv");
+			const python = process.env.PI_PYTHON || "python3";
+
+			ctx.ui.notify(`[crawl4ai] Installing in ${scopeLabel} scope: ${installRoot}`, "info");
+
+			ctx.ui.notify("[crawl4ai] Creating venv…", "info");
+			try {
+				execSync(`${python} -m venv "${venvDir}"`, { stdio: "inherit" });
+			} catch (err: any) {
+				ctx.ui.notify(`[crawl4ai] venv creation failed: ${err.message}`, "error");
+				return;
+			}
+
+			ctx.ui.notify("[crawl4ai] Installing crawl4ai (this may take a minute)…", "info");
+			try {
+				const pip = join(venvDir, "bin", "pip");
+				execFileSync(pip, ["install", "-U", "crawl4ai>=0.9.4"], { stdio: "inherit" });
+			} catch (err: any) {
+				ctx.ui.notify(`[crawl4ai] pip install failed: ${err.message}`, "error");
+				return;
+			}
+
+			// Isolate Trafilatura because current releases can require a different
+			// lxml major version than Crawl4AI.
+			const trafilaturaVenvDir = join(installRoot, ".trafilatura-venv");
+			ctx.ui.notify("[crawl4ai] Installing Trafilatura in an isolated venv…", "info");
+			try {
+				execFileSync(python, ["-m", "venv", trafilaturaVenvDir], { stdio: "inherit" });
+				const trafilaturaPip = join(trafilaturaVenvDir, "bin", "pip");
+				execFileSync(trafilaturaPip, ["install", "-U", "trafilatura>=2.2.0"], { stdio: "inherit" });
+			} catch (err: any) {
+				ctx.ui.notify(`[crawl4ai] Trafilatura install failed: ${err.message}`, "error");
+				return;
+			}
+
+			ctx.ui.notify("[crawl4ai] Running smoke tests…", "info");
+			try {
+				const crwlLocal = join(venvDir, "bin", "crwl");
+				const trafilaturaLocal = join(trafilaturaVenvDir, "bin", "trafilatura");
+				execFileSync(crwlLocal, ["--help"], { stdio: "pipe" });
+				execFileSync(trafilaturaLocal, ["--version"], { stdio: "pipe" });
+				onInstall(crwlLocal);
+				const customHint = scopeLabel === "custom"
+					? `\nFor future sessions set CRAWL4AI_VENV=${venvDir} and TRAFILATURA_VENV=${trafilaturaVenvDir}.`
+					: "";
+				ctx.ui.notify(
+					`[crawl4ai] Crawl4AI + Trafilatura installed successfully in ${scopeLabel} scope.\nLocation: ${installRoot}${customHint}`,
+					"success",
+				);
+			} catch (err: any) {
+				ctx.ui.notify(`[crawl4ai] Smoke test failed: ${err.message}`, "error");
+			}
+		},
+	});
+
+	pi.registerCommand("crawl4ai-test", {
+		description: "[crawl4ai] Smoke-test Crawl4AI + Trafilatura on example.com",
+		handler: async (_args, ctx) => {
+			const path = findCrwl(ctx.cwd);
+			if (!path) {
+				ctx.ui.notify("[crawl4ai] Binary not found. Install first via /crawl4ai-install.", "error");
+				return;
+			}
+			const trafilaturaPath = findTrafilatura(ctx.cwd, path);
+			if (!trafilaturaPath) {
+				ctx.ui.notify("[crawl4ai] Trafilatura not found. Run /crawl4ai-install.", "error");
+				return;
+			}
+			ctx.ui.notify("[crawl4ai] Testing Crawl4AI → Trafilatura on example.com…", "info");
+			try {
+				const crawlJson = execFileSync(path, [
+					"crawl", "-o", "all", "-c", "cache_mode=enabled", "https://example.com",
+				], {
+					encoding: "utf-8",
+					stdio: ["pipe", "pipe", "pipe"],
+					timeout: 30000,
+					env: getVenvEnv(path, ctx.cwd),
+				});
+				const html = JSON.parse(crawlJson).html;
+				if (typeof html !== "string" || !html.trim()) throw new Error("Crawl4AI returned no raw HTML");
+				const markdown = execFileSync(trafilaturaPath, ["--output-format", "markdown"], {
+					input: html,
+					encoding: "utf-8",
+					stdio: ["pipe", "pipe", "pipe"],
+					timeout: 30000,
+				});
+				if (!markdown.trim()) throw new Error("Trafilatura returned no content");
+				const lines = markdown.trim().split("\n").slice(0, 5).join("\n");
+				ctx.ui.notify(`[crawl4ai] Pipeline smoke test OK:\n${lines}`, "success");
+			} catch (err: any) {
+				ctx.ui.notify(`[crawl4ai] Smoke test failed: ${err.message}`, "error");
+			}
+		},
+	});
+
+	pi.registerCommand("crawl4ai-clear-cache", {
+		description: "[crawl4ai] Clear local crawl4ai cache (.crawl4ai/cache + .crawl4ai/robots)",
+		handler: async (_args, ctx) => {
+			const crawlBaseDir = getCrawl4AiFolder(ctx.cwd);
+			const targets = [join(crawlBaseDir, "cache"), join(crawlBaseDir, "robots")];
+			try {
+				for (const target of targets) {
+					rmSync(target, { recursive: true, force: true });
+				}
+				ctx.ui.notify("[crawl4ai] Local cache cleared.", "success");
+			} catch (err: any) {
+				ctx.ui.notify(`[crawl4ai] Cache clear failed: ${err.message}`, "error");
+			}
+		},
+	});
+
+	pi.registerCommand("crawl4ai-status", {
+		description: "[crawl4ai] Show installation status and binary path",
+		handler: async (_args, ctx) => {
+			ctx.ui.notify("[crawl4ai] Checking installation…", "info");
+
+			const path = findCrwl(ctx.cwd);
+			if (!path) {
+				ctx.ui.setStatus("crawl4ai", "crawl4ai: missing");
+				ctx.ui.notify(
+					"[crawl4ai] Status: NOT INSTALLED\n" +
+					"Run /crawl4ai-install or set CRAWL4AI_VENV before starting pi.",
+					"warning",
+				);
+				return;
+			}
+
+			try {
+				const help = execFileSync(path, ["--help"], {
+					encoding: "utf-8",
+					stdio: ["pipe", "pipe", "pipe"],
+					timeout: 10000,
+					env: getVenvEnv(path, ctx.cwd),
+				});
+				const summary = help.split("\n").find((line) => line.trim())?.trim() || "crwl is responding";
+				const trafilaturaPath = findTrafilatura(ctx.cwd, path);
+				let trafilaturaSummary = "missing (run /crawl4ai-install)";
+				let trafilaturaReady = false;
+				if (trafilaturaPath) {
+					try {
+						trafilaturaSummary = execFileSync(trafilaturaPath, ["--version"], {
+							encoding: "utf-8",
+							stdio: ["pipe", "pipe", "pipe"],
+							timeout: 10000,
+						}).trim();
+						trafilaturaReady = true;
+					} catch (error: any) {
+						trafilaturaSummary = `error: ${error.message}`;
+					}
+				}
+				ctx.ui.setStatus("crawl4ai", trafilaturaReady ? "crawl4ai: ready + trafilatura" : "crawl4ai: ready");
+				ctx.ui.notify(
+					`[crawl4ai] Status: READY\nBinary: ${path}\nTrafilatura: ${trafilaturaSummary}` +
+					(trafilaturaPath ? `\nTrafilatura binary: ${trafilaturaPath}` : "") +
+					`\nWorking directory: ${ctx.cwd}\nCheck: ${summary}`,
+					trafilaturaReady ? "info" : "warning",
+				);
+			} catch (err: any) {
+				ctx.ui.setStatus("crawl4ai", "crawl4ai: error");
+				ctx.ui.notify(
+					`[crawl4ai] Status: ERROR\nBinary: ${path}\nCheck failed: ${err.message}`,
+					"error",
+				);
+			}
+		},
+	});
+
+	pi.registerCommand("crawl4ai-setup-agents", {
+		description: "[crawl4ai] Symlink crawl4ai agents to ~/.pi/agent/agents/ for use with `run`",
+		handler: async (_args, ctx) => {
+			const extensionDir = dirname(fileURLToPath(import.meta.url));
+			const packageRoot = resolve(extensionDir, "..", "..");
+			const agentsSourceDir = join(packageRoot, "agents");
+
+			if (!existsSync(agentsSourceDir)) {
+				ctx.ui.notify("[crawl4ai] agents/ directory not found in package.", "error");
+				return;
+			}
+
+			const targetDir = join(getAgentDir(), "agents");
+			mkdirSync(targetDir, { recursive: true });
+
+			const agentFiles = readdirSync(agentsSourceDir).filter((f) => f.endsWith(".md"));
+			if (agentFiles.length === 0) {
+				ctx.ui.notify("[crawl4ai] No agent definitions found.", "warning");
+				return;
+			}
+
+			const results: string[] = [];
+			for (const file of agentFiles) {
+				const source = join(agentsSourceDir, file);
+				const target = join(targetDir, file);
+
+				// Remove existing symlink if it points somewhere else
+				if (existsSync(target)) {
+					try {
+						const existing = readlinkSync(target);
+						if (existing === source) {
+							results.push(`${file} (already linked)`);
+							continue;
+						}
+						unlinkSync(target);
+					} catch {
+						// Not a symlink — skip to avoid overwriting user files
+						results.push(`${file} (skipped — file exists)`);
+						continue;
+					}
+				}
+
+				symlinkSync(source, target);
+				results.push(`${file} (linked)`);
+			}
+
+			ctx.ui.notify(
+				`[crawl4ai] Agents set up in ${targetDir}:\n${results.map((r) => `  ${r}`).join("\n")}`,
+				"success",
+			);
+		},
+	});
+}
