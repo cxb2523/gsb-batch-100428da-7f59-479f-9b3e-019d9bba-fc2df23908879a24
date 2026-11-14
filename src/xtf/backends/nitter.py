@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import sys
 import urllib.parse
+from collections.abc import Callable
+from dataclasses import dataclass
 
 from .. import config, http
 from ..exceptions import BackendUnavailable, XtfError
@@ -32,6 +34,30 @@ _HEADERS = {
 
 _MAX_PAGES = 10
 
+# ── pagination outcomes (readable via ``NitterBackend.last_pagination``) ──
+STOP_LIMIT = "limit"                      # collected ``limit`` tweets
+STOP_NO_CURSOR = "no_cursor"              # upstream returned no next cursor
+STOP_UPSTREAM_ERROR = "upstream_error"    # a page failed; kept earlier tweets
+STOP_DUPLICATE_CURSOR = "duplicate_cursor"  # next cursor was already seen
+STOP_MAX_PAGES = "max_pages"              # hit the page cap
+STOP_EMPTY_PAGE = "empty_page"            # page parsed to zero tweets
+
+
+@dataclass(frozen=True)
+class PaginationOutcome:
+    """How a paginated search/list fetch ended."""
+
+    reason: str                 # one of the STOP_* constants
+    page: int                   # 1-based page where pagination stopped
+    limit: int                  # requested limit
+    count: int                  # tweets collected (already capped at ``limit``)
+    error_code: str | None = None
+
+    @property
+    def stopped_early(self) -> bool:
+        return self.reason in (STOP_UPSTREAM_ERROR, STOP_DUPLICATE_CURSOR,
+                               STOP_MAX_PAGES, STOP_EMPTY_PAGE)
+
 
 class NitterBackend(Backend):
     name = "nitter"
@@ -39,6 +65,7 @@ class NitterBackend(Backend):
     def __init__(self, instances: list[str] | None = None):
         self.instances = instances or config.nitter_instances()
         self._live: str | None = None  # cached healthy instance
+        self.last_pagination: PaginationOutcome | None = None
 
     # ── instance management ──────────────────────────────────────────────
     def _healthy_instance(self) -> str | None:
@@ -74,50 +101,95 @@ class NitterBackend(Backend):
             f"e.g. XTF_NITTER=http://127.0.0.1:8788. Tried: {errors}"
         )
 
-    # ── capabilities ─────────────────────────────────────────────────────
-    def search(self, query: str, limit: int = 20) -> list[Tweet]:
+    # ── pagination ───────────────────────────────────────────────────────
+    def _paginate(self, op: str, build_path: Callable[[str | None], str],
+                  limit: int) -> list[Tweet]:
+        """Fetch tweets page by page, recording the outcome on ``last_pagination``.
+
+        Page 1 failures propagate unchanged (the router can still fall through
+        to another backend). Later page failures keep the tweets already
+        collected and stop. A cursor already returned by an earlier page stops
+        pagination before that page is requested again.
+        """
         tweets_raw: list[dict] = []
+        requested: set[str | None] = set()  # cursors already requested
         cursor: str | None = None
         page = 1
-        while len(tweets_raw) < limit and page <= _MAX_PAGES:
+        reason = STOP_MAX_PAGES
+        error_code: str | None = None
+        self.last_pagination = None  # clear stale outcome before fetching
+        if limit <= 0:
+            self.last_pagination = PaginationOutcome(
+                reason=STOP_LIMIT, page=0, limit=limit, count=0)
+            return []
+
+        while page <= _MAX_PAGES:
+            path = build_path(cursor)
+            print(f"[nitter] {op} page {page}: {path}", file=sys.stderr)
+            try:
+                html = self._get_html(path)
+            except XtfError as e:
+                error_code = getattr(e, "code", "error")
+                if page == 1:
+                    # Nothing collected yet: record the outcome, then let the
+                    # original exception propagate so the router can fall through.
+                    self.last_pagination = PaginationOutcome(
+                        reason=STOP_UPSTREAM_ERROR, page=1, limit=limit,
+                        count=0, error_code=error_code,
+                    )
+                    raise
+                reason = STOP_UPSTREAM_ERROR
+                print(f"[nitter] {op} stopped at page {page} ({error_code}); "
+                      f"returning {len(tweets_raw)} tweets", file=sys.stderr)
+                break
+            requested.add(cursor)
+
+            page_tweets = _extract_tweets_from_events(_parse_html(html).events)
+            if not page_tweets:
+                reason = STOP_EMPTY_PAGE
+                break
+            tweets_raw.extend(page_tweets[: limit - len(tweets_raw)])
+            if len(tweets_raw) >= limit:
+                reason = STOP_LIMIT
+                break
+
+            next_cursor = _extract_next_cursor(html)
+            if not next_cursor:
+                reason = STOP_NO_CURSOR
+                break
+            if next_cursor in requested:
+                reason = STOP_DUPLICATE_CURSOR
+                print(f"[nitter] {op} stopped at page {page} (duplicate_cursor); "
+                      f"returning {len(tweets_raw)} tweets", file=sys.stderr)
+                break
+            cursor = next_cursor
+            page += 1
+
+        self.last_pagination = PaginationOutcome(
+            reason=reason, page=min(page, _MAX_PAGES), limit=limit,
+            count=len(tweets_raw), error_code=error_code,
+        )
+        return [Tweet.from_nitter_entry(tw) for tw in tweets_raw]
+
+    # ── capabilities ─────────────────────────────────────────────────────
+    def search(self, query: str, limit: int = 20) -> list[Tweet]:
+        def build_path(cursor: str | None) -> str:
             params = {"q": query, "f": "tweets"}
             if cursor:
                 params["cursor"] = cursor
-            path = "/search?" + urllib.parse.urlencode(params)
-            print(f"[nitter] search page {page}: {path}", file=sys.stderr)
-            html = self._get_html(path)
-            page_tweets = _extract_tweets_from_events(_parse_html(html).events)
-            if not page_tweets:
-                break
-            for tw in page_tweets:
-                if len(tweets_raw) >= limit:
-                    break
-                tweets_raw.append(tw)
-            cursor = _extract_next_cursor(html)
-            if not cursor:
-                break
-            page += 1
-        return [Tweet.from_nitter_entry(tw) for tw in tweets_raw]
+            return "/search?" + urllib.parse.urlencode(params)
+
+        return self._paginate("search", build_path, limit)
 
     def fetch_list(self, list_id: str, limit: int = 20) -> list[Tweet]:
         """List timeline over plain HTTP (/i/lists/ID), paginated by cursor."""
-        tweets_raw: list[dict] = []
-        cursor: str | None = None
-        page = 1
-        while len(tweets_raw) < limit and page <= _MAX_PAGES:
+        def build_path(cursor: str | None) -> str:
             path = f"/i/lists/{list_id}"
             if cursor:
                 path += "?" + urllib.parse.urlencode({"cursor": cursor})
-            html = self._get_html(path)
-            page_tweets = _extract_tweets_from_events(_parse_html(html).events)
-            if not page_tweets:
-                break
-            tweets_raw.extend(page_tweets[: limit - len(tweets_raw)])
-            cursor = _extract_next_cursor(html)
-            if not cursor:
-                break
-            page += 1
-        return [Tweet.from_nitter_entry(tw) for tw in tweets_raw]
+            return path
+
+        return self._paginate("list", build_path, limit)
 
     def fetch_timeline(self, username: str, limit: int = 20) -> list[Tweet]:
         # Direct /{username} route 404s on session-auth Nitter; search works.

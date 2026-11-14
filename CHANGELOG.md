@@ -9,6 +9,9 @@
 
 ### 修复
 
+- Nitter 翻页（search / timeline / list 共用 `_paginate`）：第一页失败仍抛错；第二页及以后失败保留已抓推文并返回，stderr 打印含页号与错误码的停止原因
+- Nitter 翻页游标去重：某页返回的游标与已请求过的游标相同即停止，不再重复请求、不重复计入推文
+- Nitter 新增 `last_pagination`（`PaginationOutcome`），区分取满 limit / 无更多游标 / 上游失败提前停止等结局
 - `--text-only` 的 search / user-info 输出改走 i18n，`--lang en` 时输出英文（默认中文输出不变）
 - `User-Agent` 跟随当前版本号（`x-tweet-fetcher/3.1.0`）
 
