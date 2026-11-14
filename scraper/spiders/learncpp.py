@@ -1,6 +1,7 @@
 import dataclasses
 import os
 import pathlib
+import threading
 import typing
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -16,9 +17,24 @@ class URL:
     url: str
 
 
+@dataclasses.dataclass
+class ConversionResult:
+    """Outcome of a single HTML -> PDF conversion attempt."""
+
+    filename: str
+    success: bool
+    error: typing.Optional[str] = None
+
+
 class LearncppSpider(scrapy.Spider):
     name = "learncpp"
     allowed_domains = ["learncpp.com"]
+
+    # wkhtmltopdf occasionally emits this teardown message even though the PDF
+    # was produced; the original implementation deliberately ignores it.
+    BENIGN_WKHTMLTOPDF_ERROR = (
+        "QNetworkReplyImplPrivate::error: Internal problem, this method must only be called once."
+    )
 
     # Define ThreadPoolExecutor
     def __init__(self, *args, **kwargs):
@@ -26,6 +42,14 @@ class LearncppSpider(scrapy.Spider):
         self.executor = ThreadPoolExecutor(
             max_workers=192
         )  # Limit to 192 concurrent PDF conversions
+
+        # Bookkeeping for PDF conversion outcomes. Worker threads and the
+        # reactor thread touch these structures, so guard them with a lock.
+        self._conversion_lock = threading.Lock()
+        self._executor_closed = False
+        self._conversion_total = 0
+        self._conversion_succeeded = 0
+        self._conversion_failures: typing.List[ConversionResult] = []
 
     def create_working_directory(self) -> None:
         # Create a directory named "learncpp" if it doesn't exist
@@ -70,9 +94,9 @@ class LearncppSpider(scrapy.Spider):
         self.clean(filename)
         self.log(f"Cleaned HTML for {filename}")
 
-        # Run convert_to_pdf function in a ThreadPool
-        self.executor.submit(self.convert_to_pdf, filename)
-        self.log(f"Started PDF conversion for {filename}")
+        # Submit the PDF conversion; rejection and per-page failures are
+        # recorded here and must not interrupt the rest of the crawl.
+        self.submit_conversion(filename)
 
     def clean(self, filename: str) -> None:
         # Read the HTML file
@@ -129,7 +153,62 @@ class LearncppSpider(scrapy.Spider):
             for element in elements:
                 element.decompose()
 
-    def convert_to_pdf(self, filename: str) -> None:
+    def submit_conversion(self, filename: str) -> None:
+        """Submit one conversion task to the thread pool.
+
+        Every page reaching this point is counted in the conversion total.
+        If the pool has already been shut down (or rejects the task for any
+        other reason), the page is recorded as a failure instead of letting
+        a RuntimeError escape and crash the crawl shutdown.
+        """
+        with self._conversion_lock:
+            self._conversion_total += 1
+            pool_closed = self._executor_closed
+
+        if pool_closed:
+            error = "PDF conversion not started: thread pool is shut down"
+            self._record_failure(filename, error)
+            self.log(f"PDF conversion failed for {filename}: {error}")
+            return
+
+        try:
+            self.executor.submit(self._run_conversion, filename)
+        except RuntimeError as exc:
+            # Thrown when the executor was shut down concurrently.
+            error = f"PDF conversion task rejected by thread pool: {exc}"
+            self._record_failure(filename, error)
+            self.log(f"PDF conversion failed for {filename}: {error}")
+            return
+
+        self.log(f"Started PDF conversion for {filename}")
+
+    def _run_conversion(self, filename: str) -> ConversionResult:
+        """Worker-thread wrapper: never lets an exception escape the future."""
+        try:
+            result = self.convert_to_pdf(filename)
+        except Exception as exc:  # pragma: no cover - defensive safety net
+            result = ConversionResult(
+                filename, False, f"{type(exc).__name__}: {exc}"
+            )
+
+        self._record_result(result)
+
+        pdf_filename = pathlib.Path(filename).with_suffix(".pdf")
+        if result.success:
+            self.log(f"Converted {filename} to PDF: {pdf_filename}")
+        else:
+            self.log(
+                f"PDF conversion failed for {filename}: {result.error}"
+            )
+        return result
+
+    def convert_to_pdf(self, filename: str) -> ConversionResult:
+        """Convert one cleaned HTML file to PDF.
+
+        Returns a ConversionResult describing the outcome. Success is only
+        reported when pdfkit actually completes without error; the message
+        about a converted PDF is therefore never logged unconditionally.
+        """
         # Original file path
         pdf_filename = pathlib.Path(filename).with_suffix(".pdf")
 
@@ -140,15 +219,78 @@ class LearncppSpider(scrapy.Spider):
                 os.path.join(self.name, pdf_filename),
                 options={"enable-local-file-access": ""},
             )
-        except OSError as e:
-            if (
-                "QNetworkReplyImplPrivate::error: Internal problem, this method must only be called once."
-                in str(e)
-            ):
-                # If so, suppress the error
-                pass
+        except OSError as exc:
+            if self.BENIGN_WKHTMLTOPDF_ERROR in str(exc):
+                # If so, suppress the error: wkhtmltopdf still wrote the PDF.
+                return ConversionResult(filename, True)
+            return ConversionResult(
+                filename, False, f"{type(exc).__name__}: {exc}"
+            )
+        except Exception as exc:
+            return ConversionResult(
+                filename, False, f"{type(exc).__name__}: {exc}"
+            )
 
-        self.log(f"Converted {filename} to PDF: {pdf_filename}")
+        return ConversionResult(filename, True)
+
+    def _record_result(self, result: ConversionResult) -> None:
+        with self._conversion_lock:
+            if result.success:
+                self._conversion_succeeded += 1
+            else:
+                self._conversion_failures.append(result)
+
+    def _record_failure(self, filename: str, error: str) -> None:
+        with self._conversion_lock:
+            self._conversion_failures.append(
+                ConversionResult(filename, False, error)
+            )
+
+    def closed(self, reason: str) -> None:
+        # Scrapy hook invoked when the spider has finished crawling.
+        self.shutdown_conversions()
+
+    def shutdown_conversions(
+        self,
+    ) -> typing.Tuple[int, int, typing.List[ConversionResult]]:
+        """Wait for submitted conversions and log the final tally.
+
+        Safe to call more than once. Returns (total, succeeded, failures).
+        """
+        with self._conversion_lock:
+            already_closed = self._executor_closed
+            self._executor_closed = True
+
+        if not already_closed:
+            # wait=True: every task already accepted by the pool runs to
+            # completion before the crawl process exits.
+            self.executor.shutdown(wait=True)
+
+        with self._conversion_lock:
+            total = self._conversion_total
+            succeeded = self._conversion_succeeded
+            failures = list(self._conversion_failures)
+
+        failed = len(failures)
+        summary_lines = [
+            "PDF conversion summary:",
+            f"  Total pages: {total}",
+            f"  Succeeded:   {succeeded}",
+            f"  Failed:      {failed}",
+        ]
+        if failures:
+            summary_lines.append("  Failed pages:")
+            for result in failures:
+                summary_lines.append(
+                    f"    - {result.filename}: {result.error}"
+                )
+        else:
+            summary_lines.append("  Failed pages: none")
+
+        for line in summary_lines:
+            self.log(line)
+
+        return total, succeeded, failures
 
     def get_urls(self) -> typing.List[URL]:
         try:

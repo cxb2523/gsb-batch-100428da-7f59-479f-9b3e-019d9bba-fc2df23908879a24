@@ -51,6 +51,28 @@ scrapy crawl learncpp
 
 You'll find the downloaded files inside `learncpp` directory under the repository root directory.
 
+Each page keeps its HTML save and clean steps as before. PDF conversions run
+on a thread pool and now report a definitive outcome per page:
+
+- A page is logged as converted only when `pdfkit` actually finishes
+  successfully; failures log the page filename and the exception reason
+  instead, and a single page failing never interrupts the rest of the crawl.
+- When the spider closes, it waits for every submitted conversion to finish
+  and logs a summary containing the total page count, succeeded count,
+  failed count, and each failed page's filename with its reason. Tasks
+  rejected because the pool was already shut down are counted as failures
+  rather than raising an unhandled exception.
+
+### Tests
+
+The test suite is fully offline: it uses local fake HTML files and stubs (or
+an unavailable) `wkhtmltopdf` command, with no dependency on the real site or
+any external network.
+
+```bash
+python -m unittest discover -s tests
+```
+
 ## FAQ
 
 **Rate Limit Errors:**
