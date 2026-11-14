@@ -31,6 +31,7 @@ from anansi.db import DATA_DIR, crawl_db
 from anansi.fetchers.base import BaseFetcher, FetchResult
 from anansi.fetchers.http import HTTPFetcher
 from anansi import security
+from anansi.robots import RobotsFetchOutcome
 from anansi.security import (
     UnsafeURLError,
     escape_csv_cell,
@@ -379,6 +380,10 @@ class Crawler:
             from anansi.robots import RobotsCache
             robots_ua = self._profile.robots_user_agent if self._profile else "*"
             self._robots = RobotsCache(user_agent=robots_ua)
+        # Origins whose robots.txt could not be fetched. The "rule missing,
+        # treated as allow" warning is emitted once per origin; the set is
+        # bounded like the other per-domain caches.
+        self._robots_unreachable_warned: set[str] = set()
 
         self._semaphore: asyncio.Semaphore | None = None
         self._pause_event = asyncio.Event()   # set = paused
@@ -613,10 +618,42 @@ class Crawler:
                 return
 
             # Check robots.txt before spending time on this URL
-            if self._robots and not await self._robots.allowed(url):
-                logger.debug("robots.txt disallows %s — skipping", url)
-                await queue.mark_done(url)
-                return
+            if self._robots:
+                robots_allowed = await self._robots.allowed(url)
+                parsed_url = urlparse(url)
+                origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
+                robots_status = self._robots.status_for(url)
+                outcome_label = (
+                    robots_status.outcome.value if robots_status is not None else "unknown"
+                )
+                robots_unreachable = (
+                    robots_status is not None
+                    and robots_status.fetch_outcome is RobotsFetchOutcome.UNREACHABLE
+                )
+                if not robots_allowed:
+                    # An unreachable robots.txt is seeded with an empty rule set
+                    # and therefore allows everything, so a skip here always
+                    # means an explicit rule blocked the URL.
+                    logger.debug(
+                        "robots.txt disallows %s — skipping (origin=%s, outcome=%s, reason=%s)",
+                        url, origin, outcome_label,
+                        robots_status.reason if robots_status else "n/a",
+                    )
+                    await queue.mark_done(url)
+                    return
+                if robots_unreachable and origin not in self._robots_unreachable_warned:
+                    # The URL proceeds, but its allowance rests on missing rules
+                    # rather than an explicit permit — surface that once per
+                    # origin so operators can trace unreliable allow decisions.
+                    self._robots_unreachable_warned.add(origin)
+                    if len(self._robots_unreachable_warned) > self._max_tracked_domains:
+                        self._robots_unreachable_warned.clear()
+                    logger.warning(
+                        "robots.txt for %s unreachable — 规则缺失、按允许处理; "
+                        "continuing crawl without rules (outcome=%s, reason=%s)",
+                        origin, outcome_label,
+                        robots_status.reason if robots_status else "n/a",
+                    )
 
             # Apply robots.txt Crawl-delay to domain throttle gap (once per domain)
             domain = urlparse(url).netloc
