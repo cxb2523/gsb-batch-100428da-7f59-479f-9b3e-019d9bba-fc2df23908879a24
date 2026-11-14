@@ -1,0 +1,56 @@
+{
+  "job": {
+    "position_name": "填写你的岗位名称，例如：Python 后端工程师",
+    "new_talent_flow": true
+  },
+  "filters": {
+    "gender": "不限",
+    "min_age": 20,
+    "max_age": 40,
+    "education": ["本科", "硕士"],
+    "experience": ["1-3年", "3-5年"],
+    "activity": ["今日活跃", "本周活跃"],
+    "schools": [],
+    "job_intention": [],
+    "job_hopping": [],
+    "keywords": []
+  },
+  "matching": {
+    "mode": "rule",
+    "min_score": 60,
+    "rules": {
+      "education_weight": 30,
+      "work_years_weight": 25,
+      "age_weight": 15,
+      "gender_weight": 10,
+      "keyword_weight": 20,
+      "keywords": ["Python", "后端", "招聘"]
+    },
+    "ai": {
+      "api_url": "https://your-ai-endpoint.example.com/v1/chat/completions",
+      "api_key": "YOUR_AI_API_KEY",
+      "model": "your-model-name",
+      "fallback_to_rules": true,
+      "system_prompt": "你是一个招聘匹配助手，请根据简历与岗位要求给出 0-100 的匹配分与简短理由。"
+    }
+  },
+  "action": {
+    "flow_mode": "manual",
+    "greet_mode": "text",
+    "greet_message": "您好，看到您的简历与我们的岗位比较契合，方便聊聊吗？",
+    "max_greet_count": 20,
+    "interval_min_ms": 3000,
+    "interval_max_ms": 8000,
+    "auto_page": false,
+    "max_pages": 5
+  },
+  "recording": {
+    "mode": "excel",
+    "feishu": {
+      "app_id": "YOUR_FEISHU_APP_ID",
+      "app_secret": "YOUR_FEISHU_APP_SECRET",
+      "app_token": "YOUR_FEISHU_APP_TOKEN",
+      "table_id": "YOUR_FEISHU_TABLE_ID"
+    }
+  }
+}

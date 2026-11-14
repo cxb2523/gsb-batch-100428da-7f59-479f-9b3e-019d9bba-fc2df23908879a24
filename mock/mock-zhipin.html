@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>推荐牛人 - BOSS直聘（离线演示页）</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: "Microsoft YaHei", sans-serif; background: #f0f3f7; color: #222; min-width: 1000px; }
+
+    .navbar { background: #fff; border-bottom: 1px solid #e3e8ee; padding: 10px 24px; display: flex; align-items: center; gap: 16px; }
+    .navbar .brand { font-size: 17px; font-weight: 700; color: #00c26e; }
+    .navbar .tab { padding: 4px 10px; color: #555; font-size: 13px; }
+    .navbar .tab.active { color: #00c26e; font-weight: 600; border-bottom: 2px solid #00c26e; }
+    .navbar .mode-btn { margin-left: auto; background: #fff; border: 1px solid #00c26e; color: #00c26e; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+    .badge-demo { background: #fff7e6; color: #b45309; border: 1px solid #f0c36d; padding: 3px 10px; border-radius: 12px; font-size: 12px; }
+
+    .main { display: flex; gap: 16px; padding: 14px 24px; }
+
+    .filter-panel { width: 200px; background: #fff; border: 1px solid #e3e8ee; border-radius: 8px; padding: 12px; height: fit-content; }
+    .filter-panel h3 { font-size: 14px; margin-bottom: 10px; }
+    .filter-group { margin-bottom: 10px; }
+    .filter-group label { display: block; font-size: 12px; color: #777; margin-bottom: 3px; }
+    .filter-group .options { display: flex; flex-wrap: wrap; gap: 5px; }
+    .filter-group span { font-size: 12px; padding: 3px 7px; border: 1px solid #e3e8ee; border-radius: 4px; cursor: pointer; color: #444; background: #fff; }
+    .filter-group span.sel { background: #00c26e; color: #fff; border-color: #00c26e; }
+    .apply { width: 100%; background: #00c26e; color: #fff; border: 0; padding: 7px 0; border-radius: 6px; cursor: pointer; font-size: 13px; }
+
+    .right { flex: 1; }
+
+    /* ---------- 列表模式（需求要求的主模式） ---------- */
+    .list-table { background: #fff; border: 1px solid #e3e8ee; border-radius: 8px; overflow: hidden; }
+    .list-head, .list-row { display: grid; grid-template-columns: 80px 190px 130px 110px 90px 80px 1fr 70px 80px; align-items: center; gap: 6px; padding: 8px 12px; font-size: 12px; }
+    .list-head { background: #f7faf9; color: #888; font-weight: 600; border-bottom: 1px solid #e3e8ee; }
+    .list-row { border-bottom: 1px solid #f0f3f7; }
+    .list-row:last-child { border-bottom: 0; }
+    .list-row:hover { background: #fafdfb; }
+    .list-row .name { font-weight: 700; }
+    .list-row .position { color: #00a35c; font-weight: 600; }
+    .list-row .company { color: #888; }
+    .list-row .salary { color: #e5462c; font-weight: 600; }
+    .list-row .viewed.yes { color: #00a35c; }
+    .list-row .viewed { color: #999; }
+    .list-row .greet { background: #00c26e; color: #fff; border: 0; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+    .list-row .greet:disabled { background: #ccc; cursor: not-allowed; }
+
+    /* ---------- 卡片模式 ---------- */
+    .card-mode { display: none; }
+    .recommend-list { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+    .recommend-card { background: #fff; border: 1px solid #e3e8ee; border-radius: 8px; padding: 14px; position: relative; }
+    .recommend-card .name { font-size: 15px; font-weight: 700; }
+    .recommend-card .meta { margin: 6px 0; display: flex; gap: 10px; font-size: 12px; color: #666; }
+    .recommend-card .position { font-size: 13px; font-weight: 600; color: #00a35c; }
+    .recommend-card .company { font-size: 12px; color: #888; }
+    .recommend-card .salary { position: absolute; top: 14px; right: 14px; font-size: 13px; color: #e5462c; font-weight: 600; }
+    .recommend-card .tags { margin: 8px 0; display: flex; flex-wrap: wrap; gap: 6px; }
+    .recommend-card .tag { font-size: 11px; background: #eef7f2; color: #00a35c; padding: 2px 8px; border-radius: 3px; }
+    .recommend-card .summary { font-size: 12px; color: #666; margin-bottom: 10px; }
+    .recommend-card .foot { display: flex; align-items: center; justify-content: space-between; }
+    .recommend-card .viewed { font-size: 11px; color: #999; }
+    .recommend-card .viewed.yes { color: #00a35c; }
+    .recommend-card .greet { background: #00c26e; color: #fff; border: 0; padding: 5px 14px; border-radius: 5px; cursor: pointer; font-size: 12px; }
+    .recommend-card .greet:disabled { background: #ccc; }
+
+    .pagination { text-align: center; margin: 14px 0; }
+    .pagination button { background: #fff; border: 1px solid #e3e8ee; padding: 5px 16px; border-radius: 5px; cursor: pointer; font-size: 13px; }
+    .pagination .page-info { margin: 0 12px; color: #666; font-size: 12px; }
+
+    .dialog { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); background: #fff; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,.18); width: 420px; padding: 18px; z-index: 100; display: none; }
+    .dialog.show { display: block; }
+    .dialog h4 { font-size: 14px; margin-bottom: 10px; }
+    .dialog textarea { width: 100%; height: 90px; border: 1px solid #e3e8ee; border-radius: 6px; padding: 8px; font-size: 13px; resize: none; }
+    .dialog .ops { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
+    .dialog .ops button { padding: 5px 14px; border-radius: 5px; cursor: pointer; font-size: 12px; }
+    .dialog .send { background: #00c26e; color: #fff; border: 0; }
+    .dialog .cancel { background: #fff; border: 1px solid #e3e8ee; color: #666; }
+    .mask { position: fixed; inset: 0; background: rgba(0,0,0,.3); z-index: 99; display: none; }
+    .mask.show { display: block; }
+    .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #1f2937; color: #fff; padding: 8px 16px; border-radius: 6px; font-size: 13px; z-index: 200; display: none; }
+    .toast.warn { background: #b45309; }
+    .toast.ok { background: #16a34a; }
+  </style>
+</head>
+<body>
+  <nav class="navbar">
+    <div class="brand">BOSS 直聘</div>
+    <div class="tab active">推荐牛人</div>
+    <div class="tab">搜索牛人</div>
+    <div class="tab">沟通中</div>
+    <button class="mode-btn" id="modeToggle">当前：列表模式（点击切换为卡片模式）</button>
+    <div class="badge-demo">离线演示页（模拟 isTrusted 检测 + 列表/卡片模式切换）</div>
+  </nav>
+
+  <div class="main">
+    <aside class="filter-panel">
+      <h3>筛选条件</h3>
+      <div class="filter-group activity"><label>活跃度</label>
+        <div class="options"><span class="sel">不限</span><span>刚刚活跃</span><span>今日活跃</span><span>本周活跃</span></div></div>
+      <div class="filter-group school"><label>院校</label>
+        <div class="options"><span class="sel">不限</span><span>985</span><span>211</span><span>双一流</span></div></div>
+      <div class="filter-group experience"><label>经验</label>
+        <div class="options"><span class="sel">不限</span><span>1-3年</span><span>3-5年</span><span>5-10年</span><span>10年以上</span></div></div>
+      <div class="filter-group education"><label>学历</label>
+        <div class="options"><span class="sel">不限</span><span>大专</span><span>本科</span><span>硕士</span><span>博士</span></div></div>
+      <div class="filter-group intention"><label>求职意向</label>
+        <div class="options"><span class="sel">不限</span><span>只看在线</span><span>只看今日查看</span></div></div>
+      <div class="filter-group hopping"><label>跳槽频率</label>
+        <div class="options"><span class="sel">不限</span><span>稳定</span><span>一般</span><span>频繁</span></div></div>
+      <div class="filter-group gender"><label>性别</label>
+        <div class="options"><span class="sel">不限</span><span>男</span><span>女</span></div></div>
+      <div class="filter-group age"><label>年龄</label>
+        <div class="options"><span>不限</span><span>20-25岁</span><span>25-30岁</span><span>30-35岁</span><span>35-40岁</span></div></div>
+      <button class="apply">确定筛选</button>
+    </aside>
+
+    <div class="right">
+      <div class="list-mode" id="listModeBox">
+        <div class="list-table" id="listTable"></div>
+      </div>
+      <div class="card-mode" id="cardModeBox">
+        <div class="recommend-list" id="cardList"></div>
+      </div>
+      <div class="pagination">
+        <button id="prevBtn">上一页</button>
+        <span class="page-info" id="pageInfo">第 1 / 3 页</span>
+        <button id="nextBtn" class="pagination-next">下一页</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="mask" id="mask"></div>
+  <div class="dialog" id="greetDialog">
+    <h4 id="dialogTitle">发送招呼语</h4>
+    <textarea class="message" id="greetText">您好，看到您的简历与我们的岗位匹配度很高，方便进一步沟通吗？</textarea>
+    <div class="ops">
+      <button class="cancel" id="cancelBtn">取消</button>
+      <button class="send" id="sendBtn">发送</button>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+
+  <script>
+    // ---------- 模拟候选人数据 ----------
+    const CANDIDATES = [];
+    const metaPool = [
+      ["男", 28, "本科", 5], ["女", 26, "本科", 3], ["男", 32, "硕士", 8], ["女", 24, "大专", 2],
+      ["男", 35, "本科", 10], ["女", 29, "硕士", 6], ["男", 23, "大专", 1], ["女", 31, "本科", 7],
+      ["男", 27, "本科", 4], ["女", 33, "硕士", 9], ["男", 30, "博士", 6], ["女", 25, "本科", 2],
+      ["男", 22, "大专", 1], ["女", 36, "本科", 12], ["男", 29, "硕士", 5], ["女", 27, "本科", 4],
+      ["男", 34, "硕士", 9], ["女", 23, "本科", 1], ["男", 31, "本科", 8], ["女", 30, "大专", 6],
+      ["男", 26, "本科", 3], ["女", 28, "硕士", 5], ["男", 33, "本科", 10], ["女", 35, "硕士", 11],
+      ["男", 24, "大专", 2], ["女", 32, "本科", 8], ["男", 37, "硕士", 13], ["女", 21, "本科", 0]
+    ];
+    const surnames = ["张", "李", "王", "刘", "陈", "杨", "赵", "黄", "周", "吴", "徐", "孙", "马", "朱", "胡", "郭", "何", "高", "林", "罗", "郑", "梁", "谢", "宋", "唐", "许", "韩", "冯"];
+    const positions = [
+      ["Java 后端工程师", "字节跳动", "30-45K·16薪", ["Java", "Spring Cloud", "Redis"]],
+      ["Java 开发工程师", "阿里云", "25-40K·14薪", ["Java", "MySQL", "Kafka"]],
+      ["后端工程师", "腾讯云", "28-42K·15薪", ["Golang", "Kubernetes"]],
+      ["Java 高级工程师", "美团", "30-50K·15薪", ["Java", "分布式", "Spring"]],
+      ["后端开发", "京东", "22-35K·14薪", ["Java", "Spring Boot"]],
+      ["Java 专家", "蚂蚁集团", "40-60K·16薪", ["Java", "高并发", "微服务"]],
+      ["Python 开发", "小红书", "20-32K·14薪", ["Python", "Django"]],
+      ["前端工程师", "bilibili", "20-35K·15薪", ["Vue", "React"]],
+      ["Java 工程师", "平安科技", "18-28K·13薪", ["Java", "Spring"]],
+      ["Java 后端", "顺丰科技", "18-30K·14薪", ["Java", "Redis", "MySQL"]],
+      ["Java 开发工程师", "携程", "20-35K·14薪", ["Java", "Spring Cloud"]],
+      ["后端工程师", "网易", "25-40K·15薪", ["Java", "Spring", "Elasticsearch"]]
+    ];
+    const schools = ["清华大学", "北京大学", "浙江大学", "上海交通大学", "复旦大学", "南京大学", "武汉大学", "华中科技大学", "普通大学", "职业技术学院", "电子科技大学", "西安交通大学"];
+
+    metaPool.forEach((m, i) => {
+      const pos = positions[i % positions.length];
+      const viewed = i % 3 === 0;
+      CANDIDATES.push({
+        id: i + 1,
+        name: surnames[i] + "某",
+        gender: m[0], age: m[1], education: m[2], years: m[3],
+        position: pos[0], company: pos[1], salary: pos[2], tags: pos[3],
+        school: schools[i % schools.length],
+        summary: m[3] + "年" + pos[0] + "经验，" + pos[3].join("、") + " 相关项目落地经验丰富。",
+        viewed
+      });
+    });
+
+    const PAGE_SIZE = 10;
+    let curPage = 1;
+    const maxPage = Math.ceil(CANDIDATES.length / PAGE_SIZE);
+
+    function render() {
+      const start = (curPage - 1) * PAGE_SIZE;
+      const items = CANDIDATES.slice(start, start + PAGE_SIZE);
+
+      document.getElementById("listTable").innerHTML =
+        `<div class="list-head"><span>姓名</span><span>年龄/性别/学历/年限</span><span>职位</span><span>院校</span><span>公司</span><span>薪资</span><span>技能/摘要</span><span>状态</span><span>操作</span></div>` +
+        items.map(c => `
+        <div class="list-row" data-id="${c.id}">
+          <span class="name">${c.name}</span>
+          <span class="meta"><span class="age">${c.age}岁</span><span class="gender">${c.gender}</span><span class="education">${c.education}</span><span class="work-years">${c.years}年</span></span>
+          <span class="position">${c.position}</span>
+          <span class="school">${c.school}</span>
+          <span class="company">${c.company}</span>
+          <span class="salary">${c.salary}</span>
+          <span class="detail"><span class="tags">${c.tags.map(t => `<span class="tag">${t}</span>`).join("")}</span><span class="summary">${c.summary}</span></span>
+          <span class="viewed ${c.viewed ? "yes" : ""}">${c.viewed ? "已查看" : "未查看"}</span>
+          <button class="greet" data-name="${c.name}">打招呼</button>
+        </div>
+      `).join("");
+
+      document.getElementById("cardList").innerHTML = items.map(c => `
+        <div class="recommend-card" data-id="${c.id}">
+          <div class="salary">${c.salary}</div>
+          <h3 class="name">${c.name}</h3>
+          <div class="meta"><span class="gender">${c.gender}</span><span class="age">${c.age}岁</span><span class="education">${c.education}</span><span class="work-years">${c.years}年</span></div>
+          <div class="position">${c.position}</div>
+          <div class="company">${c.company}</div>
+          <div class="tags">${c.tags.map(t => `<span class="tag">${t}</span>`).join("")}</div>
+          <div class="summary">${c.summary}</div>
+          <div class="foot"><span class="viewed ${c.viewed ? "yes" : ""}">${c.viewed ? "已查看" : "未查看"}</span>
+            <button class="greet" data-name="${c.name}">打招呼</button></div>
+        </div>
+      `).join("");
+
+      document.getElementById("pageInfo").textContent = `第 ${curPage} / ${maxPage} 页`;
+      document.getElementById("prevBtn").disabled = curPage === 1;
+      document.getElementById("nextBtn").disabled = curPage === maxPage;
+      bindGreet();
+    }
+
+    function bindGreet() {
+      document.querySelectorAll(".greet").forEach(btn => {
+        btn.addEventListener("click", e => {
+          if (!e.isTrusted) {
+            showToast("⚠️ 检测到非真实点击（isTrusted=false），已拦截！普通 JS click 无法触发。", "warn");
+            return;
+          }
+          document.getElementById("dialogTitle").textContent = "发送招呼语 - " + btn.dataset.name;
+          document.getElementById("greetDialog").classList.add("show");
+          document.getElementById("mask").classList.add("show");
+          document.getElementById("greetText").focus();
+        });
+      });
+    }
+
+    let listMode = true;
+    document.getElementById("modeToggle").addEventListener("click", () => {
+      listMode = !listMode;
+      document.getElementById("listModeBox").style.display = listMode ? "block" : "none";
+      document.getElementById("cardModeBox").style.display = listMode ? "none" : "grid";
+      document.getElementById("modeToggle").textContent = listMode ? "当前：列表模式（点击切换为卡片模式）" : "当前：卡片模式（点击切换为列表模式）";
+      showToast(listMode ? "已切换为列表模式" : "已切换为卡片模式（模拟页面默认卡片模式）", "ok");
+    });
+
+    document.getElementById("sendBtn").addEventListener("click", e => {
+      if (!e.isTrusted) { showToast("⚠️ 发送按钮也需要真实点击（isTrusted=false），已拦截。", "warn"); return; }
+      const text = document.getElementById("greetText").value;
+      document.getElementById("greetDialog").classList.remove("show");
+      document.getElementById("mask").classList.remove("show");
+      showToast("✅ 招呼语已发送：" + text.slice(0, 30) + (text.length > 30 ? "…" : ""), "ok");
+    });
+
+    document.getElementById("cancelBtn").addEventListener("click", () => {
+      document.getElementById("greetDialog").classList.remove("show");
+      document.getElementById("mask").classList.remove("show");
+    });
+
+    document.getElementById("prevBtn").addEventListener("click", () => { if (curPage > 1) { curPage--; render(); } });
+    document.getElementById("nextBtn").addEventListener("click", () => { if (curPage < maxPage) { curPage++; render(); } });
+
+    document.querySelectorAll(".filter-group .options").forEach(group => {
+      group.addEventListener("click", e => {
+        if (e.target.tagName === "SPAN") {
+          group.querySelectorAll("span").forEach(s => s.classList.remove("sel"));
+          e.target.classList.add("sel");
+        }
+      });
+    });
+    document.querySelector(".apply").addEventListener("click", () => showToast("筛选条件已应用（演示页不改变列表数据）", "ok"));
+
+    function showToast(msg, type) {
+      const t = document.getElementById("toast");
+      t.textContent = msg;
+      t.className = "toast " + (type || "");
+      t.style.display = "block";
+      clearTimeout(t._timer);
+      t._timer = setTimeout(() => { t.style.display = "none"; }, 2500);
+    }
+
+    render();
+    console.log("[mock] 离线演示页就绪（列表模式），候选人", CANDIDATES.length, "人，分", maxPage, "页");
+  </script>
+</body>
+</html>

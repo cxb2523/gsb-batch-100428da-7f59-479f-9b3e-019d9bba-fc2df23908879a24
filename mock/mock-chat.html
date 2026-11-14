@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>沟通 - BOSS直聘（离线演示页）</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: "Microsoft YaHei", sans-serif; background: #f0f3f7; color: #222; min-width: 900px; display: flex; flex-direction: column; height: 100vh; }
+    .navbar { background: #fff; border-bottom: 1px solid #e3e8ee; padding: 10px 24px; display: flex; align-items: center; gap: 16px; }
+    .navbar .brand { font-size: 17px; font-weight: 700; color: #00c26e; }
+    .navbar .tab { padding: 4px 10px; color: #555; font-size: 13px; }
+    .navbar .tab.active { color: #00c26e; font-weight: 600; border-bottom: 2px solid #00c26e; }
+    .badge-demo { margin-left: auto; background: #fff7e6; color: #b45309; border: 1px solid #f0c36d; padding: 3px 10px; border-radius: 12px; font-size: 12px; }
+
+    .body { display: flex; flex: 1; overflow: hidden; }
+    .chat-list { width: 280px; background: #fff; border-right: 1px solid #e3e8ee; overflow-y: auto; }
+    .chat-list h3 { font-size: 13px; color: #888; padding: 12px 14px 6px; }
+    .geek-item { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid #f0f3f7; cursor: pointer; position: relative; }
+    .geek-item:hover, .geek-item.sel { background: #eef7f2; }
+    .geek-item .name { font-size: 13px; font-weight: 600; }
+    .geek-item .tag { font-size: 11px; color: #00a35c; background: #eef7f2; padding: 1px 6px; border-radius: 3px; }
+    .geek-item .status { margin-left: auto; font-size: 11px; color: #999; }
+    .geek-item .status.done { color: #00a35c; }
+    .geek-item .icon-operate { margin-left: 6px; color: #00a35c; cursor: pointer; font-size: 14px; display: none; }
+    .geek-item:hover .icon-operate { display: inline; }
+
+    .chat-main { flex: 1; display: flex; flex-direction: column; background: #fafcfb; }
+    .chat-header { padding: 12px 18px; background: #fff; border-bottom: 1px solid #e3e8ee; font-size: 14px; font-weight: 600; }
+    .chat-history { flex: 1; padding: 18px; overflow-y: auto; font-size: 13px; color: #666; }
+    .resume-panel { display: none; position: fixed; top: 8%; left: 28%; width: 440px; max-height: 70vh; overflow-y: auto; background: #fff; border-radius: 10px; box-shadow: 0 12px 40px rgba(0,0,0,.2); padding: 18px 22px; font-size: 13px; z-index: 350; }
+    .resume-panel.show { display: block; }
+    .resume-panel h4 { font-size: 14px; margin-bottom: 10px; color: #00a35c; display: inline-block; }
+    .resume-panel .close { float: right; cursor: pointer; color: #999; font-size: 16px; }
+    .resume-panel .row { display: flex; margin-bottom: 6px; }
+    .resume-panel .label { width: 60px; color: #999; }
+    .resume-panel .value { color: #333; }
+    .chat-input-bar { border-top: 1px solid #e3e8ee; background: #fff; padding: 10px 16px; }
+    .chat-input-bar .tools { display: flex; gap: 8px; margin-bottom: 8px; }
+    .chat-input-bar .tool-btn { background: #fff; border: 1px solid #e3e8ee; border-radius: 4px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+    .chat-input-bar .input-row { display: flex; gap: 8px; }
+    .chat-input-bar textarea { flex: 1; height: 56px; border: 1px solid #e3e8ee; border-radius: 6px; padding: 8px; font-size: 13px; resize: none; }
+    .chat-input-bar .send { background: #00c26e; color: #fff; border: 0; border-radius: 6px; padding: 0 22px; cursor: pointer; font-size: 13px; }
+    .chat-input-bar .request-resume { background: #fff; color: #00a35c; border: 1px solid #00c26e; border-radius: 6px; padding: 0 16px; cursor: pointer; font-size: 13px; }
+
+    .toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: #1f2937; color: #fff; padding: 8px 16px; border-radius: 6px; font-size: 13px; z-index: 200; display: none; }
+    .toast.ok { background: #16a34a; }
+
+    .confirm-dialog { position: fixed; left: 50%; top: 40%; transform: translate(-50%, -50%); background: #fff; border-radius: 10px; box-shadow: 0 10px 40px rgba(0,0,0,.18); width: 340px; padding: 18px; z-index: 300; display: none; }
+    .confirm-dialog.show { display: block; }
+    .confirm-dialog h4 { font-size: 14px; margin-bottom: 10px; }
+    .confirm-dialog .ops { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+    .confirm-dialog .ops button { padding: 5px 16px; border-radius: 5px; cursor: pointer; font-size: 12px; }
+    .confirm-dialog .ok { background: #00c26e; color: #fff; border: 0; }
+    .confirm-dialog .cancel { background: #fff; border: 1px solid #e3e8ee; color: #666; }
+    .operate-popup { position: absolute; z-index: 250; background: #fff; border: 1px solid #e3e8ee; border-radius: 6px; box-shadow: 0 6px 20px rgba(0,0,0,.12); padding: 4px 0; display: none; min-width: 110px; }
+    .operate-popup.show { display: block; }
+    .operate-popup .menu-item { padding: 7px 14px; font-size: 12px; cursor: pointer; color: #333; }
+    .operate-popup .menu-item:hover { background: #eef7f2; color: #00a35c; }
+  </style>
+</head>
+<body>
+  <nav class="navbar">
+    <div class="brand">BOSS 直聘</div>
+    <div class="tab">推荐牛人</div>
+    <div class="tab active">沟通</div>
+    <div class="tab">搜索牛人</div>
+    <div class="badge-demo">离线演示页：沟通列表 / 常用语 / 求简历</div>
+  </nav>
+
+  <div class="body">
+    <div class="chat-list">
+      <h3>沟通中（未处理）</h3>
+      <div id="geekList"></div>
+    </div>
+    <div class="chat-main">
+      <div class="chat-header" id="chatHeader">请选择左侧候选人</div>
+      <div class="chat-history" id="chatHistory">点击左侧候选人查看对话。</div>
+      <div class="resume-panel" id="resumePanel">
+        <h4>在线简历</h4><span class="close" id="resumeClose">✕</span>
+        <div class="row"><span class="label">姓名</span><span class="value" id="rvName"></span></div>
+        <div class="row"><span class="label">性别</span><span class="value" id="rvGender"></span></div>
+        <div class="row"><span class="label">年龄</span><span class="value" id="rvAge"></span></div>
+        <div class="row"><span class="label">学历</span><span class="value" id="rvEdu"></span></div>
+        <div class="row"><span class="label">经验</span><span class="value" id="rvYears"></span></div>
+        <div class="row"><span class="label">技能</span><span class="value" id="rvSkills"></span></div>
+        <div class="row"><span class="label">期望</span><span class="value" id="rvExpect"></span></div>
+        <div class="row" style="align-items:flex-start"><span class="label">工作经历</span><span class="value" id="rvHistory"></span></div>
+      </div>
+      <div class="chat-input-bar">
+        <div class="tools">
+          <button class="tool-btn" id="quickBtn">常用语</button>
+          <button class="tool-btn" id="requestResumeBtn">求简历</button>
+          <button class="tool-btn" id="onlineResumeBtn">在线简历</button>
+        </div>
+        <div class="input-row">
+          <textarea id="msgInput" placeholder="输入消息…">您好，方便进一步沟通吗？</textarea>
+          <button class="send" id="sendBtn">发送</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="toast" id="toast"></div>
+  <div class="operate-popup" id="operatePopup">
+    <div class="menu-item" id="menuViewResume">查看简历</div>
+    <div class="menu-item" id="menuRequestResume">求简历</div>
+  </div>
+  <div class="confirm-dialog" id="resumeConfirm">
+    <h4>确认向候选人请求简历？</h4>
+    <div class="ops">
+      <button class="cancel" id="confirmCancel">取消</button>
+      <button class="ok" id="confirmOk">确认</button>
+    </div>
+  </div>
+
+  <script>
+    const GEEKS = ["张某", "李某", "王某", "刘某", "陈某", "杨某", "赵某", "黄某", "周某", "吴某"];
+    let current = null;
+    const processed = {};
+
+    const listBox = document.getElementById("geekList");
+    listBox.innerHTML = GEEKS.map((g, i) => `
+      <div class="geek-item" data-name="${g}">
+        <span class="name">${g}</span>
+        <span class="tag">Java后端</span>
+        <span class="status" id="st${i}">未发</span>
+        <span class="icon-operate list-operate" title="操作">⋯</span>
+      </div>
+    `).join("");
+
+    // 默认选中第一个候选人（模拟用户已点开对话）
+    document.querySelector(".geek-item").classList.add("sel");
+    current = GEEKS[0];
+    document.getElementById("chatHeader").textContent = "与 " + current + " 沟通中";
+    document.getElementById("chatHistory").textContent = "（演示）与 " + current + " 的对话窗口。";
+
+    function showToast(msg, type) {
+      const t = document.getElementById("toast");
+      t.textContent = msg;
+      t.className = "toast " + (type || "");
+      t.style.display = "block";
+      clearTimeout(t._timer);
+      t._timer = setTimeout(() => { t.style.display = "none"; }, 2500);
+    }
+
+    document.querySelectorAll(".geek-item").forEach((el, i) => {
+      el.addEventListener("click", e => {
+        if (!e.isTrusted) { showToast("⚠️ 需要真实点击（isTrusted=false）"); return; }
+        document.querySelectorAll(".geek-item").forEach(x => x.classList.remove("sel"));
+        el.classList.add("sel");
+        current = el.dataset.name;
+        document.getElementById("chatHeader").textContent = "与 " + current + " 沟通中";
+        document.getElementById("chatHistory").textContent = "（演示）与 " + current + " 的对话窗口。";
+      });
+      el.querySelector(".icon-operate").addEventListener("click", e => {
+        if (!e.isTrusted) { showToast("⚠️ 操作图标需要真实点击（isTrusted=false）"); return; }
+        e.stopPropagation();
+        const popup = document.getElementById("operatePopup");
+        popup.classList.add("show");
+        popup.style.top = (el.offsetTop + 24) + "px";
+        popup.style.left = (el.offsetLeft + 90) + "px";
+      });
+    });
+
+    document.addEventListener("click", e => {
+      if (!e.target.closest("#operatePopup")) {
+        document.getElementById("operatePopup").classList.remove("show");
+      }
+    });
+
+    document.getElementById("menuRequestResume").addEventListener("click", e => {
+      if (!e.isTrusted) { showToast("⚠️ 菜单需要真实点击（isTrusted=false）"); return; }
+      document.getElementById("operatePopup").classList.remove("show");
+      document.getElementById("resumeConfirm").classList.add("show");
+    });
+
+    document.getElementById("menuViewResume").addEventListener("click", e => {
+      if (!e.isTrusted) { showToast("⚠️ 菜单需要真实点击（isTrusted=false）"); return; }
+      document.getElementById("operatePopup").classList.remove("show");
+      showToast("查看简历（演示）", "ok");
+    });
+
+    // 发送（isTrusted 检测）
+    document.getElementById("sendBtn").addEventListener("click", e => {
+      if (!e.isTrusted) { showToast("⚠️ 发送需要真实点击（isTrusted=false）"); return; }
+      if (!current) { showToast("请先选择候选人"); return; }
+      const text = document.getElementById("msgInput").value;
+      document.getElementById("msgInput").value = "";  // 模拟发送成功后输入框清空
+      showToast("✅ 已发送：" + text.slice(0, 20), "ok");
+      markDone();
+    });
+
+    // 常用语：点击后在输入框插入固定话术
+    document.getElementById("quickBtn").addEventListener("click", e => {
+      if (!e.isTrusted) { showToast("⚠️ 常用语需要真实点击（isTrusted=false）"); return; }
+      document.getElementById("msgInput").value = "您好，我是HR，看到您的经历很合适，方便聊一下吗？";
+      showToast("已选择常用语，点击发送即可", "ok");
+    });
+
+    // 求简历
+    document.getElementById("requestResumeBtn").addEventListener("click", e => {
+      if (!e.isTrusted) { showToast("⚠️ 求简历需要真实点击（isTrusted=false）"); return; }
+      if (!current) { showToast("请先选择候选人"); return; }
+      document.getElementById("resumeConfirm").classList.add("show");
+    });
+
+    // 在线简历：点击后显示简历面板
+    document.getElementById("onlineResumeBtn").addEventListener("click", e => {
+      if (!e.isTrusted) { showToast("⚠️ 在线简历需要真实点击（isTrusted=false）"); return; }
+      if (!current) { showToast("请先选择候选人"); return; }
+      const idx = GEEKS.indexOf(current);
+      const meta = [
+        ["男", 28, "本科", 5, "Java、Spring、Redis", "深圳 · Java 后端 · 25K"],
+        ["女", 26, "硕士", 3, "Python、Django、MySQL", "上海 · 后端 · 22K"],
+        ["男", 32, "本科", 8, "Java、分布式、Kafka", "北京 · 高级后端 · 35K"]
+      ][idx % 3];
+      document.getElementById("rvName").textContent = current;
+      document.getElementById("rvGender").textContent = meta[0];
+      document.getElementById("rvAge").textContent = meta[1] + "岁";
+      document.getElementById("rvEdu").textContent = meta[2];
+      document.getElementById("rvYears").textContent = meta[3] + "年经验";
+      document.getElementById("rvSkills").textContent = meta[4];
+      document.getElementById("rvExpect").textContent = meta[5];
+      // 生成长工作经历，模拟长简历（需要滚动）
+      let hist = "";
+      for (let n = 1; n <= 12; n++) {
+        hist += (n === 1 ? "" : "\n") + "公司" + n + " · " + meta[4].split("、")[0] + "工程师 · 202" + (n % 5) + "-0" + (n % 3) + " 至 202" + ((n + 1) % 5) + "-0" + ((n + 2) % 3);
+      }
+      document.getElementById("rvHistory").textContent = hist;
+      document.getElementById("resumePanel").classList.add("show");
+      showToast("已打开在线简历", "ok");
+    });
+
+    document.getElementById("resumeClose").addEventListener("click", e => {
+      if (!e.isTrusted) { showToast("⚠️ 关闭需要真实点击（isTrusted=false）"); return; }
+      document.getElementById("resumePanel").classList.remove("show");
+    });
+
+    document.addEventListener("keydown", e => {
+      if (e.key === "Escape") {
+        document.getElementById("resumePanel").classList.remove("show");
+      }
+    });
+
+    document.getElementById("confirmOk").addEventListener("click", e => {
+      if (!e.isTrusted) { showToast("⚠️ 确认需要真实点击（isTrusted=false）"); return; }
+      document.getElementById("resumeConfirm").classList.remove("show");
+      showToast("✅ 已向 " + current + " 请求简历", "ok");
+      markDone();
+    });
+
+    document.getElementById("confirmCancel").addEventListener("click", e => {
+      if (!e.isTrusted) { showToast("⚠️ 取消需要真实点击（isTrusted=false）"); return; }
+      document.getElementById("resumeConfirm").classList.remove("show");
+    });
+
+    function markDone() {
+      if (!current) return;
+      processed[current] = true;
+      document.querySelectorAll(".geek-item").forEach(el => {
+        if (el.dataset.name === current) {
+          el.querySelector(".status").textContent = "已处理";
+          el.querySelector(".status").classList.add("done");
+        }
+      });
+    }
+
+    console.log("[mock-chat] 沟通页演示就绪");
+  </script>
+</body>
+</html>
