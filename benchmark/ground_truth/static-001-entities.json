@@ -1,0 +1,22 @@
+{
+  "url": "https://en.wikipedia.org/wiki/Web_crawler",
+  "annotator": "human",
+  "annotated_at": "2026-04-12",
+  "entities": [
+    {"text": "Google", "type": "ORG"},
+    {"text": "Googlebot", "type": "PRODUCT"},
+    {"text": "World Wide Web", "type": "PRODUCT"},
+    {"text": "Tim Berners-Lee", "type": "PERSON"},
+    {"text": "Internet Archive", "type": "ORG"},
+    {"text": "Yahoo", "type": "ORG"},
+    {"text": "Bing", "type": "PRODUCT"},
+    {"text": "Microsoft", "type": "ORG"},
+    {"text": "Apache Nutch", "type": "PRODUCT"},
+    {"text": "Heritrix", "type": "PRODUCT"},
+    {"text": "MIT", "type": "ORG"},
+    {"text": "W3C", "type": "ORG"},
+    {"text": "Baidu", "type": "ORG"},
+    {"text": "DuckDuckGo", "type": "ORG"},
+    {"text": "Yandex", "type": "ORG"}
+  ]
+}

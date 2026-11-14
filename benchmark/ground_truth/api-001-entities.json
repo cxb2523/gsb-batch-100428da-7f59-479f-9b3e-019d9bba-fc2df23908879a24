@@ -1,0 +1,9 @@
+{
+  "url": "https://petstore.swagger.io/",
+  "annotator": "human",
+  "annotated_at": "2026-04-12",
+  "entities": [
+    {"text": "Swagger", "type": "PRODUCT"},
+    {"text": "Petstore", "type": "PRODUCT"}
+  ]
+}

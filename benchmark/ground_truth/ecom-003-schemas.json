@@ -1,0 +1,11 @@
+{
+  "url": "https://www.bestbuy.com/site/apple-macbook-air-13-inch-apple-m3-chip-8gb-memory-256gb/6565837.p",
+  "schemas": [
+    {
+      "type": "JSON_LD",
+      "schema_org_type": "Product",
+      "key_fields": ["name", "image", "offers", "brand"],
+      "expected_count": 1
+    }
+  ]
+}

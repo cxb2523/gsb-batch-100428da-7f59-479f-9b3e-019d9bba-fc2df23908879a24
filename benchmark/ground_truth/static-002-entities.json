@@ -1,0 +1,27 @@
+{
+  "url": "https://en.wikipedia.org/wiki/Natural_language_processing",
+  "annotator": "human",
+  "annotated_at": "2026-04-12",
+  "entities": [
+    {"text": "Alan Turing", "type": "PERSON"},
+    {"text": "Georgetown University", "type": "ORG"},
+    {"text": "IBM", "type": "ORG"},
+    {"text": "Google", "type": "ORG"},
+    {"text": "OpenAI", "type": "ORG"},
+    {"text": "Noam Chomsky", "type": "PERSON"},
+    {"text": "DARPA", "type": "ORG"},
+    {"text": "Stanford University", "type": "ORG"},
+    {"text": "GPT", "type": "PRODUCT"},
+    {"text": "BERT", "type": "PRODUCT"},
+    {"text": "United States", "type": "GPE"},
+    {"text": "Siri", "type": "PRODUCT"},
+    {"text": "Alexa", "type": "PRODUCT"},
+    {"text": "Microsoft", "type": "ORG"},
+    {"text": "Apple", "type": "ORG"},
+    {"text": "Amazon", "type": "ORG"},
+    {"text": "Christopher Manning", "type": "PERSON"},
+    {"text": "Yoshua Bengio", "type": "PERSON"},
+    {"text": "China", "type": "GPE"},
+    {"text": "Europe", "type": "LOC"}
+  ]
+}

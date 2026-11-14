@@ -1,0 +1,11 @@
+{
+  "url": "https://www.allrecipes.com/recipe/10813/best-chocolate-chip-cookies/",
+  "schemas": [
+    {
+      "type": "JSON_LD",
+      "schema_org_type": "Recipe",
+      "key_fields": ["name", "author", "cookTime", "recipeIngredient", "recipeInstructions"],
+      "expected_count": 1
+    }
+  ]
+}

@@ -1,0 +1,206 @@
+{
+  "version": "1.0",
+  "created_at": "2026-04-12",
+  "urls": [
+    {
+      "id": "static-001",
+      "url": "https://en.wikipedia.org/wiki/Web_crawler",
+      "category": "static_html",
+      "expected_entities": 15,
+      "expected_schemas": 0,
+      "notes": "Well-structured Wikipedia article with many named entities"
+    },
+    {
+      "id": "static-002",
+      "url": "https://en.wikipedia.org/wiki/Natural_language_processing",
+      "category": "static_html",
+      "expected_entities": 20,
+      "expected_schemas": 0,
+      "notes": "Dense Wikipedia article covering NLP history and key figures"
+    },
+    {
+      "id": "static-003",
+      "url": "https://docs.python.org/3/library/json.html",
+      "category": "static_html",
+      "expected_entities": 5,
+      "expected_schemas": 0,
+      "notes": "Python standard library documentation page"
+    },
+    {
+      "id": "static-004",
+      "url": "https://developer.mozilla.org/en-US/docs/Web/HTML",
+      "category": "static_html",
+      "expected_entities": 8,
+      "expected_schemas": 0,
+      "notes": "MDN HTML reference landing page"
+    },
+    {
+      "id": "static-005",
+      "url": "https://en.wikipedia.org/wiki/Artificial_intelligence",
+      "category": "static_html",
+      "expected_entities": 25,
+      "expected_schemas": 0,
+      "notes": "Comprehensive Wikipedia article with many entities and references"
+    },
+    {
+      "id": "spa-001",
+      "url": "https://news.ycombinator.com/",
+      "category": "js_heavy_spa",
+      "expected_entities": 10,
+      "expected_schemas": 0,
+      "notes": "Hacker News front page, dynamically loaded content"
+    },
+    {
+      "id": "spa-002",
+      "url": "https://angular.dev/overview",
+      "category": "js_heavy_spa",
+      "expected_entities": 5,
+      "expected_schemas": 0,
+      "notes": "Angular documentation, SPA with client-side rendering"
+    },
+    {
+      "id": "spa-003",
+      "url": "https://react.dev/learn",
+      "category": "js_heavy_spa",
+      "expected_entities": 5,
+      "expected_schemas": 0,
+      "notes": "React documentation, SPA with client-side rendering"
+    },
+    {
+      "id": "spa-004",
+      "url": "https://vuejs.org/guide/introduction.html",
+      "category": "js_heavy_spa",
+      "expected_entities": 5,
+      "expected_schemas": 0,
+      "notes": "Vue.js documentation, SPA with client-side rendering"
+    },
+    {
+      "id": "jsonld-001",
+      "url": "https://www.allrecipes.com/recipe/10813/best-chocolate-chip-cookies/",
+      "category": "jsonld_structured",
+      "expected_entities": 5,
+      "expected_schemas": 1,
+      "notes": "Recipe page with schema.org/Recipe JSON-LD"
+    },
+    {
+      "id": "jsonld-002",
+      "url": "https://www.imdb.com/title/tt0111161/",
+      "category": "jsonld_structured",
+      "expected_entities": 10,
+      "expected_schemas": 1,
+      "notes": "IMDB movie page with schema.org/Movie JSON-LD"
+    },
+    {
+      "id": "jsonld-003",
+      "url": "https://www.eventbrite.com/d/online/free--events/",
+      "category": "jsonld_structured",
+      "expected_entities": 8,
+      "expected_schemas": 1,
+      "notes": "Event listing page with schema.org/Event JSON-LD"
+    },
+    {
+      "id": "jsonld-004",
+      "url": "https://www.bbc.com/news",
+      "category": "jsonld_structured",
+      "expected_entities": 10,
+      "expected_schemas": 1,
+      "notes": "BBC News homepage with schema.org/WebPage JSON-LD"
+    },
+    {
+      "id": "api-001",
+      "url": "https://petstore.swagger.io/",
+      "category": "api_documentation",
+      "expected_entities": 2,
+      "expected_schemas": 1,
+      "notes": "Swagger Petstore demo - canonical OpenAPI example"
+    },
+    {
+      "id": "api-002",
+      "url": "https://docs.github.com/en/rest",
+      "category": "api_documentation",
+      "expected_entities": 5,
+      "expected_schemas": 0,
+      "notes": "GitHub REST API documentation landing page"
+    },
+    {
+      "id": "api-003",
+      "url": "https://httpbin.org/spec.json",
+      "category": "api_documentation",
+      "expected_entities": 0,
+      "expected_schemas": 1,
+      "notes": "Raw OpenAPI spec in JSON format"
+    },
+    {
+      "id": "api-004",
+      "url": "https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API",
+      "category": "api_documentation",
+      "expected_entities": 5,
+      "expected_schemas": 0,
+      "notes": "MDN Fetch API documentation page"
+    },
+    {
+      "id": "news-001",
+      "url": "https://www.reuters.com/technology/",
+      "category": "news_entity_rich",
+      "expected_entities": 20,
+      "expected_schemas": 1,
+      "notes": "Reuters technology section with rich entity content"
+    },
+    {
+      "id": "news-002",
+      "url": "https://apnews.com/hub/technology",
+      "category": "news_entity_rich",
+      "expected_entities": 15,
+      "expected_schemas": 1,
+      "notes": "AP News technology hub with many named entities"
+    },
+    {
+      "id": "news-003",
+      "url": "https://www.bbc.com/news/technology",
+      "category": "news_entity_rich",
+      "expected_entities": 15,
+      "expected_schemas": 1,
+      "notes": "BBC Technology section with articles and entities"
+    },
+    {
+      "id": "news-004",
+      "url": "https://www.theverge.com/tech",
+      "category": "news_entity_rich",
+      "expected_entities": 15,
+      "expected_schemas": 1,
+      "notes": "The Verge tech section with rich entity content"
+    },
+    {
+      "id": "ecom-001",
+      "url": "https://www.etsy.com/listing/1308730637/",
+      "category": "ecommerce_product",
+      "expected_entities": 5,
+      "expected_schemas": 1,
+      "notes": "Etsy product listing with schema.org/Product JSON-LD"
+    },
+    {
+      "id": "ecom-002",
+      "url": "https://www.target.com/p/apple-airpods-4/-/A-93039524",
+      "category": "ecommerce_product",
+      "expected_entities": 5,
+      "expected_schemas": 1,
+      "notes": "Target product page with structured product data"
+    },
+    {
+      "id": "ecom-003",
+      "url": "https://www.bestbuy.com/site/apple-macbook-air-13-inch-apple-m3-chip-8gb-memory-256gb/6565837.p",
+      "category": "ecommerce_product",
+      "expected_entities": 8,
+      "expected_schemas": 1,
+      "notes": "Best Buy product page with schema.org/Product JSON-LD"
+    },
+    {
+      "id": "ecom-004",
+      "url": "https://www.walmart.com/ip/Apple-AirPods-Pro-2/1752657021",
+      "category": "ecommerce_product",
+      "expected_entities": 5,
+      "expected_schemas": 1,
+      "notes": "Walmart product page with structured product data"
+    }
+  ]
+}

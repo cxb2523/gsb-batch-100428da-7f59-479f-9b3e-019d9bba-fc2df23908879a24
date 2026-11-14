@@ -1,0 +1,11 @@
+{
+  "url": "https://httpbin.org/spec.json",
+  "schemas": [
+    {
+      "type": "OPENAPI",
+      "schema_org_type": null,
+      "key_fields": ["swagger", "info", "paths"],
+      "expected_count": 1
+    }
+  ]
+}

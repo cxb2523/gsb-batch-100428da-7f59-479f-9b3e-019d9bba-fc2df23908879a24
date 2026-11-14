@@ -1,0 +1,11 @@
+{
+  "url": "https://www.eventbrite.com/d/online/free--events/",
+  "schemas": [
+    {
+      "type": "JSON_LD",
+      "schema_org_type": "ItemList",
+      "key_fields": ["itemListElement", "numberOfItems"],
+      "expected_count": 1
+    }
+  ]
+}

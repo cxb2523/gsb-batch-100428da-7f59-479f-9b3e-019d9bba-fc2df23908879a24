@@ -1,0 +1,22 @@
+{
+  "url": "https://www.bbc.com/news/technology",
+  "annotator": "human",
+  "annotated_at": "2026-04-12",
+  "entities": [
+    {"text": "BBC", "type": "ORG"},
+    {"text": "Apple", "type": "ORG"},
+    {"text": "Google", "type": "ORG"},
+    {"text": "Microsoft", "type": "ORG"},
+    {"text": "Meta", "type": "ORG"},
+    {"text": "Amazon", "type": "ORG"},
+    {"text": "United Kingdom", "type": "GPE"},
+    {"text": "United States", "type": "GPE"},
+    {"text": "London", "type": "GPE"},
+    {"text": "Europe", "type": "LOC"},
+    {"text": "Samsung", "type": "ORG"},
+    {"text": "Tesla", "type": "ORG"},
+    {"text": "Elon Musk", "type": "PERSON"},
+    {"text": "OpenAI", "type": "ORG"},
+    {"text": "TikTok", "type": "PRODUCT"}
+  ]
+}

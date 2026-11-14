@@ -1,0 +1,17 @@
+{
+  "url": "https://news.ycombinator.com/",
+  "annotator": "human",
+  "annotated_at": "2026-04-12",
+  "entities": [
+    {"text": "Y Combinator", "type": "ORG"},
+    {"text": "Hacker News", "type": "PRODUCT"},
+    {"text": "Google", "type": "ORG"},
+    {"text": "Microsoft", "type": "ORG"},
+    {"text": "Apple", "type": "ORG"},
+    {"text": "Amazon", "type": "ORG"},
+    {"text": "GitHub", "type": "ORG"},
+    {"text": "San Francisco", "type": "GPE"},
+    {"text": "United States", "type": "GPE"},
+    {"text": "Silicon Valley", "type": "LOC"}
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "url": "https://www.imdb.com/title/tt0111161/",
+  "annotator": "human",
+  "annotated_at": "2026-04-12",
+  "entities": [
+    {"text": "Tim Robbins", "type": "PERSON"},
+    {"text": "Morgan Freeman", "type": "PERSON"},
+    {"text": "Frank Darabont", "type": "PERSON"},
+    {"text": "Stephen King", "type": "PERSON"},
+    {"text": "The Shawshank Redemption", "type": "PRODUCT"},
+    {"text": "Castle Rock Entertainment", "type": "ORG"},
+    {"text": "Columbia Pictures", "type": "ORG"},
+    {"text": "Andy Dufresne", "type": "PERSON"},
+    {"text": "IMDB", "type": "ORG"},
+    {"text": "Bob Gunton", "type": "PERSON"}
+  ]
+}

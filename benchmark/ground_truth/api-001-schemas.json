@@ -1,0 +1,11 @@
+{
+  "url": "https://petstore.swagger.io/",
+  "schemas": [
+    {
+      "type": "OPENAPI",
+      "schema_org_type": null,
+      "key_fields": ["openapi", "info", "paths"],
+      "expected_count": 1
+    }
+  ]
+}

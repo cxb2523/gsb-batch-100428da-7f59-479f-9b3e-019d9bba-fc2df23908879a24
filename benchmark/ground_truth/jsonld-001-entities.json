@@ -1,0 +1,12 @@
+{
+  "url": "https://www.allrecipes.com/recipe/10813/best-chocolate-chip-cookies/",
+  "annotator": "human",
+  "annotated_at": "2026-04-12",
+  "entities": [
+    {"text": "Allrecipes", "type": "ORG"},
+    {"text": "chocolate chip cookies", "type": "PRODUCT"},
+    {"text": "butter", "type": "PRODUCT"},
+    {"text": "vanilla extract", "type": "PRODUCT"},
+    {"text": "brown sugar", "type": "PRODUCT"}
+  ]
+}

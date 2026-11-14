@@ -1,0 +1,11 @@
+{
+  "url": "https://www.imdb.com/title/tt0111161/",
+  "schemas": [
+    {
+      "type": "JSON_LD",
+      "schema_org_type": "Movie",
+      "key_fields": ["name", "director", "actor", "datePublished", "genre"],
+      "expected_count": 1
+    }
+  ]
+}

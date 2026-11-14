@@ -1,0 +1,11 @@
+{
+  "url": "https://www.etsy.com/listing/1308730637/",
+  "schemas": [
+    {
+      "type": "JSON_LD",
+      "schema_org_type": "Product",
+      "key_fields": ["name", "image", "offers"],
+      "expected_count": 1
+    }
+  ]
+}

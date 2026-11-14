@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head><title>Understanding Web Crawlers</title></head>
+<body>
+<nav>
+  <a href="/">Home</a>
+  <a href="/blog">Blog</a>
+  <a href="/about">About</a>
+</nav>
+<div class="ad-banner">
+  <p>Buy our premium plan! Click here for 50% off!</p>
+</div>
+<article>
+  <h1>Understanding Web Crawlers</h1>
+  <p>Web crawlers are automated programs that browse the internet systematically.
+     They are used by search engines like <a href="https://google.com">Google</a>
+     to index web content.</p>
+  <h2>How Crawlers Work</h2>
+  <p>A crawler starts with a list of <strong>seed URLs</strong>. It visits each URL,
+     extracts links, and adds them to a queue. This process is called
+     <em>breadth-first crawling</em>.</p>
+  <h3>Key Components</h3>
+  <ul>
+    <li>URL frontier - manages the queue of URLs to visit</li>
+    <li>Fetcher - downloads web pages</li>
+    <li>Parser - extracts links and content</li>
+    <li>Storage - saves the crawled data</li>
+  </ul>
+  <h2>Robots.txt</h2>
+  <p>Websites use <code>robots.txt</code> to control crawler access. Always respect
+     these rules when building a crawler.</p>
+  <p>Here is an example:</p>
+  <pre><code>User-agent: *
+Disallow: /private/
+Allow: /public/</code></pre>
+  <h2>Conclusion</h2>
+  <p>Web crawlers are essential for the modern internet. They power search engines,
+     AI training data collection, and web archiving.</p>
+</article>
+<footer>
+  <p>Copyright 2026 Example Blog</p>
+  <a href="/privacy">Privacy Policy</a>
+  <a href="/terms">Terms of Service</a>
+</footer>
+<script>console.log("tracking");</script>
+</body>
+</html>

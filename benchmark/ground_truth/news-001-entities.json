@@ -1,0 +1,27 @@
+{
+  "url": "https://www.reuters.com/technology/",
+  "annotator": "human",
+  "annotated_at": "2026-04-12",
+  "entities": [
+    {"text": "Reuters", "type": "ORG"},
+    {"text": "Apple", "type": "ORG"},
+    {"text": "Google", "type": "ORG"},
+    {"text": "Microsoft", "type": "ORG"},
+    {"text": "Meta", "type": "ORG"},
+    {"text": "Amazon", "type": "ORG"},
+    {"text": "Nvidia", "type": "ORG"},
+    {"text": "Tesla", "type": "ORG"},
+    {"text": "OpenAI", "type": "ORG"},
+    {"text": "United States", "type": "GPE"},
+    {"text": "China", "type": "GPE"},
+    {"text": "European Union", "type": "ORG"},
+    {"text": "Samsung", "type": "ORG"},
+    {"text": "Washington", "type": "GPE"},
+    {"text": "Silicon Valley", "type": "LOC"},
+    {"text": "Elon Musk", "type": "PERSON"},
+    {"text": "Tim Cook", "type": "PERSON"},
+    {"text": "Satya Nadella", "type": "PERSON"},
+    {"text": "Mark Zuckerberg", "type": "PERSON"},
+    {"text": "Sam Altman", "type": "PERSON"}
+  ]
+}

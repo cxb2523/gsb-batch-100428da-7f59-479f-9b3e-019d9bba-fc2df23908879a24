@@ -1,0 +1,32 @@
+{
+  "url": "https://en.wikipedia.org/wiki/Artificial_intelligence",
+  "annotator": "human",
+  "annotated_at": "2026-04-12",
+  "entities": [
+    {"text": "John McCarthy", "type": "PERSON"},
+    {"text": "Alan Turing", "type": "PERSON"},
+    {"text": "Marvin Minsky", "type": "PERSON"},
+    {"text": "Geoffrey Hinton", "type": "PERSON"},
+    {"text": "Google", "type": "ORG"},
+    {"text": "DeepMind", "type": "ORG"},
+    {"text": "OpenAI", "type": "ORG"},
+    {"text": "IBM", "type": "ORG"},
+    {"text": "Microsoft", "type": "ORG"},
+    {"text": "Stanford University", "type": "ORG"},
+    {"text": "MIT", "type": "ORG"},
+    {"text": "Dartmouth", "type": "ORG"},
+    {"text": "Deep Blue", "type": "PRODUCT"},
+    {"text": "AlphaGo", "type": "PRODUCT"},
+    {"text": "ChatGPT", "type": "PRODUCT"},
+    {"text": "United States", "type": "GPE"},
+    {"text": "China", "type": "GPE"},
+    {"text": "Europe", "type": "LOC"},
+    {"text": "Yann LeCun", "type": "PERSON"},
+    {"text": "Demis Hassabis", "type": "PERSON"},
+    {"text": "Sam Altman", "type": "PERSON"},
+    {"text": "DARPA", "type": "ORG"},
+    {"text": "Facebook", "type": "ORG"},
+    {"text": "Meta", "type": "ORG"},
+    {"text": "Nvidia", "type": "ORG"}
+  ]
+}

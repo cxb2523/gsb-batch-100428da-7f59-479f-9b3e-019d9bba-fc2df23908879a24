@@ -1,0 +1,9 @@
+# Benchmark suite dependencies
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+spacy>=3.7.0
+beautifulsoup4>=4.12.0
+pydantic>=2.0.0
+crawl4ai>=0.4.0
+requests>=2.31.0
+Levenshtein>=0.25.0
