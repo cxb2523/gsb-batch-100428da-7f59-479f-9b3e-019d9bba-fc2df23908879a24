@@ -12,6 +12,7 @@ import shutil
 import unicodedata
 import requests
 from dataclasses import dataclass
+from typing import Optional
 from urllib.parse import urlparse
 
 from .browser import PersistentBrowser
@@ -603,9 +604,22 @@ def extract_article_items_from_dom(soup):
 
     return items
 
-def extract_film_data(soup):
-    """提取影片信息"""
-    global count_film, film_data_list
+def parse_film_data(soup, start_index=0):
+    """从单页 soup 提取影片数据列表；不修改全局状态，便于离线测试。"""
+    films = []
+
+    def append_film(film_number, film_title, producer):
+        films.append({
+            "film_number": film_number,
+            "film_title": film_title,
+            "producer": producer,
+        })
+        index = start_index + len(films)
+        print_detail(f"第 {index} 个影片 / Video #{index}")
+        print_detail(f"影片编号 / Video ID: {film_number}", level=3, marker="*")
+        print_detail(f"影片名称 / Video Title: {film_title}", level=3, marker="*")
+        print_detail(f"制作人 / Producer: {producer}", level=3, marker="*")
+
     article_items = extract_article_items(soup)
     if article_items is not None:
         for i, article in enumerate(article_items):
@@ -623,21 +637,11 @@ def extract_film_data(soup):
                 producer = (writer.get("name") if isinstance(writer, dict) else None) or "UNKNOWN"
                 producer = str(producer).strip() or "UNKNOWN"
 
-                film_data_list.append({
-                    "film_number": film_number,
-                    "film_title": film_title,
-                    "producer": producer
-                })
-
-                count_film += 1
-                print_detail(f"第 {count_film} 个影片 / Video #{count_film}")
-                print_detail(f"影片编号 / Video ID: {film_number}", level=3, marker="*")
-                print_detail(f"影片名称 / Video Title: {film_title}", level=3, marker="*")
-                print_detail(f"制作人 / Producer: {producer}", level=3, marker="*")
+                append_film(film_number, film_title, producer)
             except Exception as e:
                 error_type = type(e).__name__
                 print_detail(f"跳过第 {i + 1} 个影片 / Skipping video #{i + 1} ({error_type}: {e})")
-        return
+        return films
 
     containers = soup.find_all("div", class_="2xl:w-1/6 xl:w-1/5 lg:w-1/4 md:w-1/2 w-full p-4")
     for i, container in enumerate(containers):
@@ -646,7 +650,7 @@ def extract_film_data(soup):
             if not number_element:
                 number_element = container.find("span", class_="absolute top-0 left-0 text-white bg-gray-800 px-1")
             if not number_element:
-                raise ValueError("影片编号元素未找到，可能未正确提取")  
+                raise ValueError("影片编号元素未找到，可能未正确提取")
             else:
                 film_number = number_element.get_text(strip=True)
 
@@ -658,27 +662,24 @@ def extract_film_data(soup):
 
             producer_element = container.find("a", class_="text-blue-600 dark:text-blue-700 line-clamp-1")
             if not producer_element:
-                # raise ValueError("制作人元素未找到，可能未正确提取")
                 producer = "UNKNOWN"
             else:
                 producer = producer_element.get("title", "").strip()
 
-            # 保存影片数据到列表
-            film_data_list.append({
-                "film_number": film_number,
-                "film_title": film_title,
-                "producer": producer
-            })
-            
-            count_film += 1
-            print_detail(f"第 {count_film} 个影片 / Video #{count_film}")
-            print_detail(f"影片编号 / Video ID: {film_number}", level=3, marker="*")
-            print_detail(f"影片名称 / Video Title: {film_title}", level=3, marker="*")
-            print_detail(f"制作人 / Producer: {producer}", level=3, marker="*")
-            
+            append_film(film_number, film_title, producer)
+
         except Exception as e:
             error_type = type(e).__name__
             print_detail(f"跳过第 {i + 1} 个影片卡片 / Skipping video card #{i + 1} ({error_type}: {e})")
+    return films
+
+
+def extract_film_data(soup):
+    """兼容旧调用方：提取单页影片数据并追加到全局列表。"""
+    global count_film, film_data_list
+    films = parse_film_data(soup, start_index=count_film)
+    film_data_list.extend(films)
+    count_film += len(films)
 
 def extract_actress_info(soup):
     """提取演员名称和头像信息"""
@@ -832,7 +833,89 @@ def prepare_authenticated_session(browser):
 film_data_list = []
 count_film = 0
 
-def validate_film_count(extracted_count, expected_count):
+INTERRUPT_REASON_LOAD_FAILED = "load_failed"
+INTERRUPT_REASON_NO_FILM_DATA = "no_film_data"
+
+INTERRUPT_REASON_LABELS = {
+    INTERRUPT_REASON_LOAD_FAILED: "页面加载失败或超时 / Page load failed or timed out",
+    INTERRUPT_REASON_NO_FILM_DATA: "页面无影片数据 / No film data found on page",
+}
+
+
+@dataclass(frozen=True)
+class PaginationInterruption:
+    """翻页中断位置与可区分的中断原因。"""
+
+    page: int
+    reason: str
+
+    def describe(self):
+        label = INTERRUPT_REASON_LABELS.get(self.reason, self.reason)
+        return f"第 {self.page} 页（{label}）/ page {self.page} ({self.reason})"
+
+
+@dataclass
+class PaginationResult:
+    """一次翻页采集的结果：已提取影片、中断信息、最后成功页码。"""
+
+    films: list
+    interruption: Optional[PaginationInterruption]
+    last_completed_page: int
+
+
+def paginate_film_data(fetch_page, total_pages=None, first_page_soup=None):
+    """逐页提取影片数据；中断时保留已提取数据并记录中断页码与原因。
+
+    fetch_page(page) 返回该页 soup，加载失败返回 None。
+    total_pages 为 None 时逐页抓取直到空页（空页视为正常结束，而非中断）。
+    """
+    films = []
+    interruption = None
+    last_completed_page = 0
+    page = 1
+
+    while True:
+        if total_pages is not None and page > total_pages:
+            break
+        print_step(f"第 {page} 页 / Page {page}")
+        if page == 1 and first_page_soup is not None:
+            page_soup = first_page_soup
+        else:
+            page_soup = fetch_page(page)
+        if page_soup is None:
+            interruption = PaginationInterruption(page, INTERRUPT_REASON_LOAD_FAILED)
+            print_detail(
+                f"第 {page} 页加载失败或超时，停止翻页 / Page {page} failed to load, stopping pagination",
+                marker="!",
+            )
+            break
+        article_items = extract_article_items(page_soup)
+        containers = page_soup.find_all("div", class_="2xl:w-1/6 xl:w-1/5 lg:w-1/4 md:w-1/2 w-full p-4")
+        if (article_items is not None and not article_items) or (article_items is None and not containers):
+            if total_pages is not None:
+                interruption = PaginationInterruption(page, INTERRUPT_REASON_NO_FILM_DATA)
+            print_detail(f"第 {page} 页无影片数据，停止翻页 / No film data on page {page}, stopping")
+            break
+        films.extend(parse_film_data(page_soup, start_index=len(films)))
+        last_completed_page = page
+        page += 1
+
+    return PaginationResult(films, interruption, last_completed_page)
+
+
+def find_duplicate_film_numbers(films):
+    """返回重复出现的影片编号（按首次重复的顺序，去重）。"""
+    seen = set()
+    duplicates = []
+    for film in films:
+        film_number = film.get("film_number")
+        if film_number in seen and film_number not in duplicates:
+            duplicates.append(film_number)
+        seen.add(film_number)
+    return duplicates
+
+
+def validate_film_count(extracted_count, expected_count, interruption=None):
     if expected_count is None:
         print_step("未获取网页显示总数，跳过严格数量校验 / Expected total not found, skipping strict count validation")
         return True
@@ -846,8 +929,71 @@ def validate_film_count(extracted_count, expected_count):
         return True
 
     print_step("数量校验失败 / Count validation failed")
+    print_detail(f"提取数量 / Extracted: {extracted_count}")
+    print_detail(f"网页显示数量 / Expected: {expected_count}")
     print_detail(f"差异 / Difference: {abs(extracted_count - expected_count)} 个影片")
+    if interruption is not None:
+        print_detail(f"翻页中断于 / Pagination interrupted at: {interruption.describe()}", marker="!")
+    else:
+        print_detail(
+            "已完成全部翻页，数量仍不一致 / All pages were fetched, but the count still mismatches",
+            marker="!",
+        )
     return False
+
+
+def finalize_actress_results(actress_folder, target_actress_id, page_one_url, films, interruption, expected_count):
+    """数量校验与落盘策略：不完整结果仅在数据非空且无重复编号时保存。"""
+    print_section("数量校验 / Count validation")
+    extracted_count = len(films)
+    print_step(f"共提取到 {extracted_count} 个影片数据 / Total videos extracted: {extracted_count}")
+    count_valid = validate_film_count(extracted_count, expected_count, interruption=interruption)
+    incomplete = interruption is not None or not count_valid
+
+    if incomplete:
+        if not films:
+            print_step("未成功提取任何影片数据，不创建目录。 / No videos were extracted; no folders created.")
+            return 1
+        duplicates = find_duplicate_film_numbers(films)
+        if duplicates:
+            print_step(
+                f"检测到重复影片编号（{', '.join(duplicates)}），为避免数据混淆，不创建目录。 / "
+                "Duplicate video IDs detected; no folders created."
+            )
+            return 1
+        print_step(
+            "本次采集不完整，已提取数据将按现有命名规则保存为不完整结果。 / "
+            "Crawl is incomplete; saving extracted videos as a partial result."
+        )
+
+    print_section("创建文件夹 / Creating folders")
+
+    os.makedirs(actress_folder)
+    print_step(f"创建演员文件夹 / Creating actress folder: {actress_folder}")
+
+    # 在提取完所有影片数据后创建文件夹
+    create_film_folders(actress_folder, films)
+
+    first_film_id = films[0]["film_number"] if films else "未知ID"
+
+    print_section("创建快捷方式 / Creating shortcut")
+
+    # 创建快捷方式
+    shortcut_name = build_actress_shortcut_name(target_actress_id, first_film_id)
+    create_shortcut(actress_folder, page_one_url, shortcut_name)
+
+    print_section("完成 / Finished")
+    if incomplete:
+        print_step(
+            "已保存不完整采集结果，请根据上方中断/校验信息确认缺失范围。 / "
+            "Partial result saved; check the interruption/validation details above for the missing range."
+        )
+        return 1
+    if expected_count is not None:
+        print_step("所有操作完成，数量校验成功！ / All operations completed, count validation passed!")
+    else:
+        print_step("所有操作完成（未获取网页显示总数，未进行严格数量校验）。 / All operations completed without strict count validation.")
+    return 0
 
 def crawl_actress(browser, target_actress_id):
     global count_film, film_data_list
@@ -856,7 +1002,6 @@ def crawl_actress(browser, target_actress_id):
 
     film_data_list = []
     count_film = 0
-    page = 1
 
     print_section(f"演员 {target_actress_id} / Actress {target_actress_id}")
 
@@ -908,61 +1053,31 @@ def crawl_actress(browser, target_actress_id):
 
     url_1 = build_actress_page_url(target_actress_id)
 
-    # 逐页加载影片数据（直接读取 Inertia JSON，保留旧 DOM 解析作为回退）
-    while True:
-        if total_pages is not None and page > total_pages:
-            break
-        print_step(f"第 {page} 页 / Page {page}")
-        if page == 1:
-            # 第一页已加载，直接使用当前 soup
-            page_soup = soup
-        else:
-            page_soup = fetch_actress_articles(browser, target_actress_id, page)
-        if page_soup is None:
-            break
-        article_items = extract_article_items(page_soup)
-        containers = page_soup.find_all("div", class_="2xl:w-1/6 xl:w-1/5 lg:w-1/4 md:w-1/2 w-full p-4")
-        if article_items is not None and not article_items:
-            print_detail(f"第 {page} 页无影片数据，停止翻页 / No film data on page {page}, stopping")
-            break
-        if article_items is None and not containers:
-            print_detail(f"第 {page} 页无影片数据，停止翻页 / No film data on page {page}, stopping")
-            break
-        extract_film_data(page_soup)
-        page += 1
+    def fetch_page(page_number):
+        return fetch_actress_articles(browser, target_actress_id, page_number)
 
-    print_section("数量校验 / Count validation")
-    extracted_count = len(film_data_list)
-    print_step(f"共提取到 {extracted_count} 个影片数据 / Total videos extracted: {extracted_count}")
-    if not validate_film_count(extracted_count, num_films):
-        print_step("提取数量与网页显示总数不一致，停止创建文件夹并跳过当前演员。 / Count mismatch, skipping current actress before creating folders.")
-        return 1
+    # 逐页加载影片数据（直接读取 Inertia JSON，保留旧 DOM 解析作为回退）；
+    # 翻页中断时保留已提取数据并记录中断页码与原因。
+    pagination = paginate_film_data(fetch_page, total_pages=total_pages, first_page_soup=soup)
+    film_data_list = pagination.films
+    count_film = len(film_data_list)
 
-    print_section("创建文件夹 / Creating folders")
+    if pagination.interruption is not None:
+        print_step(
+            f"翻页中断 / Pagination interrupted: {pagination.interruption.describe()}；"
+            f"已保留前 {pagination.last_completed_page} 页提取的 {len(film_data_list)} 个影片。 / "
+            f"Kept {len(film_data_list)} videos from {pagination.last_completed_page} completed page(s).",
+            marker="!",
+        )
 
-    os.makedirs(actress_folder)
-    print_step(f"创建演员文件夹 / Creating actress folder: {actress_folder}")
-
-    # 在提取完所有影片数据后创建文件夹
-    create_film_folders(actress_folder, film_data_list)
-
-    first_film_id = film_data_list[0]["film_number"] if film_data_list else "未知ID"
-
-    print_section("创建快捷方式 / Creating shortcut")
-
-    # 创建快捷方式
-    shortcut_name = build_actress_shortcut_name(target_actress_id, first_film_id)
-    create_shortcut(actress_folder, url_1, shortcut_name)
-
-    # # 下载头像
-    # download_avatar(actress_folder, avatar_url, avatar_name=f'id_{target_actress_id}'+'.png')
-
-    print_section("完成 / Finished")
-    if num_films is not None:
-        print_step("所有操作完成，数量校验成功！ / All operations completed, count validation passed!")
-    else:
-        print_step("所有操作完成（未获取网页显示总数，未进行严格数量校验）。 / All operations completed without strict count validation.")
-    return 0
+    return finalize_actress_results(
+        actress_folder,
+        target_actress_id,
+        url_1,
+        film_data_list,
+        pagination.interruption,
+        num_films,
+    )
 
 
 def main():
