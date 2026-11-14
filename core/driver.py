@@ -1248,6 +1248,7 @@ def create_web_action_context(executed_actions, browser_info, webpage_info):
     """Create context for web agent actions."""
     # Format previous actions
     previous_actions_formatted = []
+    selector_fallbacks_formatted = []
     i = 0
     while i < len(executed_actions):
         # Check if current item is a response message
@@ -1264,11 +1265,26 @@ def create_web_action_context(executed_actions, browser_info, webpage_info):
                 previous_actions_formatted.append(f"{len(previous_actions_formatted) + 1}. Response Message: {response_message}")
                 i += 1
         else:
+            entry = executed_actions[i]
             # If it's an action without a preceding message
-            previous_actions_formatted.append(f"{len(previous_actions_formatted) + 1}. Action: {executed_actions[i]}")
+            previous_actions_formatted.append(f"{len(previous_actions_formatted) + 1}. Action: {entry}")
+            if isinstance(entry, str) and entry.startswith("SELECTOR_FALLBACK"):
+                selector_fallbacks_formatted.append(entry[len("SELECTOR_FALLBACK"):].lstrip(" -:").strip())
             i += 1
 
     previous_actions = "\n".join(previous_actions_formatted) if previous_actions_formatted else ""
+
+    selector_fallback_note = ""
+    if selector_fallbacks_formatted:
+        fallback_lines = "\n".join(
+            f"- {line}" for line in selector_fallbacks_formatted
+        )
+        selector_fallback_note = (
+            f"\n\nStale selectors detected - the original selectors below no longer resolve "
+            f"on the page and the listed replacement selectors were used successfully. "
+            f"Do not reuse the original selectors:"
+            f"\n{fallback_lines}"
+        )
 
     # Build MCP tool details and recent results for web assistant context
     try:
@@ -1368,17 +1384,20 @@ def create_web_action_context(executed_actions, browser_info, webpage_info):
         f"\n6. Wait for pages to load after navigation before performing actions."
         f"\n7. Use JavaScript execution only when simpler actions won't work."
         f"\nPrevious Actions:{f'\n{previous_actions}' if previous_actions else ' There are no previous actions performed.'}"
+        f"{selector_fallback_note}"
         f"\n\nCurrent Browser Information:"
         f"\n{browser_info}"
         f"\n\nCurrent Webpage Information:"
         f"\n{webpage_info}"
     )
 
-def extract_page_selectors(browser_instance, max_elements=50):
-    """Extract robust selector information from a webpage for automation."""
-    try:
-        # Use JavaScript to extract element details and robust selectors
-        script = """
+def _run_page_element_script(browser_instance, max_elements=50):
+    """Run the element inventory script and return the raw element list.
+
+    Raises on failure so callers can decide how to surface the error.
+    """
+    # Use JavaScript to extract element details and robust selectors
+    script = """
         function getElementInfo() {
             const elements = [];
             const allElements = document.querySelectorAll('button, a, input, select, textarea, [role], [data-testid], [data-cy], [data-qa], .btn, form');
@@ -1462,7 +1481,26 @@ def extract_page_selectors(browser_instance, max_elements=50):
         }
         return getElementInfo(arguments[0]);
         """
-        elements = browser_instance.execute_script(script, max_elements)
+    return browser_instance.execute_script(script, max_elements)
+
+
+def extract_page_elements(browser_instance, max_elements=50):
+    """Return the structured element inventory for the current page.
+
+    Each entry is a dict with tagName, selectors, text, type, placeholder,
+    isVisible and attributes. Returns a list (possibly empty) and never raises.
+    """
+    try:
+        elements = _run_page_element_script(browser_instance, max_elements)
+        return elements if isinstance(elements, list) else []
+    except Exception:
+        return []
+
+
+def extract_page_selectors(browser_instance, max_elements=50):
+    """Extract robust selector information from a webpage for automation."""
+    try:
+        elements = _run_page_element_script(browser_instance, max_elements)
         # Format the results for AI prompt
         formatted_elements = []
         for i, el in enumerate(elements):
@@ -1486,8 +1524,457 @@ def extract_page_selectors(browser_instance, max_elements=50):
     except Exception as e:
         return f"Error extracting page selectors: {str(e)}"
 
-def execute_web_action(action_json, sb_driver, delay=1.0):
-    """Execute a web action using SeleniumBase driver."""
+# Actions whose execution depends on a model-provided CSS/XPath selector.
+# navigate_to, scroll, wait, execute_javascript, mcp_call, open_tab, switch_tab
+# and submit_form are intentionally excluded: they must never fall back.
+_SELECTOR_DEPENDENT_ACTIONS = (
+    'click',
+    'input_text',
+    'extract_text',
+    'select_option',
+    'wait_for_element',
+)
+
+# Fallbacks recorded during the most recent execute_web_action() call.
+# Kept for callers that do not pass an explicit fallback_log list.
+_web_action_fallbacks = []
+
+# Tokens too generic to identify an element on their own.
+_FALLBACK_STOPWORDS = {
+    'the', 'a', 'an', 'on', 'in', 'into', 'to', 'of', 'and', 'or', 'it',
+    'this', 'that', 'with', 'for', 'please', 'click', 'clicks', 'clicking',
+    'press', 'type', 'typing', 'enter', 'select', 'selects', 'choose',
+    'field', 'element', 'value', 'button', 'btn', 'input', 'textbox',
+    'item', 'items', 'box',
+}
+
+# Relative importance of each attribute/field when matching an inventory
+# element against a stale selector.
+_FALLBACK_FIELD_WEIGHTS = {
+    'text': 3.0,
+    'placeholder': 3.0,
+    'aria-label': 3.0,
+    'data-testid': 3.0,
+    'data-cy': 3.0,
+    'data-qa': 3.0,
+    'name': 2.5,
+    'alt': 2.0,
+    'title': 2.0,
+    'id': 2.0,
+    'class': 1.5,
+    'value': 1.0,
+    'type': 0.5,
+}
+
+# Fields whose content represents human-readable identification of the element.
+_FALLBACK_DESCRIPTIVE_FIELDS = ('text', 'placeholder', 'name', 'aria-label', 'alt', 'title')
+
+# Minimum score / separation required before a fallback is attempted.
+_FALLBACK_MIN_SCORE = 4.0
+_FALLBACK_MIN_MARGIN = 1.0
+
+# Maximum number of replacement selectors tried for a single action.
+_FALLBACK_MAX_CANDIDATES = 6
+
+_LOOKUP_FAILURE_EXCEPTION_NAMES = {
+    'nosuchelementexception',
+    'timeoutexception',
+    'elementnotvisibleexception',
+    'elementnotinteractableexception',
+    'staleelementreferenceexception',
+}
+
+_LOOKUP_FAILURE_MESSAGE_HINTS = (
+    'no such element',
+    'element not found',
+    'unable to locate',
+    'cannot locate',
+    'element does not exist',
+    'element is not present',
+    'not present in the dom',
+    'timed out',
+    'timeout',
+    'element not visible',
+    'not interactable',
+)
+
+
+def _tokenize_for_match(value):
+    """Lowercase alphanumeric tokens, minus generic stopwords."""
+    if value is None:
+        return set()
+    try:
+        tokens = set(re.findall(r'[a-z0-9]+', str(value).lower()))
+    except Exception:
+        return set()
+    return {t for t in tokens if len(t) > 1 and t not in _FALLBACK_STOPWORDS}
+
+
+def _selector_signature(selector):
+    """Derive identifying signals (tokens, exact values, tags) from a selector."""
+    signature = {'tokens': set(), 'exact': {}, 'tags': set()}
+    raw = '' if selector is None else str(selector).strip()
+    if not raw:
+        return signature
+
+    xpath = raw
+    lowered = raw.lower()
+    if lowered.startswith('xpath:'):
+        xpath = raw.split(':', 1)[1].strip()
+
+    is_xpath = xpath.startswith('/') or xpath.startswith('(') or lowered.startswith('xpath:')
+
+    if is_xpath:
+        for attr, val in re.findall(r'@([\w:-]+)\s*=\s*["\']([^"\']*)["\']', xpath):
+            attr = attr.lower()
+            signature['exact'].setdefault(attr, set()).add(val.strip().lower())
+            signature['tokens'] |= _tokenize_for_match(val)
+        for val in re.findall(
+            r'contains\(\s*(?:text\(\)|@[\w:-]+)\s*,\s*["\']([^"\']*)["\']\s*\)', xpath
+        ):
+            signature['tokens'] |= _tokenize_for_match(val)
+        # XPath text literals such as //button[text()="Save"]
+        for val in re.findall(r'text\(\)\s*=\s*["\']([^"\']*)["\']', xpath):
+            signature['tokens'] |= _tokenize_for_match(val)
+        for tag in re.findall(r'//([a-zA-Z][\w-]*)', xpath):
+            signature['tags'].add(tag.lower())
+        return signature
+
+    # CSS selector
+    for tag in re.findall(r'(?:^|[\s>+~,])([a-zA-Z][\w-]*)', raw):
+        signature['tags'].add(tag.lower())
+    for ident in re.findall(r'#([\w-]+)', raw):
+        signature['exact'].setdefault('id', set()).add(ident.strip().lower())
+        signature['tokens'] |= _tokenize_for_match(ident)
+    for cls in re.findall(r'\.([\w-]+)', raw):
+        signature['exact'].setdefault('class', set()).add(cls.strip().lower())
+        signature['tokens'] |= _tokenize_for_match(cls)
+    for attr, val in re.findall(r'\[([\w:-]+)\s*=\s*["\']?([^"\'\]\s]+)["\']?\s*\]', raw):
+        attr = attr.lower()
+        signature['exact'].setdefault(attr, set()).add(val.strip().lower())
+        signature['tokens'] |= _tokenize_for_match(val)
+    return signature
+
+
+def _element_field_values(element):
+    """Flatten an inventory element into a lowercase field -> value mapping."""
+    values = {}
+    if not isinstance(element, dict):
+        return values
+    attributes = element.get('attributes')
+    if isinstance(attributes, dict):
+        for key, value in attributes.items():
+            if isinstance(key, str) and value is not None:
+                values[key.lower()] = str(value)
+    text = element.get('text')
+    if text:
+        values['text'] = str(text)
+    placeholder = element.get('placeholder')
+    if placeholder:
+        values.setdefault('placeholder', str(placeholder))
+    tag_name = element.get('tagName')
+    if tag_name:
+        values['tag'] = str(tag_name)
+    return values
+
+
+def _tag_compatibility_bonus(values, act_type):
+    """Prefer elements whose tag/role can actually perform the action."""
+    tag = values.get('tag', '').lower()
+    role = values.get('role', '').lower()
+    input_type = values.get('type', '').lower()
+
+    if act_type == 'click':
+        if tag in ('button', 'a') or role == 'button' or input_type in (
+            'button', 'submit', 'reset', 'checkbox', 'radio'
+        ):
+            return 2.5
+        if tag in ('input', 'textarea', 'select'):
+            return -2.0
+    elif act_type == 'input_text':
+        if tag in ('input', 'textarea') or values.get('contenteditable', '').lower() == 'true':
+            return 2.5
+        if tag in ('button', 'a', 'select'):
+            return -2.0
+    elif act_type == 'select_option':
+        if tag == 'select' or role in ('combobox', 'listbox'):
+            return 2.5
+        if tag in ('button', 'a', 'input'):
+            return -2.0
+    return 0.0
+
+
+def _score_element_for_fallback(element, signature, detail_tokens, detail_text, act_type):
+    """Score how likely an inventory element is the element a stale selector meant.
+
+    Every signal used here is read from the page element inventory (attributes,
+    visible text) or from the action's own detail description, so a fallback is
+    never constructed from thin air.
+    """
+    values = _element_field_values(element)
+    score = 0.0
+
+    for field, weight in _FALLBACK_FIELD_WEIGHTS.items():
+        raw = values.get(field)
+        if not raw:
+            continue
+        element_tokens = _tokenize_for_match(raw)
+        if not element_tokens:
+            continue
+        overlap = element_tokens & signature['tokens']
+        if overlap:
+            score += weight * min(len(overlap), 3)
+        if field in _FALLBACK_DESCRIPTIVE_FIELDS:
+            detail_overlap = element_tokens & detail_tokens
+            if detail_overlap:
+                score += 2.0 * min(len(detail_overlap), 2)
+
+        exact_values = signature['exact'].get(field)
+        if exact_values:
+            lowered = raw.strip().lower()
+            if lowered in exact_values:
+                score += 6.0
+            elif field == 'class':
+                classes = set(lowered.split())
+                if classes & exact_values:
+                    score += 4.0
+
+    tag = values.get('tag', '').lower()
+    if tag and tag in signature['tags']:
+        score += 1.5
+
+    text = values.get('text', '')
+    if text and len(text) >= 3 and detail_text and text.lower() in detail_text:
+        score += 3.5
+
+    score += _tag_compatibility_bonus(values, act_type)
+    return score
+
+
+def _find_fallback_element(inventory, selector, act_type, detail):
+    """Find the single best inventory match for a stale selector.
+
+    Returns the matched element dict, or None when the page element list has no
+    confident, unambiguous correspondence.
+    """
+    if not inventory:
+        return None
+
+    # A missing selector is not a stale selector: there is nothing to match
+    # against, so no downgrade may be derived from detail text alone.
+    if not ('' if selector is None else str(selector)).strip():
+        return None
+
+    signature = _selector_signature(selector)
+    detail_text = ''
+    detail_tokens = set()
+    # detail carries element identity only for actions where it is descriptive;
+    # for input_text/select_option it is the payload/option, not the target.
+    if act_type in ('click', 'extract_text', 'wait_for_element'):
+        detail_text = '' if detail is None else str(detail).lower()
+        detail_tokens = _tokenize_for_match(detail)
+
+    scored = []
+    for element in inventory:
+        if not isinstance(element, dict):
+            continue
+        if element.get('isVisible') is False:
+            continue
+        try:
+            score = _score_element_for_fallback(
+                element, signature, detail_tokens, detail_text, act_type
+            )
+        except Exception:
+            continue
+        if score > 0:
+            scored.append((score, element))
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    best_score, best_element = scored[0]
+    if best_score < _FALLBACK_MIN_SCORE:
+        return None
+    if len(scored) > 1 and (best_score - scored[1][0]) < _FALLBACK_MIN_MARGIN:
+        # Two elements look equally plausible - refuse to guess.
+        return None
+    return best_element
+
+
+def _fallback_candidates(element, original_selector):
+    """Return usable replacement selectors from the inventory element."""
+    selectors = element.get('selectors') if isinstance(element, dict) else None
+    if not isinstance(selectors, list):
+        return []
+
+    original_norm = ('' if original_selector is None else str(original_selector)).strip().lower()
+    candidates = []
+    seen = set()
+    for selector in selectors:
+        if not isinstance(selector, str):
+            continue
+        candidate = selector.strip()
+        if not candidate:
+            continue
+        # The inventory labels XPath alternatives for readability; strip the
+        # label so the raw expression can be handed to the driver.
+        if candidate.lower().startswith('xpath:'):
+            candidate = candidate.split(':', 1)[1].strip()
+        if not candidate:
+            continue
+        key = candidate.lower()
+        if key == original_norm or key in seen:
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+        if len(candidates) >= _FALLBACK_MAX_CANDIDATES:
+            break
+    return candidates
+
+
+def _is_element_lookup_failure(exc):
+    """True when an exception means the element could not be located/seen."""
+    if exc is None:
+        return False
+    for klass in type(exc).__mro__:
+        if klass.__name__.lower() in _LOOKUP_FAILURE_EXCEPTION_NAMES:
+            return True
+    try:
+        message = str(exc).lower()
+    except Exception:
+        message = ''
+    return any(hint in message for hint in _LOOKUP_FAILURE_MESSAGE_HINTS)
+
+
+def _perform_selector_action(sb_driver, act_type, selector, detail):
+    """Execute one selector-dependent action; returns its result if it has one."""
+    if act_type == 'click':
+        sb_driver.click(selector)
+        return None
+    if act_type == 'input_text':
+        sb_driver.type(selector, detail)
+        return None
+    if act_type == 'select_option':
+        sb_driver.select_option_by_text(selector, detail)
+        return None
+    if act_type == 'wait_for_element':
+        sb_driver.wait_for_element_visible(selector)
+        return None
+    if act_type == 'extract_text':
+        return sb_driver.get_text(selector)
+    raise ValueError(f"Unsupported selector-dependent action: {act_type}")
+
+
+def _page_element_inventory(sb_driver):
+    """Read the element inventory from the page, tolerating SB/driver wrapping."""
+    drivers = []
+    inner = getattr(sb_driver, 'driver', None)
+    if inner is not None and inner is not sb_driver:
+        drivers.append(inner)
+    drivers.append(sb_driver)
+    for driver in drivers:
+        elements = extract_page_elements(driver)
+        if elements:
+            return elements
+    return []
+
+
+def _execute_selector_action_with_fallback(sb_driver, act_type, selector, detail):
+    """Run the action with the original selector, then fall back if it is stale.
+
+    Returns (success, result, fallback_record, failure). On fallback success,
+    fallback_record describes the original and replacement selectors. On
+    failure, `failure` explains why in a user-readable way.
+    """
+    try:
+        result = _perform_selector_action(sb_driver, act_type, selector, detail)
+        return True, result, None, None
+    except Exception as exc:
+        if not _is_element_lookup_failure(exc):
+            # Not a missing/timed-out element: preserve original behaviour.
+            raise
+        original_error = exc
+
+    inventory = _page_element_inventory(sb_driver)
+    if not inventory:
+        return False, None, None, (
+            f'Element not found for selector "{selector}" ({act_type}) and the page '
+            f'element list is unavailable; no fallback selector could be used.'
+        )
+
+    element = _find_fallback_element(inventory, selector, act_type, detail)
+    if element is None:
+        return False, None, None, (
+            f'Element not found for selector "{selector}" ({act_type}); the page '
+            f'element list has no matching element to fall back to.'
+        )
+
+    candidates = _fallback_candidates(element, selector)
+    if not candidates:
+        return False, None, None, (
+            f'Element not found for selector "{selector}" ({act_type}); the matched '
+            f'page element has no alternative selector available.'
+        )
+
+    last_error = None
+    for candidate in candidates:
+        try:
+            result = _perform_selector_action(sb_driver, act_type, candidate, detail)
+        except Exception as exc:
+            if not _is_element_lookup_failure(exc):
+                # A non-lookup error means this candidate was found but the
+                # action itself failed; surface it rather than silently
+                # burning through the remaining candidates.
+                raise
+            last_error = exc
+            continue
+        record = {
+            'act': act_type,
+            'original_selector': selector,
+            'fallback_selector': candidate,
+        }
+        return True, result, record, None
+
+    return False, None, None, (
+        f'Element not found for selector "{selector}" ({act_type}) and all '
+        f'{len(candidates)} replacement selector(s) from the page element list failed '
+        f'(original error: {original_error}; last replacement error: {last_error}).'
+    )
+
+
+def _format_selector_fallback_message(record):
+    """One readable line for the web chat area describing a downgrade."""
+    return (
+        f'[Selector fallback] {record["act"]}: original selector '
+        f'"{record["original_selector"]}" was not found; used replacement selector '
+        f'"{record["fallback_selector"]}" from the page element list instead.'
+    )
+
+
+def _format_selector_fallback_context_line(record):
+    """Context line persisted in executed_actions for later planning rounds."""
+    return (
+        f'SELECTOR_FALLBACK - {record["act"]}: original selector '
+        f'"{record["original_selector"]}" no longer resolves on the page; the action '
+        f'succeeded with "{record["fallback_selector"]}"; reuse that selector instead.'
+    )
+
+
+def execute_web_action(action_json, sb_driver, delay=1.0, fallback_log=None):
+    """Execute a web action using SeleniumBase driver.
+
+    Selector-dependent actions are retried against alternative selectors from
+    the page element inventory when the original selector no longer resolves.
+    ``fallback_log``, when provided, receives a dict per downgrade; the same
+    records are also exposed through the module-level ``_web_action_fallbacks``.
+    """
+    if fallback_log is None:
+        # Default to the module-level log, reset here so records from a previous
+        # action do not leak. Caller-supplied lists are never cleared.
+        _web_action_fallbacks.clear()
+        fallback_log = _web_action_fallbacks
+
     try:
         action_data = json.loads(action_json)
         action = action_data['action'][0]
@@ -1498,26 +1985,29 @@ def execute_web_action(action_json, sb_driver, delay=1.0):
         wait = float(action.get('wait', delay))
 
         result = None
+        fallback_record = None
 
         # Execute action based on action type using SeleniumBase methods
-        if act_type == 'navigate_to':
+        if act_type in _SELECTOR_DEPENDENT_ACTIONS:
+            # Selector-dependent actions degrade to inventory-derived
+            # replacement selectors when the original selector is stale.
+            success, result, fallback_record, failure = (
+                _execute_selector_action_with_fallback(
+                    sb_driver, act_type, selector, detail
+                )
+            )
+            if not success:
+                print_to_web_chat(failure)
+                return False, None
+            if fallback_record is not None:
+                try:
+                    fallback_log.append(fallback_record)
+                except Exception:
+                    pass
+                print_to_web_chat(_format_selector_fallback_message(fallback_record))
+
+        elif act_type == 'navigate_to':
             sb_driver.open(detail)
-
-        elif act_type == 'click':
-            sb_driver.click(selector)
-
-        elif act_type == 'input_text':
-            sb_driver.type(selector, detail)
-
-        elif act_type == 'select_option':
-            sb_driver.select_option_by_text(selector, detail)
-
-        elif act_type == 'wait_for_element':
-            sb_driver.wait_for_element_visible(selector)
-
-        elif act_type == 'extract_text':
-            text = sb_driver.get_text(selector)
-            result = text
 
         elif act_type == 'scroll':
             if detail.lower() == 'down':
@@ -1831,7 +2321,10 @@ def web_assistant(goal="", executed_actions=None, headless=False, use_vision=Fal
                 # Display the raw JSON action in the chat
                 print_to_web_chat(f"```json\n{next_action}\n```", False)
 
-                success, result_data = execute_web_action(next_action, sb, action_delay) # Pass sb driver
+                selector_fallbacks = []
+                success, result_data = execute_web_action(
+                    next_action, sb, action_delay, fallback_log=selector_fallbacks
+                ) # Pass sb driver
 
                 if not success:
                     print_to_web_chat("Web action execution failed!")
@@ -1852,6 +2345,13 @@ def web_assistant(goal="", executed_actions=None, headless=False, use_vision=Fal
                     except Exception as e:
                         print_to_web_chat(f"Error parsing action JSON: {str(e)}")
                         executed_actions.append(str(next_action))
+
+                # Persist downgrade details so the next planning round sees
+                # that the original selector is stale.
+                for fallback in selector_fallbacks:
+                    executed_actions.append(
+                        _format_selector_fallback_context_line(fallback)
+                    )
 
             attempt += 1
 

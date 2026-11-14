@@ -32,6 +32,46 @@ def print_to_chat(message, is_user=False):
         # Emit signal to add message in the main thread
         chat_signals.message_received.emit(translated_message, is_user)
 
+def print_to_web_chat(message, is_user=False):
+    """Prints a message to the Web Agent chat area.
+
+    Falls back to the main chat area when the Web Agent tab is not available,
+    and to stdout when no UI is attached at all (e.g. headless runs).
+    """
+    text = str(message)
+
+    try:
+        app = app_instance
+        tab_widget = getattr(app, "tab_widget", None) if app is not None else None
+        if tab_widget is not None:
+            for index in range(tab_widget.count()):
+                widget = tab_widget.widget(index)
+                # The Web Agent tab is the only tab that owns both a
+                # process_message method and a messageReceived signal.
+                if (
+                    widget is not None
+                    and hasattr(widget, "messageReceived")
+                    and hasattr(widget, "process_message")
+                ):
+                    widget.messageReceived.emit(text, bool(is_user))
+                    return
+    except Exception as e:
+        print(f"Error printing to web chat: {str(e)}")
+
+    # No Web Agent tab available - mirror to the regular chat area if possible.
+    try:
+        if app_instance is not None:
+            print_to_chat(text, is_user)
+            return
+    except Exception:
+        pass
+
+    # Last resort (no UI at all, e.g. unattended/headless execution).
+    try:
+        print(text)
+    except Exception:
+        pass
+
 def set_app_instance(app):
     """Sets the global app instance and connects signals."""
     global app_instance
