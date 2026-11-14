@@ -76,9 +76,19 @@ export interface Pagination {
   pages: number[]
 }
 
+/**
+ * 列表抓取结局
+ * - `success`: 页面抓取与列表解析均成功
+ * - `fetch_failed`: 目标页抓取失败（如上游返回 404、5xx）
+ * - `parse_failed`: 页面已抓取，但缺少影片列表容器或分页容器，无法解析
+ */
+export type MoviesPageOutcome = 'success' | 'fetch_failed' | 'parse_failed'
+
 export interface MoviesPage {
   movies: Movie[]
   pagination: Pagination
+  /* 抓取结局；成功时可缺省，以兼容旧调用方 */
+  outcome?: MoviesPageOutcome
 }
 
 export interface StarInfo {

@@ -365,6 +365,8 @@ GET
     "nextPage": 2,
     "pages": [1, 2, 3]
   },
+  // 抓取结局，可能的值见下方说明
+  "outcome": "success",
   // 筛选信息，注意：只有在请求参数包含 filterType 和 filterValue 时才会返回
   "filter": {
     "name": "岬ななみ",
@@ -375,6 +377,19 @@ GET
 ```
 
 </details>
+
+#### 抓取结局（`outcome`）
+
+`outcome` 是新增的可选字段，用于让调用方核对这次抓取覆盖了哪一页、失败在哪一步；原有的 `movies`、`pagination`、`filter` 字段含义与结构不变。
+
+| 值             | 含义                                                               | HTTP 状态码 |
+| -------------- | ------------------------------------------------------------------ | ----------- |
+| `success`      | 页面抓取与列表解析均成功（成功时该字段也可能缺省，以兼容旧调用方） | 200         |
+| `fetch_failed` | 目标页返回了 HTTP 错误（如 404、5xx），页面未能抓到                | 200         |
+| `parse_failed` | 页面已抓到，但无法定位影片列表容器或分页容器，无法解析出可靠的列表 | 200         |
+
+- `fetch_failed` 与 `parse_failed` 时，`movies` 为空数组，`pagination` 结构完整：`currentPage` 取本次请求的页码、`hasNextPage` 为 `false`、`nextPage` 为 `null`、`pages` 为空数组；请求带 `filterType`/`filterValue` 时 `filter` 结构照常返回。
+- 连接被拒绝、超时等**真正的网络错误**不会被包装成结局，仍按原有错误链路返回对应的非 200 状态码，响应形如 `{ "error": "...", "messages": [] }`。
 
 ### /api/movies/search
 

@@ -23,7 +23,9 @@ movieRouter.get('/', validate(moviesPageValidator), async (req, res, next) => {
   try {
     const response = await getMoviesByPage(req.query)
 
-    res.json(response)
+    // 抓取失败 / 解析失败已收敛为带结局标记的结果，仍以 200 返回，便于调用方核对抓取覆盖情况；
+    // 真正的网络错误不会被包装成结局，仍会抛出并交给错误中间件
+    res.status(200).json(response)
   } catch (e) {
     next(e)
   }

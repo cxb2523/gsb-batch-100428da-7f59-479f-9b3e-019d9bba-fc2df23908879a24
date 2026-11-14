@@ -1,4 +1,5 @@
 import bytes from 'bytes'
+import { HTTPError } from 'got'
 import { type HTMLElement, parse } from 'node-html-parser'
 import probe from 'probe-image-size'
 
@@ -39,11 +40,41 @@ const starInfoMap: Record<StarInfoOptionalKey, string> = {
   hobby: '愛好: ',
 }
 
-function parseMoviesPage(pageHTML: string, filter?: (movie: Movie) => boolean): MoviesPage {
+interface MoviesPageParseSuccess {
+  outcome: 'success'
+  moviesPage: MoviesPage
+}
+
+interface MoviesPageParseFailure {
+  outcome: 'parse_failed'
+}
+
+type MoviesPageParseResult = MoviesPageParseSuccess | MoviesPageParseFailure
+
+interface MoviesPageFilter {
+  name: string
+  type: FilterType
+  value: string
+}
+
+type MoviesPageWithFilter = MoviesPage & { filter?: MoviesPageFilter }
+
+function parseMoviesPage(
+  pageHTML: string,
+  filter?: (movie: Movie) => boolean,
+): MoviesPageParseResult {
   const doc = parse(pageHTML)
 
+  const movieListContainer = doc.querySelector('#waterfall')
+  const paginationContainer = doc.querySelector('.pagination')
+
+  // 页面结构不符合预期时视为解析失败，避免返回看似正常却缺少分页信息的列表
+  if (!movieListContainer || !paginationContainer) {
+    return { outcome: 'parse_failed' }
+  }
+
   const movies = doc
-    .querySelectorAll('#waterfall #waterfall .item')
+    .querySelectorAll('#waterfall .item')
     .map((item) => {
       const img =
         formatImageUrl(item.querySelector('.photo-frame img')?.getAttribute('src')) ?? null
@@ -68,7 +99,25 @@ function parseMoviesPage(pageHTML: string, filter?: (movie: Movie) => boolean): 
   const hasNextPage = doc.querySelector('.pagination li #next') !== null
   const nextPage = hasNextPage ? currentPage + 1 : null
 
-  return { movies, pagination: { currentPage, hasNextPage, nextPage, pages } }
+  return {
+    outcome: 'success',
+    moviesPage: { movies, pagination: { currentPage, hasNextPage, nextPage, pages } },
+  }
+}
+
+/* 解析失败时返回的分页占位结构，页码取本次请求页码 */
+function createEmptyMoviesPage(requestedPage?: string): MoviesPage {
+  const pageNumber = Number(requestedPage ?? '1')
+
+  return {
+    movies: [],
+    pagination: {
+      currentPage: Number.isFinite(pageNumber) ? pageNumber : 1,
+      hasNextPage: false,
+      nextPage: null,
+      pages: [],
+    },
+  }
 }
 
 export function parseStarInfo(pageHTML: string, starId: string): StarInfo {
@@ -100,11 +149,28 @@ export function parseStarInfo(pageHTML: string, starId: string): StarInfo {
   }
 }
 
-function parseFilterInfo(pageHTML: string, type: FilterType, value: string) {
+function parseFilterInfo(pageHTML: string, type: FilterType, value: string): MoviesPageFilter {
   const doc = parse(pageHTML)
   const name = doc.querySelector('title')?.textContent.match(/^(?:第\d+?頁 - )?(.+?) - /)?.[1] ?? ''
 
   return { name, type, value }
+}
+
+/* 解析阶段不向外抛异常，任何结构异常都收敛为解析失败结局 */
+function safeParseMoviesPage(pageHTML: string): MoviesPageParseResult {
+  try {
+    return parseMoviesPage(pageHTML)
+  } catch {
+    return { outcome: 'parse_failed' }
+  }
+}
+
+function safeParseFilterInfo(pageHTML: string, type: FilterType, value: string): MoviesPageFilter {
+  try {
+    return parseFilterInfo(pageHTML, type, value)
+  } catch {
+    return { name: '', type, value }
+  }
 }
 
 export async function getMoviesByPage({
@@ -113,7 +179,7 @@ export async function getMoviesByPage({
   type,
   filterType,
   filterValue,
-}: GetMoviesQuery) {
+}: GetMoviesQuery): Promise<MoviesPageWithFilter> {
   let prefix = !type || type == 'normal' ? JAVBUS : `${JAVBUS}/${type}`
   prefix = filterType ? `${prefix}/${filterType}` : prefix
   const url =
@@ -125,15 +191,35 @@ export async function getMoviesByPage({
         ? `${prefix}/${filterValue}/${page}`
         : `${prefix}/page/${page}`
 
-  const res = await client(url, {
-    headers: { Cookie: `existmag=${magnet === 'exist' ? 'mag' : 'all'}` },
-  }).text()
+  /* ----------------- 阶段一：抓取页面 ------------------ */
+  let pageHTML: string
+  try {
+    pageHTML = await client(url, {
+      headers: { Cookie: `existmag=${magnet === 'exist' ? 'mag' : 'all'}` },
+    }).text()
+  } catch (error) {
+    // 上游返回 HTTP 错误（如 404、5xx）说明目标页抓取失败，以结局标记返回；
+    // 连接被拒绝、超时等真正的网络错误仍按现有错误链路抛出
+    if (error instanceof HTTPError) {
+      const filterInfo =
+        filterType && filterValue ? { name: '', type: filterType, value: filterValue } : undefined
 
-  const moviesPage = parseMoviesPage(res)
+      return { ...createEmptyMoviesPage(page), outcome: 'fetch_failed', filter: filterInfo }
+    }
+    throw error
+  }
+
   const filterInfo =
-    filterType && filterValue ? parseFilterInfo(res, filterType, filterValue) : undefined
+    filterType && filterValue ? safeParseFilterInfo(pageHTML, filterType, filterValue) : undefined
 
-  return { ...moviesPage, filter: filterInfo }
+  /* ----------------- 阶段二：解析列表 ------------------ */
+  const parseResult = safeParseMoviesPage(pageHTML)
+
+  if (parseResult.outcome === 'parse_failed') {
+    return { ...createEmptyMoviesPage(page), outcome: 'parse_failed', filter: filterInfo }
+  }
+
+  return { ...parseResult.moviesPage, outcome: 'success', filter: filterInfo }
 }
 
 export async function getMoviesByKeywordAndPage(
@@ -149,9 +235,13 @@ export async function getMoviesByKeywordAndPage(
     headers: { Cookie: `existmag=${magnet === 'exist' ? 'mag' : 'all'}` },
   }).text()
 
-  const moviesPage = parseMoviesPage(res)
+  const parseResult = safeParseMoviesPage(res)
 
-  return { ...moviesPage, keyword }
+  if (parseResult.outcome === 'parse_failed') {
+    return { ...createEmptyMoviesPage(page), outcome: 'parse_failed', keyword }
+  }
+
+  return { ...parseResult.moviesPage, outcome: 'success', keyword }
 }
 
 export function convertMagnetsHTML(html: string) {
