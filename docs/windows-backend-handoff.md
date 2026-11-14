@@ -28,6 +28,14 @@ platform-independent and off by default.)
   `shell:AppsFolder\<AppUserModelID>` via `Get-StartApps`, which is what made
   opening Store apps possible at all -- the planner previously returned an
   empty plan for them.
+- Launch failures are traceable: `resolve_launch_target` and `resolve_window`
+  still raise `LookupError`, but the message starts with an outcome marker --
+  `[ambiguous]` (with the candidate app names), `[not_found]`, `[launch_failed]`
+  (the shell refused it or never returned), or `[timeout]` (started, but no
+  matching window appeared). The timeout message reports the seconds waited and
+  the matching-window count of the last poll, and every poll round is logged at
+  DEBUG with the same counters, so a run that stalls can be diagnosed from its
+  log. The success path and window-selection rules are unchanged.
 - `examples/test_notepad.py`: the JEV-driven run, **passing through OpenRouter's
   Decisions API**: `TYPE_TEXT` (confidence 0.80), Ctrl+S (0.96),
   `SUBTASK_COMPLETE` (0.53), with the saved file matching. (The key on hand was

@@ -585,6 +585,153 @@ def test_the_launch_never_captures_through_pipes(monkeypatch: pytest.MonkeyPatch
     assert seen.get("timeout") is not None, "the launch must still be bounded"
 
 
+def launched(monkeypatch: pytest.MonkeyPatch, *, windows: list[int], foreground: int | None) -> None:
+    """Make launching succeed without a real shell, and script the window polls."""
+    import subprocess
+
+    def succeed(args, **kwargs):
+        kwargs["stdout"].write(b"")
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(subprocess, "run", succeed)
+    monkeypatch.setattr(w, "find_windows", lambda **kw: list(windows))
+    monkeypatch.setattr(w, "foreground_window", lambda: foreground)
+
+
+def test_a_launch_that_opens_its_own_window_succeeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Success path: older matches stay where they were, and the new window wins over them.
+    import subprocess
+
+    def succeed(args, **kwargs):
+        kwargs["stdout"].write(b"")
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(subprocess, "run", succeed)
+    polls = iter([[1, 2], [3, 1, 2], [3, 1, 2]])
+    monkeypatch.setattr(w, "find_windows", lambda **kw: list(next(polls, [3, 1, 2])))
+    foregrounds = iter([TERMINAL, 3])  # before the launch, then the newly opened window
+    monkeypatch.setattr(w, "foreground_window", lambda: next(foregrounds, 3))
+    assert w.resolve_window(process_name="notepad", launch="notepad.exe", timeout_s=1) == 3
+
+
+def test_a_single_instance_launch_succeeds_by_coming_to_the_front(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Before the launch the match is not in front; the launch brings that same window forward.
+    import subprocess
+
+    def succeed(args, **kwargs):
+        kwargs["stdout"].write(b"")
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(subprocess, "run", succeed)
+    monkeypatch.setattr(w, "find_windows", lambda **kw: [5])
+    foregrounds = iter([TERMINAL, TERMINAL, 5])
+
+    def foreground():
+        return next(foregrounds, 5)
+
+    monkeypatch.setattr(w, "foreground_window", foreground)
+    assert w.resolve_window(process_name="settings", launch="ms-settings:", timeout_s=1) == 5
+
+
+def test_a_single_launch_that_opens_no_new_window_and_brings_none_forward_times_out(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A window that existed before the launch is not evidence of it, even if it is the
+    # only match; falling back to it could type into the user's own document.
+    launched(monkeypatch, windows=[1], foreground=TERMINAL)
+    with pytest.raises(LookupError, match=r"\[timeout\]"):
+        w.resolve_window(process_name="notepad", launch="notepad.exe", timeout_s=0.3)
+
+
+def test_an_existing_window_that_is_ambiguous_without_a_launch_is_still_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The pre-launch rule is untouched: three matches, none in front -> refuse.
+    monkeypatch.setattr(w, "find_windows", lambda **kw: [7, 8, 9])
+    monkeypatch.setattr(w, "foreground_window", lambda: TERMINAL)
+    with pytest.raises(LookupError, match="3 windows match"):
+        w.resolve_window(process_name="notepad", timeout_s=0.5)
+
+
+# -- launch outcomes ------------------------------------------------------------------
+
+
+def test_a_failed_launch_command_is_marked_launch_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    def fail(args, **kwargs):
+        kwargs["stdout"].write(b"The system cannot find the file")
+        return subprocess.CompletedProcess(args, 1)
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    monkeypatch.setattr(w, "find_windows", lambda **kw: [])
+    monkeypatch.setattr(w, "foreground_window", lambda: TERMINAL)
+    with pytest.raises(LookupError, match=r"\[launch_failed\]") as caught:
+        w.resolve_window(process_name="spotify", launch="Spotify.exe:", timeout_s=5)
+    assert caught.value.outcome == "launch_failed"
+    assert "could not launch" in str(caught.value)
+    assert "The system cannot find the file" in str(caught.value)
+
+
+def test_a_launch_command_that_never_returns_is_marked_launch_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    import subprocess
+
+    def hang(args, **kwargs):
+        raise subprocess.TimeoutExpired(args, kwargs["timeout"])
+
+    monkeypatch.setattr(subprocess, "run", hang)
+    monkeypatch.setattr(w, "find_windows", lambda **kw: [])
+    monkeypatch.setattr(w, "foreground_window", lambda: TERMINAL)
+    with pytest.raises(LookupError, match=r"\[launch_failed\]") as caught:
+        w.resolve_window(process_name="notepad", launch="notepad.exe", timeout_s=5)
+    assert caught.value.outcome == "launch_failed"
+    assert "did not return within" in str(caught.value)
+
+
+def test_a_window_that_never_appears_is_marked_timeout_with_the_wait_and_counts(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    launched(monkeypatch, windows=[], foreground=TERMINAL)
+    caplog.set_level(logging.DEBUG, logger="jev_windows_agent.backends.windows_uia")
+    with pytest.raises(LookupError, match=r"\[timeout\]") as caught:
+        w.resolve_window(process_name="notepad", launch="notepad.exe", timeout_s=0.3)
+    message = str(caught.value)
+    assert caught.value.outcome == "timeout"
+    assert "waited" in message and "matching window(s) at the last poll" in message
+    # Every poll round is traced with the elapsed seconds and the match count.
+    polls = [r for r in caplog.records if r.getMessage().startswith("launch poll")]
+    assert polls, "the timeout must leave a poll trace"
+    assert all("waited" in r.getMessage() and "matching window(s)" in r.getMessage() for r in polls)
+    assert all("0 matching window(s)" in r.getMessage() for r in polls)
+    # The reported duration grows across the trace rather than staying at the start.
+    reported = message.split("waited ", 1)[1].split("s ", 1)[0]
+    assert float(reported) > 0.0
+
+
+def test_a_timeout_reports_how_many_windows_matched_while_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An old match is not evidence of the launch, so this still times out -- but the
+    # message must say a window was visible, which is the "wrong window" diagnosis.
+    launched(monkeypatch, windows=[1], foreground=TERMINAL)
+    with pytest.raises(LookupError, match=r"\[timeout\]") as caught:
+        w.resolve_window(process_name="notepad", launch="notepad.exe", timeout_s=0.3)
+    assert "1 matching window(s) at the last poll" in str(caught.value)
+
+
+def test_the_no_launch_wait_is_traced_with_elapsed_seconds(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+    import logging
+
+    monkeypatch.setattr(w, "find_windows", lambda **kw: [])
+    monkeypatch.setattr(w, "foreground_window", lambda: TERMINAL)
+    caplog.set_level(logging.DEBUG, logger="jev_windows_agent.backends.windows_uia")
+    with pytest.raises(LookupError, match=r"\[timeout\]") as caught:
+        w.resolve_window(process_name="notepad", timeout_s=0.3)
+    assert caught.value.outcome == "timeout"
+    assert "waited" in str(caught.value)
+    assert any(r.getMessage().startswith("window poll") for r in caplog.records)
+
+
 # -- resolving what to launch -------------------------------------------------------
 
 CATALOGUE = {
@@ -634,13 +781,16 @@ def test_an_exact_name_wins_over_a_longer_one_that_starts_with_it() -> None:
 
 def test_an_ambiguous_name_is_refused_with_the_candidates() -> None:
     catalogue = {"Sound Recorder": "a!App", "Sound Settings": "b!App"}
-    with pytest.raises(LookupError, match="matches several installed apps"):
+    with pytest.raises(LookupError, match="matches several installed apps") as caught:
         w.resolve_launch_target("Sound", apps=catalogue)
+    assert "[ambiguous]" in str(caught.value)
+    assert "Sound Recorder" in str(caught.value) and "Sound Settings" in str(caught.value)
 
 
 def test_an_unknown_app_name_says_so() -> None:
-    with pytest.raises(LookupError, match="no installed app is named 'Nope'"):
+    with pytest.raises(LookupError, match="no installed app is named 'Nope'") as caught:
         w.resolve_launch_target("Nope", apps=CATALOGUE)
+    assert "[not_found]" in str(caught.value)
 
 
 def test_a_launch_that_never_returns_times_out_instead_of_hanging(monkeypatch: pytest.MonkeyPatch) -> None:

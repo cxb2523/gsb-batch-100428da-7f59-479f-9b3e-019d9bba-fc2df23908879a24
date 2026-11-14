@@ -1727,29 +1727,53 @@ def installed_apps(timeout_s: float = 20.0) -> dict[str, str]:
     return {str(e["Name"]): str(e["AppID"]) for e in entries if e.get("Name") and e.get("AppID")}
 
 
+# The outcome of one launch attempt, tagged at the start of the LookupError message.
+# The exception type stays LookupError (callers already catch it), but a caller that
+# automates launches can read the marker to choose between fixing the name and giving
+# up: ambiguous/not_found mean "try another name", launch_failed/timeout mean the
+# launch or the app itself did not work.
+_LAUNCH_OUTCOMES = frozenset({"ambiguous", "not_found", "launch_failed", "timeout"})
+
+
+def _launch_error(outcome: str, detail: str) -> LookupError:
+    """Build a LookupError whose leading ``[outcome]`` marker and ``outcome`` attribute are machine-readable."""
+    if outcome not in _LAUNCH_OUTCOMES:  # pragma: no cover - guards internal typos
+        raise ValueError(f"unknown launch outcome {outcome!r}")
+    error = LookupError(f"[{outcome}] {detail}")
+    error.outcome = outcome  # type: ignore[attr-defined]
+    return error
+
+
 def resolve_launch_target(launch: str, *, apps: Mapping[str, str] | None = None) -> str:
     """Turn a plain app name into something the shell can start; pass anything else through.
 
     Matching is case-insensitive: exact name first, then a unique prefix, then a unique
-    substring. An ambiguous name raises rather than picking one of several apps.
+    substring. An ambiguous name raises a LookupError marked ``ambiguous`` listing the
+    candidate names rather than picking one of several apps; an unknown name raises
+    one marked ``not_found``.
     """
     if not looks_like_app_name(launch):
         return launch
     catalogue = installed_apps() if apps is None else apps
     wanted = launch.strip().casefold()
-    exact = [app_id for name, app_id in catalogue.items() if name.casefold() == wanted]
-    prefix = [app_id for name, app_id in catalogue.items() if name.casefold().startswith(wanted)]
-    contains = [app_id for name, app_id in catalogue.items() if wanted in name.casefold()]
+    exact = [(name, app_id) for name, app_id in catalogue.items() if name.casefold() == wanted]
+    prefix = [(name, app_id) for name, app_id in catalogue.items() if name.casefold().startswith(wanted)]
+    contains = [(name, app_id) for name, app_id in catalogue.items() if wanted in name.casefold()]
     for candidates in (exact, prefix, contains):
         if len(candidates) == 1:
-            app_id = candidates[0]
+            app_id = candidates[0][1]
             # A desktop app's "AppID" is already a path; only a real AppUserModelID
             # needs the shell:AppsFolder indirection.
             return app_id if ("\\" in app_id or "/" in app_id) else f"shell:AppsFolder\\{app_id}"
         if len(candidates) > 1:
-            names = sorted(n for n in catalogue if wanted in n.casefold())
-            raise LookupError(f"{launch!r} matches several installed apps: {', '.join(names[:6])}")
-    raise LookupError(f"no installed app is named {launch!r}")
+            # Keep naming every app whose name contains the query -- the caller needs
+            # the names it could retry with, not just the tier that ended the search.
+            names = sorted(name for name in catalogue if wanted in name.casefold())
+            raise _launch_error(
+                "ambiguous",
+                f"{launch!r} matches several installed apps: {', '.join(names[:6])}",
+            )
+    raise _launch_error("not_found", f"no installed app is named {launch!r}")
 
 
 def _launch_detached(launch: str, *, timeout_s: float) -> None:
@@ -1787,10 +1811,14 @@ def _launch_detached(launch: str, *, timeout_s: float) -> None:
             sink.seek(0)
             output = sink.read().decode("utf-8", "replace").strip()
     except subprocess.TimeoutExpired as exc:
-        raise LookupError(f"launching {launch!r} did not return within {timeout_s:.0f}s") from exc
+        raise _launch_error(
+            "launch_failed", f"launching {launch!r} did not return within {timeout_s:.0f}s"
+        ) from exc
     if done.returncode != 0:
         # e.g. a path with a stray trailing ":" copied from a URI like ms-settings:
-        raise LookupError(f"could not launch {launch!r}: {output or f'exit status {done.returncode}'}")
+        raise _launch_error(
+            "launch_failed", f"could not launch {launch!r}: {output or f'exit status {done.returncode}'}"
+        )
 
 
 def resolve_window(
@@ -1806,6 +1834,13 @@ def resolve_window(
     window a single-instance app brings forward), never an unrelated window that
     already matched. Without it, exactly one window must match, or the matching
     window must already be in front. Raises LookupError instead of guessing.
+
+    Every failure is tagged in the message so an automated caller can tell the
+    outcomes apart without parsing prose: ``launch_failed`` when the shell could
+    not start the target (or never returned), ``timeout`` when it started but no
+    matching window appeared in time. The timeout message reports how long it
+    waited and how many windows matched on the last poll, and each poll round is
+    logged at DEBUG with the same counters.
     """
     if not (process_name or title_contains):
         raise ValueError("name the target with process_name= or title_contains=")
@@ -1818,8 +1853,21 @@ def resolve_window(
     deadline = time.perf_counter() + timeout_s
     if launch:
         _launch_detached(launch, timeout_s=timeout_s)
+        wait_start = time.perf_counter()
+        waited = 0.0
+        match_count = 0
         while time.perf_counter() < deadline:
-            picked = _pick_launched_window(before, matching(), foreground_window(), foreground_before)
+            waited = time.perf_counter() - wait_start
+            matches = matching()
+            foreground = foreground_window()
+            match_count = len(matches)
+            logger.debug(
+                "launch poll: waited %.1fs, %d matching window(s), foreground=%s",
+                waited,
+                match_count,
+                foreground,
+            )
+            picked = _pick_launched_window(before, matches, foreground, foreground_before)
             if picked is not None:
                 if picked in before:
                     # A reused window surfaced first; give a window of the launch's own
@@ -1832,16 +1880,31 @@ def resolve_window(
                         time.sleep(0.1)
                 return picked
             time.sleep(0.2)
+        waited = time.perf_counter() - wait_start
         # Never fall back to a window that merely existed before: after a launch that
         # "worked" invisibly, the only match may be the user's own document.
-        raise LookupError(
-            f"launching {launch!r} neither opened a matching window nor brought one to the front "
-            f"within {timeout_s:.0f}s"
+        raise _launch_error(
+            "timeout",
+            f"launching {launch!r} neither opened a matching window nor brought one to the front, "
+            f"so it timed out (waited {waited:.1f}s of {timeout_s:g}s; "
+            f"{match_count} matching window(s) at the last poll)",
         )
     # The app may still be starting from an earlier step; wait for it to appear.
-    while not matching() and time.perf_counter() < deadline:
+    wait_start = time.perf_counter()
+    matches = matching()
+    while not matches and time.perf_counter() < deadline:
+        waited = time.perf_counter() - wait_start
+        logger.debug("window poll: waited %.1fs, 0 matching window(s)", waited)
         time.sleep(0.2)
-    return _pick_existing_window(matching(), foreground_window())
+        matches = matching()
+    if not matches:
+        waited = time.perf_counter() - wait_start
+        raise _launch_error(
+            "timeout",
+            "no visible window matched and none appeared while waiting "
+            f"(waited {waited:.1f}s of {timeout_s:g}s; 0 matching window(s) at the last poll)",
+        )
+    return _pick_existing_window(matches, foreground_window())
 
 
 def activate_window(hwnd: int, *, timeout_s: float = 3.0) -> bool:
