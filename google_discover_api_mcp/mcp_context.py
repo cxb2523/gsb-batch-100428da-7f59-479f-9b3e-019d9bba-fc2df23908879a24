@@ -33,7 +33,11 @@ def _guide(runner: Runner) -> str:
             ),
             f"Where to start: {app.AGENT_START}",
             SAFETY,
-            "A read of one country and language is reused for 15 minutes; collect_discover_cards merges many reads.",
+            (
+                "A single read of one country and language is reused for 15 minutes by get_discover_feed and "
+                "check_domain_in_feed; collect_discover_cards makes fresh reads on new connections, outside "
+                "that cache."
+            ),
             f"The full catalog with each tool's access is in {TOOLS_URI}.",
         ]
     )

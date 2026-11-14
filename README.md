@@ -340,7 +340,7 @@ On a schedule, cron on your own computer works while it is on: `0 * * * * cd ~/g
 | `check_domain_in_feed` | read | `GET /feed/domains/{domain}` | Whether cards from a domain are in a country's Discover feed now, and at which positions. |
 | `collect_discover_cards` | read | `GET /feed/cards` | Up to 300 different cards Discover shows in a country, from many reads, with how often each appeared. |
 
-A read of one country and language is reused for 15 minutes while the server runs. `collect_discover_cards` reads the feed up to 150 times, 8 at a time, for at most 70 seconds, and merges the cards by URL. From one IP the pool runs dry sooner than from many: 40 reads from one IP gave about 210 different US cards in our tests.
+A single read of one country and language is reused for 15 minutes while the server runs, but only by `get_discover_feed` and `check_domain_in_feed`. `collect_discover_cards` reads the feed up to 150 times, 8 at a time, for at most 70 seconds, each read on a new connection and never through that cache, and merges the cards by URL. Its answer says why it stopped in `stop_reason` (`target_reached`, `pool_dry`, `time_limit`, `max_reads`) and how many reads succeeded and failed in `successful_reads` and `failed_reads`; `reads` equals `successful_reads`, and `complete` is true exactly when the asked number of different cards was reached. From one IP the pool runs dry sooner than from many: 40 reads from one IP gave about 210 different US cards in our tests.
 
 Never built, on purpose: follow, hide or "Not interested" on a card, and the personal feed of a Google account. Those need a signed-in account.
 

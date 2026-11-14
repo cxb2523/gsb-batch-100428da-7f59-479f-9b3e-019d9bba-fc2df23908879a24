@@ -6,14 +6,31 @@ every read leaves from your connection, or from your proxy, which may give each 
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any, Protocol
 
 from google_discover_api_mcp.google_discover.client import ask
 
-if TYPE_CHECKING:
-    from google_discover_api_mcp.core.context import ToolContext
+
+class BoundLogger(Protocol):
+    def info(self, event: str, **fields: Any) -> Any: ...
+    def warning(self, event: str, **fields: Any) -> Any: ...
 
 
-async def ask_from_new_exit(ctx: ToolContext, language: str) -> bytes:
+class ExitContext(Protocol):
+    """What a multi-read collection needs: a fresh connection per read and a log.
+
+    It deliberately exposes neither ``cache_get`` nor ``cache_set``. The 15-minute cache of one country
+    and language belongs to the single-read tools (``get_discover_feed``, ``check_domain_in_feed``); a
+    collection is many independent reads from new exits, so it must neither write to nor read that
+    snapshot, or callers could mistake a stale single read for a fresh collection.
+    """
+
+    def new_http(self) -> Any: ...
+
+    @property
+    def log(self) -> BoundLogger: ...
+
+
+async def ask_from_new_exit(ctx: ExitContext, language: str) -> bytes:
     """The raw answer of one read through a new connection."""
     return await ask(ctx.new_http(), ctx.log, language)
