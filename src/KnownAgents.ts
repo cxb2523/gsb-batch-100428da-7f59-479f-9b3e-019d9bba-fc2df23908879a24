@@ -24,7 +24,12 @@ export class KnownAgents {
     private readonly flushQueueSize: number
     private readonly visitQueue: VisitRequest[] = []
     private flushTimeout: NodeJS.Timeout | undefined
-    private pendingFlushPromise: Promise<void> = Promise.resolve()
+    // Serializes batch uploads so concurrent flushes never interleave.
+    // Never rejects, so one failed batch cannot stall later batches.
+    private sendChain: Promise<void> = Promise.resolve()
+    // Tracks the most recent batch's outcome so the next flush() call can
+    // report a failure even if an automatic flush triggered the upload.
+    private previousBatch: Promise<void> = Promise.resolve()
 
     /**
      * Creates a new instance of the Known Agents client.
@@ -41,7 +46,8 @@ export class KnownAgents {
     /**
      * Tracks a single pageview or API call for analytics.
      * For Node.js responses, the visit is added to the visit event queue after the response finishes so status, headers, and duration are included.
-     * This method is non-blocking and handles upload errors internally.
+     * This method is non-blocking. Automatically triggered uploads log errors to the console;
+     * call `flush()` to await pending uploads and observe upload failures.
      *
      * @param request - The incoming HTTP request.
      * @param response - The outgoing HTTP response.
@@ -103,9 +109,10 @@ export class KnownAgents {
 
     /**
      * Uploads all events currently in the visit event queue and waits for pending uploads to finish.
-     * This method handles upload errors internally.
+     * Batches are uploaded serially in the order they were queued, never concurrently.
      *
-     * @returns A promise that resolves after all pending upload attempts finish.
+     * @returns A promise that resolves after this and all previously queued batches finish uploading,
+     * or rejects with the HTTP status code and reason if any of those uploads failed.
      */
     flush(): Promise<void> {
         if (this.flushTimeout) {
@@ -115,15 +122,34 @@ export class KnownAgents {
 
         const requests = this.visitQueue.splice(0)
 
-        if (requests.length === 0) {
-            return this.pendingFlushPromise
-        }
+        const send = this.sendChain.then(() => {
+            if (requests.length === 0) {
+                return
+            }
 
-        this.pendingFlushPromise = this.pendingFlushPromise.then(() => {
             return this.sendVisits(requests)
         })
 
-        return this.pendingFlushPromise
+        // Keep the serialization chain alive even when this batch fails,
+        // so later batches are still uploaded in order.
+        this.sendChain = send.catch(() => {})
+
+        // Wait for this and all previously queued batches, then surface the
+        // failure of the batch this call drained, or of the previous batch if
+        // its failure has not been observed by a flush() caller yet.
+        const result = Promise.allSettled([this.previousBatch, send]).then(([previous, current]) => {
+            if (current.status === "rejected") {
+                throw current.reason
+            }
+
+            if (previous.status === "rejected") {
+                throw previous.reason
+            }
+        })
+
+        this.previousBatch = send
+
+        return result
     }
 
     /**
@@ -226,7 +252,7 @@ export class KnownAgents {
         })
 
         if (this.visitQueue.length >= this.flushQueueSize) {
-            void this.flush()
+            this.flushAndLogErrors()
             return
         }
 
@@ -240,15 +266,24 @@ export class KnownAgents {
 
         this.flushTimeout = setTimeout(() => {
             this.flushTimeout = undefined
-            void this.flush()
+            this.flushAndLogErrors()
         }, this.flushIntervalInMilliseconds)
 
         this.flushTimeout.unref()
     }
 
+    private flushAndLogErrors(): void {
+        void this.flush().catch((error: unknown) => {
+            const message = error instanceof Error ? error.message : String(error)
+            console.error(message)
+        })
+    }
+
     private async sendVisits(requests: VisitRequest[]): Promise<void> {
+        let response: Response
+
         try {
-            const response = await fetch("https://api.knownagents.com/visits", {
+            response = await fetch("https://api.knownagents.com/visits", {
                 method: "POST",
                 headers: {
                     "Authorization": `Bearer ${this.accessToken}`,
@@ -261,13 +296,13 @@ export class KnownAgents {
                     }
                 }))
             })
-
-            if (!response.ok) {
-                throw new Error(`${response.status} ${response.statusText}`)
-            }
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
-            console.error(`Known Agents failed to track visits: ${message}`)
+            throw new Error(`Known Agents failed to track visits: ${message}`)
+        }
+
+        if (!response.ok) {
+            throw new Error(`Known Agents failed to track visits: ${response.status} ${response.statusText}`)
         }
     }
 }
