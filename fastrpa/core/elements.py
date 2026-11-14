@@ -1,4 +1,4 @@
-from time import sleep
+from time import monotonic, sleep
 from typing import Any
 from selenium.common.exceptions import NoSuchElementException
 from selenium.webdriver import ActionChains
@@ -16,10 +16,20 @@ from fastrpa.utils import (
 from fastrpa.types import WebDriver
 
 
+DEFAULT_TIMEOUT = 15
+_POLL_INTERVAL = 0.5
+
+
 class Element:
-    def __init__(self, xpath: str, webdriver: WebDriver) -> None:
+    def __init__(
+        self,
+        xpath: str,
+        webdriver: WebDriver,
+        timeout: float = DEFAULT_TIMEOUT,
+    ) -> None:
         self.xpath = xpath
         self.webdriver = webdriver
+        self.timeout = timeout
         self.file = File(self.webdriver)
         self.actions = ActionChains(self.webdriver)
 
@@ -306,9 +316,26 @@ class ButtonElement(Element):
 
 
 class FormElement(Element):
-    _success_redirect_url: str | None = None
-    _success_elements_to_find: list[str] = []
-    _success_text_to_find: list[str] = []
+    def __init__(
+        self,
+        xpath: str,
+        webdriver: WebDriver,
+        timeout: float = DEFAULT_TIMEOUT,
+    ) -> None:
+        super().__init__(xpath, webdriver, timeout)
+        self._success_redirect_url: str | None = None
+        self._success_elements_to_find: list[str] = []
+        self._success_text_to_find: list[str] = []
+
+    @property
+    def _has_success_conditions(self) -> bool:
+        return any(
+            (
+                self._success_redirect_url is not None,
+                bool(self._success_elements_to_find),
+                bool(self._success_text_to_find),
+            )
+        )
 
     def _check_success_conditions(self):
         if self._success_redirect_url is not None:
@@ -324,6 +351,17 @@ class FormElement(Element):
         for text in self._success_text_to_find:
             if text not in self.webdriver.page_source:
                 raise FormException('text_to_find', text)
+
+    def _wait_for_success_conditions(self):
+        deadline = monotonic() + self.timeout
+        while True:
+            try:
+                self._check_success_conditions()
+                return
+            except FormException as failure:
+                if monotonic() >= deadline:
+                    raise failure
+                sleep(_POLL_INTERVAL)
 
     @property
     def method(self) -> str:
@@ -344,20 +382,28 @@ class FormElement(Element):
     def set_success_condition(
         self,
         redirect_url: str | None = None,
-        elements_to_find: list[str] = [],
-        text_to_find: list[str] = [],
+        elements_to_find: list[str] | None = None,
+        text_to_find: list[str] | None = None,
     ):
         self._success_redirect_url = redirect_url
-        self._success_elements_to_find = elements_to_find
-        self._success_text_to_find = text_to_find
+        self._success_elements_to_find = (
+            list(elements_to_find) if elements_to_find is not None else []
+        )
+        self._success_text_to_find = (
+            list(text_to_find) if text_to_find is not None else []
+        )
 
     def submit(self, button_xpath: str | None = None):
         if not button_xpath:
             self.source.submit()
         else:
-            button = ButtonElement(button_xpath, self.webdriver)
+            button = ButtonElement(button_xpath, self.webdriver, self.timeout)
             button.click()
-        self._check_success_conditions()
+
+        if not self._has_success_conditions:
+            return
+
+        self._wait_for_success_conditions()
 
 
 class TableElement(Element):

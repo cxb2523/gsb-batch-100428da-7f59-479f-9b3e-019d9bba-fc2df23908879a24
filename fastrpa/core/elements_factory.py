@@ -87,7 +87,7 @@ class ElementsFactory:
                 )
             )
             element_class = self.element_class(selenium_element)
-            return element_class(xpath, self.webdriver)
+            return element_class(xpath, self.webdriver, self.timeout)
 
         except TimeoutException:
             raise ElementTimeoutException(xpath, self.timeout)
@@ -97,7 +97,7 @@ class ElementsFactory:
         try:
             selenium_element = self.webdriver.find_element(By.XPATH, xpath)
             element_class = self.element_class(selenium_element)
-            return element_class(xpath, self.webdriver)
+            return element_class(xpath, self.webdriver, self.timeout)
 
         except NoSuchElementException:
             raise ElementNotFoundException(xpath)
@@ -111,7 +111,9 @@ class ElementsFactory:
                 By.XPATH, xpath
             ):
                 element_class = self.element_class(selenium_element)
-                elements_to_return.append(element_class(xpath, self.webdriver))
+                elements_to_return.append(
+                    element_class(xpath, self.webdriver, self.timeout)
+                )
 
             return elements_to_return
 
