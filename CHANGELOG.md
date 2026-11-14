@@ -7,6 +7,13 @@ All notable changes to the **Windows Automation Inspector (MCP)** extension will
 ### Added
 - Added a manual and release-triggered PyPI publishing workflow using Trusted Publishing.
 - Hardened GitHub Actions by pinning action SHAs, reducing permissions, disabling checkout credential persistence, and validating PyPI publish refs.
+- `uia_find_control` now returns `match_status` (`unique`, `multiple`, `none`), a `truncated` flag indicating whether `max_results` cut off additional matches, and an actionable `hint`.
+- `ToolError` carries an optional structured `details` payload, surfaced through MCP dispatch; UIA ambiguity errors include a `candidates` list with each control's `control_type`, `automation_id`, and `bounds`.
+
+### Changed
+- `uia_find_control` and the by-name tools (`uia_click_control`, `uia_get_control_value`, `uia_set_control_value`) now share one bounded tree search and one matching implementation, so find and operate can no longer drift apart.
+- By-name UIA tools no longer silently act on the first control when an exact name matches multiple controls: they raise an ambiguity error listing the candidates and suggesting a more precise `control_type` or `automation_id`. Single-match behavior and response fields are unchanged.
+- UIA search depth and `max_results` continue to use the existing constant limits (depth 8, up to 100 results); no tools were added or renamed.
 
 ## [2.6.1] — 2026-05-18
 

@@ -158,6 +158,8 @@ class ToolRegistry:
             }
             if exc.suggestion:
                 error_payload["suggestion"] = exc.suggestion
+            if exc.details:
+                error_payload["details"] = exc.details
             return [
                 TextContent(
                     type="text",

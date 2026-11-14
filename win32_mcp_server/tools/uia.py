@@ -26,6 +26,7 @@ from ..utils.security import redact_text
 logger = logging.getLogger("win32-mcp")
 _MAX_UIA_TEXT_CHARS = 512
 _MAX_UIA_RESULTS = 100
+_MAX_UIA_SEARCH_DEPTH = 8
 
 # Map user-friendly lowercase names → uiautomation class name suffix.
 # e.g. "tabitem" → "TabItemControl", "radiobutton" → "RadioButtonControl"
@@ -217,32 +218,120 @@ def _matches_control(ctrl: Any, name: str, aid: str, ctrl_type: str, *, exact_na
     return not (ctrl_type and ctrl.ControlTypeName != _expected_control_type(ctrl_type))
 
 
-def _find_control_in_window(
+def _candidate_summary(ctrl: Any) -> dict[str, Any]:
+    """Return identifying information for an ambiguous-match candidate."""
+    summary: dict[str, Any] = {
+        "control_type": ctrl.ControlTypeName,
+        "automation_id": ctrl.AutomationId or "",
+        "name": ctrl.Name or "",
+    }
+    bounds = _control_bounds(ctrl)
+    if bounds is not None:
+        x, y, width, height = bounds
+        summary["bounds"] = {"x": x, "y": y, "width": width, "height": height}
+    else:
+        summary["bounds"] = None
+    return summary
+
+
+def _match_criteria_text(name: str, aid: str, ctrl_type: str) -> str:
+    parts = [f"name='{name}'", f"automation_id='{aid}'", f"control_type='{ctrl_type}'"]
+    return ", ".join(parts)
+
+
+def _bounded_search(
     win: Any,
+    *,
     name: str,
     aid: str,
     ctrl_type: str,
+    exact_name: bool,
+    max_results: int,
+    max_depth: int = _MAX_UIA_SEARCH_DEPTH,
+) -> tuple[list[Any], bool]:
+    """Search a window tree with criteria shared by every UIA tool.
+
+    Returns ``(matches, truncated)`` where ``truncated`` is True when at least
+    one additional matching control existed beyond ``max_results`` (i.e. the
+    true match count is greater than ``len(matches)``). Matching semantics —
+    name exact/partial, automation-id exact, control-type — always go through
+    :func:`_matches_control`, so find and by-name tools cannot drift apart.
+    """
+    matches: list[Any] = []
+    extra_match_found = False
+
+    def _visit(ctrl: Any, depth: int) -> None:
+        nonlocal extra_match_found
+        if depth > max_depth or extra_match_found:
+            return
+        try:
+            children = ctrl.GetChildren()
+        except Exception:
+            return
+        for child in children:
+            if _matches_control(child, name, aid, ctrl_type, exact_name=exact_name):
+                if len(matches) < max_results:
+                    matches.append(child)
+                else:
+                    extra_match_found = True
+                    return
+            _visit(child, depth + 1)
+            if extra_match_found:
+                return
+
+    _visit(win, 0)
+    return matches, extra_match_found
+
+
+def _resolve_unique_control(
+    win: Any,
     *,
-    max_depth: int = 8,
+    name: str,
+    aid: str,
+    ctrl_type: str,
+    exact_name: bool,
 ) -> Any:
-    """Find one matching control strictly within a window tree."""
-    results: list[Any] = []
-    _search_tree_objects(
+    """Resolve exactly one control or raise an actionable ToolError.
+
+    Three outcomes are distinguishable to the caller:
+      * zero matches -> "not found" error with a discovery suggestion;
+      * multiple matches -> ambiguity error listing every candidate's
+        control_type, automation_id and bounds (never silently picks one);
+      * one match -> the live control (legacy behavior preserved).
+    """
+    # One extra slot lets us tell "exactly the cap" apart from "more than the
+    # cap" without traversing the whole tree when a large family matches.
+    matches, truncated = _bounded_search(
         win,
         name=name,
         aid=aid,
         ctrl_type=ctrl_type,
-        results=results,
-        max_results=1,
-        depth=0,
-        max_depth=max_depth,
-        exact_name=True,
+        exact_name=exact_name,
+        max_results=_MAX_UIA_RESULTS,
     )
-    if results:
-        return results[0]
+    if not matches:
+        raise ToolError(
+            f"Control not found: {_match_criteria_text(name, aid, ctrl_type)}",
+            suggestion="Use uia_inspect_window or uia_find_control to discover controls.",
+        )
+    if len(matches) == 1 and not truncated:
+        return matches[0]
+
+    candidates = [_candidate_summary(ctrl) for ctrl in matches]
+    # The bound was hit and at least one more match exists in the tree.
+    match_count_text = f"more than {len(candidates)}" if truncated else str(len(candidates))
     raise ToolError(
-        f"Control not found: name='{name}', automation_id='{aid}', control_type='{ctrl_type}'",
-        suggestion="Use uia_inspect_window or uia_find_control to discover controls.",
+        f"Ambiguous control match: {match_count_text} controls match "
+        f"{_match_criteria_text(name, aid, ctrl_type)}; refusing to operate on an arbitrary control.",
+        suggestion=(
+            "Retry with more precise conditions: add or narrow control_type, "
+            "supply the unique automation_id, or call uia_find_control to inspect the candidates."
+        ),
+        details={
+            "match_count": len(candidates),
+            "results_truncated": truncated,
+            "candidates": candidates,
+        },
     )
 
 
@@ -261,7 +350,7 @@ async def click_control_impl(
         win = _find_window_control(auto, window_title)
         if control_type:
             _get_control_class(auto, control_type)
-        ctrl = _find_control_object_in_window(
+        ctrl = _resolve_unique_control(
             win,
             name=name,
             aid=automation_id,
@@ -296,7 +385,7 @@ async def set_control_value_impl(
 
     def _set() -> dict[str, Any]:
         win = _find_window_control(auto, window_title)
-        ctrl = _find_control_object_in_window(
+        ctrl = _resolve_unique_control(
             win,
             name=name,
             aid=automation_id,
@@ -323,20 +412,16 @@ async def set_labeled_control_value_impl(
 
     def _set_labeled() -> dict[str, Any]:
         win = _find_window_control(auto, window_title)
-        labels: list[Any] = []
-        _search_tree_objects(
+        labels, _label_truncated = _bounded_search(
             win,
             name=label_text,
             aid="",
             ctrl_type="",
-            results=labels,
-            max_results=20,
-            depth=0,
-            max_depth=8,
             exact_name=exact_name,
+            max_results=20,
         )
         fields: list[Any] = []
-        _collect_editable_controls(win, fields, max_depth=8)
+        _collect_editable_controls(win, fields, max_depth=_MAX_UIA_SEARCH_DEPTH)
         if not labels or not fields:
             raise ToolError("No matching UIA label/editable field pair found")
 
@@ -350,34 +435,6 @@ async def set_labeled_control_value_impl(
         return result
 
     return cast("dict[str, Any]", await _run_in_thread(_set_labeled, auto))
-
-
-def _find_control_object_in_window(
-    win: Any,
-    *,
-    name: str,
-    aid: str,
-    ctrl_type: str,
-    exact_name: bool,
-) -> Any:
-    results: list[Any] = []
-    _search_tree_objects(
-        win,
-        name=name,
-        aid=aid,
-        ctrl_type=ctrl_type,
-        results=results,
-        max_results=1,
-        depth=0,
-        max_depth=8,
-        exact_name=exact_name,
-    )
-    if results:
-        return results[0]
-    raise ToolError(
-        f"Control not found: name='{name}', automation_id='{aid}', control_type='{ctrl_type}'",
-        suggestion="Use uia_inspect_window or uia_find_control to discover controls.",
-    )
 
 
 def _set_control_value(ctrl: Any, value: str) -> dict[str, Any]:
@@ -534,7 +591,8 @@ def _collect_by_type(ctrl: Any, type_name: str, max_depth: int, depth: int = 0) 
 
 @registry.register(
     "uia_find_control",
-    "Find UI controls by name, automation ID, or type within a window",
+    "Find UI controls by name, automation ID, or type within a window. "
+    "Reports whether the match is unique, multiple, or empty, and whether results were truncated by max_results.",
     {
         "type": "object",
         "properties": {
@@ -568,81 +626,50 @@ async def handle_uia_find_control(arguments: dict[str, Any]) -> list[TextContent
             "At least one of name, automation_id, or control_type must be provided",
         )
 
-    def _find() -> list[dict[str, Any]]:
+    def _find() -> tuple[list[dict[str, Any]], bool]:
         win = _find_window_control(auto, window_title)
-        results: list[dict[str, Any]] = []
-        _search_tree(win, search_name, search_aid, filter_type, results, max_results, depth=0, max_depth=8)
-        return results
+        matches, truncated = _bounded_search(
+            win,
+            name=search_name,
+            aid=search_aid,
+            ctrl_type=filter_type,
+            exact_name=False,
+            max_results=max_results,
+        )
+        return [_control_to_dict(ctrl, depth=0, max_depth=0) for ctrl in matches], truncated
 
-    found = await _run_in_thread(_find, auto)
-    output = {"found": len(found), "controls": found}
+    found, truncated = await _run_in_thread(_find, auto)
+    match_count = len(found)
+    if match_count == 0:
+        match_status = "none"
+    elif match_count == 1 and not truncated:
+        match_status = "unique"
+    else:
+        match_status = "multiple"
+
+    output: dict[str, Any] = {
+        "found": match_count,
+        "controls": found,
+        "truncated": truncated,
+        "max_results": max_results,
+        "match_status": match_status,
+    }
+    if match_count == 0:
+        output["hint"] = (
+            "No controls matched. Verify the window title and criteria, "
+            "or use uia_inspect_window to browse the control tree."
+        )
+    elif truncated:
+        output["hint"] = (
+            f"Results truncated by max_results={max_results}: more matching controls exist. "
+            "Raise max_results or narrow the search with control_type, name, or automation_id."
+        )
+    elif match_count > 1:
+        output["hint"] = (
+            f"{match_count} controls matched; the target is not unique. "
+            "Use more precise conditions (control_type, automation_id, or a longer name)."
+        )
     return [TextContent(type="text", text=json.dumps(output, indent=2, default=str))]
-
-
-def _search_tree(
-    ctrl: Any,
-    name: str,
-    aid: str,
-    ctrl_type: str,
-    results: list[dict[str, Any]],
-    max_results: int,
-    depth: int,
-    max_depth: int,
-) -> None:
-    """Recursively search the control tree."""
-    if len(results) >= max_results or depth > max_depth:
-        return
-
-    try:
-        for child in ctrl.GetChildren():
-            if len(results) >= max_results:
-                return
-
-            if _matches_control(child, name, aid, ctrl_type, exact_name=False):
-                results.append(_control_to_dict(child, depth=0, max_depth=0))
-
-            _search_tree(child, name, aid, ctrl_type, results, max_results, depth + 1, max_depth)
-    except Exception:
-        pass
-
-
-def _search_tree_objects(
-    ctrl: Any,
-    name: str,
-    aid: str,
-    ctrl_type: str,
-    results: list[Any],
-    max_results: int,
-    depth: int,
-    max_depth: int,
-    *,
-    exact_name: bool,
-) -> None:
-    """Recursively search the control tree and keep live controls."""
-    if len(results) >= max_results or depth > max_depth:
-        return
-
-    try:
-        for child in ctrl.GetChildren():
-            if len(results) >= max_results:
-                return
-
-            if _matches_control(child, name, aid, ctrl_type, exact_name=exact_name):
-                results.append(child)
-
-            _search_tree_objects(
-                child,
-                name=name,
-                aid=aid,
-                ctrl_type=ctrl_type,
-                results=results,
-                max_results=max_results,
-                depth=depth + 1,
-                max_depth=max_depth,
-                exact_name=exact_name,
-            )
-    except Exception:
-        pass
 
 
 @registry.register(
@@ -705,7 +732,13 @@ async def handle_uia_get_control_value(arguments: dict[str, Any]) -> dict[str, A
         win = _find_window_control(auto, window_title)
         if ctrl_type:
             _get_control_class(auto, ctrl_type)
-        ctrl = _find_control_in_window(win, name, aid, ctrl_type)
+        ctrl = _resolve_unique_control(
+            win,
+            name=name,
+            aid=aid,
+            ctrl_type=ctrl_type,
+            exact_name=True,
+        )
 
         result: dict[str, Any] = _control_to_dict(ctrl, depth=0, max_depth=0)
 

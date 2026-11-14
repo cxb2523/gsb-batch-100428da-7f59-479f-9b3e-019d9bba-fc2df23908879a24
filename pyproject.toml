@@ -155,6 +155,8 @@ ignore = [
 # UIA module: try-except-pass is needed because controls may not support patterns
 "win32_mcp_server/tools/uia.py" = ["ARG001", "S110", "SIM105", "PERF401"]
 "win32_mcp_server/server.py" = ["ARG001", "E402"]
+# Fake UIA controls mirror the uiautomation library's PascalCase API on purpose
+"tests/test_uia_ambiguity.py" = ["S101", "SLF001", "S106", "N802", "N803", "ARG002", "ARG005", "UP037"]
 "tests/*.py" = ["S101", "SLF001", "S106"]
 
 [tool.ruff.lint.isort]

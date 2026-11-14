@@ -88,11 +88,17 @@ The most comprehensive Windows desktop automation server for the [Model Context 
 
 ### UI Automation (6 tools)
 - `uia_inspect_window` — get the control tree of a window
-- `uia_find_control` — find controls by type, name, or automation ID
+- `uia_find_control` — find controls by type, name, or automation ID; reports `match_status` (`unique`/`multiple`/`none`) and a `truncated` flag when `max_results` cuts off further matches
 - `uia_click_control` — click a control by name (more reliable than coordinates)
 - `uia_get_control_value` — read a control's value or text
 - `uia_set_control_value` — set a control's value (edit boxes, etc.)
 - `uia_get_focused` — get info about the currently focused control
+
+By-name tools (`uia_click_control`, `uia_get_control_value`, `uia_set_control_value`) share the
+same matching semantics as `uia_find_control`. When an exact name matches more than one control
+they refuse to pick one and return an ambiguity error whose `details.candidates` lists each
+candidate's `control_type`, `automation_id`, and `bounds`, so the caller can add a
+`control_type` or `automation_id` and retry. A single match keeps the original behavior.
 
 ---
 
@@ -333,10 +339,10 @@ Set these in your MCP client's server environment when you need production contr
 | Tool | Description |
 |------|-------------|
 | `uia_inspect_window` | Inspect control tree (buttons, edits, etc.) |
-| `uia_find_control` | Find controls by name, automation ID, or type |
-| `uia_click_control` | Click a control by name (no coordinates needed) |
-| `uia_get_control_value` | Read a control's value/text |
-| `uia_set_control_value` | Set a control's value |
+| `uia_find_control` | Find controls by name, automation ID, or type; returns `match_status` and a `truncated` flag |
+| `uia_click_control` | Click a control by name (no coordinates needed); errors on ambiguous matches with candidate details |
+| `uia_get_control_value` | Read a control's value/text; errors on ambiguous matches with candidate details |
+| `uia_set_control_value` | Set a control's value; errors on ambiguous matches with candidate details |
 | `uia_get_focused` | Get info about the focused control |
 
 ---
