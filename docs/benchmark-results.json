@@ -1,0 +1,1386 @@
+{
+  "schemaVersion": 1,
+  "at": "2026-11-14T12:41:46.818Z",
+  "version": "1.5.2",
+  "environment": {
+    "platform": "win32",
+    "release": "10.0.19045",
+    "arch": "x64",
+    "cpu": "12th Gen Intel(R) Core(TM) i5-12400F",
+    "node": "v24.14.0"
+  },
+  "repeat": 20,
+  "warmups": 2,
+  "oracle": {
+    "rowCount": 255,
+    "largest": {
+      "name": "simsunb.ttf",
+      "bytes": 17064180
+    }
+  },
+  "raw": [
+    {
+      "case": "find_uncached",
+      "round": -2,
+      "warmup": true,
+      "ok": true,
+      "ms": 218.15999999999985,
+      "textBytes": 467,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": -2,
+      "warmup": true,
+      "ok": true,
+      "ms": 5.330500000000029,
+      "textBytes": 460,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": -2,
+      "warmup": true,
+      "ok": true,
+      "ms": 228.79549999999972,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": -2,
+      "warmup": true,
+      "ok": true,
+      "ms": 111.42320000000018,
+      "textBytes": 22267,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": -2,
+      "warmup": true,
+      "ok": true,
+      "ms": 45.22950000000037,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": -1,
+      "warmup": true,
+      "ok": true,
+      "ms": 113.69419999999991,
+      "textBytes": 467,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": -1,
+      "warmup": true,
+      "ok": true,
+      "ms": 1.1755999999995765,
+      "textBytes": 460,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": -1,
+      "warmup": true,
+      "ok": true,
+      "ms": 227.08460000000014,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": -1,
+      "warmup": true,
+      "ok": true,
+      "ms": 108.40920000000006,
+      "textBytes": 22267,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": -1,
+      "warmup": true,
+      "ok": true,
+      "ms": 15.449200000000019,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 0,
+      "warmup": false,
+      "ok": true,
+      "ms": 105.3096999999998,
+      "textBytes": 467,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 0,
+      "warmup": false,
+      "ok": true,
+      "ms": 1.0059000000001106,
+      "textBytes": 460,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 0,
+      "warmup": false,
+      "ok": true,
+      "ms": 203.72729999999956,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 0,
+      "warmup": false,
+      "ok": true,
+      "ms": 107.6301999999996,
+      "textBytes": 22267,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 0,
+      "warmup": false,
+      "ok": true,
+      "ms": 16.76510000000053,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_cached",
+      "round": 1,
+      "warmup": false,
+      "ok": true,
+      "ms": 0.8438999999998487,
+      "textBytes": 460,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 1,
+      "warmup": false,
+      "ok": true,
+      "ms": 190.3661000000002,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 1,
+      "warmup": false,
+      "ok": true,
+      "ms": 104.98749999999927,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 1,
+      "warmup": false,
+      "ok": true,
+      "ms": 17.515699999999924,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 1,
+      "warmup": false,
+      "ok": true,
+      "ms": 106.19909999999982,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 2,
+      "warmup": false,
+      "ok": true,
+      "ms": 217.2484999999997,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 2,
+      "warmup": false,
+      "ok": true,
+      "ms": 112.29629999999997,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 2,
+      "warmup": false,
+      "ok": true,
+      "ms": 16.834900000001653,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 2,
+      "warmup": false,
+      "ok": true,
+      "ms": 107.630799999999,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 2,
+      "warmup": false,
+      "ok": true,
+      "ms": 1.192800000000716,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 3,
+      "warmup": false,
+      "ok": true,
+      "ms": 109.93099999999868,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 3,
+      "warmup": false,
+      "ok": true,
+      "ms": 17.069900000000416,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 3,
+      "warmup": false,
+      "ok": true,
+      "ms": 106.52009999999973,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 3,
+      "warmup": false,
+      "ok": true,
+      "ms": 1.0809000000008382,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 3,
+      "warmup": false,
+      "ok": true,
+      "ms": 221.98309999999947,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 4,
+      "warmup": false,
+      "ok": true,
+      "ms": 15.421599999999671,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 4,
+      "warmup": false,
+      "ok": true,
+      "ms": 124.54889999999978,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 4,
+      "warmup": false,
+      "ok": true,
+      "ms": 1.0552999999999884,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 4,
+      "warmup": false,
+      "ok": true,
+      "ms": 176.60629999999946,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 4,
+      "warmup": false,
+      "ok": true,
+      "ms": 110.56390000000101,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_uncached",
+      "round": 5,
+      "warmup": false,
+      "ok": true,
+      "ms": 129.85449999999946,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 5,
+      "warmup": false,
+      "ok": true,
+      "ms": 1.066499999998996,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 5,
+      "warmup": false,
+      "ok": true,
+      "ms": 213.17109999999957,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 5,
+      "warmup": false,
+      "ok": true,
+      "ms": 107.69830000000002,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 5,
+      "warmup": false,
+      "ok": true,
+      "ms": 13.67699999999968,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_cached",
+      "round": 6,
+      "warmup": false,
+      "ok": true,
+      "ms": 0.8775000000005093,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 6,
+      "warmup": false,
+      "ok": true,
+      "ms": 190.80759999999827,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 6,
+      "warmup": false,
+      "ok": true,
+      "ms": 115.8137999999999,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 6,
+      "warmup": false,
+      "ok": true,
+      "ms": 12.795799999999872,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 6,
+      "warmup": false,
+      "ok": true,
+      "ms": 123.90719999999783,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 7,
+      "warmup": false,
+      "ok": true,
+      "ms": 204.62690000000293,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 7,
+      "warmup": false,
+      "ok": true,
+      "ms": 110.59630000000107,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 7,
+      "warmup": false,
+      "ok": true,
+      "ms": 13.807199999999284,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 7,
+      "warmup": false,
+      "ok": true,
+      "ms": 109.05659999999989,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 7,
+      "warmup": false,
+      "ok": true,
+      "ms": 0.9379999999982829,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 8,
+      "warmup": false,
+      "ok": true,
+      "ms": 104.09479999999894,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 8,
+      "warmup": false,
+      "ok": true,
+      "ms": 14.140400000000227,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 8,
+      "warmup": false,
+      "ok": true,
+      "ms": 110.78790000000299,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 8,
+      "warmup": false,
+      "ok": true,
+      "ms": 1.162000000000262,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 8,
+      "warmup": false,
+      "ok": true,
+      "ms": 203.54089999999997,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 9,
+      "warmup": false,
+      "ok": true,
+      "ms": 18.360799999998562,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 9,
+      "warmup": false,
+      "ok": true,
+      "ms": 120.39500000000044,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 9,
+      "warmup": false,
+      "ok": true,
+      "ms": 1.0709999999999127,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 9,
+      "warmup": false,
+      "ok": true,
+      "ms": 181.26940000000104,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 9,
+      "warmup": false,
+      "ok": true,
+      "ms": 115.35150000000067,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_uncached",
+      "round": 10,
+      "warmup": false,
+      "ok": true,
+      "ms": 111.23769999999786,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 10,
+      "warmup": false,
+      "ok": true,
+      "ms": 0.9929000000011001,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 10,
+      "warmup": false,
+      "ok": true,
+      "ms": 213.3244999999988,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 10,
+      "warmup": false,
+      "ok": true,
+      "ms": 110.21330000000307,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 10,
+      "warmup": false,
+      "ok": true,
+      "ms": 15.821899999999005,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_cached",
+      "round": 11,
+      "warmup": false,
+      "ok": true,
+      "ms": 0.6935000000012224,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 11,
+      "warmup": false,
+      "ok": true,
+      "ms": 218.79620000000068,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 11,
+      "warmup": false,
+      "ok": true,
+      "ms": 108.27939999999944,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 11,
+      "warmup": false,
+      "ok": true,
+      "ms": 15.012900000001537,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 11,
+      "warmup": false,
+      "ok": true,
+      "ms": 105.02310000000216,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 12,
+      "warmup": false,
+      "ok": true,
+      "ms": 195.58290000000125,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 12,
+      "warmup": false,
+      "ok": true,
+      "ms": 107.95019999999931,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 12,
+      "warmup": false,
+      "ok": true,
+      "ms": 14.355499999997846,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 12,
+      "warmup": false,
+      "ok": true,
+      "ms": 105.70550000000003,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 12,
+      "warmup": false,
+      "ok": true,
+      "ms": 0.9519999999974971,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 13,
+      "warmup": false,
+      "ok": true,
+      "ms": 108.8760000000002,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 13,
+      "warmup": false,
+      "ok": true,
+      "ms": 15.916100000002189,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 13,
+      "warmup": false,
+      "ok": true,
+      "ms": 122.53480000000127,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 13,
+      "warmup": false,
+      "ok": true,
+      "ms": 0.9919000000008964,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 13,
+      "warmup": false,
+      "ok": true,
+      "ms": 204.92209999999977,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 14,
+      "warmup": false,
+      "ok": true,
+      "ms": 13.372299999999086,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 14,
+      "warmup": false,
+      "ok": true,
+      "ms": 105.95319999999992,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 14,
+      "warmup": false,
+      "ok": true,
+      "ms": 1.0868000000009488,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 14,
+      "warmup": false,
+      "ok": true,
+      "ms": 201.2331000000013,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 14,
+      "warmup": false,
+      "ok": true,
+      "ms": 102.45439999999871,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_uncached",
+      "round": 15,
+      "warmup": false,
+      "ok": true,
+      "ms": 120.55489999999554,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 15,
+      "warmup": false,
+      "ok": true,
+      "ms": 1.1154999999998836,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 15,
+      "warmup": false,
+      "ok": true,
+      "ms": 183.1678000000029,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 15,
+      "warmup": false,
+      "ok": true,
+      "ms": 101.77070000000094,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 15,
+      "warmup": false,
+      "ok": true,
+      "ms": 14.313800000003539,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_cached",
+      "round": 16,
+      "warmup": false,
+      "ok": true,
+      "ms": 0.83980000000156,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 16,
+      "warmup": false,
+      "ok": true,
+      "ms": 225.41689999999653,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 16,
+      "warmup": false,
+      "ok": true,
+      "ms": 112.80139999999665,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 16,
+      "warmup": false,
+      "ok": true,
+      "ms": 14.363799999999173,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 16,
+      "warmup": false,
+      "ok": true,
+      "ms": 106.19830000000366,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 17,
+      "warmup": false,
+      "ok": true,
+      "ms": 212.81080000000657,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 17,
+      "warmup": false,
+      "ok": true,
+      "ms": 106.46429999999964,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 17,
+      "warmup": false,
+      "ok": true,
+      "ms": 15.766999999999825,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 17,
+      "warmup": false,
+      "ok": true,
+      "ms": 109.55169999999634,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 17,
+      "warmup": false,
+      "ok": true,
+      "ms": 1.0729999999966822,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 18,
+      "warmup": false,
+      "ok": true,
+      "ms": 112.0344999999943,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 18,
+      "warmup": false,
+      "ok": true,
+      "ms": 13.483700000004319,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 18,
+      "warmup": false,
+      "ok": true,
+      "ms": 132.0023000000001,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 18,
+      "warmup": false,
+      "ok": true,
+      "ms": 0.9563999999954831,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 18,
+      "warmup": false,
+      "ok": true,
+      "ms": 191.7739999999976,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "screenshot",
+      "round": 19,
+      "warmup": false,
+      "ok": true,
+      "ms": 16.037300000003597,
+      "textBytes": 86,
+      "imageBytes": 32302,
+      "width": 896,
+      "height": 599
+    },
+    {
+      "case": "find_uncached",
+      "round": 19,
+      "warmup": false,
+      "ok": true,
+      "ms": 127.75089999999909,
+      "textBytes": 468,
+      "imageBytes": 0
+    },
+    {
+      "case": "find_cached",
+      "round": 19,
+      "warmup": false,
+      "ok": true,
+      "ms": 1.0592000000033295,
+      "textBytes": 461,
+      "imageBytes": 0
+    },
+    {
+      "case": "tree_filtered",
+      "round": 19,
+      "warmup": false,
+      "ok": true,
+      "ms": 217.3712000000014,
+      "textBytes": 85419,
+      "imageBytes": 0
+    },
+    {
+      "case": "table",
+      "round": 19,
+      "warmup": false,
+      "ok": true,
+      "ms": 112.35759999999573,
+      "textBytes": 22268,
+      "imageBytes": 0
+    },
+    {
+      "case": "task_select_largest",
+      "round": -2,
+      "warmup": true,
+      "ok": true,
+      "ms": 265.0877999999939,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": -1,
+      "warmup": true,
+      "ok": true,
+      "ms": 281.2908000000025,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 0,
+      "warmup": false,
+      "ok": true,
+      "ms": 259.0237999999954,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 1,
+      "warmup": false,
+      "ok": true,
+      "ms": 243.23839999999473,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 2,
+      "warmup": false,
+      "ok": true,
+      "ms": 278.20440000000235,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 3,
+      "warmup": false,
+      "ok": true,
+      "ms": 260.54060000000027,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 4,
+      "warmup": false,
+      "ok": true,
+      "ms": 246.5156999999963,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 5,
+      "warmup": false,
+      "ok": true,
+      "ms": 246.4979999999996,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 6,
+      "warmup": false,
+      "ok": true,
+      "ms": 263.67759999999544,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 7,
+      "warmup": false,
+      "ok": true,
+      "ms": 292.12770000000455,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 8,
+      "warmup": false,
+      "ok": true,
+      "ms": 247.80040000000008,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 9,
+      "warmup": false,
+      "ok": true,
+      "ms": 250.00019999999495,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 10,
+      "warmup": false,
+      "ok": true,
+      "ms": 256.3891999999978,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 11,
+      "warmup": false,
+      "ok": true,
+      "ms": 291.7183999999979,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 12,
+      "warmup": false,
+      "ok": true,
+      "ms": 273.77939999999944,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 13,
+      "warmup": false,
+      "ok": true,
+      "ms": 261.45850000000064,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 14,
+      "warmup": false,
+      "ok": true,
+      "ms": 271.2468999999983,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 15,
+      "warmup": false,
+      "ok": true,
+      "ms": 275.27320000000327,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 16,
+      "warmup": false,
+      "ok": true,
+      "ms": 262.68679999999586,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 17,
+      "warmup": false,
+      "ok": true,
+      "ms": 241.75620000000345,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 18,
+      "warmup": false,
+      "ok": true,
+      "ms": 244.3327999999965,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    },
+    {
+      "case": "task_select_largest",
+      "round": 19,
+      "warmup": false,
+      "ok": true,
+      "ms": 247.72090000000026,
+      "calls": 3,
+      "selected": "simsunb.ttf"
+    }
+  ],
+  "sourceHashFormat": "UTF-8 text with LF line endings (BOM preserved)",
+  "sourceSha256": {
+    "server.mjs": "33c3a22d33dd094285f5fd99c93e3e3ce467977512d7019ae6498c830c67eec8",
+    "worker.ps1": "ee67452c643d48ce8797a3f2573625656038fa9847962d30feec89712e7b7740",
+    "uia-native.cs": "efedbebe3920cbffebf8e125911ef4fc76967f07522efe9384f7a74b19e4aa4d",
+    "lib/worker.mjs": "007b971ff9774fee21126184d46df88ac2ee0fbdb7ac441bba43859d61619c03",
+    "lib/cdp.mjs": "8a5be88a19d34f84bc000e8151ff17939283d486f063ebeadbc4c1838b9a361e",
+    "lib/batch.mjs": "3195cd32f91da7ac171f844f9b8acf208b51db2b8b3aedde15b62276495e289b",
+    "lib/stats.mjs": "186fb7d3e201f7b55de628ef9343eea5181fec9f6391b8237afd94ae228d0a6a",
+    "package-lock.json": "b42da97f96217eca1e6f3c07c363cce1cd0d326a0a452b4cb33e31e0452c5e48",
+    "benchmark.mjs": "30401526e22812fcb6988e104486dbf3510262831d421fd44aae394ec9a8f725",
+    "examples/font-catalog.ps1": "59afba62f6f054312ca2a9da1d37111b75a3bc3092b3e491792f30910a08d668"
+  },
+  "startupMs": 814.0215000000001,
+  "nativeUia": true,
+  "summary": {
+    "find_uncached": {
+      "passed": 20,
+      "failed": 0,
+      "latencyMs": {
+        "n": 20,
+        "min": 105.02310000000216,
+        "p50": 109.55169999999634,
+        "p95": 129.85449999999946,
+        "max": 132.0023000000001
+      },
+      "textBytes": {
+        "n": 20,
+        "min": 467,
+        "p50": 468,
+        "p95": 468,
+        "max": 468
+      },
+      "imageBytes": null
+    },
+    "find_cached": {
+      "passed": 20,
+      "failed": 0,
+      "latencyMs": {
+        "n": 20,
+        "min": 0.6935000000012224,
+        "p50": 1.0059000000001106,
+        "p95": 1.162000000000262,
+        "max": 1.192800000000716
+      },
+      "textBytes": {
+        "n": 20,
+        "min": 460,
+        "p50": 461,
+        "p95": 461,
+        "max": 461
+      },
+      "imageBytes": null
+    },
+    "tree_filtered": {
+      "passed": 20,
+      "failed": 0,
+      "latencyMs": {
+        "n": 20,
+        "min": 176.60629999999946,
+        "p50": 203.72729999999956,
+        "p95": 221.98309999999947,
+        "max": 225.41689999999653
+      },
+      "textBytes": {
+        "n": 20,
+        "min": 85419,
+        "p50": 85419,
+        "p95": 85419,
+        "max": 85419
+      },
+      "imageBytes": null
+    },
+    "table": {
+      "passed": 20,
+      "failed": 0,
+      "latencyMs": {
+        "n": 20,
+        "min": 101.77070000000094,
+        "p50": 108.8760000000002,
+        "p95": 115.35150000000067,
+        "max": 115.8137999999999
+      },
+      "textBytes": {
+        "n": 20,
+        "min": 22267,
+        "p50": 22268,
+        "p95": 22268,
+        "max": 22268
+      },
+      "imageBytes": null
+    },
+    "screenshot": {
+      "passed": 20,
+      "failed": 0,
+      "latencyMs": {
+        "n": 20,
+        "min": 12.795799999999872,
+        "p50": 15.012900000001537,
+        "p95": 17.515699999999924,
+        "max": 18.360799999998562
+      },
+      "textBytes": {
+        "n": 20,
+        "min": 86,
+        "p50": 86,
+        "p95": 86,
+        "max": 86
+      },
+      "imageBytes": {
+        "n": 20,
+        "min": 32302,
+        "p50": 32302,
+        "p95": 32302,
+        "max": 32302
+      }
+    },
+    "task_select_largest": {
+      "passed": 20,
+      "failed": 0,
+      "latencyMs": {
+        "n": 20,
+        "min": 241.75620000000345,
+        "p50": 259.0237999999954,
+        "p95": 291.7183999999979,
+        "max": 292.12770000000455
+      },
+      "textBytes": null,
+      "imageBytes": null
+    }
+  }
+}

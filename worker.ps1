@@ -1,0 +1,3331 @@
+﻿$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+[Console]::InputEncoding  = New-Object System.Text.UTF8Encoding($false)
+
+$ErrorActionPreference = 'Continue'
+
+# Процесс должен объявить себя DPI-aware ДО любых UI-вызовов. Иначе на
+# мониторе с масштабированием (125%, 150%) координаты из UIA и OCR приходят
+# в логических единицах, а SendInput жмёт в физических пикселях, и клик уезжает
+# мимо цели на десятки пикселей. Проверено: без этого вызов процесс помечается
+# как DPI_UNAWARE.
+if (-not ("DpiFix" -as [type])) {
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class DpiFix {
+  [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr v);
+  [DllImport("shcore.dll")] static extern int SetProcessDpiAwareness(int a);
+  public static string Apply() {
+    try { if (SetProcessDpiAwarenessContext(new IntPtr(-4))) return "per-monitor-v2"; } catch { }
+    try { if (SetProcessDpiAwarenessContext(new IntPtr(-3))) return "per-monitor-v1"; } catch { }
+    try { if (SetProcessDpiAwareness(2) == 0) return "per-monitor"; } catch { }
+    return "unaware";
+  }
+}
+'@
+}
+$DpiMode = [DpiFix]::Apply()
+
+if (-not ("DeskMcp" -as [type])) {
+Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+
+public class DeskMcp {
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool SetThreadDesktop(IntPtr hDesktop);
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool CloseDesktop(IntPtr hDesktop);
+
+    private static bool _needsDeskThread = false;
+    private static bool _checkedDesk = false;
+    private static readonly object _deskGate = new object();
+    private static System.Threading.Thread _deskThread = null;
+    private static Action _deskJob = null;
+    private static Exception _deskEx = null;
+    private static System.Threading.ManualResetEventSlim _deskReady = new System.Threading.ManualResetEventSlim(false);
+    private static System.Threading.ManualResetEventSlim _deskDone = new System.Threading.ManualResetEventSlim(false);
+
+    private static void EnsureDeskThread() {
+        if (!_checkedDesk) {
+            POINT p;
+            _needsDeskThread = !GetCursorPosRaw(out p);
+            _checkedDesk = true;
+        }
+        if (!_needsDeskThread) return;
+        lock (_deskGate) {
+            if (_deskThread == null || !_deskThread.IsAlive) {
+                _deskReady.Reset();
+                _deskDone.Reset();
+                _deskThread = new System.Threading.Thread(DeskLoop);
+                _deskThread.SetApartmentState(System.Threading.ApartmentState.STA);
+                _deskThread.IsBackground = true;
+                _deskThread.Start();
+                _deskReady.Wait(2000);
+            }
+        }
+    }
+
+    private static void DeskLoop() {
+        try {
+            IntPtr hDesk = OpenInputDesktop(0, false, 0x10000000 | 0x1FF);
+            if (hDesk == IntPtr.Zero) hDesk = OpenInputDesktop(0, false, 0x1FF);
+            if (hDesk != IntPtr.Zero) {
+                SetThreadDesktop(hDesk);
+                CloseDesktop(hDesk);
+            }
+        } catch {}
+        _deskReady.Set();
+        while (true) {
+            Action job = null;
+            lock (_deskGate) {
+                while (_deskJob == null) System.Threading.Monitor.Wait(_deskGate);
+                job = _deskJob;
+                _deskJob = null;
+            }
+            try {
+                job();
+            } catch (Exception ex) {
+                _deskEx = ex;
+            }
+            _deskDone.Set();
+        }
+    }
+
+    public static void RunOnDesk(Action action) {
+        EnsureDeskThread();
+        if (!_needsDeskThread) {
+            action();
+            return;
+        }
+        lock (_deskGate) {
+            _deskEx = null;
+            _deskJob = action;
+            _deskDone.Reset();
+            System.Threading.Monitor.Pulse(_deskGate);
+        }
+        _deskDone.Wait();
+        if (_deskEx != null) throw _deskEx;
+    }
+
+    [DllImport("user32.dll", EntryPoint = "SetCursorPos")] private static extern bool SetCursorPosRaw(int X, int Y);
+    public static bool SetCursorPos(int X, int Y) {
+        bool res = false;
+        RunOnDesk(delegate() { res = SetCursorPosRaw(X, Y); });
+        return res;
+    }
+
+    [DllImport("user32.dll", EntryPoint = "mouse_event")] private static extern void mouse_event_raw(uint f, uint dx, uint dy, uint d, IntPtr e);
+    public static void mouse_event(uint f, uint dx, uint dy, uint d, IntPtr e) {
+        RunOnDesk(delegate() { mouse_event_raw(f, dx, dy, d, e); });
+    }
+
+    [DllImport("user32.dll", EntryPoint = "SendInput")] private static extern uint SendInputRaw(uint n, INPUT[] p, int size);
+    public static uint SendInput(uint n, INPUT[] p, int size) {
+        uint res = 0;
+        RunOnDesk(delegate() { res = SendInputRaw(n, p, size); });
+        return res;
+    }
+
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    [DllImport("user32.dll", SetLastError = true)] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr h);
+    [DllImport("user32.dll")] public static extern IntPtr SetActiveWindow(IntPtr h);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool attach);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr pid);
+    [DllImport("user32.dll", EntryPoint = "GetWindowThreadProcessId")]
+    static extern uint GetWindowThreadProcessIdPid(IntPtr h, out int pid);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll")] public static extern int GetSystemMetrics(int i);
+    [DllImport("user32.dll")] public static extern IntPtr GetDesktopWindow();
+    [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int ht, bool repaint);
+    [DllImport("user32.dll")] public static extern short GetKeyState(int vKey);
+
+    [DllImport("user32.dll", EntryPoint = "GetCursorPos")] private static extern bool GetCursorPosRaw(out POINT p);
+    public static bool GetCursorPos(out POINT p) {
+        POINT pt = new POINT();
+        bool ok = false;
+        RunOnDesk(delegate() { ok = GetCursorPosRaw(out pt); });
+        p = pt;
+        return ok;
+    }
+
+    [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+
+    public static System.Drawing.Bitmap CaptureScreen(int x, int y, int w, int h) {
+        System.Drawing.Bitmap bmp = null;
+        RunOnDesk(delegate() {
+            bmp = new System.Drawing.Bitmap(w, h);
+            using (var g = System.Drawing.Graphics.FromImage(bmp)) {
+                g.CopyFromScreen(x, y, 0, 0, new System.Drawing.Size(w, h));
+            }
+        });
+        return bmp;
+    }
+
+    public struct RectI32 {
+        public int X;
+        public int Y;
+        public int Width;
+        public int Height;
+        public RectI32(int x, int y, int w, int h) { X = x; Y = y; Width = w; Height = h; }
+    }
+
+    public static System.Collections.Generic.List<RectI32> GetOcrTiles(int width, int height, int edge, int overlap) {
+        var tiles = new System.Collections.Generic.List<RectI32>();
+        if (width <= 0 || height <= 0 || edge <= 0) return tiles;
+        if (width <= edge && height <= edge) {
+            tiles.Add(new RectI32(0, 0, width, height));
+            return tiles;
+        }
+        for (int y = 0; y < height; ) {
+            int h = Math.Min(edge, height - y);
+            for (int x = 0; x < width; ) {
+                int w = Math.Min(edge, width - x);
+                tiles.Add(new RectI32(x, y, w, h));
+                if (x + w >= width) break;
+                x += edge - overlap;
+            }
+            if (y + h >= height) break;
+            y += edge - overlap;
+        }
+        return tiles;
+    }
+
+    public static bool SameOcrRegion(int ax, int ay, int aw, int ah, int bx, int by, int bw, int bh) {
+        if (aw <= 0 || ah <= 0 || bw <= 0 || bh <= 0) return false;
+        long w = Math.Min((long)ax + aw, (long)bx + bw) - Math.Max(ax, bx);
+        long h = Math.Min((long)ay + ah, (long)by + bh) - Math.Max(ay, by);
+        if (w <= 0 || h <= 0) return false;
+        double area = (double)w * h;
+        double minArea = Math.Min((double)aw * ah, (double)bw * bh);
+        return area >= 0.6 * minArea;
+    }
+
+    public static void FlattenAlpha(System.Drawing.Bitmap bmp) {
+        if (bmp == null || bmp.PixelFormat != System.Drawing.Imaging.PixelFormat.Format32bppArgb) return;
+        var rect = new System.Drawing.Rectangle(0, 0, bmp.Width, bmp.Height);
+        var data = bmp.LockBits(rect, System.Drawing.Imaging.ImageLockMode.ReadWrite, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        try {
+            int bytes = Math.Abs(data.Stride) * bmp.Height;
+            byte[] rgb = new byte[bytes];
+            System.Runtime.InteropServices.Marshal.Copy(data.Scan0, rgb, 0, bytes);
+            for (int i = 0; i < bytes; i += 4) {
+                byte b = rgb[i];
+                byte g = rgb[i + 1];
+                byte r = rgb[i + 2];
+                byte a = rgb[i + 3];
+                if (a < 255) {
+                    rgb[i] = (byte)((b * a + 255 * (255 - a) + 127) / 255);
+                    rgb[i + 1] = (byte)((g * a + 255 * (255 - a) + 127) / 255);
+                    rgb[i + 2] = (byte)((r * a + 255 * (255 - a) + 127) / 255);
+                    rgb[i + 3] = 255;
+                }
+            }
+            System.Runtime.InteropServices.Marshal.Copy(rgb, 0, data.Scan0, bytes);
+        } finally {
+            bmp.UnlockBits(data);
+        }
+    }
+
+    public static void DrawOcrMarks(System.Drawing.Bitmap bmp, int[] rects, string[] labels) {
+        if (bmp == null || rects == null || labels == null) return;
+        using (var g = System.Drawing.Graphics.FromImage(bmp)) {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var pen = new System.Drawing.Pen(System.Drawing.Color.FromArgb(220, 235, 30, 30), 2))
+            using (var fillBrush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(40, 255, 50, 50)))
+            using (var tagBg = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(210, 20, 20, 20)))
+            using (var textBrush = new System.Drawing.SolidBrush(System.Drawing.Color.White))
+            using (var font = new System.Drawing.Font(System.Drawing.FontFamily.GenericSansSerif, 9, System.Drawing.FontStyle.Bold)) {
+                int count = Math.Min(rects.Length / 4, labels.Length);
+                for (int i = 0; i < count; i++) {
+                    int rx = rects[i * 4];
+                    int ry = rects[i * 4 + 1];
+                    int rw = rects[i * 4 + 2];
+                    int rh = rects[i * 4 + 3];
+                    if (rw <= 0 || rh <= 0) continue;
+                    g.FillRectangle(fillBrush, rx, ry, rw, rh);
+                    g.DrawRectangle(pen, rx, ry, rw, rh);
+                    string label = labels[i];
+                    if (!string.IsNullOrEmpty(label)) {
+                        var size = g.MeasureString(label, font);
+                        int tagW = (int)size.Width + 4;
+                        int tagH = (int)size.Height + 2;
+                        int tagY = ry >= tagH ? ry - tagH : ry;
+                        g.FillRectangle(tagBg, rx, tagY, tagW, tagH);
+                        g.DrawString(label, font, textBrush, rx + 2, tagY + 1);
+                    }
+                }
+            }
+        }
+    }
+
+    // Перечисление верхнеуровневых окон через user32, а не через UIA.
+    // Причина замерами: FindWindowByTitle шёл через
+    // AutomationElement.RootElement.FindAll, и когда в системе висит
+    // приложение, тормозящее UIA, любой вызов с названием окна платил
+    // 3.0-3.2 с. EnumWindows занимает микросекунды и не ходит в COM.
+    public delegate bool EnumWindowsProc(IntPtr h, IntPtr lParam);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetWindowTextW")]
+    public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder sb, int max);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetClassNameW")]
+    public static extern int GetClassNameW(IntPtr h, System.Text.StringBuilder sb, int max);
+
+    public class WinInfo {
+        public IntPtr Handle;
+        public string Title;
+        public string Class;
+        public int Pid;
+        public bool Visible;
+        public int X, Y, W, H;
+    }
+
+    public static WinInfo GetWindowInfo(IntPtr h) {
+        if (h == IntPtr.Zero || !IsWindow(h)) return null;
+        var sbT = new System.Text.StringBuilder(512);
+        var sbC = new System.Text.StringBuilder(256);
+        GetWindowTextW(h, sbT, sbT.Capacity);
+        GetClassNameW(h, sbC, sbC.Capacity);
+        RECT rr;
+        bool hasRect = GetWindowRect(h, out rr);
+        int ww = hasRect ? rr.Right - rr.Left : 0;
+        int hh = hasRect ? rr.Bottom - rr.Top : 0;
+        int pid;
+        GetWindowThreadProcessIdPid(h, out pid);
+        return new WinInfo {
+            Handle = h, Title = sbT.ToString(), Class = sbC.ToString(),
+            Pid = pid, Visible = IsWindowVisible(h),
+            X = rr.Left, Y = rr.Top, W = ww, H = hh
+        };
+    }
+
+    public static System.Collections.Generic.List<WinInfo> EnumTopWindows() {
+        var list = new System.Collections.Generic.List<WinInfo>();
+        RunOnDesk(delegate() {
+            var sbT = new System.Text.StringBuilder(512);
+            var sbC = new System.Text.StringBuilder(256);
+            EnumWindows(delegate(IntPtr h, IntPtr l) {
+            sbT.Length = 0; sbC.Length = 0;
+            GetWindowTextW(h, sbT, sbT.Capacity);
+            GetClassNameW(h, sbC, sbC.Capacity);
+            var title = sbT.ToString();
+            // Отбрасываем окна без заголовка и без области: служебные
+            // оверлеи, тени и заглушки дают 0x0 или 14x14 и в выдаче
+            // computer_windows они только шумят (193 окна против 16 у UIA).
+            RECT rr;
+            bool hasRect = GetWindowRect(h, out rr);
+            int ww = hasRect ? rr.Right - rr.Left : 0;
+            int hh = hasRect ? rr.Bottom - rr.Top : 0;
+            if (title.Length > 0 && ww > 1 && hh > 1) {
+                int pid;
+                GetWindowThreadProcessIdPid(h, out pid);
+                list.Add(new WinInfo {
+                    Handle = h, Title = title, Class = sbC.ToString(),
+                    Pid = pid, Visible = IsWindowVisible(h),
+                    X = rr.Left, Y = rr.Top, W = ww, H = hh
+                });
+            }
+            return true;
+            }, IntPtr.Zero);
+        });
+        return list;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+    // PrintWindow с PW_RENDERFULLCONTENT (0x2) заставляет приложение
+    // перерисовать содержимое в переданный DC. Обычный BitBlt к окну
+    // возвращает то, что лежит в композиторе, а для перекрытых и
+    // развёрнутых окон — пустоту.
+    public static System.Drawing.Bitmap CaptureWindow(IntPtr h) {
+        RECT r;
+        if (h == IntPtr.Zero || !GetWindowRect(h, out r)) return null;
+        int w = r.Right - r.Left, ht = r.Bottom - r.Top;
+        if (w <= 0 || ht <= 0) return null;
+        var bmp = new System.Drawing.Bitmap(w, ht, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+        using (var g = System.Drawing.Graphics.FromImage(bmp)) {
+            IntPtr hdc = g.GetHdc();
+            try { PrintWindow(h, hdc, 2); }
+            finally { g.ReleaseHdc(hdc); }
+        }
+        return bmp;
+    }
+
+    public static System.Drawing.Rectangle WindowBounds(IntPtr h) {
+        RECT r;
+        if (!GetWindowRect(h, out r)) return new System.Drawing.Rectangle(0, 0, 0, 0);
+        return new System.Drawing.Rectangle(r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top);
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT { public int X; public int Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYBDINPUT {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+    [StructLayout(LayoutKind.Explicit, Size = 40)]
+    public struct INPUT {
+        [FieldOffset(0)] public uint type;
+        [FieldOffset(8)] public KEYBDINPUT ki;
+    }
+
+    public const uint LEFTDOWN   = 0x0002, LEFTUP   = 0x0004;
+    public const uint RIGHTDOWN = 0x0008, RIGHTUP   = 0x0010;
+    public const uint MIDDLEDOWN = 0x0020, MIDDLEUP   = 0x0040;
+    public const uint WHEEL     = 0x0800, HWHEEL   = 0x01000;
+    public const uint MOVE      = 0x0001, ABSOLUTE = 0x8000;
+    public const uint KEYEVENTF_UNICODE = 0x0004, KEYEVENTF_KEYUP = 0x0002;
+    public const uint INPUT_KEYBOARD = 1;
+
+    public static int Size() { return Marshal.SizeOf(typeof(INPUT)); }
+
+    public static void MoveTo(int x, int y) { SetCursorPos(x, y); }
+
+    public static void MoveBy(int dx, int dy, int steps, int stepMs) {
+        int remainX = dx, remainY = dy;
+        for (int pass = 0; pass < 4; pass++) {
+            if (remainX == 0 && remainY == 0) break;
+            POINT before, after;
+            if (!GetCursorPos(out before)) break;
+            SendMove(remainX, remainY, steps, stepMs);
+            System.Threading.Thread.Sleep(30);
+            if (!GetCursorPos(out after)) break;
+            int nx = remainX - (after.X - before.X);
+            int ny = remainY - (after.Y - before.Y);
+            if (nx == remainX && ny == remainY) break;
+            remainX = nx; remainY = ny;
+            if (Math.Abs(remainX) <= 1 && Math.Abs(remainY) <= 1) break;
+            steps = steps > 2 ? steps / 2 : 1;
+        }
+    }
+
+    static void SendMove(int dx, int dy, int steps, int stepMs) {
+        if (steps < 1) steps = 1;
+        int sx = dx / steps, sy = dy / steps;
+        int rx = dx - sx * steps, ry = dy - sy * steps;
+        for (int i = 0; i < steps; i++) {
+            int ax = sx + (Math.Abs(rx) > i ? Math.Sign(rx) : 0);
+            int ay = sy + (Math.Abs(ry) > i ? Math.Sign(ry) : 0);
+            mouse_event(MOVE, unchecked((uint)ax), unchecked((uint)ay), 0, IntPtr.Zero);
+            if (stepMs > 0) System.Threading.Thread.Sleep(stepMs);
+        }
+    }
+
+    public static void ClickWithNudge(string button, int count, int nudgePx) {
+        uint down, up;
+        if (button == "right")       { down = RIGHTDOWN; up = RIGHTUP; }
+        else if (button == "middle"){ down = MIDDLEDOWN; up = MIDDLEUP; }
+        else                        { down = LEFTDOWN;   up = LEFTUP; }
+        int n = nudgePx < 0 ? -nudgePx : nudgePx;
+        for (int i = 0; i < count; i++) {
+            mouse_event(down, 0, 0, 0, IntPtr.Zero);
+            System.Threading.Thread.Sleep(30);
+            if (n > 0) {
+                mouse_event(MOVE, unchecked((uint)n), 0, 0, IntPtr.Zero);
+                System.Threading.Thread.Sleep(20);
+            }
+            mouse_event(up, 0, 0, 0, IntPtr.Zero);
+            if (i + 1 < count) System.Threading.Thread.Sleep(90);
+        }
+    }
+
+    public static void Click(string button, int count) {
+        uint down, up;
+        if (button == "right")       { down = RIGHTDOWN; up = RIGHTUP; }
+        else if (button == "middle"){ down = MIDDLEDOWN; up = MIDDLEUP; }
+        else                        { down = LEFTDOWN;   up = LEFTUP; }
+        for (int i = 0; i < count; i++) {
+            mouse_event(down, 0, 0, 0, IntPtr.Zero);
+            System.Threading.Thread.Sleep(30);
+            mouse_event(up, 0, 0, 0, IntPtr.Zero);
+            if (i + 1 < count) System.Threading.Thread.Sleep(90);
+        }
+    }
+
+    public static void ButtonDown(string button) {
+        uint down;
+        if (button == "right")        down = RIGHTDOWN;
+        else if (button == "middle") down = MIDDLEDOWN;
+        else                          down = LEFTDOWN;
+        mouse_event(down, 0, 0, 0, IntPtr.Zero);
+    }
+
+    public static void ButtonUp(string button) {
+        uint up;
+        if (button == "right")        up = RIGHTUP;
+        else if (button == "middle") up = MIDDLEUP;
+        else                          up = LEFTUP;
+        mouse_event(up, 0, 0, 0, IntPtr.Zero);
+    }
+
+    public static void Drag(int x1, int y1, int x2, int y2, int steps, int stepMs) {
+        SetCursorPos(x1, y1);
+        System.Threading.Thread.Sleep(60);
+        mouse_event(LEFTDOWN, 0, 0, 0, IntPtr.Zero);
+        System.Threading.Thread.Sleep(60);
+        for (int i = 1; i <= steps; i++) {
+            int x = x1 + (x2 - x1) * i / steps;
+            int y = y1 + (y2 - y1) * i / steps;
+            SetCursorPos(x, y);
+            System.Threading.Thread.Sleep(stepMs);
+        }
+        System.Threading.Thread.Sleep(60);
+        mouse_event(LEFTUP, 0, 0, 0, IntPtr.Zero);
+    }
+
+    public static void ScrollWheel(int dx, int dy) {
+        if (dy != 0) mouse_event(WHEEL, 0, 0, unchecked((uint)dy), IntPtr.Zero);
+        if (dx != 0) mouse_event(HWHEEL, 0, 0, unchecked((uint)dx), IntPtr.Zero);
+    }
+
+    public static int TypeUnicode(string s) {
+        int size = Size(), sent = 0;
+        foreach (char c in s) {
+            INPUT d = new INPUT { type = INPUT_KEYBOARD };
+            d.ki = new KEYBDINPUT { wScan = (ushort)c, dwFlags = KEYEVENTF_UNICODE, dwExtraInfo = IntPtr.Zero };
+            INPUT u = new INPUT { type = INPUT_KEYBOARD };
+            u.ki = new KEYBDINPUT { wScan = (ushort)c, dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, dwExtraInfo = IntPtr.Zero };
+            sent += (int)SendInput(2, new INPUT[] { d, u }, size);
+        }
+        return sent;
+    }
+
+    public static int VKey(ushort vk, bool up) {
+        INPUT i = new INPUT { type = INPUT_KEYBOARD };
+        i.ki = new KEYBDINPUT { wVk = vk, dwFlags = up ? KEYEVENTF_KEYUP : 0, dwExtraInfo = IntPtr.Zero };
+        return (int)SendInput(1, new INPUT[] { i }, Size());
+    }
+
+    public static int PidOf(IntPtr h) {
+        int pid = 0;
+        if (GetWindowThreadProcessIdPid(h, out pid) == 0) return 0;
+        return pid;
+    }
+
+    public static bool KeyDown(int vk) { return (GetKeyState(vk) & 0x8000) != 0; }
+
+    public static bool Focus(IntPtr h) {
+        if (h == IntPtr.Zero) return false;
+        IntPtr fg = GetForegroundWindow();
+        uint fgThread = GetWindowThreadProcessId(fg, IntPtr.Zero);
+        uint myThread = GetCurrentThreadId();
+        bool attached = false;
+        if (fgThread != myThread && fgThread != 0) {
+            attached = AttachThreadInput(myThread, fgThread, true);
+        }
+        // try/finally обязателен: без него исключение между Attach и Detach
+        // оставит потоки ввода сцепленными, и последующие клики будут уходить
+        // не туда — вплоть до залипания модификаторов.
+        try {
+            if (IsIconic(h)) ShowWindow(h, 9);
+            BringWindowToTop(h);
+            SetForegroundWindow(h);
+            SetActiveWindow(h);
+            for (int i = 0; i < 25; i++) {
+                if (GetForegroundWindow() == h) return true;
+                System.Threading.Thread.Sleep(10);
+            }
+            return false;
+        } finally {
+            if (attached) AttachThreadInput(myThread, fgThread, false);
+        }
+    }
+}
+'@ -ReferencedAssemblies System.Drawing
+}
+
+if (-not ("DeskMcp" -as [type])) { throw "Класс DeskMcp не скомпилировался — воркер не может работать" }
+
+
+if (-not ("VDesk" -as [type])) {
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+[ComImport, Guid("2E910C3F-9F48-4B2F-BB99-4B87A8A89A7D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IVirtualDesktopManager {
+    [PreserveSig] int IsWindowOnDesktop(IntPtr hwnd, [In] ref Guid id);
+    [PreserveSig] int MoveWindowToDesktop(IntPtr hwnd, [In] ref Guid id);
+    [PreserveSig] IntPtr FindWindowByProcessId(uint pid, [MarshalAs(UnmanagedType.LPWStr)] string caption);
+    [PreserveSig] Guid GetWindowDesktopId(IntPtr hwnd);
+    [PreserveSig] int SetWindowDesktopId(IntPtr hwnd, [In] ref Guid id);
+    [PreserveSig] uint GetDesktopCount();
+    [PreserveSig] Guid GetDesktopByIndex(uint index);
+    [PreserveSig] Guid CreateDesktop();
+    [PreserveSig] int CloseDesktop([In] ref Guid id);
+    [PreserveSig] int SwitchDesktop([In] ref Guid id);
+}
+
+public static class VDesk {
+    static readonly Guid CLSID = new Guid("A5CD92FF-29BE-454C-8D04-D8285FB3F1B5");
+    static readonly Guid IID = new Guid("2E910C3F-9F48-4B2F-BB99-4B87A8A89A7D");
+    static bool _loaded = false;
+
+    [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr LoadLibraryW(string fileName);
+    [System.Runtime.InteropServices.DllImport("ole32.dll")]
+    static extern int CoCreateInstance(ref Guid clsid, IntPtr outer, uint context, ref Guid iid, [MarshalAs(UnmanagedType.IUnknown)] out object o);
+
+    public static IVirtualDesktopManager Get() {
+        // Класс живёт в VirtualDesktopManager.dll и не зарегистрирован в реестре:
+        // Type.GetTypeFromCLSID падает с REGDB_E_CLASSNOTREG, пока DLL не
+        // загружена. Под Windows 10/11 она лежит в System32.
+        if (!_loaded) {
+            IntPtr h = LoadLibraryW("VirtualDesktopManager.dll");
+            if (h == IntPtr.Zero) {
+                throw new COMException("VirtualDesktopManager.dll не найдена (WinErr " + Marshal.GetLastWin32Error() + ")");
+            }
+            _loaded = true;
+        }
+        Guid c = CLSID, i = IID;
+        object o;
+        int hr = CoCreateInstance(ref c, IntPtr.Zero, 1, ref i, out o);
+        if (hr != 0) throw new COMException("CoCreateInstance вернул 0x" + hr.ToString("X8"));
+        return (IVirtualDesktopManager)o;
+    }
+
+    public static List<string> List() {
+        var m = Get();
+        var res = new List<string>();
+        uint n = m.GetDesktopCount();
+        for (uint i = 0; i < n; i++) res.Add(m.GetDesktopByIndex(i).ToString());
+        return res;
+    }
+
+    public static string Create() { return Get().CreateDesktop().ToString(); }
+
+    public static void Switch(string guid) {
+        Guid g = new Guid(guid);
+        int hr = Get().SwitchDesktop(ref g);
+        if (hr != 0) throw new COMException("SwitchDesktop вернул HRESULT 0x" + hr.ToString("X8"));
+    }
+
+    public static void Close(string guid) {
+        Guid g = new Guid(guid);
+        int hr = Get().CloseDesktop(ref g);
+        if (hr != 0) throw new COMException("CloseDesktop вернул HRESULT 0x" + hr.ToString("X8"));
+    }
+
+    public static string OfWindow(IntPtr hwnd) { return Get().GetWindowDesktopId(hwnd).ToString(); }
+
+    public static void MoveWindowTo(IntPtr hwnd, string guid) {
+        Guid g = new Guid(guid);
+        int hr = Get().MoveWindowToDesktop(hwnd, ref g);
+        if (hr != 0) throw new COMException("MoveWindowToDesktop вернул HRESULT 0x" + hr.ToString("X8"));
+    }
+}
+"@
+}
+
+$script:BenchProc = $null
+
+function Get-BenchLog { Join-Path $env:TEMP 'desk-mcp-bench.log' }
+
+function Start-Bench {
+    $script:BenchProc = Start-Process -FilePath 'powershell.exe' `
+        -ArgumentList '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$PSScriptRoot\bench.ps1`"" `
+        -PassThru -WindowStyle Hidden
+    return $script:BenchProc.Id
+}
+
+function Read-BenchLog {
+    $f = Get-BenchLog
+    if (-not (Test-Path $f)) { return '' }
+    return [System.IO.File]::ReadAllText($f, [System.Text.Encoding]::UTF8)
+}
+
+function Stop-Bench {
+    if ($script:BenchProc -and -not $script:BenchProc.HasExited) { $script:BenchProc.Kill() }
+    $script:BenchProc = $null
+}
+function Get-DeskInfo {
+    $ids = [VDesk]::List()
+    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    return [ordered]@{
+        count = $ids.Count
+        desktops = @($ids | ForEach-Object { [ordered]@{ id = $_ } })
+        screen = [ordered]@{ x = $vs.Left; y = $vs.Top; w = $vs.Width; h = $vs.Height }
+    }
+}
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+
+$script:NativeUia = $null
+$script:NativeUiaError = $null
+$script:UiaBudgetMs = 6000
+$script:UiaDiag = $env:DESK_UIA_DIAG
+if ($env:DESK_UIA_BUDGET_MS) {
+    $parsed = 0
+    if ([int]::TryParse($env:DESK_UIA_BUDGET_MS, [ref]$parsed) -and $parsed -gt 0) { $script:UiaBudgetMs = $parsed }
+}
+
+# ---- Режимы безопасности для автономного агента -------------------------
+# Всё выключено по умолчанию и включается переменными окружения, поэтому
+# обычное поведение сервера не меняется ни на байт.
+#
+#   DESK_DRY_RUN=1              действия не выполняются, возвращается план
+#   DESK_AUDIT=1                писать журнал вызовов
+#   DESK_AUDIT_PATH=<путь>      куда писать (по умолчанию %TEMP%\desk-mcp-audit.log)
+#   DESK_ALLOW_TITLES=a|b|c     белый список: окно с заголовком обязано
+#                              содержать одну из подстрок, иначе отказ до действия
+$script:DryRun = ($env:DESK_DRY_RUN -eq '1')
+$script:AuditOn = (($env:DESK_AUDIT -eq '1') -or [bool]$env:DESK_AUDIT_PATH)
+$script:AuditPath = if ($env:DESK_AUDIT_PATH) { $env:DESK_AUDIT_PATH } else { Join-Path $env:TEMP 'desk-mcp-audit.log' }
+if ($script:AuditOn) {
+    try { [System.IO.File]::AppendAllText($script:AuditPath, '', (New-Object System.Text.UTF8Encoding($false))) }
+    catch { throw "AuditUnavailable: журнал недоступен '$($script:AuditPath)': $($_.Exception.Message)" }
+}
+$script:AllowTitles = @()
+if ($env:DESK_ALLOW_TITLES) {
+    $script:AllowTitles = @($env:DESK_ALLOW_TITLES -split '\|' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+
+# Инструменты, которые что-то меняют: в dry-run они не выполняются.
+# wait не меняет ничего, поэтому в список не входит.
+$script:MutatingTools = @(
+    'click', 'move', 'mouse_move', 'drag', 'scroll', 'mouse_button',
+    'type', 'key', 'key_down', 'key_up',
+    'invoke', 'set_value', 'select_text', 'select', 'polyline', 'set_frame', 'clipboard_set', 'bench',
+    'focus', 'close_window', 'launch', 'desktop'
+)
+
+function Get-TargetTitle($a) {
+    if (-not $a) { return '' }
+    foreach ($k in @('title', 'window', 'windowTitle')) {
+        if ($a.PSObject.Properties.Name -contains $k -and $a.$k) { return [string]$a.$k }
+    }
+    return ''
+}
+
+function Assert-TitleAllowed([string]$tool, $a) {
+    if ($script:AllowTitles.Count -eq 0) { return }
+    $title = Get-TargetTitle $a
+    if ($title -eq '') { return }
+    foreach ($p in $script:AllowTitles) {
+        if ($title.ToLowerInvariant().Contains($p.ToLowerInvariant())) { return }
+    }
+    Fail 'BlockedByList' "Белый список окон не пропускает '$title'. Разрешено: $($script:AllowTitles -join ', ')"
+}
+
+function New-DryRunPlan([string]$tool, $a) {
+    $plan = [ordered]@{}
+    foreach ($p in @($a.PSObject.Properties)) {
+        $v = $p.Value
+        if ($v -is [string] -and $v.Length -gt 120) { $v = $v.Substring(0, 120) + '...' }
+        if ($v -is [object[]]) { $v = "[$($v.Count) значений]" }
+        $plan[$p.Name] = $v
+    }
+    return [ordered]@{
+        ok = $true
+        dryRun = $true
+        tool = $tool
+        note = 'Сухой прогон: действие не выполнялось, показано что было бы сделано'
+        would = $plan
+    }
+}
+
+function Write-AuditLog([string]$tool, $a, $started, [string]$outcome, $result) {
+    if (-not $script:AuditOn) { return }
+    try {
+        $ms = [int]((Get-Date) - $started).TotalMilliseconds
+        $title = Get-TargetTitle $a
+        $via = ''
+        if ($result -and $result.PSObject.Properties.Name -contains 'via') { $via = [string]$result.via }
+        $line = '{0} tool={1} title="{2}" ms={3} outcome={4} via={5} dryRun={6}' -f `
+            $started.ToString('yyyy-MM-dd HH:mm:ss'), $tool, $title, $ms, $outcome, $via, $script:DryRun
+        [System.IO.File]::AppendAllText($script:AuditPath, $line + [Environment]::NewLine,
+            (New-Object System.Text.UTF8Encoding($false)))
+    } catch {
+        [Console]::Error.WriteLine("AuditUnavailable: запись журнала не удалась: $($_.Exception.Message)")
+    }
+}
+if (-not ("UiaNative" -as [type])) {
+    $nativePath = Join-Path $PSScriptRoot 'uia-native.cs'
+    if (Test-Path -LiteralPath $nativePath) {
+        try {
+            Add-Type -TypeDefinition (Get-Content -Raw -Encoding UTF8 -LiteralPath $nativePath) `
+                -ReferencedAssemblies UIAutomationClient, UIAutomationTypes, WindowsBase, System.Drawing
+            $script:NativeUia = [UiaNative]
+        } catch {
+            $script:NativeUiaError = $_.Exception.Message
+        }
+    } else {
+        $script:NativeUiaError = "uia-native.cs не найден рядом с worker.ps1"
+    }
+}
+
+function Invoke-UiAct([string]$action, $a, [int]$depth, [int]$limit) {
+    # Таймаут и неполный поиск не повторяются через запасной PowerShell-путь.
+    try {
+        if (-not $script:NativeUia) { return $null }
+        if ($a -and $null -ne $a.elementId -and "$($a.elementId)".Trim() -ne '') {
+            $argv = @([int]$script:UiaBudgetMs, [string]$a.elementId, $action, [string]$a.value)
+            return (Invoke-UiaNative 'RunActByElementId' $argv | ConvertFrom-Json)
+        }
+        $hwnd = Get-TargetHwnd $a
+        if ($hwnd -eq 0) { return $null }
+        $searchName = if ($a -and $a.nameRegex) {
+            if ("$($a.nameRegex)".StartsWith('/') -and "$($a.nameRegex)".EndsWith('/')) {
+                [string]$a.nameRegex
+            } else {
+                "/$($a.nameRegex)/"
+            }
+        } elseif ($a) {
+            [string]$a.name
+        } else { '' }
+        $argv = @(
+            [int]$script:UiaBudgetMs, $hwnd, $action, $searchName, [string]$a.type,
+            [string]$a.id, [int]$depth, [string]$a.value, [int]$limit
+        )
+        $nativeResult = Invoke-UiaNative 'RunActByHwnd' $argv | ConvertFrom-Json
+        if ($nativeResult.status -eq 'incomplete') { Fail 'SearchIncomplete' 'Поиск остановлен по бюджету до нахождения цели; отсутствие элемента не доказано' }
+        if ($script:UiaDiag -and $nativeResult.status -eq 'error') { [Console]::Error.WriteLine("UIA fallback: " + $nativeResult.error) }
+        return $nativeResult
+    } catch {
+        if ($script:LastErrorCode -in @('Timeout', 'SearchIncomplete', 'InvalidArgument')) { throw }
+        if ($script:UiaDiag) { [Console]::Error.WriteLine("UIA fallback: " + $_.Exception.Message) }
+        return $null
+    }
+}
+
+function Invoke-UiaNative([string]$method, [object[]]$argv) {
+    $flags = [System.Reflection.BindingFlags]::Public -bor [System.Reflection.BindingFlags]::Static
+    $mi = $script:NativeUia.GetMethod($method, $flags)
+    if (-not $mi) { Fail 'NotSupported' "У нативного слоя UIA нет метода $method" }
+    $r = $mi.Invoke($null, $argv)
+    if ($script:UiaDiag) {
+        # При таймауте или ошибке $r.Data равен $null, и обращение к .Length
+        # роняло бы всю диагностику с NullReferenceException ровно тогда,
+        # когда она нужнее всего.
+        $dataLen = if ($r.Data) { $r.Data.Length } else { 'n/a' }
+        $script:UiaDiag = "$method($($argv -join ', ')) -> ok=$($r.Ok) статус=$($r.Status) длина=$dataLen err='$($r.Error)' TID=$($r.ThreadId) $($r.ElapsedMs)мс"
+        [Console]::Error.WriteLine("UIA-DIAG: $($script:UiaDiag)")
+    }
+    if ($r.Ok) { return $r.Data }
+    $code = if ($r.Status -eq 'timeout') { 'Timeout' } else { 'NotSupported' }
+    Fail $code "Нативный слой UIA: $method вернул '$($r.Status)' ($($r.Error))"
+}
+
+if (-not ("MsTree" -as [type])) {
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public class MsNode {
+    public string name = "";
+    public string role = "";
+    public int roleCode = 0;
+    public int x, y, w, h;
+    public int childCount = 0;
+    public int usefulCount = 0;
+    public List<MsNode> children = new List<MsNode>();
+}
+
+public static class MsTree {
+    const uint OBJID_CLIENT = 0xFFFFFFFC;
+
+    [DllImport("oleacc.dll")]
+    static extern int AccessibleObjectFromWindow(IntPtr hwnd, uint dwId,
+        ref Guid riid, [MarshalAs(UnmanagedType.Interface)] out object ppvObject);
+
+    [DllImport("oleacc.dll", CharSet = CharSet.Unicode)]
+    static extern int GetRoleTextW(uint role, StringBuilder roleText, uint roleTextLength);
+
+    [DllImport("oleacc.dll")]
+    static extern int WindowFromPointSync(int x, int y, out IntPtr phwnd);
+
+    public static string RoleText(int code) {
+        var sb = new StringBuilder(256);
+        try { if (GetRoleTextW((uint)code, sb, 256) == 0) return "?"; } catch { return "?"; }
+        return sb.ToString();
+    }
+
+    static Accessibility.IAccessible FromWindow(IntPtr hwnd) {
+        if (hwnd == IntPtr.Zero) return null;
+        Guid iid = new Guid("618736E0-3C3D-11CF-810C-00AA00389B71");
+        object o;
+        try {
+            if (AccessibleObjectFromWindow(hwnd, OBJID_CLIENT, ref iid, out o) != 0 || o == null) return null;
+            return (Accessibility.IAccessible)o;
+        } catch { return null; }
+    }
+
+    static bool IsInteractive(int role) {
+        switch (role) {
+            case 2: case 3: case 4: case 5: case 7: case 8:
+            case 12: case 14: case 21: case 22: case 23: case 24:
+            case 25: case 28: case 29: case 30: case 33: case 36:
+            case 37: case 38: case 39: case 40: case 41: case 42:
+            case 43: case 44: case 45: case 46: case 47: case 48:
+            case 60: case 61: case 64:
+                return true;
+            default: return false;
+        }
+    }
+
+    static bool IsWrapper(MsNode n) {
+        int r = n.roleCode;
+        return string.IsNullOrEmpty(n.name)
+               && (r == 16 || r == 15 || r == 10 || r == 20 || r == 0);
+    }
+
+    static void AddFlattened(List<MsNode> into, MsNode n) {
+        if (n == null) return;
+        if (IsWrapper(n) && n.children.Count > 0) {
+            for (int i = 0; i < n.children.Count; i++) AddFlattened(into, n.children[i]);
+        } else {
+            into.Add(n);
+        }
+    }
+
+    static MsNode Build(Accessibility.IAccessible acc, int depth, int maxDepth,
+                        int maxElements, bool interactiveOnly, ref int counter) {
+        if (acc == null || depth > maxDepth || counter >= maxElements) return null;
+
+        var node = new MsNode();
+        try { node.childCount = acc.accChildCount; } catch { return null; }
+        try { node.name = acc.get_accName(0) ?? ""; } catch { }
+        try { node.roleCode = Convert.ToInt32(acc.get_accRole(0)); } catch { }
+        try { node.role = RoleText(node.roleCode); } catch { }
+        try {
+            int l, t, w, h;
+            acc.accLocation(out l, out t, out w, out h, 0);
+            node.x = l; node.y = t; node.w = w; node.h = h;
+        } catch { }
+
+        if (!IsWrapper(node)) {
+            if (counter >= maxElements) return null;
+            counter++;
+        }
+
+        var kids = new List<MsNode>();
+        if (depth < maxDepth && node.childCount > 0) {
+            int lim = Math.Min(node.childCount, Math.Max(0, maxElements - counter));
+            for (int i = 1; i <= lim; i++) {
+                if (counter >= maxElements) break;
+                try {
+                    object ch = acc.get_accChild(i);
+                    if (ch == null) continue;
+                    Accessibility.IAccessible sub = ch as Accessibility.IAccessible;
+                    if (sub != null) {
+                        MsNode cn = Build(sub, depth + 1, maxDepth, maxElements, interactiveOnly, ref counter);
+                        AddFlattened(kids, cn);
+                    } else {
+                        counter++;
+                        var leaf = new MsNode();
+                        try { leaf.name = acc.get_accName(i) ?? ""; } catch { }
+                        try { leaf.roleCode = Convert.ToInt32(acc.get_accRole(i)); } catch { }
+                        try { leaf.role = RoleText(leaf.roleCode); } catch { }
+                        try {
+                            int l, t, w, h;
+                            acc.accLocation(out l, out t, out w, out h, i);
+                            leaf.x = l; leaf.y = t; leaf.w = w; leaf.h = h;
+                        } catch { }
+                        if (!interactiveOnly || IsInteractive(leaf.roleCode) || leaf.roleCode == 0) AddFlattened(kids, leaf);
+                    }
+                } catch { }
+            }
+        }
+        node.usefulCount = 0;
+        foreach (MsNode kid in kids) {
+            int r = kid.roleCode;
+            bool skip = (r == 16 || r == 15 || r == 10 || r == 0);
+            if (!skip && !string.IsNullOrEmpty(kid.name)) node.usefulCount++;
+            node.usefulCount += kid.usefulCount;
+        }
+        node.children = kids;
+        return node;
+    }
+
+    public static MsNode TreeForWindow(IntPtr hwnd, int maxDepth, int maxElements, bool interactiveOnly) {
+        Accessibility.IAccessible acc = FromWindow(hwnd);
+        if (acc == null) return null;
+        int counter = 0;
+        return Build(acc, 0, maxDepth, maxElements, interactiveOnly, ref counter);
+    }
+
+    public static List<MsNode> ChainAtPoint(int x, int y, int depth) {
+        var outList = new List<MsNode>();
+        IntPtr hwnd;
+        try {
+            if (WindowFromPointSync(x, y, out hwnd) != 0) return outList;
+        } catch { return outList; }
+        Accessibility.IAccessible acc = FromWindow(hwnd);
+        if (acc == null) return outList;
+        int counter = 0;
+        MsNode root = Build(acc, 0, depth, 8, false, ref counter);
+        if (root != null) outList.Add(root);
+        return outList;
+    }
+}
+"@ -ReferencedAssemblies Accessibility
+}
+
+function Get-MsaaTree {
+    param([string]$TitleLike, [int]$MaxDepth, [int]$MaxElements, [bool]$InteractiveOnly)
+    $result = @()
+    $script:MsaaUseful = 0
+    foreach ($w in Get-WindowList) {
+        if ($TitleLike -ne '' -and $w.title -notlike "*$(Escape-Like $TitleLike)*") { continue }
+        if (-not $w.visible) { continue }
+        $p = Get-Process -Id $w.process -ErrorAction SilentlyContinue
+        if (-not $p -or $p.MainWindowHandle -eq 0) { continue }
+        try {
+            $node = [MsTree]::TreeForWindow($p.MainWindowHandle, $MaxDepth, $MaxElements, $InteractiveOnly)
+            if ($node) {
+                $result += ,(Convert-MsaaNode $node)
+                $script:MsaaUseful += $node.usefulCount
+            }
+        } catch { }
+    }
+    return , @($result)
+}
+
+function Convert-MsaaNode($n) {
+    $node = [ordered]@{
+        name      = (Trunc $n.name)
+        type      = $n.role
+        roleCode  = $n.roleCode
+        childCount= $n.childCount
+        rect      = [ordered]@{ x = [int]$n.x; y = [int]$n.y; w = [int]$n.w; h = [int]$n.h }
+    }
+    $kids = @()
+    if ($n.children -and $n.children.Count -gt 0) {
+        foreach ($c in $n.children) { $kids += ,(Convert-MsaaNode $c) }
+    }
+    if ($kids.Count -gt 0) { $node['children'] = $kids }
+    return , $node
+}
+
+
+
+function ConvertTo-Utf8Base64([string]$s) {
+    return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($s))
+}
+
+function Send-Response($id, $ok, $data, $error, $code) {
+    $obj = [ordered]@{ id = $id; ok = $ok }
+    if ($ok) { $obj['data'] = $data } else {
+        $obj['error'] = $error
+        # Машиночитаемый код рядом с текстом. Агент должен ветвиться по коду,
+        # а не разбирать русскую прозу. Нужен только когда код известен.
+        if ($code) { $obj['code'] = $code }
+    }
+    $json = $obj | ConvertTo-Json -Depth 32 -Compress
+    [Console]::Out.WriteLine("B64:" + (ConvertTo-Utf8Base64 $json))
+    [Console]::Out.Flush()
+}
+
+# Ошибка с машиночитаемым кодом. Текст остаётся для человека, код для агента.
+if (-not ("DeskError" -as [type])) {
+class DeskError : System.Exception {
+    [string]$Code
+    DeskError([string]$code, [string]$msg) : base($msg) { $this.Code = $code }
+}
+}
+
+# Коды, которые реально выдаёт этот файл (сверено с вызовами Fail):
+# ElementNotFound, ElementDisabled, OptionNotFound, PatternUnavailable,
+# NotSelected, WindowNotFound, NeedsConfirm, BlockedByList, InvalidArgument,
+# NotSupported, CaptureFailed, Timeout, InputBlocked, WorkerRestarted.
+$script:LastErrorCode = ''
+function Fail([string]$code, [string]$msg) {
+    # Код дублируется в переменную области скрипта, потому что PowerShell при
+    # выбросе из скриптблока (например из кэша Get-UiCached) теряет и тип
+    # исключения, и цепочку InnerException. Переменная переживает любую
+    # обёртку, а DeskError остаётся типом там, где обёртки не было.
+    $script:LastErrorCode = $code
+    throw [DeskError]::new($code, $msg)
+}
+
+# PowerShell оборачивает исключение, выброшенное внутри скрипблока (например
+# в кэше Get-UiCached), поэтому DeskCode лежит не в Exception, а в цепочке
+# InnerException. Ищем по всей цепочке.
+function Get-ErrCode($ex) {
+    $depth = 0
+    while ($ex -and $depth -lt 8) {
+        if ($ex -is [DeskError]) { return $ex.Code }
+        $ex = $ex.InnerException
+        $depth++
+    }
+    return ''
+}
+
+function Rect($r) {
+    $out = [ordered]@{ x = 0; y = 0; w = 0; h = 0 }
+    if ($null -eq $r) { return $out }
+    foreach ($k in 'X', 'Y', 'Width', 'Height') {
+        $v = 0
+        try {
+            $raw = $r.$k
+            $d = [double]$raw
+            if ([double]::IsInfinity($d) -or [double]::IsNaN($d)) { $d = 0 }
+            if ([Math]::Abs($d) -gt 200000000) { $d = 0 }
+            $v = [int][Math]::Round($d)
+        } catch { $v = 0 }
+        $out[[string]$k.Substring(0,1).ToLower()] = $v
+    }
+    return $out
+}
+
+function Escape-Like([string]$s) {
+    if ($null -eq $s) { return '' }
+    return $s -replace '([\[\]\*\?])', '`$1'
+}
+
+function Trunc($s, [int]$max = 200) {
+    if ($null -eq $s) { return '' }
+    $t = [string]$s
+    $t = $t -replace '\s+', ' '
+    if ($t.Length -le $max) { return $t }
+    return $t.Substring(0, $max) + '…'
+}
+
+function Get-Vk([string]$name) {
+    switch ($name.ToLowerInvariant()) {
+        'return'        { return 0x0D }
+        'enter'         { return 0x0D }
+        'esc'           { return 0x1B }
+        'escape'        { return 0x1B }
+        'tab'           { return 0x09 }
+        'backspace'     { return 0x08 }
+        'delete'        { return 0x2E }
+        'del'           { return 0x2E }
+        'insert'        { return 0x2D }
+        'space'         { return 0x20 }
+        'home'          { return 0x24 }
+        'end'           { return 0x23 }
+        'pageup'        { return 0x21 }
+        'pgup'          { return 0x21 }
+        'pagedown'      { return 0x22 }
+        'pgdn'          { return 0x22 }
+        'up'            { return 0x26 }
+        'down'          { return 0x28 }
+        'left'          { return 0x25 }
+        'right'         { return 0x27 }
+        'ctrl'          { return 0x11 }
+        'control'       { return 0x11 }
+        'shift'         { return 0x10 }
+        'alt'           { return 0x12 }
+        'win'           { return 0x5B }
+        'lwin'          { return 0x5B }
+        'apps'          { return 0x5D }
+        'capslock'      { return 0x14 }
+        'printscreen'   { return 0x2C }
+        'scrolllock'    { return 0x91 }
+        'pause'         { return 0x13 }
+        'numlock'       { return 0x90 }
+        default {
+            if ($name -match '^(?:f)([1-9]|1[0-9]|2[0-4])$') { return 0x6F + [int]$Matches[1] }
+            if ($name.Length -eq 1) {
+                $c = $name.ToUpperInvariant()
+                if ($c -match '^[A-Z0-9]$') { return [byte][char]$c }
+            }
+            return $null
+        }
+    }
+}
+
+
+function Get-WindowList {
+    # Список остаётся на UIA намеренно: так в выдаче нет служебных окон
+    # (Task Host Window, BroadcastListenerWindow, UxdService и подобных),
+    # их видно через EnumWindows, и фильтровать пришлось бы руками.
+    # Этот вызов делают редко, а вот разрешение окна по заголовку идёт
+    # в Find-WindowByTitle, и там путь уже на user32.
+    if ($script:NativeUia) {
+        try {
+            $nat = Invoke-UiaNative 'RunListWindows' @([int]$script:UiaBudgetMs)
+            if ($nat) {
+                return @($nat | ConvertFrom-Json)
+            }
+        } catch { }
+    }
+    $result = @()
+    $root = [System.Windows.Automation.AutomationElement]::RootElement
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Window)
+    foreach ($w in $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)) {
+        try {
+            $r = $w.Current.BoundingRectangle
+            $result += [ordered]@{
+                title   = $w.Current.Name
+                hwnd    = [long]$w.Current.NativeWindowHandle
+                process = $w.Current.ProcessId
+                class   = $w.Current.ClassName
+                rect    = Rect $r
+                visible = [DeskMcp]::IsWindowVisible([IntPtr]$w.Current.NativeWindowHandle)
+            }
+        } catch { }
+    }
+    return $result
+}
+
+function Get-ArgHwnd($a) {
+    $h = 0
+    if ($a -and $null -ne $a.hwnd) { try { $h = [long]$a.hwnd } catch { $h = 0 } }
+    return $h
+}
+
+function Find-WindowByTitle([string]$like, [int]$timeoutSec, [long]$hwnd = 0) {
+    # Горячий путь: user32 вместо UIA. Замером ловилось, что при висящем в
+    # системе приложении, тормозящем UIA, каждый вызов с названием окна
+    # платил 3.0-3.2 с именно здесь. EnumWindows делает то же самое без COM.
+    # Дескриптор важнее заголовка: заголовок живого окна меняется сам, и вызов
+    # со старым заголовком либо промахивается, либо цепляет другое окно.
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    if ($hwnd -gt 0) {
+        while ($true) {
+            $w = [DeskMcp]::GetWindowInfo([IntPtr]$hwnd)
+            if ($w) {
+                return [ordered]@{
+                    title   = $w.Title
+                    hwnd    = [long]$w.Handle.ToInt64()
+                    process = $w.Pid
+                    class   = $w.Class
+                    rect    = [ordered]@{ x = $w.X; y = $w.Y; w = $w.W; h = $w.H }
+                    visible = $w.Visible
+                }
+            }
+            if ((Get-Date) -ge $deadline) { return $null }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+    $pat = "*$(Escape-Like $like)*"
+    while ($true) {
+        foreach ($w in [DeskMcp]::EnumTopWindows()) {
+            if ($w.Visible -and $w.Title -like $pat) {
+                return [ordered]@{
+                    title   = $w.Title
+                    hwnd    = [long]$w.Handle.ToInt64()
+                    process = $w.Pid
+                    class   = $w.Class
+                    rect    = [ordered]@{ x = $w.X; y = $w.Y; w = $w.W; h = $w.H }
+                    visible = $w.Visible
+                }
+            }
+        }
+        if ((Get-Date) -ge $deadline) { return $null }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+
+$script:InteractiveTypes = @(
+    'Button','CheckBox','ComboBox','Edit','Hyperlink','ListItem','MenuItem',
+    'RadioButton','Tab','TabItem','Tree','TreeItem','DataItem','Document',
+    'Slider','Spinner','ProgressBar','SplitButton','Menu','MenuBar','ToolBar'
+)
+
+function Get-AvailableOcrLangs {
+    param([switch]$TagOnly)
+    try {
+        [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime] | Out-Null
+        $langs = [Windows.Media.Ocr.OcrEngine]::AvailableRecognizerLanguages
+        $res = @()
+        foreach ($l in @($langs)) {
+            if ($TagOnly) { $res += $l.LanguageTag }
+            else {
+                $res += [ordered]@{
+                    tag = $l.LanguageTag
+                    name = $l.DisplayName
+                }
+            }
+        }
+        return $res
+    } catch {
+        return @()
+    }
+}
+
+function Invoke-ScreenOcr {
+    param(
+        [string]$Path,
+        [string]$Lang,
+        [bool]$IncludeWords = $true,
+        [string]$Mark = ''
+    )
+    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+    })[0]
+    function Await($op, $t) {
+        $x = $asTaskGeneric.MakeGenericMethod($t).Invoke($null, @($op))
+        if (-not $x.Wait(25000)) { Fail 'Timeout' "WinRT-вызов не завершился за 25 с" }
+        return $x.Result
+    }
+    $T = @{
+        StorageFile  = [Windows.Storage.StorageFile, Windows, ContentType = WindowsRuntime]
+        FileAccess   = [Windows.Storage.FileAccessMode, Windows, ContentType = WindowsRuntime]
+        Decoder      = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType = WindowsRuntime]
+        SoftBitmap   = [Windows.Graphics.Imaging.SoftwareBitmap, Windows.Foundation, ContentType = WindowsRuntime]
+        OcrEngine    = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+        OcrResult    = [Windows.Media.Ocr.OcrResult, Windows.Foundation, ContentType = WindowsRuntime]
+        Language     = [Windows.Globalization.Language, Windows.Foundation, ContentType = WindowsRuntime]
+        RandomStream = [Windows.Storage.Streams.IRandomAccessStream, Windows.Foundation, ContentType = WindowsRuntime]
+    }
+    $eng = $null
+    if ($Lang) {
+        try { $eng = $T.OcrEngine::TryCreateFromLanguage($T.Language::new($Lang)) } catch { }
+        if (-not $eng) {
+            $tags = (Get-AvailableOcrLangs -TagOnly) -join ', '
+            Fail 'NotSupported' "Язык '$Lang' не установлен для Windows OCR. Доступные языки: $tags"
+        }
+    } else {
+        $eng = $T.OcrEngine::TryCreateFromUserProfileLanguages()
+    }
+    if (-not $eng) { Fail 'NotSupported' "Не удалось создать OCR-движок: нет ни языка $Lang, ни языков профиля" }
+
+    $bmp = $null
+    $origW = 0; $origH = 0
+    try {
+        $bmp = [System.Drawing.Bitmap]::FromFile($Path)
+        $origW = $bmp.Width; $origH = $bmp.Height
+        [DeskMcp]::FlattenAlpha($bmp)
+    } catch { }
+
+    $edge = [Math]::Min(2600, [Windows.Media.Ocr.OcrEngine]::MaxImageDimension)
+    $overlap = [Math]::Min(128, [int]($edge / 8))
+
+    function Recognize-File($filePath, $offsetX, $offsetY) {
+        $sf  = Await ($T.StorageFile::GetFileFromPathAsync($filePath)) $T.StorageFile
+        $ras = Await ($sf.OpenAsync($T.FileAccess::Read)) $T.RandomStream
+        $dec = Await ($T.Decoder::CreateAsync($ras)) $T.Decoder
+        $sb  = Await ($dec.GetSoftwareBitmapAsync()) $T.SoftBitmap
+        $res = Await ($eng.RecognizeAsync($sb)) $T.OcrResult
+        $resLines = @()
+        foreach ($l in @($res.Lines)) {
+            $wordArr = @($l.Words)
+            if ($wordArr.Count -eq 0) { continue }
+            $words = @()
+            if ($IncludeWords) {
+                foreach ($w in $wordArr) {
+                    $b = $w.BoundingRect
+                    $words += [ordered]@{
+                        text = $w.Text
+                        rect = [ordered]@{ x = [int]($b.X + $offsetX); y = [int]($b.Y + $offsetY); w = [int]$b.Width; h = [int]$b.Height }
+                    }
+                }
+            }
+            $b0 = $wordArr[0].BoundingRect
+            $bN = $wordArr[$wordArr.Count - 1].BoundingRect
+            $lineObj = [ordered]@{
+                text = $l.Text
+                rect = [ordered]@{
+                    x = [int]($b0.X + $offsetX)
+                    y = [int]($b0.Y + $offsetY)
+                    w = [int](($bN.X + $bN.Width) - $b0.X)
+                    h = [int](($bN.Y + $bN.Height) - $b0.Y)
+                }
+            }
+            if ($IncludeWords) { $lineObj['words'] = $words }
+            $resLines += $lineObj
+        }
+        return $resLines
+    }
+
+    $allLines = @()
+    if ($origW -gt 0 -and $origH -gt 0 -and ($origW -gt $edge -or $origH -gt $edge) -and $bmp) {
+        $tileList = [DeskMcp]::GetOcrTiles($origW, $origH, $edge, $overlap)
+        foreach ($tile in $tileList) {
+            $tileBmp = New-Object System.Drawing.Bitmap $tile.Width, $tile.Height
+            $g = [System.Drawing.Graphics]::FromImage($tileBmp)
+            $srcRect = New-Object System.Drawing.Rectangle $tile.X, $tile.Y, $tile.Width, $tile.Height
+            $destRect = New-Object System.Drawing.Rectangle 0, 0, $tile.Width, $tile.Height
+            $g.DrawImage($bmp, $destRect, $srcRect, [System.Drawing.GraphicsUnit]::Pixel)
+            $g.Dispose()
+
+            $tmpTileBase = [System.IO.Path]::GetTempFileName()
+            $tmpTile = "$tmpTileBase.png"
+            try {
+                $tileBmp.Save($tmpTile, [System.Drawing.Imaging.ImageFormat]::Png)
+                $tileBmp.Dispose()
+                $tLines = Recognize-File $tmpTile $tile.X $tile.Y
+                foreach ($tl in $tLines) {
+                    $dup = $false
+                    for ($i = 0; $i -lt $allLines.Count; $i++) {
+                        $ex = $allLines[$i]
+                        if ($ex.text -eq $tl.text -and [DeskMcp]::SameOcrRegion($ex.rect.x, $ex.rect.y, $ex.rect.w, $ex.rect.h, $tl.rect.x, $tl.rect.y, $tl.rect.w, $tl.rect.h)) {
+                            $dup = $true
+                            if (($tl.rect.w * $tl.rect.h) -gt ($ex.rect.w * $ex.rect.h)) {
+                                $allLines[$i] = $tl
+                            }
+                            break
+                        }
+                    }
+                    if (-not $dup) { $allLines += $tl }
+                }
+            } finally {
+                Remove-Item $tmpTile -Force -ErrorAction SilentlyContinue
+                Remove-Item $tmpTileBase -Force -ErrorAction SilentlyContinue
+            }
+        }
+        $allLines = @($allLines | Sort-Object { $_.rect.y * 100000 + $_.rect.x })
+    } else {
+        $runPath = $Path
+        $tmpFlatBase = $null
+        if ($bmp) {
+            $tmpFlatBase = [System.IO.Path]::GetTempFileName()
+            $runPath = "$tmpFlatBase.png"
+            $bmp.Save($runPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        }
+        try {
+            $allLines = Recognize-File $runPath 0 0
+        } finally {
+            if ($tmpFlatBase) {
+                Remove-Item $runPath -Force -ErrorAction SilentlyContinue
+                Remove-Item $tmpFlatBase -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    $ret = [ordered]@{
+        text = ($allLines | ForEach-Object { $_.text }) -join "`n"
+        lineCount = $allLines.Count
+        lines = $allLines
+        image = [ordered]@{ x = 0; y = 0; w = $origW; h = $origH }
+    }
+
+    if ($Mark -eq 'rect' -and $bmp -and $allLines.Count -gt 0) {
+        $flatRects = New-Object 'System.Collections.Generic.List[int]'
+        $labels = New-Object 'System.Collections.Generic.List[string]'
+        $idx = 1
+        foreach ($l in $allLines) {
+            $flatRects.Add([int]$l.rect.x)
+            $flatRects.Add([int]$l.rect.y)
+            $flatRects.Add([int]$l.rect.w)
+            $flatRects.Add([int]$l.rect.h)
+            $labels.Add([string]$idx)
+            $l['markNumber'] = $idx
+            $idx++
+        }
+        [DeskMcp]::DrawOcrMarks($bmp, $flatRects.ToArray(), $labels.ToArray())
+        $ms = New-Object System.IO.MemoryStream
+        $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+        $ret['markedImage'] = "data:image/png;base64," + [Convert]::ToBase64String($ms.ToArray())
+        $ms.Dispose()
+    }
+
+    if ($bmp) { $bmp.Dispose() }
+    return $ret
+}
+
+$script:UiCache = @{}
+
+# Монотонные миллисекунды.
+#
+# [Environment]::TickCount64 в PowerShell 5.1 НЕ существует и молча отдаёт
+# $null, без всякой ошибки. Из-за этого в кэше условие "запись моложе 1200 мс"
+# превращалось в ($null - $null) -lt 1200, то есть всегда истинно, и кэш UIA
+# не протухал НИКОГДА. Stopwatch.GetTimestamp() работает в этой версии и
+# переполняется практически никогда.
+function Get-MonoMs {
+    return [long]([Diagnostics.Stopwatch]::GetTimestamp() / [Diagnostics.Stopwatch]::Frequency * 1000)
+}
+
+# Обход дерева UIA стоит сотни миллисекунд, а агентный цикл обычно делает
+# find → invoke → verify на одном и том же окне. Короткий кэш (1.2 с) убирает
+# повторный обход, но недостаточно мал, чтобы отдать протухшие данные после
+# перерисовки интерфейса.
+function Get-UiCached([string]$key, [scriptblock]$make) {
+    $now = Get-MonoMs
+    if ($script:UiCache.ContainsKey($key)) {
+        $e = $script:UiCache[$key]
+        if (($now - $e.at) -lt 1200) { return $e.data }
+    }
+    $d = & $make
+    $script:UiCache[$key] = @{ at = $now; data = $d }
+    if ($script:UiCache.Count -gt 64) { $script:UiCache.Clear() }
+    return , $d
+}
+
+function Get-ElementInfosCached {
+    param([string]$Title, [string]$Name, [string]$Type, [string]$Id, [int]$MaxDepth, [int]$Limit, [long]$Hwnd = 0)
+    $key = "ei|$Title|$Hwnd|$Name|$Type|$Id|$MaxDepth|$Limit"
+    return Get-UiCached $key {
+        $a = @{ title = $Title; hwnd = $Hwnd; name = $Name; type = $Type; id = $Id }
+        $nat = Invoke-UiAct 'find' $a $MaxDepth $Limit
+        if ($nat -and $nat.status -eq 'ok' -and $nat.elements) {
+            return , @($nat.elements)
+        }
+        $hits = Search-UiElements $Title $Name $Type $Id $MaxDepth $Limit
+        $items = @()
+        foreach ($h in $hits) { $items += ,(Convert-ElementInfo $h) }
+        , $items
+    }
+}
+
+# ---- Дельты вместо повторного полного дерева ---------------------------
+# Агентный цикл почти всегда смотрит в одно и то же окно несколько раз.
+# Полное дерево при этом отправляется заново целиком, и на повторных
+# чтениях это самая дорогая часть контекста. Здесь хранится подпись
+# последнего автоматического прохода, и следующий возвращает только
+# изменившиеся узлы.
+#
+#   mode=full   полный вид, базу НЕ обновляет (осмотр всегда честный)
+#   mode=auto   первый раз и при устаревшем токене отдаёт полный вид и
+#               запоминает базу, дальше возвращает дельту
+#   mode=reset  то же, что auto, но база обнуляется принудительно
+$script:TreeBaseline = @{}
+$script:TokenSeq = 0
+
+# База дельт ограничена по числу записей. Ключ включает заголовок окна, а у
+# браузера заголовок меняется на каждую вкладку, поэтому агент, который читает
+# страницы, создавал новый ключ на каждый заголовок и никогда не возвращался к
+# старому. Без ограничения это тихая утечка памяти на всю сессию: в записи лежит
+# подпись каждого узла дерева. Храним последние базы и забываем самые старые.
+$script:BaselineOrder = New-Object System.Collections.ArrayList
+$script:BaselineLimit = 12
+
+function Set-TreeBaseline([string]$bkey, $token, $sig) {
+    if ($script:TreeBaseline.ContainsKey($bkey)) {
+        [void]$script:BaselineOrder.Remove($bkey)
+    }
+    [void]$script:BaselineOrder.Add($bkey)
+    $script:TreeBaseline[$bkey] = @{ token = $token; sig = $sig }
+    while ($script:BaselineOrder.Count -gt $script:BaselineLimit) {
+        $oldest = [string]$script:BaselineOrder[0]
+        [void]$script:BaselineOrder.RemoveAt(0)
+        if ($script:TreeBaseline.ContainsKey($oldest)) { $script:TreeBaseline.Remove($oldest) }
+    }
+}
+
+function New-SnapshotToken {
+    $script:TokenSeq++
+    return "t$($script:TokenSeq)"
+}
+
+# Компактный узел приходит позиционным массивом:
+# [имя, роль, automationId, [x,y,w,h], флаги, паттерны, value, text, дети].
+# Обращение $n.id к такому массиву в PowerShell даёт не поле, а символ по
+# индексу, поэтому все узлы получали один ключ и подпись, а дельта по
+# compact-деревьям молча и навсегда отвечала «ничего не изменилось», даже когда
+# окно менялось целиком. Ключ и подпись строятся по форме узла, а наружу в
+# changes отдаётся исходный узел: легенда полей у вызывающего остаётся той же.
+function Get-NodeRectKey($r) {
+    if ($r -is [System.Array]) { return "$($r[0]),$($r[1]),$($r[2]),$($r[3])" }
+    if ($r) { return "$($r.x),$($r.y),$($r.w),$($r.h)" }
+    return ''
+}
+
+# PowerShell при обращении к свойству оборачивает вложенные массивы в PSObject,
+# и такой узел приходит не массивом, а обёрткой {value: [...], Count: N}:
+# обращение $n[2] к ней отдаёт не automationId, а список свойств обёртки.
+# Разворачиваем до.baseObject, иначе ключ мусорит, а дельта видит одно и то же.
+function Expand-Node($n) {
+    if ($null -eq $n) { return $null }
+    if ($n -is [System.Array]) { return $n }
+    if ($n -is [System.Management.Automation.PSObject]) {
+        $base = $n
+        try { $base = $n.BaseObject } catch { $base = $n }
+        if ($base -is [System.Array]) { return $base }
+    }
+    return $n
+}
+
+function Get-NodeKey($n) {
+    $n = Expand-Node $n
+    if ($n -is [System.Array]) {
+        $id = $n[2]
+        if ($id -is [System.Array]) { $id = $id[0] }
+        if ($id) { return "id:$id" }
+        return "n:$($n[0])|$($n[1])|$(Get-NodeRectKey $n[3])"
+    }
+    if ($n.id) { return "id:$($n.id)" }
+    $rectKey = Get-NodeRectKey $n.rect
+    if ($rectKey) { return "n:$($n.name)|$($n.type)|$rectKey" }
+    return "n:$($n.name)|$($n.type)"
+}
+
+function Get-NodeChildren($n) {
+    $n = Expand-Node $n
+    if ($n -is [System.Array]) { return @($n[8]) }
+    return @($n.children)
+}
+
+# Подпись узла без потомков. Если включить children, то изменение одного
+# листа помечало бы "update" всех его предков, и дельта раздувалась бы
+# ровно настолько, чтобы потерять смысл.
+function Get-NodeSignature($n) {
+    $n = Expand-Node $n
+    if ($n -is [System.Array]) {
+        # Флаги компактного узла: 1 включён, 2 за экраном, 4 выделен, 8 включённый
+        # переключатель. Собираем те же поля, что и у обычного узла.
+        $f = 0
+        try { $f = [int]$n[4] } catch { $f = 0 }
+        # Текст контейнера в UIA это склейка текста всех потомков, поэтому он
+        # меняется от любого изменения внутри. В подпись он не входит: иначе
+        # корень окна всегда помечался бы как изменённый и тянул за собой всё
+        # поддерево, то есть дельта вырождалась бы в полный ответ. У листа текст
+        # собственный, там он и нужен.
+        # Проверка именно на null, а не на Count: у листа слота детей нет,
+        # $n[8] это $null, а @(null).Count в PowerShell равен 1. Через Count
+        # лист всегда считался контейнером, и изменения его текста были не видны.
+        $kids = $n[8]
+        $hasKids = ($null -ne $kids) -and (@($kids).Count -gt 0)
+        $own = [ordered]@{
+            name = $n[0]; type = $n[1]; id = $n[2]; rect = (Get-NodeRectKey $n[3])
+            enabled = (($f -band 1) -ne 0); offscreen = (($f -band 2) -ne 0)
+            selected = (($f -band 4) -ne 0); toggle = (($f -band 8) -ne 0)
+            patterns = $n[5]; value = $n[6]; text = $(if ($hasKids) { $null } else { $n[7] })
+        }
+        return ($own | ConvertTo-Json -Compress -Depth 4)
+    }
+    $own = [ordered]@{
+        name = $n.name; type = $n.type; id = $n.id; class = $n.class
+        rect = $n.rect; enabled = $n.enabled; offscreen = $n.offscreen
+        patterns = $n.patterns
+    }
+    foreach ($k in @('value', 'text', 'toggle', 'selected')) {
+        # text у контейнера, как и выше, агрегатный и в подпись не годится.
+        if ($k -eq 'text' -and @($n.children).Count -gt 0) { continue }
+        if ($n.PSObject.Properties.Name -contains $k) { $own[$k] = $n.$k }
+    }
+    return ($own | ConvertTo-Json -Compress -Depth 4)
+}
+
+function Get-NodeIndex($windows) {
+    $idx = @{}
+    $stack = New-Object System.Collections.Stack
+    foreach ($w in @($windows)) { if ($w) { $stack.Push($w) } }
+    while ($stack.Count -gt 0) {
+        $n = $stack.Pop()
+        $k = Get-NodeKey $n
+        if (-not $idx.ContainsKey($k)) { $idx[$k] = $n }
+        foreach ($c in (Get-NodeChildren $n)) { if ($c) { $stack.Push($c) } }
+    }
+    return , $idx
+}
+
+function Compare-Tree([string]$mode, [string]$since, [string]$bkey, $windows, [int]$scanned) {
+    $idx = Get-NodeIndex $windows
+    $sig = @{}
+    $size = 0
+    foreach ($k in $idx.Keys) {
+        $sig[$k] = Get-NodeSignature $idx[$k]
+        $size += $sig[$k].Length
+    }
+    $token = New-SnapshotToken
+    $full = [ordered]@{
+        kind = 'full'; token = $token; windows = $windows; elementsScanned = $scanned
+    }
+
+    if ($mode -ne 'auto') {
+        if ($mode -eq 'reset') {
+            Set-TreeBaseline $bkey $token $sig
+            $full['baseline'] = 'reset'
+        }
+        return $full
+    }
+
+    $base = $script:TreeBaseline[$bkey]
+    if (-not $base -or $since -ne $base.token) {
+        Set-TreeBaseline $bkey $token $sig
+        $full['note'] = 'первый автоматический ответ или токен устарел, отдан полный вид'
+        return $full
+    }
+
+    $changes = @()
+    foreach ($k in $idx.Keys) {
+        if (-not $base.sig.ContainsKey($k)) {
+            $changes += ,([ordered]@{ op = 'add'; key = $k; node = $idx[$k] })
+        } elseif ($base.sig[$k] -ne $sig[$k]) {
+            $changes += ,([ordered]@{ op = 'update'; key = $k; node = $idx[$k] })
+        }
+    }
+    foreach ($k in $base.sig.Keys) {
+        if (-not $idx.ContainsKey($k)) { $changes += ,([ordered]@{ op = 'remove'; key = $k }) }
+    }
+
+    Set-TreeBaseline $bkey $token $sig
+
+    if ($changes.Count -eq 0) {
+        return [ordered]@{
+            kind = 'diff'; token = $token; changes = @(); windows = @()
+            elementsScanned = $scanned
+            note = 'ничего не изменилось'
+        }
+    }
+    $diffSize = ($changes | ConvertTo-Json -Compress -Depth 5).Length
+    # Сравнивать надо с настоящим размером полного ответа, а не с суммой длин
+    # подписей: подпись это один узел, полный ответ это дерево с ключами,
+    # вложенностью и заголовком. Сумма подписей меньше ответа в разы, поэтому
+    # сравнение с ней вырождало любую дельту в полный вид.
+    $fullSize = 0
+    try {
+        $fullSize = ($windows | ConvertTo-Json -Compress -Depth 9).Length
+    } catch {
+        $fullSize = [int]($size * 3)
+    }
+    if ($diffSize -ge $fullSize) {
+        $full['note'] = 'дельта вышла бы не меньше полного ответа, отдан полный вид'
+        $full['deltaChars'] = $diffSize
+        $full['fullChars'] = $fullSize
+        return $full
+    }
+    return [ordered]@{
+        kind = 'diff'; token = $token; changes = $changes; windows = @()
+        elementsScanned = $scanned
+    }
+}
+
+function Get-UiNodes($el, [int]$depth, [int]$maxDepth, [ref]$counter, [int]$maxElements, [bool]$interactiveOnly) {
+    if ($depth -gt $maxDepth) { return @() }
+    if ($counter.Value -ge $maxElements) { return @() }
+
+    $c = $null
+    try { $c = $el.Current } catch { return @() }
+    $ct = $c.ControlType.ProgrammaticName -replace '^ControlType\.', ''
+    $counter.Value++
+    $rawName = ''
+    try { $rawName = [string]$c.Name } catch { }
+
+    $include = (-not $interactiveOnly) -or ($depth -eq 0) -or ($script:InteractiveTypes -contains $ct)
+
+    $children = @()
+    if ($depth -lt $maxDepth) {
+        try {
+            $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+            $child = $walker.GetFirstChild($el)
+            while ($child -ne $null -and $counter.Value -lt $maxElements) {
+                $res = Get-UiNodes $child ($depth + 1) $maxDepth $counter $maxElements $interactiveOnly
+                if ($null -ne $res) { $children += $res }
+                try { $child = $walker.GetNextSibling($child) } catch { break }
+            }
+        } catch { }
+    }
+
+    if (-not $include) { return $children }
+
+    $node = [ordered]@{
+        name      = Trunc $rawName
+        fullLen   = $rawName.Length
+        type      = $ct
+        id        = $c.AutomationId
+        enabled   = $c.IsEnabled
+        offscreen = $c.IsOffscreen
+        rect      = Rect $c.BoundingRectangle
+    }
+
+    try {
+        $pats = @()
+        foreach ($p in $el.GetSupportedPatterns()) { $pats += ($p.ProgrammaticName -replace 'PatternIdentifiers\.', '') }
+        if ($pats.Count -gt 0) { $node['patterns'] = $pats }
+    } catch { }
+    if ($node['patterns'] -and ($node['patterns'] -contains 'ValuePattern')) {
+        try {
+            $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+            $node['value'] = Trunc $vp.Current.Value 300
+        } catch { }
+    }
+    if ($node['patterns'] -and ($node['patterns'] -contains 'TogglePattern')) {
+        try {
+            $tp = $el.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern)
+            $node['toggle'] = "$($tp.Current.ToggleState)"
+        } catch { }
+    }
+    if ($node['patterns'] -and ($node['patterns'] -contains 'SelectionItemPattern')) {
+        try {
+            $sp = $el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+            $node['selected'] = [bool]$sp.Current.IsSelected
+        } catch { }
+    }
+    if ($node['patterns'] -and ($node['patterns'] -contains 'TextPattern')) {
+        try {
+            $tp = $el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+            $doc = $tp.DocumentRange
+            $node['text'] = Trunc $doc.GetText(-1) 300
+            $node['textLen'] = $doc.Length
+        } catch { }
+    }
+    if ($children.Count -gt 0) { $node['children'] = $children }
+    return , $node
+}
+
+function Search-UiElements {
+    param(
+        [string]$TitleLike, [string]$NameLike, [string]$TypeName,
+        [string]$AutomationId, [int]$MaxDepth, [int]$Limit, [long]$Hwnd = 0
+    )
+    $hits = @()
+    $targets = @()
+    if ($Hwnd -gt 0) {
+        try {
+            $w = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$Hwnd)
+            if ($w) { $targets = @($w) }
+        } catch { $targets = @() }
+    } else {
+        $root = [System.Windows.Automation.AutomationElement]::RootElement
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Window)
+        foreach ($w in $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)) {
+            try {
+                if (-not [DeskMcp]::IsWindowVisible([IntPtr]$w.Current.NativeWindowHandle)) { continue }
+                if ($TitleLike -ne '' -and $w.Current.Name -notlike "*$(Escape-Like $TitleLike)*") { continue }
+                $targets += $w
+            } catch { continue }
+        }
+    }
+    foreach ($w in $targets) {
+        try {
+            if (-not [DeskMcp]::IsWindowVisible([IntPtr]$w.Current.NativeWindowHandle)) { continue }
+        } catch { continue }
+        $counter = 0
+        $stack = New-Object System.Collections.Stack
+        $seed = New-Object object[] 2
+        $seed[0] = $w
+        $seed[1] = 0
+        $stack.Push($seed)
+        while ($stack.Count -gt 0 -and $hits.Count -lt $Limit) {
+            $top = $stack.Pop()
+            $el = $top[0]; $depth = [int]$top[1]
+            if ($depth -gt $MaxDepth) { continue }
+            $counter++
+            if ($counter -gt 4000) { Fail 'SearchIncomplete' 'Поиск остановлен по лимиту просмотренных элементов' }
+            try {
+                $c = $el.Current
+                $ct = $c.ControlType.ProgrammaticName -replace '^ControlType\.', ''
+                $isRx = $NameLike.Length -ge 2 -and $NameLike.StartsWith('/') -and $NameLike.EndsWith('/')
+                $okName = if ($isRx) {
+                    try { [string]$c.Name -match $NameLike.Substring(1, $NameLike.Length - 2) } catch { $false }
+                } else {
+                    ($NameLike -eq '') -or ($c.Name -like "*$(Escape-Like $NameLike)*")
+                }
+                $okType = ($TypeName -eq '') -or ($ct -eq $TypeName) -or ($ct -like "*$(Escape-Like $TypeName)*")
+                $okId = ($AutomationId -eq '') -or ($c.AutomationId -eq $AutomationId)
+                if ($okName -and $okType -and $okId) { $hits += ,@($el, $ct) }
+                $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+                $ch = $walker.GetFirstChild($el)
+                while ($ch -ne $null) {
+                    $pair = New-Object object[] 2
+                    $pair[0] = $ch
+                    $pair[1] = $depth + 1
+                    $stack.Push($pair)
+                    $ch = $walker.GetNextSibling($ch)
+                }
+            } catch { }
+        }
+    }
+    return , $hits
+}
+
+# Кэшировать COM-объекты AutomationElement нельзя: протухшая ссылка даст
+# исключение при Invoke()/GetCurrentPattern() там, где раньше был успех.
+# Поэтому кэшируются только НЕИЗМЕНЯЕМЫЕ идентификаторы (automationId, имя,
+# роль, прямоугольник), а перед действием делается свежий поиск по этим ключам
+# с проверкой, что найденный элемент всё ещё им соответствует.
+# Схема предложена ревьюером и безопаснее, чем кэш объектов.
+function Resolve-Target($a) {
+    $title = [string]$a.title
+    $name = [string]$a.name
+    $type = [string]$a.type
+    $id = [string]$a.id
+    $depth = if ($a.maxDepth) { [int]$a.maxDepth } else { 8 }
+    $hw = if ($a.hwnd) { [long]$a.hwnd } else { 0 }
+    $el = $a.element
+    if ($el) {
+        if (-not $name -and $el['name']) { $name = [string]$el['name'] }
+        if (-not $type -and $el['type']) { $type = [string]$el['type'] }
+        if (-not $id   -and $el['id'])   { $id   = [string]$el['id'] }
+    }
+    $hits = Search-UiElements $title $name $type $id $depth 1 $hw
+    if (@($hits).Count -eq 0 -and $el -and $el['rect']) {
+        # Имя могло смениться (счётчик, «2 элемента выбрано»). Пробуем по роли
+        # и по координате внутри кэшированного прямоугольника.
+        $hits = Search-UiElements $title '' $type '' $depth 200
+        $cx = [int]$el['rect']['x'] + [int]([int]$el['rect']['w'] / 2)
+        $cy = [int]$el['rect']['y'] + [int]([int]$el['rect']['h'] / 2)
+        $filtered = @()
+        foreach ($h in $hits) {
+            $r = (Convert-ElementInfo $h)['rect']
+            if ([int]$r['x'] -le $cx -and $cx -le ([int]$r['x'] + [int]$r['w']) -and
+                [int]$r['y'] -le $cy -and $cy -le ([int]$r['y'] + [int]$r['h'])) { $filtered += ,$h }
+        }
+        $hits = $filtered
+    }
+    return , $hits
+}
+
+function Convert-ElementInfo($pair) {
+    $el = $pair[0]; $ct = $pair[1]
+    $c = $el.Current
+    $pats = @()
+    try { foreach ($p in $el.GetSupportedPatterns()) { $pats += ($p.ProgrammaticName -replace 'PatternIdentifiers\.', '') } } catch { }
+    $elId = if ($script:NativeUia) {
+        try { [UiaNative]::RegisterElement($el) } catch { '' }
+    } else { '' }
+    $info = [ordered]@{
+        elementId = $elId
+        name  = (Trunc $c.Name 160)
+        type  = $ct
+        id    = $c.AutomationId
+        class = $c.ClassName
+        rect  = Rect $c.BoundingRectangle
+        enabled   = $c.IsEnabled
+        offscreen = $c.IsOffscreen
+        patterns  = $pats
+    }
+    if ($pats -contains 'ValuePattern') {
+        try { $info['value'] = Trunc $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).Current.Value 300 } catch { }
+    }
+    if ($pats -contains 'TogglePattern') {
+        try { $info['toggle'] = "$($el.GetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern).Current.ToggleState)" } catch { }
+    }
+    if ($pats -contains 'SelectionItemPattern') {
+        try { $info['selected'] = [bool]$el.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Current.IsSelected } catch { }
+    }
+    if ($pats -contains 'TextPattern') {
+        try {
+            $doc = $el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange
+            $info['text'] = Trunc $doc.GetText(-1) 300
+            $info['textLen'] = $doc.Length
+        } catch { }
+    }
+    return , $info
+}
+
+function Has-Prop($obj, [string]$name) {
+    if ($null -eq $obj) { return $false }
+    return ($null -ne $obj.PSObject.Properties[$name])
+}
+
+function Get-UiProp($node, [string]$name) {
+    if ($null -eq $node) { return $null }
+    if ($node -is [System.Array]) {
+        # Компактный узел это позиционные слоты, а не свойства. Без этой ветки
+        # счётчики дерева молча возвращают ноль на compact-деревьях: элементы
+        # есть, а посчитать их нечем.
+        $n = Expand-Node $node
+        switch ($name) {
+            'name' { return $n[0] }
+            'type' { return $n[1] }
+            'id' { return $n[2] }
+            'rect' { return $n[3] }
+            'patterns' { return $n[5] }
+            'value' { return $n[6] }
+            'text' { return $n[7] }
+            'children' { return $n[8] }
+            default { return $null }
+        }
+    }
+    if ($node -is [System.Collections.IDictionary]) { return $node[$name] }
+    $p = $node.PSObject.Properties[$name]
+    if ($p) { return $p.Value }
+    return $null
+}
+
+function Count-NamedUi($nodes) {
+    $n = 0
+    foreach ($x in $nodes) {
+        if ($null -eq $x) { continue }
+        $name = Get-UiProp $x 'name'
+        if ($name -and "$name".Trim() -ne '') { $n++ }
+        $kids = Get-UiProp $x 'children'
+        if ($kids) { $n += (Count-NamedUi $kids) }
+    }
+    return $n
+}
+
+function Count-NamedUiInside($windows) {
+    $n = 0
+    foreach ($w in $windows) {
+        if ($null -eq $w) { continue }
+        $kids = Get-UiProp $w 'children'
+        if ($kids) { $n += (Count-NamedUi $kids) }
+    }
+    return $n
+}
+
+function Find-WindowHwnd([string]$title, [long]$hwnd = 0) {
+    # Если вызывающий знает дескриптор окна, заголовок не нужен вовсе. У живых
+    # окон заголовок меняется сам: браузер дописывает число вкладок, Блокнот
+    # ставит звёздочку несохранённого, приложение дописывает состояние. Окно,
+    # найденное один раз по заголовку, через минуту может перестать находиться.
+    if ($hwnd -gt 0) {
+        if ([DeskMcp]::IsWindow([IntPtr]$hwnd)) { return $hwnd }
+        return [long]0
+    }
+    # HWND верхнеуровневого окна по подстроке заголовка, через user32.
+    # 0, если не нашлось. Нужен, чтобы не заставлять нативный слой искать
+    # окно перебором RootElement: замерено, что касание RootElement стоит
+    # ~3 с, пока FromHandle с обходом потомков это 5 мс.
+    if ($title -eq '') { return [long]0 }
+    foreach ($w in [DeskMcp]::EnumTopWindows()) {
+        if ($w.Visible -and $w.Title.ToLowerInvariant().Contains($title.ToLowerInvariant())) {
+            return [long]$w.Handle.ToInt64()
+        }
+    }
+    return [long]0
+}
+
+# Единая точка выбора окна для всех инструментов: сначала дескриптор, и только
+# потом заголовок. Пока заголовок единственный способ найти окно, агент вынужден
+# держать его в памяти между вызовами, а он протухает у живых окон.
+function Get-TargetHwnd($a) {
+    $h = 0
+    if ($a -and $null -ne $a.hwnd) {
+        try { $h = [long]$a.hwnd } catch { $h = 0 }
+    }
+    return Find-WindowHwnd ([string]$a.title) $h
+}
+
+function Get-UiTree([string]$titleLike, [int]$maxDepth, [int]$maxElements, [bool]$interactiveOnly,
+                     [bool]$compact = $false, [int]$maxChars = 0, [long]$hwnd = 0) {
+    if ($hwnd -eq 0) { $hwnd = Find-WindowHwnd $titleLike }
+    if ($script:NativeUia) {
+        if ($compact -or $maxChars -gt 0) {
+            # Отдельное имя метода, а не перегрузка: Invoke-UiaNative ищет метод
+            # по имени через рефлексию, и перегрузка даёт неоднозначность.
+            if ($hwnd -ne 0) {
+                $argv = @([int]$script:UiaBudgetMs, $hwnd, [int]$maxDepth, [int]$maxElements,
+                          [bool]$interactiveOnly, [bool]$compact, [int]$maxChars)
+                $json = Invoke-UiaNative 'RunTreeByHwndCompact' $argv
+            } else {
+                $argv = @([int]$script:UiaBudgetMs, [string]$titleLike, [int]$maxDepth, [int]$maxElements,
+                          [bool]$interactiveOnly, [bool]$compact, [int]$maxChars)
+                $json = Invoke-UiaNative 'RunTreeCompact' $argv
+            }
+        } elseif ($hwnd -ne 0) {
+            $argv = @([int]$script:UiaBudgetMs, $hwnd, [int]$maxDepth, [int]$maxElements, [bool]$interactiveOnly)
+            $json = Invoke-UiaNative 'RunTreeByHwnd' $argv
+        } else {
+            $argv = @([int]$script:UiaBudgetMs, [string]$titleLike, [int]$maxDepth, [int]$maxElements, [bool]$interactiveOnly)
+            $json = Invoke-UiaNative 'RunTree' $argv
+        }
+        $o = $json | ConvertFrom-Json
+        $res = [ordered]@{ windows = @($o.windows); elementsScanned = [int]$o.elementsScanned }
+        if ($o.fields) { $res['fields'] = @($o.fields) }
+        if ($o.truncated) {
+            $res['truncated'] = $true
+            if ($o.truncatedReason) { $res['truncatedReason'] = [string]$o.truncatedReason }
+            if ($o.maxChars) { $res['maxChars'] = [int]$o.maxChars }
+            $reason = if ($o.truncatedReason) { [string]$o.truncatedReason } else { "maxChars" }
+            $res['note'] = "Дерево обрезано по $reason. Для точечного доступа зови computer_find по имени или automationId."
+        }
+        return $res
+    }
+    $root = [System.Windows.Automation.AutomationElement]::RootElement
+    $cond = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Window)
+    $targets = @()
+    foreach ($w in $root.FindAll([System.Windows.Automation.TreeScope]::Children, $cond)) {
+        try {
+            if ([DeskMcp]::IsWindowVisible([IntPtr]$w.Current.NativeWindowHandle) -and
+                ($titleLike -eq '' -or $w.Current.Name -like "*$(Escape-Like $titleLike)*")) {
+                $targets += $w
+            }
+        } catch { }
+    }
+    $counter = 0
+    $trees = @()
+    foreach ($t in $targets) {
+        $counter = 0
+        $n = Get-UiNodes $t 0 $maxDepth ([ref]$counter) $maxElements $interactiveOnly
+        if ($null -ne $n) { $trees += $n }
+    }
+    return [ordered]@{ windows = $trees; elementsScanned = $counter }
+}
+
+function Get-ElementAt([int]$x, [int]$y) {
+    if ($script:NativeUia) {
+        $json = Invoke-UiaNative 'RunElementAt' @($script:UiaBudgetMs, $x, $y)
+        return ($json | ConvertFrom-Json)
+    }
+    $p = New-Object System.Windows.Point($x, $y)
+    $el = [System.Windows.Automation.AutomationElement]::FromPoint($p)
+    if ($el -eq $null) { return [ordered]@{ found = $false } }
+    $chain = @()
+    $cur = $el
+    for ($i = 0; $i -lt 6 -and $cur -ne $null; $i++) {
+        try {
+            $c = $cur.Current
+            $chain += [ordered]@{
+                name = (Trunc $c.Name 120); type = ($c.ControlType.ProgrammaticName -replace '^ControlType\.','')
+                id = $c.AutomationId; class = $c.ClassName; rect = Rect $c.BoundingRectangle
+            }
+            $cur = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($cur)
+        } catch { break }
+    }
+    return [ordered]@{ found = $true; x = $x; y = $y; chain = $chain }
+}
+
+
+function Save-Screenshot {
+    param([string]$Region, [int]$Display, [double]$Scale, [string]$Format, [int]$Quality, [string]$WindowTitle, [long]$Hwnd = 0)
+    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $x = $vs.Left; $y = $vs.Top; $w = $vs.Width; $h = $vs.Height
+    if ($Region) {
+        $p = $Region -split ','
+        if ($p.Count -ne 4) { Fail 'InvalidArgument' "Region должен быть 'x,y,w,h', получено '$Region'" }
+        $x = [int]$p[0]; $y = [int]$p[1]; $w = [int]$p[2]; $h = [int]$p[3]
+    }
+    if ($w -le 0 -or $h -le 0) { Fail 'InvalidArgument' "Пустой размер снимка: ${w}x${h}" }
+
+    $bmp = $null; $g = $null; $g2 = $null; $out = $null; $ms = $null; $ep = $null
+    $via = 'screen'
+    try {
+        if ($WindowTitle -or $Hwnd -gt 0) {
+            $win = Find-WindowByTitle $WindowTitle 3 $Hwnd
+            if (-not $win) { Fail 'WindowNotFound' "Окно '$(if ($WindowTitle) { "*$WindowTitle*" } else { "hwnd $Hwnd" })' не найдено за 3 с" }
+            $targetHwnd = [IntPtr]$win.hwnd
+            if ($targetHwnd -eq [IntPtr]::Zero -and $win.process) {
+                try { $targetHwnd = (Get-Process -Id $win.process).MainWindowHandle } catch { }
+            }
+            if ($targetHwnd -ne [IntPtr]::Zero) {
+                $bmp = [DeskMcp]::CaptureWindow($targetHwnd)
+            }
+            if ($null -eq $bmp) {
+                $bounds = [DeskMcp]::WindowBounds($targetHwnd)
+                if ($bounds.Width -gt 0 -and $bounds.Height -gt 0) {
+                    $bmp = [DeskMcp]::CaptureScreen($bounds.X, $bounds.Y, $bounds.Width, $bounds.Height)
+                    $x = $bounds.X; $y = $bounds.Y
+                    $w = $bmp.Width; $h = $bmp.Height
+                    $via = 'screen'
+                } else {
+                    Fail 'CaptureFailed' "PrintWindow вернул пустой кадр для '$($win.title)'"
+                }
+            } else {
+                $bounds = [DeskMcp]::WindowBounds($targetHwnd)
+                $x = $bounds.X; $y = $bounds.Y
+                $w = $bmp.Width; $h = $bmp.Height
+                $via = 'printwindow'
+            }
+        } else {
+            $bmp = [DeskMcp]::CaptureScreen($x, $y, $w, $h)
+        }
+
+        $tw = $w; $th = $h
+        if ($Scale -gt 0 -and $w -gt 1 -and ($Scale -lt 1 -or $Scale -gt 1)) {
+            $tw = [Math]::Max(1, [int]($w * $Scale)); $th = [Math]::Max(1, [int]($h * $Scale))
+        }
+        $out = $bmp
+        if ($tw -ne $w -or $th -ne $h) {
+            $out = New-Object System.Drawing.Bitmap $tw, $th
+            $g2 = [System.Drawing.Graphics]::FromImage($out)
+            $g2.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $g2.DrawImage($bmp, 0, 0, $tw, $th)
+            $g2.Dispose(); $g2 = $null
+        }
+
+        $ms = New-Object System.IO.MemoryStream
+        if ($Format -eq 'jpeg') {
+            $codec = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() |
+                     Where-Object { $_.MimeType -eq 'image/jpeg' }
+            $ep = New-Object System.Drawing.Imaging.EncoderParameters 1
+            $ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter(
+                [System.Drawing.Imaging.Encoder]::Quality, $Quality)
+            $out.Save($ms, $codec, $ep)
+            $mime = 'image/jpeg'
+        } else {
+            $out.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+            $mime = 'image/png'
+        }
+        $bytes = $ms.ToArray()
+
+        return [ordered]@{
+            mime = $mime
+            width = $tw
+            height = $th
+            via = $via
+            region = [ordered]@{ x = $x; y = $y; w = $w; h = $h }
+            bytes = [Convert]::ToBase64String($bytes)
+        }
+    } finally {
+        if ($ep)    { $ep.Dispose() }
+        if ($ms)    { $ms.Dispose() }
+        if ($g2)    { $g2.Dispose() }
+        if ($out)   { $out.Dispose() }
+        if ($bmp -and $bmp -ne $out) { $bmp.Dispose() }
+        if ($g)     { $g.Dispose() }
+    }
+}
+
+
+function Test-Permissions {
+    $issues = @()
+    $fw = [DeskMcp]::GetForegroundWindow()
+    $fgPid = 0
+    if ($fw -ne [IntPtr]::Zero) {
+        $fgPid = (Get-Process | Where-Object { $_.MainWindowHandle -eq $fw } | Select-Object -First 1).Id
+    }
+    $integrity = 'unknown'
+    try {
+        $self = Get-Process -Id $PID
+        $integrity = 'medium-or-higher'
+    } catch { }
+    if ($integrity -eq 'unknown') { $issues += 'Не удалось определить уровень целостности процесса.' }
+
+    $hasUia = $true
+    try { [System.Windows.Automation.AutomationElement]::RootElement | Out-Null }
+    catch { $hasUia = $false; $issues += 'UI Automation недоступна — дерево UI и element_at работать не будут.' }
+
+    $clip = $true
+    try { Get-Clipboard -ErrorAction Stop | Out-Null } catch { $clip = $false }
+
+    return [ordered]@{
+        ok = ($issues.Count -eq 0)
+        uia = $hasUia
+        clipboard = $clip
+        foreground = (Get-WindowList | Where-Object { $_.visible } | Select-Object -First 3)
+        note = 'Инъекция ввода блокируется в окна, запущенные с повышенными правами (UIPI). Это ограничение Windows, а не ошибка.'
+    }
+}
+
+
+function Send-ControlShortcut([uint16]$key) {
+    $held = [DeskMcp]::KeyDown(0x11)
+    $sent = 0
+    try {
+        if (-not $held) { $sent += [DeskMcp]::VKey(0x11, $false) }
+        $sent += [DeskMcp]::VKey($key, $false)
+        $sent += [DeskMcp]::VKey($key, $true)
+    } finally {
+        if (-not $held) { $sent += [DeskMcp]::VKey(0x11, $true) }
+    }
+    $expected = if ($held) { 2 } else { 4 }
+    if ($sent -ne $expected) { Fail 'InputBlocked' 'SendInput не принял сочетание клавиш' }
+}
+
+function Assert-InputTarget($a, [long]$hwnd) {
+    if ([DeskMcp]::GetForegroundWindow().ToInt64() -ne $hwnd) { Fail 'FocusNotAcquired' 'Фокус ушёл из адресованного окна; ввод остановлен' }
+    $state = Invoke-UiAct 'check_focus' $a 8 1
+    if (-not $state -or -not $state.focused) { Fail 'FocusNotAcquired' 'Целевое поле не имеет фокуса; ввод остановлен' }
+}
+
+function Invoke-Tool {
+    param([string]$tool, $a)
+    $result = $null
+    if ($tool -in @('invoke', 'set_value', 'select_text', 'select')) {
+        $hasReference = $a -and -not [string]::IsNullOrWhiteSpace([string]$a.elementId)
+        $hasWindow = $a -and (($a.hwnd -and [long]$a.hwnd -gt 0) -or -not [string]::IsNullOrWhiteSpace([string]$a.title))
+        $hasSelector = $a -and ($a.name -or $a.id -or $a.type)
+        if (-not $hasReference -and (-not $hasWindow -or -not $hasSelector)) {
+            Fail 'InvalidArgument' 'Укажи elementId или title/hwnd вместе с name, id или type; действие без явной цели запрещено'
+        }
+    }
+    if ($tool -in @('focus', 'set_frame', 'close_window')) {
+        if (-not $a -or (-not $a.hwnd -and [string]::IsNullOrWhiteSpace([string]$a.title))) {
+            Fail 'InvalidArgument' 'Укажи title или hwnd выбранного окна'
+        }
+    }
+    switch ($tool) {
+            'screenshot' {
+                $fmt = if ($a.format) { $a.format } else { 'png' }
+                $result = Save-Screenshot -Region $a.region -Display $a.display `
+                                        -Scale $(if ($a.scale) { [double]$a.scale } else { 0 }) `
+                                        -Format $fmt -Quality $(if ($a.quality) { [int]$a.quality } else { 80 }) `
+                                        -WindowTitle ([string]$a.window) `
+                                        -Hwnd (Get-ArgHwnd $a)
+            }
+
+            'bench' {
+                $action = [string]$a.action
+                switch ($action) {
+                    'show'  { $result = [ordered]@{ ok = $true; pid = Start-Bench } }
+                    'read'  { $result = [ordered]@{ ok = $true; log = Read-BenchLog } }
+                    'close' { Stop-Bench; $result = [ordered]@{ ok = $true } }
+                    default { Fail 'InvalidArgument' "Неизвестное действие bench: '$action' (show|read|close)" }
+                }
+            }
+
+            'desktop' {
+                $action = [string]$a.action
+                switch ($action) {
+                    'list' { $result = Get-DeskInfo }
+                    'create' {
+                        $id = [VDesk]::Create()
+                        if ($a.switchTo) { [VDesk]::Switch($id) }
+                        $result = [ordered]@{ ok = $true; id = $id; switched = [bool]$a.switchTo }
+                    }
+                    'switch' { [VDesk]::Switch([string]$a.id); $result = [ordered]@{ ok = $true; id = [string]$a.id } }
+                    'close' { [VDesk]::Close([string]$a.id); $result = [ordered]@{ ok = $true; id = [string]$a.id } }
+                    'of_window' {
+                        $w = Find-WindowByTitle ([string]$a.title) 3 (Get-ArgHwnd $a)
+                        if (-not $w) { Fail 'WindowNotFound' "Окно '*$($a.title)*' не найдено" }
+                        $result = [ordered]@{ title = $w.title; desktop = [VDesk]::OfWindow([IntPtr][long]$w.hwnd) }
+                    }
+                    'move_window' {
+                        $w = Find-WindowByTitle ([string]$a.title) 3 (Get-ArgHwnd $a)
+                        if (-not $w) { throw "Окно '*$($a.title)*' не найдено" }
+                        $proc = Get-Process -Id $w.process
+                        [VDesk]::MoveWindowTo([IntPtr][long]$w.hwnd, [string]$a.id)
+                        $result = [ordered]@{ ok = $true; title = $w.title; desktop = [string]$a.id }
+                    }
+                    default { Fail 'InvalidArgument' "Неизвестное действие desktop: '$action' (list|create|switch|close|of_window|move_window)" }
+                }
+            }
+
+
+            'screeninfo' {
+                $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+                $monitors = [System.Windows.Forms.Screen]::AllScreens | ForEach-Object {
+                    [ordered]@{
+                        device = $_.DeviceName
+                        primary = $_.Primary
+                        x = $_.Bounds.X; y = $_.Bounds.Y
+                        w = $_.Bounds.Width; h = $_.Bounds.Height
+                    }
+                }
+                $availLangs = Get-AvailableOcrLangs -TagOnly
+                $result = [ordered]@{
+                    virtual = [ordered]@{ x = $vs.Left; y = $vs.Top; w = $vs.Width; h = $vs.Height }
+                    monitors = @($monitors)
+                    ocrLanguages = @($availLangs)
+                }
+            }
+
+            'permissions' { $result = Test-Permissions }
+
+            'click' {
+                $scale = 1.0
+                if ($null -ne $a.scale) { $scale = [double]$a.scale }
+                if ($scale -le 0) { Fail 'InvalidArgument' "scale должен быть больше нуля, получено '$($a.scale)'" }
+                $cx = [int][math]::Round([double]$a.x / $scale)
+                $cy = [int][math]::Round([double]$a.y / $scale)
+                $nudge = 0
+                if ($null -ne $a.nudge) { $nudge = [int]$a.nudge }
+                $mods = @()
+                if ($a.modifiers) {
+                    foreach ($m in $a.modifiers) {
+                        $mv = Get-Vk $m
+                        if ($null -eq $mv) { Fail 'InvalidArgument' "Неизвестный модификатор: '$m'" }
+                        $mods += $mv
+                    }
+                }
+                [DeskMcp]::MoveTo($cx, $cy)
+                if ($a.hoverFirst) { Start-Sleep -Milliseconds 250 }
+                elseif ($mods.Count -gt 0) { Start-Sleep -Milliseconds 60 }
+                $wasDown = @()
+                foreach ($m in $mods) {
+                    $wasDown += [DeskMcp]::KeyDown([uint16]$m)
+                    [DeskMcp]::VKey([uint16]$m, $false)
+                }
+                Start-Sleep -Milliseconds 30
+                $btn = $(if ($a.button) { $a.button } else { 'left' })
+                $cnt = $(if ($a.count) { [int]$a.count } else { 1 })
+                if ($nudge -ne 0) { [DeskMcp]::ClickWithNudge($btn, $cnt, $nudge) }
+                else { [DeskMcp]::Click($btn, $cnt) }
+                Start-Sleep -Milliseconds 30
+                for ($i = $mods.Count - 1; $i -ge 0; $i--) {
+                    if (-not $wasDown[$i]) { [DeskMcp]::VKey([uint16]$mods[$i], $true) }
+                }
+                $result = [ordered]@{
+                    ok = $true; x = $cx; y = $cy
+                    button = $btn
+                    count = $cnt
+                    modifiers = $a.modifiers
+                    scale = $scale
+                    nudge = $nudge
+                    requestedX = [int]$a.x
+                    requestedY = [int]$a.y
+                }
+            }
+
+            'key_down' {
+                $vk = Get-Vk ([string]$a.key)
+                if ($null -eq $vk) { Fail 'InvalidArgument' "Неизвестная клавиша: '$($a.key)'" }
+                $n = [DeskMcp]::VKey([uint16]$vk, $false)
+                if ($n -ne 1) { Fail 'InputBlocked' "SendInput не принял нажатие '$($a.key)' (UIPI?)" }
+                $result = [ordered]@{ ok = $true; key = $a.key; down = $true; note = 'Клавиша осталась зажатой — отпусти через computer_key_up' }
+            }
+
+            'key_up' {
+                $vk = Get-Vk ([string]$a.key)
+                if ($null -eq $vk) { Fail 'InvalidArgument' "Неизвестная клавиша: '$($a.key)'" }
+                $n = [DeskMcp]::VKey([uint16]$vk, $true)
+                if ($n -ne 1) { Fail 'InputBlocked' "SendInput не принял отпускание '$($a.key)' (UIPI?)" }
+                $result = [ordered]@{ ok = $true; key = $a.key; up = $true }
+            }
+
+            'wait' {
+                $ms = if ($a.ms -ne $null) { [int]$a.ms } else { 1000 }
+                if ($ms -lt 0 -or $ms -gt 120000) { Fail 'InvalidArgument' "Пауза вне диапазона 0..120000 мс: $ms" }
+                Start-Sleep -Milliseconds $ms
+                $result = [ordered]@{ ok = $true; waitedMs = $ms }
+            }
+
+            'wait_element' {
+                # Ожидание условия вместо слепых пауз. Слепое computer_wait
+                # заставляет агента угадывать время, а здесь тот же бюджет,
+                # что и у поиска, и честный отчёт "условие не наступило", а не
+                # "элемента нет".
+                $wmode = if ($a.mode) { [string]$a.mode } else { 'appear' }
+                if ($wmode -notin @('appear', 'disappear', 'state')) {
+                    Fail 'InvalidArgument' "Неизвестный режим ожидания '$wmode' (appear|disappear|state)"
+                }
+                # Ноль это осмысленное значение: «проверь один раз и не жди». Проверка через
+                # truthiness молча превращала ноль в дефолт 5000, то есть агент,
+                # попросивший не ждать, получал пятисекундное ожидание.
+                $timeoutMs = if ($null -ne $a.timeoutMs) { [int]$a.timeoutMs } else { 5000 }
+                if ($timeoutMs -lt 0 -or $timeoutMs -gt 120000) {
+                    Fail 'InvalidArgument' "Бюджет ожидания вне диапазона 0..120000 мс: $timeoutMs"
+                }
+                $depth = if ($a.maxDepth) { [int]$a.maxDepth } else { 8 }
+                $desired = if ($a.desiredState) { ([string]$a.desiredState).ToLowerInvariant() } else { '' }
+                if ($wmode -eq 'state' -and $desired -eq '') {
+                    Fail 'InvalidArgument' "Для mode=state нужен desiredState (enabled|disabled|visible|offscreen|on|off|indeterminate)"
+                }
+                if ($wmode -ne 'state' -and $desired -ne '') {
+                    Fail 'InvalidArgument' "desiredState работает только с mode=state"
+                }
+
+                # Дедлайн в той же шкале, что Get-MonoMs.
+                $deadline = (Get-MonoMs) + $timeoutMs
+                $delay = 50
+                $started = Get-MonoMs
+                $probes = 0
+                $satisfied = $false
+                $seen = $null
+
+                while ($true) {
+                    $probes++
+                    $el = $null
+                    $nat = Invoke-UiAct 'find' $a $depth 1
+                    if ($nat -and $nat.status -eq 'ok' -and @($nat.elements).Count -gt 0) {
+                        $el = @($nat.elements)[0]
+                    } elseif (-not $nat) {
+                        # нативный слой недоступен, ищем старым путём
+                        $hits = Search-UiElements ([string]$a.title) ([string]$a.name) `
+                                               ([string]$a.type) ([string]$a.id) $depth 1
+                        if (@($hits).Count -gt 0) { $el = Convert-ElementInfo @($hits)[0] }
+                    }
+                    $found = ($null -ne $el)
+                    if ($found) { $seen = $el }
+
+                    if ($wmode -eq 'appear' -and $found) { $satisfied = $true; break }
+                    if ($wmode -eq 'disappear' -and -not $found) { $satisfied = $true; break }
+                    if ($wmode -eq 'state' -and $found) {
+                        $ok = switch ($desired) {
+                            'enabled'       { $el.enabled -eq $true }
+                            'disabled'      { $el.enabled -eq $false }
+                            'visible'       { $el.offscreen -eq $false }
+                            'offscreen'     { $el.offscreen -eq $true }
+                            'on'            { "$($el.toggle)" -eq 'On' }
+                            'off'           { "$($el.toggle)" -eq 'Off' }
+                            'indeterminate' { "$($el.toggle)" -eq 'Indeterminate' }
+                            default         { $false }
+                        }
+                        if ($ok) { $satisfied = $true; break }
+                    }
+
+                    # Новый опрос не начинаем после дедлайна. Вызов Windows,
+                    # который уже ушёл, может вернуться позже, это честно
+                    # отражено в elapsedMs.
+                    if ((Get-MonoMs) -ge $deadline) { break }
+                    Start-Sleep -Milliseconds $delay
+                    if ($delay -lt 400) { $delay = [Math]::Min($delay * 2, 400) }
+                }
+
+                $elapsed = [int]((Get-MonoMs) - $started)
+                if ($satisfied) {
+                    $result = [ordered]@{
+                        ok = $true; satisfied = $true; mode = $wmode
+                        desiredState = $(if ($desired) { $desired } else { $null })
+                        elapsedMs = $elapsed; probes = $probes
+                        element = $(if ($seen) { $seen } else { $null })
+                    }
+                } else {
+                    # Таймаут это не поломка инструмента, а исход ожидания, поэтому
+                    # ошибкой не считаем: иначе агент не отличит "не дождался" от
+                    # "сломалось".
+                    $result = [ordered]@{
+                        ok = $true; satisfied = $false; mode = $wmode
+                        desiredState = $(if ($desired) { $desired } else { $null })
+                        reason = 'timeout'
+                        elapsedMs = $elapsed; probes = $probes; timeoutMs = $timeoutMs
+                        element = $(if ($seen) { $seen } else { $null })
+                        note = 'Бюджет исчерпан. Это не доказательство отсутствия элемента.'
+                    }
+                }
+            }
+
+            'mouse_button' {
+                $btn = if ($a.button) { $a.button } else { 'left' }
+                if ($a.down) { [DeskMcp]::ButtonDown($btn) } else { [DeskMcp]::ButtonUp($btn) }
+                $result = [ordered]@{ ok = $true; button = $btn; pressed = [bool]$a.down }
+            }
+
+            'cursor' {
+                $pt = New-Object DeskMcp+POINT
+                $ok = [DeskMcp]::GetCursorPos([ref]$pt)
+                if (-not $ok) { Fail 'InvalidArgument' "GetCursorPos вернул false" }
+                $result = [ordered]@{ ok = $true; x = $pt.X; y = $pt.Y }
+            }
+
+            'move' {
+                [DeskMcp]::MoveTo([int]$a.x, [int]$a.y)
+                $result = [ordered]@{ ok = $true; x = [int]$a.x; y = [int]$a.y }
+            }
+
+            'mouse_move' {
+                $dx = 0; $dy = 0
+                if ($null -ne $a.dx) { $dx = [int]$a.dx }
+                if ($null -ne $a.dy) { $dy = [int]$a.dy }
+                $steps = 1
+                if ($null -ne $a.steps) { $steps = [int]$a.steps }
+                $stepMs = 0
+                if ($null -ne $a.stepMs) { $stepMs = [int]$a.stepMs }
+                if ($steps -lt 1) { Fail 'InvalidArgument' "steps должен быть не меньше 1, получено $steps" }
+                if ($steps -gt 500) { Fail 'InvalidArgument' "steps слишком много: $steps, максимум 500" }
+                if ($stepMs -lt 0 -or $stepMs -gt 200) { Fail 'InvalidArgument' "stepMs должен быть в диапазоне 0..200, получено $stepMs" }
+                [DeskMcp]::MoveBy($dx, $dy, $steps, $stepMs)
+                Start-Sleep -Milliseconds 40
+                $pt = New-Object 'DeskMcp+POINT'
+                $got = [DeskMcp]::GetCursorPos([ref]$pt)
+                if (-not $got) { Fail 'InvalidArgument' "GetCursorPos вернул false" }
+                $result = [ordered]@{
+                    ok = $true; dx = $dx; dy = $dy; steps = $steps; stepMs = $stepMs
+                    x = $pt.X; y = $pt.Y
+                }
+            }
+
+            'drag' {
+                $steps = if ($a.steps) { [int]$a.steps } else { 25 }
+                $stepMs = if ($a.stepMs) { [int]$a.stepMs } else { 12 }
+                [DeskMcp]::Drag([int]$a.fromX, [int]$a.fromY, [int]$a.toX, [int]$a.toY, $steps, $stepMs)
+                $result = [ordered]@{ ok = $true }
+            }
+
+            'scroll' {
+                if ($a.x -ne $null -and $a.y -ne $null) { [DeskMcp]::MoveTo([int]$a.x, [int]$a.y); Start-Sleep -Milliseconds 60 }
+                [DeskMcp]::ScrollWheel([int]$(if ($a.dx) { $a.dx } else { 0 }), [int]$(if ($a.dy) { $a.dy } else { 0 }))
+                $result = [ordered]@{ ok = $true }
+            }
+
+            'type' {
+                $txt = [string]$a.text
+                $mode = if ($a.inputMode) { [string]$a.inputMode } else { 'unicode' }
+                $delay = if ($a.delayMs) { [int]$a.delayMs } else { 0 }
+                if ($mode -eq 'paste') {
+                    if ($txt.Length -gt 0) {
+                        Set-Clipboard -Value $txt
+                        Send-ControlShortcut 0x56
+                    }
+                    $result = [ordered]@{ ok = $true; verified = $false; mode = 'paste'; chars = $txt.Length }
+                } else {
+                    $n = if ($delay -gt 0) {
+                        $sent = 0
+                        foreach ($ch in $txt.ToCharArray()) {
+                            $sent += [DeskMcp]::TypeUnicode([string]$ch)
+                            Start-Sleep -Milliseconds $delay
+                        }
+                        $sent
+                    } else {
+                        [DeskMcp]::TypeUnicode($txt)
+                    }
+                    if ($txt.Length -gt 0 -and $n -ne $txt.Length * 2) {
+                        Fail 'InputBlocked' "SendInput принял $n событий из $($txt.Length * 2) — ввод заблокирован (UIPI?)"
+                    }
+                    $result = [ordered]@{ ok = $true; verified = $false; mode = 'unicode'; chars = $txt.Length; events = $n }
+                }
+            }
+
+            'key' {
+                $parts = ([string]$a.keys) -split '\+' | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ -ne '' }
+                $mods = @(); $main = $null
+                foreach ($p in $parts) {
+                    if ($p -in @('ctrl','control','shift','alt','win','lwin')) { $mods += (Get-Vk $p) } else { $main = $p }
+                }
+                if (-not $main) { Fail 'InvalidArgument' "Не найдена основная клавиша в '$($a.keys)'" }
+                $vk = Get-Vk $main
+                if ($null -eq $vk) { Fail 'InvalidArgument' "Неизвестная клавиша: '$main'" }
+                $sent = 0
+                $wasDown = @()
+                foreach ($m in $mods) {
+                    $wasDown += [DeskMcp]::KeyDown([uint16]$m)
+                    $sent += [DeskMcp]::VKey([uint16]$m, $false)
+                }
+                Start-Sleep -Milliseconds 30
+                $sent += [DeskMcp]::VKey([uint16]$vk, $false)
+                Start-Sleep -Milliseconds 30
+                $sent += [DeskMcp]::VKey([uint16]$vk, $true)
+                for ($i = $mods.Count - 1; $i -ge 0; $i--) {
+                    if (-not $wasDown[$i]) { $sent += [DeskMcp]::VKey([uint16]$mods[$i], $true) }
+                }
+                if ($sent -ne (($mods.Count + 1) * 2)) {
+                    Fail 'InputBlocked' "SendInput принял $sent событий из $(($mods.Count + 1) * 2) — ввод не дошёл"
+                }
+                $result = [ordered]@{ ok = $true; keys = $a.keys; events = $sent }
+            }
+
+            'windows' {
+                $all = Get-WindowList
+                if ($a.filter) { $pat = "*$(Escape-Like $a.filter)*"; $all = $all | Where-Object { $_.title -like $pat } }
+                $result = [ordered]@{ count = @($all).Count; windows = @($all) }
+            }
+
+            'focus' {
+                $w = Find-WindowByTitle ([string]$a.title) 3 (Get-ArgHwnd $a)
+                if (-not $w) { Fail 'WindowNotFound' "Окно с заголовком '*$($a.title)*' не найдено за 3 с" }
+                $ok = [DeskMcp]::Focus([IntPtr][long]$w.hwnd)
+                if (-not $ok) { Fail 'FocusNotAcquired' "Windows не передала фокус окну '$($w.title)'; ввод отменён" }
+                $result = [ordered]@{ ok = $true; title = $w.title; hwnd = $w.hwnd; process = $w.process; verified = $true }
+            }
+
+            'wait_window' {
+                $t = if ($a.timeoutSec) { [int]$a.timeoutSec } else { 20 }
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $w = Find-WindowByTitle ([string]$a.title) $t (Get-ArgHwnd $a)
+                if (-not $w) { Fail 'WindowNotFound' "Окно '*$($a.title)*' не появилось за $t с" }
+                $result = [ordered]@{ ok = $true; title = $w.title; waitedMs = $sw.ElapsedMilliseconds }
+            }
+
+            'close_window' {
+                # Разрушительное действие: закрывает чужое окно, а с force ещё и
+                # убивает процесс с несохранёнными данными. Требуем явного
+                # подтверждения — ровно как needsApproval у OpenAI.
+                if (-not $a.confirm) {
+                    Fail 'NeedsConfirm' "Закрытие окна требует подтверждения: повтори с confirm: true (окно '*$($a.title)*'$(if ($a.force) { ', force: ' + $a.force }))"
+                }
+                $w = Find-WindowByTitle ([string]$a.title) 3 (Get-ArgHwnd $a)
+                if (-not $w) { Fail 'WindowNotFound' "Окно '*$($a.title)*' не найдено" }
+                $p = Get-Process -Id $w.process -ErrorAction SilentlyContinue
+                if ($a.force) { $p.Kill() }
+                elseif (-not [DeskMcp]::PostMessage([IntPtr][long]$w.hwnd, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)) { Fail 'InputBlocked' 'Не удалось отправить WM_CLOSE выбранному окну' }
+                $result = [ordered]@{ ok = $true; title = $w.title; forced = [bool]$a.force }
+            }
+
+            'launch' {
+                if (-not $a.confirm) {
+                    Fail 'NeedsConfirm' "Запуск программы требует подтверждения: повтори с confirm: true (путь '$($a.path)')"
+                }
+                if (-not $a.path) { Fail 'InvalidArgument' "Не указан путь к программе" }
+                $sp = @{
+                    FilePath  = $a.path
+                    PassThru  = $true
+                    WindowStyle = if ($a.hidden) { 'Hidden' } else { 'Normal' }
+                }
+                if ($a.args -and @($a.args).Count -gt 0) { $sp['ArgumentList'] = @($a.args) }
+                $p = Start-Process @sp
+                $result = [ordered]@{ ok = $true; pid = $p.Id }
+            }
+
+            'read_screen' {
+                $md = if ($a.maxDepth) { [int]$a.maxDepth } else { 6 }
+                $me = if ($a.maxElements) { [int]$a.maxElements } else { 300 }
+                $io = [bool]$a.interactiveOnly
+                $backend = if ($a.backend) { [string]$a.backend } else { 'auto' }
+                $title = [string]$a.title
+
+                if ($backend -eq 'msaa') {
+                    $t = Get-MsaaTree $title $md $me $io
+                    $depth = $md
+                    while ($script:MsaaUseful -lt 3 -and $depth -lt 30) {
+                        $depth = $depth * 2
+                        $t = Get-MsaaTree $title $depth $me $io
+                    }
+                    $result = [ordered]@{ backend = 'msaa'; depthUsed = $depth; useful = $script:MsaaUseful; windows = $t }
+                    break
+                }
+
+                # Окно ищем сразу и быстро через user32. Перебор окон
+                # средствами UIA на этой машине стоит ~3 с, и раньше «окна нет»
+                # уводило в два бесполезных обхода и в отказ по бюджету вместо
+                # деградации. Окна нет — значит UIA и MSAA смотреть нечего,
+                # сразу идём к пикселям.
+                $windowMissing = $false
+                if ($title -ne '') {
+                    $found = Find-WindowByTitle $title 3 (Get-ArgHwnd $a)
+                    if (-not $found) { $windowMissing = $true }
+                }
+
+                if (-not $windowMissing) {
+                    $compact = [bool]$a.compact
+                    $maxChars = if ($a.maxChars) { [int]$a.maxChars } else { 0 }
+                    $mode = if ($a.mode) { [string]$a.mode } else { 'full' }
+                    $since = if ($a.since) { [string]$a.since } else { '' }
+                    $winHwnd = Get-TargetHwnd $a
+                    $uia = Get-UiTree $title $md $me $io $compact $maxChars $winHwnd
+                    # В компактном виде узлы это массивы, поля name у них нет,
+                    # поэтому критерий "дерево содержательное" считаем по
+                    $minUseful = [Math]::Min(5, $me)
+                    $uiaUseful = if ($compact) { [int]$uia.elementsScanned -ge $minUseful }
+                                 else { (Count-NamedUiInside $uia.windows) -ge $minUseful }
+                    if ($backend -eq 'uia' -or $uiaUseful) {
+                        if ($mode -eq 'full') {
+                            $uia['backend'] = 'uia'
+                            $result = $uia
+                        } else {
+                            # База привязана к набору параметров: смена глубины
+                            # или фильтра обязана дать новый полный вид, а не
+                            # сравнение разных форм дерева.
+                            $bkey = "$winHwnd|$md|$me|$io|$compact"
+                            $res = Compare-Tree $mode $since $bkey $uia.windows ([int]$uia.elementsScanned)
+                            $res['backend'] = 'uia'
+                            $result = $res
+                        }
+                        break
+                    }
+                    $msaa = Get-MsaaTree $title $md $me $io
+                    $depth = $md
+                    while ($script:MsaaUseful -lt 3 -and $depth -lt 30) {
+                        $depth = $depth * 2
+                        $msaa = Get-MsaaTree $title $depth $me $io
+                    }
+                } else {
+                    $msaa = @()
+                    $depth = $md
+                }
+                if (@($msaa).Count -gt 0 -and $script:MsaaUseful -gt 0) {
+                    $result = [ordered]@{
+                        backend = 'msaa'
+                        depthUsed = $depth
+                        useful = $script:MsaaUseful
+                        note = 'UIA вернула пустое дерево, взят MSAA (Chromium без --force-renderer-accessibility)'
+                        windows = $msaa
+                    }
+                } else {
+                    # Третья ступень деградации. Окно не отдаёт дерево доступности
+                    # ни через UIA, ни через MSAA — типично для игр, UWP, флеша и
+                    # защищённого контента. Отдавать пустой массив окон здесь
+                    # бессмысленно: вызывающий всё равно пойдёт за скриншотом.
+                    # Лучше сразу дать текст из пикселей и сказать, какой слой сработал.
+                    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+                    $region = "$($vs.Left),$($vs.Top),$($vs.Width),$($vs.Height)"
+                    $winTitle = ''
+                    $captureHwnd = [IntPtr]::Zero
+                    if ($title) {
+                        $w = Find-WindowByTitle $title 2 (Get-ArgHwnd $a)
+                        if ($w -and $w.rect -and $w.rect.w -gt 0 -and $w.rect.h -gt 0) {
+                            $region = "$($w.rect.x),$($w.rect.y),$($w.rect.w),$($w.rect.h)"
+                            $winTitle = $w.title
+                            $captureHwnd = [IntPtr][long]$w.hwnd
+                        }
+                    }
+                    $rp = $region -split ','
+                    $lines = @()
+                    $via = 'screen'
+                    $tmpBase = $null
+                    try {
+                        $tmpBase = [System.IO.Path]::GetTempFileName()
+                        $tmp = "$tmpBase.png"
+                        # Окно снимаем через PrintWindow, а не CopyFromScreen: окно
+                        # может быть свёрнуто или перекрыто, и с экрана попал бы
+                        # кто-то другой. В режим окна D3D9/11 PrintWindow даёт кадр.
+                        if ($captureHwnd -ne [IntPtr]::Zero) {
+                            $wbmp = [DeskMcp]::CaptureWindow($captureHwnd)
+                            if ($wbmp) {
+                                try { $wbmp.Save($tmp, [System.Drawing.Imaging.ImageFormat]::Png); $via = 'window' }
+                                finally { $wbmp.Dispose() }
+                            }
+                        }
+                        if (-not (Test-Path -LiteralPath $tmp)) {
+                            $bmp = [DeskMcp]::CaptureScreen([int]$rp[0], [int]$rp[1], [int]$rp[2], [int]$rp[3])
+                            try {
+                                $bmp.Save($tmp, [System.Drawing.Imaging.ImageFormat]::Png)
+                            } finally { $bmp.Dispose() }
+                        }
+                        $o = Invoke-ScreenOcr -Path $tmp -Lang ''
+                        if ($o -and $o.lines) { $lines = @($o.lines) }
+                    } catch { }
+                    finally {
+                        if ($tmpBase) {
+                            Remove-Item "$tmpBase.png" -Force -ErrorAction SilentlyContinue
+                            Remove-Item $tmpBase -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                    $result = [ordered]@{
+                        backend = 'ocr'
+                        degraded = $true
+                        elementsScanned = (Count-NamedUiInside $uia.windows)
+                        note = 'UIA и MSAA вернули пустое дерево: окно не отдаёт дерево доступности (игры, UWP, защищённый контент). Взят OCR. Координаты строк локальны относительно region — при клике прибавь origin.'
+                        window = $winTitle
+                        region = $region
+                        origin = [ordered]@{ x = [int]$rp[0]; y = [int]$rp[1] }
+                        via = $via
+                        lines = $lines
+                        windows = @()
+                    }
+                    # В режиме дельт отвечающий обязан сказать, что дельты здесь
+                    # не будет: окно отдаёт пиксели, сравнивать не с чем. Без этой
+                    # пометки агент ждёт токен, которого в ответе нет, и решает,
+                    # что режим сломан.
+                    if ($mode -ne 'full') {
+                        $result['kind'] = 'fallback'
+                        $result['note'] = $result['note'] + ' Дельт для этого окна не бывает: сравнивать нечего.'
+                    }
+                }
+            }
+
+            'element_at' { $result = Get-ElementAt ([int]$a.x) ([int]$a.y) }
+
+            'clipboard_get' {
+                $t = ''
+                try { $t = Get-Clipboard -Raw -ErrorAction Stop } catch { $t = '' }
+                if ($null -eq $t) { $t = '' }
+                $result = [ordered]@{ text = $t; length = $t.Length }
+            }
+
+            'clipboard_set' {
+                if ([string]::IsNullOrEmpty([string]$a.text)) {
+                    Add-Type -AssemblyName System.Windows.Forms
+                    [System.Windows.Forms.Clipboard]::Clear()
+                } else { Set-Clipboard -Value ([string]$a.text) }
+                $result = [ordered]@{ ok = $true; length = ([string]$a.text).Length }
+            }
+
+            'ocr' {
+                if ($a.languages -or $a.lang -eq 'list') {
+                    $avail = Get-AvailableOcrLangs
+                    $defLang = [Windows.Globalization.Language, Windows.Foundation, ContentType = WindowsRuntime]::new((Get-Culture).Name).LanguageTag
+                    $result = [ordered]@{
+                        ok = $true
+                        languages = $avail
+                        default = $defLang
+                    }
+                    break
+                }
+                $region = if ($a.region) { [string]$a.region } else { '0,0,2560,1440' }
+                $rp = $region -split ','
+                if ($rp.Count -ne 4) { Fail 'InvalidArgument' "Region должен быть 'x,y,w,h', получено '$region'" }
+                # GetTempFileName СОЗДАЁТ файл на диске. Если дописать к нему
+                # '.png' и удалить только результат, базовый tmpXXXX.tmp остаётся
+                # навсегда: один нулевой файл на каждый вызов, измерено.
+                $tmpBase = [System.IO.Path]::GetTempFileName()
+                $tmp = "$tmpBase.png"
+                $bmp = $null
+                try {
+                    $w = [int]$rp[2]; $h = [int]$rp[3]
+                    if ($w -le 0 -or $h -le 0) { Fail 'InvalidArgument' "Пустой размер области: ${w}x${h}" }
+                    $bmp = [DeskMcp]::CaptureScreen([int]$rp[0], [int]$rp[1], $w, $h)
+                    $bmp.Save($tmp, [System.Drawing.Imaging.ImageFormat]::Png)
+                } finally {
+                    if ($bmp) { $bmp.Dispose() }
+                }
+                $words = if ($null -ne $a.words) { [bool]$a.words } else { $true }
+                $mark = if ($a.mark) { [string]$a.mark } else { '' }
+                try {
+                    $r = Invoke-ScreenOcr -Path $tmp -Lang ([string]$a.lang) -IncludeWords $words -Mark $mark
+                } finally {
+                    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+                    Remove-Item $tmpBase -Force -ErrorAction SilentlyContinue
+                }
+                $r['origin'] = [ordered]@{ x = [int]$rp[0]; y = [int]$rp[1] }
+                $result = $r
+            }
+
+            'find' {
+                $depth = if ($a.maxDepth) { [int]$a.maxDepth } else { 8 }
+                $limit = if ($a.limit) { [int]$a.limit } else { 20 }
+                $reqUnique = if ($a.requireUnique) { [bool]$a.requireUnique } else { $false }
+                if ($a.nameRegex) {
+                    try { [void][regex]::new([string]$a.nameRegex, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase, [TimeSpan]::FromMilliseconds(250)) }
+                    catch { Fail 'InvalidArgument' "Некорректный nameRegex: $($_.Exception.Message)" }
+                }
+                if ($reqUnique -and $limit -lt 2) { $limit = 2 }
+                $searchName = if ($a.nameRegex) {
+                    if ("$($a.nameRegex)".StartsWith('/') -and "$($a.nameRegex)".EndsWith('/')) {
+                        [string]$a.nameRegex
+                    } else {
+                        "/$($a.nameRegex)/"
+                    }
+                } else {
+                    [string]$a.name
+                }
+                $hw = if ($a.hwnd) { [long]$a.hwnd } else { 0 }
+                $key = "find|$([string]$a.title)|$hw|$searchName|$([string]$a.type)|$([string]$a.id)|$depth|$limit|$reqUnique"
+                $result = Get-UiCached $key {
+                    # STA-путь: поиск на STA-потоке, без PowerShell в UIA.
+                    $nat = Invoke-UiAct 'find' $a $depth $limit
+                    if ($nat -and $nat.status -eq 'notfound') { Fail 'ElementNotFound' 'Не найдено ни одного элемента по заданным условиям' }
+                    if ($nat -and $nat.status -eq 'ok') {
+                        $cnt = [int]$nat.count
+                        if ($reqUnique -and $cnt -gt 1) {
+                            Fail 'AmbiguousMatch' "Найдено $cnt элементов, ожидался ровно один (requireUnique=true)"
+                        }
+                        $res = [ordered]@{ count = $cnt; elements = @($nat.elements) }
+                        if ($reqUnique -and $nat.searchIncomplete) { Fail 'AmbiguousMatch' 'Поиск неполный: уникальность элемента не подтверждена' }
+                        if ($nat.searchIncomplete) { $res['searchIncomplete'] = $true }
+                        return $res
+                    }
+                    $hits = Search-UiElements ([string]$a.title) $searchName ([string]$a.type) `
+                                           ([string]$a.id) $depth $limit $hw
+                    if (@($hits).Count -eq 0) { Fail 'ElementNotFound' "Не найдено ни одного элемента по заданным условиям" }
+                    if ($reqUnique -and @($hits).Count -gt 1) {
+                        Fail 'AmbiguousMatch' "Найдено $(@($hits).Count) элементов, ожидался ровно один (requireUnique=true)"
+                    }
+                    $items = @()
+                    foreach ($h in $hits) { $items += ,(Convert-ElementInfo $h) }
+                    $res = [ordered]@{ count = $items.Count; elements = $items }
+                    if (@($hits).Count -ge $limit) { $res['searchIncomplete'] = $true }
+                    return $res
+                }
+            }
+
+            'invoke' {
+                $depth = if ($a.maxDepth) { [int]$a.maxDepth } else { 8 }
+                # Сначала STA: поиск и InvokePattern в одном вызове, без
+                # похода PowerShell в UIA. Если окно не нашлось или нативного
+                # слоя нет, Invoke-UiAct вернёт $null и пойдёт старый путь.
+                $nat = Invoke-UiAct 'invoke' $a $depth 1
+                if ($nat) {
+                    if ($nat.status -eq 'disabled') {
+                        Fail 'ElementDisabled' "Элемент '$($nat.element.name)' неактивен (enabled=false): приложение его отключило, нажать нельзя. Нажатие отчиталось бы успехом, но ничего не изменит."
+                    }
+                    if ($nat.status -eq 'stale' -or $nat.status -eq 'notFound') {
+                        Fail 'ElementNotFound' $(if ($nat.error) { [string]$nat.error } else { 'Элемент не найден по заданным условиям' })
+                    }
+                    if ($nat.status -eq 'noPattern' -and $a.elementId) {
+                        Fail 'PatternUnavailable' "Элемент '$($nat.element.name)' не поддерживает нажатие (нет InvokePattern)"
+                    }
+                    if ($nat.status -eq 'ok') {
+                        $result = [ordered]@{ ok = $true; via = $nat.via; element = $nat.element }
+                        break
+                    }
+                }
+                if ($a -and $null -ne $a.elementId -and "$($a.elementId)".Trim() -ne '') {
+                    Fail 'ElementNotFound' "Элемент '$($a.elementId)' не найден или больше недоступен"
+                }
+
+                $hits = Resolve-Target $a
+                if (@($hits).Count -eq 0) { Fail 'ElementNotFound' "Элемент '$($a.name)' не найден — нажимать нечего" }
+                $pair = @($hits)[0]
+                $el = $pair[0]
+                $info = Convert-ElementInfo $pair
+                # InvokePattern на неактивном элементе в Windows молча ничего не
+                # делает и при этом не бросает исключение: проверено на Paint,
+                # где серая кнопка «Копировать» вернула ok, а буфер не изменился.
+                # Ложный «нажал» хуже отказа, поэтому проверяем заранее.
+                if ($info['enabled'] -eq $false) {
+                    Fail 'ElementDisabled' "Элемент '$($info['name'])' неактивен (enabled=false): приложение его отключило, нажать нельзя. Нажатие отчиталось бы успехом, но ничего не изменит."
+                }
+                $invokeErr = $null
+                try {
+                    $ip = $el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+                    $ip.Invoke()
+                    $result = [ordered]@{ ok = $true; via = 'InvokePattern'; element = $info }
+                    break
+                } catch { $invokeErr = $_.Exception.Message }
+                $r = $info['rect']
+                if ($r['w'] -le 0 -or $r['h'] -le 0) {
+                    Fail 'PatternUnavailable' "У элемента нет InvokePattern ('$invokeErr') и нулевые границы: $($r | ConvertTo-Json -Compress) — нажать нечем"
+                }
+                $cx = $r['x'] + [int]($r['w'] / 2)
+                $cy = $r['y'] + [int]($r['h'] / 2)
+                [DeskMcp]::MoveTo($cx, $cy)
+                Start-Sleep -Milliseconds 120
+                [DeskMcp]::Click('left', 1)
+                $result = [ordered]@{
+                    ok = $true; via = 'pixel'; x = $cx; y = $cy; element = $info
+                    invokeError = $invokeErr
+                    note = 'InvokePattern не сработал, сделан клик по центру границ — мышь захвачена, окно могло получить фокус'
+                }
+            }
+
+            'set_value' {
+                $depth = if ($a.maxDepth) { [int]$a.maxDepth } else { 8 }
+                $mode = if ($a.inputMode) { [string]$a.inputMode } else { 'value' }
+                $val = [string]$a.value
+
+                if ($mode -eq 'value') {
+                    $nat = Invoke-UiAct 'set_value' $a $depth 1
+                    if ($nat) {
+                        if ($nat.status -eq 'disabled') {
+                            Fail 'ElementDisabled' "Элемент '$($nat.element.name)' неактивен (enabled=false): поле отключено приложением, запись не пройдёт."
+                        }
+                        if ($nat.status -eq 'stale' -or $nat.status -eq 'notFound') {
+                            Fail 'ElementNotFound' $(if ($nat.error) { [string]$nat.error } else { 'Элемент не найден по заданным условиям' })
+                        }
+                        if ($nat.status -eq 'noPattern' -and $a.elementId) {
+                            Fail 'PatternUnavailable' "Элемент '$($nat.element.name)' не поддерживает запись (нет ValuePattern)"
+                        }
+                        if ($nat.status -eq 'ok') {
+                            $result = [ordered]@{ ok = $true; via = $nat.via; value = $val; element = $nat.element }
+                            break
+                        }
+                    }
+                    if ($a -and $null -ne $a.elementId -and "$($a.elementId)".Trim() -ne '') {
+                        Fail 'ElementNotFound' "Элемент '$($a.elementId)' не найден или больше недоступен"
+                    }
+                    $hits = Resolve-Target $a
+                    if (@($hits).Count -eq 0) { Fail 'ElementNotFound' "Элемент '$($a.name)' не найден" }
+                    $el = @($hits)[0][0]
+                    $info = Convert-ElementInfo @($hits)[0]
+                    if ($info['enabled'] -eq $false) {
+                        Fail 'ElementDisabled' "Элемент '$($info['name'])' неактивен (enabled=false): поле отключено приложением, запись не пройдёт."
+                    }
+                    try {
+                        $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+                        $vp.SetValue($val)
+                        $result = [ordered]@{ ok = $true; via = 'ValuePattern'; value = $val; element = $info }
+                    } catch {
+                        Fail 'PatternUnavailable' "У элемента нет доступного для записи ValuePattern: $($_.Exception.Message)"
+                    }
+                } else {
+                    if (-not $script:NativeUia) { Fail 'NotSupported' 'Адресный клавиатурный ввод требует нативный UIA-слой для проверки фокуса и результата' }
+                    $described = Invoke-UiAct 'describe' $a $depth 1
+                    if (-not $described -or $described.status -ne 'ok') {
+                        if ($described.status -eq 'disabled') { Fail 'ElementDisabled' 'Поле отключено приложением' }
+                        Fail 'ElementNotFound' 'Целевое поле недоступно'
+                    }
+                    $targetInfo = $described.element
+                    if (@($targetInfo.patterns) -notcontains 'ValuePattern') { Fail 'PatternUnavailable' 'Для подтверждения адресного ввода требуется ValuePattern' }
+                    if ($targetInfo.readOnly) { Fail 'PatternUnavailable' 'Поле доступно только для чтения; ввод не отправлен' }
+                    $targetHwnd = [long]$targetInfo.hwnd
+                    if ($targetHwnd -eq 0 -or -not [DeskMcp]::Focus([IntPtr]$targetHwnd)) {
+                        Fail 'FocusNotAcquired' 'Не удалось активировать адресованное окно; ввод не отправлен'
+                    }
+                    $targetArgs = [pscustomobject]@{ elementId = [string]$targetInfo.elementId; value = $val }
+                    $focused = Invoke-UiAct 'focus' $targetArgs $depth 1
+                    $focusDeadline = (Get-MonoMs) + 500
+                    while ($true) {
+                        try { Assert-InputTarget $targetArgs $targetHwnd; break }
+                        catch {
+                            if ($script:LastErrorCode -ne 'FocusNotAcquired' -or (Get-MonoMs) -ge $focusDeadline) { throw }
+                            $script:LastErrorCode = ''
+                            Start-Sleep -Milliseconds 25
+                        }
+                    }
+                    Send-ControlShortcut 0x41
+                    Assert-InputTarget $targetArgs $targetHwnd
+                    $down = [DeskMcp]::VKey(0x08, $false)
+                    $up = [DeskMcp]::VKey(0x08, $true)
+                    if ($down + $up -ne 2) { Fail 'InputBlocked' 'SendInput не принял очистку поля' }
+                    Assert-InputTarget $targetArgs $targetHwnd
+                    if ($mode -eq 'paste' -and $val.Length -gt 0) {
+                        Set-Clipboard -Value $val
+                        Assert-InputTarget $targetArgs $targetHwnd
+                        Send-ControlShortcut 0x56
+                    } else {
+                        $n = [DeskMcp]::TypeUnicode($val)
+                        if ($n -ne $val.Length * 2) { Fail 'InputBlocked' 'SendInput принял не весь текст' }
+                    }
+                    $verified = $null
+                    for ($attempt = 0; $attempt -lt 10; $attempt++) {
+                        $verified = Invoke-UiAct 'verify_value' $targetArgs $depth 1
+                        if ($verified -and $verified.matches) { break }
+                        Start-Sleep -Milliseconds 50
+                    }
+                    if (-not $verified -or -not $verified.matches) {
+                        Fail 'InputNotVerified' 'Ввод был отправлен, но значение поля не подтверждено; перечитай состояние перед повтором'
+                    }
+                    $result = [ordered]@{ ok = $true; verified = $true; via = $mode; value = $val; element = $verified.element }
+                }
+            }
+
+            'read_table' {
+                # Таблица одним вызовом через Grid/Table паттерны. Иначе это либо
+                # огромное дерево, либо N*M поисков, либо OCR, который путает
+                # столбцы.
+                $depth = if ($a.maxDepth) { [int]$a.maxDepth } else { 8 }
+                $maxRows = if ($a.maxRows) { [int]$a.maxRows } else { 200 }
+                $maxColumns = if ($a.maxColumns) { [int]$a.maxColumns } else { 50 }
+                $useHeaders = if ($null -ne $a.headers) { [bool]$a.headers } else { $true }
+                if ($script:NativeUia) {
+                    $hw = Get-TargetHwnd $a
+                    if ($hw -ne 0) {
+                        $argv = @([int]$script:UiaBudgetMs, $hw, [string]$a.name, [string]$a.type,
+                                  [string]$a.id, [int]$depth, [int]$maxRows, [int]$maxColumns, $useHeaders)
+                        $nat = (Invoke-UiaNative 'RunTableByHwnd' $argv | ConvertFrom-Json)
+                        if ($nat.status -eq 'ok') {
+                            $result = [ordered]@{
+                                ok = $true; via = 'GridPattern'; table = $nat.table; element = $nat.element
+                            }
+                            break
+                        }
+                        if ($nat.status -eq 'incomplete') { Fail 'SearchIncomplete' 'Поиск таблицы остановлен по бюджету; отсутствие элемента не доказано' }
+                        if ($nat.status -eq 'notfound') {
+                            Fail 'ElementNotFound' "Элемент '$($a.name)' не найден — читать нечего"
+                        }
+                        if ($nat.status -eq 'notGrid') {
+                            Fail 'PatternUnavailable' $nat.error
+                        }
+                        Fail 'PatternUnavailable' "Чтение таблицы не удалось: $($nat.status)"
+                    } else {
+                        # Раньше сюда попадали и «окно не нашлось», и «нативный слой
+                        # не загрузился», и агент читал про несуществующую поломку
+                        # при пустом NativeUiaError. Окно и слой это разные вещи.
+                        Fail 'WindowNotFound' "Окно '$([string]$a.title)' не найдено: read_table ищет сетку в конкретном окне, укажи title"
+                    }
+                }
+                Fail 'NotSupported' "Чтение таблицы требует нативного слоя UIA, а он не загрузился: $($script:NativeUiaError)"
+            }
+
+            'polyline' {
+                # Один непрерывный штрих: нажатие в первой точке, обход всех
+                # вершин, отпускание в последней. N отдельных перетаскиваний
+                # поднимают ручку на каждой вершине, и вместо линии получается
+                # пунктир из отдельных отрезков.
+                $pts = @($a.points)
+                if ($pts.Count -lt 2) { Fail 'InvalidArgument' "Нужно минимум две точки, получено $($pts.Count)" }
+                $btn = $(if ($a.button) { [string]$a.button } else { 'left' })
+                $first = $pts[0]
+                $sx = [int]$first[0]; $sy = [int]$first[1]
+                [DeskMcp]::MoveTo($sx, $sy)
+                Start-Sleep -Milliseconds 40
+                $buttonDown = $(if ($btn -eq 'right') { 'right' } elseif ($btn -eq 'middle') { 'middle' } else { 'left' })
+                [DeskMcp]::ButtonDown($buttonDown)
+                foreach ($pt in $pts[1..($pts.Count - 1)]) {
+                    [DeskMcp]::MoveTo([int]$pt[0], [int]$pt[1])
+                    Start-Sleep -Milliseconds 12
+                }
+                $last = $pts[$pts.Count - 1]
+                [DeskMcp]::MoveTo([int]$last[0], [int]$last[1])
+                Start-Sleep -Milliseconds 20
+                [DeskMcp]::ButtonUp($buttonDown)
+                $result = [ordered]@{ ok = $true; points = $pts.Count; button = $btn; note = 'Один штрих без подъёма руки' }
+            }
+
+            'select' {
+                # Выбор значения в выпадающем списке, поле со списком или на
+                # вкладке. Раньше это было недостижимо: SelectionItem и
+                # ExpandCollapse вызываются на STA-потоке, а PowerShell держит
+                # свой единственный runspace и зависает на этом. Теперь раскрытие,
+                # выбор и сворачивание делает нативный слой, наружу уходит
+                # только результат с проверкой, что элемент действительно выбран.
+                $depth = if ($a.maxDepth) { [int]$a.maxDepth } else { 8 }
+                $want = if ($a.value) { [string]$a.value } else { '' }
+                if ($want -eq '') { Fail 'InvalidArgument' "Не передано значение для выбора (value)" }
+                if (-not ([string]$a.title) -and -not $a.hwnd -and -not $a.elementId) {
+                    # Без заголовка окна искать негде, и сообщение про
+                    # несуществующий сломанный нативный слой тут обманывало:
+                    # слой как раз загружен, просто не сказано, где искать.
+                    Fail 'InvalidArgument' "Не указан title, hwnd или elementId: computer_select ищет элемент со списком в конкретном окне"
+                }
+                $nat = Invoke-UiAct 'select' $a $depth 1
+                if ($nat) {
+                    if ($nat.status -eq 'disabled') {
+                        Fail 'ElementDisabled' "Элемент '$($nat.element.name)' неактивен (enabled=false): приложение его отключило, выбирать нечего."
+                    }
+                    if ($nat.status -eq 'stale' -or $nat.status -eq 'notFound') {
+                        Fail 'ElementNotFound' $(if ($nat.error) { [string]$nat.error } else { 'Элемент не найден по заданным условиям' })
+                    }
+                    if ($nat.status -eq 'noPattern') {
+                        Fail 'PatternUnavailable' $nat.error
+                    }
+                    if ($nat.status -eq 'ok') {
+                        $result = [ordered]@{
+                            ok = $true; via = $nat.via; selected = [bool]$nat.selected
+                            selectedName = [string]$nat.selectedName; element = $nat.element
+                        }
+                        break
+                    }
+                    if ($nat.status -eq 'optionNotFound') {
+                        Fail 'OptionNotFound' "Вариант '$want' не найден среди элементов '$($nat.element.name)'. Список значений: computer_read_screen этого окна покажет их."
+                    }
+                    if ($nat.status -eq 'notSelected') {
+                        Fail 'NotSelected' "Паттерн SelectionItem отработал, но элемент не выбрался (status notSelected). Значит элемент виден, но не выбирается."
+                    }
+                    if ($nat.status -eq 'notfound') {
+                        Fail 'ElementNotFound' "Элемент '$($a.name)' не найден — выбирать нечего"
+                    }
+                    Fail 'NotSelected' "Выбор не удался: $($nat.status) $($nat.error)"
+                }
+                # Нативного слоя нет: честный отказ, а не выдуманный успех.
+                Fail 'NotSupported' "Выбор значения требует нативного слоя UIA, а uia-native.cs не загрузился: $($script:NativeUiaError)"
+            }
+
+            'select_text' {
+                $depth = if ($a.maxDepth) { [int]$a.maxDepth } else { 8 }
+                $natInfo = $null
+                $nat = Invoke-UiAct 'find' $a $depth 1
+                if ($nat -and $nat.status -eq 'ok' -and @($nat.elements).Count -gt 0) {
+                    $natInfo = @($nat.elements)[0]
+                    if ($natInfo.enabled -eq $false) {
+                        Fail 'ElementDisabled' "Элемент '$($natInfo.name)' неактивен (enabled=false): поле отключено, выделять нечего."
+                    }
+                }
+                if (-not $natInfo) {
+                    $hits = Search-UiElements ([string]$a.title) ([string]$a.name) ([string]$a.type) `
+                                           ([string]$a.id) $depth 1
+                    if (@($hits).Count -eq 0) { Fail 'ElementNotFound' "Элемент '$($a.name)' не найден" }
+                    $natInfo = Convert-ElementInfo @($hits)[0]
+                    if ($natInfo['enabled'] -eq $false) {
+                        Fail 'ElementDisabled' "Элемент '$($natInfo['name'])' неактивен (enabled=false): поле отключено, выделять нечего."
+                    }
+                }
+                $info = $natInfo
+                $r = if ($info['rect']) { $info['rect'] } else { $info.rect }
+                [DeskMcp]::MoveTo($r['x'] + [int]($r['w'] / 2), $r['y'] + [int]($r['h'] / 2))
+                Start-Sleep -Milliseconds 150
+                [DeskMcp]::Click('left', 1)
+                Start-Sleep -Milliseconds 80
+                $ctrlWasDown = [DeskMcp]::KeyDown(0x11)
+                [DeskMcp]::VKey([uint16]0x11, $false)
+                Start-Sleep -Milliseconds 20
+                [DeskMcp]::VKey([uint16]0x41, $false)
+                Start-Sleep -Milliseconds 20
+                [DeskMcp]::VKey([uint16]0x41, $true)
+                Start-Sleep -Milliseconds 20
+                if (-not $ctrlWasDown) { [DeskMcp]::VKey([uint16]0x11, $true) }
+                $result = [ordered]@{ ok = $true; note = 'Выделено всё содержимое поля (Ctrl+A)'; element = $info }
+            }
+
+            'verify' {
+                $checks = @($a.expect)
+                if ($checks.Count -eq 0) { Fail 'InvalidArgument' "Ни одного предиката не передано" }
+                $report = @()
+                $allOk = $true
+                foreach ($chk in $checks) {
+                    $desc = $chk.label
+                    $state = 'unknown'
+                    $detail = ''
+                    try {
+                        if ((Has-Prop $chk 'window')) {
+                            $state = $(if ($chk.window.exists) { 'satisfied' } else { 'unsatisfied' })
+                        } else {
+                            $role = if ($chk.selector) { $chk.selector.role } else { $null }
+                            $lab  = if ($chk.selector) { $chk.selector.label_contains } else { $null }
+                            # Кэшируем именно сведения (без COM-объектов): verify
+                            # в агентном цикле вызывается после find и не
+                            # требует живого элемента, а обход дерева стоит
+                            # сотни миллисекунд каждый раз.
+                            $targetHwnd = if ($a.hwnd) { [long]$a.hwnd } else { 0 }
+                            $infos = Get-ElementInfosCached ([string]$a.title) ([string]$lab) ([string]$role) '' 8 5 $targetHwnd
+                            $n = @($infos).Count
+                            if ($n -eq 0) { $state = 'unsatisfied'; $detail = 'не найден' }
+                            else {
+                                $info = @($infos)[0]
+                                $detail = "найдено $n"
+                                if ((Has-Prop $chk 'value_equals')) {
+                                    $v = Get-UiProp $info 'value'
+                                    if ($null -eq $v) { $state = 'unknown'; $detail += ', значение недоступно' }
+                                    elseif ($v -eq $chk.value_equals) { $state = 'satisfied' }
+                                    else { $state = 'unsatisfied'; $detail += ", значение='$v'" }
+                                } elseif ((Has-Prop $chk 'enabled')) {
+                                    $en = Get-UiProp $info 'enabled'
+                                    $state = $(if ([bool]$en -eq [bool]$chk.enabled) { 'satisfied' } else { 'unsatisfied' })
+                                    $detail += ", enabled=$en"
+                                } elseif ((Has-Prop $chk 'selected')) {
+                                    $sel = Get-UiProp $info 'selected'
+                                    if ($null -eq $sel) { $state = 'unknown'; $detail += ', selected недоступно' }
+                                    else { $state = $(if ([bool]$sel -eq [bool]$chk.selected) { 'satisfied' } else { 'unsatisfied' }) }
+                                } else { $state = 'satisfied' }
+                            }
+                        }
+                    } catch {
+                        $state = 'unknown'; $detail = $_.Exception.Message
+                    }
+                    if ($state -ne 'satisfied') { $allOk = $false }
+                    $report += [ordered]@{ check = $desc; state = $state; detail = $detail }
+                }
+                $result = [ordered]@{ ok = $allOk; checks = $report }
+            }
+
+            'set_frame' {
+                $w = Find-WindowByTitle ([string]$a.title) 3 (Get-ArgHwnd $a)
+                if (-not $w) { Fail 'WindowNotFound' "Окно '*$($a.title)*' не найдено за 3 с" }
+                $h = [IntPtr][long]$w.hwnd
+                $x = if ($null -ne $a.x) { [int]$a.x } else { $w.rect.x }
+                $y = if ($null -ne $a.y) { [int]$a.y } else { $w.rect.y }
+                $ww = if ($a.width)  { [int]$a.width }  else { $w.rect.w }
+                $hh = if ($a.height) { [int]$a.height } else { $w.rect.h }
+                $ok = [DeskMcp]::MoveWindow($h, $x, $y, $ww, $hh, $true)
+                if (-not $ok) { Fail 'CaptureFailed' "MoveWindow вернул false (окно '$($w.title)')" }
+                Start-Sleep -Milliseconds 200
+                $after = Find-WindowByTitle ([string]$a.title) 1 (Get-ArgHwnd $a)
+                $result = [ordered]@{
+                    ok = $true; title = $w.title
+                    requested = [ordered]@{ x = $x; y = $y; w = $ww; h = $hh }
+                    actual = $(if ($after) { $after.rect } else { $null })
+                }
+            }
+
+            'active_window' {
+                $h = [DeskMcp]::GetForegroundWindow()
+                $pid2 = [DeskMcp]::PidOf($h)
+                $proc = Get-Process -Id $pid2 -ErrorAction SilentlyContinue
+                $result = [ordered]@{
+                    pid = $pid2
+                    process = $(if ($proc) { $proc.ProcessName } else { $null })
+                    title = $(if ($proc) { $proc.MainWindowTitle } else { $null })
+                    handle = $h.ToInt64()
+                }
+            }
+
+            'selftest' {
+                $issues = @()
+                $s = Save-Screenshot -Region '0,0,200,120' -Scale 0 -Format 'png' -Quality 80
+                if (-not $s.bytes -or $s.bytes.Length -lt 100) { $issues += 'Снимок пустой' }
+                $d1 = [DeskMcp]::VKey([uint16]0x10, $false)
+                $u1 = [DeskMcp]::VKey([uint16]0x10, $true)
+                $n = $d1 + $u1
+                if ($n -ne 2) { $issues += "SendInput принял $n событий из 2 — ввод заблокирован (UIPI?)" }
+                $uia = $true
+                try { [System.Windows.Automation.AutomationElement]::RootElement | Out-Null } catch { $uia = $false }
+                if (-not $uia) { $issues += 'UI Automation недоступна' }
+                $wins = @(Get-WindowList)
+                $result = [ordered]@{
+                    ok = ($issues.Count -eq 0)
+                    issues = $issues
+                    screenshotBytes = $s.bytes.Length
+                    windows = $wins.Count
+                    sendInputOk = ($n -eq 2)
+                    dpi = $DpiMode
+                    nativeUia = [bool]$script:NativeUia
+                    nativeUiaError = $script:NativeUiaError
+                    uiaBudgetMs = $script:UiaBudgetMs
+                    pid = $PID
+                }
+            }
+
+            default { Fail 'InvalidArgument' "Неизвестный инструмент: '$tool'" }
+        }
+    return , $result
+}
+$script:In = New-Object System.IO.StreamReader([Console]::OpenStandardInput(), [System.Text.Encoding]::UTF8)
+
+Send-Response 0 $true ([ordered]@{ ready = $true; pid = $PID; powershell = $PSVersionTable.PSVersion.ToString() }) $null
+
+while ($true) {
+    $line = [Console]::In.ReadLine()
+    if ($null -eq $line) { break }
+    if ($line.Trim() -eq '') { continue }
+
+    $id = 0
+    $tool = ''
+    $a = $null
+    $started = Get-Date
+    $outcome = 'ok'
+    $result = $null
+    try {
+        $req = $line | ConvertFrom-Json
+        $id = $req.id
+        $tool = [string]$req.tool
+        $a = $req.args
+
+        # Белый список проверяется до всего, включая сухой прогон: иначе
+        # план на запрещённое окно выглядел бы как разрешённое действие.
+        Assert-TitleAllowed $tool $a
+
+        if ($script:DryRun -and ($script:MutatingTools -contains $tool)) {
+            $result = New-DryRunPlan $tool $a
+        } else {
+            $result = Invoke-Tool $tool $a
+        }
+        Send-Response $id $true $result $null
+    } catch {
+        $outcome = 'error'
+        $code = Get-ErrCode $_.Exception
+        if (-not $code) { $code = $script:LastErrorCode }
+        $script:LastErrorCode = ''
+        Send-Response $id $false $null $_.Exception.Message $code
+    } finally {
+        Write-AuditLog $tool $a $started $outcome $result
+    }
+}
