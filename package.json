@@ -1,0 +1,57 @@
+{
+  "name": "scrapyteer",
+  "version": "1.4.1",
+  "description": "Web scraping/crawling framework built on top of headless Chrome",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "test": "tsc && jest test"
+  },
+  "author": "Max Miroshnikov <miroshnikov@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/miroshnikov/scrapyteer.git"
+  },
+  "homepage": "https://github.com/miroshnikov/scrapyteer#readme",
+  "devDependencies": {
+    "@types/ramda": "^0.31.1",
+    "jest": "^30.3.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "commander": "^14.0.3",
+    "puppeteer": "^24.39.1",
+    "ramda": "^0.32.0"
+  },
+  "keywords": [
+    "scrape",
+    "scraping",
+    "scraper",
+    "web-scraper",
+    "scraping-framework",
+    "node-scraper",
+    "scrapy",
+    "crawl",
+    "crawling",
+    "crawler",
+    "web-crawler",
+    "crawling-framework",
+    "spider",
+    "puppeteer"
+  ],
+  "bugs": {
+    "url": "https://github.com/miroshnikov/scrapyteer/issues"
+  },
+  "files": [
+    "dist/",
+    "bin/"
+  ],
+  "bin": {
+    "scrapyteer": "bin/scrapyteer.js"
+  },
+  "jest": {
+    "testTimeout": 60000
+  }
+}
