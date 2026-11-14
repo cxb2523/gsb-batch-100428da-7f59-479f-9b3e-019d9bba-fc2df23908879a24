@@ -148,8 +148,9 @@ app.use("/genre-all", genreAll);
 app.use("/genre-rekomendasi", genreRekomendasi);
 app.use("/genre", genreDetail);
 
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`Server jalan di http://localhost:${port}`);
 });
 
 module.exports = app;
+module.exports.server = server;

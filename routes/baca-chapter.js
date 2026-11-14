@@ -82,8 +82,30 @@ const { getBacaChapter } = require("../controllers/bacaChapterController");
  *                       type: object
  *                     allChapters:
  *                       type: string
+ *                 attempts:
+ *                   type: array
+ *                   description: Riwayat percobaan kandidat URL, berurutan
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       url:
+ *                         type: string
+ *                       chapter:
+ *                         type: string
+ *                       outcome:
+ *                         type: string
+ *                         enum: [ok, not_found, blocked, chapter_mismatch, parse_failed, error]
+ *                       statusCode:
+ *                         type: integer
+ *                         nullable: true
+ *                       detail:
+ *                         type: string
  *       404:
- *         description: Chapter not found
+ *         description: Chapter not found (detail menyebutkan variasi nomor yang sudah dicoba, disertai attempts)
+ *       502:
+ *         description: Halaman berhasil diambil tetapi judul/gambar tidak bisa diparse (disertai source, missing, attempts)
+ *       503:
+ *         description: Upstream Cloudflare protection aktif
  *       500:
  *         description: Internal server error
  */

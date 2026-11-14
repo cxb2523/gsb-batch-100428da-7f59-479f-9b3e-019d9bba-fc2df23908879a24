@@ -1,7 +1,7 @@
 const https = require("https");
 const axios = require("axios");
 
-const BASE_URL = "https://komiku.org";
+const BASE_URL = process.env.KOMIKU_BASE_URL || "https://komiku.org";
 const PLACEHOLDER_IMAGE_RE = /\/asset\/img\/lazy\.jpg/i;
 
 const httpsAgent = new https.Agent({

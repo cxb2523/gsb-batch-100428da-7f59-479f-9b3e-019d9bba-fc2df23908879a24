@@ -126,33 +126,175 @@ function getChapterUrlCandidates(slug, chapter) {
   return candidates;
 }
 
+function extractTitle($) {
+  return (
+    normalizeText($("#Judul h1").first().text()) ||
+    normalizeText($("h1").first().text()) ||
+    normalizeText($("meta[itemprop='name']").attr("content"))
+  );
+}
+
+function extractImages($) {
+  const images = [];
+  $("#Baca_Komik img, img.ww, img[id]").each((_, el) => {
+    const img = $(el);
+    const src = getImageUrl($, img);
+    const id = normalizeText(img.attr("id"));
+
+    if (
+      src &&
+      /(?:[\w-]+\.)?komiku\.(?:org|to)\/(?:wp-content\/)?uploads?\d*\//i.test(src) &&
+      (!id || /^\d+$/.test(id))
+    ) {
+      images.push({
+        src,
+        alt: normalizeText(img.attr("alt")),
+        id,
+        fallbackSrc: src.replace("cdn.komiku.org", "img.komiku.org"),
+      });
+    }
+  });
+
+  return images.filter(
+    (image, index, allImages) =>
+      image.src && allImages.findIndex((item) => item.src === image.src) === index
+  );
+}
+
+// Ambil nomor chapter yang tertera di halaman (canonical, og:url,
+// atribut .chapterInfo, atau teks judul) untuk diverifikasi terhadap
+// nomor chapter yang diminta.
+function extractPageChapter($) {
+  const fromCanonical = extractChapterNumber($("link[rel='canonical']").attr("href"));
+  if (fromCanonical) return fromCanonical;
+
+  const fromOgUrl = extractChapterNumber($("meta[property='og:url']").attr("content"));
+  if (fromOgUrl) return fromOgUrl;
+
+  const fromChapterInfo = normalizeText($(".chapterInfo").attr("valuechapter"));
+  if (fromChapterInfo) return fromChapterInfo;
+
+  const titleText =
+    normalizeText($("#Judul h1").first().text()) ||
+    normalizeText($("h1").first().text());
+  const match = titleText.match(/chapter\s+([\d]+(?:[.-]\d+)*)/i);
+  return match ? match[1] : "";
+}
+
+// Samakan variasi penulisan nomor chapter: "5" = "05", "5.5" = "5-5".
+function normalizeChapterForCompare(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, ".")
+    .split(".")
+    .map((segment) => segment.replace(/^0+(?=\d)/, ""))
+    .join(".");
+}
+
+function chapterVariantsEqual(a, b) {
+  const normalizedA = normalizeChapterForCompare(a);
+  const normalizedB = normalizeChapterForCompare(b);
+  return normalizedA !== "" && normalizedA === normalizedB;
+}
+
 async function fetchChapterHtml(slug, chapter) {
   const candidates = getChapterUrlCandidates(slug, chapter);
-  let lastError;
+  const attempts = [];
 
   for (const candidate of candidates) {
+    let data;
     try {
-      const data = await fetchHtml(candidate.url);
-      return { data, chapterUrl: candidate.url, chapterValue: candidate.chapterValue };
+      data = await fetchHtml(candidate.url);
     } catch (error) {
-      lastError = error;
-      if (!error.response || (error.response.status !== 404 && error.response.status !== 403)) throw error;
+      const statusCode = (error.response && error.response.status) || null;
+      attempts.push({
+        url: candidate.url,
+        chapter: candidate.chapterValue,
+        outcome:
+          statusCode === 404
+            ? "not_found"
+            : statusCode === 403
+              ? "blocked"
+              : "error",
+        statusCode,
+        error: statusCode
+          ? `HTTP ${statusCode}`
+          : error.code || error.message || "request failed",
+      });
+
+      // 404/403: lanjut ke kandidat berikutnya. Error lain (jaringan,
+      // 5xx upstream) tetap dilempar agar tidak menambah beban upstream.
+      if (statusCode === 404 || statusCode === 403) continue;
+      error.attempts = attempts;
+      throw error;
     }
+
+    const $ = cheerio.load(data);
+
+    // Halaman berhasil diambil, tetapi pastikan isinya memang chapter
+    // yang diminta — upstream kadang mengembalikan chapter lain untuk
+    // variasi penulisan nomor yang tidak dikenalnya.
+    const pageChapter = extractPageChapter($);
+    if (pageChapter && !chapterVariantsEqual(chapter, pageChapter)) {
+      attempts.push({
+        url: candidate.url,
+        chapter: candidate.chapterValue,
+        outcome: "chapter_mismatch",
+        statusCode: 200,
+        detail: `Halaman berisi chapter ${pageChapter}, bukan chapter ${chapter} yang diminta.`,
+      });
+      continue;
+    }
+
+    const title = extractTitle($);
+    const images = extractImages($);
+    const missing = [];
+    if (!title) missing.push("title");
+    if (!images.length) missing.push("images");
+
+    if (missing.length) {
+      logEmptyParse("GET /baca-chapter", data, {
+        target: candidate.url,
+        titleFound: !!title,
+        imagesFound: images.length,
+        selectors: "#Judul h1, #Baca_Komik img, img.ww",
+      });
+      attempts.push({
+        url: candidate.url,
+        chapter: candidate.chapterValue,
+        outcome: "parse_failed",
+        statusCode: 200,
+        missing,
+        detail: `Halaman berhasil diambil tetapi ${missing.join(" dan ")} tidak ditemukan.`,
+      });
+      continue;
+    }
+
+    attempts.push({
+      url: candidate.url,
+      chapter: candidate.chapterValue,
+      outcome: "ok",
+      statusCode: 200,
+    });
+    return { data, chapterUrl: candidate.url, chapterValue: candidate.chapterValue, attempts };
   }
 
-  throw lastError;
+  const error = new Error(
+    "Semua kandidat URL chapter gagal diambil atau tidak cocok dengan chapter yang diminta."
+  );
+  error.attempts = attempts;
+  error.isChapterCandidatesExhausted = true;
+  throw error;
 }
 
 const getBacaChapter = async (req, res) => {
   try {
     const { slug, chapter } = req.params;
-    const { data, chapterUrl, chapterValue } = await fetchChapterHtml(slug, chapter);
+    const { data, chapterUrl, chapterValue, attempts } = await fetchChapterHtml(slug, chapter);
     const $ = cheerio.load(data);
 
-    const title =
-      normalizeText($("#Judul h1").first().text()) ||
-      normalizeText($("h1").first().text()) ||
-      normalizeText($("meta[itemprop='name']").attr("content"));
+    const title = extractTitle($);
     const mangaTitleElement = $(
       '#Judul a[href*="/manga/"], a[href*="/manga/"]'
     ).first();
@@ -171,30 +313,7 @@ const getBacaChapter = async (req, res) => {
       if (key && value && key !== value) chapterInfo[key] = value;
     });
 
-    const images = [];
-    $("#Baca_Komik img, img.ww, img[id]").each((_, el) => {
-      const img = $(el);
-      const src = getImageUrl($, img);
-      const id = normalizeText(img.attr("id"));
-
-      if (
-        src &&
-        /(?:[\w-]+\.)?komiku\.(?:org|to)\/(?:wp-content\/)?uploads?\d*\//i.test(src) &&
-        (!id || /^\d+$/.test(id))
-      ) {
-        images.push({
-          src,
-          alt: normalizeText(img.attr("alt")),
-          id,
-          fallbackSrc: src.replace("cdn.komiku.org", "img.komiku.org"),
-        });
-      }
-    });
-
-    const uniqueImages = images.filter(
-      (image, index, allImages) =>
-        image.src && allImages.findIndex((item) => item.src === image.src) === index
-    );
+    const uniqueImages = extractImages($);
 
     const navigationLinks = $("#Judul")
       .parent()
@@ -244,21 +363,6 @@ const getBacaChapter = async (req, res) => {
       $("meta[itemprop='datePublished']").attr("content") ||
       normalizeText($("time").first().text());
 
-    if (!title || !uniqueImages.length) {
-      logEmptyParse("GET /baca-chapter", data, {
-        target: chapterUrl,
-        titleFound: !!title,
-        imagesFound: uniqueImages.length,
-        selectors: "#Judul h1, #Baca_Komik img, img.ww",
-      });
-
-      return res.status(502).json({
-        error: "Gagal parsing data chapter komik dari Komiku.",
-        detail:
-          "Struktur HTML chapter kemungkinan berubah atau gambar chapter kosong.",
-      });
-    }
-
     res.json({
       title,
       mangaInfo: {
@@ -283,12 +387,76 @@ const getBacaChapter = async (req, res) => {
         allChapters: mangaSlug ? `/detail-komik/${mangaSlug}` : null,
       },
       additionalDescription,
+      attempts,
     });
   } catch (err) {
+    const attempts = err.attempts || [];
+
+    // Semua kandidat sudah dicoba dan tidak ada yang bisa dipakai.
+    if (err.isChapterCandidatesExhausted) {
+      const parseFailure = attempts.find((a) => a.outcome === "parse_failed");
+      if (parseFailure) {
+        const missingLabels = (parseFailure.missing || []).map((item) =>
+          item === "title" ? "judul" : item === "images" ? "gambar" : item
+        );
+        return res.status(502).json({
+          error: "Gagal parsing data chapter komik dari Komiku.",
+          detail:
+            `Halaman ${parseFailure.url} berhasil diambil (HTTP 200) tetapi ` +
+            `${missingLabels.join(" dan ")} tidak ditemukan. Struktur HTML chapter ` +
+            "kemungkinan berubah atau gambar chapter kosong.",
+          source: parseFailure.url,
+          missing: parseFailure.missing,
+          attempts,
+        });
+      }
+
+      const hasBlocked = attempts.some((a) => a.outcome === "blocked");
+      if (hasBlocked) {
+        // Periksa apakah komik dasarnya memang ada di Komiku
+        const exists = await checkMangaExists(req.params?.slug);
+        if (!exists) {
+          return res.status(404).json({
+            error: "Komik tidak ditemukan",
+            detail: "Komik dengan slug tersebut tidak ditemukan di situs Komiku.",
+            attempts,
+          });
+        }
+
+        return res.status(503).json({
+          error: "Upstream Cloudflare Protection",
+          detail:
+            "Situs upstream (komiku.org) sedang mengaktifkan Cloudflare bot challenge untuk halaman chapter. Silakan sediakan CF_CLEARANCE cookie atau gunakan proxy.",
+          attempts,
+        });
+      }
+
+      const triedChapters = [
+        ...new Set(attempts.map((a) => a.chapter).filter(Boolean)),
+      ];
+      let detail =
+        "Chapter komik tersebut tidak ditemukan di situs Komiku. " +
+        `Variasi nomor chapter yang sudah dicoba: ${triedChapters
+          .map((c) => `"${c}"`)
+          .join(", ")}.`;
+      const mismatches = attempts.filter((a) => a.outcome === "chapter_mismatch");
+      if (mismatches.length) {
+        detail += ` Kandidat berikut berisi chapter lain: ${mismatches
+          .map((m) => `${m.url} (${m.detail})`)
+          .join("; ")}.`;
+      }
+      return res.status(404).json({
+        error: "Chapter tidak ditemukan",
+        detail,
+        attempts,
+      });
+    }
+
     if (err.response && err.response.status === 404) {
       return res.status(404).json({
         error: "Chapter tidak ditemukan",
         detail: "Chapter komik tersebut tidak ditemukan di situs Komiku.",
+        attempts,
       });
     }
 
@@ -299,6 +467,7 @@ const getBacaChapter = async (req, res) => {
         return res.status(404).json({
           error: "Komik tidak ditemukan",
           detail: "Komik dengan slug tersebut tidak ditemukan di situs Komiku.",
+          attempts,
         });
       }
 
@@ -306,6 +475,7 @@ const getBacaChapter = async (req, res) => {
         error: "Upstream Cloudflare Protection",
         detail:
           "Situs upstream (komiku.org) sedang mengaktifkan Cloudflare bot challenge untuk halaman chapter. Silakan sediakan CF_CLEARANCE cookie atau gunakan proxy.",
+        attempts,
       });
     }
 
@@ -314,9 +484,14 @@ const getBacaChapter = async (req, res) => {
       error: "Gagal mengambil data chapter komik",
       detail: err.message,
       stack: process.env.NODE_ENV === "development" ? err.stack : undefined,
+      attempts,
     });
   }
 };
 
-module.exports = { getBacaChapter, extractSlugAndChapter };
-
+module.exports = {
+  getBacaChapter,
+  extractSlugAndChapter,
+  getChapterUrlCandidates,
+  chapterVariantsEqual,
+};
