@@ -58,12 +58,28 @@ class CrawlEngine(object):
     missed_pages = set()
     # pages that should be ignores(not html or not-texual pages)
     garbage_pages = set()
+    # links that were never expanded because their depth exceeded max_depth
+    too_deep_pages = set()
     # crawler's work queue containig the pages to be visited
     work_queue = queue.Queue()
     # a lock to controll the treads
     glock = Lock()
     # page grabber object used in crawling
     pg = PageGrabber()
+
+    def __init__(self):
+        # per-instance (per-batch) state; the class attributes above act as defaults
+        self.visited_pages = set()
+        self.missed_pages = set()
+        self.garbage_pages = set()
+        self.too_deep_pages = set()
+        self.work_queue = queue.Queue()
+        self.glock = Lock()
+        self.pg = PageGrabber()
+        # worker threads spawned by the current batch (joined before start() returns)
+        self._worker_threads = []
+        # structured outcome of the last finished batch
+        self.last_outcome = None
 
     def _get_robotstxt(self, robotstxt_url):
         try:
@@ -198,13 +214,36 @@ class CrawlEngine(object):
             with self.glock:
                 self.max_worker_threads += 1
 
+    def _finalize_outcome(self):
+        """Build the structured outcome of the finished batch.
+
+        Every link seen in this batch lands in exactly one category:
+        crawled (successfully grabbed) > missed (retries exhausted) >
+        garbage (non-textual) > too-deep (beyond max_depth, never expanded).
+        """
+        crawled = set(self.visited_pages)
+        missed = set(self.missed_pages) - crawled
+        garbage = set(self.garbage_pages) - crawled - missed
+        too_deep = set(self.too_deep_pages) - crawled - missed - garbage
+
+        self.last_outcome = {
+            "crawled_pages": frozenset(crawled),
+            "missed_pages": frozenset(missed),
+            "too_deep_pages": frozenset(too_deep),
+            "garbage_pages": frozenset(garbage),
+        }
+        return self.last_outcome
+
     def start(self):
+        # how many times in a row the work queue may be empty before giving up;
+        # kept local so the configured threshold survives each batch
+        empty_queue_strikes = self.max_empty_queue_threshold
         try:
             # insert the start url to crawler's work queue
             with self.glock:
                 self.work_queue.put_nowait(self.start_url)
 
-            while len(self.visited_pages) < self.max_links and self.max_empty_queue_threshold > 0:
+            while len(self.visited_pages) < self.max_links and empty_queue_strikes > 0:
                 try:
                     # fetch me a link to process
                     with self.glock:
@@ -216,7 +255,7 @@ class CrawlEngine(object):
                             log_says(message="WORK QUEUE IS EMPTY", log_type=WARN, agent="CrawlEngine")
 
                     # crawler's work queue was empty
-                    self.max_empty_queue_threshold -= 1
+                    empty_queue_strikes -= 1
 
                     # wait a little
                     sleep(self.empty_queue_wait)
@@ -235,6 +274,10 @@ class CrawlEngine(object):
                                          log_type=WARN, agent="CrawlEngine")
 
                     elif url.DEPTH > self.max_depth:
+                        # record the link instead of silently dropping it
+                        with self.glock:
+                            self.too_deep_pages.add(url.LINK)
+
                         if VERBOSE >= 5:
                             with self.glock:
                                 log_says(
@@ -261,6 +304,14 @@ class CrawlEngine(object):
                         else:
                             with self.glock:
                                 self.max_worker_threads -= 1
+                                self._worker_threads.append(t)
         except:
             if DEBUG:
                 print_stack_trace()
+        finally:
+            # wait for every worker of this batch so the outcome is complete
+            # by the time start() returns
+            for t in self._worker_threads:
+                t.join()
+
+        return self._finalize_outcome()
