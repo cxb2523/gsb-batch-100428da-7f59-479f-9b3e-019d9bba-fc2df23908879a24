@@ -25,4 +25,4 @@ export type {
   SelectorOptions,
 } from './extract/index.js';
 export { crawl } from './crawl/index.js';
-export type { CrawlOptions, CrawlResult, CrawlSummary } from './crawl/index.js';
+export type { CrawlOptions, CrawlResult, CrawlOutcome, CrawlSummary } from './crawl/index.js';

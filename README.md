@@ -154,6 +154,12 @@ npx agent-fetch crawl https://example.com --cookie-file ~/.cookies.txt --select 
 npx agent-fetch crawl https://example.com --json
 ```
 
+Every crawled page yields a result with an `outcome` field — `fetched`, `failed`, or `blocked`:
+blocked pages are not requested at all and carry the robots.txt rule in `blockedBy`, while failed
+pages carry a `reason`. The final summary's `pagesBlocked` equals the number of `blocked` results.
+`robots.txt` patterns support `*` wildcards and a trailing `$` anchor, and the longest matching
+`Allow`/`Disallow` pattern decides the outcome.
+
 ## How Extraction Works
 
 agent-fetch runs multiple extraction strategies in parallel and picks the most complete result. No single method works for every site — modern pages use frameworks, APIs, and structured data that each require different approaches.

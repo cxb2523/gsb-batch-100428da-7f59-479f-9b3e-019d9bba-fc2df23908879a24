@@ -170,7 +170,7 @@ describe('crawl orchestrator', () => {
   });
 
   describe('robots.txt integration', () => {
-    it('skips URLs disallowed by robots.txt', async () => {
+    it('emits a blocked result instead of fetching disallowed URLs', async () => {
       vi.mocked(httpRequest).mockImplementation(async (url) => {
         if (url.endsWith('/robots.txt')) {
           return {
@@ -195,12 +195,22 @@ describe('crawl orchestrator', () => {
       });
 
       const results = await collectResults(crawl('https://example.com/', { maxPages: 10 }));
-      const urls = filterCrawlResults(results).map((r) => r.url);
+      const crawlResults = filterCrawlResults(results);
+      const blocked = crawlResults.find((r) => r.url === 'https://example.com/admin/secret');
 
-      expect(urls).not.toContain('https://example.com/admin/secret');
+      expect(blocked).toBeDefined();
+      expect(blocked!.outcome).toBe('blocked');
+      expect(blocked!.success).toBe(false);
+      expect(blocked!.reason).toContain('/admin');
+      expect(blocked!.blockedBy).toBe('/admin');
+      // The page request must never be made.
+      expect(httpFetch).not.toHaveBeenCalledWith(
+        'https://example.com/admin/secret',
+        expect.anything()
+      );
     });
 
-    it('counts robots-blocked pages in summary', async () => {
+    it('counts robots-blocked pages in summary consistent with per-page results', async () => {
       vi.mocked(httpRequest).mockImplementation(async (url) => {
         if (url.endsWith('/robots.txt')) {
           return {
@@ -221,8 +231,10 @@ describe('crawl orchestrator', () => {
       });
 
       const results = await collectResults(crawl('https://example.com/', { maxPages: 10 }));
+      const blockedResults = filterCrawlResults(results).filter((r) => r.outcome === 'blocked');
 
-      expect(findSummary(results).pagesBlocked).toBeGreaterThanOrEqual(1);
+      expect(blockedResults.length).toBeGreaterThanOrEqual(1);
+      expect(findSummary(results).pagesBlocked).toBe(blockedResults.length);
     });
   });
 
@@ -275,22 +287,31 @@ describe('crawl orchestrator', () => {
   });
 
   describe('failed pages', () => {
-    it('counts failed pages in summary', async () => {
+    it('keeps failed pages in per-page results with a failure reason', async () => {
       vi.mocked(httpFetch).mockResolvedValue({
         success: false,
         url: 'https://example.com/',
         latencyMs: 10,
-        error: 'http_error',
+        error: 'http_status_error',
+        errorDetails: { statusCode: 500 },
         statusCode: 500,
         rawHtml: null,
         extractionMethod: null,
       });
 
       const results = await collectResults(crawl('https://example.com/', { maxPages: 1 }));
+      const crawlResults = filterCrawlResults(results);
       const summary = findSummary(results);
 
+      expect(crawlResults).toHaveLength(1);
+      expect(crawlResults[0].url).toBe('https://example.com/');
+      expect(crawlResults[0].outcome).toBe('failed');
+      expect(crawlResults[0].success).toBe(false);
+      expect(crawlResults[0].reason).toBeTruthy();
       expect(summary.pagesFailed).toBe(1);
       expect(summary.pagesSuccess).toBe(0);
+      expect(summary.pagesTotal).toBe(1);
+      expect(summary.pagesBlocked).toBe(0);
     });
   });
 

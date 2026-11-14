@@ -17,7 +17,9 @@ export type FetchError =
   | 'rate_limited'
   | 'extraction_failed'
   | 'pdf_fetch_failed'
-  | 'response_too_large';
+  | 'response_too_large'
+  /** Crawl-only: the page was not requested because robots.txt disallows it. */
+  | 'robots_blocked';
 
 export interface ValidationResult {
   valid: boolean;

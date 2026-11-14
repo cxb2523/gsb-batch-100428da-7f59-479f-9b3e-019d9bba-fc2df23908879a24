@@ -7,9 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- robots.txt `Allow` support and wildcard/`$`-anchored `Disallow` patterns (`*` wildcard, trailing `$` end anchor), resolved by longest matching pattern
+- Crawl per-page `outcome` (`fetched` / `failed` / `blocked`), `reason`, and `blockedBy` fields, echoed in default and `--json` crawl output
+
 ### Changed
 
+- Crawl blocked URLs are no longer silently dropped: they are emitted as per-page results with reason and depth, and `pagesBlocked` now matches the number of blocked per-page results
+- Crawl failed pages are kept in per-page results with a failure reason
+- Crawl summary line now also reports the failed page count
 - Documented cookie file, web crawling, CSS selector, PDF, and TLS preset features
+
+### Fixed
+
+- robots.txt patterns containing `*` (e.g. `/private/*.pdf`, `/*?print=1`) were treated as literal prefixes, letting disallowed pages be fetched
 
 ## [0.1.6] - 2026-02-14
 

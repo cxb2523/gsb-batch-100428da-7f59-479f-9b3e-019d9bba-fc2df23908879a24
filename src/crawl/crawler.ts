@@ -5,8 +5,9 @@ import { httpFetch } from '../fetch/http-fetch.js';
 import { httpRequest } from '../fetch/http-client.js';
 import { extractLinks } from './link-extractor.js';
 import { UrlFrontier } from './url-frontier.js';
-import { fetchRobotsTxt, isAllowedByRobots } from './robots-parser.js';
+import { fetchRobotsTxt, evaluateRobotsRules } from './robots-parser.js';
 import { fetchSitemapEntries } from './sitemap-parser.js';
+import type { FetchResult } from '../fetch/types.js';
 import type { CrawlOptions, CrawlResult, CrawlSummary } from './types.js';
 import { logger } from '../logger.js';
 
@@ -38,7 +39,7 @@ async function simpleFetch(
  * Yields CrawlResult objects as pages are fetched.
  *
  * Strategy:
- * 1. Fetch robots.txt for Disallow rules and Sitemap directives
+ * 1. Fetch robots.txt for Allow/Disallow rules and Sitemap directives
  * 2. If sitemap found, use sitemap URLs as crawl queue
  * 3. Otherwise, use link discovery (BFS)
  */
@@ -57,14 +58,15 @@ export async function* crawl(
   let pagesFailed = 0;
   let pagesBlocked = 0;
 
-  function trackResult(success: boolean): void {
-    pagesTotal++;
-    if (success) pagesSuccess++;
-    else pagesFailed++;
-  }
+  function trackResult(result: CrawlResult): void {
+    if (result.outcome === 'blocked') {
+      pagesBlocked++;
+      return;
+    }
 
-  function trackBlocked(): void {
-    pagesBlocked++;
+    pagesTotal++;
+    if (result.success) pagesSuccess++;
+    else pagesFailed++;
   }
 
   const origin = new URL(startUrl).origin;
@@ -74,6 +76,7 @@ export async function* crawl(
   // Step 1: Fetch robots.txt
   const robots = await fetchRobotsTxt(origin, fetchFn);
   const disallowPaths = robots?.disallowPaths ?? [];
+  const allowPaths = robots?.allowPaths ?? [];
 
   // Step 2: Try sitemap
   const sitemapUrls = robots?.sitemapUrls ?? [];
@@ -118,10 +121,10 @@ export async function* crawl(
     concurrency,
     delay,
     disallowPaths,
+    allowPaths,
     options,
     discoverLinks: !useSitemap,
     onResult: trackResult,
-    onBlocked: trackBlocked,
   });
 
   // Emit summary
@@ -141,22 +144,50 @@ interface ProcessOptions {
   concurrency: number;
   delay: number;
   disallowPaths: string[];
+  allowPaths: string[];
   options: CrawlOptions;
   discoverLinks: boolean;
-  onResult: (success: boolean) => void;
-  onBlocked: () => void;
+  onResult: (result: CrawlResult) => void;
 }
 
 /**
- * Check if a URL is allowed by robots.txt Disallow rules.
- * Returns false (blocked) if the URL cannot be parsed.
+ * Evaluate robots.txt for a URL.
+ * URLs that cannot be parsed are treated as disallowed.
  */
-function isUrlAllowed(url: string, disallowPaths: string[]): boolean {
+function evaluateUrlRobots(
+  url: string,
+  disallowPaths: string[],
+  allowPaths: string[]
+): ReturnType<typeof evaluateRobotsRules> {
   try {
-    return isAllowedByRobots(new URL(url).pathname, disallowPaths);
+    const parsed = new URL(url);
+    // robots.txt matching applies to the path plus query string.
+    return evaluateRobotsRules(`${parsed.pathname}${parsed.search}`, disallowPaths, allowPaths);
   } catch {
-    return false;
+    return {
+      allowed: false,
+      reason: `Blocked: could not parse URL "${url}"`,
+    };
   }
+}
+
+/**
+ * Build the per-page result for a fetch that failed to produce content.
+ * `httpFetch` normally supplies its own error fields; this fills in the
+ * crawl-level outcome/reason so failures are visible in per-page results.
+ */
+function toFailedResult(fetchResult: FetchResult, depth: number): CrawlResult {
+  const reason =
+    fetchResult.hint ??
+    fetchResult.error ??
+    (fetchResult.statusCode ? `HTTP ${fetchResult.statusCode}` : 'Fetch failed');
+
+  return {
+    ...fetchResult,
+    depth,
+    outcome: 'failed',
+    reason,
+  };
 }
 
 /**
@@ -169,10 +200,10 @@ async function* processFrontier(
   frontier: UrlFrontier,
   opts: ProcessOptions
 ): AsyncGenerator<CrawlResult> {
-  const { concurrency, delay, disallowPaths, options, discoverLinks, onResult, onBlocked } = opts;
+  const { concurrency, delay, disallowPaths, allowPaths, options, discoverLinks, onResult } = opts;
 
   let nextId = 0;
-  const inflight = new Map<number, Promise<{ id: number; result: CrawlResult | null }>>();
+  const inflight = new Map<number, Promise<{ id: number; result: CrawlResult }>>();
 
   function enqueue(): void {
     while (inflight.size < concurrency && frontier.hasMore()) {
@@ -183,10 +214,28 @@ async function* processFrontier(
       const promise = (async () => {
         if (delay > 0) await new Promise((r) => setTimeout(r, delay));
 
-        if (!isUrlAllowed(entry.url, disallowPaths)) {
-          logger.debug({ url: entry.url }, 'Blocked by robots.txt');
-          onBlocked();
-          return { id, result: null };
+        const decision = evaluateUrlRobots(entry.url, disallowPaths, allowPaths);
+        if (!decision.allowed) {
+          logger.debug({ url: entry.url, rule: decision.rule }, 'Blocked by robots.txt');
+          // Do not issue a page request; emit an identifiable blocked result.
+          return {
+            id,
+            result: {
+              success: false,
+              url: entry.url,
+              latencyMs: 0,
+              depth: entry.depth,
+              outcome: 'blocked',
+              error: 'robots_blocked',
+              errorDetails: { type: 'robots_blocked' },
+              suggestedAction: 'skip',
+              reason: decision.reason ?? 'Blocked by robots.txt',
+              blockedBy: decision.rule,
+              statusCode: null,
+              rawHtml: null,
+              extractionMethod: null,
+            } satisfies CrawlResult,
+          };
         }
 
         const fetchResult = await httpFetch(entry.url, {
@@ -204,7 +253,11 @@ async function* processFrontier(
           fetchResult.rawHtml = null;
         }
 
-        return { id, result: { ...fetchResult, depth: entry.depth } as CrawlResult };
+        const result: CrawlResult = fetchResult.success
+          ? { ...fetchResult, depth: entry.depth, outcome: 'fetched' }
+          : toFailedResult(fetchResult, entry.depth);
+
+        return { id, result };
       })();
 
       inflight.set(id, promise);
@@ -219,10 +272,8 @@ async function* processFrontier(
     const settled = await Promise.race(inflight.values());
     inflight.delete(settled.id);
 
-    if (settled.result) {
-      onResult(settled.result.success);
-      yield settled.result;
-    }
+    onResult(settled.result);
+    yield settled.result;
 
     // Refill window
     enqueue();

@@ -390,13 +390,15 @@ async function runCrawl(args: string[]): Promise<void> {
         if (item.textContent) console.log(item.textContent);
       } else if ('type' in item && item.type === 'summary') {
         if (!opts.json) {
+          const failed = item.pagesFailed > 0 ? `, ${item.pagesFailed} failed` : '';
           const blocked = item.pagesBlocked > 0 ? `, ${item.pagesBlocked} blocked` : '';
           console.error(
-            `\nCrawl complete: ${item.pagesSuccess}/${item.pagesTotal} pages${blocked}, ${item.durationMs}ms (${item.source})`
+            `\nCrawl complete: ${item.pagesSuccess}/${item.pagesTotal} pages${failed}${blocked}, ${item.durationMs}ms (${item.source})`
           );
         }
       } else {
-        // Default: JSONL output for crawl
+        // Default: JSONL output for crawl. Blocked and failed pages include
+        // `outcome`/`reason` so their disposition is visible per page.
         console.log(JSON.stringify(item));
       }
     }

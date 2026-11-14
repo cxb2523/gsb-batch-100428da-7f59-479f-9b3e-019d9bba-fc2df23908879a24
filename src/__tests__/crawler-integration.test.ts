@@ -200,14 +200,26 @@ describe('crawler integration', () => {
       vi.mocked(httpFetch).mockImplementation(async (url) => mockFetchResult(url));
 
       const results = await collectResults(crawl('https://example.com/', { maxPages: 10 }));
-      const urls = filterCrawlResults(results).map((r) => r.url);
+      const crawlResults = filterCrawlResults(results);
+      const urls = crawlResults.map((r) => r.url);
       const summary = findSummary(results);
+      const blocked = crawlResults.filter((r) => r.outcome === 'blocked');
 
       expect(summary.source).toBe('sitemap');
       expect(urls).toContain('https://example.com/public-page');
       expect(urls).toContain('https://example.com/about');
-      expect(urls).not.toContain('https://example.com/admin/secret');
-      expect(summary.pagesBlocked).toBeGreaterThanOrEqual(1);
+      // The disallowed entry is reported as a blocked result, not silently dropped.
+      const blockedEntry = blocked.find((r) => r.url === 'https://example.com/admin/secret');
+      expect(blockedEntry).toBeDefined();
+      expect(blockedEntry!.reason).toContain('/admin/');
+      expect(blockedEntry!.depth).toBe(0);
+      expect(summary.pagesBlocked).toBe(blocked.length);
+      expect(summary.pagesBlocked).toBe(1);
+      // No page request is issued for the blocked entry.
+      expect(httpFetch).not.toHaveBeenCalledWith(
+        'https://example.com/admin/secret',
+        expect.anything()
+      );
     });
 
     it('follows nested sitemap index → child sitemap → URLs', async () => {
@@ -288,6 +300,97 @@ describe('crawler integration', () => {
 
       // maxPages=5: seed + sitemap entries, total should not exceed 5
       expect(summary.pagesTotal).toBeLessThanOrEqual(5);
+    });
+  });
+
+  // =========================================================================
+  // robots.txt wildcard rules
+  // =========================================================================
+  describe('robots.txt wildcard rules', () => {
+    function robotsResponse(html: string) {
+      vi.mocked(httpRequest).mockImplementation(async (url) => {
+        if (typeof url === 'string' && url.endsWith('/robots.txt')) {
+          return mockHttpResponse({ html });
+        }
+        return robotsTxt404();
+      });
+    }
+
+    it('blocks wildcard and end-anchored patterns without fetching them', async () => {
+      robotsResponse('User-agent: *\nDisallow: /private/*.pdf\nDisallow: /*?print=1$\n');
+
+      vi.mocked(httpFetch).mockImplementation(async (url) => {
+        if (url === 'https://example.com/') {
+          return mockFetchResult(url, {
+            rawHtml: `<html><body>
+              <a href="/private/report.pdf">PDF</a>
+              <a href="/article?print=1">Print</a>
+              <a href="/article?print=1&page=2">Print (extra param)</a>
+              <a href="/open">Open</a>
+            </body></html>`,
+          });
+        }
+        return mockFetchResult(url, { rawHtml: null });
+      });
+
+      const results = await collectResults(
+        crawl('https://example.com/', { maxPages: 10, concurrency: 1 })
+      );
+      const crawlResults = filterCrawlResults(results);
+      const blocked = crawlResults.filter((r) => r.outcome === 'blocked');
+      const blockedUrls = blocked.map((r) => r.url).sort();
+
+      expect(blockedUrls).toContain('https://example.com/private/report.pdf');
+      expect(blockedUrls).toContain('https://example.com/article?print=1');
+      // `$` anchors the rule, so a longer query string is not matched.
+      expect(blockedUrls).not.toContain('https://example.com/article?print=1&page=2');
+      expect(crawlResults.some((r) => r.url === 'https://example.com/open')).toBe(true);
+
+      expect(blocked.find((r) => r.url.endsWith('/private/report.pdf'))!.blockedBy).toBe(
+        '/private/*.pdf'
+      );
+      expect(blocked.find((r) => r.url.endsWith('?print=1'))!.blockedBy).toBe('/*?print=1$');
+
+      for (const url of blockedUrls) {
+        expect(httpFetch).not.toHaveBeenCalledWith(url, expect.anything());
+      }
+
+      expect(findSummary(results).pagesBlocked).toBe(blocked.length);
+    });
+
+    it('applies longest-match precedence between Allow and Disallow', async () => {
+      robotsResponse('User-agent: *\nDisallow: /private/\nAllow: /private/public/\n');
+
+      vi.mocked(httpFetch).mockImplementation(async (url) => {
+        if (url === 'https://example.com/') {
+          return mockFetchResult(url, {
+            rawHtml: `<html><body>
+              <a href="/private/public/page">Public</a>
+              <a href="/private/secret/page">Secret</a>
+            </body></html>`,
+          });
+        }
+        return mockFetchResult(url, { rawHtml: null });
+      });
+
+      const results = await collectResults(
+        crawl('https://example.com/', { maxPages: 10, concurrency: 1 })
+      );
+      const crawlResults = filterCrawlResults(results);
+      const byUrl = new Map(crawlResults.map((r) => [r.url, r]));
+
+      // Longer Allow rule wins over the shorter Disallow prefix.
+      expect(byUrl.get('https://example.com/private/public/page')!.outcome).toBe('fetched');
+      expect(byUrl.get('https://example.com/private/public/page')!.success).toBe(true);
+
+      // The shorter Disallow still blocks the rest of /private/.
+      const secret = byUrl.get('https://example.com/private/secret/page')!;
+      expect(secret.outcome).toBe('blocked');
+      expect(secret.blockedBy).toBe('/private/');
+      expect(httpFetch).not.toHaveBeenCalledWith(
+        'https://example.com/private/secret/page',
+        expect.anything()
+      );
     });
   });
 

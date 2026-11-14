@@ -1,5 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
-import { parseRobotsTxt, isAllowedByRobots } from '../crawl/robots-parser.js';
+import {
+  parseRobotsTxt,
+  isAllowedByRobots,
+  evaluateRobotsRules,
+  matchRobotsPattern,
+} from '../crawl/robots-parser.js';
 import { parseSitemapXml, fetchSitemapEntries } from '../crawl/sitemap-parser.js';
 import { extractLinks } from '../crawl/link-extractor.js';
 import { UrlFrontier, normalizeUrl } from '../crawl/url-frontier.js';
@@ -65,6 +70,63 @@ Disallow: /test
       const rules = parseRobotsTxt(content);
       expect(rules.disallowPaths).toEqual(['/test']);
     });
+
+    it('parses wildcard and end-anchored rules verbatim', () => {
+      const content = `User-agent: *
+Disallow: /private/*.pdf
+Disallow: /*?print=1$
+`;
+      const rules = parseRobotsTxt(content);
+      expect(rules.disallowPaths).toEqual(['/private/*.pdf', '/*?print=1$']);
+    });
+
+    it('parses Allow rules for the wildcard user-agent', () => {
+      const content = `User-agent: *
+Disallow: /private/
+Allow: /private/public/
+`;
+      const rules = parseRobotsTxt(content);
+      expect(rules.allowPaths).toEqual(['/private/public/']);
+    });
+
+    it('ignores empty Allow/Disallow values', () => {
+      const content = `User-agent: *
+Disallow:
+Allow:
+`;
+      const rules = parseRobotsTxt(content);
+      expect(rules.disallowPaths).toEqual([]);
+      expect(rules.allowPaths).toEqual([]);
+    });
+  });
+
+  describe('matchRobotsPattern', () => {
+    it('matches literal prefixes', () => {
+      expect(matchRobotsPattern('/admin/settings', '/admin')).toBe(true);
+      expect(matchRobotsPattern('/public', '/admin')).toBe(false);
+    });
+
+    it('treats * as a wildcard', () => {
+      expect(matchRobotsPattern('/private/report.pdf', '/private/*.pdf')).toBe(true);
+      expect(matchRobotsPattern('/private/deep/report.pdf', '/private/*.pdf')).toBe(true);
+      expect(matchRobotsPattern('/private/report.pdf?x=1', '/private/*.pdf')).toBe(true);
+      expect(matchRobotsPattern('/private/report.html', '/private/*.pdf')).toBe(false);
+    });
+
+    it('supports * in the middle and multiple wildcards', () => {
+      expect(matchRobotsPattern('/a/b/c/d', '/*/b/*/d')).toBe(true);
+    });
+
+    it('anchors with a trailing $', () => {
+      expect(matchRobotsPattern('/search?print=1', '/*?print=1$')).toBe(true);
+      expect(matchRobotsPattern('/search?print=1&x=2', '/*?print=1$')).toBe(false);
+      expect(matchRobotsPattern('/page/', '/page$')).toBe(false);
+    });
+
+    it('escapes regex metacharacters in literal segments', () => {
+      expect(matchRobotsPattern('/a.b', '/a.b')).toBe(true);
+      expect(matchRobotsPattern('/axb', '/a.b')).toBe(false);
+    });
   });
 
   describe('isAllowedByRobots', () => {
@@ -76,8 +138,76 @@ Disallow: /test
       expect(isAllowedByRobots('/admin/settings', ['/admin'])).toBe(false);
     });
 
+    it('blocks wildcard matches', () => {
+      expect(isAllowedByRobots('/private/report.pdf', ['/private/*.pdf'])).toBe(false);
+      expect(isAllowedByRobots('/search?print=1', ['/*?print=1$'])).toBe(false);
+    });
+
     it('allows all paths with empty disallow list', () => {
       expect(isAllowedByRobots('/anything', [])).toBe(true);
+    });
+
+    it('honours Allow rules that are longer than Disallow rules', () => {
+      expect(
+        isAllowedByRobots('/private/public/a.pdf', ['/private/*.pdf'], ['/private/public/'])
+      ).toBe(true);
+    });
+  });
+
+  describe('evaluateRobotsRules longest match', () => {
+    it('prefers the longest matching pattern', () => {
+      // Both match /private/public/page; the Allow rule is longer.
+      const decision = evaluateRobotsRules(
+        '/private/public/page',
+        ['/private/'],
+        ['/private/public/']
+      );
+      expect(decision.allowed).toBe(true);
+      expect(decision.ruleType).toBe('allow');
+      expect(decision.rule).toBe('/private/public/');
+    });
+
+    it('prefers a longer Disallow over a shorter Allow', () => {
+      const decision = evaluateRobotsRules(
+        '/private/secret/page',
+        ['/private/secret/'],
+        ['/private/']
+      );
+      expect(decision.allowed).toBe(false);
+      expect(decision.ruleType).toBe('disallow');
+      expect(decision.rule).toBe('/private/secret/');
+    });
+
+    it('lets Allow win on equal specificity', () => {
+      const decision = evaluateRobotsRules('/page', ['/page'], ['/page']);
+      expect(decision.allowed).toBe(true);
+      expect(decision.ruleType).toBe('allow');
+    });
+
+    it('reports the blocking rule and reason when disallowed', () => {
+      const decision = evaluateRobotsRules('/private/report.pdf', ['/private/*.pdf']);
+      expect(decision.allowed).toBe(false);
+      expect(decision.rule).toBe('/private/*.pdf');
+      expect(decision.reason).toContain('/private/*.pdf');
+    });
+
+    it('measures specificity without counting the $ anchor', () => {
+      // '/page$' is more specific than '/pag' but not than '/page/'.
+      const decision = evaluateRobotsRules('/page', ['/page$'], ['/pag']);
+      expect(decision.allowed).toBe(false);
+      expect(decision.rule).toBe('/page$');
+    });
+
+    it('ignores $ when comparing against an equal-length literal', () => {
+      // '/page$' and '/page' both describe 5 characters of path; Allow wins ties.
+      const decision = evaluateRobotsRules('/page', ['/page$'], ['/page']);
+      expect(decision.allowed).toBe(true);
+    });
+
+    it('allows when no rule matches', () => {
+      const decision = evaluateRobotsRules('/public', ['/admin/*'], []);
+      expect(decision.allowed).toBe(true);
+      expect(decision.rule).toBeUndefined();
     });
   });
 });
