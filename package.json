@@ -23,10 +23,12 @@
 		"start": "npm run start:dev",
 		"start:prod": "node dist/main.js",
 		"start:dev": "tsx src/main.ts",
-		"build": "tsc",
+		"build": "tsc -p tsconfig.build.json",
+		"typecheck": "tsc --noEmit",
 		"lint": "eslint ./src --ext .ts",
 		"lint:fix": "eslint ./src --ext .ts --fix",
-		"test": "echo \"Error: oops, the actor has no tests yet, sad!\" && exit 1"
+		"lint:test": "eslint ./test --ext .ts",
+		"test": "node --import tsx --import ./test/helpers/apify-mock-loader.mjs --test test/detail-parser.test.ts test/detailRoute.test.ts test/schema-check.test.ts"
 	},
 	"author": "It's not you it's me",
 	"license": "ISC"

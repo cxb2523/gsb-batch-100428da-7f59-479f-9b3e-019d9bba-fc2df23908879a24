@@ -21,6 +21,14 @@ export const GENERAL_PRODUCT_INFO_GRAPHQL_ID = '0af6e2f0eb9c44bc51253963e94093de
 export const COLOR_PRICE_CATEGORY_GRAPHQL_ID = '124c10eaaf10b885f86f1e3a582c1783fa69e259b2f9d6c8974d36e78500b7ed';
 export const PRICE_CURRENCY_GRAPHQL_ID = 'ae0b20f72e03398da471712776fd8db5059ce6389d3b2fa137012185cc6bbae9';
 
+// Human-readable names of the GraphQL blocks, used in logs when a block is missing or malformed
+
+export const PRODUCT_IMAGES_BLOCK_NAME = 'product images and basic info';
+export const PRODUCT_ATTRIBUTES_BLOCK_NAME = 'product attributes';
+export const GENERAL_PRODUCT_INFO_BLOCK_NAME = 'price, sizes and availability';
+export const COLOR_PRICE_CATEGORY_BLOCK_NAME = 'color, formatted price and category';
+export const PRICE_CURRENCY_BLOCK_NAME = 'price currency';
+
 // Content fallbacks, used only when a GraphQL ID above is not found
 
 export const PRODUCT_IMAGES_DATA_REGEX = /"gallery":\[\{"galleryThumbnails"/;
