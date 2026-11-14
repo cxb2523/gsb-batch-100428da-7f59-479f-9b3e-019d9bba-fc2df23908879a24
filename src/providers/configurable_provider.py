@@ -12,6 +12,13 @@ from src.database.db_manager import DatabaseManager
 from src.providers.base_product import BaseProduct
 from src.providers.field_mapper import FieldMapper
 from src.providers.jsonld_extractor import create_extractor
+from src.providers.offer_selection import (
+    DEFAULT_OFFER_STRATEGY,
+    OfferSelection,
+    StrategyDecision,
+    resolve_offer_strategy,
+    select_offer,
+)
 from src.providers.selector_extractor import SelectorExtractor
 from src.providers.transformations import Transformations
 from src.scrapers.async_base_provider import AsyncBaseProvider
@@ -234,31 +241,31 @@ class ConfigurableProvider(AsyncBaseProvider):
 
         offers_path = field_mappings.get("offers", "offers")
         offers = FieldMapper.get_value(json_ld, offers_path, default={})
-        strategy = json_ld_config.get("offer_selection_strategy", "first")
+        strategy = json_ld_config.get("offer_selection_strategy", DEFAULT_OFFER_STRATEGY)
+        selection: OfferSelection | None = None
+        decision: StrategyDecision | None = None
         if isinstance(offers, list) and offers:
-            # Lock strategy only after the first snapshot exists
-            locked_strategy = None
-            try:
-                db = DatabaseManager(get_db_url(), read_only=True)
-                tracked_page = db.get_tracked_page(url)
-                if tracked_page and db.get_snapshot_count(url) > 0:
-                    locked_strategy = tracked_page.get("offer_selection_strategy")
-                    config_strategy = json_ld_config.get("offer_selection_strategy", "first")
+            decision = self._resolve_locked_strategy(url, json_ld_config)
+            if decision.warning:
+                logger.warning(f"⚠ {decision.warning}")
+                logger.warning(
+                    f"  To change strategy: Delete product with "
+                    f"'price-scout track --delete --url {url[:60]}...' and re-track"
+                )
 
-                    if locked_strategy and locked_strategy != config_strategy:
-                        logger.warning(
-                            f"⚠ Using locked offer strategy '{locked_strategy}' for this product "
-                            f"(config has '{config_strategy}' but strategy locked from first snapshot)"
-                        )
-                        logger.warning(
-                            f"  To change strategy: Delete product with "
-                            f"'price-scout track --delete --url {url[:60]}...' and re-track"
-                        )
-            except Exception as e:
-                logger.debug(f"Could not check for locked offer strategy: {e}")
+            strategy = decision.strategy
+            selection = select_offer(offers, strategy)
+            if selection.fallback:
+                logger.warning(f"Offer selection for {url}: {selection.reason}")
+            else:
+                logger.debug(f"Offer selection for {url}: {selection.reason}")
 
-            strategy = locked_strategy or json_ld_config.get("offer_selection_strategy", "first")
-            offers = self._select_best_offer(offers, strategy)
+            if selection.offer is None:
+                # Nothing usable came back; keep extraction going without price.
+                logger.warning(f"No usable offer selected for {url}: {selection.reason}")
+                offers = {}
+            else:
+                offers = selection.offer
 
             # Update json_ld with selected offer so field extraction works correctly
             # This handles nested paths like "object.offers" by updating the parent dict
@@ -431,6 +438,17 @@ class ConfigurableProvider(AsyncBaseProvider):
                 "was_canonicalized": True,
             }
 
+        offer_selection_details: dict[str, Any] | None = None
+        if selection is not None:
+            offer_selection_details = selection.to_dict()
+            if decision is not None:
+                offer_selection_details["strategy_source"] = decision.source
+                offer_selection_details["config_strategy"] = decision.config_strategy
+                if decision.locked_strategy is not None:
+                    offer_selection_details["locked_strategy"] = decision.locked_strategy
+                if decision.warning:
+                    offer_selection_details["warning"] = decision.warning
+
         return BaseProduct(
             name=name,
             url=url,
@@ -459,6 +477,7 @@ class ConfigurableProvider(AsyncBaseProvider):
             images=images,
             provider=self.name,
             offer_selection_strategy=strategy,
+            offer_selection=offer_selection_details,
             extracted_at=now_in_configured_tz(),
             raw_data=json_ld,
         )
@@ -603,69 +622,39 @@ class ConfigurableProvider(AsyncBaseProvider):
     def _select_best_offer(offers: list[dict[str, Any]], strategy: str = "first") -> dict[str, Any]:
         """Select best offer from array based on strategy.
 
-        Examples:
-            >>> offers = [
-            ...     {"price": 509.99, "availability": "InStock"},
-            ...     {"price": 495.99, "availability": "OutOfStock"},
-            ...     {"price": 491.99, "availability": "InStock"},
-            ... ]
-            >>> _select_best_offer(offers, "cheapest")
-            {"price": 491.99, "availability": "InStock"}
-            >>> _select_best_offer(offers, "cheapest_available")
-            {"price": 491.99, "availability": "InStock"}
+        Thin backwards-compatible wrapper around
+        :func:`src.providers.offer_selection.select_offer`.
         """
-        if not offers:
-            return {}
+        return select_offer(offers, strategy).offer or {}
 
-        if strategy == "first":
-            return offers[0]
+    @staticmethod
+    def _get_locked_strategy(url: str) -> tuple[str | None, bool]:
+        """Read the locked strategy for ``url`` from the database.
 
-        elif strategy == "cheapest":
-            # Find cheapest offer with valid price
-            valid_offers = [o for o in offers if o.get("price") is not None]
-            if not valid_offers:
-                logger.debug("No offers with valid prices, falling back to first")
-                return offers[0]
+        Returns ``(locked_strategy, has_snapshots)``.  Database access errors
+        are treated as "no lock" so scraping keeps working without a database.
+        """
+        try:
+            db = DatabaseManager(get_db_url(), read_only=True)
+            tracked_page = db.get_tracked_page(url)
+            if not tracked_page:
+                return None, False
+            return tracked_page.get("offer_selection_strategy"), db.get_snapshot_count(url) > 0
+        except Exception as e:
+            logger.debug(f"Could not check for locked offer strategy: {e}")
+            return None, False
 
-            try:
-                cheapest = min(valid_offers, key=lambda o: float(o["price"]))
-                logger.debug(
-                    f"Selected cheapest offer: €{cheapest['price']} from {len(offers)} offers"
-                )
-                return cheapest
-            except (ValueError, TypeError, KeyError) as e:
-                logger.warning(f"Failed to select cheapest offer: {e}, using first")
-                return offers[0]
-
-        elif strategy == "cheapest_available":
-            # Find cheapest in-stock offer
-            in_stock_offers = [
-                o
-                for o in offers
-                if "InStock" in str(o.get("availability", "")) and o.get("price") is not None
-            ]
-
-            if in_stock_offers:
-                try:
-                    cheapest_available = min(in_stock_offers, key=lambda o: float(o["price"]))
-                    logger.debug(
-                        f"Selected cheapest available offer: €{cheapest_available['price']} "
-                        f"from {len(in_stock_offers)} in-stock offers"
-                    )
-                    return cheapest_available
-                except (ValueError, TypeError, KeyError) as e:
-                    logger.warning(f"Failed to select cheapest available offer: {e}, using first")
-                    return offers[0]
-
-            logger.debug("No in-stock offers found, falling back to cheapest overall")
-            # Fallback to cheapest regardless of availability
-            return ConfigurableProvider._select_best_offer(offers, "cheapest")
-
-        else:
-            logger.warning(
-                f"Unknown offer selection strategy '{strategy}', using 'first' as fallback"
-            )
-            return offers[0]
+    def _resolve_locked_strategy(
+        self, url: str, json_ld_config: dict[str, Any]
+    ) -> StrategyDecision:
+        """Resolve the strategy for a product, honouring locks from the first snapshot."""
+        config_strategy = json_ld_config.get("offer_selection_strategy", DEFAULT_OFFER_STRATEGY)
+        locked_strategy, has_snapshots = self._get_locked_strategy(url)
+        return resolve_offer_strategy(
+            config_strategy=config_strategy,
+            locked_strategy=locked_strategy,
+            has_snapshots=has_snapshots,
+        )
 
     @staticmethod
     def _apply_field_transformation(value: Any, transformation: Any) -> Any:

@@ -554,7 +554,25 @@ class AsyncBaseProvider(ABC):
             return None
 
     @staticmethod
-    def normalize_json_ld_product(data: dict) -> dict:
+    def normalize_json_ld_product(data: dict, strategy: str | None = None) -> dict:
+        """Normalize a JSON-LD Product into the flat product dict.
+
+        For multi-offer products the offer is chosen with
+        :func:`src.providers.offer_selection.select_offer` according to
+        ``strategy``; the selection (including a readable reason) is returned
+        under ``offer_selection`` so callers can verify what was picked.
+        """
+        # Imported lazily: src.providers.__init__ imports ConfigurableProvider,
+        # which imports this module, so a module-level import would be circular.
+        from src.providers.offer_selection import (
+            DEFAULT_OFFER_STRATEGY,
+            OfferSelection,
+            select_offer,
+        )
+
+        if strategy is None:
+            strategy = DEFAULT_OFFER_STRATEGY
+
         product = {
             "name": data.get("name", ""),
             "description": data.get("description", ""),
@@ -582,30 +600,63 @@ class AsyncBaseProvider(ABC):
             product["brand"] = ""
 
         offers = data.get("offers", {})
+        selection = None
+        selected_offer: dict[str, Any] | None = None
+
         if isinstance(offers, dict):
+            # Single offer object: no strategy decision is needed.
+            selected_offer = offers
             product["current_price"] = offers.get("lowPrice") or offers.get("price")
             product["original_price"] = offers.get("highPrice")
             product["currency"] = offers.get("priceCurrency", "")
-
-            if product.get("original_price") and product.get("current_price"):
-                if float(product["original_price"]) > float(product["current_price"]):
-                    product["has_promotion"] = True
-                    orig = float(product["original_price"])
-                    curr = float(product["current_price"])
-                    product["discount_percentage"] = ((orig - curr) / orig) * 100
-                else:
-                    product["has_promotion"] = False
-            else:
-                product["has_promotion"] = False
+            selection = OfferSelection(
+                offer=offers,
+                requested_strategy=strategy,
+                strategy=strategy,
+                reason="Single offer object (not a list); offer selection strategy not applied.",
+                selected_index=0,
+            )
 
         elif isinstance(offers, list) and offers:
-            first_offer = offers[0]
-            product["current_price"] = first_offer.get("lowPrice") or first_offer.get("price")
-            product["original_price"] = first_offer.get("highPrice")
-            product["currency"] = first_offer.get("priceCurrency", "")
-            product["has_promotion"] = False
+            selection = select_offer(offers, strategy)
+            selected_offer = selection.offer
+
+            if selected_offer is not None:
+                raw_price = selected_offer.get("lowPrice") or selected_offer.get("price")
+                product["current_price"] = raw_price if raw_price is not None else selection.price
+                product["original_price"] = selected_offer.get("highPrice")
+                product["currency"] = selected_offer.get("priceCurrency", "")
+            else:
+                product["current_price"] = None
+                product["original_price"] = None
+                product["currency"] = ""
+
+            if selection.fallback:
+                logger.warning(f"JSON-LD offer selection fallback: {selection.reason}")
+            else:
+                logger.debug(f"JSON-LD offer selection: {selection.reason}")
+
+        product["has_promotion"] = False
+        original_price = product.get("original_price")
+        current_price_value = product.get("current_price")
+        if original_price and current_price_value:
+            try:
+                orig = float(original_price)
+                curr = float(current_price_value)
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"Could not compare prices for promotion detection: "
+                    f"{original_price} / {current_price_value}"
+                )
+            else:
+                if orig > curr:
+                    product["has_promotion"] = True
+                    product["discount_percentage"] = ((orig - curr) / orig) * 100
 
         product["availability"] = bool(offers)
+        if selection is not None:
+            product["offer_selection_strategy"] = selection.strategy
+            product["offer_selection"] = selection.to_dict()
 
         logger.debug(f"Normalized JSON-LD product: {product.get('name', 'Unknown')}")
         return product

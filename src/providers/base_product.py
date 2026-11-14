@@ -71,6 +71,7 @@ class BaseProduct:
 
     provider: str | None = None  # Provider name (e.g., "store_a", "store_b")
     offer_selection_strategy: str | None = None  # Strategy used for multi-offer JSON-LD
+    offer_selection: dict[str, Any] | None = None  # Chosen offer details + reason
     extraction_method: str | None = None  # "json-ld" or "selectors"
     extracted_at: datetime | None = None  # When data was extracted
     raw_data: dict[str, Any] = field(default_factory=dict)  # Original raw data
@@ -125,6 +126,7 @@ class BaseProduct:
             "delivery_time": self.delivery_time,
             "provider": self.provider,
             "offer_selection_strategy": self.offer_selection_strategy,
+            "offer_selection": self.offer_selection,
             "extraction_method": self.extraction_method,
             "extracted_at": self.extracted_at.isoformat() if self.extracted_at else None,
         }
