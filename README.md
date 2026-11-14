@@ -183,7 +183,7 @@ Live DOM
 
 ```bash
 # Regression suite — no Chrome needed (hub, diff, snapshot, trusted-input,
-# guide-truth and doc-drift guards). Currently 170 tests.
+# guide-truth and doc-drift guards). Currently 191 tests.
 npm test
 
 # Print the LISTED surface from a running server (tools/list is filtered to it)
@@ -196,6 +196,37 @@ node test/mcp-client-test.js
 # Keep MODEL_PROMPT.md in sync with the in-tool guide (also enforced inside npm test)
 node tools/export-guide.mjs --check
 ```
+
+### Verifying incremental explore by hand
+
+`explore_page{incremental:true}` must report SEMANTIC change only — scrolling is
+not a page change. `test/harness/incremental-scan.html` is the fixture: 40 rows
+(far more than a viewport), plus Add/Remove-row and modal buttons.
+
+```bash
+# 1. Serve the fixture (any static server works; the repo's harness server is one)
+node test/harness/serve.cjs        # http://127.0.0.1:38499/incremental-scan.html
+
+# 2. Load the unpacked extension, open the fixture, then drive it:
+
+#    a. seed the baseline (the FIRST incremental call always returns a full map)
+#       explore_page {incremental:true}
+#    b. scroll down a few ticks, then call it again
+#       -> added / changed / removed must all be EMPTY and escalated:false
+#    c. click #btn-add-row,  call again -> one `added` entry for the new row's control
+#    d. click #btn-remove-row, call again -> one `removed` entry
+#    e. click #btn-open-modal, call again -> OK + Cancel are `added`;
+#       NOTHING from the page behind the dialog appears in `removed`
+#    f. click #modal-cancel,  call again -> OK + Cancel are `removed`
+
+# 3. Or run the same scripted sequence against a live server:
+python test/incremental-scan-test.py
+```
+
+The logic itself is also executable without a browser: the regression suite runs
+the REAL content-script scan functions against a fake DOM
+(`test/harness/cs-scan-harness.mjs` + `fake-dom.mjs`), so a scroll, a dialog
+toggle and a genuine DOM removal are each asserted as a behaviour, not a grep.
 
 ## File structure
 

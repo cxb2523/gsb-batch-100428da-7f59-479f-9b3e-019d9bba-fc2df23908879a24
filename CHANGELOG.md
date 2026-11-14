@@ -3,6 +3,13 @@
 All notable changes to WebSense MCP are documented here.
 Format based on [Keep a Changelog](https://keepachangelog.com/), versioning follows [SemVer](https://semver.org/).
 
+## [2.1.1] — 2026-11-15
+
+- **Incremental explore no longer reports scrolling as a page change.** `explore_page{incremental:true}` compared a baseline of only the elements inside the viewport (plus dialog controls) while its fingerprint deliberately excluded `inViewport`. The two rules contradicted each other: a scroll took the previous viewport window out of the scan (`removed`) and put the new one in (`added`), and the ratio crossed 0.6, forcing a full re-scan of a page nobody had changed. The baseline is now the PAGE: every interactive element is tracked wherever it is, and `inViewport` is recorded as context only. `collectScan` also stopped re-measuring layout twice per element (geometry is handed to `extractState`), and classification resolves style lazily.
+- **Added/removed now mean what they say.** A genuine DOM removal is still reported as `removed`; a dialog's controls appear as `added` when it opens and `removed` when it closes. Membership is rendering presence (`display:none`/`visibility:hidden`), so a modal library marking the page behind the dialog `aria-hidden` does not report the whole background as removed. Refs stay attached to their elements across a scroll.
+- `inViewport` is also excluded from the per-field change list (`IGNORED_CHANGE_FIELDS`), so a genuine change on an element that also crossed the fold no longer carries scroll noise alongside it.
+- **Tests:** three behavioural regressions (scroll, dialog open/close, real removal) execute the REAL content-script scan functions against a fake DOM (`test/harness/cs-scan-harness.mjs`), and a static pin keeps the viewport filter from returning. Verified to fail against the old implementation.
+
 ## [2.1.0] — 2026-10-02
 
 - **`preflight` (new, listed tool):** walks launch → server → extension → binding → page-ready, stops at the first broken link and returns the exact command that fixes it. Never guesses which tab you meant.

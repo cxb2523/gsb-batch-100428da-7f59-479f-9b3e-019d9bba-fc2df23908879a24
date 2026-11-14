@@ -31,13 +31,22 @@
     return true;
   }
 
+  // "Is this rect inside the viewport?" — takes an ALREADY-READ rect so a caller
+  // that measured layout once never forces a second read. Kept separate from
+  // isInViewport() because the incremental scan records this as INFORMATION only
+  // (see 50-candidates.js collectScan): viewport membership is not a change.
+  function rectInViewport(rect, vw, vh) {
+    if (!rect) return false;
+    return rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
+  }
+
   function isInViewport(el) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
     const rect = el.getBoundingClientRect();
     const vw = window.innerWidth || document.documentElement.clientWidth;
     const vh = window.innerHeight || document.documentElement.clientHeight;
     // Element is "in viewport" if any part intersects the viewport
-    const inView = rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
+    const inView = rectInViewport(rect, vw, vh);
     // Also treat zero-size interactive elements (inputs hidden by CSS but present) as in-viewport
     // so they aren't dropped from the graph when offscreen scan is off.
     return inView || (rect.width === 0 && rect.height === 0 && isVisible(el));
@@ -333,7 +342,11 @@
     return 'disabled';
   }
 
-  function extractState(el) {
+  // `pre` (2026-11-15) lets a caller that ALREADY measured visibility/geometry
+  // (the incremental scan does, once per element) hand those values in instead of
+  // paying two more getBoundingClientRect calls here. Optional — every existing
+  // caller keeps the self-measuring behaviour, so the shape is unchanged.
+  function extractState(el, pre) {
     const a = getAttrs(el);
     return {
       disabled: el.disabled||a['aria-disabled']==='true', disabledReason: detectDisabledReason(el),
@@ -341,7 +354,9 @@
       selected: a['aria-selected']==='true', pressed: a['aria-pressed']==='true',
       required: el.required||a.required!==undefined, readOnly: el.readOnly||a.readonly!==undefined,
       valid: el.validity?el.validity.valid:null, error: el.validationMessage||null,
-      value: el.value!==undefined?el.value:null, visible: isVisible(el), inViewport: isInViewport(el),
+      value: el.value!==undefined?el.value:null,
+      visible: (pre && pre.visible !== undefined) ? !!pre.visible : isVisible(el),
+      inViewport: (pre && pre.inViewport !== undefined) ? !!pre.inViewport : isInViewport(el),
     };
   }
 

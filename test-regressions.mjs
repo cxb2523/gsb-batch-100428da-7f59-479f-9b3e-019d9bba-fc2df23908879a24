@@ -471,6 +471,264 @@ test('incr: fieldChanges truncates long values to 40 chars', () => {
   assert.strictEqual(ch[0].to, 'y');
 });
 
+test('incr: inViewport is NEVER reported as a changed field (scroll is not a change)', () => {
+  // Two halves of one rule (2026-11-15): inViewport never enters the fingerprint,
+  // so it must not leak back in through the per-field change list either. A real
+  // state change on an element that ALSO crossed the fold must report exactly the
+  // real fields.
+  const prev = new Map([['k1', scanEntry('fp-old', { checked: false, inViewport: true }, 'E0', 'One')]]);
+  const curr = new Map([['k1', scanEntry('fp-new', { checked: true, inViewport: false }, 'E0', 'One')]]);
+  const d = diffScan(prev, curr);
+  assert.strictEqual(d.changed.length, 1);
+  assert.deepStrictEqual(d.changed[0].changes.map((c) => c.field), ['checked'],
+    'only the real change is named — inViewport must be suppressed from its own exclusion');
+  // And an element that ONLY crossed the fold, with an identical fp, is unchanged.
+  const prev2 = new Map([['k1', scanEntry('same', { value: 'x', inViewport: true }, 'E0', 'One')]]);
+  const curr2 = new Map([['k1', scanEntry('same', { value: 'x', inViewport: false }, 'E0', 'One')]]);
+  const d2 = diffScan(prev2, curr2);
+  assert.strictEqual(d2.changed.length, 0);
+  assert.strictEqual(d2.unchangedCount, 1);
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INCREMENTAL SCAN — BEHAVIOURAL (2026-11-15)
+// The three paths the incremental explore must get right, executed against the
+// REAL content-script scan functions under a fake DOM (test/harness). A source
+// grep cannot distinguish "a scroll reported 12 removed / 40 added" from a clean
+// delta; these run the scan twice over a changed page and diff the two scans
+// through the canonical diffScan().
+//
+// The rule under test: the baseline is the PAGE, not the current viewport window.
+// Scrolling must produce NO delta; a genuine DOM removal must still be reported;
+// a dialog opening/closing must report its controls as real additions/removals
+// WITHOUT the page behind it churning.
+// ═════════════════════════════════════════════════════════════════════════════
+import { makeEl, makeDoc, scrollBy } from './test/harness/fake-dom.mjs';
+import { makeScanHarness } from './test/harness/cs-scan-harness.mjs';
+import { extractFunction } from './test/harness/cs-scan-harness.mjs';
+
+function fakeWin() { return { innerWidth: 1000, innerHeight: 800, location: { href: 'http://test/' } }; }
+
+// Diff two harness scans the way the content script's inline differ does:
+// same key + same fp => unchanged, absent key => removed, new key => added.
+function diffHarnessScans(harness) {
+  const mk = (entries) => {
+    const m = new Map();
+    for (const e of entries) m.set(e.key, { fp: e.fp, fpo: e.fpo, ref: e.ref, label: e.label, action: { ref: e.ref, label: e.label, type: e.fpo.type, subtype: e.fpo.subtype } });
+    return m;
+  };
+  return mk(harness.scanEntries());
+}
+
+// A long page: `count` buttons stacked 100px apart; only ~8 fit the viewport.
+function longPage(count, extra) {
+  const els = [], kids = [];
+  for (let i = 0; i < count; i++) {
+    const b = makeEl('button', {
+      text: 'B' + i, attrs: { id: 'b' + i }, tabIndex: 0,
+      rect: { top: i * 100, bottom: i * 100 + 30, left: 10, right: 110, width: 100, height: 30 },
+    });
+    els.push(b); kids.push(b);
+  }
+  if (extra) for (const e of extra) { els.push(e); kids.push(e); }
+  return { els, doc: makeDoc(kids) };
+}
+
+test('scan: a SCROLL produces no added/removed/changed and never escalates', () => {
+  const { els, doc } = longPage(60);
+  const h = makeScanHarness(doc, fakeWin());
+  // A full SAG hands out refs; the scan must NOT reassign them later.
+  const early = h.assignRef(els[0]);
+  assert.strictEqual(early, 'E0');
+  const before = h.scanEntries();
+  // The scan must hold the WHOLE page, not the visible window — that is the fix.
+  assert.strictEqual(before.length, 60, 'the baseline must track every interactive element, not just the viewport');
+  assert(before.filter((e) => !e.fpo.inViewport).length > 40,
+    'most of this page is offscreen and must still be tracked');
+  const prev = new Map(before.map((e) => [e.key, e]));
+
+  // Scroll by more than a full viewport: everything currently visible leaves the
+  // viewport and everything that was below enters it.
+  scrollBy(els, 1400);
+  const after = h.scanEntries();
+  const curr = new Map(after.map((e) => [e.key, e]));
+  const d = diffScan(prev, curr);
+
+  assert.strictEqual(d.added.length, 0, 'elements scrolling INTO the viewport are not additions');
+  assert.strictEqual(d.removed.length, 0, 'elements scrolling OUT of the viewport are not removals');
+  assert.strictEqual(d.changed.length, 0, 'inViewport flipping is not a semantic change');
+  assert.strictEqual(d.unchangedCount, 60);
+  assert(d.changedRatio < 0.6, 'changedRatio must stay well under the escalation threshold (got ' + d.changedRatio + ')');
+  assert.strictEqual(d.escalate, false, 'a scroll must not trigger a full re-scan');
+
+  // Ref stability: a ref handed out BEFORE the scroll still names the same element.
+  const earlyEntry = before.find((e) => e.key === 'id:b0');
+  const lateEntry = after.find((e) => e.key === 'id:b0');
+  assert.strictEqual(earlyEntry.ref, 'E0', 'the fixture handed E0 to the first button before the scroll');
+  assert.strictEqual(earlyEntry.ref, lateEntry.ref, 'a ref issued before a scroll must keep pointing at the same element after it');
+  assert.strictEqual(h.assignRef(els[0]), 'E0', 'and re-assigning still returns the SAME ref (no drift after a scroll)');
+});
+
+test('scan: a GENUINE DOM removal is still reported as removed (not filtered as offscreen)', () => {
+  // The element must be OFFSCREEN, because that is the case the old viewport
+  // filter muddled: it was never in the scan to begin with, so a real removal
+  // could not be told apart from a scroll. Placing it below the fold proves the
+  // removal is reported for a control the baseline tracks page-wide.
+  const extra = makeEl('button', { text: 'Removable', attrs: { id: 'gone' }, tabIndex: 0, rect: { top: 3400, bottom: 3430, left: 200, right: 300, width: 100, height: 30 } });
+  const { doc } = longPage(30, [extra]);
+  const h = makeScanHarness(doc, fakeWin());
+  // A full SAG surfaced this control before the removal, so it already has a ref.
+  const goneRef = h.assignRef(extra);
+  const prev = new Map(h.scanEntries().map((e) => [e.key, e]));
+  assert(prev.has('id:gone'), 'the control to be removed must be in the baseline first');
+  assert.strictEqual(prev.get('id:gone').ref, goneRef, 'the baseline carried the ref from the earlier SAG');
+  assert.strictEqual(prev.get('id:gone').fpo.inViewport, false,
+    'fixture: the target is OFFSCREEN — the viewport must not decide its membership');
+
+  // Remove it from the DOM exactly as the page would (unlink + drop the child).
+  const idx = doc.body.children.indexOf(extra);
+  assert(idx >= 0, 'fixture: the button is an attached child');
+  doc.body.children.splice(idx, 1);
+  const curr = new Map(h.scanEntries().map((e) => [e.key, e]));
+
+  const d = diffScan(prev, curr);
+  assert.strictEqual(d.removed.length, 1, 'a control actually removed from the DOM must appear in removed');
+  assert.strictEqual(d.removed[0].key, 'id:gone');
+  assert.strictEqual(d.removed[0].ref, goneRef, 'the removed entry carries the ref the caller last saw');
+});
+
+test('scan: the incremental baseline is page-wide — the viewport filter must never come back', () => {
+  // The bug (2026-11-15): collectScan() held only the elements inside the
+  // viewport (plus dialog controls), while the fingerprint deliberately excluded
+  // inViewport. Two rules that contradicted each other, so a scroll reported the
+  // previous viewport window as `removed` and the new one as `added` — and the
+  // ratio crossed 0.6, forcing a full re-scan of a page nobody had changed.
+  // The behavioural tests above prove the outcome; this pin proves the CAUSE
+  // cannot be reintroduced by an edit that leaves the behaviour tests passing by
+  // accident (e.g. by widening the viewport instead of removing the filter).
+  // Read the artifact here rather than using CS_SRC: this block runs before the
+  // module-level CS_SRC binding is initialized.
+  const ART = readFileSync(new URL('./extension/websense-cs.js', import.meta.url), 'utf8');
+  const CODE = ART.replace(/\/\/[^\n]*/g, '');   // comments quote the old line
+  // Scope the "no viewport gate" assertion to collectScan's own body: the FULL
+  // extraction path is legitimately viewport-bounded (that is its cost model),
+  // and it is not what the incremental baseline uses.
+  const SCAN_BODY = extractFunction(ART, 'collectScan');
+  assert(!/!\s*isInViewport\(/.test(SCAN_BODY),
+    'collectScan must not gate membership on the viewport — scroll is not a change');
+  assert(SCAN_BODY.includes('_scanPresent(el, rect)'),
+    'membership must run through _scanPresent (presence, not viewport, not actionability)');
+  assert(CODE.includes('aria-hidden') && CODE.includes('checkVisibility'),
+    'presence must be rendering presence, and must NOT treat modal aria-hidden as absence');
+  // inViewport stays as CONTEXT: it is still measured and recorded, just never
+  // allowed to decide membership or change.
+  assert(/inViewport: rectInViewport\(rect, vw, vh\)/.test(CODE),
+    'the scan still records inViewport per element (context, not membership)');
+  assert(/extractState\(el, \{/.test(CODE),
+    'the scan must hand its geometry to extractState instead of re-measuring layout');
+  // And the change list must suppress it, the same as the fingerprint does.
+  assert(/IGNORED_CHANGE_FIELDS/.test(CODE) && /inViewport: true/.test(CODE),
+    'wsFieldChanges must ignore inViewport — otherwise a real change reports scroll noise too');
+});
+
+test('scan: a control becoming DISABLED is a changed entry, never a removal', () => {
+  // `_isCandidateNode` asks the platform whether an element is focusable, and a
+  // disabled button is not — so a naive population would drop it, and the diff
+  // would report "the button was removed from the DOM". Being disabled is a
+  // STATE change; the element is still there. Same class of mistake as the
+  // viewport filter, one attribute over.
+  const btn = makeEl('button', { text: 'Save', attrs: { id: 'save' }, tabIndex: 0, rect: { top: 10, bottom: 40, left: 10, right: 90, width: 80, height: 30 } });
+  const { doc } = longPage(0, [btn]);
+  const h = makeScanHarness(doc, fakeWin());
+  const prev = new Map(h.scanEntries().map((e) => [e.key, e]));
+  assert(prev.has('id:save'), 'the enabled control is tracked');
+  assert.strictEqual(prev.get('id:save').fpo.disabled, false);
+
+  // Disable it exactly as a page would: the property flips, focusability goes.
+  btn.disabled = true;
+  btn.tabIndex = -1;
+  const curr = new Map(h.scanEntries().map((e) => [e.key, e]));
+
+  const d = diffScan(prev, curr);
+  assert.strictEqual(d.removed.length, 0, 'a disabled control is NOT removed from the page');
+  assert.strictEqual(d.added.length, 0);
+  assert.strictEqual(d.changed.length, 1, 'it is reported as changed (its state moved)');
+  assert(d.changed[0].changes.some((c) => c.field === 'disabled'),
+    'and the changed field names disabled: ' + JSON.stringify(d.changed[0].changes));
+});
+
+test('scan: a DIALOG opening reports its controls as added; the page behind it does NOT churn', () => {
+  // A realistic modal: the controls exist in the DOM inside a role=dialog container
+  // that is display:none until opened. The library also marks the background
+  // aria-hidden while the dialog is up — which must NOT read as "the page is gone".
+  const dialog = makeEl('div', { attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Confirm' }, rect: { top: 200, bottom: 500, left: 100, right: 800, width: 700, height: 300 } });
+  dialog._setStyle({ display: 'none' });
+  const ok = makeEl('button', { text: 'OK', attrs: { id: 'dlg-ok' }, tabIndex: 0, rect: { top: 400, bottom: 430, left: 500, right: 560, width: 60, height: 30 } });
+  const cancel = makeEl('button', { text: 'Cancel', attrs: { id: 'dlg-cancel' }, tabIndex: 0, rect: { top: 400, bottom: 430, left: 600, right: 680, width: 80, height: 30 } });
+  dialog.appendChild(ok); dialog.appendChild(cancel);
+
+  const page = [];
+  for (let i = 0; i < 25; i++) {
+    page.push(makeEl('button', { text: 'P' + i, attrs: { id: 'p' + i }, tabIndex: 0, rect: { top: i * 60, bottom: i * 60 + 30, left: 10, right: 110, width: 100, height: 30 } }));
+  }
+  const { doc } = longPage(0, page.concat([dialog]));
+  const h = makeScanHarness(doc, fakeWin());
+
+  const baseline = new Map(h.scanEntries().map((e) => [e.key, e]));
+  assert(baseline.size >= 25, 'the background controls are tracked while the dialog is closed');
+  assert(!baseline.has('id:dlg-ok') && !baseline.has('id:dlg-cancel'),
+    'a display:none dialog is genuinely absent — its controls are not tracked yet');
+
+  // OPEN: show the dialog, and mark the background aria-hidden as modal libraries do.
+  dialog._setStyle({ display: 'block' });
+  for (const el of page) el._setAttr('aria-hidden', 'true');
+
+  const opened = new Map(h.scanEntries().map((e) => [e.key, e]));
+  const dOpen = diffScan(baseline, opened);
+  // The two controls must be in `added`. The dialog CONTAINER also counts: it
+  // carries role/aria-*, so it has always been a candidate element, and it
+  // genuinely became rendered. That is a real addition, not churn.
+  const addedKeys = dOpen.added.map((a) => a.label);
+  assert(addedKeys.includes('OK'), 'the OK control must be reported as added');
+  assert(addedKeys.includes('Cancel'), 'the Cancel control must be reported as added');
+  assert.strictEqual(dOpen.added.length, 3,
+    'exactly the dialog container + its two controls are added, got ' + dOpen.added.length);
+  assert(opened.has('id:dlg-ok') && opened.has('id:dlg-cancel'), 'and they are in the scan');
+  assert(dOpen.removed.length === 0,
+    'the page behind the dialog must NOT be reported as removed just because it went aria-hidden');
+  assert(dOpen.changed.length === 0, 'background controls are unchanged, not churned');
+  assert(dOpen.added.every((a) => ['OK', 'Cancel', 'Confirm'].includes(a.label)),
+    'every added entry names a real dialog element — nothing from the background');
+
+  // CLOSE: hide the dialog again and clear the background's aria-hidden.
+  dialog._setStyle({ display: 'none' });
+  for (const el of page) el.removeAttribute('aria-hidden');
+  const closed = new Map(h.scanEntries().map((e) => [e.key, e]));
+  const dClose = diffScan(opened, closed);
+  const removedKeys = dClose.removed.map((r) => r.key).sort();
+  assert(removedKeys.includes('id:dlg-ok') && removedKeys.includes('id:dlg-cancel'),
+    'closing the dialog must report its controls as removed, got ' + JSON.stringify(removedKeys));
+  assert.deepStrictEqual(removedKeys, ['aria:Confirm', 'id:dlg-cancel', 'id:dlg-ok'],
+    'exactly the dialog container + its two controls are removed');
+  assert.strictEqual(dClose.added.length, 0, 'un-hiding the background is not an addition');
+  assert.strictEqual(dClose.changed.length, 0);
+  assert(dClose.changedRatio < 0.6 && !dClose.escalate, 'a dialog toggle must not escalate to a full scan');
+
+  // ★ THE OTHER MODAL IDIOM (2026-11-15): `[hidden]` rather than display:none — what
+  // test/harness/incremental-scan.html uses, and what many libraries emit. Both must
+  // read as absence while hidden and as presence when shown.
+  const h2 = makeEl('div', { attrs: { role: 'dialog', 'aria-modal': 'true', 'aria-label': 'H2' }, hidden: true });
+  const h2btn = makeEl('button', { text: 'Continue', attrs: { id: 'h2-go' }, tabIndex: 0 });
+  h2.appendChild(h2btn);
+  const doc2 = makeDoc([h2]);
+  const hh = makeScanHarness(doc2, fakeWin());
+  assert(!new Map(hh.scanEntries().map((e) => [e.key, e])).has('id:h2-go'),
+    '[hidden] means the dialog is absent — its controls are not tracked');
+  h2.hidden = false;
+  assert(new Map(hh.scanEntries().map((e) => [e.key, e])).has('id:h2-go'),
+    'clearing [hidden] makes its controls present again');
+});
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 2026-09-11 — transport-friction fixes (see the "why it feels unreliable"
 // diagnosis: the CS bridge attempted a socket that https mixed-content forbids,

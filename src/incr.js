@@ -17,6 +17,20 @@
  *          and including it made every scroll report as a page change
  *          (2026-09-21). Same key +
  *          same fp = unchanged. Password values never enter the fp.
+ *
+ * MEMBERSHIP (2026-11-15): the same rule applies to which elements the scan
+ * holds at all. If inViewport is not identity, it cannot decide membership
+ * either — otherwise an element scrolling out of the viewport leaves the
+ * baseline and is reported as `removed`, while the one scrolling in is
+ * reported as `added`. The baseline is therefore the PAGE, not the current
+ * viewport window: every PRESENT interactive element is tracked regardless of
+ * position. Presence is RENDERING presence — display:none / visibility:hidden /
+ * [hidden] / zero-size — and deliberately NOT aria-hidden or inert, because a
+ * modal library marks the page behind a dialog aria-hidden and that page has not
+ * gone anywhere. Consequence: scrolling produces no delta at all, an element
+ * genuinely removed from the DOM is still reported as `removed`, and a dialog's
+ * controls appear as `added` when it opens and `removed` when it closes without
+ * the background churning.
  */
 
 /**
@@ -25,6 +39,12 @@
  * @param {Map|null} prev  key -> { fp, ref, label } from the last scan
  *                         (null = no baseline; caller should do a full scan)
  * @param {Map} curr       key -> { fp, ref, label, action }
+ *                         `action` is the caller's pre-built delta payload. The
+ *                         content script now builds actions lazily (only for
+ *                         entries the diff reports, so a page-wide scan does not
+ *                         pay locator construction per control), which is why
+ *                         both arrays fall back to a minimal {key, label} when
+ *                         `action` is absent — the DIFF is the same either way.
  * @param {object} [opts]
  * @param {number} [opts.escalateRatio=0.6]  changed fraction above which the
  *        caller should fall back to a full explore
@@ -94,17 +114,27 @@ export function diffScan(prev, curr, opts) {
  * Per-field change list between two fingerprint objects (plain objects of
  * scalar fields). Values are truncated to keep the delta payload small.
  *
+ * Fields listed in IGNORED_CHANGE_FIELDS are recorded for context but never
+ * reported as a change: `inViewport` is scroll/relayout state, not page
+ * semantics (2026-11-15). It is the same reason it is excluded from the
+ * fingerprint — a genuine change on an element that also crossed the fold must
+ * not come back carrying `inViewport` as one of its "fields changed", or the
+ * scroll noise returns through the side door.
+ *
  * @param {object|null} prevFpo
  * @param {object|null} currFpo
  * @param {number} [maxLen=40]
  * @returns {Array<{field: string, from: string, to: string}>}
  */
+export const IGNORED_CHANGE_FIELDS = Object.freeze({ inViewport: true });
+
 export function fieldChanges(prevFpo, currFpo, maxLen) {
   const ml = maxLen || 40;
   const out = [];
   if (!prevFpo || !currFpo) return out;
   const keys = new Set([...Object.keys(prevFpo), ...Object.keys(currFpo)]);
   for (const k of keys) {
+    if (IGNORED_CHANGE_FIELDS[k]) continue;
     const a = prevFpo[k];
     const b = currFpo[k];
     if (a !== b) {

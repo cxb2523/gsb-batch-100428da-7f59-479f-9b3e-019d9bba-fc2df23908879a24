@@ -939,13 +939,22 @@ function handleReadClipboard() {
     return true;
   }
 
+  // "Is this rect inside the viewport?" — takes an ALREADY-READ rect so a caller
+  // that measured layout once never forces a second read. Kept separate from
+  // isInViewport() because the incremental scan records this as INFORMATION only
+  // (see 50-candidates.js collectScan): viewport membership is not a change.
+  function rectInViewport(rect, vw, vh) {
+    if (!rect) return false;
+    return rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
+  }
+
   function isInViewport(el) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
     const rect = el.getBoundingClientRect();
     const vw = window.innerWidth || document.documentElement.clientWidth;
     const vh = window.innerHeight || document.documentElement.clientHeight;
     // Element is "in viewport" if any part intersects the viewport
-    const inView = rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
+    const inView = rectInViewport(rect, vw, vh);
     // Also treat zero-size interactive elements (inputs hidden by CSS but present) as in-viewport
     // so they aren't dropped from the graph when offscreen scan is off.
     return inView || (rect.width === 0 && rect.height === 0 && isVisible(el));
@@ -1241,7 +1250,11 @@ function handleReadClipboard() {
     return 'disabled';
   }
 
-  function extractState(el) {
+  // `pre` (2026-11-15) lets a caller that ALREADY measured visibility/geometry
+  // (the incremental scan does, once per element) hand those values in instead of
+  // paying two more getBoundingClientRect calls here. Optional — every existing
+  // caller keeps the self-measuring behaviour, so the shape is unchanged.
+  function extractState(el, pre) {
     const a = getAttrs(el);
     return {
       disabled: el.disabled||a['aria-disabled']==='true', disabledReason: detectDisabledReason(el),
@@ -1249,7 +1262,9 @@ function handleReadClipboard() {
       selected: a['aria-selected']==='true', pressed: a['aria-pressed']==='true',
       required: el.required||a.required!==undefined, readOnly: el.readOnly||a.readonly!==undefined,
       valid: el.validity?el.validity.valid:null, error: el.validationMessage||null,
-      value: el.value!==undefined?el.value:null, visible: isVisible(el), inViewport: isInViewport(el),
+      value: el.value!==undefined?el.value:null,
+      visible: (pre && pre.visible !== undefined) ? !!pre.visible : isVisible(el),
+      inViewport: (pre && pre.inViewport !== undefined) ? !!pre.inViewport : isInViewport(el),
     };
   }
 
@@ -1994,7 +2009,7 @@ function handleReadClipboard() {
     }
   }
 
-  function _collectCursorCandidates(out, seen) {
+  function _collectCursorSelectorTexts() {
     const sels = [];
     try {
       for (let s = 0; s < document.styleSheets.length; s++) {
@@ -2003,6 +2018,11 @@ function handleReadClipboard() {
         _cursorSelectorText(rules, sels, 0);
       }
     } catch (_) {}
+    return sels;
+  }
+
+  function _collectCursorCandidates(out, seen) {
+    const sels = _collectCursorSelectorTexts();
     let hits = 0;
     for (let i = 0; i < sels.length; i++) {
       let found = null;
@@ -2092,6 +2112,36 @@ function handleReadClipboard() {
       nodes: out, totalElements: totalElements, selectorHits: selectorHits,
       cursorSelectorsRead: cursor.selectorsRead, cursorAdded: cursor.added,
     };
+  }
+
+  // ★ PRESENCE, NOT ACTIONABILITY (2026-11-15). The incremental scan's baseline has
+  // to answer "is this element still on the page?", and it must answer the same way
+  // before and after a dialog opens. A modal library marks the page BEHIND the dialog
+  // aria-hidden (and sometimes inert) while the dialog is up; if presence treated those
+  // as absence, opening one dialog would report every control behind it as `removed`
+  // and closing it would report them all as `added` — the same wholesale-churn failure
+  // this scan was fixed to stop, only in the other direction.
+  // So presence here is RENDERING presence: display:none / visibility:hidden /
+  // zero-size anywhere up the tree (checkVisibility is ancestor-aware). aria-hidden,
+  // inert and opacity are deliberately NOT absence — they are accessibility/modal
+  // state, and the element is still in the document.
+  function _scanPresent(el, rect) {
+    try {
+      if (typeof el.checkVisibility === 'function') {
+        if (!el.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true })) return false;
+      } else {
+        const s = cachedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden') return false;
+      }
+    } catch (_) {
+      try {
+        const s2 = cachedStyle(el);
+        if (s2.display === 'none' || s2.visibility === 'hidden') return false;
+      } catch (_) {}
+    }
+    const r = rect || el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) return false;
+    return true;
   }
 
   // Visibility using one native checkVisibility() call when available (Chrome
@@ -2401,12 +2451,16 @@ function handleReadClipboard() {
     return s;
   }
   function _cachedClassify(el) {
-    // Re-use cached style instead of calling getComputedStyle again
     const tag = el.tagName.toLowerCase();
     const attrs = getAttrs(el);
     const role = attrs.role || '';
     const type = attrs.type || '';
-    const style = cachedStyle(el);
+    // Style is resolved LAZILY — only the cursor fallback at the bottom needs it.
+    // It used to be read eagerly for every element, which was invisible while the
+    // scan looked at the viewport only; now that the incremental scan covers the
+    // whole page, a getComputedStyle per element would be the dominant cost.
+    let styleLazy = null;
+    const style = () => (styleLazy || (styleLazy = cachedStyle(el)));
 
     if (tag === 'a' && attrs.href) return { type: 'navigation', subtype: 'link', href: attrs.href, target: attrs.target || '_self' };
     if (tag === 'a') return { type: 'action', subtype: 'anchor_button' };
@@ -2438,7 +2492,7 @@ function handleReadClipboard() {
       return { type: 'action', subtype: 'button' };
     }
     if (role) return { type: 'action', subtype: role };   // page's own word — no table
-    if (style.cursor === 'pointer') return { type: 'action', subtype: 'clickable' };
+    if (style().cursor === 'pointer') return { type: 'action', subtype: 'clickable' };
     return { type: 'unknown', subtype: tag };
   }
 
@@ -2516,6 +2570,11 @@ function handleReadClipboard() {
   // Semantics are CANONICAL in src/incr.js (diffScan/fieldChanges/
   // identityKey/disambiguate) and unit-pinned in test-regressions.mjs. The
   // inline mirrors below must stay in lockstep with src/incr.js.
+  //
+  // ★ THE BASELINE IS THE PAGE, NOT THE VIEWPORT (2026-11-15). Same rule as
+  // the fingerprint's: if inViewport is not identity, it cannot decide membership
+  // either. Offscreen elements are as much part of this page as onscreen ones,
+  // and a scroll that takes one across the fold is not a change to anything.
   let SCAN_CACHE = new Map();
 
   // MIRROR of incr.js identityKey — priority: testid > id > name > aria > ph > pos.
@@ -2529,6 +2588,14 @@ function handleReadClipboard() {
   }
 
   // MIRROR of incr.js fieldChanges — per-field diff, values truncated.
+  // ★ INFORMATIONAL FIELDS ARE NOT CHANGES (2026-11-15). `inViewport` is recorded
+  // in fpo for context, but it is scroll/relayout state, not page semantics — the
+  // same reason it never entered the fingerprint. Reporting it here put the scroll
+  // noise straight back into the very delta the fingerprint excludes it from: an
+  // element that genuinely changed (e.g. checked) while also crossing the fold
+  // listed `inViewport` as one of its "fields changed". Keep the list in lockstep
+  // with src/incr.js IGNORED_CHANGE_FIELDS.
+  var IGNORED_CHANGE_FIELDS = { inViewport: true };
   function wsFieldChanges(prevFpo, currFpo, maxLen) {
     var ml = maxLen || 40;
     var out = [];
@@ -2536,6 +2603,7 @@ function handleReadClipboard() {
     var keys = Object.keys(Object.assign({}, prevFpo, currFpo));
     for (var i = 0; i < keys.length; i++) {
       var k = keys[i];
+      if (IGNORED_CHANGE_FIELDS[k]) continue;
       if (prevFpo[k] !== currFpo[k]) {
         out.push({
           field: k,
@@ -2566,6 +2634,13 @@ function handleReadClipboard() {
         // crossing the fold, so a scroll was reported as a page change (measured:
         // changedRatio 1.038 — 12 added / 40 removed — read as "the page changed").
         // state.inViewport is still recorded in fpo below for informational use.
+        //
+        // `visible` is in the fingerprint but is CONSTANT for scan entries since
+        // 2026-11-15: collectScan only admits elements that are PRESENT (rendered),
+        // so every tracked element is visible by construction. It is kept for
+        // shape-parity with the full SAG's action object, and it cannot churn on a
+        // modal toggle because a modal library's aria-hidden is not visibility here
+        // (see _scanPresent) — that would otherwise re-create the dialog churn.
         String(state.visible), String(state.required), String(state.readOnly),
       ].join('|'),
       fpo: {
@@ -2579,22 +2654,115 @@ function handleReadClipboard() {
     };
   }
 
+  // ── The population the incremental scan tracks ───────────────────────────
+  // ★ STATE MUST NOT DECIDE MEMBERSHIP (2026-11-15). `_isCandidateNode` is the
+  // right test for "is this a control", but a control that becomes disabled can
+  // lose focusability (tabIndex -1), so it can drop out of that test — and if the
+  // baseline treated that as absence, disabling a button would be reported as the
+  // button being REMOVED from the DOM. Being disabled is a STATE change (it is in
+  // the fingerprint), not a disappearance. `:disabled` is the PLATFORM's own
+  // answer to "this control is currently switched off" (no tag vocabulary here),
+  // so a switched-off control stays tracked and re-enabling it reports as
+  // `changed`. This is also why the scan does not reuse isInteractive(): that
+  // predicate deliberately excludes disabled/inert, which is correct for
+  // "what can I act on" and wrong for "what is on the page".
+  function _isScanCandidate(el) {
+    if (_isCandidateNode(el)) return true;
+    try { if (el.matches && el.matches(':disabled')) return true; } catch (_) {}
+    return false;
+  }
+
+  // The DOM walk is shared with getAllElements (so same-origin iframes and shadow
+  // roots are included, exactly as before), and the per-element test is cheap —
+  // platform property reads with NO style or geometry. The page's own cursor
+  // selectors are unioned in, so a control advertised only in CSS is still
+  // tracked, just as the full path does. Only candidates then pay for a rect and
+  // a style read below.
+  function collectScanCandidates() {
+    const out = [];
+    const seen = new Set();
+    let all = [];
+    try { all = getAllElements(document.body); } catch (_) { all = []; }
+    for (let i = 0; i < all.length; i++) {
+      const el = all[i];
+      if (!_isScanCandidate(el)) continue;
+      if (seen.has(el)) continue;
+      seen.add(el);
+      out.push(el);
+    }
+    const sels = _collectCursorSelectorTexts();
+    for (let i = 0; i < sels.length; i++) {
+      let found = null;
+      try { found = document.querySelectorAll(sels[i]); } catch (_) { continue; }
+      for (let j = 0; j < found.length; j++) {
+        if (seen.has(found[j])) continue;
+        seen.add(found[j]);
+        out.push(found[j]);
+      }
+    }
+    return out;
+  }
+
   // Cheap pass: walk elements, extract identity + fingerprint + a lean action
   // object. NO settle wait, NO extractHeadings/extractBodyText, NO chunked
-  // yields. Dialog elements are scanned even when offscreen-viewport (the
-  // modal is usually what changed).
+  // yields. This is the incremental scan's ONLY population source.
+  //
+  // ★ VIEWPORT MEMBERSHIP IS INFORMATION, NOT MEMBERSHIP (2026-11-15).
+  // This used to SKIP every element outside the viewport unless it sat in a
+  // dialog:
+  //     if (!isInViewport(el) && !el.closest('[role="dialog"],[aria-modal="true"]')) continue;
+  // while the fingerprint deliberately excludes inViewport — two rules that
+  // contradicted each other. The scan therefore held only the CURRENT viewport
+  // window of the page, so a scroll dropped the whole previous window out of the
+  // baseline: those elements were reported `removed`, and the newly-visible ones
+  // `added`, with the ratio pushed past the 0.6 escalation threshold. A pure
+  // scroll was reported as a page rewrite and often forced a full re-scan.
+  //
+  // The scan now visits EVERY interactive element the page has, wherever it is,
+  // and records `inViewport` on the entry purely for context. Scrolling changes
+  // nothing about what is in the baseline, so it cannot manufacture a delta.
+  // What DOES leave the delta are elements genuinely absent from the page.
+  //
+  // Dialogs need no special case any more: they are never excluded to begin with.
+  // (The old exemption existed only to rescue dialog controls from the viewport
+  // filter — there is no filter left to rescue them from.) An open dialog's own
+  // controls therefore appear as `added` and a closed dialog's as `removed`,
+  // which is the real change a caller wants to see.
   function collectScan() {
-    const allElements = getAllElements(document.body);
+    // ★ STYLES ARE RE-READ FOR THIS SCAN (2026-11-15). The style cache is otherwise
+    // only cleared by a full extraction, so a dialog that was display:none when a
+    // previous explore cached its controls' style would keep reporting them
+    // invisible after the page SHOWED them — and its controls would never appear as
+    // `added`. One WeakMap allocation per scan keeps visibility honest, and it is
+    // what makes the open/close path report the real change in both directions.
+    _styleCacheClear();
+    const allElements = collectScanCandidates();
     const pairs = [];
+    const vw = window.innerWidth || document.documentElement.clientWidth;
+    const vh = window.innerHeight || document.documentElement.clientHeight;
     for (const el of allElements) {
-      if (!isInteractive(el)) continue;
-      if (!isInViewport(el) && !el.closest('[role="dialog"],[aria-modal="true"]')) continue;
+      let rect = null;
+      try { rect = el.getBoundingClientRect(); } catch (_) { rect = null; }
+      // Membership is PRESENCE (on the page and rendered), not actionability and
+      // not viewport position — see _scanPresent. An element scrolled offscreen
+      // is still on the page and stays in the baseline; an element inside a
+      // display:none/[hidden] dialog really is absent and belongs in
+      // `removed`/`added`. The population itself (collectScanCandidates) already
+      // answers "is this a control", including controls the platform currently
+      // reports as disabled — disabled is STATE (it lives in the fingerprint, and
+      // extractState reports disabledReason), so a control becoming disabled is a
+      // `changed` entry, never a removal.
+      if (!_scanPresent(el, rect)) continue;
       const attrs = getAttrs(el);
       const t = el.tagName.toLowerCase();
       attrs.__tag = t;
       const classification = _cachedClassify(el);
       const label = getLabel(el);
-      const state = extractState(el);
+      // Geometry measured once, handed to the state extractor — see extractState.
+      const state = extractState(el, {
+        visible: true,
+        inViewport: rectInViewport(rect, vw, vh),
+      });
       const fp = scanFingerprintOf(attrs, classification, label, state);
       const key = wsIdentityKey({
         tag: t,
@@ -2622,46 +2790,62 @@ function handleReadClipboard() {
 
   // STABLE REFS: incremental explores do NOT reset refCounter/refMap, so refs
   // from previous explores stay valid. Only NEW elements get fresh refs.
-  // NOTE: locator/intent are NOT built here — that's the expensive part, and
-  // they're only needed for the DELTA (added/changed). Enriched post-diff.
+  // (2026-11-15) This matters MORE now that the scan is viewport-independent:
+  // an element that scrolls out of the viewport is still in the scan, so
+  // elementSignatures still returns its original ref on the next scan — a ref
+  // handed out before a scroll keeps pointing at the same element after it.
+  //
+  // ★ REFS ARE ASSIGNED LAZILY (2026-11-15). The scan covers the WHOLE page now,
+  // and assignRef() builds a locator (an ancestor climb + sibling scan) for every
+  // element it touches — the expensive part. Only elements that actually appear
+  // in the delta need a ref, so this stage only READS the signature cache:
+  //   - an element surfaced earlier keeps its ref (stability is the point),
+  //   - an element never surfaced yet gets `ref: null` and a ref on demand when
+  //     the diff reports it (see enrichDeltaEntries).
+  // NOTE: locator/intent are NOT built here either — they're only needed for the
+  // DELTA (added/changed), and are enriched post-diff.
   function collectScanWithRefs() {
     const scan = collectScan();
     for (const entry of scan.values()) {
       const existing = elementSignatures.get(entry.el);
-      entry.ref = existing ? existing.ref : assignRef(entry.el);
-      // Lean action object — enriched with locator/intent for delta entries only.
-      entry.action = {
-        ref: entry.ref,
-        type: entry.fpo.type,
-        subtype: entry.fpo.subtype,
-        label: entry.label,
-        value: entry.fpo.value === '' ? null : entry.fpo.value,
-        checked: entry.fpo.checked,
-        disabled: entry.fpo.disabled,
-        expanded: entry.fpo.expanded,
-        selected: entry.fpo.selected,
-      };
-      if (entry.fpo.href) entry.action.href = entry.fpo.href;
+      entry.ref = existing ? existing.ref : null;
     }
     return scan;
   }
 
-  // Post-diff enrichment: build locator + intent ONLY for delta entries (the
-  // agent needs to act on those; unchanged elements already have locators
-  // from previous full SAGs).
-  function enrichDeltaActions(delta) {
-    const need = [].concat(delta.added, delta.changed.map(function (c) { return c.action; }));
-    for (const action of need) {
-      if (!action || !action.ref) continue;
-      const el = resolveRef(action.ref);
-      if (!el) continue;
-      const cls = _cachedClassify(el);
-      const loc = buildLocator(el);
+  // The lean action object for a scan entry — built ONLY for delta entries.
+  function scanActionOf(entry, ref) {
+    const action = {
+      ref: ref,
+      type: entry.fpo.type,
+      subtype: entry.fpo.subtype,
+      label: entry.label,
+      value: entry.fpo.value === '' ? null : entry.fpo.value,
+      checked: entry.fpo.checked,
+      disabled: entry.fpo.disabled,
+      expanded: entry.fpo.expanded,
+      selected: entry.fpo.selected,
+    };
+    if (entry.fpo.href) action.href = entry.fpo.href;
+    return action;
+  }
+
+  // Post-diff enrichment: ref + locator + intent ONLY for delta entries (the
+  // agent needs to act on those; unchanged elements already have locators from
+  // previous full SAGs). This is where a never-surfaced element gets its ref —
+  // assignRef builds a locator (ancestor climb + sibling scan), so a page-wide
+  // scan must not pay for it on elements the delta does not mention.
+  function enrichDeltaEntries(list) {
+    for (const item of list) {
+      const entry = item.entry, action = item.action;
+      if (!entry || !entry.el || !action) continue;
+      if (!action.ref) action.ref = assignRef(entry.el);
+      const cls = _cachedClassify(entry.el);
+      const loc = buildLocator(entry.el);
       if (loc && loc.length) action.locator = loc[0];
-      action.intent = detectIntent(el, cls);
+      action.intent = detectIntent(entry.el, cls);
       if (cls.href) action.href = cls.href;
     }
-    return delta;
   }
 
   async function exploreIncremental(options) {
@@ -2672,17 +2856,42 @@ function handleReadClipboard() {
     const hadBaseline = SCAN_CACHE.size > 0;
     const prev = SCAN_CACHE;
     // ── Inline diff (MIRROR of incr.js diffScan) ──
+    // added / changed / removed all describe SEMANTIC change now: the baseline
+    // and the live scan cover the same population (every visible interactive
+    // element on the page), so neither scrolling nor viewport crossing can
+    // manufacture an entry. See collectScan for the membership rule.
     const added = [], changed = [], removed = [];
+    const deltaPairs = [];   // entries the delta names, enriched after the diff
     let unchangedCount = 0;
     for (const [key, e] of scan) {
       const p = prev.get(key);
-      if (!p) added.push(e.action);
-      else if (p.fp !== e.fp) changed.push({ action: e.action, changes: wsFieldChanges(p.fpo, e.fpo) });
-      else unchangedCount++;
+      if (!p) {
+        const action = scanActionOf(e, e.ref);
+        added.push(action);
+        deltaPairs.push({ entry: e, action: action });
+      } else if (p.fp !== e.fp) {
+        const action = scanActionOf(e, e.ref);
+        changed.push({ action: action, changes: wsFieldChanges(p.fpo, e.fpo) });
+        deltaPairs.push({ entry: e, action: action });
+      } else {
+        unchangedCount++;
+      }
     }
     for (const [key, p] of prev) {
-      if (!scan.has(key)) removed.push({ key: key, ref: p.ref || null, label: p.label || '' });
+      if (!scan.has(key)) {
+        // A REMOVED element still gets a ref so the caller can correlate it with
+        // what it was shown before ("E57 is gone"). If it was already surfaced the
+        // ref is the SAME one (elementSignatures is keyed by element), so nothing
+        // drifts; only an element that never appeared in a delta pays for a new
+        // one — and only at removal, not on every scan.
+        let ref = p.ref || null;
+        if (!ref && p.el) { try { ref = assignRef(p.el); } catch (_) { ref = null; } }
+        removed.push({ key: key, ref: ref, label: p.label || '' });
+      }
     }
+    // changedRatio is therefore a ratio of REAL change: elements that entered or
+    // left the DOM, or whose own state changed. Scroll contributes nothing, so it
+    // cannot push this past the escalation threshold any more.
     const totalTracked = Math.max(prev.size, scan.size);
     const changedRatio = totalTracked > 0 ? (added.length + removed.length + changed.length) / totalTracked : 0;
     const escalate = hadBaseline && totalTracked > 20 && changedRatio > 0.6;
@@ -2703,8 +2912,8 @@ function handleReadClipboard() {
       return sag;
     }
 
-    // Locator/intent only for the delta — the scan itself stays cheap.
-    enrichDeltaActions({ added: added, changed: changed });
+    // Ref + locator + intent only for the delta — the scan itself stays cheap.
+    enrichDeltaEntries(deltaPairs);
 
     return {
       incremental: true,
@@ -4082,7 +4291,7 @@ function handleReadClipboard() {
       // v4.6.1. The build stamp is substituted here at build time and encodes BOTH the
       // version and the source hash, so reporting it is the only freshness claim that
       // cannot rot. Reported from one place so both dispatchers agree.
-      csBuild:'v4.6.1-d57fb3a3',
+      csBuild:'v4.6.1-1b259781',
     };
   }
 

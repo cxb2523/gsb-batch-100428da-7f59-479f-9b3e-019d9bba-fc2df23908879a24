@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WS Incremental Scan Fixture</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; }
+  #hud { position: sticky; top: 0; z-index: 100; background: #123; color: #9f9; padding: 6px 10px;
+         font: 12px/1.4 monospace; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  #hud button { font: inherit; }
+  main { max-width: 720px; padding: 0 16px 60vh; }
+  .row { border: 1px solid #ccc; border-radius: 4px; margin: 8px 0; padding: 8px; }
+  #modal[hidden] { display: none; }
+  #modal { position: fixed; inset: 0; background: rgba(0,0,0,.4); z-index: 200; }
+  #modal .card { background: #fff; max-width: 360px; margin: 90px auto; padding: 16px; border-radius: 8px;
+                 display: flex; gap: 8px; align-items: center; }
+  #modal .card p { flex: 1; margin: 0; }
+  /* Off-screen but rendered: the scan must keep tracking it. */
+  .far { border-color: #48f; }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <button id="btn-add-row">Add row (real DOM add)</button>
+  <button id="btn-remove-row">Remove last row (real DOM remove)</button>
+  <button id="btn-open-modal">Open modal</button>
+  <span id="hud-status">ready</span>
+</div>
+
+<main id="list">
+  <!-- 40 rows, each with one control. Only the first few fit a 1080p viewport,
+       so most of the page is "offscreen but present" — exactly the population
+       the incremental baseline must keep. -->
+  <p>Scroll down: the row buttons leave the viewport one by one. An incremental
+     scan afterwards must report NO added/removed elements.</p>
+</main>
+
+<div id="modal" hidden role="dialog" aria-modal="true" aria-label="Fixture dialog">
+  <div class="card">
+    <p id="modal-text">This dialog's controls are real page controls.</p>
+    <button id="modal-ok">OK</button>
+    <button id="modal-cancel">Cancel</button>
+  </div>
+</div>
+
+<script>
+  var status = function (s) { document.getElementById('hud-status').textContent = s; };
+  var list = document.getElementById('list');
+  var makeRow = function (i) {
+    var row = document.createElement('div');
+    row.className = 'row';
+    row.id = 'row-' + i;
+    var b = document.createElement('button');
+    b.id = 'rowbtn-' + i;
+    b.textContent = 'Row ' + i + ' action';
+    b.onclick = function () { status('clicked row ' + i); };
+    row.appendChild(b);
+    return row;
+  };
+  var nextRow = 0;
+  for (; nextRow < 40; nextRow++) list.appendChild(makeRow(nextRow));
+
+  document.getElementById('btn-add-row').onclick = function () {
+    list.appendChild(makeRow(nextRow++));
+    status('added row ' + (nextRow - 1));
+  };
+  document.getElementById('btn-remove-row').onclick = function () {
+    if (nextRow <= 1) return status('nothing to remove');
+    var doomed = document.getElementById('row-' + (nextRow - 1));
+    if (!doomed) return status('last row already gone');
+    doomed.parentNode.removeChild(doomed);
+    nextRow--;
+    status('removed row ' + nextRow);
+  };
+
+  var modal = document.getElementById('modal');
+  document.getElementById('btn-open-modal').onclick = function () {
+    modal.hidden = false;
+    // Modal libraries typically mark the page behind the dialog aria-hidden.
+    // That must NOT be read as "the background was removed".
+    list.setAttribute('aria-hidden', 'true');
+    status('modal open');
+  };
+  document.getElementById('modal-ok').onclick =
+  document.getElementById('modal-cancel').onclick = function () {
+    modal.hidden = true;
+    list.removeAttribute('aria-hidden');
+    status('modal closed');
+  };
+  window.__fix = {
+    rows: function () { return nextRow; },
+    status: function () { return document.getElementById('hud-status').textContent; },
+  };
+</script>
+</body>
+</html>
