@@ -23,6 +23,18 @@ from tikhub._errors import (
     TikHubUpstreamError,
 )
 
+_RETRYABLE_ERRORS: tuple[type[TikHubError], ...] = (
+    TikHubConnectionError,
+    TikHubServerError,
+    TikHubUpstreamError,
+    TikHubRateLimitError,
+)
+
+
+def is_retryable_error(exc: BaseException) -> bool:
+    """Return ``True`` if ``exc`` is a transient TikHub error worth retrying."""
+    return isinstance(exc, _RETRYABLE_ERRORS)
+
 
 @dataclass(frozen=True)
 class RetryPolicy:
@@ -43,15 +55,7 @@ class RetryPolicy:
         """Return ``True`` if ``exc`` is retryable and we have attempts left."""
         if attempt >= self.max_retries:
             return False
-        return isinstance(
-            exc,
-            (
-                TikHubConnectionError,
-                TikHubServerError,
-                TikHubUpstreamError,
-                TikHubRateLimitError,
-            ),
-        )
+        return is_retryable_error(exc)
 
     def sleep_for(self, exc: BaseException, attempt: int) -> float:
         """Compute the sleep duration before the next retry.

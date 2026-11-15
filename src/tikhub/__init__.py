@@ -32,6 +32,7 @@ from tikhub._pagination import (
     CursorPaginator,
     OffsetPaginator,
     Page,
+    PageFailure,
     PagePaginator,
 )
 from tikhub._version import __version__
@@ -44,6 +45,7 @@ __all__ = [
     "CursorPaginator",
     "OffsetPaginator",
     "Page",
+    "PageFailure",
     "PagePaginator",
     # Clients
     "TikHub",
