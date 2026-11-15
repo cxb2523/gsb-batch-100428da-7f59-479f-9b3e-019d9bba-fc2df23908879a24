@@ -279,6 +279,10 @@ components:
           enum: [Tweet, SelfThread, MediaGrid, CondensedTweet]
         tweet_results:
           $ref: "#/components/schemas/ItemResult"
+        tweet_unwrapped:
+          allOf:
+            - $ref: "./tweet.yaml#/components/schemas/TweetUnwrapped"
+          description: Optional client-side view of tweet_results.result after unfolding TweetWithVisibilityResults and retweet wrappers (see TweetUnwrapped). Not returned by the API; generated clients populate it by applying the documented unwrap path.
         socialContext:
           $ref: "#/components/schemas/SocialContextUnion"
         promotedMetadata:

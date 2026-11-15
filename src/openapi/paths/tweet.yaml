@@ -77,6 +77,10 @@ components:
       properties:
         threaded_conversation_with_injections_v2:
           $ref: "./../schemas/timeline.yaml#/components/schemas/Timeline"
+        tweet_unwrapped:
+          allOf:
+            - $ref: "./../schemas/tweet.yaml#/components/schemas/TweetUnwrapped"
+          description: Optional client-side view of the focal tweet (the first TimelineTweet entry in threaded_conversation_with_injections_v2) after unfolding TweetWithVisibilityResults and retweet wrappers. Not returned by the API; see TweetUnwrapped for the documented unwrap path and depth limit.
 
     TweetResultByRestIdResponse:
       required:
@@ -93,6 +97,10 @@ components:
       properties:
         tweetResult:
           $ref: "./../schemas/content.yaml#/components/schemas/ItemResult"
+        tweet_unwrapped:
+          allOf:
+            - $ref: "./../schemas/tweet.yaml#/components/schemas/TweetUnwrapped"
+          description: Optional client-side view of tweetResult.result after unfolding TweetWithVisibilityResults and retweet wrappers. Not returned by the API; see TweetUnwrapped for the documented unwrap path and depth limit.
 
     TweetFavoritersResponse:
       required:

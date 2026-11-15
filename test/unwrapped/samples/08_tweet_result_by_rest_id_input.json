@@ -1,0 +1,17 @@
+{
+  "data": {
+    "tweetResult": {
+      "__typename": "TimelineTweet",
+      "result": {
+        "__typename": "TweetUnavailable",
+        "reason": "Protected"
+      }
+    },
+    "tweet_unwrapped": {
+      "state": "Unavailable",
+      "__typename": "TweetUnavailable",
+      "reason": "Protected",
+      "depth": 0
+    }
+  }
+}

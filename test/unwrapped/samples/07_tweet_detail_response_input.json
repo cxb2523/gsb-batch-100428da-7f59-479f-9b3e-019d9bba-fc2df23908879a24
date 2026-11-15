@@ -1,0 +1,115 @@
+{
+  "data": {
+    "threaded_conversation_with_injections_v2": {
+      "instructions": [
+        {
+          "type": "TimelineAddEntries",
+          "entries": [
+            {
+              "entryId": "tweet-5001",
+              "sortIndex": "5001",
+              "content": {
+                "__typename": "TimelineTimelineItem",
+                "entryType": "TimelineTimelineItem",
+                "itemContent": {
+                  "__typename": "TimelineTweet",
+                  "itemType": "TimelineTweet",
+                  "tweetDisplayType": "Tweet",
+                  "tweet_results": {
+                    "__typename": "TimelineTweet",
+                    "result": {
+                      "__typename": "Tweet",
+                      "rest_id": "5001",
+                      "core": {
+                        "user_results": {
+                          "result": {
+                            "__typename": "User",
+                            "id": "VXNlcjo0MDAx",
+                            "rest_id": "4001",
+                            "is_blue_verified": false,
+                            "profile_image_shape": "Circle",
+                            "core": {
+                              "created_at": "Mon Jan 01 00:00:00 +0000 2024",
+                              "name": "carol",
+                              "screen_name": "carol"
+                            }
+                          }
+                        }
+                      },
+                      "legacy": {
+                        "bookmark_count": 0,
+                        "bookmarked": false,
+                        "conversation_id_str": "5001",
+                        "created_at": "Mon Jan 01 00:00:00 +0000 2024",
+                        "display_text_range": [
+                          0,
+                          11
+                        ],
+                        "favorite_count": 0,
+                        "favorited": false,
+                        "full_text": "focal tweet",
+                        "is_quote_status": false,
+                        "lang": "en",
+                        "quote_count": 0,
+                        "reply_count": 0,
+                        "retweet_count": 0,
+                        "retweeted": false,
+                        "user_id_str": "4001",
+                        "id_str": "5001"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    "tweet_unwrapped": {
+      "state": "Available",
+      "depth": 0,
+      "tweet": {
+        "__typename": "Tweet",
+        "rest_id": "5001",
+        "core": {
+          "user_results": {
+            "result": {
+              "__typename": "User",
+              "id": "VXNlcjo0MDAx",
+              "rest_id": "4001",
+              "is_blue_verified": false,
+              "profile_image_shape": "Circle",
+              "core": {
+                "created_at": "Mon Jan 01 00:00:00 +0000 2024",
+                "name": "carol",
+                "screen_name": "carol"
+              }
+            }
+          }
+        },
+        "legacy": {
+          "bookmark_count": 0,
+          "bookmarked": false,
+          "conversation_id_str": "5001",
+          "created_at": "Mon Jan 01 00:00:00 +0000 2024",
+          "display_text_range": [
+            0,
+            11
+          ],
+          "favorite_count": 0,
+          "favorited": false,
+          "full_text": "focal tweet",
+          "is_quote_status": false,
+          "lang": "en",
+          "quote_count": 0,
+          "reply_count": 0,
+          "retweet_count": 0,
+          "retweeted": false,
+          "user_id_str": "4001",
+          "id_str": "5001"
+        }
+      }
+    }
+  }
+}

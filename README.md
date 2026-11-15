@@ -47,6 +47,20 @@ uv pip install ./python_generated
 STRICT_MODE=True uv run python test/python/test_serialize.py  # needs cookie.json
 ```
 
+### offline unwrap tests (no network / credentials)
+
+`test/unwrapped` validates the reusable `TweetUnwrapped` schema — the documented
+"unwrap to the actual tweet" path that peels `TweetWithVisibilityResults`,
+follows `legacy.retweeted_status_result` (bounded to `TweetUnwrappedMaxDepth`),
+keeps quotes as plain fields, and represents tombstones / unavailable tweets
+with their `__typename` and `reason`. All inputs are fabricated JSON samples.
+
+```shell
+uv run python tools/build.py
+uv run python test/unwrapped/make_samples.py   # (re)generate fabricated samples
+uv run python test/unwrapped/test_unwrapped.py
+```
+
 ## License
 
 This project is dual licensed. You can choose one of the following licenses:

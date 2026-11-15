@@ -2534,3 +2534,195 @@ components:
         urlType:
           type: string
           enum: ["DeepLink", "UrtEndpoint", "ExternalUrl"]
+
+    # ================= Unwrapped tweet =================
+    # Reusable "unwrap to the actual tweet" result.
+    #
+    # A timeline entry (ItemResult / TweetUnion) can wrap the real tweet in
+    # several layers: TweetWithVisibilityResults adds a `tweet` wrapper, a
+    # TweetLegacy.retweeted_status_result points at the retweeted tweet, and
+    # quoted_status_result only references another tweet without replacing the
+    # subject. The schemas below describe the output of walking those wrappers:
+    #
+    #   * TweetWithVisibilityResults  -> its inner `tweet`
+    #   * retweet                    -> legacy.retweeted_status_result.result
+    #   * quote (quoted_status_result / quotedRefResult) -> kept as a field of
+    #     the subject, the subject is never replaced
+    #   * TweetTombstone / TweetUnavailable / TweetPreviewDisplay -> an
+    #     "unwrapped but unavailable" result that keeps __typename (+ reason),
+    #     so callers can tell "no content" apart from "failed to parse".
+    #
+    # Retweet chains are unfolded at most TweetUnwrappedMaxDepth times.
+    # OpenAPI 3.0 cannot express recursive depth limits, so the bounded chain
+    # is materialised as TweetUnwrappedChainDepth0..Depth{N} where each level
+    # references the next one and the last level stops unfolding (its raw
+    # retweeted ItemResult is still kept on tweet.legacy).
+
+    TweetUnwrappedMaxDepth:
+      description: Maximum number of retweet wrappers unfolded by TweetUnwrapped (bounded chain depth, 0-based). A chain longer than this keeps the remaining raw ItemResult on tweet.legacy.retweeted_status_result instead of recursing forever.
+      type: integer
+      enum: [5]
+      default: 5
+
+    TweetUnwrappedState:
+      description: Discriminates an unwrapped tweet that carries content from one that was unfolded but has no usable body (tombstone / unavailable / preview).
+      type: string
+      enum: [Available, Unavailable]
+
+    # Entry point: feed any TweetUnion (for example ItemResult.result) here.
+    TweetUnwrapped:
+      oneOf:
+        - $ref: "#/components/schemas/TweetUnwrappedChainDepth0"
+        - $ref: "#/components/schemas/TweetUnwrappedUnavailable"
+      discriminator:
+        propertyName: state
+        mapping:
+          Available: "#/components/schemas/TweetUnwrappedChainDepth0"
+          Unavailable: "#/components/schemas/TweetUnwrappedUnavailable"
+
+    # Unfolded successfully: rest_id / author / body are readable on `tweet`.
+    # `depth` counts the retweet wrappers that were unfolded (0 = original).
+    # `tweet.quoted_status_result` keeps any quote as a plain field; it never
+    # replaces the subject.
+    TweetUnwrappedTweet:
+      required:
+        - "state"
+        - "tweet"
+      properties:
+        state:
+          $ref: "#/components/schemas/TweetUnwrappedState" # Available
+        tweet:
+          $ref: "#/components/schemas/Tweet"
+        depth:
+          type: integer
+          minimum: 0
+          maximum: 5
+
+    TweetUnwrappedChainDepth0:
+      allOf:
+        - $ref: "#/components/schemas/TweetUnwrappedTweet"
+      properties:
+        state:
+          type: string
+          enum: [Available]
+        depth:
+          type: integer
+          enum: [0]
+          default: 0
+        tweet:
+          $ref: "#/components/schemas/Tweet"
+        retweet:
+          allOf:
+            - $ref: "#/components/schemas/TweetUnwrappedChainDepth1"
+          description: Present when this tweet is a retweet; the retweeted tweet unfolded one level further.
+
+    TweetUnwrappedChainDepth1:
+      allOf:
+        - $ref: "#/components/schemas/TweetUnwrappedTweet"
+      properties:
+        state:
+          type: string
+          enum: [Available]
+        depth:
+          type: integer
+          enum: [1]
+          default: 1
+        tweet:
+          $ref: "#/components/schemas/Tweet"
+        retweet:
+          allOf:
+            - $ref: "#/components/schemas/TweetUnwrappedChainDepth2"
+          description: Present when the retweeted tweet is itself a retweet.
+
+    TweetUnwrappedChainDepth2:
+      allOf:
+        - $ref: "#/components/schemas/TweetUnwrappedTweet"
+      properties:
+        state:
+          type: string
+          enum: [Available]
+        depth:
+          type: integer
+          enum: [2]
+          default: 2
+        tweet:
+          $ref: "#/components/schemas/Tweet"
+        retweet:
+          allOf:
+            - $ref: "#/components/schemas/TweetUnwrappedChainDepth3"
+
+    TweetUnwrappedChainDepth3:
+      allOf:
+        - $ref: "#/components/schemas/TweetUnwrappedTweet"
+      properties:
+        state:
+          type: string
+          enum: [Available]
+        depth:
+          type: integer
+          enum: [3]
+          default: 3
+        tweet:
+          $ref: "#/components/schemas/Tweet"
+        retweet:
+          allOf:
+            - $ref: "#/components/schemas/TweetUnwrappedChainDepth4"
+
+    TweetUnwrappedChainDepth4:
+      allOf:
+        - $ref: "#/components/schemas/TweetUnwrappedTweet"
+      properties:
+        state:
+          type: string
+          enum: [Available]
+        depth:
+          type: integer
+          enum: [4]
+          default: 4
+        tweet:
+          $ref: "#/components/schemas/Tweet"
+        retweet:
+          allOf:
+            - $ref: "#/components/schemas/TweetUnwrappedChainDepth5"
+
+    # Last level: no further `retweet` property is modelled, so a chain longer
+    # than TweetUnwrappedMaxDepth cannot recurse. The unprocessed tail stays
+    # available on tweet.legacy.retweeted_status_result.
+    TweetUnwrappedChainDepth5:
+      allOf:
+        - $ref: "#/components/schemas/TweetUnwrappedTweet"
+      properties:
+        state:
+          type: string
+          enum: [Available]
+        depth:
+          type: integer
+          enum: [5]
+          default: 5
+        tweet:
+          $ref: "#/components/schemas/Tweet"
+
+    # Unfolded but the body cannot be read. Keeps the original __typename (and
+    # reason when the API provides one) so callers can distinguish "this entry
+    # genuinely has no content" from a local parsing failure.
+    TweetUnwrappedUnavailable:
+      required:
+        - "state"
+        - "__typename"
+      properties:
+        state:
+          $ref: "#/components/schemas/TweetUnwrappedState" # Unavailable
+        __typename:
+          type: string
+          enum:
+            - TweetTombstone
+            - TweetUnavailable
+            - TweetPreviewDisplay
+        reason:
+          type: string # TweetUnavailable.reason when present
+        depth:
+          type: integer
+          minimum: 0
+          maximum: 5
+        preview:
+          $ref: "#/components/schemas/TweetPreviewDisplayTweet" # TweetPreviewDisplay still exposes a reduced preview
