@@ -28,6 +28,9 @@ def save(results: result.Results, started_at: str, ended_at: str, out: str, verb
 	extracted_error       = jquery.sort_by_url(extracted_error)
 	tmp.failed.extraction = jquery.select_url(extracted_error)
 	# ------------------------------------
+	tmp.invalid.extraction = results.results[result.Stage.EXTRACTION].invalid
+	tmp.invalid.validation = results.results[result.Stage.VALIDATION].invalid
+	# ------------------------------------
 	file.overwrite(get_primary(tmp, plaintext), out)
 	# ------------------------------------
 	if verbose:
@@ -43,6 +46,9 @@ def save(results: result.Results, started_at: str, ended_at: str, out: str, verb
 			tmp.failed.validation = jquery.select_url_by_file(validated_error, path)
 			# ----------------------------
 			tmp.failed.extraction = jquery.select_url_by_file(extracted_error, path)
+			# ----------------------------
+			tmp.invalid.extraction = results.results[result.Stage.EXTRACTION].invalid
+			tmp.invalid.validation = results.results[result.Stage.VALIDATION].invalid
 			# ----------------------------
 			file.write_silent(get_secondary(tmp, plaintext), path.rsplit(".", 1)[0] + config.REPORT_EXTENSION)
 
@@ -61,6 +67,14 @@ class ReportFailed:
 	extraction: list[str] = dataclasses.field(default_factory = list)
 
 @dataclasses.dataclass
+class ReportInvalid:
+	"""
+	Template entries that were skipped due to an invalid RegEx.
+	"""
+	validation: list[result.InvalidEntry] = dataclasses.field(default_factory = list)
+	extraction: list[result.InvalidEntry] = dataclasses.field(default_factory = list)
+
+@dataclasses.dataclass
 class Report:
 	"""
 	"""
@@ -68,6 +82,7 @@ class Report:
 	ended_at  : str           = ""
 	summary   : ReportSummary = dataclasses.field(default_factory = ReportSummary)
 	failed    : ReportFailed  = dataclasses.field(default_factory = ReportFailed)
+	invalid   : ReportInvalid = dataclasses.field(default_factory = ReportInvalid)
 	full      : list          = dataclasses.field(default_factory = list)
 
 def get_primary(report: Report, plaintext: bool):

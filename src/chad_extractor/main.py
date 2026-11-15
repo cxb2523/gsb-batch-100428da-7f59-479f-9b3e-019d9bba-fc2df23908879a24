@@ -71,7 +71,9 @@ def main():
 					print("No extracted data matched the validation criteria")
 			results = shared_storage.get_results()
 		stopwatch.stop()
-		if results.results[result.Stage.EXTRACTION].success:
+		if (results.results[result.Stage.EXTRACTION].success
+			or results.results[result.Stage.EXTRACTION].invalid
+			or results.results[result.Stage.VALIDATION].invalid):
 			report.save(
 				results,
 				stopwatch.get_start(),

@@ -27,12 +27,22 @@ class ResultPlaintext:
 	results: dict[str, list[str]] = dataclasses.field(default_factory = dict)
 
 @dataclasses.dataclass
+class InvalidEntry:
+	"""
+	Class for storing a template entry that was skipped due to an invalid RegEx.
+	"""
+	key  : str
+	regex: str
+	error: str
+
+@dataclasses.dataclass
 class StageResults:
 	"""
 	Class for storing results of a single stage.
 	"""
 	success: list[Result | ResultPlaintext] = dataclasses.field(default_factory = list)
 	error  : list[Result | ResultPlaintext] = dataclasses.field(default_factory = list)
+	invalid: list[InvalidEntry]             = dataclasses.field(default_factory = list)
 
 @dataclasses.dataclass
 class Results:

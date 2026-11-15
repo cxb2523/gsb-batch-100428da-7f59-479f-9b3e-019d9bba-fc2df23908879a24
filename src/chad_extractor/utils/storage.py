@@ -89,6 +89,27 @@ class Shared:
 		"""
 		return bool(self.get_success())
 
+	def append_invalid(self, entry: result.InvalidEntry):
+		"""
+		Append a template entry with an invalid RegEx to the invalid list.\n
+		Each entry is appended only once per template key.
+		"""
+		entries = self.__results.results[self.__stage].invalid
+		if not any(existing.key == entry.key for existing in entries):
+			entries.append(entry)
+
+	def get_invalid(self):
+		"""
+		Get the invalid list.
+		"""
+		return self.__results.results[self.__stage].invalid
+
+	def has_invalid(self):
+		"""
+		Check if there is any template entry in the invalid list.
+		"""
+		return bool(self.get_invalid())
+
 	def get_results(self):
 		"""
 		Get all results.
@@ -120,11 +141,22 @@ class Shared:
 		"""
 		During extraction, remove all template entries without the `extract` RegEx.\n
 		During validation, remove all template entries without the `validate` RegEx.\n
+		Entries with an invalid RegEx are skipped, recorded as invalid, and do not affect other entries.\n
 		Returns `False` if no entries are left.
 		"""
 		for key in list(self.__template.entries.keys()):
-			if (self.__stage == result.Stage.EXTRACTION and not self.__template.entries[key].extract) or (self.__stage == result.Stage.VALIDATION and not self.__template.entries[key].validate):
+			entry = self.__template.entries[key]
+			query = entry.extract if self.__stage == result.Stage.EXTRACTION else entry.validate
+			if not query:
 				self.__template.entries.pop(key)
+			else:
+				try:
+					re.compile(query, flags = self.__flags)
+				except re.error as ex:
+					self.__template.entries.pop(key)
+					self.append_invalid(result.InvalidEntry(key, query, str(ex)))
+					if self.__debug:
+						general.print_red(f"[ INVALID ] {key} -> {ex}")
 		return bool(self.__template.entries)
 
 	def parse_input(self):
@@ -167,26 +199,42 @@ class Shared:
 
 	def parse_response(self, content: str, key = "") -> dict[str, list[str]] | bool:
 		"""
-		Parse an HTTP response content as a result of extraction or validation.
+		Parse an HTTP response content as a result of extraction or validation.\n
+		A template entry with an invalid RegEx is skipped and recorded as invalid without affecting other entries.
 		"""
 		tmp = {}
-		try:
-			if not self.is_validation_started():
-				if self.__excludes:
-					for query in self.__excludes:
+		if not self.is_validation_started():
+			if self.__excludes:
+				for query in self.__excludes:
+					try:
 						content = re.sub(query, "", content, flags = self.__flags)
-				for key, value in self.__template.entries.items():
+					except re.error as ex:
+						if self.__debug:
+							general.print_red(str(ex))
+			for key, value in self.__template.entries.items():
+				try:
 					matches = re.findall(value.extract, content, flags = self.__flags)
-					if matches:
-						if value.extract_prepend or value.extract_append:
-							for i in range(len(matches)):
-								matches[i] = value.extract_prepend + matches[i] + value.extract_append
-						tmp[key] = array.unique(matches, sort = True)
-			elif re.search(self.__template.entries[key].validate, content, flags = self.__flags):
-				tmp = True
-		except (re.error, KeyError) as ex:
-			if self.__debug:
-				general.print_red(str(ex))
+				except re.error as ex:
+					self.append_invalid(result.InvalidEntry(key, value.extract, str(ex)))
+					if self.__debug:
+						general.print_red(str(ex))
+					continue
+				if matches:
+					if value.extract_prepend or value.extract_append:
+						for i in range(len(matches)):
+							matches[i] = value.extract_prepend + matches[i] + value.extract_append
+					tmp[key] = array.unique(matches, sort = True)
+		else:
+			try:
+				if re.search(self.__template.entries[key].validate, content, flags = self.__flags):
+					tmp = True
+			except re.error as ex:
+				self.append_invalid(result.InvalidEntry(key, self.__template.entries[key].validate, str(ex)))
+				if self.__debug:
+					general.print_red(str(ex))
+			except KeyError as ex:
+				if self.__debug:
+					general.print_red(str(ex))
 		return tmp
 
 	def get_headers(self, key = "", with_cookies = False) -> dict[str, str]:

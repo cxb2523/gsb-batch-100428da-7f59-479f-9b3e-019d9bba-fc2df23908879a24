@@ -43,6 +43,19 @@ class ChadExtractorSpider(scrapy.Spider):
 
 	def start_requests(self):
 		"""
+		Main method (Scrapy < 2.13).
+		"""
+		yield from self.__start()
+
+	async def start(self):
+		"""
+		Main method (Scrapy >= 2.13).
+		"""
+		for request in self.__start():
+			yield request
+
+	def __start(self):
+		"""
 		Main method.
 		"""
 		input = self.__shared_storage.get_input()
@@ -299,7 +312,7 @@ class ChadExtractor:
 		"""
 		return request.resource_type in ["fetch", "stylesheet", "image", "ping", "font", "media", "imageset", "beacon", "csp_report", "object", "texttrack", "manifest"]
 
-	def __run(self):
+	def _run(self):
 		"""
 		Configure the settings and run the Chad Extractor spider.
 		"""
@@ -355,7 +368,7 @@ class ChadExtractor:
 		"""
 		Run Scrapy's spider.
 		"""
-		process = multiprocessing.Process(target = self.__run)
+		process = multiprocessing.Process(target = self._run)
 		try:
 			process.start()
 			process.join()
