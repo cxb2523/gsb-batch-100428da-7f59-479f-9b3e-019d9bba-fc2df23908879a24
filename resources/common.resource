@@ -5,6 +5,7 @@ Library     RPA.Excel.Files
 Library     RPA.Robocorp.Vault
 Library     InvoiceGenerator
 Library     InvoiceModeler
+Library     InvoiceBatch
 
 
 *** Keywords ***
