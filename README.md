@@ -57,24 +57,29 @@ flowchart TD
     B -- no --> B
     B -- yes --> C[For each kid in config]
     C --> V{name, username and<br/>password all set?}
-    V -- no --> X[Log warning and<br/>stop this run]
-    V -- yes --> D[Start headless Chrome]
+    V -- no --> X[Record failure and<br/>skip this entry]
+    X --> C
+    V -- yes --> D[Start a fresh headless Chrome]
     D --> E[Open myofek.cet.ac.il/he<br/>and click Login]
     E --> F[Choose edu.gov.il SSO,<br/>switch to username/password login]
     F --> G[Enter the kid's username and password]
     G --> H[Read the four task counters<br/>from the dashboard]
-    H --> I{To do > 0 or<br/>to fix > 0?}
-    I -- yes --> J[Send Apprise notification]
-    I -- no --> K[Log: no tasks]
-    J --> L[Close browser]
-    K --> L
-    L --> C
+    H --> I{Counters parsed?}
+    I -- no --> Y[Record failure and<br/>skip this kid]
+    I -- yes --> J{To do > 0 or<br/>to fix > 0?}
+    J -- yes --> K[Send Apprise notification]
+    J -- no --> L[Log: no tasks]
+    K --> M[Close this kid's browser]
+    L --> M
+    Y --> M
+    M --> C
+    C --> N[Log one round summary:<br/>succeeded, failed, with/without tasks,<br/>failed names and reasons]
 ```
 
-The diagram shows the normal path. If a scrape fails, the error is logged and the previous
-counter values are kept. If no counter has been read since the bot started, the counter check
-raises an error that ends the run for all remaining kids (see
-[Known issues and limitations](#known-issues-and-limitations)).
+Every kid is handled independently: a fresh Chrome session, a fresh set of four counters, and
+its own notification decision. An incomplete config entry or a failed login/scrape marks only
+that kid as failed — it is skipped, never notified, and the rest of the list is still checked.
+The browser is closed in a `finally` block, whether the kid succeeded or failed.
 
 1. On startup the bot loads the kids list from `config/config.yaml` (relative to the working
    directory, `/app` in the container). If the file does not exist, it copies the empty
@@ -87,6 +92,11 @@ raises an error that ends the run for all remaining kids (see
    edu.gov.il SSO, and reads the text of the four counters on the dashboard.
 4. It takes the first number in the "to do" and "to fix" counters. If either is greater than
    zero, it sends a notification; otherwise it logs that there are no tasks.
+5. After every kid has been handled, it logs one round summary line with the number of kids
+   that succeeded and failed, how many had tasks and how many did not, and the name and reason
+   for every failure. A kid whose login or scrape fails, or whose counters cannot be parsed,
+   counts as a failure for that round: no notification is sent for it, and the other kids are
+   still checked.
 
 There is no stored state or de-duplication: as long as a kid has open tasks, you get a
 notification at **every** scheduled run.
@@ -213,10 +223,10 @@ kids:
 Quote usernames with leading zeros (`"012345678"`), or YAML may misread them as numbers
 (including octal) and change the value.
 
-All three keys are required for every entry. When the bot reaches an entry with an empty
-`name`, `username`, or `password`, it logs `Kids list is empty or not configured` and **stops
-processing the rest of the list** for that run. Remove unused entries instead of leaving them
-blank.
+All three keys are required for every entry. An entry with an empty `name`, `username`, or
+`password` is skipped for that run and counted as a failure — it is logged as
+`Skipping kid ...: invalid config: missing ...` and included in the round summary. The remaining
+entries are still checked. Remove unused entries to keep the failure count clean.
 
 ## Notifications
 
@@ -257,8 +267,16 @@ The bot logs to standard error with Loguru's default format at `DEBUG` level. Th
 not configurable. View the logs with `docker logs -f ofek`.
 
 Useful messages: `Loading kids list`, `Getting tasks for: <name>`, `Scrapping...`,
-`No tasks tbd for <name>`, `Setting default schedule to 16:00` (when `SCHEDULES` is empty),
-and `Setting schedule to everyday at <time>`.
+`No tasks tbd for <name>`, `Skipping kid <name> (#<index>): <reason>`,
+`Kid <name> (#<index>) failed: <reason>`, `Round summary: ...`, and the schedule lines
+`Setting default schedule to 16:00` / `Setting schedule to everyday at <time>`.
+
+`Round summary` reports the totals for the round and appends the failed kids' names and
+reasons, for example:
+
+```
+Round summary: 2 succeeded, 1 failed, 1 with tasks, 1 without tasks (3 kids total); failures: Noa: scrape failed: CrawlError: enter password failed: ...
+```
 
 ## Troubleshooting
 
@@ -270,8 +288,9 @@ and `Setting schedule to everyday at <time>`.
 - **No notifications arrive.** Check that `NOTIFIERS` is set, that multiple URLs are separated
   by spaces (not commas), and that the log shows an `Adding: ...` line for each URL. Test each
   URL with the `apprise` CLI.
-- **`Kids list is empty or not configured`.** An entry in `config.yaml` has an empty `name`,
-  `username`, or `password`. The bot stops at the first such entry.
+- **`Skipping kid ...: invalid config: missing ...`.** An entry in `config.yaml` has an empty
+  `name`, `username`, or `password`. Only that entry is skipped and counted as a failure; the
+  other kids are still checked. Look at `Round summary` for the full list of failures.
 - **`config.yaml` is not created in the mounted folder.** The container runs as the
   non-root `seluser`. Create `config/config.yaml` yourself, or make the host folder writable
   by that user.
@@ -304,14 +323,6 @@ and `Setting schedule to everyday at <time>`.
 - **Fragile scraping:** the scraper relies on absolute XPaths, fixed element ids and a
   hard-coded SSO URL rewrite (`EduCombinedAuthSms` to `EduCombinedAuthUidPwd`), so any change
   to the Ofek website or the edu.gov.il login can break the bot.
-- **An empty entry stops the run:** an incomplete kid entry ends the run for the entries that
-  follow it.
-- **Stale counters after a failed scrape:** the counter values are not reset between kids. If
-  scraping fails for a kid, the previous kid's values are kept and reported under the current
-  kid's name.
-- **A scrape failure can end the run:** if no counter has been read since the bot started, an
-  `IndexError` ends the run for all remaining kids and leaves Chrome running, because
-  `browser.quit()` is skipped.
 - **Configuration is read once** at startup; restart the container after editing
   `config.yaml`.
 - Images are built for `linux/amd64` only.
@@ -324,8 +335,12 @@ Project layout:
 app/
   app.py         # the bot: scheduler, Selenium crawler, Apprise notifications
   config.yaml    # empty kids template, copied to config/config.yaml on first run
+tests/
+  support.py     # loads app/app.py and provides the fake crawler/notifier
+  test_round.py  # round-level behaviour tests
 Dockerfile       # based on selenium/standalone-chrome; runs as seluser
 requirements.txt # Python dependencies
+requirements-dev.txt # test dependencies (pytest; the tests also run with unittest)
 VERSION          # image version tag used by the Docker workflow
 .github/workflows/docker-image.yml
 ```
@@ -345,7 +360,17 @@ The `docker` GitHub Actions workflow is started manually (`workflow_dispatch`). 
 `linux/amd64` and pushes `techblog/ofek-bot:latest` and `techblog/ofek-bot:<VERSION>`. Bump
 `VERSION` before running it.
 
-There are no automated tests.
+### Running the tests
+
+```bash
+pip3 install -r requirements-dev.txt
+python3 -m unittest discover -s tests -v   # or: python3 -m pytest tests
+```
+
+The tests never start Chrome or contact Ofek or your notification services: they inject a
+fake crawler and a fake notifier into the round function and cover multiple kids, a failed kid
+followed by healthy ones, incomplete config entries, unparseable counters, notification
+failures, and the all-success summary.
 
 ## Contributing
 

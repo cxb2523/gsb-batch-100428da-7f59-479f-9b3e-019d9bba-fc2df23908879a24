@@ -1,8 +1,11 @@
+# One entry per kid. All three keys are required; an entry with a blank
+# name, username or password is skipped and reported as a failure for that
+# round, without stopping the other kids.
 kids:
-  - name: 
-    username: 
-    password: 
+  - name:
+    username:
+    password:
 
-  - name: 
-    username: 
-    password: 
+  - name:
+    username:
+    password:
