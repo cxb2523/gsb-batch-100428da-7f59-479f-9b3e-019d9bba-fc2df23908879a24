@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+### Fixed
+
+**Web(Playwright):**
+
+- **`target=_blank` 改道不再让后续动作读到旧文档**:关闭新 tab + 主页面
+  `goto` 是异步完成的(popup 事件比动作返回晚 30-450ms),此前 `click` /
+  `screenshot` / `wait_for_navigation` 会在改道刚发出时就返回,紧接着的
+  截图与元素定位落在跳转前的旧文档上(采集到的标题/价格来自上一页、报告
+  截图与实际内容不符)。
+  - 新增 `WebPage._settle_popup_redirect()`:动作收尾时用 CDP
+    `Target.targetCreated`(带 `openerId`,可精确归属到本页面、对页面请求
+    零开销)识别"本页面刚开了新 tab",再等 popup 事件落地并等改道
+    `goto` + 导航等待全部完成;`wait_for_navigation()` 在返回前总会先
+    收尾在飞的改道。拿不到 CDP 时(Firefox/WebKit)退回 context 级
+    `request` 事件作早期信号。
+  - 改道失败(目标不可达 / popup 落在浏览器错误页 / 目标不可达时 popup
+    事件始终没来)**不再静默继续**:新增 `PopupNavigationError`,由
+    `wait_for_navigation()`、`screenshot()`、`get_size()`、
+    `evaluate_javascript()` 及全部 XPath 定位/滚动入口抛出;错误信息带上
+    目标 URL 与具体原因,并以 ERROR 级别写入日志(含 CDP 导航历史恢复出的
+    原始目标地址)。
+  - `page.goto` 失败后先等浏览器错误页落定;显式 `navigate()` 对"被另一
+    次导航打断"的瞬时冲突重试一次,并在成功后清除失败状态,因此失败可以
+    被恢复而不会永久卡住采集。
+  - 同一新 tab 连发多次 popup 事件时按 Page 身份去重并用锁串行化,避免
+    把已到达的新页面再导航一次。
+  - `force_same_tab_navigation` 默认仍为 `True`,`__init__` 对其行为
+    唯一的新增是记录状态与等待;弹窗事件回调仍然不向外抛异常。
+
 ## [0.7.0] - 2026-06-17
 
 核心功能(web / 移动端 / 缓存 / 日志报告 / 坐标)横扫 JS 保真审查(8 区对抗,

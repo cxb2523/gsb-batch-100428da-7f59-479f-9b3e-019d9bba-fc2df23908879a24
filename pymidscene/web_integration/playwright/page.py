@@ -9,6 +9,7 @@ import base64
 import asyncio
 import re
 import sys
+import time
 
 from playwright.async_api import Page as PlaywrightPage
 
@@ -18,12 +19,49 @@ from ...shared.types import Size
 from ...shared.logger import logger
 
 
+class PopupNavigationError(RuntimeError):
+    """``target=_blank`` 同标签页改道失败.
+
+    改道目标不可达时抛这个错误,而不是让调用方把"跳转前的旧文档"
+    当成已经到达的目标页继续截图/定位。
+    """
+
+    def __init__(self, url: Optional[str], reason: str) -> None:
+        self.url = url
+        self.reason = reason
+        target = url or "<unknown>"
+        super().__init__(
+            "Popup same-tab navigation failed: the main page did not reach "
+            f"{target} ({reason}). The current document is NOT the redirect "
+            "target, so screenshot/locate/query are refused instead of "
+            "silently returning data from the previous page."
+        )
+
+
 class WebPage(AbstractInterface):
     """Playwright 页面适配器"""
 
     # 默认配置(对齐 JS shared/constants: 5000ms / 2000ms)
     DEFAULT_WAIT_FOR_NAVIGATION_TIMEOUT = 5000
     DEFAULT_WAIT_FOR_NETWORK_IDLE_TIMEOUT = 2000
+
+    # 早期信号排空: 只让出事件循环(不 sleep 真实时间). 实测 300 个 tick
+    # 合计约 0.5ms, 且 CDP 的 targetCreated 在 click() 返回时通常已就绪。
+    POPUP_HINT_TICKS = 300
+    # 收到早期信号后, 等 popup 事件本身(拿到 Page 句柄才能关 tab).
+    # 实测这个事件最慢可以接近 1s(冷启动/首次点击时), 给 3s 余量。
+    POPUP_EVENT_TIMEOUT_MS = 3000
+    # 一轮动作里最多处理几次"连开多个 tab"的收尾
+    POPUP_SETTLE_ROUNDS = 3
+    # popup 先落在 about:blank, 随后脚本再设 location 的常见写法: 短轮询等真实 URL
+    POPUP_URL_SETTLE_MS = 1000
+    # 读 popup URL 前的 load state 等待
+    POPUP_LOAD_STATE_TIMEOUT_MS = 5000
+    # 改道 goto 自身超时(与"导航后等待"的 wait_for_navigation_timeout 分开:
+    # 后者是元素等待, 不该被当成整页加载上限)
+    POPUP_REDIRECT_TIMEOUT_MS = 15000
+    # 改道失败后, 等浏览器的错误页落定的上限
+    POPUP_ERROR_SETTLE_MS = 2000
 
     def __init__(
         self,
@@ -39,6 +77,8 @@ class WebPage(AbstractInterface):
             page: Playwright Page 实例
             wait_for_navigation_timeout: 导航超时时间（毫秒）
             wait_for_network_idle_timeout: 网络空闲超时时间（毫秒）
+            force_same_tab_navigation: 是否把 target=_blank 的新 tab 改道到当前
+                tab(默认开启, 对齐 JS forceClosePopup)
         """
         self.page = page
         self.wait_for_navigation_timeout = (
@@ -60,44 +100,590 @@ class WebPage(AbstractInterface):
         # 对齐 JS forceClosePopup(base-page.ts:781-812, 默认开启):
         # target=_blank 的点击会开新 tab, agent 的截图仍是旧 tab → 后续
         # 动作全部脱靶. 关闭新 tab 并在当前 tab 打开其 URL.
+        self._force_same_tab_navigation = force_same_tab_navigation
+        # 改道是**异步**完成的: popup 事件比动作返回晚 30-450ms. 只注册回调
+        # 而不记录状态, 紧跟着的截图/定位就会落在跳转前的旧文档上. 这里把
+        # "有改道在飞"和"改道失败"都显式记下来, 让 wait_for_navigation /
+        # screenshot 能等到它、并在失败时拒绝把旧页面当成目标页。
+        self._redirect_tasks: set[asyncio.Task] = set()
+        # 早期信号: 新 tab 正在创建的迹象 (URL / 其 CDP targetId / 时刻)
+        self._popup_hint_url: Optional[str] = None
+        self._popup_hint_target_id: Optional[str] = None
+        # 改道失败状态: 非 None 时 screenshot/locate 会拒绝把旧页面当目标页
+        self._popup_redirect_error: Optional[PopupNavigationError] = None
+        self._last_popup_redirect_url: Optional[str] = None
+        # 等待 popup 事件落地的 future 们(由 handler 在入口处统一唤醒,
+        # 避免用固定间隔轮询 —— Windows 上 sleep(0.005) 实测约 15ms)
+        self._popup_waiters: List[asyncio.Future] = []
+        # 同一 target=_blank 点击可能触发多次 popup 事件(脚本 click + 原生
+        # 点击都会走到), 重复改道会把已到达的新页面再导航一次。用 Page
+        # 对象身份 + 目标 URL 双重去重, 并用锁串行化改道。
+        self._handled_popups: list[Any] = []
+        self._handled_popups_limit = 20
+        self._redirect_lock = asyncio.Lock()
+        # CDP target 监听(Chromium); 拿不到时退回 context request 监听
+        self._cdp_session: Any = None
+        self._cdp_task: Optional[asyncio.Task] = None
+        self._self_target_id: Optional[str] = None
+        self._cdp_ready = False
+        self._early_watch_started = False
         if force_same_tab_navigation:
-            self.page.on("popup", self._on_popup_force_same_tab)
+            self._arm_popup_detection()
 
         logger.debug(
             f"WebPage initialized: "
             f"nav_timeout={self.wait_for_navigation_timeout}ms, "
-            f"idle_timeout={self.wait_for_network_idle_timeout}ms"
+            f"idle_timeout={self.wait_for_network_idle_timeout}ms, "
+            f"force_same_tab={force_same_tab_navigation}"
         )
 
-    async def _on_popup_force_same_tab(self, popup: PlaywrightPage) -> None:
-        """popup 事件处理: 关掉新 tab, 当前 tab goto 它的 URL."""
+    # ==================== popup 同标签页改道 ====================
+
+    def _arm_popup_detection(self) -> None:
+        """注册 popup 事件, 并装上"新 tab 正在创建"的早期信号.
+
+        popup 事件本身比动作返回晚 30-450ms(实测). 只靠它, 紧随其后的
+        截图/定位必然落在改道前的旧文档上. 因此这里额外装一个早期信号:
+        Chromium 下用 CDP 的 Target.targetCreated —— 它带 openerId, 能
+        精确判断"这个新 page 是本页面开的", 且对页面请求零开销; 拿不到
+        CDP 时(Firefox/WebKit)退回到 context 级 request 事件。
+        """
+        self.page.on("popup", self._on_popup_force_same_tab)
+        self._ensure_early_signal_watch()
+
+    def _ensure_early_signal_watch(self) -> None:
+        """装上早期信号监听(幂等).
+
+        CDP 会话必须在事件循环里创建, 而 WebPage 也可能在同步上下文里被
+        构造(测试/工具脚本)。这种情况下先不装, 由第一次 async 调用补上;
+        真实使用总是在事件循环里, 因此第一次动作之前就已经就绪。
+        """
+        if self._early_watch_started or not self._force_same_tab_navigation:
+            return
         try:
-            # Playwright 的 popup 初始常是 about:blank, 等导航提交后再取 URL
-            try:
-                await popup.wait_for_load_state(
-                    "domcontentloaded", timeout=5000
-                )
-            except Exception:
-                pass
-            url = popup.url
-            logger.info(f"Popup opened: {url}, forcing same-tab navigation")
-            if not popup.is_closed():
-                try:
-                    await popup.close()
-                except Exception as exc:
-                    logger.debug(f"Failed to close popup {url}: {exc}")
-            if url and url != "about:blank" and not self.page.is_closed():
-                try:
-                    await self.page.goto(url)
-                except Exception as exc:
-                    logger.debug(f"Failed to goto {url}: {exc}")
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._early_watch_started = True
+        if not self._arm_cdp_target_watch():
+            self._arm_context_request_watch()
+
+    def _arm_cdp_target_watch(self) -> bool:
+        """订阅 CDP 的新 target 事件(仅 Chromium).
+
+        返回是否成功装上。CDP 会话的建立是异步的, 这里起一个后台 task;
+        在它完成前, 早期信号暂时缺失(此时仍由 popup 事件兜底)。
+        """
+        context = getattr(self.page, "context", None)
+        if context is None or not hasattr(context, "new_cdp_session"):
+            return False
+        self._cdp_task = asyncio.ensure_future(self._setup_cdp_target_watch())
+        self._cdp_task.add_done_callback(self._on_cdp_task_done)
+        return True
+
+    def _on_cdp_task_done(self, task: asyncio.Task) -> None:
+        # 后台 task 的异常必须在这里取走, 否则 asyncio 会打 "never retrieved"
+        try:
+            task.result()
+            return
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.debug(f"CDP popup watch setup failed: {exc}")
+        # CDP 不可用(Firefox/WebKit 或连接异常) → 退回 context request 信号
+        self._arm_context_request_watch()
+
+    async def _setup_cdp_target_watch(self) -> None:
+        context = self.page.context
+        session = await context.new_cdp_session(self.page)
+        info = await session.send("Target.getTargetInfo")
+        self._self_target_id = (info.get("targetInfo") or {}).get("targetId")
+        if not self._self_target_id:
+            raise RuntimeError("CDP did not expose this page's targetId")
+        self._cdp_session = session
+        session.on("Target.targetCreated", self._on_cdp_target_created)
+        session.on("Target.targetInfoChanged", self._on_cdp_target_info_changed)
+        await session.send("Target.setDiscoverTargets", {"discover": True})
+        self._cdp_ready = True
+        logger.debug(
+            f"CDP popup watch armed (self target {self._self_target_id})"
+        )
+
+    def _on_cdp_target_created(self, event: Any) -> None:
+        """CDP: 本页面开了新 page target → 记下早期信号(同步, 必须极轻)."""
+        try:
+            info = event.get("targetInfo") or {}
+            if info.get("type") != "page":
+                return
+            if info.get("openerId") != self._self_target_id:
+                # 同 context 的别的 tab 开的窗口不归本页面管
+                return
+            self._popup_hint_target_id = info.get("targetId")
+            url = info.get("url")
+            if url and url != "about:blank":
+                self._popup_hint_url = url
+        except Exception:  # pragma: no cover - 防御
+            pass
+
+    def _on_cdp_target_info_changed(self, event: Any) -> None:
+        """CDP: 跟踪新 target 的 URL(它先为空, 导航提交后才有地址)."""
+        try:
+            info = event.get("targetInfo") or {}
+            if info.get("targetId") != self._popup_hint_target_id:
+                return
+            url = info.get("url")
+            if url and url != "about:blank":
+                self._popup_hint_url = url
+        except Exception:  # pragma: no cover - 防御
+            pass
+
+    def _arm_context_request_watch(self) -> None:
+        """非 Chromium 的回退信号: context 级导航请求且 frame 尚未关联 page.
+
+        这个监听对每个请求都会回调, 开销不可忽略(请求密集的页面上实测
+        会让整页加载慢一倍), 所以只在拿不到 CDP 时启用。
+        """
+        context = getattr(self.page, "context", None)
+        if context is None:
+            logger.debug(
+                "Page has no context; popup early detection is disabled"
+            )
+            return
+        try:
+            context.on("request", self._on_context_request)
+        except Exception as exc:  # pragma: no cover - 仅防御
+            logger.warning(f"Cannot subscribe to context requests: {exc}")
+
+    def _on_context_request(self, request: Any) -> None:
+        """记录"新浏览上下文即将导航"的早期信号(同步回调, 必须极轻)."""
+        try:
+            if not request.is_navigation_request():
+                return
+        except Exception:
+            return
+        try:
+            request.frame  # 新上下文的 frame 还没有 page, 这里会抛错
+            return
+        except Exception:
+            pass
+        self._popup_hint_url = getattr(request, "url", None)
+
+    async def _on_popup_force_same_tab(self, popup: PlaywrightPage) -> None:
+        """popup 事件处理: 关掉新 tab, 当前 tab goto 它的 URL.
+
+        Playwright 把 async 事件回调当作独立 task 调度, 所以这个方法一
+        进去就把自己登记到 ``_redirect_tasks``。``wait_for_navigation``
+        因此能 await 到"改道真正完成", 而不是在 goto 刚发出时就返回。
+        """
+        task = asyncio.current_task()
+        if task is not None:
+            self._redirect_tasks.add(task)
+            task.add_done_callback(self._redirect_tasks.discard)
+        self._notify_popup_waiters()
+        try:
+            await self._force_same_tab(popup)
+        except asyncio.CancelledError:
+            self._record_popup_failure(None, "popup handler cancelled")
+            raise
         except Exception as exc:  # 事件回调不允许向外抛
-            logger.warning(f"force_same_tab_navigation handler failed: {exc}")
+            self._record_popup_failure(None, f"handler crashed: {exc!r}")
+            logger.error(
+                f"force_same_tab_navigation handler failed: {exc}", exc_info=True
+            )
+
+    async def _force_same_tab(self, popup: PlaywrightPage) -> None:
+        """关掉 popup, 把主页面改道到它要去的地址(失败时留下诊断)."""
+        if self._is_duplicate_popup(popup):
+            logger.debug("Ignoring duplicate popup event for the same Page")
+            return
+        self._remember_popup(popup)
+        hint_url = self._take_popup_hint()
+        url = await self._resolve_popup_target_url(popup, hint_url)
+
+        if self.page.is_closed():
+            await self._close_popup(popup)
+            logger.warning(
+                "Main page was closed while handling popup; redirect skipped"
+            )
+            return
+
+        # 先把新 tab 关掉: 无论改道成败, 都不该留下一个抢走后续动作的标签页。
+        await self._close_popup(popup)
+
+        if url is None:
+            self._record_popup_failure(
+                hint_url,
+                "popup closed before exposing a navigable URL",
+            )
+            return
+
+        if url == "about:blank":
+            # window.open() 后由脚本自己写入内容 / 再导航: 没有可直接改道
+            # 的地址. 这里不静默 —— 明确告警说明主页面仍停在旧文档上。
+            logger.warning(
+                "Popup target is about:blank and never navigated; "
+                "main page stays on the previous document (no redirect target)"
+            )
+            return
+
+        if url.startswith("chrome-error:"):
+            self._record_popup_failure(
+                hint_url,
+                "popup landed on a browser error page (target unreachable)",
+            )
+            return
+
+        async with self._redirect_lock:
+            if await self._already_at(url):
+                logger.debug(f"Main page is already at {url}; redirect skipped")
+                self._popup_redirect_error = None
+                return
+            logger.info(f"Popup opened: {url}, forcing same-tab navigation")
+            try:
+                await self.page.goto(
+                    url,
+                    wait_until="load",
+                    timeout=self.POPUP_REDIRECT_TIMEOUT_MS,
+                )
+            except Exception as exc:
+                self._record_popup_failure(url, f"page.goto failed: {exc}")
+                # goto 失败时主页面会落到浏览器的错误页上。这个导航可能还
+                # 在收尾, 若不等它落定, 紧接着的一次显式 navigate 会被它
+                # 打断(err: "interrupted by another navigation to
+                # chrome-error://...")。这里等它稳定下来再返回。
+                await self._settle_error_document()
+                return
+
+            # 改道落地后, 主页面必须走完与普通导航一致的等待, 否则紧接着的
+            # 截图/定位仍可能读到跳转中途的文档(正是本次要修的问题)。
+            await self._wait_for_navigation_impl()
+            self._last_popup_redirect_url = url
+            self._popup_redirect_error = None
+            logger.info(f"Popup redirect completed on main page: {url}")
+
+    def _is_duplicate_popup(self, popup: PlaywrightPage) -> bool:
+        """同一个新 tab 可能连发多次 popup 事件(脚本 click + 原生点击).
+
+        只保留最近的若干条记录: 一个长会话里 popup 次数可能很多, 无限
+        累积会泄漏; 而重复事件总是紧挨着原事件到达, 小窗口就够用。
+        """
+        return any(p is popup for p in self._handled_popups)
+
+    def _remember_popup(self, popup: PlaywrightPage) -> None:
+        self._handled_popups.append(popup)
+        if len(self._handled_popups) > self._handled_popups_limit:
+            del self._handled_popups[0]
+
+    async def _settle_error_document(self) -> None:
+        """等改道失败后的浏览器错误页落定.
+
+        失败本身已经记录在 ``_popup_redirect_error`` 里; 这里只负责让
+        "错误页导航"这个副作用收尾, 避免打断调用方接下来的显式导航。
+        """
+        try:
+            await self.page.wait_for_load_state(
+                "domcontentloaded", timeout=self.POPUP_ERROR_SETTLE_MS
+            )
+        except Exception as exc:
+            logger.debug(f"Error-page settle wait finished: {exc}")
+
+    async def _already_at(self, url: str) -> bool:
+        """主页面是否已经停在该地址(用于压掉重复改道)."""
+        try:
+            current = self.page.url
+        except Exception:
+            return False
+        return current == url and current != "about:blank"
+
+    async def _resolve_popup_target_url(
+        self, popup: PlaywrightPage, hint_url: Optional[str]
+    ) -> Optional[str]:
+        """等 popup 提交导航后取它的目标 URL(含不可达情形的恢复)."""
+        try:
+            await popup.wait_for_load_state(
+                "domcontentloaded", timeout=self.POPUP_LOAD_STATE_TIMEOUT_MS
+            )
+        except Exception as exc:
+            logger.debug(f"Popup load state wait failed: {exc}")
+
+        url = self._safe_popup_url(popup)
+        if url is None:
+            return None
+        if url != "about:blank" and not url.startswith("chrome-error:"):
+            return url
+
+        if url == "about:blank":
+            # 常见写法: window.open('about:blank') 之后再设置 location
+            url = await self._wait_popup_url_settle(popup)
+            if url is None:
+                return None
+            if url != "about:blank" and not url.startswith("chrome-error:"):
+                return url
+
+        if url.startswith("chrome-error:"):
+            # 目标不可达时 popup.url 已经变成 chrome-error://chromewebdata/,
+            # 原本要去的地址只剩导航历史 / 早期信号里能查到 —— 没有它,
+            # 后面就只能对着旧页面继续跑, 这正是要避免的静默失败。
+            recovered = await self._recover_navigation_url(popup)
+            if recovered:
+                logger.warning(
+                    "Popup target unreachable; recovered intended URL "
+                    f"from navigation history: {recovered}"
+                )
+                return recovered
+            if hint_url:
+                logger.warning(
+                    "Popup target unreachable; using the early-signal URL: "
+                    f"{hint_url}"
+                )
+                return hint_url
+        return url
+
+    async def _wait_popup_url_settle(
+        self, popup: PlaywrightPage
+    ) -> Optional[str]:
+        """短轮询: 等 about:blank 的 popup 被脚本导航到真实地址."""
+        deadline = time.monotonic() + self.POPUP_URL_SETTLE_MS / 1000
+        while time.monotonic() < deadline:
+            try:
+                if popup.is_closed():
+                    return None
+            except Exception:
+                return None
+            await asyncio.sleep(0.05)
+            url = self._safe_popup_url(popup)
+            if url and url != "about:blank":
+                return url
+        return self._safe_popup_url(popup)
+
+    @staticmethod
+    def _safe_popup_url(popup: PlaywrightPage) -> Optional[str]:
+        try:
+            return popup.url
+        except Exception:
+            return None
+
+    async def _recover_navigation_url(
+        self, popup: PlaywrightPage
+    ) -> Optional[str]:
+        """从 CDP 导航历史恢复 chrome-error 页本该去的 URL(仅 Chromium)."""
+        session = None
+        try:
+            session = await popup.context.new_cdp_session(popup)
+            history = await session.send("Page.getNavigationHistory")
+            entries = history.get("entries") or []
+            for entry in reversed(entries):
+                candidate = entry.get("url")
+                if candidate and not candidate.startswith("chrome-error:"):
+                    return candidate
+        except Exception as exc:
+            logger.debug(f"Cannot recover popup URL via CDP: {exc}")
+        finally:
+            if session is not None:
+                try:
+                    await session.detach()
+                except Exception:
+                    pass
+        return None
+
+    async def _close_popup(self, popup: PlaywrightPage) -> None:
+        try:
+            if not popup.is_closed():
+                await popup.close()
+        except Exception as exc:
+            logger.debug(f"Failed to close popup: {exc}")
+
+    def _has_popup_hint(self) -> bool:
+        """是否有"新 tab 正在创建"的迹象.
+
+        注意不能只看 URL: CDP 的 targetCreated 事件里 URL 往往还是空的
+        (导航尚未提交), 但它带 targetId 和 openerId, 已经足以确认信号。
+        """
+        return bool(self._redirect_tasks or self._popup_hint_url
+                    or self._popup_hint_target_id)
+
+    def _take_popup_hint(self) -> Optional[str]:
+        url = self._popup_hint_url
+        self._popup_hint_url = None
+        self._popup_hint_target_id = None
+        return url
+
+    def _record_popup_failure(self, url: Optional[str], reason: str) -> None:
+        """记录改道失败: 之后的截图/定位会拒绝把旧页面当成目标页."""
+        error = PopupNavigationError(url, reason)
+        self._popup_redirect_error = error
+        # 失败必须在日志里留下可诊断的痕迹(URL + 原因), 不能静默继续
+        logger.error(f"Popup same-tab navigation FAILED: {error}")
+
+    def _raise_if_popup_redirect_failed(self) -> None:
+        if self._popup_redirect_error is not None:
+            raise self._popup_redirect_error
+
+    async def _await_popup_redirect(self, timeout: Optional[float] = None) -> None:
+        """等待所有在飞的改道任务收尾(任务自身已吞异常, 只记录失败状态)."""
+        current = asyncio.current_task()
+        tasks = [
+            t for t in list(self._redirect_tasks)
+            if t is not current and not t.done()
+        ]
+        if not tasks:
+            return
+        logger.debug(f"Waiting for {len(tasks)} popup redirect task(s)")
+        await asyncio.wait(
+            tasks,
+            timeout=(
+                timeout
+                if timeout is not None
+                else (self.POPUP_REDIRECT_TIMEOUT_MS / 1000 + 5)
+            ),
+        )
+
+    async def _settle_popup_redirect(self) -> None:
+        """动作收尾时把"刚刚弹出的 popup"纳入等待范围.
+
+        popup 事件比动作返回晚 30-450ms, 所以动作结束后要主动"探一下":
+        先用少量 sleep(0) tick 收早期信号(实测 300 个 tick 合计约 0.5ms,
+        且信号通常在第 0 个 tick 前就已到达), 一旦确认有新 tab 正在创建,
+        就等 popup 事件落地 + 改道完成。没有信号时几乎零成本。
+        """
+        if not self._force_same_tab_navigation:
+            return
+        self._ensure_early_signal_watch()
+        try:
+            if self.page.is_closed():
+                return
+        except Exception:
+            return
+
+        # 允许一轮动作里连开多个 tab: 每次收尾都重新排空信号
+        for _ in range(self.POPUP_SETTLE_ROUNDS):
+            if not self._has_popup_hint():
+                await self._drain_popup_hint_events()
+            if not self._has_popup_hint():
+                return
+            if not self._redirect_tasks:
+                await self._await_popup_event()
+            await self._await_popup_redirect()
+
+    async def _drain_popup_hint_events(self) -> None:
+        """把"已经发生但还没派发"的早期信号推到回调里.
+
+        只让出事件循环(不 sleep 真实时间), 因此不会改变动作节奏: 实测
+        300 个 tick 约 0.5ms, 有信号时通常第一个 tick 前就已经置位。
+        """
+        for _ in range(self.POPUP_HINT_TICKS):
+            if self._has_popup_hint():
+                return
+            await asyncio.sleep(0)
+
+    def _notify_popup_waiters(self) -> None:
+        """popup 事件已到 → 唤醒所有在等它的收尾流程."""
+        waiters, self._popup_waiters = self._popup_waiters, []
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(True)
+
+    async def _await_popup_event(self) -> None:
+        """等 popup 事件把 Page 句柄交给我们(拿到才能关 tab).
+
+        早期信号只能说明"有新 tab 在创建"; 真正关掉它、拿到它的 URL 仍要
+        等 popup 事件。这里用 future 唤醒而不是固定间隔轮询, 拿到事件后
+        立即继续。
+        """
+        hint_url = self._popup_hint_url
+        if self._redirect_tasks:
+            return
+        waiter: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._popup_waiters.append(waiter)
+        try:
+            await asyncio.wait_for(
+                waiter, timeout=self.POPUP_EVENT_TIMEOUT_MS / 1000
+            )
+        except asyncio.TimeoutError:
+            pass
+        finally:
+            try:
+                self._popup_waiters.remove(waiter)
+            except ValueError:
+                pass
+        if self._redirect_tasks:
+            return
+
+        if self._cdp_ready and self._popup_hint_target_id:
+            # CDP 明确告诉我们"本页面开了一个新 page target", 但 popup 事件
+            # 迟迟没来 → 改道无法完成. 主页面仍停在旧文档上, 必须把它记为
+            # 失败(而不是告警后继续), 否则后续采集会把旧页面当目标页。
+            self._record_popup_failure(
+                hint_url,
+                "a new page was opened by this page but its popup event never "
+                f"arrived within {self.POPUP_EVENT_TIMEOUT_MS}ms",
+            )
+        else:
+            # 无 CDP 时只能靠 context 级请求事件, 它无法区分"本页面开的
+            # 窗口"和"同 context 其它 tab 开的窗口", 因此这里只告警。
+            logger.warning(
+                "Observed a new-browser-context navigation "
+                f"({hint_url!r}) but no popup event arrived within "
+                f"{self.POPUP_EVENT_TIMEOUT_MS}ms; the tab was likely opened "
+                "outside this page's popup chain (e.g. by another page in the "
+                "same context), so no same-tab redirect was needed."
+            )
+        self._popup_hint_url = None
+        self._popup_hint_target_id = None
 
     async def navigate(self, url: str) -> None:
-        """对应 JS base-page.ts `navigate`."""
-        await self.page.goto(url)
+        """对应 JS base-page.ts `navigate`.
+
+        改道失败后主页面停在浏览器的错误页上, 而来电的 ``goto`` 可能被那次
+        残留导航打断("is interrupted by another navigation"). 显式导航是
+        调用方要求"离开这里"的动作, 所以这里对这类瞬时冲突做有限重试 ——
+        但重试前必须先确认前一次导航真的没把页面带到目的地, 否则会把已经
+        成功的导航再打断一次。
+        """
+        attempt = 0
+        while True:
+            try:
+                await self.page.goto(url)
+                break
+            except Exception as exc:
+                if not self._is_interrupted_navigation(exc) or attempt >= 2:
+                    raise
+                attempt += 1
+                await self._wait_for_navigation_settled()
+                if self._url_matches(url):
+                    logger.debug(
+                        f"Navigation target {url} was reached despite the "
+                        "interruption; not retrying"
+                    )
+                    break
+                logger.debug(
+                    f"Navigation to {url} was interrupted; retrying "
+                    f"(attempt {attempt})"
+                )
+        # 显式导航到别处后, 之前那次失败的改道不再"挡"住后续采集:
+        # 失败状态只在原地打转(截图/定位)时才有意义。
+        self._popup_redirect_error = None
         await self.wait_for_navigation()
+
+    async def _wait_for_navigation_settled(self) -> None:
+        """等当前那次导航落定(goto 被打断后调用)."""
+        try:
+            await self.page.wait_for_load_state(
+                "load", timeout=self.POPUP_ERROR_SETTLE_MS
+            )
+        except Exception as exc:
+            logger.debug(f"Navigation settle wait finished: {exc}")
+
+    def _url_matches(self, url: str) -> bool:
+        try:
+            return self.page.url == url
+        except Exception:
+            return False
+
+    @staticmethod
+    def _is_interrupted_navigation(exc: BaseException) -> bool:
+        """是否为"被另一次导航打断"这类可重试的瞬时错误."""
+        return "is interrupted by another navigation" in str(exc)
 
     async def reload(self) -> None:
         """对应 JS `reload`."""
@@ -138,6 +724,7 @@ class WebPage(AbstractInterface):
         # 用 documentElement.clientWidth/clientHeight(排除滚动条宽度),对齐 JS
         # base-page.ts:316-324 —— innerWidth/Height 会把经典滚动条的 15-17px 算进
         # 去,导致归一化坐标的参考系比 JS 宽,右/下边缘出现系统性偏移。
+        self._raise_if_popup_redirect_failed()
         size_info = await self.page.evaluate(
             """
             () => ({
@@ -529,9 +1116,27 @@ class WebPage(AbstractInterface):
         """
         等待导航完成
 
+        除元素等待外, 这里还负责把"刚弹出的新 tab 改道到当前 tab"这件事
+        收尾: popup 事件本身比动作返回晚 30-450ms, 若不等, 紧接着的截图
+        和元素定位就会落在改道前的旧文档上。
+
         Args:
             timeout: 超时时间（毫秒）
+
+        Raises:
+            PopupNavigationError: 同标签页改道失败 —— 当前文档不是改道目标,
+                调用方不应把它当成"已到达目标页"继续采集。
         """
+        # 改道是异步发起的, 无论动作配置的导航等待是多久都要先把它等完;
+        # 否则 timeout=0 的调用方会直接读到旧页面。
+        await self._settle_popup_redirect()
+        self._raise_if_popup_redirect_failed()
+
+        await self._wait_for_navigation_impl(timeout)
+
+    async def _wait_for_navigation_impl(
+        self, timeout: Optional[int] = None
+    ) -> None:
         timeout_ms = (
             timeout if timeout is not None else self.wait_for_navigation_timeout
         )
@@ -593,6 +1198,7 @@ class WebPage(AbstractInterface):
         """
         logger.debug(f"Evaluating JavaScript: {script[:100]}...")
 
+        self._raise_if_popup_redirect_failed()
         result = await self.page.evaluate(script)
 
         logger.debug(f"JavaScript evaluation result: {str(result)[:100]}...")
@@ -624,6 +1230,7 @@ class WebPage(AbstractInterface):
         """
         logger.debug(f"Getting XPath for element at ({x}, {y})")
 
+        self._raise_if_popup_redirect_failed()
         # JavaScript 代码：获取坐标处元素的 XPath
         xpath = await self.page.evaluate("""
             (coords) => {
@@ -690,6 +1297,7 @@ class WebPage(AbstractInterface):
         """
         logger.debug(f"Getting XPath candidates for element at ({x}, {y})")
 
+        self._raise_if_popup_redirect_failed()
         xpaths: List[str] = await self.page.evaluate(
             """
             (coords) => {
@@ -762,6 +1370,7 @@ class WebPage(AbstractInterface):
         """
         logger.debug(f"Getting element by XPath: {xpath}")
 
+        self._raise_if_popup_redirect_failed()
         try:
             # 使用 Playwright 的 locator 通过 XPath 定位
             locator = self.page.locator(f"xpath={xpath}")
@@ -876,7 +1485,8 @@ class WebPage(AbstractInterface):
             是否成功滚动
         """
         logger.debug(f"Scrolling element at ({x}, {y}) into view (block={block}, behavior={behavior})")
-        
+
+        self._raise_if_popup_redirect_failed()
         try:
             # 执行 JS 代码：获取元素并滚动到视口中心
             result = await self.page.evaluate("""
@@ -944,7 +1554,8 @@ class WebPage(AbstractInterface):
             是否成功滚动
         """
         logger.debug(f"Scrolling element by XPath into view: {xpath}")
-        
+
+        self._raise_if_popup_redirect_failed()
         try:
             # 执行 JS 代码：通过 XPath 获取元素并滚动
             result = await self.page.evaluate("""
