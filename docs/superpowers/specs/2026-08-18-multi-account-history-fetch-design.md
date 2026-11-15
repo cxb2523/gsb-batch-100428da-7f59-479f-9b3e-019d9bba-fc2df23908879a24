@@ -176,3 +176,28 @@ MITM 抓包 ──写入── credentials(+指纹)
 - `app/errors.py` — 仅当提示文案需要更清楚时小改
 
 不改同步服务器上传、批量导入抓包流程。
+
+## 翻页上限后的续翻状态（增量）
+
+`fetch_history_days` 达到 `max_pages` 且微信仍返回 `can_msg_continue` 时，除既有
+`next_offset` / `can_continue` / `scanned_oldest_ts` 外，额外返回 `resume` 载荷，供下一次
+点击直接回传（参数名 `resume`）：
+
+| 字段 | 含义 |
+|---|---|
+| `start_offset` / `next_offset` | 下一次续翻的起始 offset |
+| `scanned_from_offset` | 本次是从哪一页开始的（0 = 从头，>0 = 接上次） |
+| `oldest_ts` / `scanned_oldest_ts` | 已扫描到的最早发布时间（跨多次续翻取最早） |
+| `biz` / `__biz` | 本次扫描所属公众号 |
+| `merged_articles` / `article_count` | 合并补录后的文章数 |
+| `sighting_keys` | 已经计入 `merged_sightings` 的补录去重键 |
+| `can_continue` | 微信是否仍表示可继续 |
+
+续翻规则：`__biz` 与上次不一致 → `resume_reason=biz_changed` 并从第 0 页重来；
+上次 `oldest_ts` 已早于/等于本次时间范围下界 → `older_than_range_start` 并从第 0 页重来；
+其余情况沿用上次 offset。补录仍按 `__biz` 过滤、按 `mid|idx|sn` 去重，`sighting_keys`
+命中的补录会继续出现在文章列表里，但不再重复计入 `merged_sightings`。
+
+既有字段（`ok`、`error`、`articles`、`pages`、`warning`、`merged_sightings`、
+`stopped_reason`、`next_offset`、`can_continue`）保持不变；取消、接口报错、空页、
+`next_offset` 不前进等停止行为不变。

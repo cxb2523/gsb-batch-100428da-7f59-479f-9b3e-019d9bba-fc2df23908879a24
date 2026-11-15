@@ -70,7 +70,7 @@ from app.history_client import (
     fetch_history_days,
     merge_resumed_articles,
     oldest_publish_ts,
-    resolve_history_start_offset,
+    resume_plan_from_state,
 )
 from app.history_export import (
     FORMAT_LABELS,
@@ -2791,15 +2791,14 @@ class CertificateApp(ctk.CTk):
         if self._history_range_iso:
             start_ts = _iso_date_to_ts(self._history_range_iso[0])
             end_ts = _iso_date_to_ts(self._history_range_iso[1], end_of_day=True)
-        start_offset = resolve_history_start_offset(
+        plan = resume_plan_from_state(
+            self._history_resume,
             biz=biz,
-            resume_biz=str(self._history_resume.get("biz") or ""),
-            resume_offset=self._history_resume.get("next_offset"),
-            resume_oldest_ts=self._history_resume.get("oldest_ts"),
             days=self._history_days,
             start_ts=start_ts,
             end_ts=end_ts,
         )
+        start_offset = int(plan.get("start_offset") or 0)
         self._pending_resume_merge = (
             list(self._history_accumulated or self._history_articles)
             if start_offset > 0
@@ -2809,6 +2808,8 @@ class CertificateApp(ctk.CTk):
             self.set_hist_status(
                 f"从上次中断处续翻（offset={start_offset}）…", ok=True
             )
+        elif plan.get("restarted"):
+            self.set_hist_status("上次进度与本公众号/时间范围不匹配，已从头重新拉取…", ok=True)
 
         def worker() -> None:
             def progress(msg: str) -> None:
@@ -2825,6 +2826,7 @@ class CertificateApp(ctk.CTk):
                     start_ts=start_ts,
                     end_ts=end_ts,
                     start_offset=start_offset,
+                    resume=dict(self._history_resume or {}),
                 )
             except Exception as exc:  # noqa: BLE001
                 result = {"ok": False, "error": describe_exception(exc), "articles": []}
@@ -2877,19 +2879,30 @@ class CertificateApp(ctk.CTk):
         self._render_history_list()
         resume_biz = str(result.get("__biz") or (self._history_cred or {}).get("__biz") or "")
         next_off = result.get("next_offset")
-        if result.get("ok") and result.get("hit_page_cap") and next_off:
+        prev_oldest = self._history_resume.get("oldest_ts")
+        if result.get("ok") and result.get("hit_page_cap") and next_off and result.get(
+            "can_continue"
+        ):
             oldest = result.get("scanned_oldest_ts") or oldest_publish_ts(articles)
-            prev_oldest = self._history_resume.get("oldest_ts")
             if prev_oldest and oldest:
                 oldest = min(int(prev_oldest), int(oldest))
             elif prev_oldest and not oldest:
                 oldest = prev_oldest
-            self._history_resume = {
-                "biz": resume_biz,
-                "next_offset": int(next_off),
-                "oldest_ts": oldest,
-            }
-        elif result.get("ok") and not result.get("hit_page_cap"):
+            # Prefer the full resume payload so the next click also carries the
+            # __biz/window it belongs to and sightings already counted.
+            resume_state = dict(result.get("resume") or {})
+            resume_state["biz"] = resume_biz
+            resume_state["__biz"] = resume_biz
+            resume_state["next_offset"] = int(next_off)
+            resume_state["start_offset"] = int(next_off)
+            resume_state["oldest_ts"] = oldest
+            resume_state["scanned_oldest_ts"] = oldest
+            resume_state["merged_articles"] = len(articles)
+            resume_state["can_continue"] = bool(result.get("can_continue"))
+            self._history_resume = resume_state
+        elif result.get("ok"):
+            # Nothing left to continue from (finished, empty page, or WeChat
+            # stopped offering more) — drop stale progress.
             self._history_resume = {}
         if not result.get("ok"):
             self.set_hist_status(
@@ -2907,6 +2920,8 @@ class CertificateApp(ctk.CTk):
             else range_text(self._history_days)
         )
         msg = f"「{account_name}」{scope}共 {len(articles)} 篇（请求 {pages} 页）"
+        if result.get("resume_restarted"):
+            msg += "（上次进度已失效，本次从头拉取）"
         if warn:
             msg = f"{msg} · {warn}"
         self.set_hist_status(msg, ok=True)

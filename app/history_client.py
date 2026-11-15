@@ -477,6 +477,105 @@ def oldest_publish_ts(articles: list[dict[str, Any]]) -> int | None:
     return min(stamps) if stamps else None
 
 
+def _article_key(a: dict[str, Any]) -> str:
+    """Dedupe key shared by getmsg rows and merged sighting rows."""
+    mid = str(a.get("mid") or "")
+    idx = str(a.get("idx") or "")
+    sn = str(a.get("sn") or "")
+    if mid:
+        return f"mid:{mid}|idx:{idx or '1'}|sn:{sn}"
+    key = str(a.get("identity") or "") or article_identity(
+        str(a.get("link") or ""),
+        title=str(a.get("title") or ""),
+        publish_ts=int(a.get("publish_ts") or 0),
+    )
+    if not key:
+        key = f"t:{a.get('title')}|ts:{a.get('publish_ts')}|l:{a.get('link')}"
+    return key
+
+
+def _dedupe(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for a in articles:
+        key = _article_key(a)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(a)
+    return out
+
+
+def plan_history_resume(
+    *,
+    biz: str,
+    resume_biz: str = "",
+    resume_offset: int | None = None,
+    resume_oldest_ts: int | None = None,
+    days: int | None = None,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+) -> dict[str, Any]:
+    """Decide where a (possibly resumed) getmsg scan starts.
+
+    Returns ``start_offset`` (0 = newest, >0 = continue after a page cap) plus
+    why we chose it, so callers can tell "continued last progress" apart from
+    "started over". A resume is dropped when the account changed or when the
+    previously scanned window already reaches past this run's lower bound.
+    """
+    try:
+        offset = int(resume_offset or 0)
+    except (TypeError, ValueError):
+        offset = 0
+    plan: dict[str, Any] = {
+        "start_offset": 0,
+        "resume_biz": (resume_biz or "").strip(),
+        "resume_offset": offset,
+        "resume_oldest_ts": resume_oldest_ts,
+        "restarted": False,
+        "resumed": False,
+        "reason": "no_resume",
+    }
+    if offset <= 0:
+        return plan
+    if (biz or "").strip() != (resume_biz or "").strip():
+        plan["restarted"] = True
+        plan["reason"] = "biz_changed"
+        return plan
+
+    range_mode = start_ts is not None or end_ts is not None
+    need_older_than: int | None = None
+    if not range_mode and days is None:
+        # 「全部」：一直往更早翻，续翻永远有意义。
+        plan["start_offset"] = offset
+        plan["resumed"] = True
+        plan["reason"] = "same_account"
+        return plan
+    if start_ts is not None:
+        need_older_than = int(start_ts)
+    elif days is not None:
+        need_older_than = int(time.time()) - max(1, int(days)) * 86400
+    if need_older_than is None or resume_oldest_ts is None:
+        plan["start_offset"] = offset
+        plan["resumed"] = True
+        plan["reason"] = "same_account"
+        return plan
+    try:
+        oldest = int(resume_oldest_ts)
+    except (TypeError, ValueError):
+        oldest = 0
+    if oldest > 0 and oldest <= need_older_than:
+        # 上次已扫描到本次时间范围下界（或更早）：旧 offset 只会翻到范围之外，
+        # 续翻没有意义，按新窗口从头开始。
+        plan["restarted"] = True
+        plan["reason"] = "older_than_range_start"
+        return plan
+    plan["start_offset"] = offset
+    plan["resumed"] = True
+    plan["reason"] = "same_account"
+    return plan
+
+
 def resolve_history_start_offset(
     *,
     biz: str,
@@ -488,51 +587,76 @@ def resolve_history_start_offset(
     end_ts: int | None = None,
 ) -> int:
     """Where to start getmsg paging. 0 = newest; >0 = continue after a 100-page cap."""
-    try:
-        offset = int(resume_offset or 0)
-    except (TypeError, ValueError):
-        offset = 0
-    if offset <= 0:
-        return 0
-    if (biz or "").strip() != (resume_biz or "").strip():
-        return 0
-    range_mode = start_ts is not None or end_ts is not None
-    if not range_mode and days is None:
-        return offset
-    need_older_than = int(start_ts) if start_ts is not None else None
-    if need_older_than is None and days is not None:
-        need_older_than = int(time.time()) - max(1, int(days)) * 86400
-    if need_older_than is None:
-        return offset
+    return int(
+        plan_history_resume(
+            biz=biz,
+            resume_biz=resume_biz,
+            resume_offset=resume_offset,
+            resume_oldest_ts=resume_oldest_ts,
+            days=days,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )["start_offset"]
+    )
+
+
+_RESUME_BIZ_KEYS = ("biz", "__biz")
+_RESUME_OFFSET_KEYS = ("next_offset", "offset", "start_offset")
+_RESUME_OLDEST_KEYS = ("oldest_ts", "scanned_oldest_ts")
+_RESUME_SIGHTING_KEYS = (
+    "sighting_keys",
+    "merged_sighting_keys",
+    "sighting_identities",
+)
+
+
+def resume_plan_from_state(
+    resume: dict[str, Any] | None,
+    *,
+    biz: str,
+    resume_biz: str = "",
+    resume_offset: int | None = None,
+    resume_oldest_ts: int | None = None,
+    days: int | None = None,
+    start_ts: int | None = None,
+    end_ts: int | None = None,
+) -> dict[str, Any]:
+    """Merge a previous ``resume`` payload with explicit args, then plan.
+
+    Explicit arguments win over fields carried in ``resume``.
+    """
+    state = dict(resume or {})
+
+    def _pick(keys: tuple[str, ...]) -> Any:
+        for k in keys:
+            if k in state and state[k] is not None:
+                return state[k]
+        return None
+
+    if not (resume_biz or "").strip():
+        resume_biz = str(_pick(_RESUME_BIZ_KEYS) or "")
+    from_state = resume_offset is None
+    if from_state:
+        resume_offset = _pick(_RESUME_OFFSET_KEYS)
     if resume_oldest_ts is None:
-        return offset
-    if int(resume_oldest_ts) > need_older_than:
-        return offset
-    return 0
-
-
-def _dedupe(articles: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    out: list[dict[str, Any]] = []
-    for a in articles:
-        mid = str(a.get("mid") or "")
-        idx = str(a.get("idx") or "")
-        sn = str(a.get("sn") or "")
-        if mid:
-            key = f"mid:{mid}|idx:{idx or '1'}|sn:{sn}"
-        else:
-            key = str(a.get("identity") or "") or article_identity(
-                str(a.get("link") or ""),
-                title=str(a.get("title") or ""),
-                publish_ts=int(a.get("publish_ts") or 0),
-            )
-        if not key:
-            key = f"t:{a.get('title')}|ts:{a.get('publish_ts')}|l:{a.get('link')}"
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(a)
-    return out
+        resume_oldest_ts = _pick(_RESUME_OLDEST_KEYS)
+    if from_state and state.get("can_continue") is False:
+        # A previous run that ended for good (finished/empty page) must not be
+        # resurrected as a resume just because it remembers its final offset.
+        resume_offset = 0
+    plan = plan_history_resume(
+        biz=biz,
+        resume_biz=resume_biz,
+        resume_offset=resume_offset,
+        resume_oldest_ts=resume_oldest_ts,
+        days=days,
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
+    plan["sighting_keys"] = [
+        str(k) for k in (_pick(_RESUME_SIGHTING_KEYS) or []) if str(k)
+    ]
+    return plan
 
 
 def _sighting_to_article(s: dict[str, Any]) -> dict[str, Any] | None:
@@ -576,11 +700,16 @@ def merge_articles_with_sightings(
     *,
     cutoff_ts: int = 0,
     biz: str = "",
+    collect_sighting_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Merge getmsg articles with MITM/manual sightings (fills API gaps).
 
     WeChat often omits later same-day pushes from ``getmsg``. Sightings collected
     while browsing (or补录) are merged in and deduped by mid|idx|sn / identity.
+
+    ``collect_sighting_keys`` collects every sighting key that contributed a row,
+    so a later (resumed) fetch can avoid counting the same补录 twice while still
+    merging it into the visible article list.
     """
     rows: list[dict[str, Any]] = []
     for a in base or []:
@@ -608,6 +737,9 @@ def merge_articles_with_sightings(
         ts = int(art.get("publish_ts") or 0)
         if cutoff_ts and ts and ts < cutoff_ts:
             continue
+        if collect_sighting_keys is not None:
+            # Same key space as ``_article_key`` so a later resume can compare.
+            collect_sighting_keys.add(_article_key(art))
         rows.append(art)
 
     merged = _dedupe(rows)
@@ -620,6 +752,30 @@ def merge_articles_with_sightings(
     ]
     merged.sort(key=lambda a: int(a.get("publish_ts") or 0), reverse=True)
     return merged
+
+
+def _count_new_sightings(
+    merged: list[dict[str, Any]],
+    base: list[dict[str, Any]],
+    *,
+    seen_sighting_keys: set[str] | None = None,
+) -> int:
+    """How many merged rows came from补录/抓包 and were not counted before.
+
+    ``seen_sighting_keys`` holds keys an earlier (resumed) fetch already
+    reported, so continuing after a page cap does not count the same补录 again.
+    """
+    seen = seen_sighting_keys or set()
+    base_keys = {_article_key(a) for a in _dedupe(base)}
+    extra = 0
+    for row in merged:
+        key = _article_key(row)
+        if key in base_keys:
+            continue
+        if key in seen:
+            continue
+        extra += 1
+    return max(0, extra)
 
 
 def is_rate_limit_error(err: str) -> bool:
@@ -694,6 +850,7 @@ def fetch_history_days(
     start_ts: int | None = None,
     end_ts: int | None = None,
     start_offset: int = 0,
+    resume: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Paginate getmsg and keep articles with publish_ts within the last ``days``.
 
@@ -705,6 +862,13 @@ def fetch_history_days(
 
     ``sightings`` (MITM browse / 补录) are merged in because WeChat often omits
     later same-day pushes from getmsg alone.
+
+    Resuming after a page cap: pass the previous result back as ``resume`` (or
+    explicitly ``start_offset``). A stale resume — different ``__biz``, or
+    already scanned past this run's lower bound — is dropped and the scan
+    restarts at offset 0. The result always carries everything the next call
+    needs: ``resume`` (start offset, oldest scanned ts, ``__biz``, merged
+    article count, already-counted sighting keys) plus the legacy flat fields.
     """
     cred = normalize_credentials(cred)
     ok, err = validate_credentials(cred)
@@ -739,8 +903,40 @@ def fetch_history_days(
         scope = "全部历史" if days is None else f"近 {days} 天"
     articles: list[dict[str, Any]] = []
     pages = 0
+    biz = str(cred.get("__biz") or "").strip()
+    # Decide resume before touching the network: the same rule the UI shows
+    # ("continued last progress" vs "started over"). A ``resume`` payload from
+    # an earlier page-cap result wins over the legacy explicit ``start_offset``,
+    # because only it knows which __biz/time window that offset belonged to.
+    if resume:
+        resume_info = resume_plan_from_state(
+            resume,
+            biz=biz,
+            resume_offset=start_offset or None,
+            days=days,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+    else:
+        try:
+            legacy_offset = max(0, int(start_offset or 0))
+        except (TypeError, ValueError):
+            legacy_offset = 0
+        resume_info = {
+            "start_offset": legacy_offset,
+            "restarted": False,
+            "resumed": legacy_offset > 0,
+            "reason": "explicit_start_offset" if legacy_offset > 0 else "no_resume",
+        }
+    # A restart at offset 0 is a fresh scan: whatever sighting keys an older
+    # page-cap run counted must not suppress this run's counts.
+    scan_start_offset = int(resume_info["start_offset"])
+    is_resume = scan_start_offset > 0
+    seen_sighting_keys = (
+        set(resume_info.get("sighting_keys") or []) if is_resume else set()
+    )
     try:
-        offset = max(0, int(start_offset or 0))
+        offset = max(0, int(scan_start_offset or 0))
     except (TypeError, ValueError):
         offset = 0
     start_offset = offset
@@ -749,15 +945,69 @@ def fetch_history_days(
     hit_page_cap = False
     last_can_continue = False
     scanned_oldest: int | None = None
-    biz = str(cred.get("__biz") or "").strip()
+    sighting_keys: set[str] = set(seen_sighting_keys) if is_resume else set()
 
     page_limit = max(1, int(max_pages))
     t0 = time.time()
     stop_reason = "completed"
+    # Earliest publish_ts seen by an *earlier* resumed run; kept so the returned
+    # resume state never looks younger than the chain actually scanned. A
+    # restart at page 0 deliberately forgets it.
+    prior_oldest = resume_info.get("resume_oldest_ts") if is_resume else None
+
+    def _merge_and_count() -> tuple[list[dict[str, Any]], int, set[str]]:
+        keys: set[str] = set()
+        merged = merge_articles_with_sightings(
+            articles,
+            sightings or [],
+            cutoff_ts=cutoff,
+            biz=biz,
+            collect_sighting_keys=keys,
+        )
+        merged_sightings = _count_new_sightings(
+            merged,
+            articles,
+            seen_sighting_keys=seen_sighting_keys if is_resume else None,
+        )
+        return merged, merged_sightings, keys | sighting_keys
+
+    def _merged_oldest() -> int | None:
+        oldest = scanned_oldest
+        try:
+            po = int(prior_oldest) if prior_oldest is not None else 0
+        except (TypeError, ValueError):
+            po = 0
+        if po > 0:
+            oldest = po if oldest is None else min(oldest, po)
+        return oldest
+
+    def _resume_fields(
+        merged_len: int, keys: set[str], *, can_continue: bool
+    ) -> dict[str, Any]:
+        """Payload the *next* click needs; self-contained (no UI state required)."""
+        oldest = _merged_oldest()
+        return {
+            # ``start_offset`` / ``next_offset`` = where the next run begins.
+            "start_offset": offset,
+            "next_offset": offset if can_continue else None,
+            # Where *this* run began (0 = fresh scan, >0 = continued).
+            "scanned_from_offset": start_offset,
+            "oldest_ts": oldest,
+            "scanned_oldest_ts": oldest,
+            "biz": biz,
+            "__biz": biz,
+            "merged_articles": merged_len,
+            "article_count": merged_len,
+            "sighting_keys": sorted(keys),
+            "can_continue": bool(can_continue),
+            "pages": pages,
+        }
+
     for i in range(page_limit):
         if should_cancel and should_cancel():
-            partial = merge_articles_with_sightings(
-                articles, sightings or [], cutoff_ts=cutoff, biz=biz
+            partial, partial_sightings, keys = _merge_and_count()
+            resume_state = _resume_fields(
+                len(partial), keys, can_continue=False
             )
             return {
                 "ok": False,
@@ -768,8 +1018,14 @@ def fetch_history_days(
                 "days": days,
                 "cutoff_ts": cutoff,
                 "warning": "",
-                "merged_sightings": max(0, len(partial) - len(_dedupe(articles))),
+                "merged_sightings": partial_sightings,
                 "stopped_reason": "cancelled",
+                "__biz": biz,
+                "start_offset": start_offset,
+                "next_offset": None,
+                "can_continue": False,
+                "scanned_oldest_ts": resume_state["oldest_ts"],
+                "resume": resume_state,
             }
         if on_progress:
             elapsed = int(time.time() - t0)
@@ -791,14 +1047,13 @@ def fetch_history_days(
             }
         pages += 1
         if not page.get("ok"):
-            partial = merge_articles_with_sightings(
-                articles, sightings or [], cutoff_ts=cutoff, biz=biz
-            )
+            partial, partial_sightings, keys = _merge_and_count()
             err_text = page.get("error") or "getmsg 失败"
             hint = _rate_limit_hint(err_text)
             stopped = classify_stopped_reason(err_text)
             if hint:
                 err_text += hint
+            resume_state = _resume_fields(len(partial), keys, can_continue=False)
             return {
                 "ok": False,
                 "error": err_text,
@@ -807,8 +1062,14 @@ def fetch_history_days(
                 "days": days,
                 "cutoff_ts": cutoff,
                 "warning": "",
-                "merged_sightings": max(0, len(partial) - len(_dedupe(articles))),
+                "merged_sightings": partial_sightings,
                 "stopped_reason": stopped,
+                "__biz": biz,
+                "start_offset": start_offset,
+                "next_offset": None,
+                "can_continue": False,
+                "scanned_oldest_ts": resume_state["oldest_ts"],
+                "resume": resume_state,
             }
 
         batch = page.get("articles") or []
@@ -890,28 +1151,29 @@ def fetch_history_days(
             time.sleep(delay)
         else:
             hit_page_cap = True
-            last_can_continue = True
 
     _debug_log(
         "STOP reason=" + stop_reason + " pages=" + str(pages) + " raw_articles=" + str(len(articles))
         + " cutoff=" + str(cutoff) + " upper=" + str(upper_ts)
     )
-    base_n = len(_dedupe(articles))
-    deduped = merge_articles_with_sightings(
-        articles, sightings or [], cutoff_ts=cutoff, biz=biz
-    )
+    deduped, merged_extra, keys = _merge_and_count()
     _debug_log(
         "RESULT deduped=" + str(len(deduped)) + " raw=" + str(len(articles))
         + " merged_sightings=" + str(len(sightings or []))
     )
-    merged_extra = max(0, len(deduped) - base_n)
     if upper_ts is not None:
         deduped = [a for a in deduped if not (int(a.get("publish_ts") or 0) > upper_ts)]
+
+    can_continue = bool(hit_page_cap and last_can_continue)
+    # Legacy field kept as-is (offset reached when the page cap stopped us).
+    next_offset = offset if hit_page_cap else None
+    resume_state = _resume_fields(len(deduped), keys, can_continue=can_continue)
 
     warn = ""
     if hit_page_cap and last_can_continue:
         warn = (
-            f"已达翻页上限 {page_limit} 页，{scope}可能仍有文章未拉完，请再点一次拉取续翻。"
+            f"已达翻页上限 {page_limit} 页，{scope}可能仍有文章未拉完；"
+            f"再点一次拉取将从 offset={offset} 接着上次进度续翻。"
         )
     if merged_extra:
         extra = f"已合并补录/抓包 {merged_extra} 篇"
@@ -938,7 +1200,15 @@ def fetch_history_days(
         "__biz": biz,
         "stopped_reason": "completed",
         "start_offset": start_offset,
-        "next_offset": offset if hit_page_cap else None,
-        "can_continue": bool(hit_page_cap and last_can_continue),
-        "scanned_oldest_ts": scanned_oldest,
+        "next_offset": next_offset,
+        "can_continue": can_continue,
+        "scanned_oldest_ts": resume_state["oldest_ts"],
+        "merged_articles": len(deduped),
+        "article_count": len(deduped),
+        # Additive: actual paging stop reason (``stopped_reason`` stays "completed"
+        # for backward compatibility, as before).
+        "paging_stop_reason": stop_reason,
+        "resume": resume_state,
+        "resume_restarted": bool(resume_info.get("restarted")),
+        "resume_reason": str(resume_info.get("reason") or ""),
     }
