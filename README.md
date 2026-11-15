@@ -41,7 +41,7 @@ python -m playwright install chromium
 ### 基本用法
 
 ```bash
-python -m src.interface.cli wiki \
+python -m src.application.interface.cli wiki \
 	"https://deepwiki.com/username/repository" \
 	-o "/path/to/output"
 ```
@@ -51,6 +51,23 @@ python -m src.interface.cli wiki \
 | 参数       | 类型   | 必需 | 说明              |
 | ---------- | ------ | ---- | ----------------- |
 | `-o` | string | ✅   | 输出目录路径      |
+
+### 输出约定
+
+输出目录固定为 `<输出目录>/wiki/<组织>/<仓库>`，其中：
+
+- 每个导航页面都会得到一个明确结局：`saved`（已保存）、`title_mismatch`（标题匹配失败）或 `content_missing`（内容缺失）。
+- 只有成功保存的页面才会写入文件；匹配不到内容的页面不会产生空文件或错页文件，其标题与原因会在运行结束时汇总打印。
+- `index.md` 只列出实际保存成功的页面，链接文件名与磁盘文件一致。
+- 页面与内容的匹配优先使用页面 ID / URL 路径等稳定标识，标题匹配仅作为兜底，且同一份内容不会被多个页面重复占用。
+
+### 运行测试
+
+```bash
+uv run pytest
+```
+
+测试仅使用本地假数据，不依赖真实网络请求。
 
 ---
 

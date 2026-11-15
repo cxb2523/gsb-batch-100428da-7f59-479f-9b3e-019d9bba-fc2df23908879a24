@@ -27,7 +27,13 @@ class FileRepository:
         Args:
             content: The markdown content to save.
             filepath: The path to the file.
+
+        Raises:
+            ValueError: If the content is empty, so no blank page files are
+                ever produced.
         """
+        if content is None or not content.strip():
+            raise ValueError(f"refusing to write empty markdown to {filepath}")
         self.file_adapter.write_file(filepath, content)
 
     def create_directory(self, dir_path: str) -> None:

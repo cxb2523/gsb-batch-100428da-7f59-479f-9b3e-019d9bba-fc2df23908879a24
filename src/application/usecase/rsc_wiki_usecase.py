@@ -6,39 +6,59 @@ Usecase for converting a wiki site to markdown using RSC interception.
 """
 
 import os
-import re
-from urllib.parse import quote
+from typing import List, Optional
+
+from src.domain.models.wiki_page import (
+    ConversionResult,
+    PageOutcome,
+    PageResult,
+    WikiContent,
+)
+from src.domain.services.page_filename import (
+    build_page_filename,
+    escape_link_text,
+    relative_link,
+)
+from src.domain.services.page_matcher import PageMatcher
 from src.domain.models.wikisite_entity import WikiSite
-from src.infrastructure.repository.rsc_repository import RSCRepository
-from src.infrastructure.repository.file_repository import FileRepository
+
 
 class ConvertWikiSiteToMarkdownViaRSCUsecase:
     """
     通过RSC拦截将DeepWiki站点转换为Markdown文档集合的用例。
+
+    抓取与落盘之间通过 ``rsc_repository`` / ``file_repository`` 两个边界解耦，
+    测试时可以注入返回假数据的仓储实现。
     """
 
     def __init__(
         self,
-        rsc_repository: RSCRepository,
-        file_repository: FileRepository,
+        rsc_repository,
+        file_repository,
+        matcher: Optional[PageMatcher] = None,
     ):
         """
         Initialize the usecase with repositories.
 
         Args:
-            rsc_repository: For fetching RSC content.
+            rsc_repository: For fetching RSC content (``fetch_wiki_content``).
             file_repository: For file operations.
+            matcher: Optional matcher override (useful for tests).
         """
         self.rsc_repository = rsc_repository
         self.file_repository = file_repository
+        self.page_matcher = matcher or PageMatcher()
 
-    async def execute(self, url: str, output_base_dir: str) -> None:
+    async def execute(self, url: str, output_base_dir: str) -> ConversionResult:
         """
         通过RSC拦截将Wiki网站转换为Markdown文件的集合。
 
         Args:
             url: DeepWiki的URL (例: https://deepwiki.com/langchain-ai/langchain)
             output_base_dir: 输出目录的基本路径
+
+        Returns:
+            本次抓取的结算结果，包含每个导航页面的明确结局。
         """
         print("Starting RSC-based Wiki to Markdown conversion process...")
         print(f"Target URL: {url}")
@@ -54,178 +74,174 @@ class ConvertWikiSiteToMarkdownViaRSCUsecase:
         self.file_repository.ensure_directory(output_dir)
         print(f"Output directory: {output_dir}")
 
+        result = ConversionResult(output_directory=output_dir)
+
         # 3. 通过拦截RSC响应获取Wiki内容
         print("Fetching wiki content via RSC interception...")
         try:
-            pages_info, content_map, all_pages_content = await self.rsc_repository.fetch_wiki_content(url)
-            
-            if not pages_info:
-                print("No pages found via RSC interception. Exiting.")
-                return
-            
-            print(f"Found {len(pages_info)} pages via RSC interception.")
-            print(f"Successfully extracted content for {len(content_map)} pages.")
-            
-            # 保存页面信息以便在文件名生成中使用
-            self._current_pages_info = all_pages_content
-            
+            wiki_content = WikiContent.coerce(
+                await self.rsc_repository.fetch_wiki_content(url)
+            )
         except Exception as e:
             print(f"Error during RSC content extraction: {e}")
-            return
+            result.error = str(e)
+            return result
 
-        # 4. 直接保存获取到的Markdown内容
-        saved_count = 0
-        for page_num, page_info in enumerate(pages_info, 1):
-            page_url = page_info["url"]
-            page_title = page_info["title"]
-            
-            print(f"Processing page {page_num}/{len(pages_info)}: {page_title}")
-            
-            if page_url in content_map:
-                markdown_content = content_map[page_url]
-                
-                # 从内容映射中提取页面信息来生成正确的文件名
-                # 尝试从all_pages_content中找到匹配的页面信息
-                page_id = None
-                actual_title = page_title
-                
-                # 如果有详细的页面信息，使用它们
-                if hasattr(self, '_current_pages_info'):
-                    for page_key, page_data in self._current_pages_info.items():
-                        if page_data.get('content') == markdown_content:
-                            page_id = page_data.get('id')
-                            actual_title = page_data.get('title', page_title)
-                            break
-                
-                # 生成保持层级关系的文件名
-                if page_id:
-                    page_filename = self._generate_hierarchical_filename(actual_title, page_id)
-                else:
-                    page_filename = self._generate_filename(page_title, page_num)
-                
-                page_filepath = os.path.join(output_dir, page_filename)
-                                
-                self.file_repository.save_markdown(markdown_content, page_filepath)
-                print(f"Saved: {page_filepath}")
-                saved_count += 1
-                
-            else:
-                print(f"Warning: No content found for page: {page_title}")
+        if not wiki_content.navigation_pages:
+            print("No navigation pages found via RSC interception. Exiting.")
+            result.error = "no navigation pages found"
+            # Refresh the index so a previous run's links cannot survive.
+            self._write_index(result, wiki_site)
+            return result
 
-        # 5. 生成简单的索引页面
-        if saved_count > 0:
-            index_content = self._generate_simple_index(pages_info, wiki_site.organization, wiki_site.repository)
-            index_filepath = os.path.join(output_dir, "index.md")
+        print(f"Found {len(wiki_content.navigation_pages)} navigation pages.")
+        print(f"Extracted content for {len(wiki_content.content_pages)} pages.")
+
+        # 4. 将导航链接与内容匹配（稳定标识优先，标题仅作兜底）
+        matches = self.page_matcher.match(wiki_content)
+
+        # 5. 保存匹配成功的页面；其余页面只记录结局，不写出空文件/错页文件
+        used_filenames: set[str] = set()
+        for page_num, match in enumerate(matches, 1):
+            title = match.navigation.title
+            print(f"Processing page {page_num}/{len(matches)}: {title}")
+
+            if match.status is PageOutcome.SAVED and match.content is not None:
+                filename = build_page_filename(
+                    match.page_id,
+                    title,
+                    page_num,
+                    used_filenames,
+                )
+                page_filepath = os.path.join(output_dir, filename)
+
+                try:
+                    self.file_repository.save_markdown(
+                        match.content.content, page_filepath
+                    )
+                except Exception as exc:
+                    # A failed write must not be counted as saved nor linked
+                    # from the index.
+                    print(f"  Failed to write {page_filepath}: {exc}")
+                    result.pages.append(
+                        PageResult(
+                            title=title,
+                            url=match.navigation.url,
+                            status=PageOutcome.CONTENT_MISSING,
+                            reason=f"write failed: {exc}",
+                            page_id=match.page_id,
+                        )
+                    )
+                    continue
+
+                used_filenames.add(filename)
+                print(f"  Saved: {page_filepath} (matched by {match.match_kind})")
+                result.pages.append(
+                    PageResult(
+                        title=title,
+                        url=match.navigation.url,
+                        status=PageOutcome.SAVED,
+                        reason=f"matched by {match.match_kind}",
+                        filename=filename,
+                        page_id=match.page_id,
+                    )
+                )
+                continue
+
+            # Not written: record the explicit outcome instead of guessing.
+            reason = match.reason or "content could not be matched"
+            status = (
+                match.status
+                if match.status is not PageOutcome.SAVED
+                else PageOutcome.CONTENT_MISSING
+            )
+            print(f"  Skipped ({status.value}): {reason}")
+            result.pages.append(
+                PageResult(
+                    title=title,
+                    url=match.navigation.url,
+                    status=status,
+                    reason=reason,
+                    page_id=match.page_id,
+                )
+            )
+
+        # 6. 索引只列出真正落盘的页面；即使本次一页未存也重写索引，
+        #    避免上一轮遗留的 index.md 继续链接已失效的页面。
+        self._write_index(result, wiki_site)
+
+        self._report(result)
+        return result
+
+    def _write_index(self, result: ConversionResult, wiki_site: WikiSite) -> None:
+        """Write ``index.md`` from the pages that actually reached disk."""
+        index_content = self._generate_index(
+            result.saved_pages,
+            wiki_site.organization,
+            wiki_site.repository,
+        )
+        index_filepath = os.path.join(result.output_directory, "index.md")
+        try:
             self.file_repository.save_markdown(index_content, index_filepath)
+            result.index_path = index_filepath
             print(f"Generated index page: {index_filepath}")
+        except Exception as exc:
+            print(f"Failed to write index {index_filepath}: {exc}")
+            result.error = f"index write failed: {exc}"
 
-        print(f"Successfully saved {saved_count} wiki pages as Markdown files via RSC.")
-        print(f"Output directory: {output_dir}")
-
-    def _generate_filename(self, title: str, page_number: int) -> str:
-        """
-        生成文件名。
-        
-        Args:
-            title: 页面标题
-            page_number: 页面编号
-            
-        Returns:
-            清理后的文件名
-        """
-        # 清理标题，移除特殊字符
-        sanitized_title = re.sub(r'[^\w\s-]', '', title)
-        sanitized_title = re.sub(r'[-\s]+', '-', sanitized_title).strip('-')
-        
-        return f"{page_number}-{sanitized_title.lower()}.md"
-
-    def _generate_simple_index(self, pages_info: list, organization: str, repository: str) -> str:
-        """
-        生成简单的索引页面内容。
-        
-        Args:
-            pages_info: 页面信息列表
-            organization: 组织名
-            repository: 仓库名
-            
-        Returns:
-            索引页面的Markdown内容
-        """
+    def _generate_index(
+        self,
+        saved_pages: List[PageResult],
+        organization: str,
+        repository: str,
+    ) -> str:
+        """生成只包含已保存页面的索引，链接文件名与磁盘文件一致。"""
         lines = [
             f"# {organization}/{repository}",
             "",
             "## Pages",
-            ""
+            "",
         ]
-        
-        # 使用 self._current_pages_info 中的实际文件名映射
-        if hasattr(self, '_current_pages_info') and self._current_pages_info:
-            # 按照页面ID排序，确保目录顺序正确
-            sorted_pages = sorted(self._current_pages_info.items(), 
-                                key=lambda x: self._extract_sort_key(x[1].get('id', '0')))
-            
-            for page_key, page_data in sorted_pages:
-                title = page_data.get('title', page_key)
-                page_id = page_data.get('id', '')
-                # 生成文件名（与实际保存的文件名一致）
-                filename = self._generate_hierarchical_filename(title, page_id)
-                # 对文件名进行URL编码以确保链接合法
-                encoded_filename = quote(filename)
-                lines.append(f"- [{title}](./{encoded_filename})")
-        else:
-            # 回退到原始方法
-            for page_num, page_info in enumerate(pages_info, 1):
-                page_title = page_info["title"]
-                filename = self._generate_filename(page_title, page_num)
-                # 对文件名进行URL编码以确保链接合法
-                encoded_filename = quote(filename)
-                lines.append(f"- [{page_title}](./{encoded_filename})")
-        
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-        lines.append("*Generated by deepwiki-get via RSC interception*")
-        lines.append("")
-        
+
+        for page in saved_pages:
+            if not page.filename:
+                continue
+            lines.append(
+                f"- [{escape_link_text(page.title)}]"
+                f"({relative_link(page.filename)})"
+            )
+
+        lines.extend(
+            [
+                "",
+                "---",
+                "",
+                "*Generated by deepwiki-get via RSC interception*",
+                "",
+            ]
+        )
         return "\n".join(lines)
 
-    def _extract_sort_key(self, page_id: str) -> tuple:
-        """
-        从页面ID提取排序键，支持层级排序。
-        例如：'1' -> (1,), '2.1' -> (2, 1), '2.10' -> (2, 10)
-        
-        Args:
-            page_id: 页面ID字符串
-            
-        Returns:
-            排序用的元组
-        """
-        if not page_id:
-            return (0,)
-        
-        try:
-            # 分割页面ID并转换为整数元组
-            parts = page_id.split('.')
-            return tuple(int(part) for part in parts)
-        except ValueError:
-            # 如果转换失败，使用字符串排序
-            return (float('inf'), page_id)
+    def _report(self, result: ConversionResult) -> None:
+        """在日志中为每个未保存页面留下明确原因，并打印汇总。"""
+        mismatched = result.pages_with_status(PageOutcome.TITLE_MISMATCH)
+        missing = result.pages_with_status(PageOutcome.CONTENT_MISSING)
 
-    def _generate_hierarchical_filename(self, title: str, page_id: str) -> str:
-        """
-        生成保持层级关系的文件名。
-        
-        Args:
-            title: 页面标题
-            page_id: 页面ID（如 "2.3"）
-            
-        Returns:
-            层级化的文件名（如 "2.3 frontend application.md"）
-        """
-        # 避免/生成目录导致写文件错误
-        sanitized_title = title.replace('/', '-')
-        # 清理标题，移除特殊字符
-        # sanitized_title = re.sub(r'[^\w\s-]', '', title)
-        # sanitized_title = re.sub(r'[-\s]+', '-', sanitized_title).strip('-')
-        
-        return f"{page_id}-{sanitized_title}.md"
+        if mismatched:
+            print("\nPages skipped because no unique content match was found:")
+            for page in mismatched:
+                print(f"  - {page.title} ({page.url}): {page.reason}")
+
+        if missing:
+            print("\nPages skipped because content is missing:")
+            for page in missing:
+                print(f"  - {page.title} ({page.url}): {page.reason}")
+
+        print(
+            "\nSummary: "
+            f"{result.count(PageOutcome.SAVED)} saved, "
+            f"{result.count(PageOutcome.TITLE_MISMATCH)} title-mismatch, "
+            f"{result.count(PageOutcome.CONTENT_MISSING)} content-missing "
+            f"(total {len(result.pages)} navigation pages)"
+        )
+        print(f"Output directory: {result.output_directory}")

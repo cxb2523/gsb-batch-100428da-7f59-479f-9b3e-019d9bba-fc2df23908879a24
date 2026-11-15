@@ -62,8 +62,7 @@ async def execute_wiki_command(url: str, output_dir: str):
     )
     
     # Execute the RSC usecase
-    await usecase.execute(url, output_dir)
-        
+    return await usecase.execute(url, output_dir)
 
 
 
@@ -75,7 +74,10 @@ async def run_cli():
 
         # Branch according to the command
         if args.command == "wiki":
-            await execute_wiki_command(args.url, args.output)
+            result = await execute_wiki_command(args.url, args.output)
+            if result is not None and result.error:
+                print(f"Error: {result.error}", file=sys.stderr)
+                return 1
         else:
             print("Error: Unknown command. Use 'wiki'.")
             return 1
