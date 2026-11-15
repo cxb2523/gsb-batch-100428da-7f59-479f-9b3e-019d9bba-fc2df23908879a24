@@ -64,6 +64,7 @@ class Scanner:
         scan_result: Aggregated scan results
         timeout: HTTP request timeout
         results_lock: Thread lock for thread-safe result collection
+        crawl_stats: Cumulative crawl outcome counters (see reset_crawl_stats)
     """
     
     def __init__(
@@ -140,6 +141,19 @@ class Scanner:
         self.time_based_threshold: float = time_based_threshold
         self.scan_result: ScanResult = ScanResult(normalized_url)
         self.results_lock: Lock = Lock()
+        # Cumulative crawl outcome counters. Updated only under
+        # ``_crawl_stats_lock`` so they stay consistent while the thread
+        # pool scans; repeated crawl() calls accumulate until an explicit
+        # reset_crawl_stats().
+        self._crawl_stats_lock: Lock = Lock()
+        self.crawl_stats: Dict[str, int] = {
+            "pages_visited": 0,        # pages actually requested
+            "pages_succeeded": 0,      # pages whose links were parsed
+            "pages_failed": 0,         # pages whose request failed
+            "links_ignored": 0,        # links skipped by ignore rules
+            "links_truncated": 0,      # links dropped by the max_links cap
+            "endpoints_discovered": 0, # links appended to target_links
+        }
         self._target_parts = urlparse.urlsplit(normalized_url)
         self._seen_vulnerability_keys: Set[Tuple[str, str, str, str, str, str]] = set()
         
@@ -329,6 +343,35 @@ class Scanner:
             self._seen_vulnerability_keys.add(key)
             self.scan_result.add_vulnerability(vuln)
     
+    def _crawl_stat_add(self, key: str, amount: int = 1) -> None:
+        """Increment a crawl statistic (thread-safe)."""
+        with self._crawl_stats_lock:
+            self.crawl_stats[key] += amount
+
+    def _crawl_stat_value(self, key: str) -> int:
+        """Read a single crawl statistic (thread-safe)."""
+        with self._crawl_stats_lock:
+            return self.crawl_stats[key]
+
+    def get_crawl_stats(self) -> Dict[str, int]:
+        """Return a consistent snapshot of the crawl statistics.
+
+        Safe to call before or after run_scanner(); the returned dict is a
+        copy, so callers cannot mutate the live counters.
+        """
+        with self._crawl_stats_lock:
+            return dict(self.crawl_stats)
+
+    def reset_crawl_stats(self) -> None:
+        """Reset all crawl statistics to zero.
+
+        crawl() accumulates across calls; use this to start a fresh
+        measurement without creating a new Scanner.
+        """
+        with self._crawl_stats_lock:
+            for key in self.crawl_stats:
+                self.crawl_stats[key] = 0
+
     def extract_links_from(self, url: str) -> List[str]:
         """
         Extract hyperlinks from HTML content.
@@ -361,9 +404,11 @@ class Scanner:
             
         except requests.exceptions.Timeout:
             logger.warning(f"Timeout extracting links from {url}")
+            self._crawl_stat_add("pages_failed")
             return []
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to extract links from {url}: {e}")
+            self._crawl_stat_add("pages_failed")
             return []
     
     def crawl(self, url: Optional[str] = None, depth: int = 0, max_depth: Optional[int] = None) -> None:
@@ -402,14 +447,25 @@ class Scanner:
                 continue
 
             if self.max_links and len(self.target_links) >= self.max_links:
+                # Links already enqueued but never processed because of the
+                # cap count as truncated instead of being silently dropped.
+                pending = 1 + sum(
+                    1 for _, pending_depth in queue if pending_depth <= max_depth
+                )
+                self._crawl_stat_add("links_truncated", pending)
                 logger.info(f"Reached max_links limit ({self.max_links})")
                 break
 
+            self._crawl_stat_add("pages_visited")
+            failed_before = self._crawl_stat_value("pages_failed")
             try:
                 href_links: List[str] = self.extract_links_from(current)
             except Exception as e:
+                self._crawl_stat_add("pages_failed")
                 logger.debug(f"Error extracting links from {current}: {e}")
                 continue
+            if self._crawl_stat_value("pages_failed") == failed_before:
+                self._crawl_stat_add("pages_succeeded")
 
             # Provide feedback if no links found at initial URL
             if current == url and current_depth == depth and not href_links:
@@ -426,10 +482,6 @@ class Scanner:
 
             for link in href_links:
                 try:
-                    # Respect the max_links limit per discovered link too
-                    if self.max_links and len(self.target_links) >= self.max_links:
-                        break
-
                     # Normalize link
                     link = urlparse.urljoin(current, link)
 
@@ -443,12 +495,26 @@ class Scanner:
                     if not self._is_internal_url(link):
                         continue
 
-                    # Skip already-visited links and ignored patterns
-                    if link in visited or self._should_ignore_link(link):
+                    # Skip already-visited links
+                    if link in visited:
+                        continue
+
+                    # Skip ignored patterns (unchanged exact/path/glob semantics)
+                    if self._should_ignore_link(link):
+                        self._crawl_stat_add("links_ignored")
+                        continue
+
+                    # Respect the max_links limit per discovered link too.
+                    # Candidates past the cap are counted as truncated rather
+                    # than silently discarded; the crawl stops at the outer
+                    # loop's cap check once this page's links are tallied.
+                    if self.max_links and len(self.target_links) >= self.max_links:
+                        self._crawl_stat_add("links_truncated")
                         continue
 
                     visited.add(link)
                     self.target_links.append(link)
+                    self._crawl_stat_add("endpoints_discovered")
                     logger.info(f"Discovered: {link}")
                     print(f"[+] Discovered: {link}")
 

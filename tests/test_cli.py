@@ -98,6 +98,18 @@ def _mock_scan_result():
     return result
 
 
+def _mock_crawl_stats():
+    """Build a crawl stats dict that satisfies print_crawl_summary."""
+    return {
+        "pages_visited": 1,
+        "pages_succeeded": 1,
+        "pages_failed": 0,
+        "links_ignored": 0,
+        "links_truncated": 0,
+        "endpoints_discovered": 1,
+    }
+
+
 class TestCliMain:
     """Tests for the non-interactive CLI scan flow."""
 
@@ -108,6 +120,7 @@ class TestCliMain:
         mock_instance = Mock()
         mock_instance.target_links = ["http://example.com/page1"]
         mock_instance.run_scanner.return_value = _mock_scan_result()
+        mock_instance.get_crawl_stats.return_value = _mock_crawl_stats()
         mock_scanner_class.return_value = mock_instance
 
         output_dir = str(tmp_path / "reports")
@@ -132,6 +145,7 @@ class TestCliMain:
         mock_instance = Mock()
         mock_instance.target_links = ["http://example.com/page1"]
         mock_instance.run_scanner.return_value = _mock_scan_result()
+        mock_instance.get_crawl_stats.return_value = _mock_crawl_stats()
         mock_scanner_class.return_value = mock_instance
 
         args = parse_args([
@@ -152,6 +166,7 @@ class TestCliMain:
         mock_instance = Mock()
         mock_instance.target_links = ["http://example.com/page1"]
         mock_instance.run_scanner.return_value = _mock_scan_result()
+        mock_instance.get_crawl_stats.return_value = _mock_crawl_stats()
         mock_scanner_class.return_value = mock_instance
 
         args = parse_args([
@@ -183,6 +198,7 @@ class TestCliMain:
         mock_instance = Mock()
         mock_instance.target_links = ["http://example.com/page1"]
         mock_instance.run_scanner.return_value = _mock_scan_result()
+        mock_instance.get_crawl_stats.return_value = _mock_crawl_stats()
         mock_scanner_class.return_value = mock_instance
 
         args = parse_args([
@@ -218,6 +234,7 @@ class TestCliMain:
         """cli_main exits cleanly when the crawl discovers nothing."""
         mock_instance = Mock()
         mock_instance.target_links = []
+        mock_instance.get_crawl_stats.return_value = _mock_crawl_stats()
         mock_scanner_class.return_value = mock_instance
 
         args = parse_args(["--url", "http://example.com", "--no-banner"])
@@ -239,6 +256,7 @@ class TestMainDispatch:
         mock_instance = Mock()
         mock_instance.target_links = ["http://example.com/page1"]
         mock_instance.run_scanner.return_value = _mock_scan_result()
+        mock_instance.get_crawl_stats.return_value = _mock_crawl_stats()
         mock_scanner_class.return_value = mock_instance
 
         main(["--url", "http://example.com", "--no-banner"])
@@ -268,6 +286,7 @@ class TestMainDispatch:
         mock_instance = Mock()
         mock_instance.target_links = ["http://example.com/page1"]
         mock_instance.run_scanner.return_value = _mock_scan_result()
+        mock_instance.get_crawl_stats.return_value = _mock_crawl_stats()
         mock_scanner_class.return_value = mock_instance
 
         with patch("exploiterX.display_banner"):
