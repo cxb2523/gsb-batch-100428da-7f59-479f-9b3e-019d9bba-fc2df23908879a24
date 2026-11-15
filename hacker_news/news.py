@@ -36,6 +36,11 @@ class News:
         self.favicon = ''
         self.image = None
         self.img_id = ''
+        # Which chain actually served the body, see ParseResult in
+        # page_content_extractor.result. `self.url` stays the cache key.
+        self.final_url = url
+        self.parser_type = ''
+        self.via_jina = False
         self.cache: db.Summary = db.Summary(url)
 
     def __repr__(self):
@@ -69,6 +74,17 @@ class News:
         if not hasattr(self, '_parser'):
             logger.info("#%d, fetching %s", self.rank, self.url)
             self._parser = parser_factory(self.url)
+            result = getattr(self._parser, 'parse_result', None)
+            if result:
+                # Report the chain that handled this article without changing
+                # the cache key, which stays the originally submitted url.
+                self.final_url = result.final_url or self.url
+                self.parser_type = result.parser_type
+                self.via_jina = result.via_jina
+                logger.info("#%d, %s -> %s via %s parser%s%s",
+                            self.rank, self.url, self.final_url, self.parser_type,
+                            ' (jina proxy)' if result.via_jina else '',
+                            ''.join('; %s' % note for note in result.notes))
         return self._parser
 
     def get_score(self) -> int:
