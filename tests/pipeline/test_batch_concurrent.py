@@ -1,0 +1,854 @@
+import copy
+import logging
+import time
+import traceback
+
+import pytest
+
+from smartpipeline.error.handling import ErrorManager
+from tests.utils import (
+    HEAVY_TIMEOUT,
+    BatchErrorStage,
+    BatchExceptionStage,
+    BatchTextDuplicator,
+    BatchTextReverser,
+    ErrorStage,
+    ExceptionStage,
+    RandomTextSource,
+    SerializableBatchStage,
+    TextDuplicator,
+    TextReverser,
+    TimeWaster,
+    check_items,
+    get_item_with_timeout,
+    get_pipeline,
+    mark_item_checked,
+    run_with_timeout,
+)
+
+__author__ = "Giacomo Berardi <giacbrd.com>"
+
+logger = logging.getLogger(__name__)
+
+
+def test_concurrent_run():
+    """Concurrent batch pipelines deliver all items across executors."""
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(96))
+        .append("reverser0", BatchTextReverser(), concurrency=2)
+        .append("reverser1", BatchTextReverser(), concurrency=0)
+        .append("reverser2", BatchTextReverser(), concurrency=1)
+        .append("duplicator", BatchTextDuplicator(), concurrency=2)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 96, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(81))
+        .append("reverser0", BatchTextReverser(), concurrency=2, executor="processes")
+        .append("reverser1", BatchTextReverser(), concurrency=1, executor="processes")
+        .append("reverser2", BatchTextReverser(), concurrency=0)
+        .append(
+            "duplicator", BatchTextDuplicator(), concurrency=2, executor="processes"
+        )
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 81, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(92))
+        .append("reverser0", BatchTextReverser(), concurrency=0)
+        .append("reverser1", BatchTextReverser(), concurrency=1)
+        .append("duplicator", BatchTextDuplicator(), concurrency=0)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 92, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(83))
+        .append("reverser0", BatchTextReverser(), concurrency=1, executor="processes")
+        .append("reverser1", BatchTextReverser(), concurrency=1, executor="threads")
+        .append(
+            "duplicator", BatchTextDuplicator(), concurrency=1, executor="processes"
+        )
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 83, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(101))
+        .append("duplicator0", BatchTextDuplicator(), concurrency=0)
+        .append("reverser", BatchTextReverser(), concurrency=0)
+        .append("duplicator1", BatchTextDuplicator(), concurrency=0)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 101, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(100))
+        .append("reverser", BatchTextReverser(), concurrency=0)
+        .append("duplicator0", BatchTextDuplicator(), concurrency=0)
+        .append("duplicator1", BatchTextDuplicator(check_batch=True), concurrency=1)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 100, pipeline)
+
+
+def test_queue_sizes():
+    """Bounded queues deliver all items for concurrent batch stages."""
+    pipeline = (
+        get_pipeline(max_queues_size=1)
+        .set_source(RandomTextSource(93))
+        .append("reverser0", BatchTextReverser(), concurrency=2)
+        .append("reverser1", BatchTextReverser(), concurrency=0)
+        .append("reverser2", BatchTextReverser(), concurrency=1)
+        .append("duplicator", BatchTextDuplicator(), concurrency=2)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 93, pipeline)
+    pipeline = (
+        get_pipeline(max_queues_size=1)
+        .set_source(RandomTextSource(79))
+        .append("reverser0", BatchTextReverser(), concurrency=2, executor="processes")
+        .append("reverser1", BatchTextReverser(), concurrency=1, executor="processes")
+        .append("reverser2", BatchTextReverser(), concurrency=0)
+        .append(
+            "duplicator", BatchTextDuplicator(), concurrency=2, executor="processes"
+        )
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 79, pipeline)
+    pipeline = (
+        get_pipeline(max_queues_size=2)
+        .set_source(RandomTextSource(131))
+        .append("reverser0", BatchTextReverser(), concurrency=2, executor="processes")
+        .append("waster1", TimeWaster(0.02), concurrency=2, executor="processes")
+        .append("reverser1", BatchTextReverser(), concurrency=0)
+        .append("waster2", TimeWaster(0.03), concurrency=2)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 131, pipeline)
+    pipeline = (
+        get_pipeline(max_queues_size=0)
+        .set_source(RandomTextSource(4))
+        .append("reverser0", BatchTextReverser(), concurrency=2)
+        .append("reverser1", BatchTextReverser(), concurrency=0)
+        .append("reverser2", BatchTextReverser(), concurrency=1)
+        .append("duplicator", BatchTextDuplicator(), concurrency=2)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 4, pipeline)
+    pipeline = (
+        get_pipeline(max_queues_size=0)
+        .set_source(RandomTextSource(11))
+        .append("reverser0", BatchTextReverser(), concurrency=2, executor="processes")
+        .append("reverser1", BatchTextReverser(), concurrency=1, executor="processes")
+        .append("reverser2", BatchTextReverser(), concurrency=0)
+        .append(
+            "duplicator", BatchTextDuplicator(), concurrency=2, executor="processes"
+        )
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 11, pipeline)
+
+
+def test_mixed_concurrent_run():
+    """Mixed single and batch stages interoperate concurrently."""
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(96))
+        .append("reverser0", TextReverser(), concurrency=2)
+        .append("reverser1", BatchTextReverser(), concurrency=0)
+        .append("reverser2", TextReverser(), concurrency=1)
+        .append("duplicator", BatchTextDuplicator(), concurrency=2)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 96, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(81))
+        .append("reverser0", BatchTextReverser(), concurrency=2, executor="processes")
+        .append("reverser1", TextReverser(), concurrency=1, executor="processes")
+        .append("reverser2", TextReverser(), concurrency=0)
+        .append(
+            "duplicator", BatchTextDuplicator(), concurrency=2, executor="processes"
+        )
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 81, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(92))
+        .append("reverser0", BatchTextReverser(), concurrency=0)
+        .append("reverser1", TextReverser(), concurrency=1)
+        .append("duplicator", BatchTextDuplicator(), concurrency=0)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 92, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(83))
+        .append("reverser0", BatchTextReverser(), concurrency=1, executor="processes")
+        .append("reverser1", BatchTextReverser(), concurrency=1, executor="threads")
+        .append("duplicator", TextDuplicator(), concurrency=1, executor="processes")
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 83, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(100))
+        .append("duplicator0", TextDuplicator(), concurrency=0)
+        .append("reverser", TextReverser(), concurrency=0)
+        .append("duplicator1", BatchTextDuplicator(check_batch=True), concurrency=0)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 100, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(100))
+        .append("duplicator0", TextDuplicator(), concurrency=2)
+        .append("reverser", TextReverser(), concurrency=2)
+        .append("duplicator1", BatchTextDuplicator(), concurrency=2)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 100, pipeline)
+
+
+def test_concurrent_batch_single_stage_error_raises():
+    """A failing single stage in a concurrent batch pipeline raises out of run."""
+    with pytest.raises(Exception):
+        pipeline = (
+            get_pipeline()
+            .set_source(RandomTextSource(29))
+            .append("reverser", BatchTextReverser(size=7), concurrency=1)
+            .append("error", ExceptionStage(), concurrency=1)
+            .build()
+        )
+        try:
+            for _ in run_with_timeout(pipeline):
+                pass
+        except Exception:
+            tb = traceback.format_exc()
+            assert 'Exception("test exception")' in tb
+            assert "CriticalError" in tb
+            raise
+    with pytest.raises(Exception):
+        pipeline = (
+            get_pipeline()
+            .set_source(RandomTextSource(10))
+            .append(
+                "reverser",
+                BatchTextReverser(size=3),
+                concurrency=1,
+                executor="processes",
+            )
+            .append("error", ExceptionStage(), concurrency=1, executor="processes")
+            .build()
+        )
+        for _ in run_with_timeout(pipeline):
+            pass
+
+
+def test_concurrent_batch_single_soft_errors_flow():
+    """Single-stage soft errors flow with timings through concurrent batch pipelines."""
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(29))
+        .append("reverser", BatchTextReverser(size=3), concurrency=3)
+        .append("error", ErrorStage(), concurrency=1)
+        .append("duplicator", BatchTextDuplicator(size=7), concurrency=2)
+        .build()
+    )
+    for item in run_with_timeout(pipeline):
+        assert item.get_timing("reverser")
+        assert item.get_timing("duplicator")
+        assert any(k.startswith("text_") for k in item.data.keys())
+        assert item.get_timing("error")
+    assert pipeline.count == 29
+
+
+def test_concurrent_batch_stage_error_raises():
+    """A failing concurrent batch stage raises the wrapped error."""
+    with pytest.raises(Exception):
+        pipeline = (
+            get_pipeline()
+            .set_source(RandomTextSource(29))
+            .append("reverser", BatchTextReverser(size=7), concurrency=1)
+            .append("error", BatchExceptionStage(size=3), concurrency=1)
+            .build()
+        )
+        try:
+            for _ in run_with_timeout(pipeline):
+                pass
+        except Exception:
+            tb = traceback.format_exc()
+            assert 'Exception("test exception")' in tb
+            assert "CriticalError" in tb
+            raise
+    with pytest.raises(Exception):
+        pipeline = (
+            get_pipeline()
+            .set_source(RandomTextSource(10))
+            .append(
+                "reverser",
+                BatchTextReverser(size=3),
+                concurrency=1,
+                executor="processes",
+            )
+            .append(
+                "error",
+                BatchExceptionStage(size=1),
+                concurrency=1,
+                executor="processes",
+            )
+            .build()
+        )
+        try:
+            for _ in run_with_timeout(pipeline):
+                pass
+        except Exception:
+            tb = traceback.format_exc()
+            assert 'Exception("test exception")' in tb
+            assert "CriticalError" in tb
+            raise
+
+
+def test_concurrent_batch_wide_soft_errors_flow():
+    """Batch-wide soft errors flow with timings through concurrent batch pipelines."""
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(29))
+        .append("reverser", BatchTextReverser(size=3), concurrency=3)
+        .append("error", BatchErrorStage(size=13), concurrency=1)
+        .append("duplicator", BatchTextDuplicator(size=7), concurrency=2)
+        .build()
+    )
+    for item in run_with_timeout(pipeline):
+        assert item.get_timing("reverser")
+        assert item.get_timing("duplicator")
+        assert any(k.startswith("text_") for k in item.data.keys())
+        assert item.get_timing("error")
+    assert pipeline.count == 29
+
+
+def test_concurrent_batch_error_never_sticks_pipeline():
+    """A failing concurrent batch stage never sticks the pipeline, at any queue size."""
+    # a failing batch stage must not make the pipeline stuck, whatever the queues size is
+    for max_queues_size in (0, 1, 10):
+        with pytest.raises(Exception):
+            pipeline = (
+                get_pipeline(max_queues_size=max_queues_size)
+                .set_source(RandomTextSource(60))
+                .append("reverser", BatchTextReverser(size=3), concurrency=2)
+                .append("error", BatchExceptionStage(size=3), concurrency=2)
+                .append("duplicator", BatchTextDuplicator(size=5), concurrency=2)
+                .build()
+            )
+            run_with_timeout(pipeline)
+        with pytest.raises(Exception):
+            pipeline = (
+                get_pipeline(max_queues_size=max_queues_size)
+                .set_source(RandomTextSource(60))
+                .append("reverser", BatchTextReverser(size=3), concurrency=2)
+                .append("error", BatchExceptionStage(size=3), concurrency=2)
+                .build()
+            )
+            run_with_timeout(pipeline)
+
+
+def test_batch_stage_termination():
+    """a concurrent batch stage must be terminated and drained as any other concurrent stage"""
+    stage = SerializableBatchStage(size=3, timeout=0.1)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(10))
+        .append("stage", stage, concurrency=2)
+        .build()
+    )
+    assert len(run_with_timeout(pipeline)) == 10
+    assert stage.is_closed()
+    # a forced termination must drain the queues of a failing concurrent batch stage too
+    pipeline = (
+        get_pipeline(max_queues_size=10)
+        .set_source(RandomTextSource(200))
+        .append("reverser", BatchTextReverser(size=2), concurrency=2)
+        .append("error", BatchExceptionStage(size=5), concurrency=2)
+        .build()
+    )
+    with pytest.raises(Exception):
+        run_with_timeout(pipeline)
+
+
+def test_stop_is_the_last_item():
+    """the Stop item must never overtake the items of the batch which received it"""
+    for _ in range(5):
+        pipeline = (
+            get_pipeline()
+            .set_error_manager(ErrorManager())
+            .set_source(RandomTextSource(28))
+            .append("reverser", BatchTextReverser(size=8))
+            .append("error", ErrorStage())
+            .append("duplicator", BatchTextDuplicator(size=5))
+            .build()
+        )
+        items = run_with_timeout(pipeline)
+        assert len(items) == 28, "some items have been lost before the Stop item"
+        assert pipeline.count == 28
+
+
+def test_concurrent_initialization():
+    """append wires batch stage classes with init_args and init_kwargs."""
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(100))
+        .append(
+            "reverser0", BatchTextReverser, init_kwargs={"cycles": 3}, concurrency=2
+        )
+        .append("reverser1", BatchTextReverser, init_args=[5], concurrency=0)
+        .append("reverser2", BatchTextReverser(), concurrency=1)
+        .append("duplicator", BatchTextDuplicator(), concurrency=2)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 100, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(100))
+        .append("reverser0", BatchTextReverser, concurrency=2, executor="processes")
+        .append(
+            "reverser1",
+            BatchTextReverser,
+            init_args=[10],
+            concurrency=1,
+            executor="processes",
+        )
+        .append("reverser2", BatchTextReverser, concurrency=0)
+        .append(
+            "duplicator",
+            BatchTextDuplicator,
+            init_args=[10],
+            concurrency=2,
+            executor="processes",
+        )
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 100, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(100))
+        .append("reverser0", BatchTextReverser(), concurrency=0)
+        .append("reverser1", BatchTextReverser, concurrency=1)
+        .append("duplicator", BatchTextDuplicator(10), concurrency=0)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 100, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(100))
+        .append("duplicator0", BatchTextDuplicator, concurrency=0)
+        .append("reverser", BatchTextReverser(), concurrency=0)
+        .append("duplicator1", BatchTextDuplicator, concurrency=0)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 100, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(100))
+        .append("reverser", BatchTextReverser(12), concurrency=0)
+        .append("duplicator0", BatchTextDuplicator, concurrency=0)
+        .append("duplicator1", BatchTextDuplicator(), concurrency=1)
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 100, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(100))
+        .append(
+            "reverser0",
+            BatchTextReverser,
+            init_args=[20],
+            concurrency=1,
+            executor="processes",
+        )
+        .append(
+            "reverser1",
+            BatchTextReverser,
+            init_args=[20],
+            concurrency=1,
+            executor="threads",
+        )
+        .append(
+            "duplicator",
+            BatchTextDuplicator,
+            init_args=[20],
+            concurrency=1,
+            executor="processes",
+        )
+        .build()
+    )
+    items = run_with_timeout(pipeline)
+    check_items(items, 100, pipeline)
+
+
+@pytest.mark.skip
+def test_huge_run():
+    """Parallel batch pipelines beat sequential ones on CPU-bound stages."""
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(200))
+        .append(
+            "reverser0",
+            BatchTextReverser(30000, size=200),
+            concurrency=2,
+            executor="processes",
+        )
+        .append(
+            "reverser1",
+            BatchTextReverser(30000, size=200),
+            concurrency=3,
+            executor="processes",
+        )
+        .append(
+            "reverser2",
+            BatchTextReverser(30000, size=200),
+            concurrency=1,
+            executor="processes",
+        )
+        .append(
+            "duplicator",
+            BatchTextDuplicator(30000, size=200),
+            concurrency=2,
+            executor="processes",
+        )
+        .build()
+    )
+    start_time = time.time()
+    items = run_with_timeout(pipeline, timeout=HEAVY_TIMEOUT)
+    elapsed1 = time.time() - start_time
+    logger.debug("Time for parallel: %s", elapsed1)
+    check_items(items, 200)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(200))
+        .append("reverser0", BatchTextReverser(30000, size=200), concurrency=0)
+        .append("reverser1", BatchTextReverser(30000, size=200), concurrency=0)
+        .append("reverser2", BatchTextReverser(30000, size=200), concurrency=0)
+        .append("duplicator", BatchTextDuplicator(30000, size=200), concurrency=0)
+        .build()
+    )
+    start_time = time.time()
+    items = run_with_timeout(pipeline, timeout=HEAVY_TIMEOUT)
+    elapsed2 = time.time() - start_time
+    logger.debug("Time for sequential: %s", elapsed2)
+    check_items(items, 200)
+    assert elapsed2 > elapsed1
+
+
+def test_timeouts():
+    """Batch timeouts flush partial batches without stalling termination."""
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(100))
+        .append("reverser0", BatchTextReverser(timeout=1, size=120), concurrency=0)
+        .append("reverser1", BatchTextReverser(timeout=1, size=120), concurrency=0)
+        .append("reverser2", BatchTextReverser(timeout=0, size=120), concurrency=0)
+        .append("duplicator", BatchTextDuplicator(timeout=1, size=120), concurrency=0)
+        .build()
+    )
+    start_time = time.monotonic()
+    items = run_with_timeout(pipeline)
+    elapsed = time.monotonic() - start_time
+    # The new engine forwards Stop as soon as it is received, flushing the pending
+    # batch without waiting for the full timeout, so no lower bound on elapsed.
+    # Only assert an upper bound proving prompt termination.
+    assert elapsed < 15, f"pipeline took too long: {elapsed:.3f}s"
+    check_items(items, 100, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(100))
+        .append("reverser0", BatchTextReverser(timeout=1, size=120), concurrency=1)
+        .append("reverser1", BatchTextReverser(timeout=2, size=120), concurrency=1)
+        .append("reverser2", BatchTextReverser(timeout=0, size=120), concurrency=1)
+        .append("duplicator", BatchTextDuplicator(timeout=1, size=120), concurrency=1)
+        .build()
+    )
+    start_time = time.monotonic()
+    items = run_with_timeout(pipeline)
+    elapsed = time.monotonic() - start_time
+    assert elapsed < 15, f"pipeline took too long: {elapsed:.3f}s"
+    check_items(items, 100, pipeline)
+    pipeline = (
+        get_pipeline()
+        .set_source(RandomTextSource(100))
+        .append(
+            "reverser0",
+            BatchTextReverser(timeout=1, size=120),
+            concurrency=1,
+            executor="processes",
+        )
+        .append(
+            "reverser1",
+            BatchTextReverser(timeout=0, size=120),
+            concurrency=1,
+            executor="processes",
+        )
+        .append(
+            "reverser2",
+            BatchTextReverser(timeout=1, size=120),
+            concurrency=1,
+            executor="processes",
+        )
+        .append(
+            "duplicator",
+            BatchTextDuplicator(timeout=0, size=120),
+            concurrency=1,
+            executor="processes",
+        )
+        .build()
+    )
+    start_time = time.monotonic()
+    items = run_with_timeout(pipeline)
+    elapsed = time.monotonic() - start_time
+    assert elapsed < 15, f"pipeline took too long: {elapsed:.3f}s"
+    check_items(items, 100, pipeline)
+
+
+def test_single_items(items_generator_fx):
+    """process_async and get_item round-trip single items through batch stages."""
+    pipeline = (
+        get_pipeline()
+        .append("reverser0", BatchTextReverser())
+        .append("reverser1", BatchTextReverser())
+        .append("reverser2", BatchTextReverser())
+        .append("duplicator", BatchTextDuplicator())
+        .build()
+    )
+    item = next(items_generator_fx)
+    for _ in range(88):
+        pipeline.process_async(copy.deepcopy(item), callback=mark_item_checked)
+    pipeline.stop()
+    result = get_item_with_timeout(pipeline)
+    assert result.id == item.id
+    assert result.metadata["check"]
+    assert result.data["text"] != item.data["text"]
+    for _ in range(87):
+        get_item_with_timeout(pipeline)
+
+    pipeline = (
+        get_pipeline()
+        .append(
+            "reverser0", BatchTextReverser, init_kwargs={"cycles": 3}, concurrency=2
+        )
+        .append("reverser1", BatchTextReverser, init_args=[5], concurrency=0)
+        .append("reverser2", BatchTextReverser(), concurrency=1)
+        .append("duplicator", BatchTextDuplicator(), concurrency=2)
+        .build()
+    )
+    item = next(items_generator_fx)
+    pipeline.process_async(copy.deepcopy(item), callback=mark_item_checked)
+    pipeline.stop()
+    result = get_item_with_timeout(pipeline)
+    assert result.id == item.id
+    assert result.metadata["check"]
+    assert result.data["text"] != item.data["text"]
+
+    pipeline = (
+        get_pipeline()
+        .append("reverser0", BatchTextReverser, concurrency=2, executor="processes")
+        .append(
+            "reverser1",
+            BatchTextReverser,
+            init_args=[9],
+            concurrency=1,
+            executor="processes",
+        )
+        .append("reverser2", BatchTextReverser, concurrency=0)
+        .append(
+            "duplicator",
+            BatchTextDuplicator,
+            init_args=[10],
+            concurrency=2,
+            executor="processes",
+        )
+        .build()
+    )
+    item = next(items_generator_fx)
+    for _ in range(88):
+        pipeline.process_async(item, callback=mark_item_checked)
+    pipeline.stop()
+    for _ in range(88):
+        result = get_item_with_timeout(pipeline)
+        assert result.id == item.id
+        assert result.metadata["check"]
+        assert result.data["text"]
+        assert result.data["text"] != item.data["text"]
+
+    pipeline = (
+        get_pipeline()
+        .append("reverser0", BatchTextReverser(), concurrency=0)
+        .append("reverser1", BatchTextReverser, concurrency=1)
+        .append("duplicator", BatchTextDuplicator(10), concurrency=0)
+        .build()
+    )
+    item = next(items_generator_fx)
+    pipeline.process_async(copy.deepcopy(item), callback=mark_item_checked)
+    pipeline.stop()
+    result = get_item_with_timeout(pipeline)
+    assert result.id == item.id
+    assert result.metadata["check"]
+    assert result.data["text"] == item.data["text"]
+
+    pipeline = (
+        get_pipeline()
+        .append("duplicator0", BatchTextDuplicator)
+        .append("reverser", BatchTextReverser())
+        .append("duplicator1", BatchTextDuplicator)
+        .build()
+    )
+    item = next(items_generator_fx)
+    pipeline.process_async(copy.deepcopy(item), callback=mark_item_checked)
+    pipeline.stop()
+    result = get_item_with_timeout(pipeline)
+    assert result.id == item.id
+    assert result.metadata["check"]
+    assert result.data["text"] != item.data["text"]
+
+    pipeline = (
+        get_pipeline()
+        .append("reverser", BatchTextReverser(11), concurrency=0)
+        .append("duplicator0", BatchTextDuplicator, concurrency=0)
+        .append("duplicator1", BatchTextDuplicator(), concurrency=1)
+        .build()
+    )
+    item = next(items_generator_fx)
+    pipeline.process_async(copy.deepcopy(item), callback=mark_item_checked)
+    pipeline.stop()
+    result = get_item_with_timeout(pipeline)
+    assert result.id == item.id
+    assert result.metadata["check"]
+    assert result.data["text"] != item.data["text"]
+
+    pipeline = (
+        get_pipeline()
+        .append(
+            "reverser0",
+            BatchTextReverser,
+            init_args=[20],
+            concurrency=1,
+            executor="processes",
+        )
+        .append(
+            "reverser1",
+            BatchTextReverser,
+            init_args=[20],
+            concurrency=1,
+            executor="threads",
+        )
+        .append(
+            "duplicator",
+            BatchTextDuplicator,
+            init_args=[20],
+            concurrency=1,
+            executor="processes",
+        )
+        .build()
+    )
+    item = next(items_generator_fx)
+    pipeline.process_async(item, callback=mark_item_checked)
+    pipeline.stop()
+    result = get_item_with_timeout(pipeline)
+    assert result.id == item.id
+    assert result.metadata["check"]
+    assert result.data["text"] == item.data["text"]
+    assert len(result.data.keys()) > len(item.data.keys())
+
+
+def test_mixed_single_items(items_generator_fx):
+    """Single items flow through mixed single and batch pipelines."""
+    pipeline = (
+        get_pipeline()
+        .append("reverser0", BatchTextReverser())
+        .append("reverser1", TextReverser())
+        .append("reverser2", BatchTextReverser())
+        .append("duplicator", TextDuplicator())
+        .build()
+    )
+    item = next(items_generator_fx)
+    for _ in range(88):
+        pipeline.process_async(copy.deepcopy(item), callback=mark_item_checked)
+    pipeline.stop()
+    result = get_item_with_timeout(pipeline)
+    assert result.id == item.id
+    assert result.metadata["check"]
+    assert result.data["text"] != item.data["text"]
+    for _ in range(87):
+        get_item_with_timeout(pipeline)
+
+    pipeline = (
+        get_pipeline()
+        .append("reverser0", TextReverser, init_kwargs={"cycles": 3}, concurrency=2)
+        .append("reverser1", BatchTextReverser, init_args=[5], concurrency=0)
+        .append("reverser2", TextReverser(), concurrency=1)
+        .append("duplicator", BatchTextDuplicator(), concurrency=2)
+        .build()
+    )
+    item = next(items_generator_fx)
+    pipeline.process_async(copy.deepcopy(item), callback=mark_item_checked)
+    pipeline.stop()
+    result = get_item_with_timeout(pipeline)
+    assert result.id == item.id
+    assert result.metadata["check"]
+    assert result.data["text"] != item.data["text"]
+
+    pipeline = (
+        get_pipeline()
+        .append("reverser0", TextReverser, concurrency=2, executor="processes")
+        .append(
+            "reverser1",
+            BatchTextReverser,
+            init_args=[9],
+            concurrency=1,
+            executor="processes",
+        )
+        .append("reverser2", TextReverser, concurrency=0)
+        .append(
+            "duplicator",
+            BatchTextDuplicator,
+            init_args=[10],
+            concurrency=2,
+            executor="processes",
+        )
+        .build()
+    )
+    item = next(items_generator_fx)
+    for _ in range(88):
+        pipeline.process_async(item, callback=mark_item_checked)
+    pipeline.stop()
+    for _ in range(88):
+        result = get_item_with_timeout(pipeline)
+        assert result.id == item.id
+        assert result.metadata["check"]
+        assert result.data["text"]
+        assert result.data["text"] != item.data["text"]

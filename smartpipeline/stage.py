@@ -1,0 +1,171 @@
+import uuid
+from abc import ABC, abstractmethod
+from logging import Logger, getLogger
+from queue import Queue
+from typing import Any, Generic, Optional, Sequence
+
+from smartpipeline.item import DataT, Item
+
+__author__ = "Giacomo Berardi <giacbrd.com>"
+
+
+__all__ = ["Source", "Stage", "BatchStage", "ItemsQueue"]
+
+
+class AliveMixin:
+    """
+    Simple mixin for defining an object that can "exist and communicate"
+    """
+
+    def set_name(self, name: str):
+        self._name = name
+        self._logger: Optional[Logger] = None
+
+    @property
+    def name(self) -> str:
+        if getattr(self, "_name", None) is None:
+            self._name = f"{self.__class__.__name__}-{str(uuid.uuid4())[:8]}"
+        return self._name
+
+    def __str__(self) -> str:
+        return self.name
+
+    @property
+    def logger(self) -> Logger:
+        """Specific logger for this object"""
+        logger: Optional[Logger] = getattr(self, "_logger", None)
+        if logger is None:
+            logger = getLogger(self.name)
+            self._logger = logger
+        return logger
+
+
+class ConstructorMixin:
+    def on_start(self) -> Any:
+        """
+        Called in the pipeline start phase, when :meth:`.Pipeline.run` or
+        :meth:`.Pipeline.process_async` starts the stage, never by
+        :meth:`.Pipeline.build`.
+        With multiprocessing concurrency the stage in the executor is a copy of the
+        original, so by overriding this method one can initialize variables
+        specifically for the copies; that is mandatory when they are not serializable.
+
+        Any exception raised here is fatal for the whole pipeline and is
+        reported to the pipeline caller (on `run()`/`process_async()`) instead of
+        hanging the execution without feedback. `on_end` runs only for stages
+        whose `on_start` completed.
+        """
+        pass
+
+    def on_end(self) -> Any:
+        """
+        Called when the stage terminates, useful for executing closing operations (e.g. on files)
+
+        It is paired with a successful :meth:`.on_start`, also when the start phase
+        fails after this stage has started.
+        Any exception raised here is fatal for the whole pipeline and is
+        reported to the pipeline caller on termination instead of hanging
+        the execution without feedback.
+        """
+        pass
+
+
+class Stage(AliveMixin, ConstructorMixin, ABC, Generic[DataT]):
+    """
+    Extend this class and override :meth:`.Stage.process` for defining a stage,
+    e.g. `Stage[MyData]` processes `Item[MyData]` items
+    """
+
+    def __str__(self) -> str:
+        return f"Stage {self.name}"
+
+    @abstractmethod
+    def process(self, item: Item[DataT]) -> Item[DataT]:
+        """
+        Process a single item received by the stage.
+        Must be overridden for properly defining a stage
+
+        :return: The same item instance processed and enriched by the stage
+        """
+        return item
+
+
+class BatchStage(AliveMixin, ConstructorMixin, ABC, Generic[DataT]):
+    """
+    Extend this class and override :meth:`.BatchStage.process_batch` for defining a batch stage,
+    e.g. `BatchStage[MyData]` processes `Item[MyData]` items
+    """
+
+    @abstractmethod
+    def process_batch(self, items: Sequence[Item[DataT]]) -> Sequence[Item[DataT]]:
+        """
+        Process a batch of items received by the stage.
+        Must be overridden for properly defining a batch stage
+
+        :return: The same batch with items processed and enriched by the stage; it must contain exactly one item for each input item
+        """
+        return items
+
+    def __init__(self, size: int, timeout: float = 1.0):
+        """
+        :param size: Maximum size of item batches that can be processed together, at least 1
+        :param timeout: Seconds to wait before flushing a batch (calling :meth:`.BatchStage.process_batch` on it), 0 to flush it as soon as one item is in it
+        :raises ValueError: When `size` is < 1 or `timeout` is negative
+        """
+        if size < 1:
+            raise ValueError("The `size` parameter must be >= 1")
+        if timeout < 0:
+            raise ValueError("The `timeout` parameter must be >= 0")
+        self._size = size
+        self._timeout = timeout
+
+    def __str__(self) -> str:
+        return f"Batch stage {self.name}"
+
+    @property
+    def size(self) -> int:
+        """
+        Get the maximum size of item batches that can be processed together
+        """
+        return self._size
+
+    @property
+    def timeout(self) -> float:
+        """
+        Seconds to wait before flushing a batch (calling :meth:`.BatchStage.process_batch` on it)
+        """
+        return self._timeout
+
+
+class Source(ABC, AliveMixin, Generic[DataT]):
+    """
+    Extend this for defining a pipeline source,
+    e.g. `Source[MyData]` generates `Item[MyData]` items
+    """
+
+    @abstractmethod
+    def pop(self) -> Optional[Item[DataT]]:
+        """
+        Generate items for feeding a pipeline.
+        Must be overridden for properly defining a source.
+        Call :meth:`.Source.stop` when item generation is ended
+
+        :return: The generated item, if None it is simply ignored (e.g. after calling :meth:`.Source.stop`)
+        """
+        pass
+
+    def stop(self):
+        """
+        Declare the end item generation, this event will be spread through the pipeline
+        """
+        self._is_stopped = True
+
+    @property
+    def is_stopped(self) -> bool:
+        """
+        True if the source has called the stop event
+        """
+        return getattr(self, "_is_stopped", False)
+
+
+ItemsQueue = Queue[Item[Any]]

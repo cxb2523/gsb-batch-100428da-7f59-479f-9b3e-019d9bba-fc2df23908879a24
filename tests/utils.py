@@ -1,0 +1,722 @@
+import logging
+import random
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from threading import Thread
+from typing import (
+    Any,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Type,
+    TypedDict,
+)
+
+import pytest
+
+from smartpipeline.error.exceptions import CriticalError, SoftError
+from smartpipeline.error.handling import ErrorManager
+from smartpipeline.helpers import FilePathItem
+from smartpipeline.item import DataT, Item
+from smartpipeline.pipeline import Pipeline, PipelineState
+from smartpipeline.stage import BatchStage, Source, Stage
+
+__author__ = "Giacomo Berardi <giacbrd.com>"
+
+# Default safety net for a whole pipeline run or a single item wait. The slowest
+# legitimate tests take ~20s (deliberate sleeps and backoffs), so keep a 3x margin.
+PIPELINE_TIMEOUT = 60.0
+# Deliberately heavy performance tests get twice the default safety net.
+HEAVY_TIMEOUT = 2 * PIPELINE_TIMEOUT
+# Blocking queue/future waits inside a test.
+QUEUE_TIMEOUT = 30.0
+# Best-effort forced cleanup after a timeout, so the failure path stays bounded.
+CLEANUP_TIMEOUT = 10.0
+
+TEXT_SAMPLES = (
+    "On the other hand, we denounce with righteous indignation and dislike men who are so beguiled and demoralized by the charms of pleasure of the moment,",
+    "so blinded by desire, that they cannot foresee the pain and trouble that are bound to ensue; and equal blame belongs to those who fail in their duty through weakness of will,",
+    "which is the same as saying through shrinking from toil and pain. These cases are perfectly simple and easy to distinguish.",
+    "In a free hour, when our power of choice is untrammelled and when nothing prevents our being able to do what we like best, every pleasure is to be welcomed and every pain avoided.",
+    "But in certain circumstances and owing to the claims of duty or the obligations of business it will frequently occur that pleasures have to be repudiated and annoyances accepted.",
+    "The wise man therefore always holds in these matters to this principle of selection: he rejects pleasures to secure other greater pleasures, or else he endures pains to avoid worse pains.",
+)
+
+
+def random_text():
+    return random.choice(TEXT_SAMPLES)
+
+
+def text_item(text: str = "hello") -> Item[Dict[str, Any]]:
+    item: Item[Dict[str, Any]] = Item()
+    item.data["text"] = text
+    return item
+
+
+class CustomException(Exception):
+    pass
+
+
+class RandomTextSource(Source[Dict[str, Any]]):
+    def __init__(self, count):
+        self.total = count
+        self.counter = 0
+
+    def pop(self) -> Optional[Item[Dict[str, Any]]]:
+        self.counter += 1
+        if self.counter > self.total:
+            self.stop()
+            return None
+        item = Item[Dict[str, Any]]({"text": random_text(), "count": self.counter})
+        return item
+
+
+class ListSource(Source[Dict[str, Any]]):
+    def __init__(self, items: Iterable[Item[Dict[str, Any]]]):
+        self.items = iter(items)
+
+    def pop(self) -> Optional[Item[Dict[str, Any]]]:
+        try:
+            return next(self.items)
+        except StopIteration:
+            self.stop()
+            return None
+
+
+class ErrorSource(Source):
+    def __init__(self):
+        self.items = iter([Item() for _ in range(3)])
+
+    def pop(self):
+        try:
+            return next(self.items)
+        except StopIteration:
+            raise ValueError()
+
+
+class TextGenerator(Stage[Dict[str, Any]]):
+    def process(self, item: Item[Dict[str, Any]]) -> Item[Dict[str, Any]]:
+        item.data["text"] = random_text()
+        return item
+
+
+class TextReverser(Stage[Dict[str, Any]]):
+    def __init__(self, cycles=1):
+        self._cycles = cycles
+
+    def process(self, item: Item[Dict[str, Any]]) -> Item[Dict[str, Any]]:
+        for _ in range(self._cycles):
+            item.data["text"] = item.data["text"][::-1]
+        return item
+
+
+class TextDuplicator(Stage[Dict[str, Any]]):
+    def __init__(self, cycles=1):
+        self._cycles = cycles
+
+    def process(self, item: Item[Dict[str, Any]]) -> Item[Dict[str, Any]]:
+        for _ in range(self._cycles):
+            item.data["text_" + str(random.randint(1, 1000))] = item.data["text"]
+        return item
+
+
+class SlowInitializer(Stage):
+    def __init__(self, wait_time=2):
+        time.sleep(wait_time)
+
+    def process(self, item: Item):
+        return item
+
+
+class CustomizableBrokenStage(Stage):
+    def __init__(self, exceptions_to_raise: List[Type[Exception]]):
+        self._exceptions_to_raise = exceptions_to_raise
+        self._last_processed = 0
+
+    def process(self, item: Item):
+        to_raise = self._exceptions_to_raise[
+            self._last_processed % len(self._exceptions_to_raise)
+        ]
+        self._last_processed += 1
+        raise to_raise("exception")
+
+
+class TextExtractor(Stage[Dict[str, Any]]):
+    def process(self, item: Item[Dict[str, Any]]) -> Item[Dict[str, Any]]:
+        assert isinstance(item, FilePathItem)
+        with open(item.path) as f:
+            item.data["text"] = f.read()
+        return item
+
+
+class Logger(Stage):
+    def __init__(self):
+        self.logger.warning("testing concurrent initialization")
+
+    def on_start(self):
+        self.logger.setLevel(logging.INFO)
+
+    def process(self, item: Item):
+        self.logger.info("logging item %s", item)
+        return item
+
+
+class BatchTextGenerator(BatchStage[Dict[str, Any]]):
+    def __init__(self, size=10, timeout=0.1):
+        super().__init__(size, timeout)
+
+    def process_batch(
+        self, items: Sequence[Item[Dict[str, Any]]]
+    ) -> Sequence[Item[Dict[str, Any]]]:
+        for item in items:
+            item.data["text"] = random_text()
+        return items
+
+
+class BatchTextReverser(BatchStage[Dict[str, Any]]):
+    def __init__(self, cycles=1, size=10, timeout=0.1):
+        super().__init__(size, timeout)
+        self._cycles = cycles
+
+    def process_batch(
+        self, items: Sequence[Item[Dict[str, Any]]]
+    ) -> Sequence[Item[Dict[str, Any]]]:
+        for item in items:
+            for _ in range(self._cycles):
+                item.data["text"] = item.data["text"][::-1]
+        return items
+
+
+class BatchTextDuplicator(BatchStage):
+    def __init__(self, cycles=1, size=10, timeout=0.1, check_batch=False):
+        super().__init__(size, timeout)
+        self._check_batch = check_batch
+        self._cycles = cycles
+
+    def process_batch(self, items):
+        if self._check_batch:
+            if len(items) != self.size:
+                raise CriticalError(
+                    "The current batch contains {} items instead of {}".format(
+                        len(items), self.size
+                    )
+                )
+        for item in items:
+            for c in range(self._cycles):
+                item.data["text_b_{}_{}".format(c, random.randint(1, 1000))] = (
+                    item.data["text"]
+                )
+        return items
+
+
+class TruncatingBatchStage(BatchStage):
+    """Return fewer items than the input batch, violating the batch contract."""
+
+    def process_batch(self, items):
+        return list(items)[:1]
+
+
+class CustomizableBrokenBatchStage(BatchStage):
+    def __init__(self, size, timeout, exceptions_to_raise: List[Type[Exception]]):
+        super().__init__(size, timeout)
+        self._exceptions_to_raise = exceptions_to_raise
+        self._last_processed = 0
+
+    def process_batch(self, items):
+        to_raise = self._exceptions_to_raise[
+            self._last_processed % len(self._exceptions_to_raise)
+        ]
+        self._last_processed += 1
+        raise to_raise("exception")
+
+
+class TimeWaster(Stage):
+    def __init__(self, time=1):
+        self._time = time
+
+    def process(self, item: Item):
+        time.sleep(self._time)
+        return item
+
+
+class ExceptionStage(Stage):
+    def __init__(self, counter: int = 0):
+        self._counter = counter
+
+    def process(self, item: Item):
+        self._counter -= 1
+        time.sleep(0.3)
+        if self._counter < 0:
+            raise Exception("test exception")
+        return item
+
+
+class ErrorStage(Stage):
+    def process(self, item: Item):
+        raise SoftError("test pipeline error")
+
+
+class CriticalIOErrorStage(Stage):
+    def process(self, item: Item):
+        raise CriticalError("test pipeline critical IO error") from IOError()
+
+
+class BatchExceptionStage(BatchStage):
+    def __init__(self, size=10, timeout=0.1):
+        super().__init__(size, timeout)
+
+    def process_batch(self, items):
+        time.sleep(0.3)
+        raise Exception("test exception")
+
+
+class BatchErrorStage(BatchStage):
+    def __init__(self, size=10, timeout=0.1):
+        super().__init__(size, timeout)
+
+    def process_batch(self, items):
+        raise SoftError("test pipeline error")
+
+
+class SerializableStage(Stage):
+    def __init__(self):
+        self._file = None
+
+    def on_start(self):
+        self._file = open(__file__)
+
+    def on_end(self):
+        self._file.close()
+
+    def is_closed(self):
+        return self._file.closed
+
+    def process(self, item: Item):
+        if item.data.get("file"):
+            raise ValueError("bad item")
+        if self._file is not None and self._file.name == __file__:
+            item.data["file"] = self._file.name
+        return item
+
+
+class SerializableBatchStage(BatchStage, SerializableStage):
+    def __init__(self, size: int, timeout: int):
+        super().__init__(size, timeout)
+        self._file = None
+
+    def process_batch(self, items):
+        for item in items:
+            self.process(item)
+        return items
+
+
+class ErrorSerializableStage(Stage):
+    def __init__(self):
+        self._file = None
+
+    def on_start(self):
+        raise IOError
+
+    def process(self, item: Item):
+        return item
+
+
+class BrokenOnEndStage(Stage):
+    def process(self, item: Item):
+        return item
+
+    def on_end(self):
+        raise RuntimeError("test on_end failure")
+
+
+class SlowOnEndStage(Stage):
+    def __init__(self, delay: float = 2.0):
+        self._delay = delay
+
+    def process(self, item: Item):
+        return item
+
+    def on_end(self):
+        time.sleep(self._delay)
+        raise RuntimeError("test slow on_end failure")
+
+
+class BrokenOnEndBatchStage(BatchStage):
+    def __init__(self, size: int = 10, timeout: float = 0.1):
+        super().__init__(size, timeout)
+
+    def process_batch(self, items):
+        return items
+
+    def on_end(self):
+        raise RuntimeError("test batch on_end failure")
+
+
+class BrokenProcessAndEndStage(Stage):
+    def process(self, item: Item):
+        raise ValueError("test process failure")
+
+    def on_end(self):
+        raise RuntimeError("test on_end failure")
+
+
+class BrokenProcessAndEndBatchStage(BatchStage):
+    def __init__(self, size: int = 2, timeout: float = 0.1):
+        super().__init__(size, timeout)
+
+    def process_batch(self, items):
+        raise ValueError("test batch process failure")
+
+    def on_end(self):
+        raise RuntimeError("test batch on_end failure")
+
+
+class BrokenInitStage(Stage):
+    def __init__(self):
+        raise RuntimeError("test init failure")
+
+    def process(self, item: Item):
+        return item
+
+
+class BrokenOnStartErrorManager(ErrorManager):
+    def on_start(self):
+        raise RuntimeError("test error manager on_start failure")
+
+
+class LifecycleStage(Stage):
+    """Stage which records lifecycle hooks and processed items in a shared list."""
+
+    def __init__(self, events: List[str], fail_on_start: bool = False):
+        self._events = events
+        self._fail_on_start = fail_on_start
+
+    def on_start(self):
+        self._events.append(f"{self.name}:start")
+        if self._fail_on_start:
+            raise RuntimeError(f"{self.name} failed on_start")
+
+    def on_end(self):
+        self._events.append(f"{self.name}:end")
+
+    def process(self, item: Item):
+        self._events.append(f"{self.name}:process")
+        return item
+
+
+class LifecycleErrorManager(ErrorManager):
+    """Error manager which records lifecycle hooks in a shared list."""
+
+    def __init__(self, events: List[str], fail_on_start: bool = False):
+        self._events = events
+        self._fail_on_start = fail_on_start
+
+    def on_start(self):
+        self._events.append("error-manager:start")
+        if self._fail_on_start:
+            raise RuntimeError("test error manager on_start failure")
+
+    def on_end(self):
+        self._events.append("error-manager:end")
+
+
+class BrokenOnEndErrorManager(ErrorManager):
+    def on_end(self):
+        raise RuntimeError("test error manager on_end failure")
+
+
+class SerializableErrorManager(ErrorManager):
+    def __init__(self):
+        self._file = None
+
+    def on_start(self):
+        self._file = open(__file__)
+
+    def on_end(self):
+        self._file.close()
+
+    def is_closed(self):
+        return self._file.closed
+
+
+def check_items(items, num, pipeline=None):
+    """Assert that a run produced every expected item, in any order.
+
+    Items are expected to carry a ``count`` field (as produced by
+    :class:`RandomTextSource`) covering ``1..num``; when a pipeline is given
+    its processed count is asserted too.
+    """
+    diff = frozenset(range(1, num + 1)).difference(item.data["count"] for item in items)
+    assert not diff, "Not found items: {}".format(", ".join(str(x) for x in diff))
+    assert len(items) == num
+    if pipeline is not None:
+        assert num == pipeline.count
+
+
+def mark_item_checked(item: Item):
+    """Callback for ``process_async`` asserting the result and flagging it."""
+    assert item.data
+    item.metadata["check"] = True
+
+
+def _stop_pipeline_forced(pipeline: Pipeline):
+    """
+    Best-effort abort of a stuck pipeline: stop the source and cancel its engine,
+    without waiting on any blocking join.
+    """
+    try:
+        pipeline.stop()
+    except BaseException:
+        pass
+    try:
+        engine = getattr(pipeline, "_engine", None)
+        if engine is not None:
+            cancel = getattr(engine, "cancel", None)
+            if cancel is not None:
+                cancel.set()
+    except BaseException:
+        pass
+
+
+def _close_with_timeout(pipeline: Pipeline, timeout: float = CLEANUP_TIMEOUT):
+    """
+    Run ``pipeline.close()`` in a daemon thread, never blocking the test suite on a
+    stuck executor or queue join.
+    """
+
+    def _close():
+        try:
+            pipeline.close()
+        except BaseException:
+            pass
+
+    thread = Thread(target=_close, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        logging.warning("The pipeline close did not end in %s seconds", timeout)
+
+
+def next_with_timeout(
+    iterator: Iterator[Item[DataT]],
+    timeout: float = PIPELINE_TIMEOUT,
+    pipeline: Optional[Pipeline[DataT]] = None,
+) -> Item[DataT]:
+    """
+    Call ``next()`` on a pipeline iterator in a separate thread, failing the test instead
+    of hanging forever when no item is produced.
+
+    :param iterator: An iterator over the processed items
+    :param timeout: Maximum time to wait for the next item
+    :param pipeline: The pipeline to abort when the timeout expires
+    :return: The next processed item
+    :raises BaseException: Whatever exception the iterator has raised
+    """
+    outcome: Dict[str, Any] = {}
+
+    def _next():
+        try:
+            outcome["item"] = next(iterator)
+        except BaseException as e:
+            outcome["error"] = e
+
+    thread = Thread(target=_next, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        if pipeline is not None:
+            _stop_pipeline_forced(pipeline)
+            _close_with_timeout(pipeline)
+        pytest.fail("next() did not return in {} seconds".format(int(timeout)))
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["item"]
+
+
+def get_item_with_timeout(
+    pipeline: Pipeline[DataT], timeout: float = PIPELINE_TIMEOUT
+) -> Item[DataT]:
+    """
+    Call ``pipeline.get_item()`` in a separate thread, failing the test instead of hanging
+    forever when no asynchronously processed item is delivered.
+
+    :param pipeline: A pipeline running asynchronously
+    :param timeout: Maximum time to wait for the processed item
+    :return: The processed item
+    :raises BaseException: Whatever exception the pipeline has raised
+    """
+    outcome: Dict[str, Any] = {}
+
+    def _get():
+        try:
+            outcome["item"] = pipeline.get_item()
+        except BaseException as e:
+            outcome["error"] = e
+
+    thread = Thread(target=_get, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        _stop_pipeline_forced(pipeline)
+        _close_with_timeout(pipeline)
+        pytest.fail("get_item() did not return in {} seconds".format(int(timeout)))
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["item"]
+
+
+def run_with_timeout(
+    pipeline: Pipeline[DataT], timeout: float = PIPELINE_TIMEOUT
+) -> List[Item[DataT]]:
+    """
+    Consume a pipeline run in a separate thread, failing the test when the pipeline does not
+    terminate, so that a stuck pipeline can never hang the whole test suite
+
+    :param pipeline: A pipeline to run
+    :param timeout: Maximum time to wait for the pipeline termination
+    :return: The list of processed items, when the pipeline terminates without errors
+    :raises BaseException: Whatever exception the pipeline has raised
+    """
+    outcome: Dict[str, Any] = {}
+
+    def _runner():
+        try:
+            outcome["items"] = list(pipeline.run())
+        except BaseException as e:
+            outcome["error"] = e
+
+    thread = Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        # a stuck pipeline leaves its executions behind: abort it as a whole, so that
+        # non-daemon runner threads cannot keep the interpreter alive either
+        _stop_pipeline_forced(pipeline)
+        _close_with_timeout(pipeline)
+        # `pytest.fail` is not an `Exception`, so it is never captured by `pytest.raises`
+        pytest.fail("The pipeline did not terminate in {} seconds".format(int(timeout)))
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("items", [])
+
+
+def build_with_timeout(
+    pipeline: Pipeline[DataT], timeout: float = PIPELINE_TIMEOUT
+) -> Pipeline[DataT]:
+    """
+    Build a pipeline in a separate thread, failing the test instead of hanging forever
+    when the build does not terminate, e.g. when a stage initialization fails
+
+    :param pipeline: A pipeline to build
+    :param timeout: Maximum time to wait for the build termination
+    :return: The built pipeline
+    :raises BaseException: Whatever exception the build has raised
+    """
+    outcome: Dict[str, Any] = {}
+
+    def _builder():
+        try:
+            pipeline.build()
+        except BaseException as e:
+            outcome["error"] = e
+
+    thread = Thread(target=_builder, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        _stop_pipeline_forced(pipeline)
+        _close_with_timeout(pipeline)
+        pytest.fail("The pipeline build did not end in {} seconds".format(int(timeout)))
+    if "error" in outcome:
+        raise outcome["error"]
+    return pipeline
+
+
+def wait_for_state(
+    pipeline: Pipeline,
+    state: PipelineState,
+    timeout: float = PIPELINE_TIMEOUT,
+) -> None:
+    """
+    Wait until a pipeline reaches a lifecycle state, failing the test on timeout.
+
+    :param pipeline: The pipeline to observe
+    :param state: The expected lifecycle state
+    :param timeout: Maximum time to wait
+    """
+    deadline = time.monotonic() + timeout
+    while pipeline.state is not state:
+        if time.monotonic() > deadline:
+            pytest.fail(
+                "The pipeline did not reach state '{}' in {} seconds (current '{}')".format(
+                    state.value, int(timeout), pipeline.state.value
+                )
+            )
+        time.sleep(0.01)
+
+
+def get_pipeline(*args, **kwargs) -> Pipeline[Dict[str, Any]]:
+    return Pipeline[Dict[str, Any]](*args, **kwargs).set_error_manager(
+        ErrorManager().raise_on_critical_error()
+    )
+
+
+@contextmanager
+def cleanup_on_exit(pipeline: Pipeline) -> Iterator[Pipeline]:
+    """Guarantee pipeline cleanup (executors and manager) on test exit, without hanging."""
+    try:
+        yield pipeline
+    finally:
+        _stop_pipeline_forced(pipeline)
+        _close_with_timeout(pipeline)
+
+
+class TypedRow(TypedDict):
+    id: str
+    text: str
+
+
+class TypedRowSource(Source[TypedRow]):
+    def __init__(self, count: int = 3):
+        self.total = count
+        self.counter = 0
+
+    def pop(self) -> Optional[Item[TypedRow]]:
+        self.counter += 1
+        if self.counter > self.total:
+            self.stop()
+            return None
+        return Item[TypedRow]({"id": str(self.counter), "text": random_text()})
+
+
+class TypedRowUpper(Stage[TypedRow]):
+    def process(self, item: Item[TypedRow]) -> Item[TypedRow]:
+        item.data["text"] = item.data["text"].upper()
+        return item
+
+
+@dataclass
+class TypedDoc:
+    id: str
+    text: str
+
+
+class TypedDocUpper(Stage[TypedDoc]):
+    def process(self, item: Item[TypedDoc]) -> Item[TypedDoc]:
+        item.data = TypedDoc(id=item.data.id, text=item.data.text.upper())
+        return item
+
+
+class StrUpper(Stage[str]):
+    def process(self, item: Item[str]) -> Item[str]:
+        item.data = item.data.upper()
+        return item
+
+
+class OptionalNoOp(Stage[Optional[str]]):
+    def process(self, item: Item[Optional[str]]) -> Item[Optional[str]]:
+        return item
