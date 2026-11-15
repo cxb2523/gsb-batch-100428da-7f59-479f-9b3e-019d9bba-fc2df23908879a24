@@ -161,6 +161,34 @@ curl -X POST \
   http://localhost:3000/api/cron/check-prices
 ```
 
+Each run returns a per-product report under `results` so a round can be
+audited and safely re-run:
+
+- `updatedProducts`: products whose price changed (with old/new price,
+  direction, whether history was written, and the alert outcome when the
+  price dropped).
+- `unchangedProducts`: products scraped successfully whose price matched the
+  stored value. The product row is refreshed but no history row is inserted.
+- `failedProducts`: products that could not be scraped or parsed, each with
+  `productId`, `url`, `stage` (`scrape` | `parse` | `database`) and a short
+  `reason`. Failed products never receive history writes or alert emails.
+- `alerts`: price-drop alert outcomes with status `sent`, `failed` or
+  `skipped`, including the reason when an alert could not be sent.
+- Scalar counters (`total`, `updated`, `unchanged`, `failed`,
+  `priceChanges`, `priceDrops`, `alertsSent`, `alertsFailed`,
+  `historyPruned`) summarize the same data.
+
+A failure for one product never aborts the run; every product still appears
+in exactly one of the outcome lists. Unauthorized requests return `401`.
+
+The logic lives in
+[lib/cron/price-check.ts](lib/cron/price-check.ts) and can be exercised
+offline with in-memory fakes (no network or real credentials):
+
+```bash
+node scripts/verify-check-prices.mts
+```
+
 ## Troubleshooting
 
 - Login redirects to the wrong domain: verify `NEXT_PUBLIC_APP_URL` and Supabase Site URL / Redirect URLs.
