@@ -1,0 +1,99 @@
+version: '3.8'
+
+services:
+  # ExploiterX Scanner Service
+  exploiterx:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: exploiterx-scanner
+    image: exploiterx:latest
+    
+    # Volume mounts for reports and logs
+    volumes:
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+      - ./config:/app/config:ro
+    
+    # Environment variables
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=INFO
+    
+    # Network configuration
+    networks:
+      - exploiter_network
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '1'
+          memory: 512M
+    
+    # Restart policy
+    restart: "no"
+    
+    # Interactive mode
+    stdin_open: true
+    tty: true
+    
+    # Dependencies
+    depends_on:
+      dvwa:
+        condition: service_healthy
+
+  # DVWA (Damn Vulnerable Web Application) - For Testing
+  dvwa:
+    image: vulnerables/web-dvwa
+    container_name: exploiterx-dvwa
+    
+    ports:
+      - "8888:80"
+    
+    environment:
+      - MYSQL_ROOT_PASSWORD=dvwa
+      - MYSQL_PASSWORD=dvwa
+      - MYSQL_USER=dvwa
+      - MYSQL_DATABASE=dvwa
+    
+    networks:
+      - exploiter_network
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    restart: unless-stopped
+
+  # Optional: OWASP Juice Shop - Alternative vulnerable app
+  juice-shop:
+    image: bkimminich/juice-shop
+    container_name: exploiterx-juice-shop
+    
+    ports:
+      - "3000:3000"
+    
+    networks:
+      - exploiter_network
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    
+    restart: unless-stopped
+
+networks:
+  exploiter_network:
+    driver: bridge
+    name: exploiter-network

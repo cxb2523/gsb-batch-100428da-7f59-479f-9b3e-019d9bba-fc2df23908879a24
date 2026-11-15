@@ -1,0 +1,85 @@
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# GitHub workflows
+.github
+
+# Python cache
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+htmlcov/
+
+# Testing and coverage
+tests/
+.pytest_cache/
+.coverage
+coverage.xml
+*.log
+
+# Reports and output
+reports/
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+.Thumbs.db
+*.tmp
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Build files
+build/
+dist/
+*.egg-info/
+.eggs/
+*.whl
+
+# CI/CD
+.travis.yml
+.gitlab-ci.yml
+azure-pipelines.yml
+
+# Misc
+.editorconfig
+Makefile
+*.bak
