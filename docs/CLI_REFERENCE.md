@@ -96,6 +96,13 @@ BM25 accepts Markdown/aliases/fitted Markdown or Trafilatura text. It reports `r
 
 Deep crawling accepts Markdown, fitted Markdown, or `all` only. The runner requests structured upstream `all` JSON for every deep crawl, deduplicates page records by Crawl4AI 0.9.4 normalized URL (fragments removed; trailing slashes preserved), and serializes the requested format. `--max-pages` caps records returned by upstream before deduplication, so the saved unique count can be lower when the upstream batch contains duplicates. The runner reports that count truthfully and does not crawl extra pages to fill the cap.
 
+Every deduplicated page gets a page-level outcome. A page succeeds only when upstream did not mark it as `success: false` and the Markdown view selected by the output format (`raw_markdown`, or `fit_markdown` for fitted Markdown) contains non-whitespace text. Otherwise it fails with a short reason such as `upstream reported success=false`, `missing raw_markdown`, or `empty raw_markdown`; a non-empty upstream `error_message` is preferred as the reason when present. Failed pages never abort the crawl and never contribute a body section:
+
+- `--output-format all`: every record carries `outcome` (`success` or `failure`) and, for failures, a `reason`, while all upstream fields are preserved. When the batch reaches the cap, each record also carries `deep_crawl_truncation` with `may_be_truncated`, `returned_records`, `saved_pages`, `max_pages`, and a `message`.
+- Markdown / fitted Markdown: only successful pages are written as sections; the artifact ends with a `# Page outcomes` list naming every page as `SUCCESS` or `FAILED` with its URL and, for failures, the reason. The list also repeats the truncation warning when applicable.
+
+When the upstream record count reaches `--max-pages`, both the terminal summary and the artifact state that output may be truncated, including the saved unique page count and the configured cap. Below the cap no truncation marker is written.
+
 ### Question and extraction options
 
 | Option | Default | Meaning |

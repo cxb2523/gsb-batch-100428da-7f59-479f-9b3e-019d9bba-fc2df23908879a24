@@ -122,6 +122,13 @@ Deep crawl supports Markdown, fitted Markdown, or `all`. It cannot be combined w
 
 `--max-pages` limits the upstream batch, not the number of unique records after wrapper deduplication. Crawl4AI can return the seed more than once, and each duplicate still consumes an upstream batch slot. The wrapper reports both the returned record count and the unique saved count; it does not launch extra crawls or fabricate records to fill the requested cap. Increase the cap conservatively if the unique result is smaller than requested.
 
+The deep-crawl artifact is self-checking. Each deduplicated page is classified as a success when upstream did not mark it failed and the Markdown view selected by the output format has non-whitespace text; otherwise it is a failure with a short reason. Failed pages are reported but never written into the body, and they never make the run fail.
+
+- `--output-format markdown` / `markdown-fit`: successful pages appear as sections, and the artifact ends with a `# Page outcomes` list of `SUCCESS`/`FAILED` entries with URLs and failure reasons.
+- `--output-format all`: every JSON record carries `outcome` (`success` or `failure`) and, for failures, `reason`, while the upstream record is otherwise intact.
+
+When the upstream record count reaches `--max-pages`, both the terminal summary and the artifact warn that output may be truncated and state the saved unique page count and the cap. Runs below the cap carry no truncation marker.
+
 ## Question mode
 
 ```bash

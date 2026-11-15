@@ -51,6 +51,8 @@ Always set a traversal and explicit page cap:
 - `dfs`: follow branches deeply.
 - `best-first`: prioritize relevant pages.
 - Use Markdown, Markdown-fit, or all output.
+- Each artifact records a per-page outcome. Markdown ends with a `# Page outcomes` list; `all` JSON records carry `outcome` (`success`/`failure`) and a failure `reason`. Report that list instead of guessing which pages worked.
+- When the summary warns that output may be truncated, report the saved unique page count and the `--max-pages` limit.
 - Do not combine deep crawl with Trafilatura, BM25, question mode, or JSON extraction.
 
 ### Structured JSON extraction

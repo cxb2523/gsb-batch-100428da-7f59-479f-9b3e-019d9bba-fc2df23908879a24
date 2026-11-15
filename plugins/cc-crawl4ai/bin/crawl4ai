@@ -31,6 +31,9 @@ RUNTIME_STATE = ".runtime-state.json"
 BROWSER_MARKER = ".browser-ready.json"
 _ACTIVE_PROCESS: subprocess.Popen[bytes] | None = None
 WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+DEEP_CRAWL_OUTCOME_FIELD = "outcome"
+DEEP_CRAWL_REASON_FIELD = "reason"
+DEEP_CRAWL_TRUNCATION_FIELD = "deep_crawl_truncation"
 
 
 class CliError(RuntimeError):
@@ -462,28 +465,156 @@ def parse_deep_crawl_pages(
     return pages, len(document)
 
 
-def serialize_deep_crawl_pages(
-    pages: list[dict[str, object]], output_format: str
-) -> str:
-    """Serialize deduplicated page records in the requested wrapper format."""
+def _deep_crawl_markdown_key(output_format: str) -> str:
+    if output_format in ("markdown-fit", "md-fit"):
+        return "fit_markdown"
+    return "raw_markdown"
+
+
+def _usable_markdown(page: dict[str, object], key: str) -> str | None:
+    markdown = page.get("markdown")
+    value = markdown.get(key) if isinstance(markdown, dict) else None
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _record_error_message(page: dict[str, object]) -> str | None:
+    value = page.get("error_message")
+    if isinstance(value, str):
+        compact = " ".join(value.split())
+        if compact:
+            return compact[:200]
+    return None
+
+
+def _deep_crawl_page_outcome(
+    page: dict[str, object], output_format: str
+) -> tuple[str, str | None]:
+    """Classify a deduplicated page as a success or a failure with a short reason.
+
+    A page succeeds only when upstream did not mark it as failed and the
+    Markdown view selected by the output format holds non-whitespace text.
+    ``all`` keeps both views, so either usable view counts as success.
+    """
+    if page.get("success") is False:
+        return (
+            "failure",
+            _record_error_message(page) or "upstream reported success=false",
+        )
+    upstream_error = _record_error_message(page)
     if output_format == "all":
-        return json.dumps(pages, indent=2, ensure_ascii=False)
-    markdown_key = (
-        "fit_markdown"
-        if output_format in ("markdown-fit", "md-fit")
-        else "raw_markdown"
-    )
-    sections: list[str] = []
-    for index, page in enumerate(pages):
-        url = page.get("url")
+        keys = ("raw_markdown", "fit_markdown")
+        if any(_usable_markdown(page, key) is not None for key in keys):
+            return "success", None
         markdown = page.get("markdown")
-        content = markdown.get(markdown_key) if isinstance(markdown, dict) else None
-        if not isinstance(url, str) or not isinstance(content, str):
-            raise CliError(
-                f"Crawl4AI deep crawl page record {index + 1} has no {markdown_key}"
-            )
+        if not isinstance(markdown, dict):
+            return "failure", upstream_error or "no markdown body"
+        if any(key in markdown for key in keys):
+            return "failure", upstream_error or "raw and fit markdown are empty"
+        return "failure", upstream_error or "missing raw_markdown and fit_markdown"
+    key = _deep_crawl_markdown_key(output_format)
+    if _usable_markdown(page, key) is not None:
+        return "success", None
+    markdown = page.get("markdown")
+    if not isinstance(markdown, dict):
+        return "failure", upstream_error or "no markdown body"
+    if key not in markdown:
+        return "failure", upstream_error or f"missing {key}"
+    if not isinstance(markdown.get(key), str):
+        return "failure", upstream_error or f"{key} is not text"
+    return "failure", upstream_error or f"empty {key}"
+
+
+def classify_deep_crawl_pages(
+    pages: list[dict[str, object]], output_format: str
+) -> list[dict[str, object]]:
+    """Return one outcome record per deduplicated page."""
+    results: list[dict[str, object]] = []
+    for page in pages:
+        status, reason = _deep_crawl_page_outcome(page, output_format)
+        outcome: dict[str, object] = {"url": page.get("url"), "status": status}
+        if reason is not None:
+            outcome["reason"] = reason
+        results.append(outcome)
+    return results
+
+
+def _deep_crawl_truncation_note(truncation: dict[str, object]) -> str:
+    return (
+        f"upstream returned {truncation['returned_records']} page records, reaching "
+        f"the --max-pages limit of {truncation['max_pages']}; saved "
+        f"{truncation['saved_pages']} unique pages. Output may be truncated."
+    )
+
+
+def _deep_crawl_outcome_section(
+    outcomes: list[dict[str, object]],
+    truncation: dict[str, object] | None,
+) -> str:
+    succeeded = sum(1 for outcome in outcomes if outcome["status"] == "success")
+    failed = len(outcomes) - succeeded
+    lines = [
+        "",
+        "",
+        "=" * 60,
+        "# Page outcomes",
+        "=" * 60,
+        "",
+        f"Unique pages: {len(outcomes)} (successful: {succeeded}, failed: {failed})",
+        "",
+    ]
+    for outcome in outcomes:
+        url = outcome.get("url")
+        if outcome["status"] == "success":
+            lines.append(f"- SUCCESS {url}")
+        else:
+            lines.append(f"- FAILED {url} - {outcome.get('reason', 'unknown reason')}")
+    if truncation:
+        lines += ["", f"WARNING: {_deep_crawl_truncation_note(truncation)}"]
+    return "\n".join(lines)
+
+
+def serialize_deep_crawl_pages(
+    pages: list[dict[str, object]],
+    output_format: str,
+    truncation: dict[str, object] | None = None,
+) -> str:
+    """Serialize deduplicated page records in the requested wrapper format.
+
+    Failed pages never reach the Markdown body. Every ``all`` record carries a
+    page-level outcome, and every artifact marks truncation when upstream
+    filled the ``--max-pages`` budget.
+    """
+    outcomes = classify_deep_crawl_pages(pages, output_format)
+    if output_format == "all":
+        records: list[dict[str, object]] = []
+        for page, outcome in zip(pages, outcomes):
+            record = dict(page)
+            record[DEEP_CRAWL_OUTCOME_FIELD] = outcome["status"]
+            if "reason" in outcome:
+                record[DEEP_CRAWL_REASON_FIELD] = outcome["reason"]
+            if truncation:
+                record[DEEP_CRAWL_TRUNCATION_FIELD] = {
+                    "may_be_truncated": True,
+                    "returned_records": truncation["returned_records"],
+                    "saved_pages": truncation["saved_pages"],
+                    "max_pages": truncation["max_pages"],
+                    "message": _deep_crawl_truncation_note(truncation),
+                }
+            records.append(record)
+        return json.dumps(records, indent=2, ensure_ascii=False)
+    markdown_key = _deep_crawl_markdown_key(output_format)
+    sections: list[str] = []
+    for page, outcome in zip(pages, outcomes):
+        if outcome["status"] != "success":
+            continue
+        url = page.get("url")
+        content = _usable_markdown(page, markdown_key)
+        if not isinstance(url, str) or content is None:
+            continue
         sections.append(f"\n\n{'=' * 60}\n# {url}\n{'=' * 60}\n\n{content}")
-    return "".join(sections)
+    return "".join(sections) + _deep_crawl_outcome_section(outcomes, truncation)
 
 
 def _validate_crawl(args: argparse.Namespace) -> None:
@@ -848,11 +979,27 @@ def cmd_crawl(args: argparse.Namespace) -> int:
         content = Path(stdout_file.name).read_text(encoding="utf-8")
     if not content.strip():
         raise CliError("crawl succeeded but produced no content")
-    deep_stats: tuple[int, int] | None = None
+    deep_stats: dict[str, object] | None = None
     if args.deep_crawl:
         pages, total = parse_deep_crawl_pages(content, args.url)
-        content = serialize_deep_crawl_pages(pages, args.output_format)
-        deep_stats = total, len(pages)
+        truncation = None
+        if args.max_pages is not None and total >= args.max_pages:
+            truncation = {
+                "returned_records": total,
+                "saved_pages": len(pages),
+                "max_pages": args.max_pages,
+            }
+        outcomes = classify_deep_crawl_pages(pages, args.output_format)
+        content = serialize_deep_crawl_pages(
+            pages, args.output_format, truncation=truncation
+        )
+        deep_stats = {
+            "returned": total,
+            "saved": len(pages),
+            "succeeded": sum(1 for item in outcomes if item["status"] == "success"),
+            "failed": sum(1 for item in outcomes if item["status"] == "failure"),
+            "truncation": truncation,
+        }
     if args.bm25_query:
         content, matched, total = filter_bm25(
             content,
@@ -864,8 +1011,13 @@ def cmd_crawl(args: argparse.Namespace) -> int:
     output.write_text(content, encoding="utf-8")
     if deep_stats:
         print(
-            f"[crawl4ai] Deep crawl returned {deep_stats[0]} page records; saved {deep_stats[1]} unique pages."
+            f"[crawl4ai] Deep crawl returned {deep_stats['returned']} page records; "
+            f"saved {deep_stats['saved']} unique pages "
+            f"({deep_stats['succeeded']} successful, {deep_stats['failed']} failed)."
         )
+        truncation = deep_stats["truncation"]
+        if isinstance(truncation, dict):
+            print(f"[crawl4ai] WARNING: {_deep_crawl_truncation_note(truncation)}")
     print(f"[crawl4ai] Full output saved to: {output}")
     return 0
 

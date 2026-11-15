@@ -5,6 +5,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,94 @@ class CliTests(unittest.TestCase):
             encoding="utf-8",
         )
         binary.chmod(0o755)
+
+    def write_portable_fake_crawler(
+        self, root: Path, records: list[dict[str, object]]
+    ) -> Path:
+        """Create a real fake ``crwl`` launcher for POSIX and Windows.
+
+        The launcher is an executable file that the CLI runs as a subprocess
+        without a shell, so the fake exercises the same invocation path as an
+        installed ``crwl``.
+        """
+        root.mkdir(parents=True, exist_ok=True)
+        payload = root / "records.json"
+        payload.write_text(json.dumps(records), encoding="utf-8")
+        script = root / "fake_crwl.py"
+        script.write_text(
+            "import json, sys\n"
+            "args = sys.argv[1:]\n"
+            "assert args[0] == 'crawl', args\n"
+            "assert args[args.index('-o') + 1] == 'all', args\n"
+            "assert '-O' not in args, args\n"
+            f"print(json.dumps(json.load(open({str(payload)!r}, encoding='utf-8'))))\n",
+            encoding="utf-8",
+        )
+        if os.name == "nt":
+            launcher = root / "crwl.cmd"
+            launcher.write_text(
+                "@echo off\r\n"
+                f'"{sys.executable}" "{script}" %*\r\n',
+                encoding="utf-8",
+            )
+        else:
+            launcher = root / "crwl"
+            launcher.write_text(
+                "#!/usr/bin/env python3\n"
+                "import runpy\n"
+                f"runpy.run_path({str(script)!r}, run_name='__main__')\n",
+                encoding="utf-8",
+            )
+            launcher.chmod(0o755)
+        return launcher
+
+    def run_cli_deep_crawl(
+        self,
+        base: Path,
+        records: list[dict[str, object]],
+        output_format: str,
+        max_pages: int,
+        output_file: str | None = None,
+    ) -> tuple[int, str, Path]:
+        """Run ``cmd_crawl`` against the fake launcher and return its artifact."""
+        project = base / "project"
+        project.mkdir(exist_ok=True)
+        launcher = self.write_portable_fake_crawler(base / "fake-runtime", records)
+        arguments = [
+            "crawl",
+            "https://example.com/",
+            "--project-root",
+            str(project),
+            "--runtime-root",
+            str(base / "runtime"),
+            "--deep-crawl",
+            "bfs",
+            "--max-pages",
+            str(max_pages),
+            "--output-format",
+            output_format,
+        ]
+        if output_file:
+            arguments += ["--output-file", output_file]
+        args = self.parse(*arguments)
+        stream = StringIO()
+        with (
+            patch.object(module, "_resolve_tools", return_value=(launcher, None, None)),
+            redirect_stdout(stream),
+        ):
+            code = module.cmd_crawl(args)
+        stdout_text = stream.getvalue()
+        printed = re.search(r"Full output saved to: (.+)", stdout_text)
+        self.assertIsNotNone(printed, "CLI did not report its artifact path")
+        artifact = Path(printed.group(1).strip())
+        self.assertTrue(artifact.is_file(), f"missing artifact {artifact}")
+        if output_file:
+            self.assertEqual(artifact, project / output_file)
+        else:
+            self.assertTrue(
+                artifact.is_relative_to(project / ".crawl4ai" / "outputs")
+            )
+        return code, stdout_text, artifact
 
     def test_bm25_selects_relevant_structural_chunk(self) -> None:
         content = "# Intro\n\nGeneral words only.\n\n# Pricing\n\nEnterprise price is 99 dollars."
@@ -89,6 +178,133 @@ class CliTests(unittest.TestCase):
         ]
         self.assertIn("fitted", module.serialize_deep_crawl_pages(pages, "md-fit"))
         self.assertNotIn("raw", module.serialize_deep_crawl_pages(pages, "md-fit"))
+
+    def test_deep_crawl_outcome_distinguishes_success_and_failure(self) -> None:
+        pages = [
+            {
+                "url": "https://example.com/ok",
+                "markdown": {"raw_markdown": "body", "fit_markdown": "fit"},
+                "success": True,
+            },
+            {
+                "url": "https://example.com/flagged",
+                "markdown": {"raw_markdown": "body"},
+                "success": False,
+            },
+            {
+                "url": "https://example.com/empty",
+                "markdown": {"raw_markdown": "   "},
+                "success": True,
+            },
+            {
+                "url": "https://example.com/missing",
+                "markdown": {},
+                "success": True,
+            },
+            {"url": "https://example.com/no-markdown", "success": True},
+        ]
+        outcomes = module.classify_deep_crawl_pages(pages, "markdown")
+        self.assertEqual(
+            [outcome["status"] for outcome in outcomes],
+            ["success", "failure", "failure", "failure", "failure"],
+        )
+        self.assertNotIn("reason", outcomes[0])
+        self.assertEqual(outcomes[1]["reason"], "upstream reported success=false")
+        self.assertTrue(outcomes[2]["reason"])
+        self.assertIn("raw_markdown", outcomes[3]["reason"])
+        self.assertEqual(outcomes[4]["reason"], "no markdown body")
+        for outcome in outcomes:
+            self.assertTrue(outcome["url"].startswith("https://example.com/"))
+
+    def test_deep_crawl_failure_keeps_upstream_error_message(self) -> None:
+        pages = [
+            {
+                "url": "https://example.com/upstream-error",
+                "success": False,
+                "error_message": "  HTTP 503\n\nservice unavailable  ",
+            },
+            {
+                "url": "https://example.com/empty-with-error",
+                "markdown": {"raw_markdown": ""},
+                "error_message": "timeout",
+            },
+        ]
+        outcomes = module.classify_deep_crawl_pages(pages, "markdown")
+        self.assertEqual(outcomes[0]["reason"], "HTTP 503 service unavailable")
+        self.assertEqual(outcomes[1]["reason"], "timeout")
+
+    def test_deep_crawl_all_counts_either_markdown_view_as_success(self) -> None:
+        pages = [
+            {"url": "https://example.com/raw", "markdown": {"raw_markdown": "raw"}},
+            {"url": "https://example.com/fit", "markdown": {"fit_markdown": "fit"}},
+        ]
+        outcomes = module.classify_deep_crawl_pages(pages, "all")
+        self.assertEqual(
+            [outcome["status"] for outcome in outcomes], ["success", "success"]
+        )
+        fitted_only = module.classify_deep_crawl_pages(
+            [{"url": "https://example.com/fit", "markdown": {"fit_markdown": "fit"}}],
+            "markdown",
+        )
+        self.assertEqual(fitted_only[0]["status"], "failure")
+
+    def test_deep_crawl_all_format_marks_outcome_per_record(self) -> None:
+        pages = [
+            {"url": "https://example.com/a", "markdown": {"raw_markdown": "A"}},
+            {"url": "https://example.com/b", "success": False},
+        ]
+        serialized = module.serialize_deep_crawl_pages(pages, "all")
+        records = json.loads(serialized)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0][module.DEEP_CRAWL_OUTCOME_FIELD], "success")
+        self.assertNotIn(module.DEEP_CRAWL_REASON_FIELD, records[0])
+        self.assertEqual(records[1][module.DEEP_CRAWL_OUTCOME_FIELD], "failure")
+        self.assertIn("success=false", records[1][module.DEEP_CRAWL_REASON_FIELD])
+        self.assertEqual(records[0]["url"], "https://example.com/a")
+
+    def test_deep_crawl_markdown_outcomes_append_at_end_without_failed_bodies(
+        self,
+    ) -> None:
+        pages = [
+            {
+                "url": "https://example.com/ok",
+                "markdown": {"raw_markdown": "KEEP-ME"},
+                "success": True,
+            },
+            {
+                "url": "https://example.com/broken",
+                "markdown": {"raw_markdown": "DROP-ME"},
+                "success": False,
+            },
+        ]
+        serialized = module.serialize_deep_crawl_pages(pages, "markdown")
+        self.assertIn("KEEP-ME", serialized)
+        self.assertNotIn("DROP-ME", serialized)
+        outcome_section = serialized.index("# Page outcomes")
+        self.assertGreater(outcome_section, serialized.index("KEEP-ME"))
+        self.assertIn("FAILED https://example.com/broken", serialized)
+        self.assertNotIn("FAILED https://example.com/ok", serialized)
+        self.assertNotIn("truncat", serialized.lower())
+
+    def test_deep_crawl_truncation_only_at_limit(self) -> None:
+        pages = [
+            {"url": f"https://example.com/{index}", "markdown": {"raw_markdown": "x"}}
+            for index in range(2)
+        ]
+        truncation = {"returned_records": 2, "saved_pages": 2, "max_pages": 2}
+        limited = module.serialize_deep_crawl_pages(pages, "markdown", truncation)
+        self.assertIn("--max-pages limit of 2", limited)
+        self.assertIn("saved 2 unique pages", limited)
+        self.assertIn("may be truncated", limited)
+        unlimited = module.serialize_deep_crawl_pages(pages, "markdown", None)
+        self.assertNotIn("truncat", unlimited.lower())
+        records = json.loads(
+            module.serialize_deep_crawl_pages(pages, "all", truncation)
+        )
+        marker = records[0][module.DEEP_CRAWL_TRUNCATION_FIELD]
+        self.assertTrue(marker["may_be_truncated"])
+        plain = json.loads(module.serialize_deep_crawl_pages(pages, "all", None))
+        self.assertNotIn(module.DEEP_CRAWL_TRUNCATION_FIELD, plain[0])
 
     def test_missing_markdown_table_is_restored(self) -> None:
         crawl_markdown = "| Name | Price |\n| --- | --- |\n| A | 10 |"
@@ -385,6 +601,148 @@ class CliTests(unittest.TestCase):
             self.assertEqual(pages[0]["metadata"]["title"], "kept intact")
             self.assertEqual(pages[1]["url"], "https://example.com/a/")
             self.assertIn(str(output), result.stdout)
+
+    def test_cli_deep_markdown_reports_page_outcomes_and_omits_failed_bodies(
+        self,
+    ) -> None:
+        records = [
+            {
+                "url": "https://example.com/good",
+                "markdown": {"raw_markdown": "GOOD-BODY"},
+                "success": True,
+            },
+            {
+                "url": "https://example.com/failed",
+                "markdown": {"raw_markdown": "FAILED-BODY"},
+                "success": False,
+            },
+            {
+                "url": "https://example.com/empty",
+                "markdown": {"raw_markdown": "  "},
+                "success": True,
+            },
+            {
+                "url": "https://example.com/good#duplicate",
+                "markdown": {"raw_markdown": "DUPLICATE-BODY"},
+                "success": True,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            code, stdout, artifact = self.run_cli_deep_crawl(
+                base, records, "markdown", max_pages=4
+            )
+            self.assertEqual(code, 0)
+            content = artifact.read_text(encoding="utf-8")
+            self.assertIn("GOOD-BODY", content)
+            self.assertNotIn("FAILED-BODY", content)
+            self.assertNotIn("DUPLICATE-BODY", content)
+            self.assertIn("- SUCCESS https://example.com/good", content)
+            self.assertIn("FAILED https://example.com/failed", content)
+            self.assertIn("success=false", content)
+            self.assertIn("FAILED https://example.com/empty", content)
+            self.assertEqual(content.count("- FAILED https://example.com/good"), 0)
+            self.assertEqual(content.count("- SUCCESS https://example.com/good"), 1)
+            # The outcome list is appended after the body, not interleaved with it.
+            self.assertGreater(
+                content.index("# Page outcomes"),
+                content.index("GOOD-BODY"),
+            )
+            self.assertIn("saved 3 unique pages", stdout)
+            self.assertIn("1 successful, 2 failed", stdout)
+            self.assertIn("WARNING", stdout)
+            self.assertIn("limit of 4", stdout)
+            self.assertIn("truncated", content)
+            self.assertTrue(artifact.is_absolute())
+
+    def test_cli_deep_all_records_carry_outcome_and_truncation(self) -> None:
+        records = [
+            {"url": "https://example.com/a", "markdown": {"raw_markdown": "A"}},
+            {"url": "https://example.com/b", "success": False},
+            {"url": "https://example.com/c", "markdown": {"raw_markdown": "C"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            code, stdout, artifact = self.run_cli_deep_crawl(
+                base, records, "all", max_pages=3, output_file="deep/all.json"
+            )
+            self.assertEqual(code, 0)
+            page_records = json.loads(artifact.read_text(encoding="utf-8"))
+            self.assertEqual(len(page_records), 3)
+            outcomes = [
+                record[module.DEEP_CRAWL_OUTCOME_FIELD] for record in page_records
+            ]
+            self.assertEqual(outcomes, ["success", "failure", "success"])
+            self.assertIn("reason", page_records[1])
+            for record in page_records:
+                self.assertTrue(
+                    record[module.DEEP_CRAWL_TRUNCATION_FIELD]["may_be_truncated"]
+                )
+            self.assertIn("may be truncated", stdout)
+
+    def test_cli_deep_crawl_does_not_flag_truncation_below_limit(self) -> None:
+        records = [
+            {"url": "https://example.com/a", "markdown": {"raw_markdown": "A"}},
+            {"url": "https://example.com/b", "markdown": {"raw_markdown": "B"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            code, stdout, artifact = self.run_cli_deep_crawl(
+                base, records, "markdown", max_pages=10
+            )
+            self.assertEqual(code, 0)
+            content = artifact.read_text(encoding="utf-8")
+            self.assertNotIn("truncat", content.lower())
+            self.assertNotIn("WARNING", stdout)
+            self.assertNotIn("truncat", stdout.lower())
+            self.assertIn("saved 2 unique pages", stdout)
+
+    def test_cli_deep_all_is_not_truncated_below_limit(self) -> None:
+        records = [
+            {"url": "https://example.com/a", "markdown": {"raw_markdown": "A"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            code, stdout, artifact = self.run_cli_deep_crawl(
+                base, records, "all", max_pages=3, output_file="deep/below.json"
+            )
+            self.assertEqual(code, 0)
+            page_records = json.loads(artifact.read_text(encoding="utf-8"))
+            self.assertNotIn(module.DEEP_CRAWL_TRUNCATION_FIELD, page_records[0])
+            self.assertNotIn("truncat", stdout.lower())
+
+    def test_cli_deep_crawl_with_only_failed_pages_still_succeeds(self) -> None:
+        records = [
+            {"url": "https://example.com/a", "success": False},
+            {"url": "https://example.com/b", "markdown": {}, "success": True},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            code, stdout, artifact = self.run_cli_deep_crawl(
+                base, records, "markdown", max_pages=2
+            )
+            self.assertEqual(code, 0)
+            content = artifact.read_text(encoding="utf-8")
+            self.assertIn("Unique pages: 2 (successful: 0, failed: 2)", content)
+            self.assertNotIn("# https://example.com/a\n", content)
+
+    def test_cli_deep_crawl_keeps_generated_paths_and_never_overwrites(self) -> None:
+        records = [
+            {"url": "https://example.com/a", "markdown": {"raw_markdown": "A"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            first = self.run_cli_deep_crawl(base, records, "markdown", max_pages=1)
+            second = self.run_cli_deep_crawl(base, records, "markdown", max_pages=1)
+            folder = base / "project" / ".crawl4ai" / "outputs" / "example.com"
+            artifacts = sorted((folder / "markdown").glob("*.md"))
+            self.assertEqual(len(artifacts), 2)
+            self.assertNotEqual(first[2], second[2])
+            self.assertIn(first[2], artifacts)
+            self.assertIn(second[2], artifacts)
+            for artifact in artifacts:
+                self.assertTrue(artifact.read_text(encoding="utf-8").startswith("\n\n"))
+            self.assertTrue(second[2].is_relative_to(folder / "markdown"))
 
     @unittest.skipIf(os.name == "nt", "fake POSIX executables")
     def test_skip_browser_is_partial_and_invalidates_old_marker(self) -> None:
