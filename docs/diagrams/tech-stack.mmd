@@ -1,0 +1,46 @@
+flowchart TB
+    subgraph UI["UI Layer"]
+        JS["Chart.js — visualization"]
+        J2["Jinja2 — templating"]
+        CSS["Custom CSS — styling"]
+    end
+
+    subgraph API["API Layer"]
+        FA["FastAPI — routing"]
+        UV["Uvicorn — ASGI server"]
+        SM["Starlette SessionMiddleware — auth"]
+        MW2["BaseHTTPMiddleware — tenant context"]
+    end
+
+    subgraph SVC["Service Layer"]
+        MF["meta_fetcher — Meta API client"]
+        SE["sync_engine — orchestration"]
+        SW["sheets_writer — Sheets writer"]
+        DR["data_reader — analytics + cache"]
+        RE["rules_engine — automation"]
+        SC["scheduler — APScheduler cron"]
+        CM["config_manager — Fernet encryption"]
+        LI["license — JWT decoder"]
+    end
+
+    subgraph DAT["Data Layer"]
+        GS["gspread + oauth2client — Google Sheets"]
+        SA["SQLAlchemy — ORM"]
+        SQ["SQLite — database"]
+        FE["Fernet (cryptography) — file encryption"]
+        BC["bcrypt — password hashing"]
+        JW["PyJWT — token signing"]
+    end
+
+    subgraph INF["Infrastructure Layer"]
+        PY["Python 3.11+ — runtime"]
+        NG["Nginx — reverse proxy"]
+        SD["systemd — process manager"]
+        DK["Docker — container (optional)"]
+        DT["python-dotenv — env config"]
+    end
+
+    UI --> API
+    API --> SVC
+    SVC --> DAT
+    DAT --> INF

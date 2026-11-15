@@ -1,0 +1,27 @@
+erDiagram
+    Organization ||--o{ User : "has"
+    Organization ||--o| TenantDatabase : "maps to"
+    User }o--|| Organization : "belongs to"
+
+    Organization {
+        int id PK
+        string name
+        datetime created_at
+    }
+
+    User {
+        int id PK
+        string email
+        string username
+        string name
+        string role
+        int organization_id FK
+        bool is_profile_complete
+        string google_id
+        datetime created_at
+    }
+
+    TenantDatabase {
+        int organization_id PK FK
+        string db_name
+    }

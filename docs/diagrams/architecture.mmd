@@ -1,0 +1,59 @@
+flowchart TD
+    subgraph EXT["External Services"]
+        META["Meta Marketing API"]
+        GSHEETS["Google Sheets API"]
+        TG["Telegram Bot API"]
+        GOAUTH["Google OAuth 2.0"]
+    end
+
+    subgraph BROWSER["Frontend Layer"]
+        UI["Browser\nJinja2 HTML + Chart.js"]
+    end
+
+    subgraph WEB["Web Layer — FastAPI"]
+        MW["Auth Middleware\n(session + tenant context)"]
+        AUTH["auth.py\nLogin / Register / OAuth"]
+        DASH["dashboard.py\nPage + JSON endpoints"]
+        SETT["settings.py\nConfig management"]
+        SYNC_R["sync.py\nManual sync trigger"]
+        USERS["users.py\nUser management"]
+        API_R["api.py\nSuper-admin endpoints"]
+    end
+
+    subgraph CORE["Core Layer"]
+        FETCHER["meta_fetcher.py\nMeta API client"]
+        SYNCENG["sync_engine.py\nSync orchestration"]
+        WRITER["sheets_writer.py\nGoogle Sheets writer"]
+        READER["data_reader.py\nSheet reader + metrics"]
+        RULES["rules_engine.py\nAutomation rules"]
+        SCHED["scheduler.py\nAPScheduler jobs"]
+        CFG["config_manager.py\nEncrypted settings"]
+        LIC["license.py\nLicense key system"]
+    end
+
+    subgraph DATA["Data Layer"]
+        MAINDB[("main.db\nSQLite")]
+        TENDB[("tenant DBs\nSQLite per org")]
+        CACHE["File Cache\n60-min TTL"]
+        SETTF["Encrypted\nsettings.json"]
+    end
+
+    UI --> MW
+    MW --> AUTH & DASH & SETT & SYNC_R & USERS & API_R
+    DASH --> READER
+    SETT --> CFG & LIC
+    SYNC_R --> SYNCENG
+    SCHED --> SYNCENG
+    AUTH --> MAINDB & TENDB
+    READER --> CACHE & GSHEETS & RULES
+    SYNCENG --> FETCHER & WRITER & TG
+    FETCHER --> META
+    WRITER --> GSHEETS
+    CFG --> SETTF
+    AUTH --> GOAUTH
+
+    style EXT fill:#f0f0f0,stroke:#999
+    style BROWSER fill:#dbeafe,stroke:#3b82f6
+    style WEB fill:#d1fae5,stroke:#10b981
+    style CORE fill:#d1fae5,stroke:#10b981
+    style DATA fill:#fed7aa,stroke:#f97316

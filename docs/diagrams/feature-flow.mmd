@@ -1,0 +1,48 @@
+sequenceDiagram
+    actor User
+    participant Browser
+    participant FastAPI
+    participant DataReader
+    participant Cache
+    participant GoogleSheets
+    participant RulesEngine
+
+    User->>Browser: Open dashboard for account
+    Browser->>FastAPI: GET /dashboard/{account_id}
+    FastAPI->>FastAPI: Auth middleware (check session)
+    FastAPI->>FastAPI: Set tenant context (org_id)
+    FastAPI->>Browser: HTML shell (Jinja2 template)
+
+    Browser->>FastAPI: GET /api/chart-data/{account_id}?start=X&end=Y
+    FastAPI->>DataReader: read_analytics_sheet(account)
+    DataReader->>Cache: Check cache file (60-min TTL)
+
+    alt Cache is fresh
+        Cache-->>DataReader: Cached row data
+    else Cache is stale or missing
+        DataReader->>GoogleSheets: get_all_values() from ANALYTICS worksheet
+        GoogleSheets-->>DataReader: Raw rows (headers + data)
+        DataReader->>DataReader: enrich_all() (compute Hook Rate, CVR, AOV, etc.)
+        DataReader->>Cache: Write new cache file
+    end
+
+    DataReader->>DataReader: apply_date_filter(start, end)
+    DataReader->>RulesEngine: evaluate_all_adsets(rows, rules, business_type)
+    RulesEngine->>RulesEngine: group_by_adset()
+    RulesEngine->>RulesEngine: evaluate each ad set (proprietary)
+    RulesEngine-->>DataReader: Ad set rows with rule_flag
+
+    DataReader->>DataReader: get_kpi_summary() with period comparison
+    DataReader->>DataReader: get_daily_trend()
+    DataReader->>DataReader: get_funnel_data() with leakage detection
+    DataReader->>DataReader: get_heatmap_data()
+    DataReader->>DataReader: get_platform_breakdown()
+    DataReader-->>FastAPI: Full JSON payload
+
+    FastAPI-->>Browser: JSON (KPIs, charts, flags, table)
+    Browser->>Browser: Render Chart.js charts
+    Browser->>Browser: Render KPI cards with change indicators
+    Browser->>Browser: Render filtered ad table
+    User->>Browser: Apply filter or change date range
+    Browser->>FastAPI: POST /api/dashboard/{account_id}/data (with filters)
+    FastAPI-->>Browser: Filtered JSON payload
