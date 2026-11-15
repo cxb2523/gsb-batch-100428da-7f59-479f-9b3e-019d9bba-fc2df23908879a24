@@ -12,12 +12,57 @@ from sqlmodel import Session, col, select
 
 from config import MAX_PAGES, MIN_SCORE, PROFILE, SOURCES
 from database import create_db_and_tables, engine
-from models import Project
+from models import Project, RunOutcome
 
 load_dotenv()
 
 FREELANCERMAP_USERNAME = os.getenv("FREELANCERMAP_USERNAME")
 FREELANCERMAP_PASSWORD = os.getenv("FREELANCERMAP_PASSWORD")
+
+STATUS_COMPLETED = "abgeschlossen"
+STATUS_ABORTED = "abgebrochen"
+STATUS_SKIPPED = "übersprungen"
+
+
+class ScrapeAborted(Exception):
+    """Fatal source error: aborts the source, earlier committed batches stay."""
+
+    def __init__(self, stage, reason):
+        super().__init__(reason)
+        self.stage = stage
+        self.reason = reason
+
+
+def new_outcome(source):
+    """Blank per-source run outcome; scrapers fill counts and failure info."""
+    return {
+        "source": source,
+        "status": STATUS_COMPLETED,
+        "fetched": 0,
+        "inserted": 0,
+        "updated": 0,
+        "failed_stage": None,
+        "reason": None,
+    }
+
+
+def record_run_outcomes(run_id, outcomes):
+    """Persist one RunOutcome row per source and print a terminal summary."""
+    finished_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    print(f"\n=== Lauf {run_id} – Ergebnis pro Quelle ===")
+    with Session(engine) as session:
+        for o in outcomes:
+            session.add(RunOutcome(run_id=run_id, finished_at=finished_at, **o))
+            line = (
+                f"{o['source']}: {o['status']} | abgerufen: {o['fetched']}"
+                f" | neu: {o['inserted']} | aktualisiert: {o['updated']}"
+            )
+            if o["failed_stage"]:
+                line += f" | Phase: {o['failed_stage']}"
+            if o["reason"]:
+                line += f" | Grund: {o['reason']}"
+            print(line)
+        session.commit()
 
 
 class FreelancermapScraper:
@@ -103,38 +148,42 @@ class FreelancermapScraper:
     def get_page(self, page_number):
         url = self.get_page_url(page_number)
         print(f"\nAbrufen von Seite {page_number}: {url}")
+        ajax_headers = {
+            **self.headers,
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+        }
         try:
-            ajax_headers = {
-                **self.headers,
-                "Accept": "application/json, text/javascript, */*; q=0.01",
-                "X-Requested-With": "XMLHttpRequest",
-            }
             response = self.session.get(url, headers=ajax_headers)
-            if response.status_code != 200:
-                print(f"Fehler: Status Code {response.status_code}")
-                return []
-            data = response.json()
-            if isinstance(data, dict) and data.get("redirect"):
-                print("Session abgelaufen, versuche erneuten Login...")
-                if self.login():
-                    return self.get_page(page_number)
-                return []
-            projects = (
-                data
-                if isinstance(data, list)
-                else data.get("projects", data.get("hits", []))
-            )
-            if not projects:
-                return []
-            return [
-                p for p in (self._parse_project_json(proj) for proj in projects) if p
-            ]
         except Exception as e:
-            import traceback
-
-            print(f"Fehler beim Laden von Seite {page_number}: {e}")
-            print(traceback.format_exc())
+            raise ScrapeAborted("pagination", f"Seite {page_number}: {e}")
+        if response.status_code != 200:
+            raise ScrapeAborted(
+                "pagination", f"Seite {page_number}: Status {response.status_code}"
+            )
+        try:
+            data = response.json()
+        except Exception as e:
+            raise ScrapeAborted(
+                "pagination", f"Seite {page_number}: ungültige Antwort: {e}"
+            )
+        if isinstance(data, dict) and data.get("redirect"):
+            print("Session abgelaufen, versuche erneuten Login...")
+            if self.login():
+                return self.get_page(page_number)
+            raise ScrapeAborted(
+                "login", "Session abgelaufen, erneuter Login fehlgeschlagen"
+            )
+        projects = (
+            data
+            if isinstance(data, list)
+            else data.get("projects", data.get("hits", []))
+        )
+        if not projects:
             return []
+        return [
+            p for p in (self._parse_project_json(proj) for proj in projects) if p
+        ]
 
     def _parse_project_json(self, project):
         try:
@@ -180,23 +229,42 @@ class FreelancermapScraper:
             return None
 
     def scrape(self, matcher, profile, min_score=30):
-        if not self.login():
-            return
-        with Session(engine) as session:
-            for page in range(1, self.max_pages + 1):
-                projects = self.get_page(page)
-                if not projects:
-                    break
-                save_matches(session, matcher, profile, projects, min_score)
-                if page < self.max_pages:
-                    time.sleep(random.uniform(2, 4))
+        outcome = new_outcome("freelancermap")
+        try:
+            if not self.login():
+                raise ScrapeAborted("login", "Login fehlgeschlagen")
+            with Session(engine) as session:
+                for page in range(1, self.max_pages + 1):
+                    projects = self.get_page(page)
+                    if not projects:
+                        break
+                    outcome["fetched"] += len(projects)
+                    inserted, updated = save_matches(
+                        session, matcher, profile, projects, min_score
+                    )
+                    outcome["inserted"] += inserted
+                    outcome["updated"] += updated
+                    if page < self.max_pages:
+                        time.sleep(random.uniform(2, 4))
+        except ScrapeAborted as e:
+            outcome["status"] = STATUS_ABORTED
+            outcome["failed_stage"] = e.stage
+            outcome["reason"] = e.reason
+        except Exception as e:
+            outcome["status"] = STATUS_ABORTED
+            outcome["failed_stage"] = "unbekannt"
+            outcome["reason"] = str(e)
+        return outcome
 
 
 def save_matches(session, matcher, profile, candidates, min_score):
     """Score, dedupe (by link) and persist a batch of raw project dicts.
 
     Shared by every scraper source so the DB-write logic lives in one place.
+    Returns (inserted, updated) counts of the rows actually committed.
     """
+    inserted = 0
+    updated = 0
     for p in candidates:
         candidate = Project(**p)
         score, debug = matcher.calculate_match_score(candidate, profile)
@@ -220,9 +288,12 @@ def save_matches(session, matcher, profile, candidates, min_score):
             existing.match_debug = debug
             existing.scrape_date = candidate.scrape_date
             existing.source = candidate.source
+            updated += 1
         else:
             session.add(candidate)
+            inserted += 1
     session.commit()
+    return inserted, updated
 
 
 class ProjectMatcher:
@@ -371,6 +442,8 @@ if __name__ == "__main__":
     create_db_and_tables()
 
     matcher = ProjectMatcher()
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    outcomes = []
 
     if "freelancermap" in SOURCES:
         try:
@@ -379,17 +452,39 @@ if __name__ == "__main__":
                 password=FREELANCERMAP_PASSWORD,
                 max_pages=MAX_PAGES,
             )
-            scraper.scrape(matcher, PROFILE, min_score=MIN_SCORE)
+            outcomes.append(scraper.scrape(matcher, PROFILE, min_score=MIN_SCORE))
         except Exception as e:
-            print(f"freelancermap-Quelle abgebrochen: {e}")
+            outcome = new_outcome("freelancermap")
+            outcome["status"] = STATUS_ABORTED
+            outcome["failed_stage"] = "unbekannt"
+            outcome["reason"] = str(e)
+            outcomes.append(outcome)
+    else:
+        outcome = new_outcome("freelancermap")
+        outcome["status"] = STATUS_SKIPPED
+        outcome["reason"] = "nicht in SOURCES"
+        outcomes.append(outcome)
 
     if "arbeitsamt" in SOURCES:
         try:
             from arbeitsamt import ArbeitsamtScraper
 
-            ArbeitsamtScraper().scrape(matcher, PROFILE, min_score=MIN_SCORE)
+            outcomes.append(
+                ArbeitsamtScraper().scrape(matcher, PROFILE, min_score=MIN_SCORE)
+            )
         except Exception as e:
-            print(f"arbeitsamt-Quelle abgebrochen: {e}")
+            outcome = new_outcome("arbeitsamt")
+            outcome["status"] = STATUS_ABORTED
+            outcome["failed_stage"] = "unbekannt"
+            outcome["reason"] = str(e)
+            outcomes.append(outcome)
+    else:
+        outcome = new_outcome("arbeitsamt")
+        outcome["status"] = STATUS_SKIPPED
+        outcome["reason"] = "nicht in SOURCES"
+        outcomes.append(outcome)
+
+    record_run_outcomes(run_id, outcomes)
 
     stats = matcher.get_statistics()
 

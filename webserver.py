@@ -7,7 +7,7 @@ from sqlmodel import Session, col, select
 from werkzeug.middleware.proxy_fix import ProxyFix
 
 from database import create_db_and_tables, engine
-from models import Project
+from models import Project, RunOutcome
 from version import __version__
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -136,12 +136,30 @@ def statistics():
             {"source": r[0] or "Unbekannt", "count": r[1]} for r in source_rows
         ]
 
+        # Outcomes of the most recent collection run, one row per source.
+        # Empty when no run has been recorded yet — the template handles that.
+        latest_run_id = session.exec(
+            select(col(RunOutcome.run_id))
+            .order_by(col(RunOutcome.id).desc())
+            .limit(1)
+        ).first()
+        run_outcomes = []
+        if latest_run_id:
+            outcome_rows = session.exec(
+                select(RunOutcome)
+                .where(col(RunOutcome.run_id) == latest_run_id)
+                .order_by(col(RunOutcome.id))
+            ).all()
+            run_outcomes = [r.model_dump() for r in outcome_rows]
+
     return render_template(
         "statistics.html",
         stats=stats,
         score_distribution=score_distribution,
         by_source=by_source,
         top_companies=top_companies,
+        latest_run_id=latest_run_id,
+        run_outcomes=run_outcomes,
     )
 
 

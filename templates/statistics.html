@@ -66,6 +66,44 @@
         </div>
     </div>
 
+    <div class="bg-white rounded-3xl shadow-sm p-6 md:col-span-2">
+        <h2 class="text-base font-bold text-gray-900 mb-4">
+            Letzter Lauf – Ergebnis pro Quelle
+            {% if latest_run_id %}<span class="text-xs font-normal text-gray-400">({{ latest_run_id }})</span>{% endif %}
+        </h2>
+        {% if run_outcomes %}
+        <table class="w-full text-sm">
+            <thead>
+                <tr class="text-left text-xs font-medium text-gray-400 uppercase tracking-wide border-b border-gray-100">
+                    <th class="py-2 pr-4">Quelle</th>
+                    <th class="py-2 pr-4">Status</th>
+                    <th class="py-2 pr-4">Abgerufen</th>
+                    <th class="py-2 pr-4">Neu</th>
+                    <th class="py-2 pr-4">Aktualisiert</th>
+                    <th class="py-2 pr-4">Phase</th>
+                    <th class="py-2">Grund</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for o in run_outcomes %}
+                {% set status_color = {'abgeschlossen': '#21cda4', 'abgebrochen': '#e5534b', 'übersprungen': '#9ca3af'}.get(o['status'], '#9ca3af') %}
+                <tr class="border-b border-gray-100 last:border-0">
+                    <td class="py-2 pr-4 font-medium text-gray-700">{{ o['source'] }}</td>
+                    <td class="py-2 pr-4 font-semibold" style="color:{{ status_color }};">{{ o['status'] }}</td>
+                    <td class="py-2 pr-4 text-gray-700">{{ o['fetched'] }}</td>
+                    <td class="py-2 pr-4 text-gray-700">{{ o['inserted'] }}</td>
+                    <td class="py-2 pr-4 text-gray-700">{{ o['updated'] }}</td>
+                    <td class="py-2 pr-4 text-gray-500">{{ o['failed_stage'] or '–' }}</td>
+                    <td class="py-2 text-gray-500">{{ o['reason'] or '–' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <p class="text-sm text-gray-400">Noch keine Läufe aufgezeichnet.</p>
+        {% endif %}
+    </div>
+
     <div class="bg-white rounded-3xl shadow-sm p-6">
         <h2 class="text-base font-bold text-gray-900 mb-4">Top 10 Unternehmen</h2>
         <div>
