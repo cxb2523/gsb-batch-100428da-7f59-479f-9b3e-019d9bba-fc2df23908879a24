@@ -1,0 +1,20 @@
+# Secrets / session (NEVER commit real cookies or tokens)
+config.json
+
+# Output data & crawler state
+output/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

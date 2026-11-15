@@ -1,0 +1,14 @@
+{
+  "cookie": "PASTE_YOUR_FULL_LOGGED_IN_COOKIE_HERE (must include sessionid=...)",
+  "x_dynosaur": "PASTE_A_CAPTURED_X-Dynosaur_TOKEN_HERE (reusable, from a search request)",
+  "impersonate": "firefox133",
+  "max_followers_per_user": 1000,
+  "page_size": 30,
+  "max_depth": 5,
+  "max_users": 1000000,
+  "delay_min": 0.3,
+  "delay_max": 1.0,
+  "output": "output/tiktok-bio.json",
+  "state": "output/crawl_state.json",
+  "keywords": ["مطعم", "عقارات", "توصيل", "متجر", "خدمات"]
+}
