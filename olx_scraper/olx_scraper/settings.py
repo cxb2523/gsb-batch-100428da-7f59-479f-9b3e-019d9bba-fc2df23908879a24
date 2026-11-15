@@ -9,10 +9,17 @@
 #     http://scrapy.readthedocs.org/en/latest/topics/downloader-middleware.html
 #     http://scrapy.readthedocs.org/en/latest/topics/spider-middleware.html
 
+import os
+
 BOT_NAME = 'olx_scraper'
 
 SPIDER_MODULES = ['olx_scraper.spiders']
 NEWSPIDER_MODULE = 'olx_scraper.spiders'
+
+# Use the project's `crawl` command so that a structurally failed crawl
+# (unrecognised list page, failed list request) exits with a non-zero status
+# instead of looking like an empty success.
+COMMANDS_MODULE = 'olx_scraper.commands'
 
 
 # Crawl responsibly by identifying yourself (and your website) on the user-agent
@@ -30,16 +37,30 @@ ROBOTSTXT_OBEY = False
 
 # Configure item pipelines
 # See http://scrapy.readthedocs.org/en/latest/topics/item-pipeline.html
-#ITEM_PIPELINES = {
-#     'olx_scraper.pipelines.MongoDBPipeline': 300,
-#}
+#
+# The MongoDB pipeline is enabled automatically as soon as a database and a
+# collection name are configured, so a checkout without a running MongoDB does
+# not break crawls.  Flip it on permanently by filling in the values below, or
+# set the same names as environment variables.  A crawl that runs without the
+# pipeline still succeeds and records ``pipeline_disabled: true`` in its
+# outcome summary.
 #--------------------MONGODB CONFIG ---------------------------------------
-#MONGODB_SERVER = "localhost"
-#MONGODB_PORT = 27017
-#MONGODB_DB = ""
-#MONGODB_COLLECTION = ""
-
+MONGODB_SERVER = os.environ.get("MONGODB_SERVER", "localhost")
+try:
+    MONGODB_PORT = int(os.environ.get("MONGODB_PORT", "27017"))
+except ValueError:
+    MONGODB_PORT = 27017
+MONGODB_DB = os.environ.get("MONGODB_DB", "")
+MONGODB_COLLECTION = os.environ.get("MONGODB_COLLECTION", "")
+# Optional full URI; takes precedence over server/port when set.
+MONGODB_URI = os.environ.get("MONGODB_URI", "")
 #--------------------------------------------------------------------------
+
+ITEM_PIPELINES = {}
+if MONGODB_DB and MONGODB_COLLECTION:
+    ITEM_PIPELINES = {
+        'olx_scraper.pipelines.MongoDBPipeline': 300,
+    }
 
 
 
