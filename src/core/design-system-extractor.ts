@@ -91,6 +91,16 @@ export async function extractDesignSystem(url: string): Promise<DesignSystem> {
     // Extract component patterns
     const components = extractComponents(css.rules);
 
+    // Stylesheet accounting derived from the per-sheet verifiable outcomes
+    const stylesheetResults = css.stylesheetResults;
+    const stylesheetsProcessed = stylesheetResults.filter((r) => r.outcome === 'success').length;
+    const stylesheetsFailed = stylesheetResults.filter(
+        (r) => r.outcome === 'http-error' || r.outcome === 'network-error'
+    ).length;
+    const stylesheetsSkipped = stylesheetResults.filter(
+        (r) => r.outcome === 'skipped-limit'
+    ).length;
+
     const extractionTime = Date.now() - startTime;
 
     return {
@@ -109,7 +119,11 @@ export async function extractDesignSystem(url: string): Promise<DesignSystem> {
         allCssVariables: css.cssVariables,
         metadata: {
             statusCode: fetchResult.statusCode,
-            stylesheetsProcessed: parsed.stylesheetUrls.length,
+            stylesheetsProcessed,
+            stylesheetsDiscovered: stylesheetResults.length,
+            stylesheetsFailed,
+            stylesheetsSkipped,
+            stylesheetResults,
             cssRulesAnalyzed: css.rules.length,
             extractionTimeMs: extractionTime,
         },

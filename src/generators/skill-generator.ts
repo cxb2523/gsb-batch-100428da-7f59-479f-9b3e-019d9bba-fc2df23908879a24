@@ -307,8 +307,27 @@ export function generateSkillMd(designSystem: DesignSystem): string {
     lines.push('');
     lines.push(`- **HTTP Status**: ${designSystem.metadata.statusCode}`);
     lines.push(`- **Stylesheets Processed**: ${designSystem.metadata.stylesheetsProcessed}`);
+    lines.push(`- **Stylesheets Discovered**: ${designSystem.metadata.stylesheetsDiscovered}`);
+    lines.push(`- **Stylesheets Failed**: ${designSystem.metadata.stylesheetsFailed}`);
+    lines.push(`- **Stylesheets Skipped (limit)**: ${designSystem.metadata.stylesheetsSkipped}`);
     lines.push(`- **CSS Rules Analyzed**: ${designSystem.metadata.cssRulesAnalyzed}`);
     lines.push(`- **Extraction Time**: ${designSystem.metadata.extractionTimeMs}ms`);
+    lines.push('');
+
+    // Per-stylesheet fetch outcomes so consumers can judge completeness
+    if (designSystem.metadata.stylesheetResults.length > 0) {
+        lines.push('### Stylesheet Fetch Results');
+        lines.push('');
+        lines.push('| # | Outcome | HTTP Status | URL | Detail |');
+        lines.push('| - | ------- | ----------- | --- | ------ |');
+        designSystem.metadata.stylesheetResults.forEach((result, index) => {
+            const detail = result.error ? result.error.replace(/\|/g, '\\|') : '';
+            lines.push(
+                `| ${index + 1} | ${result.outcome} | ${result.statusCode} | ${result.url} | ${detail} |`
+            );
+        });
+        lines.push('');
+    }
     lines.push(`- **Total Colors Found**: ${designSystem.colors.totalColors}`);
     lines.push(`- **Total Gradients Found**: ${designSystem.gradients.totalGradients}`);
     lines.push(`- **Components Detected**: ${designSystem.components.length}`);

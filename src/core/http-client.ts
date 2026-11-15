@@ -9,7 +9,7 @@
  * - Redirect following
  */
 
-import type { FetchResult, UrlValidationResult } from '../types/index.js';
+import type { FetchResult, StylesheetResult, UrlValidationResult } from '../types/index.js';
 
 /**
  * Pool of modern browser User-Agent strings
@@ -149,9 +149,25 @@ export async function fetchPage(url: string, maxRetries = 3): Promise<FetchResul
 }
 
 /**
- * Fetch CSS content from a stylesheet URL
+ * Result of fetching a single stylesheet.
+ *
+ * Extends the verifiable StylesheetResult with the raw CSS body so the
+ * extraction pipeline can still parse successful responses. A failure never
+ * throws: callers receive a structured outcome instead of an empty string.
  */
-export async function fetchStylesheet(url: string): Promise<string> {
+export interface StylesheetFetchResult extends StylesheetResult {
+    /** Stylesheet body; empty string when the fetch did not succeed */
+    css: string;
+}
+
+/**
+ * Fetch CSS content from a stylesheet URL
+ *
+ * Never throws for an individual stylesheet. Returns a structured result that
+ * distinguishes successful fetches (including an HTTP 200 with an empty body)
+ * from HTTP failures and network-level exceptions.
+ */
+export async function fetchStylesheet(url: string): Promise<StylesheetFetchResult> {
     try {
         const userAgent = getRandomUserAgent();
         const response = await fetch(url, {
@@ -165,13 +181,31 @@ export async function fetchStylesheet(url: string): Promise<string> {
         });
 
         if (!response.ok) {
-            return '';
+            return {
+                url,
+                outcome: 'http-error',
+                statusCode: response.status,
+                error: `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}`,
+                css: '',
+            };
         }
 
-        return await response.text();
-    } catch {
-        // Silently fail for individual stylesheets
-        return '';
+        const css = await response.text();
+
+        return {
+            url,
+            outcome: 'success',
+            statusCode: response.status,
+            css,
+        };
+    } catch (error) {
+        return {
+            url,
+            outcome: 'network-error',
+            statusCode: 0,
+            error: error instanceof Error ? error.message : 'Unknown network error',
+            css: '',
+        };
     }
 }
 

@@ -11,6 +11,16 @@
 
 import css from 'css';
 import { fetchStylesheet } from './http-client.js';
+import type { StylesheetResult } from '../types/index.js';
+
+/**
+ * Maximum number of external stylesheets fetched per extraction.
+ *
+ * The first MAX_STYLESHEETS discovered links are fetched concurrently; any
+ * links beyond this limit are explicitly marked as 'skipped-limit' rather than
+ * silently dropped.
+ */
+export const MAX_STYLESHEETS = 10;
 
 export interface CSSDeclaration {
     property: string;
@@ -31,6 +41,8 @@ export interface ExtractedCSS {
     mediaQueries: string[];
     /** All unique property-value pairs */
     allDeclarations: CSSDeclaration[];
+    /** Per-stylesheet fetch outcomes in discovery order (one entry per discovered link) */
+    stylesheetResults: StylesheetResult[];
 }
 
 /**
@@ -180,14 +192,29 @@ export async function extractAllCSS(
         }
     }
 
-    // Fetch and process external stylesheets (with concurrency limit)
-    const stylesheetContents = await Promise.all(
-        stylesheetUrls.slice(0, 10).map((url) => fetchStylesheet(url))
+    // Fetch and process external stylesheets.
+    // At most MAX_STYLESHEETS discovered links are fetched, all concurrently
+    // (preserving the previous concurrency-cap semantics). Links beyond the
+    // cap are explicitly recorded as 'skipped-limit' instead of being dropped.
+    const stylesheetResults: StylesheetResult[] = [];
+
+    const fetchedResults = await Promise.all(
+        stylesheetUrls.slice(0, MAX_STYLESHEETS).map((url) => fetchStylesheet(url))
     );
 
-    for (const content of stylesheetContents) {
-        if (content) {
-            const { rules, cssVariables, mediaQueries } = parseCSSContent(content);
+    for (const result of fetchedResults) {
+        // Record the verifiable outcome (the CSS body is not part of the shared type)
+        stylesheetResults.push({
+            url: result.url,
+            outcome: result.outcome,
+            statusCode: result.statusCode,
+            ...(result.error ? { error: result.error } : {}),
+        });
+
+        // Only successfully fetched stylesheets feed the downstream parsers.
+        // A single failed stylesheet must never interrupt the whole extraction.
+        if (result.outcome === 'success') {
+            const { rules, cssVariables, mediaQueries } = parseCSSContent(result.css);
             allRules.push(...rules);
             Object.assign(allCssVariables, cssVariables);
 
@@ -204,11 +231,22 @@ export async function extractAllCSS(
         }
     }
 
+    // Every link beyond the fetch limit must be visible in the results.
+    for (const url of stylesheetUrls.slice(MAX_STYLESHEETS)) {
+        stylesheetResults.push({
+            url,
+            outcome: 'skipped-limit',
+            statusCode: 0,
+            error: `Stylesheet not fetched: exceeded the limit of ${MAX_STYLESHEETS} stylesheets per extraction`,
+        });
+    }
+
     return {
         rules: allRules,
         cssVariables: allCssVariables,
         mediaQueries: allMediaQueries,
         allDeclarations,
+        stylesheetResults,
     };
 }
 

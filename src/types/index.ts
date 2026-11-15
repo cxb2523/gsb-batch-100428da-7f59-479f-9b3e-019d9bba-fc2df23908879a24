@@ -335,8 +335,16 @@ export interface DesignSystem {
     metadata: {
         /** HTTP status code */
         statusCode: number;
-        /** Total stylesheets processed */
+        /** Number of stylesheets fetched successfully and processed */
         stylesheetsProcessed: number;
+        /** Total number of stylesheet links discovered on the page */
+        stylesheetsDiscovered: number;
+        /** Number of discovered stylesheets that failed to fetch (HTTP or network errors) */
+        stylesheetsFailed: number;
+        /** Number of discovered stylesheets skipped because the fetch limit was reached */
+        stylesheetsSkipped: number;
+        /** Per-stylesheet, verifiable fetch outcomes in discovery order */
+        stylesheetResults: StylesheetResult[];
         /** Total CSS rules analyzed */
         cssRulesAnalyzed: number;
         /** Extraction duration in ms */
@@ -355,6 +363,37 @@ export interface UrlValidationResult {
     /** Content type */
     contentType?: string;
     /** Error message if not accessible */
+    error?: string;
+}
+
+/**
+ * Outcome of fetching a single discovered stylesheet
+ *
+ * - success: the stylesheet was fetched over HTTP and its body returned
+ *   (note: an HTTP 200 with an empty body is still a successful fetch)
+ * - http-error: the server responded with a non-2xx HTTP status
+ * - network-error: the request could not be completed (DNS failure,
+ *   connection refused/reset, timeout, etc.)
+ * - skipped-limit: the stylesheet was discovered but not fetched because
+ *   the per-extraction stylesheet concurrency limit was reached
+ */
+export type StylesheetOutcome =
+    | 'success'
+    | 'http-error'
+    | 'network-error'
+    | 'skipped-limit';
+
+/**
+ * Verifiable per-stylesheet fetch outcome
+ */
+export interface StylesheetResult {
+    /** Absolute URL of the discovered stylesheet */
+    url: string;
+    /** What happened when this stylesheet was handled */
+    outcome: StylesheetOutcome;
+    /** HTTP status code for success/http-error outcomes; 0 otherwise */
+    statusCode: number;
+    /** Human-readable error detail for failed outcomes; undefined on success/skip */
     error?: string;
 }
 
