@@ -31,6 +31,9 @@ class TaskManager:
             'target': 0,          # 本次目标章数
             'fetched': 0,         # 本次已抓
             'todo': 0,            # 本次待抓
+            'failed': 0,          # 当前失败章数
+            'failures': [],       # 失败章明细 [{id,index,title,error,time?}]
+            'last_fail': None,    # 最近一次失败描述
             'last': None,         # 最近一章描述
             'error': None,
             'single_txt': None,
@@ -73,22 +76,47 @@ class TaskManager:
                 self._state['last'] = (
                     f"第{event['index']}章 {event['title']} "
                     f"({event['chars']}字)")
+                # 重试成功：就地清除该章的失败记录
+                if self._state['failures']:
+                    self._state['failures'] = [
+                        f for f in self._state['failures']
+                        if f['index'] != event['index']]
+                    self._state['failed'] = len(self._state['failures'])
                 self._append_log(
                     f"✓ [{event['index']}/{event['total']}] "
                     f"{event['title']} ({event['chars']}字) "
                     f"{event['i']}/{event['todo']}")
             elif phase == 'chapter_fail':
+                entry = {'id': event.get('id'),
+                         'index': event['index'],
+                         'title': event['title'],
+                         'error': event['error']}
+                self._state['failures'] = [
+                    f for f in self._state['failures']
+                    if f['index'] != event['index']] + [entry]
+                self._state['failed'] = len(self._state['failures'])
+                self._state['last_fail'] = (
+                    f"第{event['index']}章 {event['title']}："
+                    f"{event['error']}")
                 self._append_log(
                     f"✗ 第{event['index']}章 {event['title']} "
                     f"失败：{event['error']}")
             elif phase == 'stopped':
                 self._append_log('已停止（进度已保存，可续传）。')
             elif phase == 'done':
+                # done 事件携带的是中间态里的权威失败清单（含以往运行残留）
+                fails = event.get('failures') or []
                 self._state.update(
                     single_txt=event.get('single_txt'),
-                    split_dir=event.get('split_dir'))
-                self._append_log(
-                    f"完成：{event.get('chapters')} 章已导出。")
+                    split_dir=event.get('split_dir'),
+                    failures=fails, failed=len(fails))
+                if fails:
+                    self._append_log(
+                        f"完成：{event.get('chapters')} 章已导出；"
+                        f"有 {len(fails)} 章失败，可重新运行续抓。")
+                else:
+                    self._append_log(
+                        f"完成：{event.get('chapters')} 章已导出。")
 
     # ---- 启动/停止 ----
     def start(self, *, novel=None, attach=False, start=None,

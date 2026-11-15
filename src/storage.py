@@ -7,6 +7,7 @@ JSON 中间态是唯一权威数据源，抓取过程只往里增量写；TXT �
 import json
 import os
 import re
+from datetime import datetime
 from typing import Optional
 from config import OUTPUT_DIR
 
@@ -41,12 +42,19 @@ def state_path(title: str, novel_id: str) -> str:
 
 
 def load_state(title: str, novel_id: str) -> dict:
-    """读已抓的 JSON 中间态；不存在则返回空壳。"""
+    """读已抓的 JSON 中间态；不存在则返回空壳。
+
+    兼容旧格式：早期 content.json 没有 failures 字段，读出后补空表，
+    按「无失败」处理。
+    """
     path = state_path(title, novel_id)
     if os.path.exists(path):
         with open(path, 'r', encoding='UTF-8') as f:
-            return json.load(f)
-    return {'title': title, 'novel_id': novel_id, 'chapters': {}}
+            state = json.load(f)
+        state.setdefault('failures', {})
+        return state
+    return {'title': title, 'novel_id': novel_id,
+            'chapters': {}, 'failures': {}}
 
 
 def save_state(state: dict) -> str:
@@ -60,18 +68,58 @@ def save_state(state: dict) -> str:
 
 
 def done_ids(state: dict) -> set:
-    """已成功抓到正文的章节 id 集合（用于断点续传）。"""
+    """已成功抓到正文的章节 id 集合（用于断点续传）。
+
+    失败章只进 failures、不写 content，因此天然不会被算作已完成。
+    """
     return {cid for cid, ch in state['chapters'].items() if ch.get('content')}
 
 
 def put_chapter(state: dict, chapter: dict, content: str) -> dict:
-    """记录一章正文到中间态（不落盘，由调用方决定何时 save_state）。"""
+    """记录一章正文到中间态（不落盘，由调用方决定何时 save_state）。
+
+    成功即就地清除该章的失败标记（若有）。
+    """
     state['chapters'][chapter['id']] = {
         'index': chapter['index'],
         'title': chapter['title'],
         'content': content,
     }
+    clear_failure(state, chapter['id'])
     return state
+
+
+def put_failure(state: dict, chapter: dict, error) -> dict:
+    """记录一章抽取失败：写失败标记（原因+时间），不写 content。
+
+    不落盘，由调用方决定何时 save_state。失败章不进 chapters，
+    断点续传时会被重新尝试。
+    """
+    failures = state.setdefault('failures', {})
+    failures[chapter['id']] = {
+        'index': chapter['index'],
+        'title': chapter['title'],
+        'error': str(error),
+        'time': datetime.now().isoformat(timespec='seconds'),
+    }
+    return state
+
+
+def clear_failure(state: dict, chapter_id: str) -> None:
+    """清除某章的失败标记（无标记时静默）。"""
+    failures = state.get('failures')
+    if failures:
+        failures.pop(chapter_id, None)
+
+
+def failures(state: dict) -> dict:
+    """当前失败章表 {chapter_id: {index,title,error,time}}；旧格式视为无失败。"""
+    return state.get('failures') or {}
+
+
+def failed_ids(state: dict) -> set:
+    """当前有失败标记的章节 id 集合。"""
+    return set(failures(state))
 
 
 def _ordered_chapters(state: dict) -> list:

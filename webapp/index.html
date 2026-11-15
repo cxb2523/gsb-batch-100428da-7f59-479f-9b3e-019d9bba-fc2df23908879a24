@@ -96,6 +96,13 @@
   .counts { display: flex; justify-content: space-between; font-size: 13px;
     color: var(--muted); font-family: var(--mono); }
   .counts b { color: var(--text); }
+  .counts .fail b { color: var(--err); }
+  .warn-box { display: none; margin-top: 12px; padding: 11px 14px;
+    background: rgba(224,179,65,.1); border: 1px solid var(--warn);
+    border-radius: 9px; font-size: 13.5px; color: var(--warn); }
+  .warn-box.show { display: block; }
+  .warn-box .reason { color: var(--muted); font-size: 12.5px; margin-top: 3px;
+    font-family: var(--mono); }
   .log {
     margin-top: 16px; background: var(--bg); border: 1px solid var(--line);
     border-radius: 9px; padding: 12px 14px; height: 190px; overflow-y: auto;
@@ -175,8 +182,13 @@
     </div>
     <div class="bar"><i id="stBar"></i></div>
     <div class="counts">
-      <span>已抓 <b id="stFetched">0</b> / 待抓 <b id="stTodo">0</b></span>
+      <span>已抓 <b id="stFetched">0</b> / 待抓 <b id="stTodo">0</b>
+        <span class="fail"> · 失败 <b id="stFailed">0</b></span></span>
       <span id="stLast"></span>
+    </div>
+    <div class="warn-box" id="stWarn">
+      <div id="stWarnText"></div>
+      <div class="reason" id="stWarnReason"></div>
     </div>
     <div class="log" id="stLog"></div>
   </div>
@@ -233,11 +245,29 @@ const BADGE = {idle:'空闲', catalog:'读取目录', running:'下载中',
 function render(s) {
   const badge = $('stBadge');
   badge.className = 'badge ' + (s.phase === 'catalog' ? 'running' : s.phase);
-  badge.textContent = BADGE[s.phase] || s.phase;
+  badge.textContent = (s.phase === 'done' && s.failed > 0)
+    ? '部分完成' : (BADGE[s.phase] || s.phase);
   $('stTitle').textContent = s.title ? `《${s.title}》` : '尚未开始';
   $('stFetched').textContent = s.fetched || 0;
   $('stTodo').textContent = s.todo || 0;
+  $('stFailed').textContent = s.failed || 0;
   $('stLast').textContent = s.last || '';
+  const warn = $('stWarn');
+  if (s.failed > 0) {
+    $('stWarnText').textContent = s.running
+      ? `⚠ 已有 ${s.failed} 章抽取失败（已记录，重跑会自动重试）`
+      : `⚠ 有 ${s.failed} 章失败，可重新运行续抓`;
+    const lastFail = s.last_fail
+      || (s.failures && s.failures.length
+          ? `第${s.failures[s.failures.length-1].index}章 `
+            + `${s.failures[s.failures.length-1].title}：`
+            + `${s.failures[s.failures.length-1].error}`
+          : '');
+    $('stWarnReason').textContent = lastFail ? `最近失败：${lastFail}` : '';
+    warn.classList.add('show');
+  } else {
+    warn.classList.remove('show');
+  }
   const pct = s.todo ? Math.round((s.fetched / s.todo) * 100) : (s.phase==='done'?100:0);
   $('stBar').style.width = pct + '%';
   const log = $('stLog');
@@ -259,6 +289,9 @@ async function poll() {
     if (!s.running) {
       setRunning(false);
       clearInterval(polling); polling = null;
+      if (s.failed > 0 && (s.phase === 'done' || s.phase === 'stopped')) {
+        toast(`有 ${s.failed} 章失败，可重新运行续抓`);
+      }
       loadBooks();
     }
   };

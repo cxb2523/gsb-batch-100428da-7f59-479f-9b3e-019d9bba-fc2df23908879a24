@@ -122,14 +122,20 @@ def _run(novel_id: str, start=None, end=None, split=False, save_every=5,
         for i, ch in enumerate(todo, 1):
             if stop_event is not None and stop_event.is_set():
                 _log('\n收到停止请求，保存已抓进度后退出（下次可续传）。')
-                _emit(progress, phase='stopped', fetched=fetched)
+                _emit(progress, phase='stopped', fetched=fetched,
+                      failed=len(S.failures(state)))
                 break
             try:
                 content = extract_chapter(page, ch['id'])
             except ChapterExtractError as e:
                 _log(f"  ✗ [{ch['index']}] {ch['title']} 抽取失败：{e}")
+                # 记录失败标记（原因+时间）并立即落盘：不写 content，
+                # 断点续传不会把它当已完成，下次运行会重试。
+                S.put_failure(state, ch, e)
+                S.save_state(state)
                 _emit(progress, phase='chapter_fail', index=ch['index'],
-                      title=ch['title'], error=str(e), i=i, todo=len(todo))
+                      id=ch['id'], title=ch['title'], error=str(e),
+                      i=i, todo=len(todo))
                 continue
             S.put_chapter(state, ch, content)
             fetched += 1
@@ -150,12 +156,16 @@ def _run(novel_id: str, start=None, end=None, split=False, save_every=5,
         browser.close()
         p.stop()
 
-    _log(f'本次新抓 {fetched} 章，中间态已保存。')
+    failed_cnt = len(S.failures(state))
+    _log(f'本次新抓 {fetched} 章'
+         + (f'，失败 {failed_cnt} 章（已记录，重跑会重试）'
+            if failed_cnt else '')
+         + '，中间态已保存。')
     return _finish(state, split, progress)
 
 
 def _finish(state: dict, split: bool, progress=None) -> dict:
-    """导出 TXT 交付物。"""
+    """导出 TXT 交付物；收尾时汇总失败章（若有）。"""
     single = S.export_single_txt(state)
     if single:
         _log(f'单文件 TXT: {single}')
@@ -164,10 +174,20 @@ def _finish(state: dict, split: bool, progress=None) -> dict:
         split_dir = S.export_split_txt(state)
         if split_dir:
             _log(f'分章 TXT 目录: {split_dir}')
+    fails = S.failures(state)
+    fail_list = [
+        {'id': cid, **info}
+        for cid, info in sorted(fails.items(),
+                                key=lambda kv: kv[1].get('index', 0))
+    ]
+    if fail_list:
+        _log(f'有 {len(fail_list)} 章失败，可重新运行续抓：'
+             + '、'.join(f"第{f['index']}章" for f in fail_list))
     _emit(progress, phase='done', title=state['title'],
           novel_id=state['novel_id'],
           chapters=sum(1 for c in state['chapters'].values()
                        if c.get('content')),
+          failed=len(fail_list), failures=fail_list,
           single_txt=single, split_dir=split_dir)
     return state
 
