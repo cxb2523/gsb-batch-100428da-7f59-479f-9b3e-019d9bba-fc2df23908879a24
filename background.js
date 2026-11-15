@@ -45,7 +45,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === "log") {
     chrome.storage.local.get({ lca_log: [] }, ({ lca_log }) => {
-      lca_log.push(message.entry);
+      const entry = message.entry || {};
+      // Normalize the author-recognition flag without touching any existing
+      // fields. Entries from older content scripts lack it; fall back to the
+      // presence of firstName so downstream analysis always sees a boolean.
+      if (typeof entry.authorRecognized !== "boolean") {
+        entry.authorRecognized = !!(entry.firstName && String(entry.firstName).trim());
+      }
+      lca_log.push(entry);
       if (lca_log.length > 500) lca_log.splice(0, lca_log.length - 500);
       chrome.storage.local.set({ lca_log });
     });
