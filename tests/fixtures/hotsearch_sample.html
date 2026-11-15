@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<!-- Local fixture that mirrors the element nesting targeted by
+     hotsearch.TITLE_XPATH and hotsearch.HEAT_XPATH:
+
+       //*[@id="sanRoot"]/main/div[2]/div/div[2]/div/div[2]/a/div[1]
+       //*[@id="sanRoot"]/main/div[2]/div/div[2]/div/div[1]/div[2]
+
+     Used to exercise the real XPath expressions without a browser or network
+     access.  Three rows are present: row 2's title is blank and row 3's heat
+     is blank, so the parser has both a length mismatch and empty values to
+     report. -->
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+</head>
+<body>
+<div id="sanRoot">
+  <main>
+    <div class="header">unrelated sibling</div>
+    <div class="content">
+      <div class="inner">
+        <div class="sidebar">unrelated sibling</div>
+        <div class="rows">
+          <div class="row">
+            <div class="heat-wrap"><div class="rank">1</div><div class="heat">4,912,345</div></div>
+            <div class="title-wrap"><a href="#"><div class="title">本地样例热搜一</div><div class="desc">desc</div></a></div>
+          </div>
+          <div class="row">
+            <div class="heat-wrap"><div class="rank">2</div><div class="heat">3,201,000</div></div>
+            <div class="title-wrap"><a href="#"><div class="title"></div><div class="desc">desc</div></a></div>
+          </div>
+          <div class="row">
+            <div class="heat-wrap"><div class="rank">3</div><div class="heat"></div></div>
+            <div class="title-wrap"><a href="#"><div class="title">本地样例热搜三</div><div class="desc">desc</div></a></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+</body>
+</html>

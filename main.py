@@ -5,7 +5,8 @@ import pymysql
 import traceback
 import os
 from dotenv import load_dotenv
-from selenium.webdriver import Chrome,ChromeOptions
+
+import hotsearch
 
 load_dotenv()
 
@@ -146,42 +147,20 @@ def update_history():
         close_conn(conn,cursor)
 
 # get the hot search data from baidu
+#
+# The scrape/parse/store logic lives in hotsearch.py so this file and
+# spider.py share a single implementation.  The helpers below stay as thin
+# wrappers for backwards compatibility.
 def get_baidu_hot():
-    option = ChromeOptions()
-    option.add_argument("--headless")# hide the browser
-    option.add_argument("--no--sandbox")# for linux
-    browser =  Chrome(options=option)
-    
-    url = "https://top.baidu.com/board?tab=realtime&sa=fyb_realtime_31065"
-    # res = requests.get(url)
-    # print(res.text)
-    browser.get(url)
-    # print(browser.page_source)
-    c = browser.find_elements("xpath", '//*[@id="sanRoot"]/main/div[2]/div/div[2]/div/div[2]/a/div[1]') 
-    n = browser.find_elements("xpath", '//*[@id="sanRoot"]/main/div[2]/div/div[2]/div/div[1]/div[2]') 
+    """Return ``[[title, heat], ...]`` for the current Baidu hot search."""
+    result = hotsearch.collect_hotsearch()
+    return [[item.title, item.heat] for item in result.items]
 
-    context = []
-    for i in range(len(c)):
-        context.append([c[i].text, n[i].text])
-    print(context)
-
-    browser.close()
-    return context
 
 def update_hotsearch():
-    cursor = None
-    conn = None
-    try:
-        context = get_baidu_hot()
-        print(f"{time.asctime()}start update hotsearch data")
-        conn,cursor = get_conn()
-        sql = "INSERT INTO hotsearch (dt, content) VALUES (%s, %s)"  # Specify both columns
-        ts = time.strftime("%Y-%m-%d %X")
-        for i in context:
-            cursor.execute(sql,(ts,i))
-        conn.commit()
-        print(f"{time.asctime()}complete update hotsearch data")
-    except:
-        traceback.print_exc()
-    finally:
-        close_conn(conn,cursor)
+    """Refresh the hotsearch table and report one auditable summary line.
+
+    Raises :class:`hotsearch.HotSearchCollectionError` when the run stored
+    nothing at all (browser start, page load, parse or store failed).
+    """
+    return hotsearch.update_hotsearch()

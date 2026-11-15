@@ -1,72 +1,69 @@
-import requests
-import time
-import pymysql
-import traceback
-import os
-from dotenv import load_dotenv
-from selenium.webdriver import Chrome,ChromeOptions
+"""Standalone entry point that refreshes the ``hotsearch`` table.
 
-load_dotenv()
+The implementation lives in :mod:`hotsearch` and is shared with ``main.py``.
+Run this module directly to perform one collection run::
 
-def get_conn():
-    conn = pymysql.connect(
-        host= os.getenv("MYSQL_HOST"),
-        user= os.getenv("MYSQL_USER"),
-        password= os.getenv("MYSQL_PASSWORD"), 
-        db= os.getenv("MYSQL_DATABASE"), 
-        charset="utf8")
+    python spider.py
 
-    cursor = conn.cursor()
-    return conn, cursor
+The run prints one summary line and exits non-zero when nothing could be
+stored.
+"""
+
+import hotsearch
+from hotsearch import (
+    HotSearchCollectionError,
+    HotSearchResult,
+    close_conn,
+    get_conn,
+)
+
+__all__ = [
+    "get_conn",
+    "close_conn",
+    "get_baidu_hot",
+    "update_hotsearch",
+    "collect_hotsearch",
+    "store_hotsearch",
+    "run_hotsearch",
+    "HotSearchResult",
+    "HotSearchCollectionError",
+]
 
 
-def close_conn(conn, cursor):
-    if cursor:
-        cursor.close()
-    if conn:
-        conn.close()
-
-# get the hot search data from baidu
 def get_baidu_hot():
-    option = ChromeOptions()
-    option.add_argument("--headless")# hide the browser
-    option.add_argument("--no--sandbox")# for linux
-    browser =  Chrome(options=option)
-    
-    url = "https://top.baidu.com/board?tab=realtime&sa=fyb_realtime_31065"
-    # res = requests.get(url)
-    # print(res.text)
-    browser.get(url)
-    # print(browser.page_source)
-    c = browser.find_elements("xpath", '//*[@id="sanRoot"]/main/div[2]/div/div[2]/div/div[2]/a/div[1]') 
-    n = browser.find_elements("xpath", '//*[@id="sanRoot"]/main/div[2]/div/div[2]/div/div[1]/div[2]') 
+    """Backwards-compatible wrapper returning ``[(title, heat), ...]``.
 
-    # for content, num in zip(c,n):
-    #     print(f"{content.text} {num.text}")
-    context = [content.text + " " + num.text for content, num in zip(c,n)]
-    print("context:", context)
+    Kept for callers of the old API.  New code should call
+    :func:`hotsearch.collect_hotsearch` and inspect the structured result,
+    which also exposes dropped entries and the failing stage.
+    """
+    result = hotsearch.collect_hotsearch()
+    return [(item.title, item.heat) for item in result.items]
 
-    browser.close()
-    return context
 
-def update_hotsearch():
-    cursor = None
-    conn = None
+def collect_hotsearch(*args, **kwargs):
+    """Delegate to :func:`hotsearch.collect_hotsearch`."""
+    return hotsearch.collect_hotsearch(*args, **kwargs)
+
+
+def store_hotsearch(*args, **kwargs):
+    """Delegate to :func:`hotsearch.store_hotsearch`."""
+    return hotsearch.store_hotsearch(*args, **kwargs)
+
+
+def run_hotsearch(*args, **kwargs):
+    """Delegate to :func:`hotsearch.run_hotsearch`."""
+    return hotsearch.run_hotsearch(*args, **kwargs)
+
+
+def update_hotsearch(*args, **kwargs):
+    """Delegate to :func:`hotsearch.update_hotsearch`."""
+    return hotsearch.update_hotsearch(*args, **kwargs)
+
+
+if __name__ == "__main__":
     try:
-        context = get_baidu_hot()
-        print(f"{time.asctime()}start update hotsearch data")
-        conn,cursor = get_conn()
-        sql = "INSERT INTO hotsearch (dt, content) VALUES (%s, %s)"  # Specify both columns
-        ts = time.strftime("%Y-%m-%d %X")
-        for i in context:
-            cursor.execute(sql,(ts,i))
-        conn.commit()
-        print(f"{time.asctime()}complete update hotsearch data")
-    except:
-        traceback.print_exc()
-    finally:
-        close_conn(conn,cursor)
-
-update_hotsearch()
-
-
+        update_hotsearch()
+    except HotSearchCollectionError as exc:
+        # Non-zero exit so schedulers/CI can tell this run produced nothing.
+        raise SystemExit(f"[hotsearch] {exc}") from None
