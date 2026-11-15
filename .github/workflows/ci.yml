@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      - run: node bin/searvex rules validate --strict
+
+  render:
+    name: JavaScript rendering (Playwright + Chromium)
+    # Pinned: on the ubuntu-26.04 image (ubuntu-latest since November 2026) "playwright install --with-deps"
+    # fails to fetch its apt packages.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - name: Render tests must run (not skip)
+        run: |
+          npx vitest run test/integration/render.test.ts --reporter=verbose | tee render.log
+          # Without Chromium the suite is skipped; in this job every render test must actually run.
+          if grep -E "Tests .*skipped" render.log; then echo "render tests were skipped"; exit 1; fi
+
+  bundle-in-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci
+      - run: npm run bundle
+      - name: Committed plugin bundle matches sources
+        run: git diff --exit-code -- dist/searvex.mjs
+      - name: Committed JSON Schemas match the TypeScript types
+        run: node scripts/schema.mjs --check
+      - name: Third-party notices match the lockfile
+        run: node scripts/third-party-notices.mjs --check
+
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm install -g @anthropic-ai/claude-code
+      - run: claude plugin validate .
+
+  clean-install:
+    name: clean install from packed tarball (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: npm }
+      - run: npm ci && npm run build
+      - run: npm pack
+      - name: Install the tarball into an empty project and run the CLI end to end
+        run: |
+          consumer="$RUNNER_TEMP/consumer"
+          mkdir -p "$consumer" && cd "$consumer"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund "$GITHUB_WORKSPACE"/searvex-seo-*.tgz
+          export SEARVEX_CONFIG_DIR="$consumer/cfg"
+          npx --no-install searvex --version
+          npx --no-install searvex rules validate --strict
+          cp -r "$GITHUB_WORKSPACE/test/fixtures/repos/static-site" site
+          npx --no-install searvex audit site --out ws --format json,md,html,sarif
+          npx --no-install searvex optimize site --site-url https://northwind.example --lang en --apply --yes
+          npx --no-install searvex rollback "$(ls site/.searvex/changes)" site
+          npx --no-install searvex connect https://example.com --json

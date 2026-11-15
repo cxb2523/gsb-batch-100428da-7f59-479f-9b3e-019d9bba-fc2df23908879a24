@@ -1,0 +1,442 @@
+import crypto from 'node:crypto';
+import type { FindingSink } from '../rules/engine.js';
+import { factsOf, mainTextOf, type SiteContext } from './context.js';
+import { URL_RULES } from './inventory.js';
+
+/**
+ * Content intelligence: term extraction, topic clusters, duplicates and cannibalisation.
+ * Everything here is statistical and labelled heuristic; it never invents search volumes.
+ */
+
+const STOPWORDS = new Set(
+  (
+    // English
+    'a about above after again against all am an and any are as at be because been before being below between both but by can could did do does doing down during each few for from further had has have having he her here hers him his how i if in into is it its itself just me more most my no nor not now of off on once only or other our ours out over own same she should so some such than that the their them then there these they this those through to too under until up very was we were what when where which while who whom why will with you your yours ' +
+    'get got also use using used new one two may like make many much via per vs etc com www http https home page ' +
+    // Turkish
+    've ile bir bu da de için gibi daha çok en mi mu mü ne o şu ama veya ya ki her olan olarak sonra önce kadar ise değil var yok nasıl neden ' +
+    // German / French / Spanish (minimal)
+    'der die das und ist nicht mit für auf ein eine den von zu im le la les et des un une du pour dans est el los las y en del por con para una'
+  ).split(/\s+/),
+);
+
+export function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    // "İ".toLowerCase() is "i" + U+0307 (combining dot); drop it so Turkish words stay whole ("İlgili" → "ilgili").
+    .replace(/\u0307/g, '')
+    .normalize('NFKC')
+    .split(/[^\p{L}\p{M}\p{N}]+/u)
+    .filter((w) => w.length > 2 && !STOPWORDS.has(w) && !/^\d+$/.test(w));
+}
+
+export interface ContentReport {
+  topTerms: Array<{ term: string; pages: number }>;
+  pageTerms: Array<{ url: string; terms: string[] }>;
+  clusters: Array<{ key: string; pages: string[]; terms: string[] }>;
+  cannibalization: Array<{ terms: string[]; pages: string[] }>;
+  nearDuplicates: Array<{ a: string; b: string; similarity: number }>;
+  exactDuplicates: string[][];
+  /** Topically related indexable pages that do not link to each other (suggested direction from → to). */
+  linkOpportunities?: Array<{ from: string; to: string; similarity: number; sharedTerms: string[]; toInlinks: number }>;
+}
+
+/** 32-bit FNV-1a; shingles are stored as numbers to keep memory and hashing cheap on large sites. */
+function fnv1a(str: string, seed = 0x811c9dc5): number {
+  let h = seed >>> 0;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
+/** Distinct 5-word shingle hashes, sorted: a typed array holds them in 4 bytes each (a Set needs ~5× that). */
+function shingles(words: string[], k = 5): Uint32Array {
+  const s = new Set<number>();
+  for (let i = 0; i + k <= words.length; i++) s.add(fnv1a(words.slice(i, i + k).join(' ')));
+  return Uint32Array.from(s).sort();
+}
+
+/** Shingles that occur on at least `min` of the pages (each page's array holds distinct values). */
+function frequentShingles(arrays: Uint32Array[], min: number): Set<number> {
+  let total = 0;
+  for (const a of arrays) total += a.length;
+  const all = new Uint32Array(total);
+  let o = 0;
+  for (const a of arrays) {
+    all.set(a, o);
+    o += a.length;
+  }
+  all.sort();
+  const out = new Set<number>();
+  for (let i = 0; i < all.length; ) {
+    let j = i + 1;
+    while (j < all.length && all[j] === all[i]) j++;
+    if (j - i >= min) out.add(all[i]!);
+    i = j;
+  }
+  return out;
+}
+
+const MINHASH_N = 64;
+function minhash(sh: Uint32Array): Uint32Array {
+  const sig = new Uint32Array(MINHASH_N).fill(0xffffffff);
+  for (const x of sh) {
+    // Two independent hashes derived from the shingle hash give the permutation family a + i·b.
+    const a = x >>> 0;
+    const b = (Math.imul(x ^ 0x9e3779b9, 0x85ebca6b) >>> 0) | 1;
+    for (let i = 0; i < MINHASH_N; i++) {
+      const v = (a + Math.imul(i, b)) >>> 0;
+      if (v < sig[i]!) sig[i] = v;
+    }
+  }
+  return sig;
+}
+
+/** Jaccard similarity of two sorted shingle arrays (merge walk). */
+function jaccard(a: Uint32Array, b: Uint32Array): number {
+  let inter = 0;
+  for (let i = 0, j = 0; i < a.length && j < b.length; ) {
+    if (a[i] === b[j]) {
+      inter++;
+      i++;
+      j++;
+    } else if (a[i]! < b[j]!) i++;
+    else j++;
+  }
+  return inter / (a.length + b.length - inter || 1);
+}
+
+export function runContentChecks(ctx: SiteContext, sink: FindingSink): ContentReport {
+  const pages = ctx.indexable.map((p) => ({ p, f: factsOf(p)! }));
+  /** Locale + first path segment, e.g. "/help", "en/help": templates and title patterns live per section. */
+  const groupOf = (url: string) => {
+    const segs = new URL(url).pathname.split('/').filter(Boolean);
+    const locale = segs[0] && /^[a-z]{2}(-[a-z]{2})?$/i.test(segs[0]) ? segs.shift()! : '';
+    return `${locale}/${segs[0] ?? ''}`;
+  };
+
+
+  // One pass over the pages reads each main text once: term counts (TF-IDF over title + headings + body), the
+  // exact-duplicate hash and the near-duplicate shingles. Terms are numbered and each page keeps its counts in
+  // typed arrays: a Map per page costs ~10× the memory on large sites.
+  const vocab = new Map<string, number>();
+  const termOf: string[] = [];
+  const df: number[] = [];
+  const idOf = (t: string) => {
+    let id = vocab.get(t);
+    if (id === undefined) {
+      id = termOf.length;
+      vocab.set(t, id);
+      termOf.push(t);
+      df.push(0);
+    }
+    return id;
+  };
+  const dfOf = (t: string) => {
+    const id = vocab.get(t);
+    return id === undefined ? 0 : df[id]!;
+  };
+  const docs: Array<{ url: string; group: string; ids: Uint32Array; counts: Uint32Array }> = [];
+  // Section template vocabulary ("Help centre", "Categories", "Related articles" on every help page) says
+  // nothing about a page's topic: drop terms on at least 80% of the pages of the same section. (A lower
+  // threshold also removes the shared subject of a topical blog, e.g. "mail" on a mail product's blog.)
+  const secSize = new Map<string, number>();
+  const secDf = new Map<string, Map<number, number>>();
+  const byHash = new Map<string, string[]>();
+  const allSh = new Map<string, Uint32Array>();
+  for (const { p, f } of pages) {
+    const text = mainTextOf(ctx, f);
+    const tf = new Map<number, number>();
+    const count = (t: string, n: number) => {
+      const id = idOf(t);
+      tf.set(id, (tf.get(id) ?? 0) + n);
+    };
+    for (const t of tokenize(f.title ?? '')) count(t, 3);
+    // Headings in site chrome (footer "Product family", "Legal"…) repeat on every page: not page topics.
+    for (const h of f.headings) if (!h.chrome) for (const t of tokenize(h.text)) count(t, h.level === 1 ? 3 : 2);
+    for (const t of tokenize(text.slice(0, 20000))) count(t, 1);
+    const g = groupOf(p.url);
+    secSize.set(g, (secSize.get(g) ?? 0) + 1);
+    const m = secDf.get(g) ?? secDf.set(g, new Map()).get(g)!;
+    for (const id of tf.keys()) {
+      df[id]!++;
+      m.set(id, (m.get(id) ?? 0) + 1);
+    }
+    docs.push({ url: p.url, group: g, ids: Uint32Array.from(tf.keys()), counts: Uint32Array.from(tf.values()) });
+    // Exact duplicates by normalised body hash.
+    if (f.mainWordCount >= 30) {
+      const h = crypto.createHash('sha1').update(text.toLowerCase()).digest('hex');
+      const a = byHash.get(h);
+      if (a) a.push(p.url);
+      else byHash.set(h, [p.url]);
+    }
+    // Near-duplicates compare main content only: shared navigation/footer would make short pages look identical.
+    const words = text.toLowerCase().split(/\s+/).filter(Boolean);
+    if (words.length >= 50) allSh.set(p.url, shingles(words));
+  }
+  const N = Math.max(1, pages.length);
+  const pageTerms: ContentReport['pageTerms'] = [];
+  const vectors = new Map<string, Map<string, number>>();
+  for (const d of docs) {
+    const gs = secSize.get(d.group)!;
+    const gm = secDf.get(d.group)!;
+    const sectionTemplate = (id: number) => gs >= 4 && (gm.get(id) ?? 0) >= gs * 0.8;
+    const scored = Array.from(d.ids, (id, k) => [id, d.counts[k]! * Math.log(1 + N / df[id]!)] as const).sort((a, b) => b[1] - a[1]);
+    pageTerms.push({ url: d.url, terms: scored.slice(0, 8).map(([id]) => termOf[id]!) });
+    // Topic vector: top 20 TF-IDF terms, excluding site vocabulary (on more than half of all pages).
+    vectors.set(d.url, new Map(scored.filter(([id]) => df[id]! <= Math.max(3, N * 0.5) && !sectionTemplate(id)).slice(0, 20).map(([id, w]) => [termOf[id]!, w] as const)));
+  }
+  docs.length = 0;
+  secDf.clear();
+  const langOf = new Map(pages.map(({ p, f }) => [p.url, (f.lang ?? '').toLowerCase().split('-')[0]!]));
+  const linkOpportunities = findLinkOpportunities(ctx, vectors, langOf);
+  if (linkOpportunities.length) {
+    sink.emit('links.internal-opportunity', linkOpportunities.slice(0, 50).map((o) => ({ url: o.to, observed: `link from ${o.from} (topic similarity ${Math.round(o.similarity * 100)}%: ${o.sharedTerms.slice(0, 4).join(', ')}); target has ${o.toInlinks} internal inlink(s)` })));
+  }
+  const topTerms = df
+    .map((c, id) => [termOf[id]!, c] as const)
+    .filter(([, c]) => c >= Math.min(2, N) && c <= Math.max(2, N * 0.8))
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 40)
+    .map(([term, n]) => ({ term, pages: n }));
+
+  // Low text (heuristic; excludes utility pages).
+  const utility = /\/(contact|login|signin|sign-in|register|signup|cart|checkout|account|search|404|privacy|terms|legal|cookie|impressum|iletisim|giris)(\/|$|\?)/i;
+  for (const { p, f } of pages) {
+    // Hub pages (indexes, category lists) are mostly links by design: not "thin content".
+    const linkDensity = f.mainWordCount ? (f.mainLinkWordCount ?? 0) / f.mainWordCount : 0;
+    if (f.mainWordCount < 100 && linkDensity < 0.5 && !utility.test(new URL(p.finalUrl).pathname) && p !== ctx.homepage) {
+      sink.emit('content.low-text', { url: p.url, observed: `${f.mainWordCount} words of main content (${f.wordCount} incl. navigation/footer)` });
+    }
+  }
+
+  const exactDuplicates = [...byHash.values()].filter((g) => g.length > 1);
+  for (const g of exactDuplicates) {
+    sink.emit('duplicate.content', { url: g[0], observed: `identical text on ${g.length} URLs: ${g.slice(0, 5).join(', ')}` });
+    sink.markAffected('duplicate.content', g);
+  }
+
+  // Near-duplicates: MinHash + LSH banding (16 bands × 4 rows), then exact Jaccard on candidates.
+  // Template (boilerplate) removal: shingles that recur on a large share of pages — sidebars, category
+  // lists, CTAs inside <main> — are dropped before comparing, so pages are judged on unique content.
+  // Templates live per section and language (e.g. a help-centre sidebar on /help/* and another on /en/help/*),
+  // so boilerplate frequency is counted within each locale+section group as well as site-wide.
+  // Counted by sorting all shingles of a scope into one typed array: a count map would hold every distinct shingle
+  // of the site (millions on large sites); only the frequent ones are kept.
+  const byGroup = new Map<string, Uint32Array[]>();
+  for (const [url, s] of allSh) {
+    const g = groupOf(url);
+    (byGroup.get(g) ?? byGroup.set(g, []).get(g)!).push(s);
+  }
+  const siteMin = Math.max(3, Math.ceil(allSh.size * 0.3));
+  const siteBoilerplate = allSh.size >= 5 ? frequentShingles([...allSh.values()], siteMin) : new Set<number>();
+  const groupBoilerplate = new Map<string, Set<number>>();
+  for (const [g, arrays] of byGroup) groupBoilerplate.set(g, arrays.length >= 5 ? frequentShingles(arrays, Math.max(3, Math.ceil(arrays.length * 0.3))) : new Set<number>());
+  byGroup.clear();
+  const sh = new Map<string, Uint32Array>();
+  const sigs = new Map<string, Uint32Array>();
+  for (const [url, s] of allSh) {
+    const gb = groupBoilerplate.get(groupOf(url))!;
+    const isBoilerplate = (x: number) => siteBoilerplate.has(x) || gb.has(x);
+    const unique = s.filter((x) => !isBoilerplate(x));
+    // Too little unique text left to compare meaningfully (thin pages are covered by content.low-text).
+    if (unique.length < 20) continue;
+    sh.set(url, unique);
+    sigs.set(url, minhash(unique));
+  }
+  // Candidate pairs share a band bucket. They are collected per page (later pages only), never in one site-wide
+  // pair set: a Set holds at most 2^24 entries, which a large, varied site exceeds.
+  const buckets = new Map<string, number[]>();
+  const urlsByIndex = [...sigs.keys()];
+  const bucketKeys = urlsByIndex.map((url) => {
+    const sig = sigs.get(url)!;
+    return Array.from({ length: 16 }, (_, b) => `${b}:${sig.slice(b * 4, b * 4 + 4).join(',')}`);
+  });
+  bucketKeys.forEach((keys, i) => {
+    for (const key of keys) {
+      const arr = buckets.get(key);
+      if (arr) arr.push(i);
+      else buckets.set(key, [i]);
+    }
+  });
+  const exactSet = new Set(exactDuplicates.flat());
+  const nearDuplicates: ContentReport['nearDuplicates'] = [];
+  bucketKeys.forEach((keys, i) => {
+    const candidates = new Set<number>();
+    for (const key of keys) {
+      const members = buckets.get(key)!;
+      if (members.length < 2 || members.length > 200) continue;
+      for (const j of members) if (j > i) candidates.add(j);
+    }
+    const a = urlsByIndex[i]!;
+    for (const j of [...candidates].sort((x, y) => x - y)) {
+      const b = urlsByIndex[j]!;
+      if (exactSet.has(a) && exactSet.has(b)) continue;
+      const sim = jaccard(sh.get(a)!, sh.get(b)!);
+      if (sim >= 0.9) nearDuplicates.push({ a, b, similarity: Math.round(sim * 100) / 100 });
+    }
+  });
+  if (nearDuplicates.length) sink.emit('content.near-duplicate', nearDuplicates.slice(0, 50).map((d) => ({ url: d.a, observed: `${Math.round(d.similarity * 100)}% similar to ${d.b}` })));
+
+  // Cannibalisation: indexable pages whose specific title/H1 terms strongly overlap.
+  const groups = new Map<string, string[]>();
+  const titleTerms = new Map<string, string[]>();
+  const specificTerms = new Map<string, Set<string>>();
+  const sectionTermDf = new Map<string, Map<string, number>>();
+  const sectionPages = new Map<string, number>();
+  for (const { p, f } of pages) {
+    const terms = [...new Set([...tokenize(f.title ?? ''), ...tokenize(f.headings.find((h) => h.level === 1 && !h.chrome)?.text ?? '')])];
+    titleTerms.set(p.url, terms);
+    const g = groupOf(p.url);
+    sectionPages.set(g, (sectionPages.get(g) ?? 0) + 1);
+    const m = sectionTermDf.get(g) ?? new Map<string, number>();
+    sectionTermDf.set(g, m);
+    for (const t of terms) m.set(t, (m.get(t) ?? 0) + 1);
+  }
+  // Legal documents (each product's privacy policy, refund terms …) share titles by design and do not
+  // compete for searches; pages in different languages do not compete with each other either.
+  const legal = URL_RULES.find(([, t]) => t === 'legal')![0];
+  for (const { p } of pages) {
+    if (legal.test(new URL(p.url).pathname)) continue;
+    const terms = titleTerms.get(p.url)!;
+    const section = groupOf(p.url);
+    const gSize = sectionPages.get(section) ?? 0;
+    // Remove brand terms that appear on most pages site-wide (e.g. "Acme" in every title) and section
+    // template terms (e.g. every help article titled "… — Help centre").
+    const specific = terms.filter((t) => (dfOf(t) < N * 0.5 || N < 4) && !(gSize >= 4 && (sectionTermDf.get(section)!.get(t) ?? 0) >= gSize * 0.5));
+    if (specific.length >= 2) specificTerms.set(p.url, new Set(specific));
+  }
+  // Candidate pairs via an inverted index; pages collide when their specific title/H1 terms overlap
+  // strongly (Jaccard ≥ 0.6 with at least two shared terms). Union-find groups chains of collisions.
+  const termUrls = [...specificTerms.keys()];
+  const index = new Map<string, number[]>();
+  termUrls.forEach((url, i) => {
+    for (const t of specificTerms.get(url)!) (index.get(t) ?? index.set(t, []).get(t)!).push(i);
+  });
+  const parent = new Map<string, string>();
+  const find = (x: string): string => {
+    const px = parent.get(x) ?? x;
+    if (px === x) return x;
+    const r = find(px);
+    parent.set(x, r);
+    return r;
+  };
+  // Pairs are collected per page (later pages only), not in a site-wide set (a Set holds at most 2^24 entries).
+  termUrls.forEach((a, i) => {
+    const sa = specificTerms.get(a)!;
+    const candidates = new Set<number>();
+    for (const t of sa) {
+      const posting = index.get(t)!;
+      if (posting.length > 100) continue;
+      for (const j of posting) if (j > i) candidates.add(j);
+    }
+    for (const j of candidates) {
+      const b = termUrls[j]!;
+      if (langOf.get(a) !== langOf.get(b)) continue;
+      const sb = specificTerms.get(b)!;
+      let shared = 0;
+      for (const t of sa) if (sb.has(t)) shared++;
+      if (shared >= 2 && shared / (sa.size + sb.size - shared) >= 0.6) parent.set(find(a), find(b));
+    }
+  });
+  for (const url of specificTerms.keys()) {
+    const root = find(url);
+    (groups.get(root) ?? groups.set(root, []).get(root)!).push(url);
+  }
+  const cannibalization = [...groups.values()]
+    .filter((g) => g.length > 1)
+    .map((g) => {
+      const sets = g.map((u) => specificTerms.get(u)!);
+      const common = [...sets[0]!].filter((t) => sets.every((x) => x.has(t)));
+      return { terms: (common.length ? common : [...sets[0]!]).slice(0, 4), pages: g };
+    });
+  for (const c of cannibalization) {
+    sink.emit('content.cannibalization', { url: c.pages[0], observed: `"${c.terms.join(' ')}" shared by ${c.pages.length} pages: ${c.pages.slice(0, 5).join(', ')}` });
+    sink.markAffected('content.cannibalization', c.pages);
+  }
+
+  // Topic clusters: first path segment groups, labelled with their dominant terms.
+  const termsByUrl = new Map(pageTerms.map((x) => [x.url, x.terms]));
+  const clusterMap = new Map<string, string[]>();
+  for (const { p } of pages) {
+    const seg = new URL(p.finalUrl).pathname.split('/').filter(Boolean)[0] ?? '(root)';
+    const a = clusterMap.get(seg);
+    if (a) a.push(p.url);
+    else clusterMap.set(seg, [p.url]);
+  }
+  const clusters = [...clusterMap.entries()]
+    .map(([key, urls]) => {
+      const counts = new Map<string, number>();
+      for (const u of urls) for (const t of termsByUrl.get(u) ?? []) counts.set(t, (counts.get(t) ?? 0) + 1);
+      return { key, pages: urls, terms: [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([t]) => t) };
+    })
+    .sort((a, b) => b.pages.length - a.pages.length);
+
+  return { topTerms, pageTerms, clusters, cannibalization, nearDuplicates, exactDuplicates, linkOpportunities: linkOpportunities.slice(0, 200) };
+}
+
+/**
+ * Internal-linking opportunities: pairs of indexable pages with similar topic vectors (cosine ≥ 0.3, ≥ 2
+ * shared terms) and no link in either direction. Direction: from the better-linked page to the weaker one.
+ * Each target gets at most 3 suggestions; near-identical pairs (similarity > 0.9) are left to duplicate checks.
+ * Pages declaring different languages are never paired.
+ */
+export function findLinkOpportunities(ctx: SiteContext, vectors: Map<string, Map<string, number>>, langOf?: Map<string, string>): NonNullable<ContentReport['linkOpportunities']> {
+  // Pages in different declared languages are alternates for different readers, not link candidates.
+  const otherLanguage = (a: string, b: string) => {
+    const la = langOf?.get(a), lb = langOf?.get(b);
+    return !!la && !!lb && la !== lb;
+  };
+  const norm = new Map<string, number>();
+  for (const [u, v] of vectors) norm.set(u, Math.sqrt([...v.values()].reduce((a, x) => a + x * x, 0)) || 1);
+  // Pages sharing a term (posting lists of at most 200 pages), collected per page, later pages only: a site-wide
+  // set of seen pairs exceeds the 2^24 entries a Set can hold on large, varied sites.
+  const urls = [...vectors.keys()];
+  const index = new Map<string, number[]>();
+  urls.forEach((u, i) => {
+    for (const t of vectors.get(u)!.keys()) (index.get(t) ?? index.set(t, []).get(t)!).push(i);
+  });
+  const outlinks = new Map<string, Set<string>>();
+  for (const [target, sources] of ctx.inlinks) for (const s of sources) (outlinks.get(s) ?? outlinks.set(s, new Set()).get(s)!).add(target);
+  const links = (a: string, b: string) => outlinks.get(a)?.has(b) || outlinks.get(b)?.has(a);
+  const inl = (u: string) => ctx.reachIn.get(u)?.size ?? 0;
+  const out: NonNullable<ContentReport['linkOpportunities']> = [];
+  urls.forEach((a, i) => {
+    const va = vectors.get(a)!;
+    const candidates = new Set<number>();
+    for (const t of va.keys()) {
+      const posting = index.get(t)!;
+      if (posting.length > 200) continue;
+      for (const j of posting) if (j > i) candidates.add(j);
+    }
+    for (const j of candidates) {
+      const b = urls[j]!;
+      if (otherLanguage(a, b)) continue;
+      const vb = vectors.get(b)!;
+      let dot = 0;
+      const shared: string[] = [];
+      for (const [t, w] of va) {
+        const w2 = vb.get(t);
+        if (w2 !== undefined) {
+          dot += w * w2;
+          shared.push(t);
+        }
+      }
+      const sim = dot / (norm.get(a)! * norm.get(b)!);
+      if (shared.length < 2 || sim < 0.3 || sim > 0.9 || links(a, b)) continue;
+      const [from, to] = inl(a) >= inl(b) ? [a, b] : [b, a];
+      out.push({ from, to, similarity: Math.round(sim * 100) / 100, sharedTerms: shared.slice(0, 6), toInlinks: inl(to) });
+    }
+  });
+  // Ties are broken by URL so the result does not depend on the order pairs were found in.
+  out.sort((x, y) => x.toInlinks - y.toInlinks || y.similarity - x.similarity || (x.to < y.to ? -1 : x.to > y.to ? 1 : x.from < y.from ? -1 : x.from > y.from ? 1 : 0));
+  const perTarget = new Map<string, number>();
+  return out.filter((o) => {
+    const n = perTarget.get(o.to) ?? 0;
+    if (n >= 3) return false;
+    perTarget.set(o.to, n + 1);
+    return true;
+  });
+}

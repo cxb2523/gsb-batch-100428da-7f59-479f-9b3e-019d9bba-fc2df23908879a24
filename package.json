@@ -1,0 +1,91 @@
+{
+  "name": "searvex-seo",
+  "version": "1.5.0",
+  "description": "Understand search, fix what matters: open-source SEO + GEO auditor for websites and repositories with a bilingual (EN/TR) action-center report, root-cause grouping, repair prompts for coding agents and safe code fixes with rollback.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "bin": {
+    "searvex": "bin/searvex"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "bin",
+    "knowledge",
+    "schema",
+    "skills",
+    "agents",
+    ".claude-plugin",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "THIRD_PARTY_NOTICES.md",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=20.10"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json && node scripts/bundle.mjs && node scripts/schema.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage",
+    "rules:validate": "node dist/cli.js rules validate",
+    "prepublishOnly": "npm run build && npm test",
+    "bundle": "node scripts/bundle.mjs",
+    "schema": "node scripts/schema.mjs",
+    "benchmark": "node scripts/benchmark.mjs",
+    "notices": "node scripts/third-party-notices.mjs"
+  },
+  "keywords": [
+    "seo",
+    "geo",
+    "aeo",
+    "technical-seo",
+    "crawler",
+    "claude-code",
+    "plugin",
+    "structured-data",
+    "ai-search",
+    "seo-audit",
+    "llm",
+    "coding-agent",
+    "sitemap",
+    "hreflang",
+    "search-console"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cihantopac/searvex.git"
+  },
+  "homepage": "https://github.com/cihantopac/searvex#readme",
+  "bugs": {
+    "url": "https://github.com/cihantopac/searvex/issues"
+  },
+  "dependencies": {
+    "@babel/parser": "7.29.9",
+    "cheerio": "1.2.0",
+    "fast-xml-parser": "5.11.2",
+    "parse5": "7.3.0",
+    "parse5-htmlparser2-tree-adapter": "7.1.0",
+    "robots-parser": "3.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@vitest/coverage-v8": "5.0.4",
+    "ajv": "8.20.0",
+    "esbuild": "^0.28.1",
+    "playwright": "^1.64.1",
+    "typescript": "6.0.3",
+    "vite": "8.3.4",
+    "vitest": "5.0.4"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  }
+}
