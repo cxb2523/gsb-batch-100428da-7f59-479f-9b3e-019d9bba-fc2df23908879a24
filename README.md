@@ -116,6 +116,16 @@ npx t66y run         # 启动定时调度器,从此全自动
 }
 ```
 
+#### 新帖监控的增量与补推逻辑
+
+- **首次运行只建立基线**:把版块现有主题全部记为「已见」,不推送历史帖。
+- **之后每轮增量推送**:新出现且命中关键词(未配置关键词则全部)的主题才推送。
+- **关键词只管推送,不管已见**:未命中关键词的新帖同样记为已见,不会被反复扫描。
+- **「已见」与「已推送」分开落盘**:进程重启后,停机期间出现的新帖会在恢复后补推;已推送过的主题不会重复推送。
+- 状态仍写入本地 JSON(`seenThreads` 与 `pushedThreads` 两个数组);旧版本只有 `seenThreads` 的状态文件可直接加载,历史主题按已推送处理,不会被当新帖重推。
+
+---
+
 ### 🍪 如何获取 Cookie?
 
 1. 用 Chrome / Edge 打开论坛并**登录**;
@@ -197,7 +207,7 @@ Cookie 有有效期,重新按上面的步骤获取一次即可。建议顺手在
 | HTML 解析 | **cheerio** | 服务端 jQuery 语法,解析论坛页面最顺手 |
 | 定时调度 | **node-cron** | 语义化 cron 表达式,进程内调度无需外部依赖 |
 | 代理 | **undici ProxyAgent** | 与原生 fetch 无缝对接,支持 HTTP/SOCKS |
-| 状态存储 | **本地 JSON 文件** | 只需记录回帖计数与已读 ID,引入数据库是过度设计 |
+| 状态存储 | **本地 JSON 文件** | 记录回帖计数、已见与已推送主题 ID,引入数据库是过度设计 |
 | 分发方式 | **npm (git 源)** | 用户无需 clone 仓库,`npm install github:user/repo` 即用 |
 
 ### 项目结构
@@ -213,12 +223,13 @@ t66y-automatic/
 │   ├── client.js             # HTTP 客户端:Cookie 会话 / 代理 / 重试 / 超时
 │   ├── checkin.js            # 签到:入口发现 → 表单提交 → 结果解析
 │   ├── reply.js              # 回帖:列表抓取 → 频率控制 → 表单提交
-│   ├── monitor.js            # 监控:轮询基线 → 增量发现 → 关键词过滤
+│   ├── monitor.js            # 监控:轮询基线 → 增量发现 → 关键词过滤(重启补推)
 │   ├── notify.js             # 推送:Telegram / Bark / Server 酱多渠道并发
 │   ├── scheduler.js          # 调度:cron 驱动签到与回帖任务
-│   └── state.js              # 状态:每日计数 / 已回帖 / 已推送,落盘去重
+│   └── state.js              # 状态:每日计数 / 已回帖 / 已见 / 已推送,落盘去重
 ├── test/
-│   └── config.test.js        # node:test 单元测试
+│   ├── config.test.js        # node:test 配置与状态单元测试
+│   └── monitor.test.js       # node:test 监控增量发现 / 重启补推 / 旧状态兼容测试
 └── docs/
     └── github-seo.md         # 仓库 SEO 配置建议(描述 / Topics / 封面)
 ```

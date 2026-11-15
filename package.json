@@ -40,7 +40,7 @@
     "checkin": "node index.js checkin",
     "reply": "node index.js reply",
     "monitor": "node index.js monitor",
-    "test": "node --test test/"
+    "test": "node --test \"test/*.test.js\""
   },
   "engines": {
     "node": ">=18.0.0"
