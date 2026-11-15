@@ -129,12 +129,23 @@ python3 deep_search.py --keywords "متجر" --max-users 200000 --max-depth 6
 | `--max-followers`  | max followers fetched per account             | 1000               |
 | `--max-users`      | max accounts to process (safety cap)          | 1000000            |
 | `--state`          | state file of already-crawled users           | `output/crawl_state.json` |
+| `--outcomes`       | JSONL file with one outcome record per account | `output/crawl_outcomes.jsonl` |
+| `--page-retries`   | retries per account for a failed/anomalous page | 3                  |
+| `--retry-backoff`  | base seconds for exponential retry backoff    | 1.0                |
 | `--reset-state`    | ignore state and start fresh                  | off                |
 | `--delay-min/max`  | random delay between requests (seconds)       | 0.3 / 1.0          |
 
 - Runs **continuously** and deepens as long as the frontier is non-empty.
 - Stop anytime with **Ctrl+C**; progress and state are saved.
 - Private accounts are not expanded (their follower list isn't public).
+- **Resilient pagination**: empty responses, non-zero `status_code` and cursor
+  anomalies (repeated/regressing cursor) are retried per account with bounded
+  exponential backoff. If retries run out, only that account's pagination stops —
+  followers already fetched are kept and their bios are still scanned.
+- Every processed account leaves an **outcome record** (account, depth, followers
+  fetched, complete?, failure reason, attempts) in the outcomes JSONL file, and the
+  run ends with a success/partial/failed summary. Only fully-crawled accounts are
+  written to the state file; partially-failed accounts are retried on the next run.
 
 ### 3) Enrich an existing file (`enrich_country.py`, `enrich_categories.py`)
 

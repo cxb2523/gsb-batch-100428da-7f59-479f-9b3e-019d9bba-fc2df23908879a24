@@ -8,7 +8,10 @@
   "max_users": 1000000,
   "delay_min": 0.3,
   "delay_max": 1.0,
+  "page_retries": 3,
+  "retry_backoff": 1.0,
   "output": "output/tiktok-bio.json",
   "state": "output/crawl_state.json",
+  "outcomes": "output/crawl_outcomes.jsonl",
   "keywords": ["مطعم", "عقارات", "توصيل", "متجر", "خدمات"]
 }
