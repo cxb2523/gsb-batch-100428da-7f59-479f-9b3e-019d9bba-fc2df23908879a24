@@ -1,4 +1,4 @@
-from web import auth_lk, scrape_grades
+from web import auth_lk, scrape_grades, WebClientError, GradesScrapeResult, ScrapeOutcome
 from core import (
     DiplomaSubjectsInfo,
     GradesAnalysisResult,
@@ -8,6 +8,38 @@ from core import (
     get_diploma_grades_stats,
     diploma_with_distinction_check
 )
+
+
+class WebAnalysisResult:
+    """Outcome of the full web collection + analysis pipeline
+
+    On success `analysis` holds the computed GradesAnalysisResult and `scrape_result` carries
+    the raw grades HTML. On collection failure `analysis` is None and the scrape result explains
+    which verifiable outcome occurred (unauthorized session, changed page, HTTP/network error...).
+    """
+
+    def __init__(self, scrape_result: GradesScrapeResult, analysis: GradesAnalysisResult | None = None):
+        self.scrape_result = scrape_result
+        self.analysis = analysis
+
+    @property
+    def ok(self) -> bool:
+        return self.scrape_result.ok and self.analysis is not None
+
+    @property
+    def outcome(self) -> ScrapeOutcome:
+        return self.scrape_result.outcome
+
+    @property
+    def reason(self) -> str | None:
+        return self.scrape_result.reason
+
+    @property
+    def request_chain(self) -> list[str]:
+        return self.scrape_result.request_chain
+
+    def format_details(self) -> str:
+        return self.scrape_result.format_details()
 
 
 def analyze_from_web(
@@ -20,14 +52,31 @@ def analyze_from_web(
     department: str | None = None,
     retakes: int = 0,
     semesters_shown: int = 0
-) -> GradesAnalysisResult:
-    """Start the analysis of grades from the web"""
-    session = auth_lk(login_url=login_url, email=email, password=password)
+) -> WebAnalysisResult:
+    """Run the full web collection and analysis, propagating the collection outcome
 
-    html_content = scrape_grades(session=session, grades_url=grades_url)
+    Collection failures (login or grades page) are returned as a WebAnalysisResult with the
+    concrete outcome instead of a generic exception. The grades calculation and red-diploma
+    rules themselves are the same as in analyze_from_html.
+    """
+    try:
+        session = auth_lk(login_url=login_url, email=email, password=password)
+
+    except WebClientError as error:
+        return WebAnalysisResult(
+            GradesScrapeResult.failure(
+                outcome=ScrapeOutcome.AUTH_FAILED,
+                reason=str(error)
+            )
+        )
+
+    scrape_result = scrape_grades(session=session, grades_url=grades_url)
+
+    if not scrape_result.ok:
+        return WebAnalysisResult(scrape_result)
 
     result = analyze_from_html(
-        html_content=html_content,
+        html_content=scrape_result.html,
         faculty=faculty,
         study_program=study_program,
         department=department,
@@ -35,7 +84,7 @@ def analyze_from_web(
         semesters_shown=semesters_shown
     )
 
-    return result
+    return WebAnalysisResult(scrape_result, analysis=result)
 
 
 def analyze_from_html(

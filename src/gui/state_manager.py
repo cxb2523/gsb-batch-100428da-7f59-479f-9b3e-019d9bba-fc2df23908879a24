@@ -2,7 +2,7 @@ import logging
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, QTimer
 
 from utils import load_config, resource_path
-from web import auth_lk, scrape_grades, WebClientError
+from web import auth_lk, scrape_grades, WebClientError, GradesScrapeResult, ScrapeOutcome
 from services import analyze_from_html
 from core import parse_grades, GradesAnalysisResult
 from gui import TerminalView, WizardView
@@ -12,8 +12,8 @@ logger = logging.getLogger(__name__)
 
 class AuthWorker(QObject):
     """Runs the blocking login + scrape network I/O off the UI thread"""
-    finished = pyqtSignal(str) # scraped grades HTML
-    failed = pyqtSignal(str) # user-facing error message
+    finished = pyqtSignal(str)  # scraped grades HTML
+    failed = pyqtSignal(object)  # GradesScrapeResult with a concrete outcome
 
     def __init__(self, login_url: str, grades_url: str, email: str, password: str):
         super().__init__()
@@ -25,15 +25,26 @@ class AuthWorker(QObject):
     def run(self) -> None:
         try:
             session = auth_lk(login_url=self._login_url, email=self._email, password=self._password)
-            html = scrape_grades(session=session, grades_url=self._grades_url)
-            self.finished.emit(html)
+            scrape_result = scrape_grades(session=session, grades_url=self._grades_url)
 
-        except WebClientError as e:
-            self.failed.emit(str(e))
+            if scrape_result.ok:
+                self.finished.emit(scrape_result.html)
+            else:
+                self.failed.emit(scrape_result)
 
-        except Exception as e:
+        except WebClientError as error:
+            logger.warning("Authorization failed: %s", error)
+            self.failed.emit(GradesScrapeResult.failure(
+                outcome=ScrapeOutcome.AUTH_FAILED,
+                reason=str(error)
+            ))
+
+        except Exception as error:
             logger.exception("Unexpected error during authentication/scraping")
-            self.failed.emit(f"Непредвиденная ошибка при загрузке данных: {e}")
+            self.failed.emit(GradesScrapeResult.failure(
+                outcome=ScrapeOutcome.UNEXPECTED_ERROR,
+                reason=str(error)
+            ))
 
 
 class StateManager(QObject):
@@ -451,9 +462,9 @@ class StateManager(QObject):
         self.stage = 1
         self.transition_to_faculty_selection()
 
-    def _on_auth_failed(self, message: str) -> None:
-        """Handles the failure of the auth + scrape process"""
-        self.terminal.print_line(message, "error")
+    def _on_auth_failed(self, scrape_result: GradesScrapeResult) -> None:
+        """Handles the failure of the auth + scrape process and shows the concrete outcome"""
+        self.terminal.print_line(f"\n{scrape_result.format_details()}", "error")
         self._prompt_login()
 
     def _go_back(self) -> None:

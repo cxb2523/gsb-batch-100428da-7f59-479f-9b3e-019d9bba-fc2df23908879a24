@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from web import auth_lk, scrape_grades
+from web import auth_lk, scrape_grades, WebClientError
 from utils import load_config
 from services import analyze_from_html
 
@@ -13,20 +13,25 @@ def main():
     if grades_path.exists():
         grades_html_data = grades_path.read_text(encoding="utf-8")
     else:
-        session = auth_lk(
-            config["login_url"],
-            config["user_email"],
-            config["user_password"]
-        )
+        try:
+            session = auth_lk(
+                config["login_url"],
+                config["user_email"],
+                config["user_password"]
+            )
 
-        if not session:
+        except WebClientError as error:
+            print(f"Ошибка авторизации: {error}")
             return
 
-        grades_html_data = scrape_grades(session, config["grades_url"])
+        scrape_result = scrape_grades(session, config["grades_url"])
 
-        if not grades_html_data:
+        if not scrape_result.ok:
+            print(scrape_result.format_details())
             return
-    
+
+        grades_html_data = scrape_result.html
+
         grades_path.parent.mkdir(parents=True, exist_ok=True)
         grades_path.write_text(grades_html_data, encoding="utf-8")
 
