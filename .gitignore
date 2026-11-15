@@ -1,0 +1,72 @@
+# Runtime data (may contain real cookies, databases with personal info)
+data/
+
+# Output files (generated resumes, reports, exports)
+output/
+
+# User resumes and offer inputs (personal data, never publish)
+resumes/
+offers/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Package build artifacts
+*.egg-info/
+dist/
+
+# Environment files (API keys)
+.env
+*.env
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Certificates and keys
+*.pem
+*.key
+*.crt
+
+# Databases (local DBs may contain personal info)
+*.db
+*.sqlite
+*.sqlite3
+
+# Type checking
+.mypy_cache/
+
+# Linting
+.ruff_cache/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# test/verification artifacts
+coverage.json
+*.html
+# website landing page is intentional and must be tracked
+!website/index.html
+
+# Local MCP screenshots / personal working artifacts
+.playwright-mcp/
+misc/
+website/screenshots/
+
+# Internal docs (ai-assistant memory / retrospects with private details)
+AGENTS.md
+docs/development-plan.md
+docs/unfinished-work.md
+docs/retrospective-*.md
+
+# Promo video generation scripts (contain API keys, local-only)
+scripts/make_promo*.py
+scripts/compose_promo*.py
+scripts/wan3_ad_script.py
