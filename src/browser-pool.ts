@@ -11,7 +11,7 @@ import QuickLRU from 'quick-lru';
 import { BrowserController } from './abstract-classes/browser-controller';
 import { BrowserPlugin } from './abstract-classes/browser-plugin';
 import { BROWSER_POOL_EVENTS } from './events';
-import { LaunchContext } from './launch-context';
+import { LaunchContext, normalizeProxyUrl } from './launch-context';
 import { log } from './logger';
 import { InferBrowserPluginArray, UnwrapPromise } from './utils';
 import { createFingerprintPreLaunchHook, createPrePageCreateHook, createPostPageCreateHook } from './fingerprinting/hooks';
@@ -394,9 +394,21 @@ export class BrowserPool<
         }
 
         // Limiter is necessary - https://github.com/apify/apify-js/issues/1126
+        // It serializes browser selection and launching, so concurrent newPage()
+        // requests for the same proxy cannot race into launching duplicate browsers
+        // and pages with different proxies can never land in the same browser.
         return this.limiter(async () => {
-            let browserController = this._pickBrowserWithFreeCapacity(browserPlugin);
-            if (!browserController) browserController = await this._launchBrowser(id, { browserPlugin });
+            // Normalize upfront, so equivalent proxy URLs (e.g. differing only by a
+            // trailing slash or a path) resolve to the same browser.
+            const normalizedProxyUrl = proxyUrl ? normalizeProxyUrl(proxyUrl) : undefined;
+
+            let browserController = this._pickBrowserWithFreeCapacity(browserPlugin, normalizedProxyUrl);
+            if (!browserController) {
+                browserController = await this._launchBrowser(id, {
+                    browserPlugin,
+                    proxyUrl: normalizedProxyUrl,
+                });
+            }
             tryCancel();
 
             return this._createPageForBrowser(id, browserController, pageOptions, proxyUrl);
@@ -624,6 +636,7 @@ export class BrowserPool<
         const {
             browserPlugin,
             launchOptions,
+            proxyUrl,
         } = options;
 
         const browserController = browserPlugin.createController() as BrowserControllerReturn;
@@ -632,6 +645,10 @@ export class BrowserPool<
         const launchContext = browserPlugin.createLaunchContext({
             id: pageId,
             launchOptions,
+            // Passing `undefined` explicitly keeps the plugin-level default behavior,
+            // while a defined value launches the new browser through that proxy and
+            // records it on the LaunchContext for later matching.
+            proxyUrl,
         });
 
         try {
@@ -682,11 +699,29 @@ export class BrowserPool<
         return this.browserPlugins[pluginIndex];
     }
 
-    private _pickBrowserWithFreeCapacity(browserPlugin: BrowserPlugin) {
+    /**
+     * Picks an active browser controller that still has capacity for another page.
+     *
+     * When `proxyUrl` is provided, only browsers launched with the exact same
+     * proxy are eligible. A shared-context browser whose proxy differs from the
+     * requested one is therefore never silently reused - a new browser gets
+     * launched instead. When `proxyUrl` is not provided, any browser with free
+     * capacity can be reused, preserving the original pool behavior.
+     *
+     * @private
+     */
+    private _pickBrowserWithFreeCapacity(browserPlugin: BrowserPlugin, proxyUrl?: string) {
         for (const controller of this.activeBrowserControllers) {
             const hasCapacity = controller.activePages < this.maxOpenPagesPerBrowser;
             const isCorrectPlugin = controller.browserPlugin === browserPlugin;
-            if (hasCapacity && isCorrectPlugin) {
+            // Normalize the browser's recorded proxy as well: proxies configured on
+            // the plugin keep their trailing-slash form, while per-page proxy URLs
+            // are normalized, so the two must be canonicalized before comparing.
+            const browserProxyUrl = controller.launchContext?.proxyUrl;
+            const isCorrectProxy = proxyUrl === undefined
+                || (browserProxyUrl !== undefined && normalizeProxyUrl(browserProxyUrl) === proxyUrl);
+
+            if (hasCapacity && isCorrectPlugin && isCorrectProxy) {
                 return controller;
             }
         }
@@ -812,6 +847,12 @@ export interface BrowserPoolNewPageOptions<PageOptions, BP extends BrowserPlugin
     browserPlugin?: BP;
     /**
      * Proxy URL.
+     *
+     * When provided, the page is opened in a browser launched with this proxy:
+     * the pool reuses an active browser with the same proxy and free capacity,
+     * or launches a new one (recording the proxy on its `LaunchContext`) if none
+     * exists. A browser launched with a different proxy is never reused for the
+     * page. When omitted, any browser with free capacity can be reused.
      */
     proxyUrl?: string;
 }
@@ -849,4 +890,5 @@ export interface BrowserPoolNewPageInNewBrowserOptions<PageOptions, BP extends B
 interface InternalLaunchBrowserOptions<BP extends BrowserPlugin> {
     browserPlugin: BP;
     launchOptions?: BP['launchOptions'];
+    proxyUrl?: string;
 }

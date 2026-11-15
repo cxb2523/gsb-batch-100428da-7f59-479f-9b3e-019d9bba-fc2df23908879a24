@@ -194,6 +194,27 @@ const puppeteerPlugin = new PuppeteerPlugin(puppeteer, {
 > We plan to extend this by adding a proxy-per-page functionality,
 > allowing you to rotate proxies per page, rather than per browser.
 
+A proxy URL can also be passed to [`browserPool.newPage()`](#BrowserPool+newPage).
+When a `proxyUrl` is provided, Browser Pool first tries to reuse an already
+running browser that was launched with the exact same proxy and still has free
+capacity. Only when no such browser exists does it launch a new one, recording
+the proxy on the browser's `LaunchContext`. This keeps all pages sharing one
+proxy inside the same browser, which preserves sessions and consistent
+fingerprints, while pages with different proxies are always placed in separate
+browsers. Calls without a `proxyUrl` keep the original behavior and may reuse
+any browser with free capacity. Concurrent `newPage()` calls are serialized,
+so simultaneous requests for the same proxy never race into launching
+duplicate browsers.
+
+```js
+// Both pages are opened in the same browser, launched through PROXY_URL.
+const page1 = await browserPool.newPage({ proxyUrl: PROXY_URL });
+const page2 = await browserPool.newPage({ proxyUrl: PROXY_URL });
+
+// A different proxy forces a new, isolated browser.
+const page3 = await browserPool.newPage({ proxyUrl: OTHER_PROXY_URL });
+```
+
 ### Lifecycle management with hooks
 Browser Pool allows you to manage the full browser / page lifecycle
 by attaching hooks to the most important events. Asynchronous hooks

@@ -3,6 +3,23 @@ import type { BrowserPlugin, CommonBrowser, CommonLibrary } from './abstract-cla
 import { UnwrapPromise } from './utils';
 
 /**
+ * Normalizes a proxy URL so that equivalent proxy URLs always compare equal.
+ *
+ * The path, query string and hash are stripped, because they do not identify
+ * a proxy server (only scheme, host, port and credentials do). The trailing
+ * slash added by `URL.href` is also removed.
+ */
+export function normalizeProxyUrl(proxyUrl: string): string {
+    const urlInstance = new URL(proxyUrl);
+    urlInstance.pathname = '/';
+    urlInstance.search = '';
+    urlInstance.hash = '';
+
+    // https://www.chromium.org/developers/design-documents/network-settings/#command-line-options-for-proxy-settings
+    return urlInstance.href.slice(0, -1);
+}
+
+/**
  * `LaunchContext` holds information about the launched browser. It's useful
  * to retrieve the `launchOptions`, the proxy the browser was launched with
  * or any other information user chose to add to the `LaunchContext` by calling
@@ -115,13 +132,7 @@ export class LaunchContext<
             return;
         }
 
-        const urlInstance = new URL(url);
-        urlInstance.pathname = '/';
-        urlInstance.search = '';
-        urlInstance.hash = '';
-
-        // https://www.chromium.org/developers/design-documents/network-settings/#command-line-options-for-proxy-settings
-        this._proxyUrl = urlInstance.href.slice(0, -1);
+        this._proxyUrl = normalizeProxyUrl(url);
     }
 
     /**
