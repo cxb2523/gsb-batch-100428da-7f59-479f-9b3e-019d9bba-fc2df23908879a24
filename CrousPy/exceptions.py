@@ -9,6 +9,13 @@ class CrousAPIError(Exception):
         super().__init__(self.error)
 
 
+class CrousDataError(CrousAPIError):
+    """Levée quand le corps d'une réponse n'a pas la structure attendue."""
+
+    def __init__(self, error: str = "La structure des données reçues est invalide."):
+        super().__init__(error)
+
+
 class RedirectError(CrousAPIError):
     def __init__(self):
         self.error = "Redirection !"

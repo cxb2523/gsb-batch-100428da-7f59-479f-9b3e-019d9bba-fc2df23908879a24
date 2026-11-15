@@ -106,6 +106,26 @@ async def main():
     restaurants = await client.feed.getByURL(feeds[0].url)
     print(restaurants)
 
+    # Collecte groupée de plusieurs régions : chaque région est isolée.
+    # Une erreur HTTP, un timeout ou une structure de réponse inattendue sur
+    # une région est consigné dans le rapport sans interrompre les autres,
+    # et les données des régions réussies sont conservées.
+    report = await client.collect([23, 24, 25])
+    for region in report:
+        if not region.success:
+            # region.errorType vaut CollectErrorType.REQUEST (échec de requête)
+            # ou CollectErrorType.DATA (structure de données inattendue)
+            print(region.regionId, region.errorType, region.reason)
+            continue
+        for restaurant in region.restaurants:
+            if restaurant.success:
+                print(restaurant.title, len(restaurant.menus), "menus")
+
+    # En mode flux, les menus viennent du flux régional et la correspondance
+    # des restaurants se fait par `RU.feedId` ; un restaurant absent du flux
+    # est sauté et consigné (restaurant.skipped) sans affecter les autres.
+    report = await client.collect([23], source="feed")
+
     # Récupérer le contenu brut d'une image
     image = await client.image.get("https://example.com/image.jpg")
 
@@ -121,6 +141,7 @@ if __name__ == "__main__":
 | Exception | Code HTTP | Description |
 |---|---|---|
 | `CrousAPIError` | - | Erreur générique de l'API |
+| `CrousDataError` | - | Structure des données reçues invalide |
 | `RedirectError` | 302 | Redirection inattendue |
 | `BadRequestError` | 400 | Mauvaise requête |
 | `ForbiddenError` | 403 | Accès refusé |

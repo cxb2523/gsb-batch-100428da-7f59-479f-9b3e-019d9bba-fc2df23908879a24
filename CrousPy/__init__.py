@@ -13,6 +13,15 @@ __feedIndexURL__ = "http://webservices-v2.crous-mobile.fr/feed/feeds.json"
 
 from .client import Crous
 
+# Collecte groupée
+from .collect import (
+    CollectErrorType,
+    Collector,
+    CollectReport,
+    RegionResult,
+    RestaurantResult,
+)
+
 # Categories
 from .entity.category import Category
 from .entity.collection.feedCollection import Feeds
@@ -45,6 +54,7 @@ from .exceptions import (
     BadRequestError,
     ConflictWithServer,
     CrousAPIError,
+    CrousDataError,
     FluxIntrouvable,
     ForbiddenError,
     InternalServerError,
@@ -63,9 +73,13 @@ __all__ = [
     "RU",
     "BadRequestError",
     "Category",
+    "CollectErrorType",
+    "CollectReport",
+    "Collector",
     "ConflictWithServer",
     "Crous",
     "CrousAPIError",
+    "CrousDataError",
     "Dish",
     "Feed",
     "FeedRU",
@@ -82,8 +96,10 @@ __all__ = [
     "RedirectError",
     "Region",
     "RegionIntrouvable",
+    "RegionResult",
     "Regions",
     "RestaurantIntrouvable",
+    "RestaurantResult",
     "TeapotError",
     "TooEarlyError",
     "formatTitle",

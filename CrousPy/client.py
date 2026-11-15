@@ -1,6 +1,7 @@
 from aiohttp import ClientSession
 from async_timeout import timeout
 
+from .collect import Collector
 from .entity.collection.feedCollection import Feeds
 from .entity.collection.feedRuCollection import FeedRUs
 from .entity.collection.menuCollection import Menus
@@ -49,6 +50,42 @@ class Crous:
         self.menu = Menu(self.client)
         self.feed = Feed(self.client)
         self.image = Image(self.client)
+
+        self._collector = Collector(self)
+
+    async def collect(
+        self,
+        regionIDs: list[int],
+        source: str = "api",
+        feedURLs: dict[int, str] | None = None,
+    ):
+        """
+        Collecte groupée des restaurants et de leurs menus sur plusieurs régions.
+
+        Chaque région est traitée indépendamment : une erreur HTTP, un timeout
+        ou une structure de réponse inattendue sur une région sont consignés
+        dans le rapport sans interrompre les régions suivantes, et les données
+        des régions réussies sont conservées.
+
+        :param regionIDs: Les ID des régions à collecter.
+        :type regionIDs: list[int]
+
+        :param source: La source des menus : ``"api"`` (défaut, ID région + ID
+            restaurant) ou ``"feed"`` (flux régional, correspondance par
+            ``RU.feedId``).
+        :type source: str
+
+        :param feedURLs: Mapping optionnel ``regionID -> URL de flux`` pour le
+            mode ``"feed"``.
+        :type feedURLs: dict[int, str] | None
+
+        :return: Le rapport de collecte (une entrée par région, avec son
+            succès ou son échec et sa raison).
+        :rtype: CollectReport
+        """
+        return await self._collector.collect(
+            regionIDs, source=source, feedURLs=feedURLs
+        )
 
 
 class Region:
