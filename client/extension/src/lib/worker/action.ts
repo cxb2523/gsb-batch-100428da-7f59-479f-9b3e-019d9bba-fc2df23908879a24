@@ -1,4 +1,9 @@
 import { ActionType } from "../ui/utils/types";
+import {
+  ActionResolution,
+  ExecutionReport,
+  runActions,
+} from "./actionResolution";
 
 class ActionExecutor {
   tabId: number;
@@ -13,15 +18,34 @@ class ActionExecutor {
     this.waitAfterKeystroke = 15; // ms
   }
 
-  async executeActions() {
-    for (const action of this.actions) {
-      await this.executeAction(action);
+  /**
+   * Executes the configured actions.
+   *
+   * Actions the server could not locate are skipped without touching the
+   * debugger; they are reported as failures and the remaining actions still
+   * run. The returned report lists exactly which steps succeeded and which did
+   * not.
+   */
+  async executeActions(): Promise<ExecutionReport<Action>> {
+    const report = await runActions(this.actions || [], async (action) => {
+      const outcome = await this.executeAction(action);
+      // Keep the original spacing between executed actions.
       await this.wait(50);
+      return outcome;
+    });
+
+    for (const failure of report.failed) {
+      console.warn(
+        `[AI Employe] Action ${failure.index} failed (${failure.reason}): ${
+          failure.message
+        }`
+      );
     }
-    return this.tabId;
+
+    return report;
   }
 
-  async executeAction(action) {
+  async executeAction(action: Action) {
     const actionHandlers = {
       click: () => this.performClick(action),
       input: () => this.performType(action),
@@ -30,12 +54,13 @@ class ActionExecutor {
     };
 
     const handler = actionHandlers[action.action_type];
-    if (handler) {
-      await handler();
-    } else {
+    if (!handler) {
       console.warn(`Unsupported action type: ${action.action_type}`);
-      return;
+      return false;
     }
+
+    await handler();
+    return true;
   }
 
   async performClick(action) {
@@ -243,10 +268,11 @@ interface Action {
   action_type: BrowserActionType;
   search_term_to_find_this_element?: string;
   value?: string;
-  node_id?: number;
+  node_id?: number | null;
   thought_process?: string;
   block_ids?: string;
   pressEnter?: boolean;
+  resolution?: ActionResolution | null;
 }
 
 export default ActionExecutor;

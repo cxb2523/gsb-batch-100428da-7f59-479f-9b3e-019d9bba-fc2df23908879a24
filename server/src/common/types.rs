@@ -148,6 +148,92 @@ pub enum Value {
     JsonValue(JsonValue),
 }
 
+/// Which search was responsible for locating an element.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchScope {
+    /// The search was limited to the block ids supplied by the model.
+    BlockIds,
+    /// The search covered the whole document (either because no block ids were
+    /// supplied, or because the block limited search had no hits).
+    Document,
+}
+
+/// Why an action could not be resolved to a concrete DOM element.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LocateFailureReason {
+    /// Neither the block limited search nor the document wide search returned
+    /// a hit.
+    NoMatch,
+    /// A hit was found but the element had no `node_id`/`aie-id`.
+    MissingNodeId,
+    /// The action needs an element but the model did not provide a search term.
+    MissingSearchTerm,
+    /// No HTML was supplied with the request, so no index could be built and
+    /// no search was attempted.
+    NotIndexed,
+}
+
+/// Auditable outcome of locating a DOM element for a single action.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ActionResolution {
+    /// Whether the action can be executed. Always `true` for actions such as
+    /// `goto_url` that do not target an element (see `requires_element`).
+    pub located: bool,
+    /// Whether this action type needs a DOM element at all.
+    #[serde(default)]
+    pub requires_element: bool,
+    /// Which search produced the element. `None` when no search was performed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_scope: Option<SearchScope>,
+    /// Whether the initial block limited search was empty and we had to fall
+    /// back to the document wide search.
+    pub fallback_used: bool,
+    /// Why the action is not located. `None` when located or when the action
+    /// does not target an element.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<LocateFailureReason>,
+}
+
+impl ActionResolution {
+    pub fn located(scope: SearchScope, fallback_used: bool) -> Self {
+        Self {
+            located: true,
+            requires_element: true,
+            search_scope: Some(scope),
+            fallback_used,
+            reason: None,
+        }
+    }
+
+    pub fn unlocated(
+        scope: Option<SearchScope>,
+        fallback_used: bool,
+        reason: LocateFailureReason,
+    ) -> Self {
+        Self {
+            located: false,
+            requires_element: true,
+            search_scope: scope,
+            fallback_used,
+            reason: Some(reason),
+        }
+    }
+
+    /// Actions such as `goto_url` or `enter` do not need a DOM element, so
+    /// there is nothing that can fail to resolve.
+    pub fn not_required() -> Self {
+        Self {
+            located: true,
+            requires_element: false,
+            search_scope: None,
+            fallback_used: false,
+            reason: None,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AIAction {
     pub action_type: ActionType,
@@ -156,6 +242,16 @@ pub struct AIAction {
     pub node_id: Option<i32>,
     pub thought_process: Option<String>,
     pub block_ids: Option<String>,
+    /// How the search term was resolved to `node_id`. Always present after the
+    /// action went through DOM indexing, so clients can tell located and
+    /// unlocated actions apart.
+    pub resolution: Option<ActionResolution>,
+}
+
+impl AIAction {
+    pub fn requires_element(&self) -> bool {
+        self.action_type.requires_element_location()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -193,4 +289,19 @@ pub enum ActionType {
     CodeGeneration,
     GotoUrl,
     ExtractAndStoreInfoForNextTask,
+}
+
+impl ActionType {
+    /// Actions that are dispatched against a concrete DOM element and therefore
+    /// need `search_term_to_find_this_element` to resolve to a `node_id`.
+    pub fn requires_element_location(&self) -> bool {
+        matches!(
+            self,
+            ActionType::Click
+                | ActionType::Input
+                | ActionType::Select
+                | ActionType::Hover
+                | ActionType::Focus
+        )
+    }
 }

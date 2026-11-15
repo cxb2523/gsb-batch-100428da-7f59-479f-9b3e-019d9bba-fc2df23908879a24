@@ -4,6 +4,7 @@ import { fetchClient, queryActiveTab, isChromeUrl } from "./utils";
 import { ActionType } from "../ui/utils/types";
 import { sendMessage } from "../ui/utils/message";
 import ActionExecutor from "./action";
+import { summarizeFailures } from "./actionResolution";
 import { getOpenAIKey } from "./setup";
 
 let stopRequested = false;
@@ -62,10 +63,22 @@ export const startWorkflow = async (payload: {
     const actions = response.action.actions;
     sendResponseToSidePanel(response.action.actions);
     const actionExecutor = new ActionExecutor(tab.id, actions);
-    const executedTabId = await actionExecutor.executeActions();
+    const report = await actionExecutor.executeActions();
+    if (report.failed.length > 0) {
+      console.warn(
+        `[AI Employe] ${report.failed.length} of ${actions.length} action(s) failed`,
+        report.failed
+      );
+      // Tell the user which step failed instead of aborting the workflow.
+      sendResponseToSidePanel(
+        `Skipped ${report.failed.length} of ${actions.length} action(s):\n${summarizeFailures(
+          report
+        )}`
+      );
+    }
 
     await new Promise((resolve) => setTimeout(resolve, 1000)); // TODO: need different logic to calculate when to start next request
-    startWorkflow({ workflowId, tabId: executedTabId });
+    startWorkflow({ workflowId, tabId: actionExecutor.tabId });
   } catch (e) {
     console.log("error", e);
     workflowDone(`Error: ${e.message}`);

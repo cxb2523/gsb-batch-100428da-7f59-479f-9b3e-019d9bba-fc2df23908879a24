@@ -7,7 +7,7 @@
     "dev": "ENV=development dotenv -e ../../.env.development -- bun build.ts",
     "stage:build": "ENV=development dotenv -e ../../.env.development -- bun build.ts",
     "prod:build": "ENV=production dotenv -e ../../.env.production -- bun build.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "node --test test/actionResolution.test.ts"
   },
   "author": "",
   "license": "ISC",

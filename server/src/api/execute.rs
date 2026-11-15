@@ -14,7 +14,7 @@ use crate::{
             user::get_user_info_from_db,
             workflow::get_workflow_by_id,
         },
-        dom::search::build_index_and_attach_node_id,
+        dom::search::{build_index_and_attach_node_id, mark_actions_without_index},
         gpt::action::{
             get_search_term_and_action_with_workflow_id, get_search_term_and_for_common_action,
         },
@@ -163,6 +163,11 @@ async fn execute_workflow(
                 status: ApiStatus::Error("Error indexing HTML".to_string()),
             });
         }
+    } else {
+        // Without HTML there is no DOM index to resolve search terms against.
+        // Mark element actions as unlocated so the client skips them instead of
+        // looking up a node id that was never assigned.
+        mark_actions_without_index(&mut ai_actions);
     }
 
     if update_task_status_and_ai_action(
@@ -262,6 +267,8 @@ async fn execute(
                 status: ApiStatus::Error("Error indexing HTML".to_string()),
             });
         }
+    } else {
+        mark_actions_without_index(&mut ai_action);
     }
 
     if update_actions_stats_by_user_id(&user_info.id, &db)
