@@ -17,22 +17,33 @@ if __name__ == "__main__":
     destn_dir = itf_values[keys.destn_dir]
     if itf_event == keys.submit:
         init_time = time()
-        sellers_data_list = sellers_data(prd_name, sellers_qty)
+        sellers_result = sellers_data(prd_name, sellers_qty)
+        sellers_data_list = sellers_result["success"]
+        failed_list = sellers_result["failed"]
         data_to_excel(destn_dir, prd_name, sellers_data_list)
         end_time = time()
+        failed_msg = ""
+        if failed_list:
+            failed_details = "\n".join(
+                f"- {item['company_name'] or 'Unknown company'}: {item['error']}"
+                for item in failed_list
+            )
+            failed_msg = f"\n\n {len(failed_list)} supplier(s) failed and were skipped:\n{failed_details}"
         if not itf_values[keys.auto_cont]:
             sg.popup_auto_close(
                 "Sucess",
-                f"Your search for new sellers was finished with sucess! \n\n Execution time:{round(end_time - init_time, 2)}",
+                f"Your search for new sellers was finished with sucess! \n\n Execution time:{round(end_time - init_time, 2)}{failed_msg}",
                 auto_close_duration=6,
             )
             exit()
         for value in sellers_data_list:
             cont_link = value["dir_cont_link"]
+            if not cont_link:
+                continue
             auto_contact(cont_link, sellers_msg)
             end_time = time()
         sg.popup_auto_close(
             "Sucess",
-            f"Sellers contacted with sucess! \n\n Execution time: {round(end_time - init_time, 2)}",
+            f"Sellers contacted with sucess! \n\n Execution time: {round(end_time - init_time, 2)}{failed_msg}",
             auto_close_duration=6,
         )
