@@ -187,12 +187,24 @@ outputs/
       "detail": "Priority score: 45 → navigated to /",
       "timestamp": "2026-04-29T06:50:16.123Z",
       "screenshot": "outputs/screenshots/step-1-initial.png"
+    },
+    {
+      "step": 2,
+      "action": "Skipped \"Get Started\" — element became unavailable",
+      "detail": "locator.click: Timeout 3000ms exceeded.",
+      "timestamp": "2026-04-29T06:50:19.456Z",
+      "screenshot": "outputs/screenshots/step-2-step.png"
     }
   ],
   "errors": [],
   "summary": "Clicked Home → Clicked About → ..."
 }
 ```
+
+If an element disappears before it can be acted on (the page re-rendered), it is
+recorded as a `Skipped "…"` step with the failure reason and the exploration
+continues with the next untried element in the same step — skipped steps appear
+in `report.json`, `flow.md` and the summary just like successful actions.
 
 ## Supported Project Types
 

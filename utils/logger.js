@@ -33,8 +33,15 @@ class Logger {
 
   /** Associate a screenshot path with a step */
   addScreenshot(stepN, filePath) {
-    const entry = this.steps.find(s => s.step === stepN);
-    if (entry) entry.screenshot = filePath;
+    // Attach to the most recent entry for this step: a step can have several
+    // entries when an element went stale and the action was retried on a
+    // fallback element within the same step.
+    for (let i = this.steps.length - 1; i >= 0; i--) {
+      if (this.steps[i].step === stepN) {
+        this.steps[i].screenshot = filePath;
+        return;
+      }
+    }
   }
 
   /** Log an error */

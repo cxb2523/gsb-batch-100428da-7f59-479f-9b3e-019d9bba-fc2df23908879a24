@@ -5,6 +5,12 @@ All notable changes to RunSight will be documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- An element removed by a page re-render between discovery and click no longer aborts the demo: it is marked attempted, recorded as a `skipped` step (with the failure reason) in `report.json`, `flow.md` and `logs.txt`, and the exploration retries the next untried element within the same step — in both `happy` and `full` coverage. Only genuine page-level errors (crash, closed tab/browser) count toward the consecutive-error abort; element staleness does not
+- A step screenshot is now attached to the most recent log entry for that step, so a same-step retry (after a skipped element) gets the screenshot instead of the earlier skipped entry
+
 ## [1.2.0] - 2026-11-15
 
 ### Added

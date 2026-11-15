@@ -44,7 +44,7 @@ graph TD
 | API | `index.js` | Orchestrate full pipeline |
 | Detector | `agent/detector.js` | Identify project types (Node.js/Python/static), detect frameworks, return run commands. Supports monorepo scanning. |
 | Runner | `agent/runner.js` | Install deps via spawn, start dev servers, detect ports from stdout, manage process lifecycle. Includes killAll() and identifyFrontend(). |
-| Explorer | `agent/explorer.js` | 3-tier exploration loop: heuristic discovery → priority scoring → LLM guidance. Dialog handling, error capture, stop conditions, summary generation. |
+| Explorer | `agent/explorer.js` | 3-tier exploration loop: heuristic discovery → priority scoring → LLM guidance. Dialog handling, error capture, stop conditions, summary generation. Elements that vanish before the click (page re-render) are marked attempted, recorded as `skipped` steps, and retried with the next candidate in the same step; only page-level errors count toward the consecutive-error abort. |
 | Screenshotter | `agent/screenshotter.js` | Full-page PNG capture with step naming. Blank screen detection via text content check. |
 | Recorder | `agent/recorder.js` | Playwright recordVideo context wrapper. Records a 1280×720 layout at 1.5× device scale (Full HD frames); needs `Recorder.LAUNCH_ARGS` on the browser. Returns the raw WebM. |
 | Director | `agent/director.js` | On-camera presentation: injected cursor overlay + click ripple, smooth scroll and cursor glide to targets (`pointAt`), intro/outro title cards (`showCard`), read/narration hold times (`holdMs`). |

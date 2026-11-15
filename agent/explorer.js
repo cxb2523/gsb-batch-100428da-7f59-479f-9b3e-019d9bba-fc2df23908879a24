@@ -51,6 +51,12 @@ function parseKeyboardActions(guide) {
  * to be read and narrated. Time spent thinking (screenshots, analysis, waiting
  * for UI) is reported in `cuts` so the editor can remove it from the video.
  *
+ * If an element disappears between discovery and the click (the page
+ * re-rendered), that element is marked as attempted and skipped: a `skipped`
+ * step is recorded with the failure reason and the next untried element is
+ * attempted within the same step. Only genuine page-level errors (crash,
+ * closed tab) count toward the consecutive-error abort.
+ *
  * @param {import('playwright').Page} page
  * @param {Object} options
  * @param {number} [options.maxSteps=15]
@@ -203,9 +209,13 @@ async function explore(page, options, logger, screenshotter) {
       }
 
       // CHOOSE the action(s) for this page based on coverage mode.
+      // Happy path leads with the recommended action but keeps the remaining
+      // ranked elements as fallbacks: if the chosen element goes stale before
+      // the click lands, the next candidate is tried within the same step.
+      const rankedElements = analysis.ranked.map(r => r.element);
       const actionPlan = coverage === 'full'
-        ? analysis.ranked.map(r => r.element)   // breadth-first: try all, ranked
-        : [analysis.recommended].filter(Boolean); // happy-path: just the best
+        ? rankedElements                            // breadth-first: try all, ranked
+        : [analysis.recommended, ...rankedElements.filter(el => el !== analysis.recommended)].filter(Boolean);
 
       for (const target of actionPlan) {
         if (step > maxSteps) break;
@@ -220,11 +230,40 @@ async function explore(page, options, logger, screenshotter) {
         const tStart = now();
         const prevUrl = page.url();
         const point = present ? await pointAt(page, page.locator(chosen.selector).first()) : null;
-        const actionDesc = await executeAction(page, chosen, {
-          value: isRecommended ? analysis.inputValue : '',
-          typeDelay: present ? 45 : 0,
-          guide: options.guide || null
-        });
+
+        let actionDesc;
+        try {
+          actionDesc = await executeAction(page, chosen, {
+            value: isRecommended ? analysis.inputValue : '',
+            typeDelay: present ? 45 : 0,
+            guide: options.guide || null
+          });
+        } catch (err) {
+          // A genuine page/browser failure (crash, closed tab) is not an
+          // element problem — hand it to the outer catch, which counts it
+          // toward the consecutive-error abort.
+          if (isPageLevelError(err)) throw err;
+          // Element-level failure (e.g. the page re-rendered and removed the
+          // element between discovery and click): mark it attempted, leave a
+          // verifiable trace in the step record, and try the next candidate
+          // within the same step instead of aborting the run.
+          tracker.markClicked(tracker.elementKey(chosen));
+          const reason = String((err && err.message) || 'unknown error').split('\n')[0].slice(0, 160);
+          const label = (chosen.text || chosen.name || chosen.href || chosen.tagName || 'element')
+            .toString().replace(/\s+/g, ' ').trim().slice(0, 60);
+          const skipAction = `Skipped "${label}" — element became unavailable`;
+          logger.step(step, skipAction, reason);
+          logger.addScreenshot(step, ssPath);
+          history.push(`${skipAction} (${reason})`);
+          steps.push(makeStep(step, skipAction, reason, ssPath, t0, {
+            kind: 'skipped',
+            status: 'skipped',
+            error: reason,
+            selector: chosen.selector,
+            tStartMs: tStart
+          }));
+          continue;
+        }
         const tActed = now();
         await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
         // Wait for the URL to settle — some static servers redirect to clean URLs
@@ -307,6 +346,19 @@ function makeStep(step, action, detail, screenshot, t0, extra = {}) {
 
 function safePath(url) {
   try { return new URL(url).pathname; } catch { return url; }
+}
+
+/**
+ * Distinguish genuine page/browser failures (crash, closed tab or context)
+ * from element-level failures (stale, detached, hidden or timed-out locators).
+ * Only page-level errors count toward the consecutive-error abort; an element
+ * that vanished before the click is skipped, not treated as a run failure.
+ * @param {Error} err
+ * @returns {boolean}
+ */
+function isPageLevelError(err) {
+  const msg = (err && err.message) || '';
+  return /page crashed|has been closed|browser.*closed/i.test(msg);
 }
 
 /**

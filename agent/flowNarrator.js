@@ -69,11 +69,18 @@ function buildNarrative(result, opts = {}) {
 
   lines.push('## Walkthrough');
   lines.push('');
+  // Skipped elements are part of the story too: they are listed with their
+  // failure reason, but get no caption/zoom (nothing happened on camera).
+  const walkthroughSteps = steps.filter(s => s.kind === 'action' || s.kind === 'key' || s.kind === 'skipped');
   let n = 1;
-  for (const s of actionSteps) {
-    const dest = s.predictedDestination ? ` — leads to ${s.predictedDestination}` : '';
-    const nav = s.navigated ? ` (navigated ${s.fromUrl} → ${s.toUrl})` : '';
-    lines.push(`${n}. ${s.caption || s.action}${dest}${nav}`);
+  for (const s of walkthroughSteps) {
+    if (s.kind === 'skipped') {
+      lines.push(`${n}. ⚠️ ${s.action}${s.detail ? ` — ${s.detail}` : ''}`);
+    } else {
+      const dest = s.predictedDestination ? ` — leads to ${s.predictedDestination}` : '';
+      const nav = s.navigated ? ` (navigated ${s.fromUrl} → ${s.toUrl})` : '';
+      lines.push(`${n}. ${s.caption || s.action}${dest}${nav}`);
+    }
     n++;
   }
   lines.push('');
