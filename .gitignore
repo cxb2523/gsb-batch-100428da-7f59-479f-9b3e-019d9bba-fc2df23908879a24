@@ -1,5 +1,6 @@
 state/staged_articles.json
 state/classified_articles.json
+state/fetch_outcomes.json
 __pycache__/
 .env
 _site/

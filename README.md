@@ -109,6 +109,22 @@ To use Claude instead of Copilot:
 | AI system prompt | `prompts/classify.md` |
 | Site theme | `site/_config.yml` and `site/_layouts/` |
 
+## Auditing a fetch run
+
+Each fetch writes `state/fetch_outcomes.json` (gitignored, also attached to failed workflow runs as an artifact): a per-URL manifest explaining what happened to every candidate in that run. Each record contains `url`, `title`, `feed`, `outcome`, `recorded_at`, and — for non-staged outcomes — a `detail` string.
+
+| Outcome | Meaning |
+| --- | --- |
+| `staged` | Content extracted and written to `state/staged_articles.json` |
+| `content_too_short` | Extracted content under the 200-character minimum |
+| `extraction_timeout` | `defuddle` did not finish within 30 seconds |
+| `extraction_command_missing` | The `defuddle` executable was not found on `PATH` |
+| `extraction_error` | Any other extraction failure (non-zero exit, unparseable output, …) |
+| `already_processed` | URL was already in `state/processed_urls.json` (or duplicated across feeds) |
+| `capped` | Dropped by the `MAX_ARTICLES` limit |
+
+The `staged` records correspond one-to-one with the articles actually written to `staged_articles.json` — skipped and failed URLs are never counted as staged. Outcomes are recorded live during the run because every candidate (including failed ones) is marked as seen immediately, so the manifest cannot be reconstructed from the dedup table afterwards. If the manifest cannot be written, the fetch step fails with a non-zero exit code instead of silently succeeding.
+
 ## Security warning
 
 Feed content is untrusted input. A malicious article can include indirect prompt-injection text that tries to coerce the classifier into revealing secrets or following attacker instructions.

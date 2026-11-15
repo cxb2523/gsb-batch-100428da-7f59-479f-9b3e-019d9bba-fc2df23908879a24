@@ -23,11 +23,14 @@ uv run python pipeline/persist_state.py
 uv run ruff check pipeline/
 uv run ruff format pipeline/
 
+# Unit tests (local fakes only, no network): fetch_feeds outcomes, manifest, dedup
+uv run pytest tests/test_fetch_feeds.py -v
+
 # E2E tests (requires deployed GitHub Pages site)
 uv run pytest tests/test_site.py -v
 ```
 
-There are no unit tests. The staging files (`state/staged_articles.json`, `state/classified_articles.json`) are the primary debugging surface — run steps individually and inspect JSON output between runs.
+The unit tests under `tests/test_fetch_feeds.py` use in-memory fake feeds and a fake extractor (no network, no real defuddle). They cover the normal staging path, content-too-short, extraction exceptions (timeout / missing binary / generic), already-processed skipping, the `MAX_ARTICLES` cap, and the fatal behavior when the outcome manifest cannot be written. The staging files (`state/staged_articles.json`, `state/classified_articles.json`, `state/fetch_outcomes.json`) are the primary debugging surface — run steps individually and inspect JSON output between runs.
 
 ## Architecture
 
@@ -45,7 +48,23 @@ notify_discord.py / notify_slack.py  →  webhooks
 
 ### Key module behaviors
 
-**fetch_feeds.py** — Parses `feeds/feeds.yaml`, fetches up to `ENTRIES_PER_FEED` entries per feed via `feedparser` with 30 concurrent workers, skips URLs in `state/processed_urls.json`, then calls `defuddle parse --json --md <url>` as a subprocess. All candidate URLs are marked seen immediately (including capped/failed). Content capped at 8000 chars; articles <200 chars discarded but still marked seen. Appends URLs to `logs/urls.txt` with `[YYYY-MM-DD]` prefix.
+**fetch_feeds.py** — Parses `feeds/feeds.yaml`, fetches up to `ENTRIES_PER_FEED` entries per feed via `feedparser` with 30 concurrent workers, skips URLs in `state/processed_urls.json`, then calls `defuddle parse --json --md <url>` as a subprocess. All candidate URLs are marked seen immediately (including capped/failed). Content capped at 8000 chars; articles <200 chars discarded but still marked seen. Appends URLs to `logs/urls.txt` with `[YYYY-MM-DD]` prefix. Writes an auditable per-URL outcome manifest to `state/fetch_outcomes.json` (see below); a failure to write that manifest is fatal — the step exits non-zero rather than silently succeeding.
+
+#### `state/fetch_outcomes.json` outcome manifest
+
+Every URL encountered in a run gets one record (fields: `url`, `title`, `feed`, `outcome`, `recorded_at`, optional `detail`). Outcomes:
+
+| Outcome | Meaning |
+|---------|---------|
+| `staged` | Extraction succeeded (≥200 chars); the URL is in `staged_articles.json` |
+| `content_too_short` | Extraction returned fewer than 200 chars (incl. empty) |
+| `extraction_timeout` | The defuddle subprocess exceeded `DEFUDDLE_TIMEOUT` (30s) |
+| `extraction_command_missing` | The `defuddle` binary is not installed / not on PATH (`FileNotFoundError`) |
+| `extraction_error` | Any other extraction failure (non-zero exit, invalid JSON output, unexpected error) |
+| `already_processed` | URL was already in `processed_urls.json`, or duplicated across feeds in this run |
+| `capped` | Dropped by the `MAX_ARTICLES` cap (still marked seen) |
+
+The manifest is built live during the run — it cannot be reconstructed afterwards from `processed_urls.json`, because candidates (including failed ones) are marked seen at collection time. The writer enforces an invariant: the set of `staged` records must equal the URLs actually written to `staged_articles.json`; skipped/failed URLs are never counted as staged. The file is gitignored like the other staging artifacts and is included in the workflow's failure-upload artifact.
 
 **classify.py** — Classifies articles using one of two backends selected by `CLASSIFIER_BACKEND` env var:
 - **`copilot`** (default) — Calls `@github/copilot` npm CLI as a subprocess per article (120s timeout). Auth via `COPILOT_GITHUB_TOKEN` env var — must be a **fine-grained PAT with Copilot Requests: Read** (classic `ghp_` tokens are rejected).

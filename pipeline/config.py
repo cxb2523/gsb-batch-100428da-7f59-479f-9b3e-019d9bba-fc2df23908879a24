@@ -6,6 +6,8 @@ STATE_DIR = REPO_ROOT / "state"
 CLASSIFIED_FILE = STATE_DIR / "classified_articles.json"
 STAGING_FILE = STATE_DIR / "staged_articles.json"
 PROCESSED_URLS_FILE = STATE_DIR / "processed_urls.json"
+# Per-run audit manifest: one record per candidate URL with its final outcome.
+FETCH_REPORT_FILE = STATE_DIR / "fetch_outcomes.json"
 URL_LOG_FILE = REPO_ROOT / "logs" / "urls.txt"
 FEEDS_FILE = REPO_ROOT / "feeds" / "feeds.yaml"
 VAULT_DIR = REPO_ROOT / "site" / "_posts"

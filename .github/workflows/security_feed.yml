@@ -102,6 +102,9 @@ jobs:
           name: pipeline-state-${{ github.run_id }}
           path: |
             state/classified_articles.json
+            state/staged_articles.json
+            state/fetch_outcomes.json
+            state/processed_urls.json
             site/_posts/
           retention-days: 1
 
