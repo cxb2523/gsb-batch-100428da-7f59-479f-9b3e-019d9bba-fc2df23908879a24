@@ -1,0 +1,29 @@
+# venv (liegt direkt im Projektordner)
+bin/
+lib/
+include/
+pyvenv.cfg
+.claude/
+
+.venv/
+
+# Credentials & Config
+.env
+ui_config.json
+config.py
+
+# Datenbank
+*.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Exports
+*.csv
+
+# macOS
+.DS_Store
+
+# Design-Extrakte
+design-extract-output/
