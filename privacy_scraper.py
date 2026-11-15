@@ -51,6 +51,9 @@ DOWNLOAD_CHUNK_SIZE = 64 * 1024
 MAX_WORKERS_MEDIA = 8
 MAX_WORKERS_HLS = 16
 
+PURCHASED_PAGE_RETRIES = 2
+PURCHASED_MAX_OFFSET = 10000
+
 
 class TurnstileResolver:
     def __init__(self):
@@ -539,6 +542,7 @@ class MediaDownloader:
         self.max_workers_media = max_workers_media
         self.max_workers_hls = max_workers_hls
         self._pbar_lock = threading.Lock()
+        self.last_list_report = None
 
     def download_file(self, url, filename, is_video=False, file_id=None, is_image=False, use_original_url=False):
         self.scraper.refresh_token_if_needed()
@@ -848,10 +852,59 @@ class MediaDownloader:
             offset += max_parallel * page_size
         return all_items
 
+    def _fetch_page_with_retry(self, fetch_page, offset, page_size, retries):
+        reason = "resposta inválida (falha na requisição)"
+        for _ in range(retries + 1):
+            try:
+                result = fetch_page(offset, page_size)
+            except Exception as e:
+                reason = f"exceção: {e}"
+                continue
+            if result is None:
+                reason = "resposta inválida (falha na requisição)"
+                continue
+            return result, None
+        return None, reason
+
+    def _fetch_all_pages_resilient(self, fetch_page, page_size=20, max_parallel=8,
+                                   retries=PURCHASED_PAGE_RETRIES,
+                                   max_offset=PURCHASED_MAX_OFFSET):
+        all_items = []
+        report = {"ok_pages": 0, "failed_pages": []}
+        offset = 0
+        done = False
+        while not done and offset <= max_offset:
+            batch_offsets = [offset + i * page_size for i in range(max_parallel)]
+            pages = {}
+            with ThreadPoolExecutor(max_workers=max_parallel) as pool:
+                futures = {
+                    pool.submit(self._fetch_page_with_retry, fetch_page, off, page_size, retries): off
+                    for off in batch_offsets
+                }
+                for fut in as_completed(futures):
+                    off = futures[fut]
+                    try:
+                        pages[off] = fut.result()
+                    except Exception as e:
+                        pages[off] = (None, f"exceção inesperada: {e}")
+            for off in batch_offsets:
+                items, error = pages.get(off, (None, "resultado ausente"))
+                if error is not None:
+                    report["failed_pages"].append({"offset": off, "reason": error})
+                    continue
+                report["ok_pages"] += 1
+                all_items.extend(items)
+                if len(items) < page_size:
+                    done = True
+                    break
+            offset += max_parallel * page_size
+        return all_items, report
+
     def list_items(self, profile_name, source, media_type):
         type_filters = {"1": ["image"], "2": ["video"], "3": ["image", "video"]}[media_type]
         results = []
         lock = threading.Lock()
+        self.last_list_report = None
 
         def add_from_post(post, files):
             eligible = [
@@ -886,9 +939,13 @@ class MediaDownloader:
             def fetch_page(offset, page_size):
                 self.scraper.refresh_token_if_needed()
                 data = self.scraper.get_purchased_media(offset, page_size)
-                return (data or {}).get("items") or []
+                if not isinstance(data, dict):
+                    return None
+                return data.get("items") or []
 
-            for post in self._fetch_all_pages(fetch_page):
+            posts, report = self._fetch_all_pages_resilient(fetch_page)
+            self.last_list_report = report
+            for post in posts:
                 if post.get("creator", {}).get("profileName") != profile_name:
                     continue
                 add_from_post(post, post.get("medias", []))
@@ -1259,6 +1316,16 @@ def main():
 
                 print(f"{GREEN}Buscando itens (desbloqueados)...{RESET}")
                 items = downloader.list_items(profile_name, source, list_media_type)
+
+                report = downloader.last_list_report
+                if report is not None:
+                    print(f"Páginas baixadas com sucesso: {report['ok_pages']}")
+                    if report["failed_pages"]:
+                        print(f"{RED}Falha em {len(report['failed_pages'])} página(s):{RESET}")
+                        for fp in report["failed_pages"]:
+                            print(f"  - offset {fp['offset']}: {fp['reason']}")
+                        print(f"{RED}Atenção: a lista pode estar incompleta.{RESET}")
+
                 if not items:
                     print("Nenhum item desbloqueado encontrado.")
                     continue
