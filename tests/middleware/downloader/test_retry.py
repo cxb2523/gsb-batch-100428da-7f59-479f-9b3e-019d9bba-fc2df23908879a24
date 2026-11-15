@@ -399,6 +399,109 @@ async def test_process_response_honors_retry_after(spider):
     assert retry_request.meta["retry_delay"] == 30.0
 
 
+# Retry-After edge cases
+# The header must take precedence over exponential backoff and survive values
+# that `int()` used to reject silently.
+
+
+@pytest.mark.asyncio
+async def test_process_response_honors_fractional_retry_after(spider):
+    """A fractional Retry-After is used as-is instead of falling back to backoff."""
+    middleware = RetryMiddleware(backoff_jitter=0.0)
+    request = Request(url="https://example.com/page")
+    response = Page(
+        url="https://example.com/page",
+        content=b"rate limited",
+        status_code=429,
+        headers={"Retry-After": "1.5"},
+        request=request,
+    )
+
+    result = await middleware.process_response(request, response, spider)
+
+    assert result.payload.meta["retry_delay"] == pytest.approx(1.5)
+
+
+@pytest.mark.asyncio
+async def test_retry_after_takes_precedence_over_backoff_and_jitter(spider):
+    """Retry-After beats backoff and is not shrunk by jitter."""
+    middleware = RetryMiddleware(backoff_base=10.0, backoff_jitter=0.9)
+    request = Request(url="https://example.com/page")
+    response = Page(
+        url="https://example.com/page",
+        content=b"rate limited",
+        status_code=503,
+        headers={"Retry-After": "3"},
+        request=request,
+    )
+
+    result = await middleware.process_response(request, response, spider)
+
+    assert result.payload.meta["retry_delay"] == pytest.approx(3.0)
+
+
+@pytest.mark.asyncio
+async def test_retry_after_zero_is_honored(spider):
+    """Retry-After: 0 means retry immediately, not "ignore the header"."""
+    middleware = RetryMiddleware(backoff_base=5.0, backoff_jitter=0.0)
+    request = Request(url="https://example.com/page")
+    response = Page(
+        url="https://example.com/page",
+        content=b"rate limited",
+        status_code=429,
+        headers={"Retry-After": "0"},
+        request=request,
+    )
+
+    result = await middleware.process_response(request, response, spider)
+
+    assert result.payload.meta["retry_delay"] == 0.0
+
+
+@pytest.mark.parametrize("bad_header", ["", "   ", "Wed, 21 Oct 2015 07:28:00 GMT", "soon", True])
+@pytest.mark.asyncio
+async def test_unparseable_retry_after_falls_back_to_backoff(spider, bad_header):
+    """Non delta-seconds Retry-After is ignored and exponential backoff applies."""
+    middleware = RetryMiddleware(backoff_base=2.0, backoff_jitter=0.0)
+    request = Request(url="https://example.com/page")
+    response = Page(
+        url="https://example.com/page",
+        content=b"rate limited",
+        status_code=429,
+        headers={"Retry-After": bad_header},
+        request=request,
+    )
+
+    result = await middleware.process_response(request, response, spider)
+
+    # retry_count=0 -> 2.0 * 2^0 = 2.0
+    assert result.payload.meta["retry_delay"] == pytest.approx(2.0)
+
+
+def test_compute_delay_retry_after_is_not_capped_by_backoff_max():
+    """Retry-After may exceed backoff_max; the server's wait is not truncated."""
+    middleware = RetryMiddleware(backoff_max=5.0, backoff_jitter=0.0)
+
+    assert middleware._compute_delay(0, header_retry_after=120) == pytest.approx(120.0)
+
+
+@pytest.mark.asyncio
+async def test_process_response_keeps_handling_missing_headers_attr(spider):
+    """A response object without headers does not break the retry path."""
+    middleware = RetryMiddleware(backoff_base=1.0, backoff_jitter=0.0)
+    request = Request(url="https://example.com/page")
+
+    class NoHeadersResponse:
+        url = "https://example.com/page"
+        status_code = 503
+        content = b""
+
+    result = await middleware.process_response(request, NoHeadersResponse(), spider)  # type: ignore[arg-type]
+
+    assert result.action == Action.RETRY
+    assert result.payload.meta["retry_delay"] == pytest.approx(1.0)
+
+
 @pytest.mark.asyncio
 async def test_process_response_keeps_after_max_retries(spider):
     """process_response keeps response after max_retries."""

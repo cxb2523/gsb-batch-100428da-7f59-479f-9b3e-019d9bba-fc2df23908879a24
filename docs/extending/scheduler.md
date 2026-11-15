@@ -112,6 +112,11 @@ By default, fingerprints are computed from:
 - URL (normalized)
 - HTTP method
 - Request body
+- Retry attempt (`meta["retry_count"]`, when greater than zero)
+
+The retry attempt is part of the identity so that retrying an already-seen URL is
+not deduplicated away: the retry request carries the same URL/method/body as the
+original, and without this component the scheduler would silently drop it.
 
 ```python
 # These requests are considered duplicates:

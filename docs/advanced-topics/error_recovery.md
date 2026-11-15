@@ -46,6 +46,18 @@ delay = min(backoff_base * (2^retry_count), backoff_max)
 
 With jitter applied: `delay ± (delay * jitter)`
 
+A `Retry-After` header takes precedence over this calculation entirely: its
+delta-seconds value is used as the wait, is not capped by `backoff_max`, and is
+not shortened by jitter. It accepts fractional seconds (e.g. `Retry-After: 1.5`);
+values that are not delta-seconds (such as an HTTP-date) fall back to exponential
+backoff.
+
+The computed delay is handed to `DownloadDelayMiddleware` as a **domain-wide wait
+window**: the retried request waits before it is dispatched again, and other
+requests to the same domain are held back for the same window. This prevents a
+rate-limited domain from being hit by a burst of sibling requests right after the
+429/503 that triggered the retry.
+
 **Example delays** (with `backoff_base=1.0`, `backoff_max=60.0`, `jitter=0.3`):
 
 - Retry 1: 1.0s ± 0.3s (0.7-1.3s)

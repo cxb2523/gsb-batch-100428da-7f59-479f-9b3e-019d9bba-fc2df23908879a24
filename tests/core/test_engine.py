@@ -528,3 +528,80 @@ async def test_drain_idle_loops_until_no_new_work(engine, mock_scheduler):
         signals.signals_registry.disconnect("spider_idle", on_idle, sender=engine)
 
     assert len(fires) == 2
+
+
+# Retry Scheduling Notification Tests
+# On RETRY the engine notifies middleware implementing on_retry_scheduled before
+# the request enters the scheduler, so a per-domain wait window opens in time.
+
+
+@pytest.mark.asyncio
+async def test_retry_notifies_middleware_before_scheduling(engine, mock_scheduler):
+    """on_retry_scheduled runs before scheduler.add, with the retry request."""
+    order: list[str] = []
+    scheduled: list[Request] = []
+
+    class NotifyMW(DownloaderMiddleware):
+        async def on_retry_scheduled(self, request):
+            order.append("hook")
+
+    class RetryMW(DownloaderMiddleware):
+        async def process_exception(self, request, exception, spider):
+            return MiddlewareResult.retry(request)
+
+    async def add(request):
+        order.append("add")
+        scheduled.append(request)
+
+    engine.add_middleware(NotifyMW())
+    engine.add_middleware(RetryMW())
+    mock_scheduler.add = add
+    request = Request(url="https://example.com", meta={"retry_delay": 0.1})
+
+    await engine._handle_retry_or_drop(
+        MiddlewareResult.retry(request), Request(url="https://example.com")
+    )
+
+    assert order == ["hook", "add"]
+    assert scheduled == [request]
+
+
+@pytest.mark.asyncio
+async def test_retry_hook_failure_does_not_lose_the_retry(engine, mock_scheduler):
+    """A middleware whose hook raises must not prevent rescheduling."""
+    scheduled: list[Request] = []
+
+    class BrokenMW(DownloaderMiddleware):
+        async def on_retry_scheduled(self, request):
+            raise RuntimeError("boom")
+
+    async def add(request):
+        scheduled.append(request)
+
+    engine.add_middleware(BrokenMW())
+    mock_scheduler.add = add
+    request = Request(url="https://example.com")
+
+    await engine._handle_retry_or_drop(
+        MiddlewareResult.retry(request), Request(url="https://example.com")
+    )
+
+    assert scheduled == [request]
+
+
+@pytest.mark.asyncio
+async def test_drop_does_not_notify_retry_hook(engine, mock_scheduler):
+    """DROP never invokes on_retry_scheduled."""
+    called: list[int] = []
+
+    class NotifyMW(DownloaderMiddleware):
+        async def on_retry_scheduled(self, request):
+            called.append(1)
+
+    engine.add_middleware(NotifyMW())
+    mock_scheduler.add = AsyncMock()
+
+    await engine._handle_retry_or_drop(MiddlewareResult.drop(), Request(url="https://example.com"))
+
+    assert called == []
+    mock_scheduler.add.assert_not_awaited()

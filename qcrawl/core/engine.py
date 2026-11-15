@@ -343,7 +343,14 @@ class CrawlEngine:
     async def _handle_retry_or_drop(
         self, result: MiddlewareResult, original_request: Request
     ) -> None:
-        """Handle RETRY or DROP results from downloader middleware."""
+        """Handle RETRY or DROP results from downloader middleware.
+
+        For RETRY, middleware that owns a per-domain gate is told about the
+        rescheduled request *before* it enters the scheduler. That lets the
+        domain-wide wait window open immediately, instead of only when the retry
+        request itself is dequeued — otherwise other same-domain workers can
+        slip a request through during the gap.
+        """
         if result.action is Action.RETRY:
             if not isinstance(result.payload, Request):
                 raise TypeError("Retry payload must be Request")
@@ -353,6 +360,7 @@ class CrawlEngine:
                 except Exception:
                     preview = "<unreprable>"
                 logger.debug("middleware.retry scheduling new request %s", preview)
+            await self._notify_retry_scheduled(result.payload)
             await self.scheduler.add(result.payload)
         elif result.action is Action.DROP:
             if logger.isEnabledFor(logging.DEBUG):
@@ -362,6 +370,25 @@ class CrawlEngine:
                 request=original_request,
                 exception=None,
             )
+
+    async def _notify_retry_scheduled(self, request: Request) -> None:
+        """Offer a rescheduled retry to middleware implementing `on_retry_scheduled`.
+
+        A middleware failure here must never lose the retry itself, so errors
+        are logged and swallowed.
+        """
+        for mw in self.middlewares:
+            hook = getattr(mw, "on_retry_scheduled", None)
+            if hook is None:
+                continue
+            try:
+                await hook(request)
+            except Exception:
+                logger.exception(
+                    "%s.on_retry_scheduled failed for %s",
+                    mw.__class__.__name__,
+                    getattr(request, "url", None),
+                )
 
     async def _process_parse_results(self, request: Request, response: Page) -> None:
         """Run spider parse coroutine via spider middleware and handle yielded values."""

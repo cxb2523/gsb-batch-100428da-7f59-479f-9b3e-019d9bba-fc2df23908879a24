@@ -2,7 +2,6 @@ import asyncio
 import logging
 import random
 from collections.abc import Iterable
-from contextlib import suppress
 from typing import TYPE_CHECKING
 
 import aiohttp
@@ -15,6 +14,33 @@ if TYPE_CHECKING:
     from qcrawl.core.spider import Spider
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_retry_after(value: object) -> float | None:
+    """Parse a `Retry-After` header value into non-negative seconds.
+
+    Only the delta-seconds form is supported. Anything else (an HTTP-date, a
+    malformed value, a boolean/container) returns None so the caller falls back
+    to exponential backoff. `Retry-After: 0` is valid and returns 0.0.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+
+    seconds: float
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            seconds = float(text)
+        except ValueError:
+            return None
+    else:
+        seconds = float(value)
+
+    if seconds != seconds or seconds in (float("inf"), float("-inf")):  # NaN / infinity
+        return None
+    return max(0.0, seconds)
 
 
 class RetryMiddleware(DownloaderMiddleware):
@@ -96,14 +122,17 @@ class RetryMiddleware(DownloaderMiddleware):
                 return val
         return self.max_retries
 
-    def _compute_delay(self, retry_count: int, header_retry_after: int | None = None) -> float:
+    def _compute_delay(self, retry_count: int, header_retry_after: float | None = None) -> float:
         """Compute delay for next retry.
 
         Uses `Retry-After` header value when provided; otherwise exponential backoff:
             delay = min(backoff_base * (2 ** retry_count), backoff_max)
 
+        The header wins outright: it is neither capped by `backoff_max` nor jittered,
+        so the wait never undercuts what the server asked for.
+
         Jitter:
-            when `backoff_jitter > 0` the returned delay is randomized within
+            when `backoff_jitter > 0` the exponential-backoff delay is randomized within
             +/- backoff_jitter fraction of the base delay.
 
         Args:
@@ -114,9 +143,9 @@ class RetryMiddleware(DownloaderMiddleware):
             float seconds to wait before next retry.
         """
         if header_retry_after is not None:
-            base_delay = max(0.0, float(header_retry_after))
-        else:
-            base_delay = min(self.backoff_base * (2**retry_count), self.backoff_max)
+            return max(0.0, float(header_retry_after))
+
+        base_delay = min(self.backoff_base * (2**retry_count), self.backoff_max)
 
         if self.backoff_jitter > 0:
             jitter = self.backoff_jitter * base_delay
@@ -219,11 +248,12 @@ class RetryMiddleware(DownloaderMiddleware):
             return MiddlewareResult.keep(response)
 
         retry_after = None
-        if hasattr(response, "headers"):
-            ra = response.headers.get("Retry-After")
-            if ra:
-                with suppress(Exception):
-                    retry_after = int(ra)
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            try:
+                retry_after = _parse_retry_after(headers.get("Retry-After"))
+            except Exception:
+                retry_after = None
 
         delay = self._compute_delay(retry_count, retry_after)
         spider.crawler.stats.inc("downloader/retry/total")

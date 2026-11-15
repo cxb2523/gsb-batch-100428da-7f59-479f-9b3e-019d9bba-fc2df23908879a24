@@ -189,6 +189,88 @@ def test_fingerprint_url_normalization():
     assert fp1 == fp2
 
 
+# Retry Identity Tests
+# A retried request has the same method/url/body as the original. If retries
+# shared the original's fingerprint the scheduler would drop them as duplicates
+# and retry_delay could never take effect.
+
+
+def test_fingerprint_retry_differs_from_original():
+    """A retried request fingerprints differently from the original request."""
+    fp = RequestFingerprinter()
+    original = Request(url="https://example.com/page")
+    retry = Request(url="https://example.com/page", meta={"retry_count": 1})
+
+    assert fp.fingerprint_bytes(original) != fp.fingerprint_bytes(retry)
+
+
+def test_fingerprint_distinct_per_retry_attempt():
+    """Each retry attempt gets its own fingerprint."""
+    fp = RequestFingerprinter()
+
+    fingerprints = {
+        fp.fingerprint_bytes(Request(url="https://example.com/page", meta={"retry_count": n}))
+        for n in (0, 1, 2, 3)
+    }
+
+    assert len(fingerprints) == 4
+
+
+def test_fingerprint_retry_is_deterministic():
+    """The same retry attempt fingerprints identically (dedupe still works)."""
+    fp = RequestFingerprinter()
+    request1 = Request(url="https://example.com/page", meta={"retry_count": 2})
+    request2 = Request(url="https://example.com/page", meta={"retry_count": 2})
+
+    assert fp.fingerprint_bytes(request1) == fp.fingerprint_bytes(request2)
+
+
+@pytest.mark.parametrize(
+    "meta",
+    [
+        {},
+        {"retry_count": 0},
+        {"retry_count": "1"},
+        {"retry_count": True},
+        {"retry_count": -1},
+        {"retry_count": None},
+    ],
+)
+def test_fingerprint_ignores_non_retry_retry_count(meta):
+    """A missing/zero/malformed retry_count fingerprints like a first attempt."""
+    fp = RequestFingerprinter()
+    base = Request(url="https://example.com/page")
+    candidate = Request(url="https://example.com/page", meta=dict(meta))
+
+    assert fp.fingerprint_bytes(candidate) == fp.fingerprint_bytes(base)
+
+
+def test_scheduler_accepts_retry_of_already_seen_url():
+    """Regression: a retry of an already-scheduled URL is not deduplicated away."""
+    import asyncio
+
+    from qcrawl.core.queues.memory import MemoryPriorityQueue
+    from qcrawl.core.scheduler import Scheduler
+
+    async def scenario() -> int:
+        scheduler = Scheduler(queue=MemoryPriorityQueue(), fingerprinter=RequestFingerprinter())
+        try:
+            await scheduler.add(Request(url="https://example.com/page"))
+            first = await scheduler.get()
+            scheduler.task_done()
+
+            retry = first.copy()
+            retry.meta["retry_count"] = 1
+            retry.meta["retry_delay"] = 0.5
+            await scheduler.add(retry)
+
+            return await scheduler.qsize()
+        finally:
+            await scheduler.close()
+
+    assert asyncio.run(scenario()) == 1
+
+
 # Integration Tests
 
 

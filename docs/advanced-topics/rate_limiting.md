@@ -52,7 +52,15 @@ class ConcurrencyLimitedSpider(Spider):
 
 Control delay for individual requests. `DownloadDelayMiddleware` reads the
 per-request delay from `meta["retry_delay"]` (the same key the retry middleware
-uses for backoff); the effective wait is `max(DELAY_PER_DOMAIN, retry_delay)`:
+uses for backoff); the effective wait is `max(DELAY_PER_DOMAIN, retry_delay)`.
+
+`retry_delay` is a **domain-wide** wait window, not a pause for one request: while
+it is in effect, every request to that domain waits it out. This is what stops a
+rate-limited site from receiving a burst of sibling requests immediately after
+the 429/503 that triggered the retry. The wait happens before the request is
+dispatched (in the pre-download phase), including for the retried request
+itself. A missing, zero, negative or non-numeric `retry_delay` falls back to
+`DELAY_PER_DOMAIN` and never raises.
 
 ```python
 async def parse(self, response):
