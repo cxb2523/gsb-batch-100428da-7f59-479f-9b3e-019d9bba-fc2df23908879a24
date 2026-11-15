@@ -219,6 +219,18 @@ Firecrawl uses structured extraction with a title and release year for each post
 unidentified page images and recommendation links are ignored. TMDB backdrops and
 Wikipedia disambiguation pages are excluded.
 
+`sourceOutcomes` reports the outcome of every source that was actually started, in
+start order:
+
+* `contributed` — the source returned posters that matched the movie.
+* `no_matches` — the source answered successfully but had no matching poster.
+* `failed` — the source timed out or errored; `reason` is `"timeout"` or `"error"`.
+
+Sources that were never started because the overall search budget
+(`POSTER_SEARCH_TIMEOUT_MS`, 25 seconds by default) was already exhausted are
+absent from `sourceOutcomes` and are not counted as failures. Posters collected
+before a later timeout are still returned.
+
 **Response:**
 
 ```json
@@ -230,9 +242,21 @@ Wikipedia disambiguation pages are excluded.
     "https://example.com/poster2.jpg"
   ],
   "source": "imdb",
-  "sourcesTried": ["firecrawl", "imdb"]
+  "sourcesTried": ["firecrawl", "imdb"],
+  "sourceOutcomes": [
+    { "name": "imdb", "status": "contributed" },
+    { "name": "itunes", "status": "no_matches" },
+    { "name": "wikipedia", "status": "failed", "reason": "timeout" }
+  ]
 }
 ```
+
+`/api/search` returns the same `sourceOutcomes` field alongside its existing
+`query`, `posters`, `image`, `source`, and `sourcesTried` fields. Whether a
+response is a success or a failure is still decided only by whether posters were
+found: `/api/search` keeps its `404` + `{"error": "No image found"}` payload when
+nothing matched, and `/api/scrape` still answers `200` with an empty `posters`
+array. In both cases `sourceOutcomes` is purely additive.
 
 ---
 

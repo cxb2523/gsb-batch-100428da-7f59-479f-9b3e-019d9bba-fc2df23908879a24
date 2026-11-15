@@ -24,6 +24,10 @@ test("a stalled IMDb provider times out and a later provider succeeds", async ()
     posters: [poster("later")],
     source: "itunes",
     sourcesTried: ["itunes"],
+    sourceOutcomes: [
+      { name: "imdb", status: "failed", reason: "timeout" },
+      { name: "itunes", status: "contributed" },
+    ],
   });
 });
 
@@ -41,6 +45,123 @@ test("a later timeout preserves posters already collected", async () => {
   assert.deepEqual(result.posters, [poster("collected")]);
   assert.equal(result.source, "itunes");
   assert.deepEqual(result.sourcesTried, ["itunes", "wikipedia"]);
+  assert.deepEqual(result.sourceOutcomes, [
+    { name: "imdb", status: "no_matches" },
+    { name: "itunes", status: "contributed" },
+    { name: "wikipedia", status: "failed", reason: "timeout" },
+  ]);
+});
+
+test("a timed-out middle source does not stop later sources from contributing", async () => {
+  const result = await findPostersSequential("Movie", null, {
+    providers: [
+      { name: "imdb", fetcher: async () => [] },
+      { name: "tmdb", fetcher: stalled },
+      { name: "itunes", fetcher: async () => [poster("after-timeout")] },
+    ],
+    providerTimeoutMs: 10,
+    overallTimeoutMs: 120,
+  });
+
+  assert.deepEqual(result.posters, [poster("after-timeout")]);
+  assert.equal(result.source, "itunes");
+  assert.deepEqual(result.sourcesTried, ["tmdb", "itunes"]);
+  assert.deepEqual(result.sourceOutcomes, [
+    { name: "imdb", status: "no_matches" },
+    { name: "tmdb", status: "failed", reason: "timeout" },
+    { name: "itunes", status: "contributed" },
+  ]);
+});
+
+test("an errored source is reported as failed and later sources still run", async () => {
+  const result = await findPostersSequential("Movie", null, {
+    providers: [
+      { name: "imdb", fetcher: async () => [] },
+      { name: "itunes", fetcher: async () => { throw new Error("iTunes unavailable"); } },
+      { name: "wikipedia", fetcher: async () => [poster("wiki")] },
+    ],
+    providerTimeoutMs: 50,
+    overallTimeoutMs: 200,
+  });
+
+  assert.deepEqual(result.posters, [poster("wiki")]);
+  assert.deepEqual(result.sourceOutcomes, [
+    { name: "imdb", status: "no_matches" },
+    { name: "itunes", status: "failed", reason: "error" },
+    { name: "wikipedia", status: "contributed" },
+  ]);
+});
+
+test("a source whose posters do not match the movie is reported as no_matches", async () => {
+  const result = await findPostersSequential("Movie", 2001, {
+    providers: [
+      { name: "imdb", fetcher: async () => [] },
+      { name: "itunes", fetcher: async () => [{ url: poster("wrong-year"), title: "Movie", year: 1999 }] },
+    ],
+    providerTimeoutMs: 50,
+    overallTimeoutMs: 200,
+  });
+
+  assert.deepEqual(result.posters, []);
+  assert.deepEqual(result.sourceOutcomes, [
+    { name: "imdb", status: "no_matches" },
+    { name: "itunes", status: "no_matches" },
+  ]);
+});
+
+test("budget exhaustion between sources keeps collected posters and omits unstarted sources", async () => {
+  let clock = 0;
+  const started = [];
+  const result = await findPostersSequential("Movie", null, {
+    providers: [
+      { name: "imdb", fetcher: async () => { started.push("imdb"); clock = 60; return []; } },
+      { name: "itunes", fetcher: async () => { started.push("itunes"); clock = 110; return [poster("collected-before-deadline")]; } },
+      { name: "wikipedia", fetcher: async () => { started.push("wikipedia"); return [poster("too-late")]; } },
+      { name: "firecrawl", fetcher: async () => { started.push("firecrawl"); return [poster("also-too-late")]; } },
+    ],
+    providerTimeoutMs: 50,
+    overallTimeoutMs: 100,
+    now: () => clock,
+  });
+
+  assert.deepEqual(result.posters, [poster("collected-before-deadline")]);
+  assert.equal(result.source, "itunes");
+  assert.deepEqual(result.sourcesTried, ["itunes"]);
+  assert.deepEqual(result.sourceOutcomes, [
+    { name: "imdb", status: "no_matches" },
+    { name: "itunes", status: "contributed" },
+  ]);
+  assert.deepEqual(started, ["imdb", "itunes"]);
+});
+
+test("all failed sources produce empty posters and report each started source", async () => {
+  let clock = 0;
+  const started = [];
+  const stalling = ["imdb", "tmdb", "itunes"].map((name) => ({
+    name,
+    fetcher: () => {
+      started.push(name);
+      clock += 12;
+      return stalled();
+    },
+  }));
+  const result = await findPostersSequential("Movie", null, {
+    providers: [
+      ...stalling,
+      { name: "wikipedia", fetcher: async () => { started.push("wikipedia"); return []; } },
+    ],
+    providerTimeoutMs: 10,
+    overallTimeoutMs: 30,
+    now: () => clock,
+  });
+
+  assert.deepEqual(result.posters, []);
+  assert.deepEqual(started, ["imdb", "tmdb", "itunes"]);
+  assert.deepEqual(result.sourceOutcomes, [
+    { name: "imdb", status: "failed", reason: "timeout" },
+    { name: "tmdb", status: "failed", reason: "timeout" },
+    { name: "itunes", status: "failed", reason: "timeout" },
+  ]);
 });
 
 test("all stalled providers produce a bounded response and stop at the overall deadline", async () => {

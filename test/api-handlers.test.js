@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createLatestPosterHandler } from "../api/latest-poster.js";
+import { createScrapeHandler } from "../api/scrape.js";
 import { createSearchHandler } from "../api/search.js";
 import { createPosterImageHandler } from "../api/poster-img/[title].js";
 
@@ -112,6 +113,39 @@ test("search returns structured 404 JSON when mocked providers find no results",
   assert.deepEqual(response.body, { query: "Unknown Film", error: "No image found" });
 });
 
+test("search passes per-source outcomes through on success and on 404", async () => {
+  const outcomes = [
+    { name: "imdb", status: "failed", reason: "timeout" },
+    { name: "itunes", status: "contributed" },
+  ];
+  const successHandler = createSearchHandler({
+    store: memoryStore(),
+    findPosters: async () => ({
+      posters: ["https://images.example.test/alien.jpg"],
+      source: "itunes",
+      sourcesTried: ["itunes"],
+      sourceOutcomes: outcomes,
+    }),
+  });
+  const success = await invoke(successHandler, { query: { query: "Alien" } });
+  assert.equal(success.statusCode, 200);
+  assert.deepEqual(success.body.sourceOutcomes, outcomes);
+
+  const missHandler = createSearchHandler({
+    store: memoryStore(),
+    findPosters: async () => ({
+      posters: [],
+      source: null,
+      sourcesTried: ["imdb"],
+      sourceOutcomes: [{ name: "imdb", status: "failed", reason: "timeout" }],
+    }),
+  });
+  const miss = await invoke(missHandler, { query: { query: "Unknown Film" } });
+  assert.equal(miss.statusCode, 404);
+  assert.equal(miss.body.error, "No image found");
+  assert.deepEqual(miss.body.sourceOutcomes, [{ name: "imdb", status: "failed", reason: "timeout" }]);
+});
+
 test("search converts a mocked provider failure to structured 500 JSON", async () => {
   const handler = createSearchHandler({
     store: memoryStore(),
@@ -123,6 +157,53 @@ test("search converts a mocked provider failure to structured 500 JSON", async (
   const response = await invoke(handler, { query: { query: "Alien" } });
   assert.equal(response.statusCode, 500);
   assert.deepEqual(response.body, { error: "mock provider unavailable" });
+});
+
+test("scrape passes per-source outcomes through while keeping its success contract", async () => {
+  const outcomes = [
+    { name: "imdb", status: "no_matches" },
+    { name: "itunes", status: "contributed" },
+  ];
+  const handler = createScrapeHandler({
+    store: memoryStore(),
+    logger: quietLogger,
+    findPosters: async () => ({
+      posters: ["https://images.example.test/alien.jpg"],
+      source: "itunes",
+      sourcesTried: ["itunes"],
+      sourceOutcomes: outcomes,
+    }),
+  });
+
+  const response = await invoke(handler, { query: { movie: "Alien" } });
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.body.posters[0], "https://images.example.test/alien.jpg");
+  assert.deepEqual(response.body.sourcesTried, ["itunes"]);
+  assert.deepEqual(response.body.sourceOutcomes, outcomes);
+});
+
+test("scrape still returns 200 with empty posters when no source contributed", async () => {
+  const handler = createScrapeHandler({
+    store: memoryStore(),
+    logger: quietLogger,
+    findPosters: async () => ({
+      posters: [],
+      source: null,
+      sourcesTried: ["imdb", "itunes"],
+      sourceOutcomes: [
+        { name: "imdb", status: "failed", reason: "timeout" },
+        { name: "itunes", status: "no_matches" },
+      ],
+    }),
+  });
+
+  const response = await invoke(handler, { query: { movie: "Alien" } });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(response.body.posters, []);
+  assert.deepEqual(response.body.sourceOutcomes, [
+    { name: "imdb", status: "failed", reason: "timeout" },
+    { name: "itunes", status: "no_matches" },
+  ]);
 });
 
 test("latest-poster redirects to the exact URL held in mocked shared storage", async () => {

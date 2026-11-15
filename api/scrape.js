@@ -8,7 +8,7 @@ export function createScrapeHandler({ findPosters = findPostersSequential, store
     const movie = req.query.movie || "inception";
     const year = normalizeYear(req.query.year);
 
-    const { posters, source, sourcesTried } = await findPosters(movie, year);
+    const { posters, source, sourcesTried, sourceOutcomes } = await findPosters(movie, year);
 
     if (posters && posters.length > 0) {
       await saveLatestPosterSafely(store, movie, posters[0], logger);
@@ -20,6 +20,9 @@ export function createScrapeHandler({ findPosters = findPostersSequential, store
       posters,
       source,
       sourcesTried,
+      // Per-source outcomes are additive: searches that do not report them keep
+      // their previous response shape.
+      ...(sourceOutcomes === undefined ? {} : { sourceOutcomes }),
     });
     } catch (err) {
       res.status(500).json({

@@ -16,7 +16,8 @@ export function createSearchHandler({ findPosters = findPostersSequential, store
       return res.status(400).json({ error: "Missing query parameter: query" });
     }
 
-    const { posters, source, sourcesTried } = await findPosters(query, year);
+    const { posters, source, sourcesTried, sourceOutcomes } = await findPosters(query, year);
+    const outcomesField = sourceOutcomes === undefined ? {} : { sourceOutcomes };
 
     if (posters && posters.length > 0) {
       await saveLatestPosterSafely(store, query, posters[0], logger);
@@ -25,11 +26,12 @@ export function createSearchHandler({ findPosters = findPostersSequential, store
         posters,
         image: posters[0], // backward compatibility
         source,
-        sourcesTried
+        sourcesTried,
+        ...outcomesField,
       });
     }
 
-    return res.status(404).json({ query, error: "No image found" });
+    return res.status(404).json({ query, error: "No image found", ...outcomesField });
     } catch (err) {
       return res.status(500).json({ error: err.message || "Internal server error" });
     }
