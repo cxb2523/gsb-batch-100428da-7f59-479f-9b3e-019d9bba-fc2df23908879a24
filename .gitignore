@@ -1,0 +1,47 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 虚拟环境
+.venv/
+.venv-*/
+venv/
+
+# 桌面打包产物 —— 二进制通过 Releases 分发，不进仓库
+build/
+dist/
+# PyInstaller writes its generated spec into build/ (already ignored above).
+# buildozer.spec at the repo root is a REQUIRED source file, so it is un-ignored
+# explicitly: it must never be swallowed by a broad *.spec pattern.
+*.spec
+!buildozer.spec
+
+# Android / buildozer 产物
+bin/
+.buildozer/
+.p4a/
+*.apk
+*.aab
+*.keystore
+
+# Staged by gui/build_android.py into the source dir so the APK contains the shared
+# engine. It is a copy of scripts/jmcore.py and must never be committed.
+webui/jmcore.py
+
+# 本地配置与密钥 —— 绝对不要提交
+option.yml
+option.local.yml
+.env
+
+# 下载内容（本工具会主动写入这些文件）
+downloads/
+*.pdf
+*.zip
+*.png
+!assets/**/*.png
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
