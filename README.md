@@ -160,6 +160,7 @@ chars 800+800/12398 · cached
 
 - **Same-host only**; login/API/static-asset paths are skipped; URLs deduped (fragment stripped);
 - Concurrency 2 (gentle on the target site); per-page failures recorded as `[失败]` without aborting;
+- Skipped same-host links and failed pages are itemized with machine-checkable reasons (`noise` / `duplicate` / `queue-limit` / `depth-limit`; `direct-boundary` / `redirect-offsite` / `fetch-error`), with per-reason tallies in `summary`;
 - Output is an indented tree: `[depth] title (chars) URL`;
 - **No SPA rendering here** (crawling favors speed/breadth) — use `read_url` for JS-only pages.
 

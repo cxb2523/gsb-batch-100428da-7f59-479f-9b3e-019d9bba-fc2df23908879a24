@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### 新增
+
+- `read_url_site` 为每次爬取给出可核对的采集结局：被跳过的同站链接逐条记录原因（`noise` 噪声路径/静态资源、`duplicate` 重复、`queue-limit` 队列上限、`depth-limit` 深度超限），被拦截/失败的页面逐条记录原因（`direct-boundary` 直连边界、`redirect-offsite` 重定向跳出站点、`fetch-error` 抓取错误），并返回 `summary` 按原因汇总计数（由清单派生，条数必然一致）。BFS 顺序、去重与页面预算不变；失败页不中断其余页面；直连边界命中后后续页面继续直连限制、不回退代理或浏览器，被拦页面的子链接不入队。
+
 ## [1.9.3] - 2026-10-19
 
 ### 修复

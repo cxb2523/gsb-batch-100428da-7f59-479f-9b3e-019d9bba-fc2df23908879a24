@@ -194,6 +194,28 @@ export async function runDirectOriginTests(m) {
       assert.deepEqual([...hits].sort(), [start, child].sort()); assert.equal(providerCalls.length, 0)
     })
 
+    await check('crawl marks out-of-origin pages as direct boundary and never enqueues their links', async () => {
+      const grandchild = html(article('BOUNDARY_GRANDCHILD'), b)
+      const blocked = add(b, (_req, res) => {
+        res.setHeader('content-type', 'text/html; charset=utf-8')
+        res.end(article('BOUNDARY_BLOCKED') + `<a href="${grandchild}">Grandchild</a>`)
+      })
+      const child = html(article('BOUNDARY_CHILD'))
+      const start = html(article('BOUNDARY_ROOT') + `<a href="${child}">Child</a><a href="${blocked}">Blocked</a>`)
+      const out = await tools().read_url_site.execute({ url: start, maxPages: 6, maxDepth: 2, includeContent: true })
+      assert.equal(out.succeeded, 2); assert.equal(out.failed, 1)
+      assert.equal(out.failures[0].url, blocked)
+      assert.equal(out.failures[0].reason, 'direct-boundary')
+      assert.match(out.failures[0].error, /outside directFetchOrigins/)
+      assert.equal(out.summary.failed['direct-boundary'], 1)
+      assert.deepEqual(out.skipped, [])
+      // The blocked page's own links were never discovered: no grandchild
+      // anywhere in the result, and no request touched the foreign origin.
+      assert.ok(!JSON.stringify(out).includes(grandchild))
+      assert.ok(!JSON.stringify(out).includes('BOUNDARY_GRANDCHILD'))
+      assert.deepEqual([...hits].sort(), [start, child].sort()); assert.equal(providerCalls.length, 0)
+    })
+
     await check('crawl preserves a blocked meta-refresh hint in structured and rendered output', async () => {
       const foreign = html(article('CRAWL_FORBIDDEN_REFRESH'), b)
       const start = refresh(foreign, 'CRAWL_STATIC_SHELL')

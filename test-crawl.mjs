@@ -40,6 +40,27 @@ export async function runCrawlTests(m) {
       return res.end()
     }
     if (u.pathname === '/target') return res.end(article('TARGET'))
+    if (u.pathname === '/outcome') {
+      return res.end(article('OUTCOME_ROOT',
+        '<a href="/ok-page">OK</a><a href="/logo.png">Logo</a><a href="/login">Login</a>' +
+        '<a href="/go-external">External</a><a href="/broken-500">Broken</a><a href="/level-1">Level 1</a>'))
+    }
+    if (u.pathname === '/ok-page') return res.end(article('OK_PAGE_BODY'))
+    if (u.pathname === '/go-external') {
+      res.writeHead(302, { location: `http://localhost:${server.address().port}/foreign-land` })
+      return res.end()
+    }
+    if (u.pathname === '/foreign-land') return res.end(article('FOREIGN_LAND'))
+    if (u.pathname === '/broken-500') {
+      res.writeHead(500)
+      return res.end('Server error')
+    }
+    if (u.pathname === '/level-1') return res.end(article('LEVEL_ONE_BODY', '<a href="/level-2">Level 2</a><a href="/ok-page">OK again</a>'))
+    if (u.pathname === '/level-2') return res.end(article('LEVEL_TWO_BODY'))
+    if (u.pathname === '/wide') {
+      return res.end(article('WIDE', Array.from({ length: 45 }, (_, i) => `<a href="/w-${i}">W${i}</a>`).join('')))
+    }
+    if (u.pathname.startsWith('/w-')) return res.end(article('W_PAGE'))
     res.writeHead(404)
     res.end('Not found')
   })
@@ -98,7 +119,11 @@ export async function runCrawlTests(m) {
     const filtered = await registered.read_url_site.execute({ url: `${base}/path-filter`, maxPages: 20, maxDepth: 1 })
     assert.equal(filtered.failed, 0)
     assert.equal(filtered.succeeded, readablePaths.length + 1)
-    assert.deepEqual(hits, ['/path-filter', ...readablePaths])
+    // hits records server-side arrival order, which is nondeterministic for
+    // the concurrently fetched depth-1 batch — assert entry-first plus the
+    // exact set of followed paths instead of a strict arrival sequence.
+    assert.equal(hits[0], '/path-filter')
+    assert.deepEqual([...hits.slice(1)].sort(), [...readablePaths].sort())
     passed++
 
     const redirects = await registered.read_url_site.execute({ url: `${base}/redirect-root`, maxPages: 5, maxDepth: 1, includeContent: true })
@@ -118,6 +143,47 @@ export async function runCrawlTests(m) {
     assert.equal(aliases.succeeded, 2)
     assert.deepEqual(aliases.pages.map((page) => new URL(page.url).pathname), ['/aliases', '/target'])
     passed++
+
+    // Per-reason crawl outcomes: success pages keep their content and BFS
+    // order while every skipped link and failed page is itemized, and the
+    // summary tallies match the item counts exactly.
+    const outcome = await registered.read_url_site.execute({ url: `${base}/outcome`, maxPages: 20, maxDepth: 1, includeContent: true })
+    assert.deepEqual(outcome.pages.map((page) => new URL(page.url).pathname), ['/outcome', '/ok-page', '/level-1'])
+    assert.ok(outcome.pages[1].text.includes('OK_PAGE_BODY'))
+    assert.ok(outcome.pages[2].text.includes('LEVEL_ONE_BODY'))
+    assert.equal(outcome.failed, 2)
+    const failByPath = new Map(outcome.failures.map((f) => [new URL(f.url).pathname, f]))
+    assert.equal(failByPath.get('/go-external').reason, 'redirect-offsite')
+    assert.equal(failByPath.get('/broken-500').reason, 'fetch-error')
+    const skipByPath = new Map(outcome.skipped.map((s) => [new URL(s.url).pathname, s.reason]))
+    assert.equal(skipByPath.get('/logo.png'), 'noise')
+    assert.equal(skipByPath.get('/login'), 'noise')
+    assert.equal(skipByPath.get('/level-2'), 'depth-limit')
+    assert.equal(skipByPath.get('/ok-page'), 'duplicate')
+    assert.equal(outcome.skipped.length, 4)
+    const tally = (o) => Object.values(o).reduce((x, y) => x + y, 0)
+    assert.equal(tally(outcome.summary.skipped), outcome.skipped.length)
+    assert.equal(tally(outcome.summary.failed), outcome.failures.length)
+    assert.equal(outcome.summary.skipped.noise, 2)
+    assert.equal(outcome.summary.skipped['depth-limit'], 1)
+    assert.equal(outcome.summary.skipped.duplicate, 1)
+    assert.equal(outcome.summary.failed['redirect-offsite'], 1)
+    assert.equal(outcome.summary.failed['fetch-error'], 1)
+    assert.ok(!JSON.stringify(outcome).includes('FOREIGN_LAND'))
+    assert.ok(!JSON.stringify(outcome).includes('LEVEL_TWO_BODY'))
+    const outcomeText = registered.read_url_site.output.render({}, outcome)[0].text
+    assert.ok(outcomeText.includes('[跳过]') && outcomeText.includes('深度超限'))
+    assert.ok(outcomeText.includes('重定向跳出站点'))
+    passed++
+    console.log('  ok - crawl itemizes skip/failure reasons with matching tallies')
+
+    // Queue cap: links beyond maxPages*20 are skipped with queue-limit.
+    const wide = await registered.read_url_site.execute({ url: `${base}/wide`, maxPages: 2, maxDepth: 1 })
+    assert.equal(wide.succeeded + wide.failed, 2)
+    assert.equal(wide.skipped.filter((s) => s.reason === 'queue-limit').length, 5)
+    assert.equal(wide.summary.skipped['queue-limit'], 5)
+    passed++
+    console.log('  ok - queue cap overflow recorded as queue-limit skips')
 
     const seamTools = {}
     const seamCalls = []

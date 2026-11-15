@@ -160,6 +160,7 @@ chars 800+800/12398 · cached
 
 - **只爬同域名**；登录/API/静态资源路径自动跳过；URL 去重（去 fragment）；
 - 并发 2 对目标站友好；单页失败记录 `[失败]` 不影响整体；
+- 被跳过的同站链接与失败页面逐条记录原因（`noise`/`duplicate`/`queue-limit`/`depth-limit`；`direct-boundary`/`redirect-offsite`/`fetch-error`），并在 `summary` 中按原因汇总计数；
 - 输出为缩进树：`[深度] 标题 (字符数) URL`；
 - **不做 SPA 渲染**（整站是轻量批量抓取，渲染每页 1s+ 太慢）——SPA 页请用 `read_url` 单读。
 
