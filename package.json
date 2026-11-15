@@ -1,0 +1,41 @@
+{
+  "name": "rebrowser-bot-detector",
+  "version": "1.0.0",
+  "description": "Modern tests to detect automated browser behavior. Cover most important leaks from Puppeteer and Playwright.",
+  "keywords": [
+    "automation",
+    "bot",
+    "bot-detection",
+    "crawler",
+    "crawling",
+    "chromedriver",
+    "webdriver",
+    "headless",
+    "headless-chrome",
+    "stealth",
+    "captcha",
+    "scraping",
+    "web-scraping",
+    "cloudflare",
+    "datadome",
+    "puppeteer",
+    "puppeteer-extra",
+    "selenium",
+    "rebrowser",
+    "rebrowser-patches",
+    "playwright"
+  ],
+  "author": {
+    "name": "Rebrowser",
+    "email": "info@rebrowser.net",
+    "url": "https://rebrowser.net"
+  },
+  "contributors": [
+    "Nick Webson <nwebson@rebrowser.net>"
+  ],
+  "type": "module",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "license": "MIT"
+}
