@@ -1,0 +1,908 @@
+# 薅羊毛情报站维护规范（AGENT.md）
+
+> 本文档是给**任何 AI 或人类维护者**看的操作规范。目标：哪怕是不那么聪明的 AI，
+> 照着本文档一步一步做，也能正确维护这个薅羊毛情报站，不会搞乱数据或渲染。
+>
+> **优先级**：本文档是项目级规则，优先级高于全局 AGENT.md。
+
+---
+
+## 0. 一句话理解这个项目
+
+GitHub Actions 每天分六个时段（分散全天、避开整点）自动抓取 AI/云服务优惠、开源免费工具、
+开车线报、游戏喜加一，关键词规则解析 + 去重合并，过期活动自动归档，然后生成 README +
+SVG 甘特图日历，自动 commit 推送回仓库。
+维护者的任务是：**改规则、修 bug、加源、跑流程、推结果**，不要手动改 `data/` 或 `docs/` 里的生成产物。
+
+> **两种 AI 角色**：日常更新（能力弱）只需读 [docs/日常更新指南.md](docs/日常更新指南.md)
+> 照 SOP 操作；开发维护（能力强）读本文件全文 + DEV_GUIDE.md。
+> Actions 里内置的 AI（`ai_client.py`）只负责 PENDING_URLS 自然语言理解，不是维护者。
+
+---
+
+## 1. 仓库结构（只需记住这几个关键文件，完整树见 docs/仓库结构.md）
+
+```
+wool-gathering/
+├── AGENT.md                      # 本文件（维护规范）
+├── DEV_GUIDE.md                  # 开发交接文档
+├── PENDING_URLS.md               # 用户提交新网址/自然语言的入口
+├── .github/workflows/daily-collect.yml  # Actions：六时段定时任务（分散全天避开整点）
+├── scripts/                      # 所有 Python 脚本
+│   ├── collect.py                # 主入口（Action 调这个；含 PENDING_URLS 处理 + 过期归档）
+│   ├── blog_collector.py         # 内置博客/V2EX/Reddit/ITAD/itch.io 源 + 分类规则 + 小黑盒
+│   ├── cloud_collector.py        # 云厂商活动抓取（华为云/阿里云/腾讯云）
+│   ├── direct_collector.py       # Epic/Steam/GOG 官方 API 抓取
+│   ├── ai_client.py              # AI 客户端（主力+备用自动切换）
+│   ├── prompts.py                # AI 提示词（仅用于 PENDING_URLS 自然语言理解）
+│   ├── dedup.py                  # 规范化 + 去重 + 合并
+│   ├── calendar_generator.py     # 生成 README + 前端 JSON（含车型子分类、ended 过滤）
+│   ├── svg_calendar.py           # 生成 SVG 甘特图（含文字防重叠）
+│   ├── utils.py                  # 工具函数（日期/ID/状态）
+│   └── readme_template.md        # README 模板
+├── data/                         # 原始数据（脚本写，人别手改 activities.json）
+│   ├── sources.json              # 源登记表：heybox/heybox-community 类参与日常轮询；
+│   │                             #   html 类只做登记（去重凭证），见 docs/日常更新指南.md
+│   └── {8 个分类}/activities.json  # ai/open-source/drive/games/shopping/video-vip/netdisk-vip/game-discount
+└── docs/                         # 生成产物（脚本写，人别手改）
+    ├── calendar.svg              # README 嵌入的甘特图
+    ├── 分类活动.md               # 全部活动详情（自动生成）
+    ├── archive/                  # 过期活动按月归档（index.json 为索引）
+    ├── data/{activities,meta}.json
+    └── 日常更新指南.md           # ⭐ 日常更新 AI 的 SOP
+```
+
+**铁律**：`data/*/activities.json`、`docs/calendar.svg`、`docs/data/*`、`README.md` 都是脚本生成的，
+**不要手动编辑**。要改数据，改 `scripts/` 里的规则然后重跑；要加日常轮询源，
+改 `blog_collector.py` 的 `SOURCES` / `cloud_collector.py` 的 `CLOUD_PAGES` /
+`data/sources.json` 的 heybox 类条目（详见 docs/自定义.md）。
+
+---
+
+## 2. 八大分类规则（核心，必须背下来）
+
+| 类别 | 代号 | 包含什么 | 谁来识别 |
+|------|------|---------|---------|
+| AI / 云服务优惠 | `ai` | 云厂商代金券/免费额度/打折、AI 中转站优惠、博客里讲云/AI 优惠的帖 | `cloud_collector.py` + `blog_collector.py`（默认归 ai，除非命中其他规则） |
+| 购物优惠 | `shopping` | 双11打折、红包等纯购物促销 | `blog_collector.is_shopping()` |
+| 视频会员 | `video-vip` | 爱奇艺/腾讯视频等视频 VIP 优惠 | `blog_collector.is_video_vip()` |
+| 网盘会员 | `netdisk-vip` | 夸克/百度等网盘 SVIP 优惠 | `blog_collector.is_netdisk_vip()` |
+| 开源免费工具 | `open-source` | 一直免费的开源软件/GitHub 工具（非限时促销） | `blog_collector.is_open_source()` |
+| 开车线报 | `drive` | 群发车/上车/拼车/线报类帖子 | `blog_collector.is_drive_post()` |
+| 游戏喜加一 | `games` | Epic/Steam/GOG/itch.io 免费游戏、限免、giveaway | `direct_collector.py` + `blog_collector.py` |
+| 游戏打折 | `game-discount` | Steam 新品节/尖叫节等打折汇总（史低/新史低/一折以下） | `blog_collector.collect_heybox_discounts()`（小黑盒 SPA + Playwright 渲染） |
+
+### 2.1 分类判定顺序（在 `blog_collector.parse_blog_articles` 里）
+
+1. 先判 `is_open_source(title)` → 命中归 `open-source`
+2. 再判 `is_shopping(title)` → 命中归 `shopping`
+3. 再判 `is_video_vip(title)` → 命中归 `video-vip`
+4. 再判 `is_netdisk_vip(title)` → 命中归 `netdisk-vip`
+5. 否则归调用时传入的 `category`（ai 模式传 ai，games 模式传 games）
+
+### 2.2 关键词定义（在 `blog_collector.py` 顶部）
+
+- **开车线报** `DRIVE_HINTS = ["开车","发车","上车","拼车","线报","羊毛群","薅羊毛","白嫖群"]`
+- **开源工具** `OPEN_SOURCE_HINTS = ["开源","github 上发现","在 github 发现","免费小工具","工具箱"]`
+  且不含 `OPEN_SOURCE_EXCLUDE = ["限时","打折","优惠","年卡","vip","赠送","周年庆","半价"]`（含促销词的不算纯开源）
+- **购物** `SHOPPING_HINTS = ["双11","双 11","红包","wps","vmware","videoproc","复旦","周年庆","打折好价","codex"]`
+- **视频会员** `VIDEO_VIP_HINTS = ["爱奇艺","腾讯视频"]`
+- **网盘会员** `NETDISK_VIP_HINTS = ["夸克网盘","百度网盘","网盘svip","网盘 svip","网盘会员"]`
+- **价值词** `WOOL_VALUE_WORDS`：限免/喜加一/代金券/0元/免费领/打折/优惠/…（决定博客帖是否收录）
+- **排除模式** `WOOL_EXCLUDE_PATTERNS`：讨论帖/请教/周刊等误判（正则）
+
+### 2.3 开车线报车型子分类（在 `calendar_generator.CAR_TYPES`）
+
+drive 分区在 README 里会按车型子分组渲染，顺序即列表顺序：
+
+1. **云服务器车**：云服务器/ecs/主机/vps/轻量/华为云/阿里云/腾讯云/…
+2. **AI 车**：ai/codex/deepseek/大模型/chatgpt/claude/gemini/gpt/通义/文心/kimi/智谱
+3. **会员车**：vip/svip/会员/年卡/网盘/视频/音乐/爱奇艺/腾讯视频/…
+4. **软件工具车**：软件/工具/专业版/激活/序列号/license/office/ide/jetbrains
+5. **其他车**：以上都不命中
+
+`guess_car_type(title)` 按顺序匹配，先命中先归。**云服务器车优先于 AI 车**（即使标题同时含两者）。
+
+---
+
+## 3. 开源工具的特殊规则（容易搞错，重点记）
+
+开源免费工具 = **一直免费**的软件，不是限时活动。所以：
+
+1. **end_date 必须为空**：`blog_collector._activity()` 生成开源条目时 `end_days` 参数不传，end_date 留空。
+   如果历史数据里开源条目有假 end_date，必须一次性脚本清空（已清理过一次）。
+2. **不进 SVG 时间轴**：`svg_calendar.generate_svg()` 显式排除 `category == "open-source"`。
+   SVG 画 ai + shopping + video-vip + netdisk-vip + drive + games 六类有日期的活动。
+3. **README 时间列显示"长期免费"**：`calendar_generator._md_table()` 里 end_date 为空时显示"长期免费"而非假日期。
+4. **仍出现在 README 表格里**：开源工具在 README 的"开源免费工具"分区正常列表，只是不进甘特图。
+
+---
+
+## 4. SVG 日历规则（防文字重叠，重点记）
+
+`svg_calendar.py` 里的关键常量和函数：
+
+- `LEFT_LABEL_W = 240`：左侧活动名留 240px
+- `_visual_width(s)`：计算显示宽度，权重 = 全角字符 1.0 / 半角 0.55 / emoji 1.6
+- `_truncate_label(s, max_units=16.0)`：按显示宽度截断，超限加省略号
+- `_esc(s)`：**先截断再转义**（顺序不能反，否则 html.unescape 双重转义会出 bug）
+- **textLength 强制压缩**：每个 `<text>` 加 `textLength="{可用像素}"` + `lengthAdjust="spacingAndGlyphs"`，
+  浏览器强制把文字压缩到该宽度内，这是杜绝与时间横条重叠的最可靠保障
+- 字号 12px，行高 28px，横条高 18px
+
+**如果出现文字与横条重叠**：检查 `_esc` 是否先截断再转义、textLength 是否生效、`LEFT_LABEL_W` 是否够宽。
+不要靠调字号或行高硬挤，textLength 才是根本解。
+
+### 4.1 时间轴跨度一个月 + 分区显示
+
+**日历显示所有有时间限制的活动**（除开源项目外），时间轴跨度固定为当月：
+
+- 时间轴刻度范围 = 当月 1 日到月末（前后留 1 天边距）
+- 显示所有有 `start_date` 和 `end_date` 的活动，不管持续时间多长
+- 开源项目（无 `end_date`）不显示在时间轴
+- 超过一个月持续时间的活动：横条顶满整个跨度（clamp 到时间轴范围）
+- 不在当月的活动：横条贴在对应边界
+
+**按分区分组显示**：
+
+- 分区顺序：AI / 云服务 → 购物 → 视频会员 → 网盘会员 → 开车线报 → 游戏喜加一 → 游戏打折
+- 每个分区有标题行（带活动条数）
+- 分区内按 `end_date` 升序排列（快结束的排上面）
+
+**README 分区逻辑**（`calendar_generator.generate_readme`）：
+
+1. 限时活动按 category 分区：🤖 AI / 云服务优惠、🚗 开车线报、🎮 游戏喜加一
+2. 长期活动（含 open-source + is_long_term）统一归到「♾️ 长期免费」分区
+3. open-source 不再单独成区，已合并进长期免费分区
+
+**长期免费判定**（`utils.is_long_term(a, today, threshold_days=90)`）用于 README 分区：
+
+- 无 `end_date`（永久免费，如开源工具）→ 长期
+- `end_date` 距今超过 90 天（约 3 个月）→ 长期
+- 其余 → 限时
+
+---
+
+## 5. 更新流程（六时段分散全天，避开整点）
+
+GitHub Actions 每天自动跑六次（`.github/workflows/daily-collect.yml`），任务分散到全天，
+**所有 cron 都避开整点**（分钟非 0），减轻免费源网站压力：
+
+| 北京时间 | UTC | cron | 模式 | 做什么 |
+|---------|-----|------|------|-------|
+| 05:17 | 21:17 | `17 21 * * *` | `ai-cloud` | 仅抓云厂商（华为云/阿里云/腾讯云） |
+| 08:23 | 00:23 | `23 0 * * *` | `ai-blog` | 仅抓博客聚合（ai 板块，含 open-source 分流） |
+| 10:41 | 02:41 | `41 2 * * *` | `drive` | V2EX 开车线报 |
+| 13:37 | 05:37 | `37 5 * * *` | `games-direct` | 仅抓 Epic/Steam/GOG 官方 API |
+| 15:53 | 07:53 | `53 7 * * *` | `games-blog,game-discount` | ITAD/itch.io/Reddit/ggdeals + 小黑盒打折（Playwright） |
+| 18:47 | 10:47 | `47 10 * * *` | `finalize` | 整理：PENDING_URLS + 归档 + SVG + 前端 JSON + README |
+
+**设计原则**：不集中在一个时间段请求免费源网站，把请求量分散到全天 6 个时段，间隔约 2-3 小时。
+
+**cron 提前说明**：GitHub Actions cron 在高峰期可能延迟 15 分钟到数小时。finalize 已从
+20:47 提前到 18:47 北京，即使延迟 5 小时也在当晚完成。
+
+### 5.1 命令对照（子模式）
+
+```bash
+# 细粒度子模式（workflow 定时用这些，分散请求）
+python scripts/collect.py ai-cloud       # 仅云厂商
+python scripts/collect.py ai-blog        # 仅博客（ai 板块）
+python scripts/collect.py games-direct   # 仅 Epic/Steam/GOG 官方 API
+python scripts/collect.py games-blog     # 仅 ITAD/itch.io/Reddit
+python scripts/collect.py game-discount  # 仅小黑盒（需 Playwright）
+python scripts/collect.py drive          # V2EX 开车线报
+python scripts/collect.py finalize       # 整理：PENDING_URLS + 归档 + SVG + README
+
+# 粗粒度模式（手动触发或调试用，= 对应子模式之和；支持逗号分隔多模式）
+python scripts/collect.py ai         # = ai-cloud + ai-blog
+python scripts/collect.py games      # = games-direct + games-blog
+python scripts/collect.py games-blog,game-discount   # workflow 15:53 时段实际跑的
+python scripts/collect.py all        # 全部（手动触发用）
+```
+
+### 5.2 collect.py 内部流程
+
+1. `process_category(cat)`：抓取 → `_normalize_and_save`（规范化 + 按实际 category 分流 +
+   `_merge_and_save` 去重合并写回；合并前会丢弃 id 已归档的条目，防回流）
+2. `finalize()`：处理 `PENDING_URLS.md` → 刷新 status → `archive_expired()` 归档过期活动
+   （写 `docs/archive/`）→ `generate_docs_data()` 生成前端 JSON → `generate_svg()` 生成 SVG →
+   `generate_readme()` 生成 README（再兜底过滤一次 ended）
+3. `merge(old, new, today)`：**旧值优先**——已存在的字段不被新数据覆盖（尤其 end_date 一旦写入不覆盖）；
+   status 按起止日期每天重算（active/upcoming/ended）
+
+### 5.3 Actions 提交规则
+
+workflow 最后一步：`git add data/ docs/calendar.svg docs/data/ README.md` → 有 diff 才 commit →
+commit message 格式 `chore(data): {mode} update {YYYY-MM-DD}` → `git pull --rebase` → `git push`。
+
+---
+
+## 6. 本地调试（照着做就能跑）
+
+```bash
+cd /workspace/wool-gathering
+pip install -r scripts/requirements.txt
+
+# 跑整理阶段（最安全，不抓网络，只读本地数据生成 SVG + README）
+python scripts/collect.py finalize
+
+# 跑某个板块（会抓网络，可能慢/失败，建议加超时意识）
+python scripts/collect.py ai
+python scripts/collect.py games
+
+# 看结果
+ls -la data/*/activities.json docs/calendar.svg README.md
+```
+
+**本地跑 finalize 会修改 README.md / docs/calendar.svg / docs/data/**，这些是生成产物。
+如果只是调试看效果，跑完 `git reset --hard origin/main` 丢弃即可（Actions 会自己跑）。
+如果要推送，先确认 `docs/data/meta.json` 的 `repository` 字段不是空字符串（本地没 `GITHUB_REPOSITORY` 环境变量会变空）。
+
+---
+
+## 7. 推送方式（网络不稳要重试）
+
+```bash
+# 方式一：git push（网络不稳，失败就重试 2-3 次）
+git add -A && git commit -m "feat: 你的改动说明" && git push
+
+# 方式二：GitHub Contents API（更稳，但需要 token）
+# token 可从 git remote URL 提取：git remote get-url origin 里含 ghp_xxx@
+```
+
+**推送前必做**：
+1. `git pull --rebase origin main` 拉最新（Actions 可能刚推过）
+2. 确认没有改 `data/` / `docs/` 里的生成产物（除非是脚本跑出来的）
+3. commit message 用中文，前缀规范：`feat:` 新功能 / `fix:` 修 bug / `chore:` 杂项 / `docs:` 文档
+
+---
+
+## 8. 数据格式约定
+
+每条活动 JSON（`data/{cat}/activities.json` 是数组）：
+
+```json
+{
+  "id": "稳定ID（标题+URL哈希，去重依据）",
+  "title": "活动标题",
+  "category": "ai | open-source | drive | games",
+  "source_url": "来源页",
+  "claim_url": "领取页",
+  "start_date": "YYYY-MM-DD 或空",
+  "end_date": "YYYY-MM-DD 或空（开源工具必须空）",
+  "value": "福利描述",
+  "requirements": ["条件1", "条件2"],
+  "description": "说明",
+  "tags": ["标签"],
+  "discovered_at": "ISO 时间",
+  "last_seen": "YYYY-MM-DD",
+  "status": "active | upcoming | ended（按日期自动算）"
+}
+```
+
+**铁律**：
+- `id` 必须稳定（同活动每次抓取 id 不变），否则去重失效
+- `status` 不要手写，由 `utils.status_of(start, end, today)` 按日期算
+- `end_date` 空 = 长期免费（仅开源工具允许）；非空必须是 `YYYY-MM-DD`
+- `merge` 旧值优先：已存在字段不覆盖，所以清理假 end_date 要写一次性脚本直接改文件
+
+---
+
+## 9. 禁止事项（做了会搞乱项目）
+
+1. **禁止手动编辑** `data/*/activities.json`、`docs/calendar.svg`、`docs/data/*`、`README.md`——这些都是脚本生成的，改了会被下次跑覆盖或造成不一致。要改数据，改脚本规则再跑。
+2. **禁止给开源工具填 end_date**——开源是长期免费，end_date 必须空，否则会进 SVG 时间轴显示假日期。
+3. **禁止 rebase 或强推远程 main**——Actions 每天在 main 上 commit，rebase 会丢 Actions 的数据更新 commit。要同步用 `git pull --rebase`（本地 rebase 到远程之上，不破坏远程历史）。
+4. **禁止改 `merge` 的"旧值优先"语义**——这是防止新抓数据覆盖已确认字段的保护。要清理错误字段，写一次性脚本。
+5. **禁止在 SVG 里靠调字号/行高防重叠**——用 `textLength` 强制压缩才是根本解（见第 4 节）。
+6. **禁止把开车/线报关键词加到 `WOOL_EXCLUDE_PATTERNS`**——开车帖由 `is_drive_post` 识别后归 drive 分区，不能再当误判排除。
+7. **禁止删 `CATEGORIES` 里的类别**——四个类别 `["ai","open-source","drive","games"]` 是全项目共识，删了会导致数据无处归。
+
+---
+
+## 10. 常见问题
+
+**Q: Actions 跑了但某板块没更新？**
+A: 看 Actions 日志。常见：① 网络抓取失败（腾讯云反爬返回 JS 挑战页，靠缓存回退保留数据）；② 种子源页面结构变了；③ 该板块当天确实没新活动。不是 bug，是没新数据。
+
+**Q: SVG 文字和横条重叠了？**
+A: 检查 `svg_calendar._esc` 是否先截断再转义、textLength 是否加上、`LEFT_LABEL_W` 是否够。不要调字号硬挤。
+
+**Q: 开源工具在 SVG 里显示了假日期？**
+A: 它的 end_date 没清空。写一次性脚本把 `data/open-source/activities.json` 里所有条目的 `end_date` 置空，再跑 finalize。
+
+**Q: 想加新的开车线报源？**
+A: 改 `data/sources.json` 加一条，或在 `blog_collector.collect_blog_activities` 里加抓取逻辑。开车帖靠 `is_drive_post` 识别，不用手动标 category。
+
+**Q: 想加新的车型子分类？**
+A: 改 `calendar_generator.CAR_TYPES` 列表，加 `(标签, [关键词])`。顺序即分组顺序，先命中先归。
+
+**Q: 本地跑 finalize 后 meta.json 的 repository 是空字符串？**
+A: 本地没 `GITHUB_REPOSITORY` 环境变量。要么 `export GITHUB_REPOSITORY="jiuyuan233/wool-gathering"` 再跑，要么别推本地跑的产物（Actions 跑时会自动填）。
+
+---
+
+## 11. 给维护 AI 的行为准则
+
+1. **先读本文档再动手**——不要凭猜测改东西。
+2. **以远程 origin/main 为准**——本地历史可能因 rebase 搞乱过，动手前先 `git fetch && git reset --hard origin/main`。
+3. **小步快跑**——改一处跑一次 finalize 验证，不要攒一堆改动一起推。
+4. **不确定就问**——分类规则、end_date 语义、推送方式有歧义时，问用户，别瞎猜。
+5. **生成产物别 commit**——本地调试跑出来的 `data/` `docs/` `README.md` 改动，调试完 `git reset --hard` 丢弃，让 Actions 自己跑。只有改了 `scripts/` 规则或 `sources.json` 才需要 commit 推送。
+6. **中文回复**——所有回复、commit message、文档都用简体中文。
+
+---
+
+## 12. 示范：实跑一次 finalize 流程
+
+下面是一次真实的 `finalize` 运行示范（18:47 时段的任务），供维护 AI 参考。
+
+### 步骤 1：确认起点与远程一致
+
+```bash
+$ git log --oneline -1
+31ff6a0 feat: 开源工具退出活动时间轴，时间列显示长期免费
+$ git status --short
+?? AGENT.md          # 只有新文档未跟踪，working tree 干净
+```
+
+### 步骤 2：安装依赖
+
+```bash
+$ pip install -r scripts/requirements.txt
+```
+
+### 步骤 3：执行 finalize
+
+```bash
+$ python scripts/collect.py finalize
+[INFO] ============================================================
+[INFO] 开始每日整理
+[INFO] 运行时间: 2026-10-19T16:07:08+08:00
+[INFO] ============================================================
+[INFO] [ai] 当前共 18 条（active=18）
+[INFO] [open-source] 当前共 12 条（active=12）
+[INFO] [drive] 当前共 2 条（active=2）
+[INFO] [games] 当前共 69 条（active=65）
+[INFO] 生成前端数据...
+[INFO] 已生成 docs/data/activities.json (101 条) 和 meta.json
+[INFO] 生成 SVG 日历...
+[INFO] 已生成 SVG 日历 calendar.svg（89 条有时间轴，0 条无日期，开源工具 12 条长期免费不显示）
+[INFO] 生成 README...
+[INFO] 已生成 README.md
+[INFO] 整理完成
+```
+
+### 步骤 4：验证产物
+
+```bash
+$ git diff --stat
+ README.md                 |  26 ++--
+ docs/calendar.svg         | 323 +++++++++++++++++++---------------------------
+ docs/data/activities.json |  96 +++++------
+ docs/data/meta.json       |   4 +-
+```
+
+关键验证点（全部通过）：
+- SVG 副标题：`共 101 条（89 条有时间轴，开源工具长期免费不显示）` → 开源已正确排除
+  - 89 = ai 18 + drive 2 + games 69，开源 12 条不进时间轴
+- README 开源分区：时间列显示 `长期免费` 而非假日期
+- textLength 属性：标题/副标题 2 个；活动行条件性添加（文字超长才加，当前都不超）
+- 活动横条 180 个 = 89 条 × 2（背景条 + 进度填充）
+
+### 步骤 5：注意本地跑的坑
+
+```bash
+$ python3 -c "import json; print(json.load(open('docs/data/meta.json'))['repository'])"
+（空字符串）
+```
+
+本地跑 `finalize` 时 `docs/data/meta.json` 的 `repository` 字段会变空（没 `GITHUB_REPOSITORY` 环境变量）。
+**所以本地跑的产物不要直接推送**，否则会把远程 meta.json 的 repository 覆盖成空。
+
+### 步骤 6：清理本地产物改动
+
+按本规范第 11 节第 5 条，本地调试跑出来的 `data/` `docs/` `README.md` 改动应丢弃，让 Actions 自己跑：
+
+```bash
+$ git checkout -- README.md docs/        # 丢弃产物改动
+# 只保留 AGENT.md 等源文件改动用于提交
+```
+
+### 结论
+
+一次完整的 finalize 流程：**1 条命令 → 读 4 个数据文件 → 生成 4 个产物 → 验证 3 个关键点 → 清理本地产物**。
+维护 AI 照着这 6 步走，不会出错。如果要跑 `ai` 或 `games` 模式（会抓网络），步骤相同，只是步骤 3 换命令、
+步骤 4 验证点换成"新增了多少条数据"。
+
+---
+
+## 13. AI 中转站配置与手动触发
+
+项目用 OpenAI 兼容协议的 AI 中转站辅助信息抽取（`scripts/ai_client.py`）。
+workflow 默认配置 **ChatAnywhere `gpt-6.1-sol` 为主力 + SiliconFlow DeepSeek-V3.2 为备用**，
+主力连续失败（401/欠费/超时）时自动切换备用。需配两个 GitHub Secret：`AI_API_KEY` 和 `AI_FALLBACK_API_KEY`。
+
+### 13.1 当前配置（在 `.github/workflows/daily-collect.yml` 的 env 里）
+
+| 环境变量 | 值 | 说明 |
+|---------|-----|------|
+| `AI_BASE_URL` | `https://api.chatanywhere.tech/v1` | 主力中转站 ChatAnywhere 国内接入点（EdgeOne 全球 CDN，海外 runner 可达；备选 `.org`） |
+| `AI_API_KEY` | `${{ secrets.AI_API_KEY }}` | 主力 API Key，从 GitHub Secret 读，**不 commit 到代码** |
+| `AI_MODEL` | `gpt-6.1-sol` | 主力模型：2026-11-15 实测 JSON 最稳、相对日期最准（19 个可用模型中最优） |
+| `AI_FALLBACK_BASE_URL` | `https://api.siliconflow.cn/v1` | 备用中转站 SiliconFlow |
+| `AI_FALLBACK_API_KEY` | `${{ secrets.AI_FALLBACK_API_KEY }}` | 备用 API Key，从 GitHub Secret 读 |
+| `AI_FALLBACK_MODEL` | `deepseek-ai/DeepSeek-V3.2` | 备用模型 |
+
+### 13.1.1 ChatAnywhere 可用模型实测（2026-11-15，key 实测通过）
+
+**可用（19 个）**：`gpt-6.1-sol` / `gpt-6.1-terra` / `gpt-6-sol` / `gpt-6-luna` / `gpt-6-astra` /
+`gpt-5.6-sol` / `gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-5.5`* / `gpt-5.4-*`* / `gpt-5.2`* / `gpt-5.1` /
+`gpt-5` / `gpt-5-mini` / `gpt-4o` / `gpt-4o-mini` / `gpt-4.1` / `gpt-4.1-mini` / `gpt-3.5-turbo` /
+`deepseek-chat` / `deepseek-v3.2` / `deepseek-v4-pro` / `deepseek-v4.1-flash(-1017)`
+（带 * 的当时 503 负载高，可能间歇可用）
+
+**选型依据**：`gpt-6.1-sol` 两轮抽取测试 JSON 最干净（不裹代码块）、相对日期换算最准（"本周四"→具体日期）、
+福利价值抓取最全、token 消耗低。备选 `deepseek-v4.1-flash`（便宜省额度）、`gpt-5-mini`（轻量）。
+
+### 13.2 配置 GitHub Secret（必须做，否则 AI 调用失败）
+
+1. 仓库 **Settings → Secrets and variables → Actions → New repository secret**
+2. Name 填 `AI_API_KEY`，Value 填主力 ChatAnywhere API Key（形如 `sk-xxx`）
+3. 再加一条 Name 填 `AI_FALLBACK_API_KEY`，Value 填备用 SiliconFlow API Key
+4. 点 Add secret 保存。workflow 会自动读取，无需改代码。
+
+> fork 的仓库 secrets 不会从上游继承，必须自己配。
+
+### 13.3 换其他中转站（可选）
+
+框架不绑定具体厂商，任意 OpenAI 协议兼容的中转站都能用。编辑 `.github/workflows/daily-collect.yml` 的 env 改 `AI_BASE_URL`/`AI_MODEL`：
+
+| 中转站 | `AI_BASE_URL` | `AI_MODEL` | 说明 |
+|--------|---------------|------------|------|
+| ChatAnywhere（当前主力） | `https://api.chatanywhere.tech/v1` | `gpt-6.1-sol` | 免费版每周 50000 点 + 每天 100 次；仅 PENDING_URLS 自然语言时调用，额度消耗极低 |
+| SiliconFlow（当前备用） | `https://api.siliconflow.cn/v1` | `deepseek-ai/DeepSeek-V3.2` | 按量付费，跨服务商兜底 |
+| DeepSeek 官方 | `https://api.deepseek.com/v1` | `deepseek-chat` | 便宜、中文好、有 function calling |
+| 智谱 BigModel | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` | 免费额度大 |
+| 通义千问 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-turbo` | 阿里云百炼 |
+
+### 13.4 手动触发 workflow（调试 / 首次运行）
+
+1. 进仓库 **Actions** 标签页
+2. 左侧选 **Daily Collect** workflow
+3. 点右上角 **Run workflow** 按钮 → 选 main 分支 → 点绿色 Run workflow 按钮
+4. 等绿勾出现（约 2-5 分钟），点进去可看每步日志
+5. 运行成功后，README 顶部 SVG + 分类表格 + `data/*/activities.json` 自动更新并 commit
+
+> workflow 会按当前 UTC 小时自动判断跑哪个子模式（见第 5 节六时段表）。手动触发默认跑 `all`（全量）。
+
+### 13.5 中转站额度与调用频率
+
+- **ChatAnywhere（主力）**：免费版每周 50000 点 + 每天 100 次请求。AI 仅在 PENDING_URLS.md
+  有自然语言条目时才调用，日常为 0 次/天，额度消耗极低
+- **SiliconFlow（备用）**：按量付费（账户余额），DeepSeek-V3.2 约 2 元/百万输入 token；
+  仅主力连续失败时兜底
+- 抓取主链路（blog/cloud/direct collector）**不走 AI**，纯关键词规则解析，抓取不受 AI 额度影响
+
+### 13.6 已收录的 AI 信息源
+
+- **腾讯 WorkBuddy**（workbuddy.tencent.com）：AI Agent 办公助手，已加到 `cloud_collector.CLOUD_PAGES`（第 11 条）抓取 + 种子数据
+- ChatAnywhere 中转站本身**不再作为优惠条目收录**到 `data/ai/activities.json`（曾收录后删除，仅保留 workflow 配置用于 AI 抽取辅助）
+
+### 13.7 相关文件
+
+- `scripts/ai_client.py`：OpenAI 兼容客户端，读 `AI_BASE_URL`/`AI_API_KEY`/`AI_MODEL` 环境变量；
+  支持 `AI_FALLBACK_*` 三个环境变量配置备用中转站，主力连续 3 次失败自动切换
+- `.github/workflows/daily-collect.yml`：workflow env 配了主力 + 备用 AI（key 从 secret 读）
+- `scripts/cloud_collector.py`：`CLOUD_PAGES` 11 条（华为云 3 + 阿里云 3 + 腾讯云 4 + 腾讯 WorkBuddy 1）
+
+---
+
+## 14. 游戏平台介绍
+
+详细的游戏平台介绍见 **[docs/GAME_PLATFORMS.md](docs/GAME_PLATFORMS.md)**，包含：
+- 当前启用的 6 个游戏源（Epic/Steam/GOG/itch.io/ITAD/Reddit）的抓取方式
+- sources.json 里登记的其他 15 个平台（可扩展启用）
+- 各平台特点对比、免费游戏类型、抓取可靠性
+- 如何启用新平台的步骤
+
+---
+
+## 15. AI 操作指南：手动新增/更新活动信息
+
+当用户要求手动新增或更新某条活动信息时，按以下步骤操作。
+
+### 15.1 判断活动属于限时还是长期
+
+用 `utils.is_long_term(a)` 判定（阈值 90 天，约 3 个月）：
+
+| 条件 | 判定 | README 归属 | SVG 时间轴 |
+|------|------|------------|-----------|
+| 无 `end_date` | 长期 | 「♾️ 长期免费」 | 不显示 |
+| `end_date` 距今 > 90 天 | 长期 | 「♾️ 长期免费」 | 显示（在对应分区分组） |
+| `end_date` 距今 <= 90 天 | 限时 | 按 category（AI/开车/游戏） | 显示 |
+
+**日历显示所有有时间限制的活动**（有 `end_date` 的），不管持续时间多长：
+
+- 时间轴跨度固定为当月（刻度只显示当月 1 日到月末）
+- 超过一个月持续时间的活动：横条顶满整个跨度
+- 不在当月的活动：横条贴在对应边界
+- 按分区分组：AI / 云服务 → 开车线报 → 游戏喜加一
+- 分区内按 `end_date` 升序排列（快结束的排上面）
+- 开源项目（无 `end_date`）不显示在时间轴
+
+### 15.2 手动新增一条活动
+
+1. 确定目标分类目录：`data/ai/`、`data/shopping/`、`data/video-vip/`、`data/netdisk-vip/`、`data/drive/`、`data/games/`、`data/open-source/`
+2. 读对应的 `activities.json`，追加一条活动对象：
+
+```json
+{
+  "id": "可读前缀-md5hash前10位",
+  "title": "活动标题",
+  "category": "ai",
+  "source_url": "来源页面 URL",
+  "claim_url": "领取页面 URL",
+  "start_date": "2026-10-19",
+  "end_date": "2026-12-31",
+  "value": "福利价值描述",
+  "requirements": ["注册账号"],
+  "description": "来源: xxx",
+  "tags": ["blog", "xxx"],
+  "discovered_at": "2026-10-19",
+  "last_seen": "2026-10-19",
+  "status": "active"
+}
+```
+
+3. **永久免费活动**：`end_date` 留空（不填），自动归到长期免费分区
+4. **长期但非永久**：`end_date` 填距今 > 90 天的日期（如 `2027-12-31`），也归到长期免费分区
+5. **限时活动**：`end_date` 填距今 <= 90 天的日期，显示在当月时间轴（如与当月有交集）
+
+### 15.3 手动更新已有活动
+
+1. 读 `data/<分类>/activities.json`，按 `id` 或 `title` 找到目标活动
+2. 修改需要更新的字段（如 `end_date`、`value`、`claim_url`）
+3. 更新 `last_seen` 为当天日期
+4. 手动改完直接写文件即可（不走 merge，merge 是旧值优先）
+
+### 15.4 改完后重新生成产物
+
+```bash
+cd /workspace/wool-gathering
+python3 scripts/collect.py finalize
+```
+
+重新生成：`docs/calendar.svg`（时间轴跨度一个月，显示全部限时活动，按分区分组）+ `docs/data/`（前端 JSON）+ `README.md`（含长期免费分区）
+
+### 15.5 提交推送
+
+```bash
+git add data/ docs/ README.md CHANGELOG.md AGENT.md
+git commit -m "feat: 描述你的改动"
+git push origin main
+```
+
+### 15.6 验证清单
+
+- SVG 标题显示「活动时间轴（YYYY年M月）」
+- SVG 有 7 个分区标题行（AI/购物/视频会员/网盘会员/开车/游戏/游戏打折），分区内快结束的排上面
+- 超过一个月的活动横条顶满整个跨度
+- 无 `end_date` 的活动不在 SVG 时间轴，在 README「♾️ 长期免费」分区
+- 有 `end_date` 的活动都在 SVG 时间轴（不管多长时间）
+- 总条数 = SVG 显示条数 + 开源工具条数
+- 游戏分区英文标题后附中文翻译（格式 `英文原名 ｜中文译名`）
+
+### 15.7 游戏标题中文翻译规则
+
+游戏喜加一分区的活动标题常为英文（Epic/Steam/itch.io 独立游戏），需在原标题后附中文翻译。
+
+**格式**：`原标题 ｜中文译名`
+
+例：
+- `Epic 免费游戏: Bad Cheese ｜坏奶酪`
+- `[itch.io] Offrecord Episode 1（限免） ｜非官方记录第一章`
+- `[Steam] (Game) Dumb Ways to Build（Reddit-FreeGameFindings） ｜蠢蛋建造法`
+
+**翻译原则**：
+1. 有官方中文译名的用官方译名（如 Castlevania → 恶魔城，Monument Valley → 纪念碑谷）
+2. 无官方译名的按含义翻译（如 Bad Cheese → 坏奶酪，The Wrong Way → 逆行）
+3. 纯音译无意义时保留英文（如 Pdm）
+4. 标题已有中文的无需再加（如 `Agent A - 伪装游戏`）
+
+**操作步骤**：
+1. 打开 `data/games/activities.json`
+2. 找到含英文且无 `｜` 的标题
+3. 在标题末尾加 ` ｜中文译名`（注意｜前有一个空格）
+4. 运行 `python3 scripts/collect.py finalize` 重新生成产物
+5. 验证 README 游戏表格标题含中文翻译
+6. 提交推送
+
+### 15.8 小黑盒游戏打折信息操作指南
+
+小黑盒（xiaoheihe.cn）是游戏社区 SPA，分享帖含 Steam 新品节/尖叫节打折汇总（史低/新史低/一折以下）。需 Playwright 渲染才能获取内容。
+
+**数据流**：
+1. `data/sources.json` 里 `type=heybox` 的源 → `blog_collector.collect_heybox_discounts()` → Playwright 渲染 → 提取标题/日期/摘要 → 归入 `game-discount` 分区
+2. `collect.py game-discount` 触发抓取
+3. SVG 紫色（#8b5cf6）分区显示
+
+**手动新增小黑盒打折帖**：
+1. 获取小黑盒分享帖 URL（形如 `https://api.xiaoheihe.cn/v3/bbs/app/api/web/share?...&link_id=xxx`）
+2. 在 `data/sources.json` 加一条：
+   ```json
+   {
+     "name": "小黑盒帖子标题",
+     "url": "分享帖URL",
+     "category": "game-discount",
+     "type": "heybox",
+     "enabled": true,
+     "note": "说明"
+   }
+   ```
+3. 或直接在 `data/game-discount/activities.json` 手动加一条活动
+4. 运行 `python3 scripts/collect.py finalize` 重新生成产物
+5. 验证 SVG 有「游戏打折」紫色分区
+6. 提交推送
+
+**Playwright 依赖**：
+- 本地需 `pip install playwright && playwright install chromium`
+- GitHub Actions 需在 workflow 里加 Playwright 安装步骤
+- 若 Playwright 不可用，`collect_heybox_discounts()` 自动跳过并告警
+
+## 16. AI 操作指南：处理 PENDING_URLS.md（用户提交网址入口）
+
+`PENDING_URLS.md` 是用户提交新网址的入口。用户在「待处理」区写网址，AI 在 Actions 运行时自动接入为数据源并抓取内容。
+
+### 16.1 文档格式
+
+```markdown
+## 待处理
+https://example.com/deal # ai
+https://another.com/free-game # games
+
+## 已处理
+<!-- AI 自动管理 -->
+```
+
+每行一个网址，`#` 后是分类注释（可选）。不写分类时 AI 按 URL 关键词自动判断。
+
+### 16.2 AI 处理流程（在每次 Actions 运行时执行）
+
+支持两种输入：
+- **URL 行**（`https://...`）：添加到 sources.json 作为数据源
+- **自然语言行**（如 `Qoder每天领100积分 #ai`）：用 AI 理解并直接创建活动
+
+#### URL 行处理
+
+1. 读取 `PENDING_URLS.md` 的「待处理」区，提取所有网址行
+2. 对每个网址：
+   a. **判断分类**：用户 `#` 注释优先，否则按 URL 关键词判断（见 16.3）
+   b. **判断 type**：`xiaoheihe` → `heybox`（需 Playwright），其余 → `html`
+   c. **去重检查**：查 `data/sources.json` 是否已有相同 URL，有则标记「重复，跳过」
+   d. **添加到 sources.json**：加一条源（格式见 16.4）。注意：html 源只做登记，
+      不参与日常轮询（轮询源清单见 docs/日常更新指南.md 第二节）
+   e. **当场抓取**：html 源直接 fetch 该 URL → `parse_blog_articles` 通用解析（含关键词
+      过滤与自动分流）；heybox 源触发 `process_category("game-discount")` 走 Playwright
+   f. **入库**：抓到的活动经 `_normalize_and_save` 规范化合并进 `data/{category}/activities.json`
+   g. **记录结果**：抓到几条 / 页面无活动 / 抓取失败（可能 JS 渲染或反爬），写进「已处理」区
+
+#### 自然语言行处理（新增）
+
+1. 提取非 URL 的文本行（如 `Qoder现在每天领100积分，非常好用 #ai`）
+2. 解析 `#分类` 注释（可选）
+3. 调用 `_process_natural_language(desc, category, today)`：
+   a. 用 AI（主力 gpt-6.1-sol，失败自动切备用）基于描述本身的信息提取活动
+      （AI 无联网能力，不编造；描述信息不足时诚实返回空）
+   b. 返回结构化活动 JSON
+4. 将活动直接写入 `data/{category}/activities.json`
+
+3. 把处理完的条目移到「已处理」区，附上结果（见 16.5）
+4. 提交推送
+
+### 16.3 URL 分类判断规则（按优先级匹配）
+
+| URL 含关键词 | 归入分类 | type | 说明 |
+|-------------|---------|------|------|
+| `xiaoheihe` | `game-discount` | `heybox` | 小黑盒 SPA，需 Playwright 渲染 |
+| `epic` / `store.steampowered` / `gog` / `itch.io` | `games` | `html` | 游戏平台 |
+| `huaweicloud` / `aliyun` / `cloud.tencent` / `bce.baidu` | `ai` | `html` | 云厂商 |
+| `v2ex` | `drive` | `html` | V2EX 开车线报 |
+| `github` / `opensource` / `npmjs` / `pypi` | `open-source` | `html` | 开源工具 |
+| `iqiyi` / `v.qq` / `youku` / `mgtv` / `bilibili` | `video-vip` | `html` | 视频会员 |
+| `quark` / `pan.baidu` / `aliyundrive` / `115` | `netdisk-vip` | `html` | 网盘会员 |
+| `tmall` / `taobao` / `jd` / `suning` / `双11` | `shopping` | `html` | 购物促销 |
+| `appinn` / `iplaysoft` / `landian` / `xbeta` | `ai` | `html` | 软件博客（默认归 ai，会自动分流） |
+| 其余 | `ai`（默认） | `html` | 无法判断时默认 ai，抓取后按内容分流 |
+
+**注意**：软件博客（appinn/iplaysoft 等）归 `ai` 是因为 `collect_blog_activities("ai")` 会自动按 `is_open_source` / `is_shopping` / `is_video_vip` / `is_netdisk_vip` 分流到正确分类。
+
+### 16.4 添加到 sources.json 的格式
+
+```json
+{
+  "name": "从网页 <title> 或 URL 推断的简短名称",
+  "url": "用户提交的原始 URL",
+  "category": "判断的分类",
+  "type": "heybox 或 html",
+  "enabled": true,
+  "note": "用户提交 + AI 自动接入（YYYY-MM-DD）"
+}
+```
+
+**name 推断**：优先用网页 `<title>` 标签内容（截断 30 字），否则用 URL 域名。
+
+### 16.5 处理完后更新 PENDING_URLS.md
+
+把「待处理」区的已处理网址删除，在「已处理」区追加（每条一行）：
+
+```markdown
+- [2026-10-20] https://example.com/deal → ai，已添加到 sources.json，抓取到 3 条活动
+- [2026-10-20] https://another.com/free → games，重复（sources.json 已有），跳过
+- [2026-10-20] https://failed.com → ai，抓取失败（超时），已添加源但无活动
+```
+
+### 16.6 何时处理
+
+在 **finalize 阶段**（每天 18:47 北京时间，cron `47 10 * * *`）处理 `PENDING_URLS.md`。理由：
+- finalize 是整理阶段，适合做「接入新源 + 重新生成产物」的工作
+- 处理完直接生成 SVG + README，一步到位
+- 不影响其他时段的抓取任务
+
+### 16.7 边界情况
+
+- **PENDING_URLS.md 不存在**：跳过，不报错
+- **「待处理」区为空**：跳过，不报错
+- **网址格式无效**（不以 http 开头）：跳过该行，在「已处理」区标记「格式无效」
+- **抓取失败**：仍添加到 sources.json（下次运行会重试），在「已处理」区标记「抓取失败」
+- **Playwright 不可用**（heybox 类型）：添加源但跳过抓取，标记「需 Playwright」
+- **分类无法判断**：默认归 `ai`，AI 抓取后按内容自动分流
+
+## 17. AI 完整操作规范总结（必读）
+
+本节把所有关键操作流程串起来，AI 接手维护时按此规范操作。
+
+### 17.1 日常运行（全自动，AI 不干预）
+
+GitHub Actions 每天跑 6 次（见第 5 节），AI 不需要手动干预：
+- 05:17 / 08:23 / 11:41 / 13:37 / 15:53 → 抓取各板块数据
+- 18:47 → `finalize`：**自动处理 PENDING_URLS.md + 归档过期活动** → 生成 SVG + README
+
+### 17.2 用户提交新网址（全自动）
+
+1. 用户在 `PENDING_URLS.md` 的「待处理」区写网址（可选加 `# 分类` 注释）
+2. 当天 18:47 finalize 自动处理：`process_pending_urls()` 读取网址 → 判断分类 → 登记 `sources.json` → 当场抓取入库 → 移到「已处理」区
+3. 次日对应分类的抓取模式运行时，自动抓取新源内容
+4. 次日 18:47 finalize 生成新的 SVG + README
+
+### 17.3 AI 手动维护操作（用户要求时执行）
+
+| 用户要求 | AI 操作 |
+|---------|--------|
+| 新增一条活动 | 按 15 节，直接写 `data/{category}/activities.json`，跑 finalize |
+| 新增一个数据源 | 写 `data/sources.json` 加一条，跑对应分类 + finalize |
+| 新增小黑盒打折帖 | 按 15.8 节，加 heybox 源，跑 game-discount + finalize |
+| 修改分类归属 | 编辑 `calendar_generator.py` 的 `FREE_CATS`/`DISCOUNT_CATS`，跑 finalize |
+| 修改 SVG 颜色 | 编辑 `svg_calendar.py` 的 `COLOR_*` 常量，跑 finalize |
+| 调试 | 按 12 节，`git fetch && git reset --hard origin/main` → 改规则 → 跑 finalize → 验证 → 清理 |
+
+### 17.4 两大超级分区（第 2.0 节）
+
+| 超级分区 | 子分类 | 颜色系 |
+|---------|--------|--------|
+| 🆓 纯免费 | open-source + games + drive | 绿色系 |
+| 💰 打折优惠 | ai + shopping + video-vip + netdisk-vip + game-discount | 暖色系 |
+
+**判定规则**：子分类本身决定归属，无需额外字段。修改归属编辑 `FREE_CATS`/`DISCOUNT_CATS`。
+
+### 17.5 关键文件速查
+
+| 文件 | 作用 | 何时改 |
+|------|------|--------|
+| `AGENT.md` | AI 操作规范（本文档） | 流程变更时 |
+| `PENDING_URLS.md` | 用户提交网址入口 | 用户写网址 |
+| `data/sources.json` | 种子源列表 | 加新源 |
+| `data/*/activities.json` | 各分类原始数据 | 加活动 |
+| `scripts/collect.py` | 主流程（含 `process_pending_urls`） | 改流程 |
+| `scripts/calendar_generator.py` | README 生成（含 `FREE_CATS`/`DISCOUNT_CATS`） | 改分区 |
+| `scripts/svg_calendar.py` | SVG 生成（含 `COLOR_*`） | 改颜色 |
+| `scripts/blog_collector.py` | 博客/小黑盒抓取 | 改抓取规则 |
+
+### 17.6 禁止事项（第 9 节摘要）
+
+- 不要手动编辑 `docs/` 或 `README.md`（生成产物）
+- 不要手动编辑 `data/*/activities.json` 的生成字段（id/status/last_seen）
+- 本地调试产物不要 commit（`git reset --hard` 丢弃）
+- 不要在整点 cron（减轻源网站压力）
+- 开源工具 `end_date` 必须空（一直免费）
+- 领取链接用小黑盒链接，不跳 Steam（第 15.8 节）
+
+### 17.7 workflow 已实现的功能（检查过，不是画饼）
+
+| 功能 | 实现位置 | 状态 |
+|------|---------|------|
+| 六时段定时任务 | workflow 6 个 cron（15:53 含 game-discount） | ✅ 已实现 |
+| 过期活动自动归档 | `collect.py archive_expired()`，接入 finalize | ✅ 已实现（2026-11-15） |
+| PENDING_URLS URL 当场抓取入库 | `process_pending_urls()` + `_normalize_and_save()` | ✅ 已实现（2026-11-15） |
+| PENDING_URLS 自然语言理解 | `_process_natural_language()` + `ai_client.py`（主力+备用） | ✅ 已实现（2026-11-15 实测） |
+| Playwright 安装 | workflow「安装 Playwright」步骤 | ✅ 已实现 |
+| PENDING_URLS.md 提交 | workflow `git add PENDING_URLS.md` | ✅ 已实现 |
+| finalize 生成 SVG+README | `collect.py finalize()` | ✅ 已实现 |
+| 联网搜索补充 | — | ❌ 暂未实现（聊天 API 无联网能力，NL 条目会诚实返回空） |
+
+## 18. 好用 Agent 工具分区（静态，不进日历）
+
+README 里「🛠 好用 Agent 工具」分区是**静态内容**，直接写在 `scripts/readme_template.md` 模板里，不进 SVG 日历，不进 `data/` 目录。
+
+### 18.1 为什么不进日历
+
+这些工具是长期可用的推荐（不是限时活动），没有 end_date，不适合放在 SVG 时间轴上。放在 README 里作为参考即可。
+
+### 18.2 如何修改
+
+编辑 `scripts/readme_template.md` 里 `{{SECTIONS}}` 后面的「🛠 好用 Agent 工具」部分，然后跑 `python3 scripts/collect.py finalize` 重新生成 README。
+
+### 18.3 当前收录的工具
+
+| 工具 | 分类 | 自带 Key |
+|------|------|---------|
+| bolt.diy / bolt.new | 网页+沙箱 | ✅ |
+| OpenCode web | 网页 | ✅ |
+| OpenHands | 网页+Docker | ✅ |
+| Replit | 网页 IDE | ❌ |
+| CodeSandbox | 网页沙箱 | 部分 |
+| Dify / Coze | 网页 agent | ✅ |
+| LobeChat / Open WebUI | 网页聊天 | ✅ |
+
+## 19. 小黑盒多分区源（全分类覆盖）
+
+小黑盒社区（xiaoheihe.cn）不只有游戏打折，**所有分区的信息都有**。已为 8 个分类各加 1 个小黑盒社区源（`type=heybox-community`）：
+
+| 分类 | 源名称 | 说明 |
+|------|--------|------|
+| ai | 小黑盒社区-ai | AI/大模型/云服务相关 |
+| open-source | 小黑盒社区-open-source | 开源/免费工具 |
+| drive | 小黑盒社区-drive | 开车/线报/羊毛 |
+| shopping | 小黑盒社区-shopping | 购物/红包/优惠券 |
+| video-vip | 小黑盒社区-video-vip | 视频/会员 |
+| netdisk-vip | 小黑盒社区-netdisk-vip | 网盘/会员 |
+| game-discount | 小黑盒社区-game-discount | Steam打折/史低 |
+| games | 小黑盒社区-games | 喜加一/免费领游戏 |
+
+**工作原理**：`collect_heybox_community(category)` 用 Playwright 渲染小黑盒社区首页 → 用 `eval_on_selector_all` 提取帖子标题和链接 → 按标题关键词过滤属于该分类的帖子 → 优先找"整理合集"帖子（标题含"整理/合集/汇总/盘点"等词）→ 创建活动，`source_url` 指向帖子链接，`end_date` 留空（不当天过期）。在每次抓取对应分类时自动执行。
+
+**合集帖模式**（2026-10-28 更新）：不再把每条线报拆开抓，而是找人家整理好的合集帖，把帖子链接放到 README，持续时间按帖子内容。一个合集帖 = 一个活动。
+
+## 20. 过期活动归档（自动）
+
+`finalize` 阶段自动把过期活动按月归档到 `docs/archive/YYYY-MM.md`，从 `activities.json` 移除，
+**保证已结束活动不出现在 README / SVG / 前端数据里**（README 统计区会显示「已归档：N 个」）。
+
+**工作原理**（`collect.py archive_expired()`）：
+1. 找出 `status=ended` 或 `end_date < 今天` 的活动
+2. 写入归档索引 `docs/archive/index.json`（按 id 去重，持久保存全部历史归档）
+3. 用索引**全量重渲染**各月 `docs/archive/YYYY-MM.md`（防止旧实现「本批归档覆盖整月文件」丢历史）
+4. 从 `activities.json` 移除已归档条目
+
+**防回流**：`_merge_and_save()` 会丢弃 id 已在归档索引里的新抓条目——源站还挂着过期帖被
+重新抓到时直接丢弃，避免「抓回 → 归档」每天在数据里来回震荡。
+
+**兜底**：`calendar_generator.generate_readme()` 生成 README 时再过滤一次 `status=ended`，
+即使归档环节失败，已结束活动也不会出现在页面上。
+
+## 21. 开发文档（交接文档）
+
+完整的开发文档见 `DEV_GUIDE.md`，包含：
+
+- 项目概述与架构设计
+- 每个文件的职责和关键函数详解
+- AI 工作流程（调用链、输入输出、模型配置）
+- 数据流与状态机（活动状态转换、数据文件结构）
+- **用户画像与交流指南**（如何和用户交流、用户偏好）
+- 开发环境与常见操作（GitHub API 提交、触发 Actions、更新 Secret）
+- **遗留问题**（6 个待解决问题及建议）
+- 已实现功能清单
+- GitHub Actions 配置详解
+
+**接手开发的 AI 必读 `DEV_GUIDE.md`**，里面有完整的工作流程和环境限制说明。

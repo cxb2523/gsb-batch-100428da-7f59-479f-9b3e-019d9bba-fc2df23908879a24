@@ -1,0 +1,98 @@
+# 每日薅羊毛情报收集（分时段更新不同板块）
+name: Daily Collect
+
+on:
+  schedule:
+    # 任务分散到全天，避开整点（减轻免费源网站压力，避免集中请求）
+    # 北京时间 = UTC + 8
+    - cron: "17 21 * * *"   # 05:17 北京 → ai-cloud（云厂商）
+    - cron: "23 0 * * *"    # 08:23 北京 → ai-blog（博客聚合）
+    - cron: "41 2 * * *"    # 10:41 北京 → drive（V2EX 开车线报）
+    - cron: "37 5 * * *"    # 13:37 北京 → games-direct（Epic/Steam/GOG 官方 API）
+    - cron: "53 7 * * *"    # 15:53 北京 → games-blog + game-discount（ITAD/itch.io/Reddit + 小黑盒 Playwright）
+    - cron: "47 10 * * *"   # 18:47 北京 → finalize（整理：SVG + README）
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "运行模式: ai / ai-cloud / ai-blog / games / games-direct / games-blog / drive / finalize / all / 逗号分隔"
+        required: false
+        default: "all"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          pip install -r scripts/requirements.txt
+
+      - name: 安装 Playwright（小黑盒SPA渲染用）
+        run: |
+          playwright install chromium --with-deps || echo "Playwright安装失败，小黑盒抓取将跳过"
+        continue-on-error: true
+
+      - name: 确定运行模式
+        id: mode
+        run: |
+          if [ -n "${{ github.event.inputs.mode }}" ]; then
+            echo "mode=${{ github.event.inputs.mode }}" >> $GITHUB_OUTPUT
+            echo "手动触发模式: ${{ github.event.inputs.mode }}"
+          else
+            HOUR=$(date -u +%H)
+            echo "当前 UTC 小时: $HOUR"
+            case "$HOUR" in
+              21) echo "mode=ai-cloud" >> $GITHUB_OUTPUT;       echo "定时任务: 云厂商 (06:17 北京)" ;;
+              00) echo "mode=ai-blog" >> $GITHUB_OUTPUT;        echo "定时任务: 博客聚合 (09:23 北京)" ;;
+              02) echo "mode=drive" >> $GITHUB_OUTPUT;          echo "定时任务: 开车线报 (11:41 北京)" ;;
+              05) echo "mode=games-direct" >> $GITHUB_OUTPUT;   echo "定时任务: 游戏官方API (14:37 北京)" ;;
+              07) echo "mode=games-blog,game-discount" >> $GITHUB_OUTPUT;  echo "定时任务: 游戏博客聚合+小黑盒打折 (15:53 北京)" ;;
+              10) echo "mode=finalize" >> $GITHUB_OUTPUT;       echo "定时任务: 整理 (20:47 北京)" ;;
+              *)  echo "mode=finalize" >> $GITHUB_OUTPUT;       echo "定时任务(非标准时间): 整理" ;;
+            esac
+          fi
+
+      - name: 运行收集脚本
+        env:
+          TZ: Asia/Shanghai
+          # AI 主力：ChatAnywhere gpt-6.1-sol（2026-11-15 实测 19 个模型可用，此模型 JSON 最稳、相对日期最准）
+          #   国内接入点 .tech 为 EdgeOne 全球 CDN，海外 runner 实测可达；备选接入点 .org
+          # AI 备用：SiliconFlow DeepSeek-V3.2——主力连续失败时自动切换（跨服务商兜底）
+          # 两个 API_KEY 都从 GitHub Secret 读（AI_API_KEY / AI_FALLBACK_API_KEY），不 commit 到代码
+          AI_BASE_URL: https://api.chatanywhere.tech/v1
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: gpt-6.1-sol
+          AI_FALLBACK_BASE_URL: https://api.siliconflow.cn/v1
+          AI_FALLBACK_API_KEY: ${{ secrets.AI_FALLBACK_API_KEY }}
+          AI_FALLBACK_MODEL: deepseek-ai/DeepSeek-V3.2
+        run: |
+          python scripts/collect.py ${{ steps.mode.outputs.mode }}
+
+      - name: 提交并推送更新
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/ docs/ README.md PENDING_URLS.md
+          if git diff --cached --quiet; then
+            echo "无更新，跳过提交"
+          else
+            git commit -m "chore(data): ${{ steps.mode.outputs.mode }} update $(date -u +%Y-%m-%d)"
+            git fetch origin
+            git rebase origin/main 2>/dev/null || git rebase --abort 2>/dev/null || true
+            git push origin main 2>/dev/null || git push --force-with-lease origin main || true
+          fi
