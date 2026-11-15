@@ -43,6 +43,15 @@ def send_notify(title, content):
         logging.error(f'发送通知失败：{e}')
 
 
+def mask_value(value):
+    """隐藏单个 Cookie 值。"""
+    if len(value) > 8:
+        return value[:3] + '*' * (len(value) - 6) + value[-3:]
+    if value:
+        return value[0] + '*' * (len(value) - 1)
+    return value
+
+
 def mask_cookie(cookie):
     """隐藏日志中的 Cookie 值。"""
     result = []
@@ -55,15 +64,22 @@ def mask_cookie(cookie):
             continue
 
         key, value = item.split('=', 1)
-
-        if len(value) > 8:
-            value = value[:3] + '*' * (len(value) - 6) + value[-3:]
-        elif value:
-            value = value[0] + '*' * (len(value) - 1)
-
-        result.append(f'{key}={value}')
+        result.append(f'{key}={mask_value(value)}')
 
     return '; '.join(result)
+
+
+class CookieSaveError(Exception):
+    """Cookie 写回 .env 失败，属于可降级的持久化异常。
+
+    reason 为失败原因，fields 为未能保存的 (字段名, 明文值) 列表，
+    通知前需对值脱敏。
+    """
+
+    def __init__(self, reason, fields):
+        self.reason = reason
+        self.fields = fields
+        super().__init__(f'Cookie 写回失败：{reason}')
 
 
 
@@ -136,7 +152,11 @@ def parse_set_cookie(raw_headers):
 
 
 def update_cookie(new_cookies, expires):
-    """合并受支持的 Cookie 字段，并在变化时写回 .env。"""
+    """合并受支持的 Cookie 字段，并在变化时写回 .env。
+
+    写盘失败时抛出 CookieSaveError，携带失败原因和未保存字段；
+    此时不更新内存中的 Cookie，也不发送过期时间提醒。
+    """
     old_cookie = os.getenv('E_COOKIE', '')
     current = {}
 
@@ -145,19 +165,26 @@ def update_cookie(new_cookies, expires):
             key, value = item.strip().split('=', 1)
             current[key] = value
 
-    updated = False
+    changed_fields = []
 
     for field in COOKIE_FIELDS:
         if field in new_cookies and current.get(field) != new_cookies[field]:
             current[field] = new_cookies[field]
-            updated = True
+            changed_fields.append(field)
 
-    if not updated:
+    if not changed_fields:
         logging.info('本地 Cookie 是最新的，无需更新。')
         return
 
     new_cookie = '; '.join(f'{k}={v}' for k, v in current.items())
-    save_cookie(new_cookie)
+    try:
+        save_cookie(new_cookie)
+    except OSError as exc:
+        # 只读 .env、目录不可写、临时文件无法替换等均为可降级的写回失败。
+        raise CookieSaveError(
+            f'{type(exc).__name__}: {exc}',
+            [(field, new_cookies[field]) for field in changed_fields],
+        ) from exc
     os.environ['E_COOKIE'] = new_cookie
     headers['Cookie'] = new_cookie
 
@@ -171,6 +198,18 @@ def update_cookie(new_cookies, expires):
 
     if lines:
         send_notify('Cookie 更新提醒', '\n'.join(lines))
+
+
+def notify_cookie_save_failure(error):
+    """Cookie 写回失败时单独通知，字段值需脱敏。"""
+    lines = [f'失败原因：{error.reason}', '以下 Cookie 未能保存到 .env：']
+    lines.extend(
+        f'- {field}={mask_value(value)}'
+        for field, value in error.fields
+    )
+    content = '\n'.join(lines)
+    logging.error(content)
+    send_notify('Cookie 更新失败', content)
 
 
 def do_request(session=None):
@@ -212,7 +251,11 @@ def scrape():
 
         if set_cookies:
             new_cookies, expires = parse_set_cookie(set_cookies)
-            update_cookie(new_cookies, expires)
+            try:
+                update_cookie(new_cookies, expires)
+            except CookieSaveError as cookie_error:
+                # 写回失败只降级通知，不影响本次签到结果的解析与通知。
+                notify_cookie_save_failure(cookie_error)
         else:
             logging.info('未检测到 Set-Cookie，说明当前 Cookie 有效，无需更新。')
 

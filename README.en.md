@@ -45,6 +45,8 @@ The program signs in once at startup, then continues according to the configured
 
 If a configuration or sign-in error prevents further execution, the program reports the error and exits with a nonzero status. When file logging is enabled, startup and runtime errors are recorded there too. If the configured log directory is unavailable, the program attempts to record the error in the default `logs` directory.
 
+A failure to persist cookies back to `.env` (for example a read-only file, an unwritable directory, or a failed temporary-file replacement) is a recoverable error: the current sign-in result is still parsed and notified, and a separate cookie-update-failure notification is sent with the reason and the unsaved fields (values masked), while the process exits with status zero. Other errors such as a failed news-page request are still reported and cause a nonzero exit.
+
 Release archives do not contain `.env`, logs, or directory entries. File permissions and ZIP metadata are checked before publishing. The Linux release workflow also tests extraction as a regular user and as root in isolated directories, verifying that existing configuration, logs, and destination directory permissions and ownership remain unchanged.
 
 ## Docker deployment

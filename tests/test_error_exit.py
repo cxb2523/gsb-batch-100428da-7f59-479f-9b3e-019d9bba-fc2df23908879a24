@@ -4,12 +4,18 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 import main
 from ehentai import config, log_setup, signin
+
+
+def fake_response(html, set_cookies=()):
+    headers = SimpleNamespace(getlist=lambda name: list(set_cookies))
+    return SimpleNamespace(text=html, raw=SimpleNamespace(headers=headers))
 
 
 @pytest.fixture
@@ -92,6 +98,44 @@ def test_scheduled_run_error_is_logged_and_exits(isolated_config, monkeypatch, c
     with caplog.at_level(logging.INFO):
         assert main.main() == 1
     assert 'scheduled sign-in failure' in (isolated_config.parent / 'logs' / 'ehentai.log').read_text(encoding='utf-8')
+
+
+def test_cookie_save_failure_degrades_with_zero_exit(isolated_config, monkeypatch, caplog):
+    isolated_config.write_text(
+        "LOG_ENABLED='true'\nE_COOKIE='event=oldevent1'\n"
+        "Notify='{\"GOTIFY_URL\":\"https://example.com\",\"GOTIFY_TOKEN\":\"token\"}'\n",
+        encoding='utf-8',
+    )
+    monkeypatch.setattr('sys.argv', ['main.py', '--once'])
+    monkeypatch.setattr(
+        signin, 'request_page',
+        lambda: fake_response(
+            '<div id="eventpane"><p>Reward</p></div>',
+            ['event=newevent2; Path=/', 'sk=secretkey987; Path=/'],
+        ),
+    )
+    monkeypatch.setattr(signin, 'save_cookie', Mock(side_effect=PermissionError('access denied')))
+    send = Mock()
+    monkeypatch.setattr(signin.notify, 'send', send)
+    with caplog.at_level(logging.INFO):
+        # 写回失败降级处理，进程仍以 0 退出。
+        assert main.main() == 0
+
+    titles = [call.args[0] for call in send.call_args_list]
+    assert 'Ehentai SignIn - Cookie 更新失败' in titles
+    assert 'Ehentai SignIn - 签到结果' in titles
+    failure_body = next(
+        call.args[1] for call in send.call_args_list
+        if call.args[0] == 'Ehentai SignIn - Cookie 更新失败'
+    )
+    assert 'access denied' in failure_body
+    assert 'event=' in failure_body and 'sk=' in failure_body
+    assert 'newevent2' not in failure_body and 'secretkey987' not in failure_body
+    log_text = (isolated_config.parent / 'logs' / 'ehentai.log').read_text(encoding='utf-8')
+    assert '以下 Cookie 未能保存到 .env' in log_text
+    assert 'access denied' in log_text
+    # .env 内容未被修改。
+    assert "E_COOKIE='event=oldevent1'" in isolated_config.read_text(encoding='utf-8')
     assert 'Traceback' not in caplog.text
 
 
