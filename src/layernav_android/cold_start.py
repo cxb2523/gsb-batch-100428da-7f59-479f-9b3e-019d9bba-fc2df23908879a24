@@ -9,7 +9,9 @@ Three paths tried in priority order:
    with 0.5 s pre‑wait and up to 2 retries)
 
 After the app enters foreground, optionally taps a session tab to reach the
-app's main content list (e.g. WeChat's bottom "微信" tab).
+app's main content list (e.g. WeChat's bottom "微信" tab).  When a
+``session_tab_verify`` callback is supplied, the tap is *verified* — a
+foreground package match alone is no longer treated as success.
 
 Screen dimensions are always auto‑detected via ``adb shell wm size``.
 
@@ -17,17 +19,22 @@ Screen dimensions are always auto‑detected via ``adb shell wm size``.
 
     from layernav_android.cold_start import cold_start_app_from_launcher
 
-    ok = cold_start_app_from_launcher(
+    result = cold_start_app_from_launcher(
         adb, "com.tencent.mm",
         app_name="wechat", M=4, N=3,
         session_tab_x=108, session_tab_y=2192,
+        session_tab_verify=lambda a: model.detect_layer(a, scale_w, "L1"),
     )
+    if not result:
+        print(result.failure)  # "app_not_started" | "tab_verify_failed"
 """
 
 from __future__ import annotations
 
 import re
 import time
+from dataclasses import dataclass
+from typing import Callable
 
 from layernav_android._protocol import AdbProtocol
 from layernav_android.logging import get_logger
@@ -43,6 +50,46 @@ APP_DEFAULTS: dict[str, dict[str, int]] = {
 
 _DOCK_RETRIES = 2
 _DOCK_PRE_WAIT_S = 0.5
+
+#: ``ColdStartResult.failure`` — the app never reached the foreground.
+FAILURE_APP_NOT_STARTED = "app_not_started"
+#: ``ColdStartResult.failure`` — foreground OK, but the session-tab
+#: verification callback never confirmed the conversation list page.
+FAILURE_TAB_VERIFY_FAILED = "tab_verify_failed"
+
+# Per-launch-path outcomes (internal)
+_PATH_OK = "ok"
+_PATH_NOT_FOREGROUND = "not_foreground"
+_PATH_TAB_FAILED = "tab_failed"
+
+
+@dataclass(frozen=True)
+class ColdStartResult:
+    """Outcome of :func:`cold_start_app_from_launcher`.
+
+    ``bool(result)`` is ``True`` iff the cold-start fully succeeded, so
+    legacy callers written against the old ``bool`` return value
+    (``if cold_start_app_from_launcher(...):``) keep working unchanged.
+
+    Attributes:
+        ok: full success (foreground + session tab verified if requested).
+        foreground_ready: the package reached the foreground at some point.
+        tab_verified: ``True``/``False`` when a session-tab check ran,
+            ``None`` when no tab check was requested.
+        failure: ``None`` on success, otherwise
+            :data:`FAILURE_APP_NOT_STARTED` or :data:`FAILURE_TAB_VERIFY_FAILED`.
+        path: which launch path succeeded (``"monkey"`` / ``"am_start"`` /
+            ``"dock"`` / ``"monkey_after_reboot"`` / ``"dock_after_reboot"``).
+    """
+
+    ok: bool
+    foreground_ready: bool = False
+    tab_verified: bool | None = None
+    failure: str | None = None
+    path: str | None = None
+
+    def __bool__(self) -> bool:
+        return self.ok
 
 
 def dock_app_icon_coords(
@@ -81,10 +128,12 @@ def cold_start_app_from_launcher(
     N: int | None = None,
     session_tab_x: int | None = None,
     session_tab_y: int | None = None,
+    session_tab_verify: Callable[[AdbProtocol], bool] | None = None,
+    session_tab_retries: int = 2,
     force_stop_before: bool = True,
     deadline_s: float = 25.0,
     allow_reboot: bool = False,
-) -> bool:
+) -> ColdStartResult:
     """Cold-start *package* from the Android launcher and optionally tap a session tab.
 
     Screen dimensions are always auto‑detected via ``adb shell wm size``.
@@ -98,6 +147,13 @@ def cold_start_app_from_launcher(
         session_tab_x, session_tab_y: if both are non-``None``, tap this
             coordinate after the app enters foreground (e.g. WeChat's
             「微信」 bottom tab).
+        session_tab_verify: optional callback ``(adb) -> bool`` confirming
+            the session tab actually took effect (e.g. the conversation
+            list page is showing).  Only consulted when the tab
+            coordinates are also given; without it the legacy
+            foreground-only behaviour is kept.
+        session_tab_retries: extra tab taps allowed per launch path when
+            verification fails.
         force_stop_before: issue ``am force-stop`` before cold-start.
         deadline_s: maximum time budget for the whole cold-start.
         allow_reboot: if ``True`` and all three launch paths fail, issue
@@ -111,7 +167,10 @@ def cold_start_app_from_launcher(
                lock).  Defaults to ``False``.
 
     Returns:
-        ``True`` if *package* is the foreground app after cold-start.
+        :class:`ColdStartResult` — truthy on full success.  Inspect
+        ``result.failure`` to distinguish :data:`FAILURE_APP_NOT_STARTED`
+        (app never came up) from :data:`FAILURE_TAB_VERIFY_FAILED`
+        (foreground ready but session tab never verified).
     """
     screen_w, screen_h = _resolve_screen_size(adb)
     scale_w = screen_w / 1080.0
@@ -127,38 +186,59 @@ def cold_start_app_from_launcher(
             logger.warning("cold_start: force-stop %s failed (non-fatal)", package)
         time.sleep(0.65)
 
+    saw_tab_failure = False
+
     # -- path 1: monkey LAUNCHER --
     if _try_monkey(adb, package):
-        time.sleep(1.5)
-        _tap_session_tab(adb, session_tab_x, session_tab_y)
-        if time.monotonic() < deadline and _check_foreground(adb, package):
-            return True
+        outcome = _settle_after_launch(
+            adb, package, "monkey", deadline=deadline,
+            session_tab_x=session_tab_x, session_tab_y=session_tab_y,
+            session_tab_verify=session_tab_verify,
+            session_tab_retries=session_tab_retries,
+        )
+        if outcome == _PATH_OK:
+            return _success_result("monkey", session_tab_x, session_tab_y, session_tab_verify)
+        saw_tab_failure |= outcome == _PATH_TAB_FAILED
 
     # -- path 2: am start Intent (backup for custom ROMs) --
     if _try_am_start(adb, package):
-        time.sleep(1.5)
-        _tap_session_tab(adb, session_tab_x, session_tab_y)
-        if time.monotonic() < deadline and _check_foreground(adb, package):
-            return True
+        outcome = _settle_after_launch(
+            adb, package, "am_start", deadline=deadline,
+            session_tab_x=session_tab_x, session_tab_y=session_tab_y,
+            session_tab_verify=session_tab_verify,
+            session_tab_retries=session_tab_retries,
+        )
+        if outcome == _PATH_OK:
+            return _success_result("am_start", session_tab_x, session_tab_y, session_tab_verify)
+        saw_tab_failure |= outcome == _PATH_TAB_FAILED
 
     # -- path 3: Dock icon tap (last resort, with pre-wait + retry) --
     dx, dy = dock_app_icon_coords(
         screen_w, screen_h, scale_w, app_name=app_name, M=M, N=N,
     )
-    if _try_dock_tap_with_retry(adb, package, dx, dy, session_tab_x, session_tab_y):
-        if time.monotonic() < deadline and _check_foreground(adb, package):
-            return True
+    outcome = _try_dock_tap_with_retry(
+        adb, package, dx, dy, session_tab_x, session_tab_y,
+        session_tab_verify=session_tab_verify,
+        session_tab_retries=session_tab_retries,
+    )
+    if outcome == _PATH_OK:
+        return _success_result("dock", session_tab_x, session_tab_y, session_tab_verify)
+    saw_tab_failure |= outcome == _PATH_TAB_FAILED
 
     # -- path 4: adb reboot (opt-in, very slow) --
     if not allow_reboot:
-        return False
+        return _failure_result(
+            saw_tab_failure, session_tab_x, session_tab_y, session_tab_verify,
+        )
 
     logger.warning("cold_start: all 3 launch paths failed, rebooting device")
     try:
         adb._run(["reboot"])
     except Exception as exc:
         logger.error("cold_start: adb reboot failed (%s)", exc)
-        return False
+        return _failure_result(
+            saw_tab_failure, session_tab_x, session_tab_y, session_tab_verify,
+        )
 
     # Wait for device to disconnect + come back
     time.sleep(5)
@@ -174,20 +254,36 @@ def cold_start_app_from_launcher(
             pass
         time.sleep(0.65)
     if _try_monkey(adb, package):
-        time.sleep(1.5)
-        _tap_session_tab(adb, session_tab_x, session_tab_y)
-        if _check_foreground(adb, package):
+        outcome = _settle_after_launch(
+            adb, package, "monkey_after_reboot", deadline=float("inf"),
+            session_tab_x=session_tab_x, session_tab_y=session_tab_y,
+            session_tab_verify=session_tab_verify,
+            session_tab_retries=session_tab_retries,
+        )
+        if outcome == _PATH_OK:
             logger.info("cold_start: succeeded after reboot")
-            return True
+            return _success_result(
+                "monkey_after_reboot", session_tab_x, session_tab_y, session_tab_verify,
+            )
+        saw_tab_failure |= outcome == _PATH_TAB_FAILED
     dx2, dy2 = dock_app_icon_coords(
         screen_w2, screen_h2, scale_w2, app_name=app_name, M=M, N=N,
     )
-    if _try_dock_tap_with_retry(adb, package, dx2, dy2, session_tab_x, session_tab_y):
-        if _check_foreground(adb, package):
-            logger.info("cold_start: succeeded after reboot + Dock")
-            return True
+    outcome = _try_dock_tap_with_retry(
+        adb, package, dx2, dy2, session_tab_x, session_tab_y,
+        session_tab_verify=session_tab_verify,
+        session_tab_retries=session_tab_retries,
+    )
+    if outcome == _PATH_OK:
+        logger.info("cold_start: succeeded after reboot + Dock")
+        return _success_result(
+            "dock_after_reboot", session_tab_x, session_tab_y, session_tab_verify,
+        )
+    saw_tab_failure |= outcome == _PATH_TAB_FAILED
 
-    return False
+    return _failure_result(
+        saw_tab_failure, session_tab_x, session_tab_y, session_tab_verify,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +338,129 @@ def _tap_session_tab(
         time.sleep(0.55)
 
 
+def _tab_check_requested(
+    session_tab_x: int | None,
+    session_tab_y: int | None,
+    session_tab_verify: Callable[[AdbProtocol], bool] | None,
+) -> bool:
+    return (
+        session_tab_x is not None
+        and session_tab_y is not None
+        and session_tab_verify is not None
+    )
+
+
+def _success_result(
+    path: str,
+    session_tab_x: int | None,
+    session_tab_y: int | None,
+    session_tab_verify: Callable[[AdbProtocol], bool] | None,
+) -> ColdStartResult:
+    return ColdStartResult(
+        ok=True,
+        foreground_ready=True,
+        tab_verified=(
+            True
+            if _tab_check_requested(session_tab_x, session_tab_y, session_tab_verify)
+            else None
+        ),
+        path=path,
+    )
+
+
+def _failure_result(
+    saw_tab_failure: bool,
+    session_tab_x: int | None,
+    session_tab_y: int | None,
+    session_tab_verify: Callable[[AdbProtocol], bool] | None,
+) -> ColdStartResult:
+    if saw_tab_failure:
+        return ColdStartResult(
+            ok=False,
+            foreground_ready=True,
+            tab_verified=False,
+            failure=FAILURE_TAB_VERIFY_FAILED,
+        )
+    return ColdStartResult(
+        ok=False,
+        foreground_ready=False,
+        tab_verified=None,
+        failure=FAILURE_APP_NOT_STARTED,
+    )
+
+
+def _settle_after_launch(
+    adb: AdbProtocol,
+    package: str,
+    path_name: str,
+    *,
+    deadline: float,
+    session_tab_x: int | None,
+    session_tab_y: int | None,
+    session_tab_verify: Callable[[AdbProtocol], bool] | None,
+    session_tab_retries: int,
+) -> str:
+    """Two-level post-launch check: foreground package, then session tab."""
+    time.sleep(1.5)
+    _tap_session_tab(adb, session_tab_x, session_tab_y)
+    if time.monotonic() >= deadline or not _check_foreground(adb, package):
+        logger.warning("cold_start: %s path: %s not in foreground", path_name, package)
+        return _PATH_NOT_FOREGROUND
+    if not _verify_session_tab(
+        adb, path_name, session_tab_x, session_tab_y,
+        session_tab_verify, session_tab_retries,
+    ):
+        return _PATH_TAB_FAILED
+    return _PATH_OK
+
+
+def _verify_session_tab(
+    adb: AdbProtocol,
+    path_name: str,
+    session_tab_x: int | None,
+    session_tab_y: int | None,
+    session_tab_verify: Callable[[AdbProtocol], bool] | None,
+    session_tab_retries: int,
+) -> bool:
+    """Confirm the session tab actually took effect.
+
+    Returns ``True`` immediately when no tab check was requested (no
+    coordinates or no verify callback) — the legacy foreground-only
+    behaviour.  Otherwise verifies, re-tapping the tab up to
+    ``session_tab_retries`` times on failure.
+    """
+    if not _tab_check_requested(session_tab_x, session_tab_y, session_tab_verify):
+        return True
+    assert session_tab_x is not None and session_tab_y is not None
+    assert session_tab_verify is not None
+    for attempt in range(1, session_tab_retries + 2):
+        try:
+            ok = bool(session_tab_verify(adb))
+        except Exception as exc:
+            logger.warning(
+                "cold_start: %s: session tab verify raised (%s)", path_name, exc,
+            )
+            ok = False
+        if ok:
+            if attempt > 1:
+                logger.info(
+                    "cold_start: %s: session tab verified on attempt %d",
+                    path_name, attempt,
+                )
+            return True
+        if attempt <= session_tab_retries:
+            logger.warning(
+                "cold_start: %s: session tab verify failed, re-tapping (%d/%d)",
+                path_name, attempt, session_tab_retries + 1,
+            )
+            _tap_session_tab(adb, session_tab_x, session_tab_y)
+    logger.error(
+        "cold_start: %s: session tab verify failed after %d attempts",
+        path_name, session_tab_retries + 1,
+    )
+    return False
+
+
 def _try_dock_tap_with_retry(
     adb: AdbProtocol,
     package: str,
@@ -249,7 +468,10 @@ def _try_dock_tap_with_retry(
     dy: int,
     session_tab_x: int | None,
     session_tab_y: int | None,
-) -> bool:
+    *,
+    session_tab_verify: Callable[[AdbProtocol], bool] | None = None,
+    session_tab_retries: int = 2,
+) -> str:
     logger.info("cold_start: Dock tap at (%d, %d) for %s (pre-wait %.1fs, max %d retries)",
              dx, dy, package, _DOCK_PRE_WAIT_S, _DOCK_RETRIES)
     for attempt in range(1 + _DOCK_RETRIES):
@@ -258,11 +480,18 @@ def _try_dock_tap_with_retry(
         adb.tap(dx, dy)
         time.sleep(1.2)
         _tap_session_tab(adb, session_tab_x, session_tab_y)
-        if _check_foreground(adb, package):
-            logger.info("cold_start: Dock tap succeeded on attempt %d", attempt + 1)
-            return True
-        logger.warning("cold_start: Dock tap attempt %d failed", attempt + 1)
-    return False
+        if not _check_foreground(adb, package):
+            logger.warning("cold_start: Dock tap attempt %d failed (not foreground)",
+                           attempt + 1)
+            continue
+        logger.info("cold_start: Dock tap foreground OK on attempt %d", attempt + 1)
+        if _verify_session_tab(
+            adb, "dock", session_tab_x, session_tab_y,
+            session_tab_verify, session_tab_retries,
+        ):
+            return _PATH_OK
+        return _PATH_TAB_FAILED
+    return _PATH_NOT_FOREGROUND
 
 
 def _check_foreground(adb: AdbProtocol, package: str) -> bool:

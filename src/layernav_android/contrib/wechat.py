@@ -13,7 +13,10 @@ import numpy as np
 
 from layernav_android._protocol import AdbProtocol
 from layernav_android.base import KEYCODE_BACK, BaseLayerModel, LayerDef
-from layernav_android.cold_start import cold_start_app_from_launcher
+from layernav_android.cold_start import (
+    FAILURE_TAB_VERIFY_FAILED,
+    cold_start_app_from_launcher,
+)
 from layernav_android.logging import get_logger
 
 logger = get_logger(__name__)
@@ -167,14 +170,29 @@ class WeChatGroupLayerModel(BaseLayerModel):
 
         self.home_one(adb, scale_w)
 
-        cold_start_app_from_launcher(
+        result = cold_start_app_from_launcher(
             adb, WECHAT_PACKAGE,
             app_name="wechat", M=4, N=3,
             session_tab_x=tab_x, session_tab_y=tab_y,
+            session_tab_verify=lambda a: self.detect_layer(a, scale_w, "L1"),
             force_stop_before=True,
             deadline_s=deadline_s,
             allow_reboot=allow_reboot,
         )
+        if not result.ok:
+            if result.failure == FAILURE_TAB_VERIFY_FAILED:
+                logger.error(
+                    "_cold_start: WeChat foreground ready but session tab "
+                    "verify failed (会话列表未确认到达, path 全部重试耗尽), "
+                    "继续轮询 %s 直至超时",
+                    target_layer,
+                )
+            else:
+                logger.error(
+                    "_cold_start: WeChat 冷启动未进入前台 (failure=%s), "
+                    "继续轮询 %s 直至超时",
+                    result.failure, target_layer,
+                )
 
         deadline = time.monotonic() + deadline_s
         while time.monotonic() < deadline:

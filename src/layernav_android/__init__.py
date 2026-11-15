@@ -10,6 +10,9 @@ from layernav_android.base import (
 )
 from layernav_android.cold_start import (
     APP_DEFAULTS,
+    FAILURE_APP_NOT_STARTED,
+    FAILURE_TAB_VERIFY_FAILED,
+    ColdStartResult,
     cold_start_app_from_launcher,
     dock_app_icon_coords,
 )
@@ -19,8 +22,11 @@ __all__ = [
     "APP_DEFAULTS",
     "BaseLayerModel",
     "cold_start_app_from_launcher",
+    "ColdStartResult",
     "DetectResult",
     "dock_app_icon_coords",
+    "FAILURE_APP_NOT_STARTED",
+    "FAILURE_TAB_VERIFY_FAILED",
     "home_one",
     "KEYCODE_BACK",
     "KEYCODE_HOME",
