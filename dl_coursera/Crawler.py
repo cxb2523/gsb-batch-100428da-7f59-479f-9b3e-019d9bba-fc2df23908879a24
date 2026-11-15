@@ -864,6 +864,38 @@ class Crawler:
 
             return '\n'.join(html), unique_assets
 
+        def _quiz_extract_draft(attempts):
+            if not attempts:
+                return None
+            if attempts.get('inProgressAttempt'):
+                return attempts['inProgressAttempt'].get('draft')
+            if attempts.get('lastSubmission'):
+                return attempts['lastSubmission'].get('submission')
+            return None
+
+        def _quiz_error_codes(node):
+            if not isinstance(node, dict):
+                return None
+            errors = node.get('errors')
+            if not errors:
+                return None
+            codes = [
+                _.get('errorCode')
+                for _ in errors
+                if isinstance(_, dict) and _.get('errorCode')
+            ]
+            return ', '.join(codes) if codes else None
+
+        def _quiz_mark_unavailable(quiz, reason, detail=None):
+            logging.warning(
+                '[crawl_quiz] quiz questions unavailable (reason=%s): %s'
+                % (reason, quiz['slug'])
+            )
+            quiz['items'].append(
+                CourseMaterialQuizUnavailableItem(reason=reason, detail=detail)
+            )
+
+        @attach
         @ts.register_task(
             priority=PRIO_COURSE_MATERIAL,
             ttl=3,
@@ -875,17 +907,23 @@ class Crawler:
             # Coursera exposes quiz questions as part of an attempt draft.
             # If no draft exists yet, start an attempt so that QueryState can
             # return the question prompts and options.
+            #
+            # Resetting `items` first keeps the task idempotent across crawls
+            # and retries: a re-run replaces an earlier placeholder (or stale
+            # content) instead of appending a second entry, and a quiz ends
+            # up with either one real item or one placeholder, never both.
+            quiz['items'] = []
+
             state = _quiz_state(course, quiz)
             if state.get('__typename') != 'Submission_SubmissionState':
-                logging.warning('[crawl_quiz] failed to get quiz state: %s' % state)
+                _quiz_mark_unavailable(
+                    quiz,
+                    QUIZ_UNAVAILABLE_STATE,
+                    detail=_quiz_error_codes(state) or state,
+                )
                 return
 
-            attempts = state.get('attempts') or {}
-            draft = None
-            if attempts.get('inProgressAttempt'):
-                draft = attempts['inProgressAttempt'].get('draft')
-            elif attempts.get('lastSubmission'):
-                draft = attempts['lastSubmission'].get('submission')
+            draft = _quiz_extract_draft(state.get('attempts'))
 
             if draft is None:
                 start_payload = _graphql_payload(
@@ -898,20 +936,26 @@ class Crawler:
                 )
                 start_result = _graphql_data(start_d)['Submission_StartAttempt']
                 if start_result.get('__typename') != 'Submission_StartAttemptSuccess':
-                    logging.warning(
-                        '[crawl_quiz] failed to start quiz: %s' % start_result
+                    _quiz_mark_unavailable(
+                        quiz,
+                        QUIZ_UNAVAILABLE_START_FAILED,
+                        detail=_quiz_error_codes(start_result) or start_result,
                     )
                     return
 
                 state = _quiz_state(course, quiz)
-                attempts = state.get('attempts') or {}
-                if attempts.get('inProgressAttempt'):
-                    draft = attempts['inProgressAttempt'].get('draft')
-                elif attempts.get('lastSubmission'):
-                    draft = attempts['lastSubmission'].get('submission')
+                if state.get('__typename') != 'Submission_SubmissionState':
+                    _quiz_mark_unavailable(
+                        quiz,
+                        QUIZ_UNAVAILABLE_STATE,
+                        detail=_quiz_error_codes(state) or state,
+                    )
+                    return
+
+                draft = _quiz_extract_draft(state.get('attempts'))
 
             if not draft:
-                logging.warning('[crawl_quiz] no draft for quiz: %s' % quiz['slug'])
+                _quiz_mark_unavailable(quiz, QUIZ_UNAVAILABLE_NO_DRAFT)
                 return
 
             html, assets = _quiz_draft_to_html(course, draft)

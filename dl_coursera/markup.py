@@ -1,6 +1,7 @@
 import logging
 import copy
 import re
+import html as html_lib
 
 from urllib.parse import quote
 
@@ -9,7 +10,41 @@ import bs4
 import jinja2
 
 from .resource import load_resource
-from .define import URL_ROOT
+from .define import (
+    URL_ROOT,
+    QUIZ_UNAVAILABLE_STATE,
+    QUIZ_UNAVAILABLE_START_FAILED,
+    QUIZ_UNAVAILABLE_NO_DRAFT,
+)
+
+QUIZ_UNAVAILABLE_MESSAGES = {
+    QUIZ_UNAVAILABLE_STATE: 'The quiz state returned by Coursera is abnormal.',
+    QUIZ_UNAVAILABLE_START_FAILED: 'Starting a quiz attempt failed.',
+    QUIZ_UNAVAILABLE_NO_DRAFT: 'The quiz attempt draft is empty.',
+}
+
+
+def render_quiz_unavailable(*, reason, detail=None):
+    """Build the HTML body of a quiz whose questions are unavailable."""
+
+    message = QUIZ_UNAVAILABLE_MESSAGES.get(
+        reason, 'The quiz questions are temporarily unavailable.'
+    )
+
+    parts = ['<div class="quiz-unavailable">']
+    parts.append('<h2>Quiz questions are temporarily unavailable</h2>')
+    parts.append('<p>%s</p>' % html_lib.escape(message))
+    parts.append(
+        '<p>Re-run the download later; this entry will be replaced with the '
+        'real questions once they can be fetched.</p>'
+    )
+    if detail:
+        parts.append(
+            '<pre class="quiz-unavailable-detail">%s</pre>'
+            % html_lib.escape(str(detail))
+        )
+    parts.append('</div>')
+    return '\n'.join(parts)
 
 
 def _is_root(e):

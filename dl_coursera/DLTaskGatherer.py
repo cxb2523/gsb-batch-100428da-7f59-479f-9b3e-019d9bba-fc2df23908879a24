@@ -6,7 +6,7 @@ import re
 
 from .lib.ExploringTree import ExploringTree
 
-from .markup import render_supplement
+from .markup import render_supplement, render_quiz_unavailable
 
 from .resource import load_resource
 from .define import *
@@ -237,9 +237,25 @@ class DLTaskGatherer:
             for _i, item in enumerate(supplement['items']):
                 if item['type'] == 'CML':
                     self._gather_cml(item, _i, supplement)
+                elif item['type'] == 'QuizUnavailable':
+                    self._gather_quiz_unavailable(item, _i, supplement)
 
     def _gather_quiz(self, quiz, i):
         self._gather_supplement(quiz, i)
+
+    def _gather_quiz_unavailable(self, item, i, supplement):
+        # A placeholder quiz has no downloadable resources: it only produces
+        # an HTML file, so it must never add an (empty-URL) download task.
+        html = render_quiz_unavailable(reason=item['reason'], detail=item.get('detail'))
+
+        data = render_supplement(
+            content=html,
+            resource_path=self._resource_path(),
+            title='%s' % supplement['name'],
+        ).encode('UTF-8')
+        self._add_file_task(
+            data, self._see('%02d@%s.html' % (i + 1, supplement['slug']))
+        )
 
     def _gather_cml(self, cml, i, supplement):
         import bs4

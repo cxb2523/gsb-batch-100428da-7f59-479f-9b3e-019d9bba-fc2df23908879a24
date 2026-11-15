@@ -6,6 +6,7 @@
 * (04) Generates a `playlist.m3u` file for each course
 * (05) Signs Windows executables with a self-signed certificate generated during the Nuitka build
 * (06) Modernizes packaging with a PEP 621 `pyproject.toml`, trusted-publishing workflow, and removes legacy requirements files
+* (07) A quiz whose questions cannot be fetched (failed attempt start, abnormal state, or empty draft) now gets a placeholder entry explaining why instead of disappearing from the course; it carries no download tasks and is replaced by the real questions on a later successful re-crawl
 
 ## 1.0.1
 

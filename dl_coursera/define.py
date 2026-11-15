@@ -5,6 +5,19 @@ from .lib.MyDict import MyDict
 URL_ROOT = 'https://www.coursera.org'
 COURSE_0 = 'learning-how-to-learn'
 
+# Reasons why a quiz's questions could not be fetched. They are stored on the
+# placeholder entry so that the generated page can explain what happened, and
+# so that the crawl cache records the failure for later re-runs.
+QUIZ_UNAVAILABLE_STATE = 'state'
+QUIZ_UNAVAILABLE_START_FAILED = 'start_failed'
+QUIZ_UNAVAILABLE_NO_DRAFT = 'no_draft'
+
+QUIZ_UNAVAILABLE_REASONS = [
+    QUIZ_UNAVAILABLE_STATE,
+    QUIZ_UNAVAILABLE_START_FAILED,
+    QUIZ_UNAVAILABLE_NO_DRAFT,
+]
+
 
 def URL_SPEC(slug):
     return (
@@ -239,6 +252,23 @@ class CourseMaterialSupplementItemCML(CourseMaterialSupplementItem):
         self['type'] = 'CML'
         self['html'] = html
         self['assets'] = assets
+
+
+class CourseMaterialQuizUnavailableItem(CourseMaterialSupplementItem):
+    """Placeholder for a quiz whose questions could not be fetched.
+
+    It carries no downloadable resources: only a reason and optional server
+    details, both rendered into the quiz's HTML page.
+    """
+
+    def __init__(self, *, reason, detail=None):
+        super().__init__()
+
+        assert reason in QUIZ_UNAVAILABLE_REASONS
+
+        self['type'] = 'QuizUnavailable'
+        self['reason'] = reason
+        self['detail'] = detail
 
 
 class Video(MyDict):
