@@ -1,0 +1,268 @@
+"""Contract tests for JSReactReportGenerator against the vendored report template."""
+
+import json
+import re
+from importlib import resources
+from pathlib import Path
+
+from pymidscene.core.js_react_report_generator import (
+    JSReactReportGenerator,
+    _anti_escape_script_tag,
+)
+
+REPORT_TEMPLATE_PACKAGE = "pymidscene.resources.report_template"
+PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwAD"
+    "hgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
+
+def _build_contract_report_html() -> str:
+    return _build_contract_report_generator().generate_html()
+
+
+def _build_contract_report_generator() -> JSReactReportGenerator:
+    generator = JSReactReportGenerator()
+    generator.start_session(
+        group_name="Contract Compatibility Session",
+        description="Verifies the vendored report template contract.",
+        model_name="qwen-vl-max",
+    )
+    generator.add_task(
+        task_type="Planning",
+        sub_type="Locate",
+        prompt="Locate the cart icon",
+        screenshot_before=PNG_BASE64,
+        screenshot_after=PNG_BASE64,
+        element_rect={"left": 100, "top": 10, "width": 20, "height": 30},
+        element_center=[110, 25],
+        element_text="Cart icon",
+        duration_ms=250,
+        ai_prompt_tokens=11,
+        ai_completion_tokens=7,
+        screenshot_width=1280,
+        screenshot_height=720,
+    )
+    generator.add_task(
+        task_type="Insight",
+        sub_type="Assert",
+        prompt="The cart total remains visible",
+        thought="The cart total matches the expectation.",
+        output={
+            "pass": True,
+            "details": {
+                "expected": "$39.98",
+                "actual": "$39.98",
+            },
+        },
+        duration_ms=75,
+        ai_tokens=9,
+    )
+    return generator
+
+
+def _extract_midscene_dump(html: str) -> dict:
+    matches = list(
+        re.finditer(
+            # 锚定行首 \n<script(对齐 JS ReportMergingTool)——模板自身的压缩 JS
+            # 里也含字面量 `<script type="midscene_web_dump" type="application/json"`,
+            # 不加 \n 锚会先匹配到那串 JS 而非真正的数据标签。
+            r'\n<script[^>]*type="midscene_web_dump"[^>]*>\s*(.*?)\s*</script>',
+            html,
+            re.DOTALL,
+        )
+    )
+    assert matches, "Generated HTML should embed a midscene_web_dump payload."
+    # 注入内容经 escapeScriptTag(< / > → marker)转义, 读回需对称还原 ——
+    # 与打包查看器 App.tsx 的 antiEscapeScriptTag 行为一致
+    return json.loads(_anti_escape_script_tag(matches[-1].group(1)))
+
+
+def _vendored_template_html() -> str:
+    template_root = resources.files(REPORT_TEMPLATE_PACKAGE)
+    return (template_root / "report.html").read_text(encoding="utf-8")
+
+
+def _vendored_asset_refs() -> list[str]:
+    refs = {
+        ref
+        for ref in re.findall(r'["\'](static/[^"\']+)["\']', _vendored_template_html())
+        if not ref.endswith(".LICENSE.txt")
+    }
+    return sorted(refs)
+
+
+def test_generator_dump_matches_vendored_template_compatibility_checklist():
+    dump = _extract_midscene_dump(_build_contract_report_html())
+
+    assert dump["groupName"] == "Contract Compatibility Session"
+    assert dump["groupDescription"] == "Verifies the vendored report template contract."
+    assert dump["modelBriefs"] == ["qwen-vl-max"]
+    assert len(dump["executions"]) == 2
+    assert all(execution["tasks"] for execution in dump["executions"])
+
+    locate_task = dump["executions"][0]["tasks"][0]
+    assert locate_task["param"]["prompt"] == "Locate the cart icon"
+    assert locate_task["output"]["element"]["description"] == "Cart icon"
+    assert locate_task["recorder"]
+    assert all(item["type"] == "screenshot" for item in locate_task["recorder"])
+    assert all(
+        item["screenshot"]["base64"].startswith("data:image/png;base64,")
+        for item in locate_task["recorder"]
+    )
+    assert locate_task["uiContext"]["screenshot"]["base64"].startswith("data:image/png;base64,")
+    assert locate_task["uiContext"]["size"] == {
+        "width": 1280,
+        "height": 720,
+        "dpr": 1,
+    }
+    assert locate_task["timing"]["cost"] == 250
+    assert locate_task["usage"] == {
+        "prompt_tokens": 11,
+        "completion_tokens": 7,
+        "total_tokens": 18,
+        "time_cost": 250.0,
+    }
+
+    assert_task = dump["executions"][1]["tasks"][0]
+    assert assert_task["thought"] == "The cart total matches the expectation."
+    assert assert_task["output"]["details"] == {
+        "expected": "$39.98",
+        "actual": "$39.98",
+    }
+    assert assert_task["timing"]["cost"] == 75
+    assert assert_task["usage"]["total_tokens"] == 9
+
+
+def test_generator_exposes_upstream_locate_result_details_for_matched_elements():
+    dump = _extract_midscene_dump(_build_contract_report_html())
+
+    matched_element = dump["executions"][0]["tasks"][0]["matchedElement"][0]
+
+    assert matched_element["description"] == "Cart icon"
+    assert matched_element["center"] == [110, 25]
+    assert matched_element["rect"] == {
+        "left": 100,
+        "top": 10,
+        "width": 20,
+        "height": 30,
+    }
+
+
+def test_generated_html_keeps_vendored_asset_references_intact():
+    asset_refs = _vendored_asset_refs()
+    template_root = resources.files(REPORT_TEMPLATE_PACKAGE)
+    html = _build_contract_report_html()
+
+    assert asset_refs, "Vendored template should reference packaged static assets."
+
+    for asset_ref in asset_refs:
+        assert asset_ref in html, (
+            "Generated HTML should preserve vendored template asset references "
+            f"such as {asset_ref}."
+        )
+        assert template_root.joinpath(asset_ref).is_file(), (
+            "Vendored template asset reference should resolve inside the packaged "
+            f"report_template resources: {asset_ref}."
+        )
+
+
+def test_save_materializes_vendored_assets_beside_output_report(tmp_path: Path):
+    asset_refs = _vendored_asset_refs()
+    generator = _build_contract_report_generator()
+
+    report_path = Path(generator.save(str(tmp_path), filename="official-report.html"))
+
+    assert report_path == tmp_path / "official-report.html"
+    assert report_path.is_file()
+    assert asset_refs, "Vendored template should reference packaged static assets."
+
+    for asset_ref in asset_refs:
+        assert (tmp_path / asset_ref).is_file(), (
+            "Saving a packaged official-style report should materialize vendored "
+            f"asset references beside the output HTML: {asset_ref}."
+        )
+
+
+def test_generate_html_prefers_vendored_template_and_emits_single_dump_script_tag():
+    html = _build_contract_report_html()
+    matches = list(
+        re.finditer(
+            r'(<script[^>]*type="midscene_web_dump"[^>]*>)\s*(\{.*?\})\s*</script>',
+            html,
+            re.DOTALL,
+        )
+    )
+
+    assert len(matches) == 1
+    # 两个 type 属性,对齐 JS 报告格式(第二个 application/json 是合并工具的硬要求)
+    assert matches[0].group(1) == (
+        '<script type="midscene_web_dump" type="application/json">'
+    )
+    assert "无法加载 JS 版本的 React 可视化模板" not in html, (
+        "generate_html() should keep using the packaged report_template resources "
+        "instead of the fallback warning page."
+    )
+
+
+def test_dump_payload_escapes_all_angle_brackets_like_js_escape_script_tag():
+    """
+    对齐 JS shared/utils.ts escapeScriptTag: 注入的 dump 中所有 < / > 都被
+    替换为 __midscene_lt__ / __midscene_gt__。打包查看器在解析前无条件
+    执行 antiEscapeScriptTag 还原, 两边必须严格对称; 只转义字面量
+    "</script>" 时, "</Script >" 等大小写/空白变体仍会提前终止 script
+    元素并把整页打碎。
+    """
+    generator = JSReactReportGenerator()
+    generator.start_session(group_name="escape", description="d")
+    generator.add_task(
+        task_type="Insight",
+        sub_type="Query",
+        prompt='extracted page text with </Script > and <b>html</b> tags',
+        thought="raw AI response may contain <script> sequences",
+    )
+    html = generator.generate_html()
+
+    script_match = re.search(
+        r'\n<script[^>]*type="midscene_web_dump"[^>]*>\s*(.*?)\s*</script>',
+        html,
+        re.DOTALL,
+    )
+    assert script_match is not None
+    payload = script_match.group(1)
+    # script 体内不允许出现任何裸 < / >(否则可能终止 script 元素)
+    assert "<" not in payload and ">" not in payload
+    assert "__midscene_lt__" in payload
+
+    # 还原后 JSON 完整且内容无损
+    dump = json.loads(_anti_escape_script_tag(payload))
+    task = dump["executions"][0]["tasks"][0]
+    assert task["param"]["dataDemand"] == (
+        'extracted page text with </Script > and <b>html</b> tags'
+    )
+    assert task["thought"] == "raw AI response may contain <script> sequences"
+
+
+def test_insight_tasks_carry_service_dump_log():
+    """Insight/Locate 任务必须带 task.log(JS ServiceDump): 查看器的元素
+    详情面板从 log.matchedElement 读数据, 不读顶层字段."""
+    dump = _extract_midscene_dump(_build_contract_report_html())
+
+    locate_task = dump["executions"][0]["tasks"][0]
+    locate_log = locate_task["log"]
+    assert locate_log["type"] == "locate"
+    assert locate_log["userQuery"]["element"] == "Locate the cart icon"
+    assert locate_log["matchedElement"][0]["center"] == [110, 25]
+    assert locate_log["matchedRect"]["width"] == 20
+    assert locate_log["taskInfo"]["durationMs"] == 250
+
+    assert_task = dump["executions"][1]["tasks"][0]
+    assert_log = assert_task["log"]
+    assert assert_log["type"] == "assert"
+    assert assert_log["userQuery"]["assertion"] == (
+        "The cart total remains visible"
+    )
+    assert assert_log["assertionPass"] is True
+
+    # markedScreenshot 无任何消费方, 不应再写入(白白膨胀报告体积)
+    assert "markedScreenshot" not in locate_task
