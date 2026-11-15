@@ -1,0 +1,42 @@
+import type {
+	ILoadOptionsFunctions,
+	INodeListSearchResult,
+} from "n8n-workflow";
+import {
+	getTasks,
+	searchProjectUsers,
+	searchSharedProjects,
+	searchTaskTags,
+} from "../../helpers";
+
+export const taskMethods = {
+	loadOptions: {
+		async getTasks(this: ILoadOptionsFunctions) {
+			const projectId = this.getCurrentNodeParameter("projectId") as string;
+			return await getTasks.call(this, projectId);
+		},
+	},
+	listSearch: {
+		async searchProjectUsers(
+			this: ILoadOptionsFunctions,
+			filter?: string,
+		): Promise<INodeListSearchResult> {
+			const results = await searchProjectUsers.call(this, filter);
+			return { results };
+		},
+		async searchSharedProjects(
+			this: ILoadOptionsFunctions,
+			filter?: string,
+		): Promise<INodeListSearchResult> {
+			const results = await searchSharedProjects.call(this, filter);
+			return { results };
+		},
+		async searchTaskTags(
+			this: ILoadOptionsFunctions,
+			filter?: string,
+		): Promise<INodeListSearchResult> {
+			const results = await searchTaskTags.call(this, filter);
+			return { results };
+		},
+	},
+};

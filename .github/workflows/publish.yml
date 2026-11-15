@@ -1,0 +1,100 @@
+name: Publish Package
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# The publish OIDC token is not granted here. Only the publish job
+# requests id-token: write, and only after the artifact is already built.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag is on main branch
+        run: |
+          # Check if the tagged commit exists on main
+          if ! git branch -r --contains ${{ github.sha }} | grep -q 'origin/main'; then
+            echo "Error: Tag is not on main branch"
+            exit 1
+          fi
+          echo "Tag verified on main branch"
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build
+        run: bun run build
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Unit tests
+        run: bun test tests/unit
+
+      - name: Pack release tarball
+        run: npm pack --ignore-scripts
+
+      - name: Upload package tarball
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: npm-package
+          path: n8n-nodes-ticktick-*.tgz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # No GitHub environment: declaring one rewrites the OIDC subject from
+    # repo:owner/repo:ref:refs/tags/vX to repo:owner/repo:environment:NAME.
+    # The trusted publisher on npmjs.com was registered without an
+    # environment, so the subject has to stay unchanged.
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download package tarball
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: npm-package
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install npm for trusted publishing
+        run: npm install -g npm@11.5.1
+
+      - name: Show npm version
+        run: npm --version
+
+      # Trusted publishing authenticates with the job OIDC token.
+      # npm 11.5.1+ attaches provenance automatically for a public package
+      # published from a public GitHub Actions run. The tarball was packed
+      # in the unprivileged build job, so this job does not install or run
+      # the dev toolchain.
+      - name: Publish to npm
+        run: npm publish --access public n8n-nodes-ticktick-*.tgz

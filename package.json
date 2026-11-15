@@ -1,0 +1,79 @@
+{
+	"name": "n8n-nodes-ticktick",
+	"version": "2.3.0",
+	"description": "TickTick module for custom n8n node.",
+	"keywords": [
+		"n8n-community-node-package",
+		"n8n-nodes",
+		"n8n",
+		"workflow",
+		"automation",
+		"ticktick",
+		"task",
+		"todo",
+		"productivity",
+		"api",
+		"integration"
+	],
+	"license": "MIT",
+	"homepage": "https://github.com/hansdoebel/n8n-nodes-ticktick#readme",
+	"author": {
+		"name": "Hans Doebel",
+		"email": "hansdev@mailbox.org"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/hansdoebel/n8n-nodes-ticktick.git"
+	},
+	"bugs": {
+		"url": "https://github.com/hansdoebel/n8n-nodes-ticktick/issues"
+	},
+	"engines": {
+		"node": ">=18.10"
+	},
+	"scripts": {
+		"build": "n8n-node build",
+		"build:watch": "tsc --watch",
+		"dev": "n8n-node dev",
+		"lint": "n8n-node lint",
+		"lint:fix": "n8n-node lint --fix",
+		"release": "n8n-node release",
+		"test": "bun test",
+		"test:unit": "bun test tests/unit",
+		"test:integration": "bun test tests/integration"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"files": [
+		"dist"
+	],
+	"funding": {
+		"type": "buymeacoffee",
+		"url": "https://buymeacoffee.com/hansdoebel"
+	},
+	"n8n": {
+		"n8nNodesApiVersion": 1,
+		"credentials": [
+			"dist/credentials/TickTickOAuth2Api.credentials.js",
+			"dist/credentials/TickTickTokenApi.credentials.js",
+			"dist/credentials/TickTickSessionApi.credentials.js"
+		],
+		"nodes": [
+			"dist/nodes/TickTick/TickTick.node.js",
+			"dist/nodes/TickTick/TickTickTrigger.node.js"
+		]
+	},
+	"devDependencies": {
+		"@n8n/node-cli": "^0.56.4",
+		"@types/luxon": "^3.7.6",
+		"@types/node": "^25.9.9",
+		"eslint": "^9.39.5",
+		"luxon": "^3.7.2",
+		"prettier": "^3.10.1",
+		"typescript": "^5.9.3"
+	},
+	"peerDependencies": {
+		"n8n-workflow": "*"
+	}
+}
