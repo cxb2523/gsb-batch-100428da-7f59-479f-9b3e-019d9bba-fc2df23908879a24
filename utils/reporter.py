@@ -176,6 +176,12 @@ class ReportGenerator:
         subdomain_recon = results.get('subdomain_recon', {})
         total_subs = sum(d.get('total', 0) for d in subdomain_recon.values())
         alive_subs = sum(d.get('alive', 0) for d in subdomain_recon.values())
+        wildcard_subs = sum(d.get('wildcard_filtered', 0) for d in subdomain_recon.values())
+        unresolved_subs = sum(d.get('unresolved', 0) for d in subdomain_recon.values())
+        dead_subs = sum(d.get('dead', 0) for d in subdomain_recon.values())
+        if not any('dead' in d for d in subdomain_recon.values()):
+            # Older report.json inputs predate the explicit `dead` count.
+            dead_subs = max(0, total_subs - alive_subs - wildcard_subs - unresolved_subs)
 
         js_count = stats.get('js_files_found', stats.get('js_files_downloaded', len(js_files)))
         secrets_count = stats.get('secrets_found', len(secrets))
@@ -254,6 +260,8 @@ class ReportGenerator:
                     f'"status_code":{json.dumps(r.get("status_code",0))},' +
                     f'"alive":{json.dumps(r.get("alive",False))},' +
                     f'"source":{json.dumps(r.get("source",""))},' +
+                    f'"classification":{json.dumps(r.get("classification", "alive" if r.get("alive") else "dead"))},' +
+                    f'"filter_reason":{json.dumps(r.get("filter_reason",""))},' +
                     f'"domain":{json.dumps(domain)}' +
                     '}'
                 )
@@ -384,7 +392,7 @@ tr.click{{cursor:pointer}}tr.click:hover{{background:rgba(0,0,0,.03)}}
   <div><span class="n">{esc(duration)}</span><span class="l">Duration</span></div>
 </div>
 
-{'<hr><div class="sec" id="subdomains"><h2>Subdomains</h2><div class="sbar"><input type="text" id="sdq" placeholder="filter..." oninput="rSD()"></div><div class="frow"><span class="lbl">Show:</span><span class="stamp high on" data-sd="alive" onclick="tglSD(this)">ALIVE (' + str(alive_subs) + ')</span><span class="stamp info on" data-sd="dead" onclick="tglSD(this)">DEAD (' + str(total_subs - alive_subs) + ')</span></div><table><thead><tr><th onclick="sSD(\'subdomain\')">subdomain</th><th onclick="sSD(\'ip\')">ip</th><th onclick="sSD(\'status_code\')">status</th><th onclick="sSD(\'source\')">source</th><th onclick="sSD(\'domain\')">domain</th></tr></thead><tbody id="sdb"></tbody></table></div>' if subdomain_recon else ''}
+{'<hr><div class="sec" id="subdomains"><h2>Subdomains</h2><div class="sbar"><input type="text" id="sdq" placeholder="filter..." oninput="rSD()"></div><div class="frow"><span class="lbl">Show:</span><span class="stamp high on" data-sd="alive" onclick="tglSD(this)">ALIVE (' + str(alive_subs) + ')</span><span class="stamp info on" data-sd="dead" onclick="tglSD(this)">DEAD (' + str(dead_subs) + ')</span><span class="stamp medium on" data-sd="wildcard" onclick="tglSD(this)">WILDCARD (' + str(wildcard_subs) + ')</span><span class="stamp low on" data-sd="unresolved" onclick="tglSD(this)">UNRESOLVED (' + str(unresolved_subs) + ')</span></div><table><thead><tr><th onclick="sSD(\'subdomain\')">subdomain</th><th onclick="sSD(\'ip\')">ip</th><th onclick="sSD(\'status_code\')">status</th><th onclick="sSD(\'source\')">source</th><th onclick="sSD(\'classification\')">class</th><th onclick="sSD(\'domain\')">domain</th></tr></thead><tbody id="sdb"></tbody></table></div>' if subdomain_recon else ''}
 
 <hr>
 
@@ -444,7 +452,7 @@ const S={secrets_json};
 const E={ep_json};
 const J={jf_json};
 const SD={sub_json};
-let sdf={{alive:1,dead:1}};
+let sdf={{alive:1,dead:1,wildcard:1,unresolved:1}};
 let sds={{k:'alive',a:0}};
 function tglSD(el){{let c=el.dataset.sd;sdf[c]=sdf[c]?0:1;el.classList.toggle('on');el.classList.toggle('off');rSD()}}
 function sSD(k){{if(sds.k===k)sds.a=!sds.a;else{{sds.k=k;sds.a=1}};rSD()}}
@@ -453,16 +461,18 @@ function rSD(){{
   if(q===undefined)return;
   q=(q||'').toLowerCase();
   let f=SD.filter(s=>{{
-    if(!sdf[s.alive?'alive':'dead'])return false;
-    if(q&&!((s.subdomain+s.ip+s.source+s.domain).toLowerCase().includes(q)))return false;
+    if(!sdf[s.classification])return false;
+    if(q&&!((s.subdomain+s.ip+s.source+s.classification+s.filter_reason+s.domain).toLowerCase().includes(q)))return false;
     return true;
   }});
   let k=sds.k;
   f.sort((a,b)=>{{let av=k==='status_code'?+a[k]:k==='alive'?(a[k]?0:1):String(a[k]||'').toLowerCase();let bv=k==='status_code'?+b[k]:k==='alive'?(b[k]?0:1):String(b[k]||'').toLowerCase();if(av<bv)return sds.a?-1:1;if(av>bv)return sds.a?1:-1;return 0}});
   let h='';
   for(let s of f){{
-    let cls=s.alive?'high':'info';
-    h+=`<tr><td>${{esc(s.subdomain)}}</td><td>${{esc(s.ip)}}</td><td><span class="stamp ${{cls}}">${{s.alive?s.status_code:'DEAD'}}</span></td><td><span class="cat">${{esc(s.source)}}</span></td><td>${{esc(s.domain)}}</td></tr>`;
+    let cls=s.alive?'high':(s.classification==='wildcard'?'medium':(s.classification==='unresolved'?'low':'info'));
+    let st=s.alive?String(s.status_code):(s.classification==='wildcard'?'WILDCARD':(s.classification==='unresolved'?'UNRESOLVED':'DEAD'));
+    let note=s.filter_reason?'<br><small>'+esc(s.filter_reason)+'</small>':'';
+    h+=`<tr><td>${{esc(s.subdomain)}}</td><td>${{esc(s.ip)}}</td><td><span class="stamp ${{cls}}">${{esc(st)}}</span>${{note}}</td><td><span class="cat">${{esc(s.source)}}</span></td><td><span class="cat">${{esc(s.classification)}}</span></td><td>${{esc(s.domain)}}</td></tr>`;
   }}
   document.getElementById('sdb').innerHTML=h;
 }}

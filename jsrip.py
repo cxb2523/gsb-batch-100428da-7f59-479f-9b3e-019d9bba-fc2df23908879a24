@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 from core.analyzer import JSAnalyzer
 from core.crawler import PlaywrightCrawler
-from core.enumerator import SubdomainEnumerator
+from core.enumerator import SubdomainEnumerator, recon_summary
 from core.classifier import classify_all
 from core.inspector import inspect_app_files
 from utils.reporter import ReportGenerator
@@ -247,7 +247,9 @@ def print_recon_summary(recon: dict):
 
     for domain, results in recon.items():
         alive = [r for r in results if r.alive]
-        dead = [r for r in results if not r.alive]
+        dead = [r for r in results if not r.alive and r.classification == "dead"]
+        wildcard = [r for r in results if r.classification == "wildcard"]
+        unresolved = [r for r in results if r.classification == "unresolved"]
         total_alive += len(alive)
         total_found += len(results)
 
@@ -258,6 +260,8 @@ def print_recon_summary(recon: dict):
 
         print(f"\n  {domain} - {len(results)} found, {len(alive)} alive")
         print(f"    Sources: {source_line}")
+        if wildcard:
+            print(f"    Wildcard-filtered: {len(wildcard)}")
 
         if alive:
             print(f"\n    ALIVE:")
@@ -265,12 +269,26 @@ def print_recon_summary(recon: dict):
                 status = f"[{r.status_code}]" if r.status_code else ""
                 print(f"      {r.subdomain:<40} {r.ip:<16} {status}")
 
+        if wildcard:
+            print(f"\n    WILDCARD (resolved to a wildcard IP, not counted):")
+            for r in wildcard[:10]:
+                print(f"      {r.subdomain:<40} {r.ip}")
+            if len(wildcard) > 10:
+                print(f"      ... and {len(wildcard) - 10} more")
+
         if dead:
             print(f"\n    DEAD (resolved, no HTTP):")
             for r in dead[:10]:
                 print(f"      {r.subdomain:<40} {r.ip}")
             if len(dead) > 10:
                 print(f"      ... and {len(dead) - 10} more")
+
+        if unresolved:
+            print(f"\n    UNRESOLVED ({len(unresolved)}):")
+            for r in unresolved[:10]:
+                print(f"      {r.subdomain}")
+            if len(unresolved) > 10:
+                print(f"      ... and {len(unresolved) - 10} more")
 
     print(f"\n  Total: {total_found} subdomains, {total_alive} alive")
     print("=" * 60)
@@ -281,14 +299,7 @@ def save_recon_report(recon: dict, output_dir):
     reports_dir = Path(output_dir) / "reports"
     reports_dir.mkdir(parents=True, exist_ok=True)
 
-    data = {}
-    for domain, results in recon.items():
-        alive_count = sum(1 for r in results if r.alive)
-        data[domain] = {
-            "total": len(results),
-            "alive": alive_count,
-            "results": [r.to_dict() for r in results],
-        }
+    data = {domain: recon_summary(results) for domain, results in recon.items()}
 
     with open(reports_dir / "subdomains.json", "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
@@ -390,12 +401,7 @@ async def main():
     if recon_data:
         scan_results["subdomain_recon"] = {}
         for domain, results in recon_data.items():
-            alive_count = sum(1 for r in results if r.alive)
-            scan_results["subdomain_recon"][domain] = {
-                "total": len(results),
-                "alive": alive_count,
-                "results": [r.to_dict() for r in results],
-            }
+            scan_results["subdomain_recon"][domain] = recon_summary(results)
 
     try:
         print(f"\n  [{1 + stage_offset}/{stages}] Crawling and ripping JavaScript...")

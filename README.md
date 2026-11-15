@@ -225,9 +225,10 @@ Playwright drives a real headless Chromium. It follows links, intercepts network
 Before crawling, jsrip expands scope for the target's registrable domain:
 
 1. **Certificate transparency** — queries crt.sh for every cert issued to the domain (catches historical subdomains). If crt.sh is unreachable, it falls back to [Cert Spotter](https://sslmate.com/certspotter/) automatically. A crt.sh result of *zero* is treated as a real answer, so the fallback only fires on an actual failure and doesn't burn Cert Spotter's keyless rate limit.
-2. **DNS brute-force** — resolves a built-in ~7k-name wordlist (or `--wordlist FILE`) against the target. Wildcard DNS is detected up-front so a lazy `*.target.com` doesn't inflate the list.
+2. **DNS brute-force** — resolves a built-in ~7k-name wordlist (or `--wordlist FILE`) against the target. Wildcard DNS is detected up-front so a lazy `*.target.com` doesn't inflate the list; detection skips only the brute-force, never the CT query.
 3. **HTTP alive-check** — only hosts that respond get added to scope.
-4. **Merge** — resolved live hosts become additional seed URLs for the crawler.
+4. **Wildcard filtering** — the IPs seen from the wildcard probe are applied to every discovered host, including CT-sourced ones. A host resolving to a wildcard IP is never HTTP-probed, counted alive, or used as a crawl seed. It is still written to the recon report with `classification: "wildcard"` and a `filter_reason`, so `subdomains.json` distinguishes **alive**, **dead** (resolved, no HTTP), **wildcard** (resolved to the wildcard IP), and **unresolved** (CT name that no longer resolves — recorded only for wildcard domains).
+5. **Merge** — resolved live hosts become additional seed URLs for the crawler.
 
 ### Analysis — three layers
 

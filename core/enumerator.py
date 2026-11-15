@@ -28,10 +28,41 @@ class SubdomainResult:
     ip: str
     status_code: int
     alive: bool
-    source: str  # "crt.sh" | "bruteforce" | "both"
+    source: str  # "crt.sh" | "certspotter" | "bruteforce" | "both"
+    # How the host fared in the pipeline. Kept separate from `alive` because
+    # "resolved to a wildcard IP" and "did not resolve" both end up alive=False
+    # yet mean very different things to whoever reads subdomains.json.
+    classification: str = "dead"  # "alive" | "dead" | "wildcard" | "unresolved"
+    filter_reason: str = ""       # why it was not counted as an alive asset
+
+    ALIVE = "alive"
+    DEAD = "dead"
+    WILDCARD = "wildcard"
+    UNRESOLVED = "unresolved"
 
     def to_dict(self):
         return asdict(self)
+
+
+def recon_summary(results: list) -> dict:
+    """Per-domain view of an enumeration, shared by every JSON output.
+
+    `wildcard_filtered` and `unresolved` are explicit counts rather than
+    being folded into `alive`/`dead`: on a wildcard domain the reader has to
+    be able to tell "no HTTP" apart from "only answered because of the
+    wildcard", which is the whole point of keeping filtered records.
+    """
+    return {
+        "total": len(results),
+        "alive": sum(1 for r in results if r.alive),
+        "dead": sum(
+            1 for r in results if r.classification == SubdomainResult.DEAD),
+        "wildcard_filtered": sum(
+            1 for r in results if r.classification == SubdomainResult.WILDCARD),
+        "unresolved": sum(
+            1 for r in results if r.classification == SubdomainResult.UNRESOLVED),
+        "results": [r.to_dict() for r in results],
+    }
 
 
 class SubdomainEnumerator:
@@ -111,7 +142,13 @@ class SubdomainEnumerator:
 
     async def _detect_wildcard(self, domain: str) -> set:
         """Detect wildcard DNS by resolving random garbage subdomains.
-        Returns set of wildcard IPs, or empty set if no wildcard."""
+        Returns set of wildcard IPs, or empty set if no wildcard.
+
+        Every A record seen for a garbage name is collected, not just the
+        first: a wildcard backed by several addresses can hand a different
+        one back per lookup, and comparing against only one would let
+        invented hosts slip through the filter.
+        """
         if not aiodns:
             return set()
 
@@ -127,7 +164,7 @@ class SubdomainEnumerator:
                     resolver.query(fqdn, "A"), timeout=3
                 )
                 if resp:
-                    wildcard_ips.add(resp[0].host)
+                    wildcard_ips.update(r.host for r in resp)
             except Exception:
                 # If even one random sub fails to resolve, no wildcard
                 return set()
@@ -142,6 +179,8 @@ class SubdomainEnumerator:
             self.logger.info(f"  WILDCARD DNS detected for {domain} (IPs: {', '.join(wildcard_ips)}) - filtering results")
 
         # Phase 1: Passive - certificate transparency (crt.sh, then certspotter)
+        # Always runs: a wildcard only makes active brute-force worthless, it
+        # says nothing about names that were actually certified.
         crtsh_subs, passive_source = await self._query_passive_ct(domain)
         self.logger.info(f"  {passive_source}: {len(crtsh_subs)} subdomains")
 
@@ -164,22 +203,61 @@ class SubdomainEnumerator:
                 merged[sub] = "bruteforce"
 
         if not merged:
+            if wildcard_ips:
+                self.logger.info(
+                    f"  wildcard-filtered: 0 host(s) ignored for {domain} "
+                    f"(resolved to wildcard IPs)")
             return []
 
-        # Phase 3: DNS resolve any crt.sh-only subs that need IPs
+        # Phase 3: DNS resolve any CT-only subs that need IPs.
+        # A wildcard DNS makes every invented name resolve, so an IP from the
+        # wildcard set is evidence of the wildcard rather than of a real host:
+        # such names are recorded for auditability but never probed or counted
+        # as assets. Names that fail to resolve are likewise kept (CT found
+        # them, so they are worth reporting as such) instead of vanishing.
         resolved = {}
+        wildcard_filtered = []
+        unresolved = []
         for sub, source in merged.items():
             if sub in bruteforce_subs:
-                resolved[sub] = (bruteforce_subs[sub], source)
+                ips = [bruteforce_subs[sub]]
             else:
-                ip = await self._resolve_single(sub)
-                if ip:
-                    resolved[sub] = (ip, source)
+                ips = await self._resolve_ips(sub)
+
+            if not ips:
+                # Without a wildcard this is the historical behaviour: a CT
+                # name that no longer resolves is simply dropped. With a wildcard
+                # the domain's result keeps the record so "unresolved" stays
+                # distinguishable from "wildcard", which both fail alive checks.
+                if wildcard_ips:
+                    unresolved.append(SubdomainResult(
+                        sub, "", 0, False, source,
+                        SubdomainResult.UNRESOLVED,
+                        "DNS resolution failed",
+                    ))
+            elif any(ip in wildcard_ips for ip in ips):
+                # Any wildcard answer taints the host: a real multi-homed name
+                # that also lands on the wildcard address can't be told apart
+                # from an invented one, so it isn't an asset we can trust.
+                matched = next(ip for ip in ips if ip in wildcard_ips)
+                wildcard_filtered.append(SubdomainResult(
+                    sub, matched, 0, False, source,
+                    SubdomainResult.WILDCARD,
+                    f"resolved to wildcard IP {matched}",
+                ))
+            else:
+                resolved[sub] = (ips[0], source)
 
         self.logger.info(f"  resolved: {len(resolved)} total unique subdomains")
+        if wildcard_ips:
+            self.logger.info(
+                f"  wildcard-filtered: {len(wildcard_filtered)} host(s) "
+                f"ignored for {domain} (resolved to wildcard IPs)")
 
-        # Phase 4: HTTP alive check
+        # Phase 4: HTTP alive check (wildcard/unresolved hosts excluded)
         results = await self._check_alive(resolved)
+        results.extend(wildcard_filtered)
+        results.extend(unresolved)
         alive_count = sum(1 for r in results if r.alive)
         self.logger.info(f"  alive: {alive_count}/{len(results)}")
 
@@ -314,17 +392,27 @@ class SubdomainEnumerator:
 
     async def _resolve_single(self, subdomain: str) -> str:
         """Resolve a single subdomain to an IP."""
+        ips = await self._resolve_ips(subdomain)
+        return ips[0] if ips else ""
+
+    async def _resolve_ips(self, subdomain: str) -> list:
+        """Resolve every A record for a subdomain (empty list on failure).
+
+        The full set matters under wildcard DNS: round-robin wildcards hand
+        back different addresses per lookup, so judging a host by only its
+        first answer would let wildcard-backed names through the filter.
+        """
         if not aiodns:
-            return ""
+            return []
         resolver = self._get_resolver()
         try:
             resp = await asyncio.wait_for(
                 resolver.query(subdomain, "A"),
                 timeout=3
             )
-            return resp[0].host if resp else ""
+            return [r.host for r in (resp or [])]
         except Exception:
-            return ""
+            return []
 
     async def _check_alive(self, resolved: dict) -> list[SubdomainResult]:
         """HTTP probe resolved subdomains for liveness."""
@@ -333,7 +421,9 @@ class SubdomainEnumerator:
 
         if not session:
             return [
-                SubdomainResult(sub, ip, 0, False, source)
+                SubdomainResult(sub, ip, 0, False, source,
+                                SubdomainResult.DEAD,
+                                "HTTP probe unavailable")
                 for sub, (ip, source) in resolved.items()
             ]
 
@@ -349,10 +439,13 @@ class SubdomainEnumerator:
                             allow_redirects=True,
                             max_redirects=3,
                         ) as resp:
-                            return SubdomainResult(sub, ip, resp.status, True, source)
+                            return SubdomainResult(
+                                sub, ip, resp.status, True, source,
+                                SubdomainResult.ALIVE)
                     except Exception:
                         continue
-                return SubdomainResult(sub, ip, 0, False, source)
+                return SubdomainResult(sub, ip, 0, False, source,
+                                       SubdomainResult.DEAD)
 
         tasks = [
             asyncio.create_task(probe(sub, ip, source))

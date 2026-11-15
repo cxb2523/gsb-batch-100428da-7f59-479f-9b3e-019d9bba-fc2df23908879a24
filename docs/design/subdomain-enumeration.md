@@ -147,18 +147,37 @@ Printed before crawling begins:
   "target.com": {
     "total": 47,
     "alive": 31,
+    "wildcard_filtered": 9,
+    "unresolved": 0,
     "results": [
       {
         "subdomain": "api.target.com",
         "ip": "104.21.5.12",
         "status_code": 200,
         "alive": true,
-        "source": "both"
+        "source": "both",
+        "classification": "alive",
+        "filter_reason": ""
+      },
+      {
+        "subdomain": "random1.target.com",
+        "ip": "104.21.5.12",
+        "status_code": 0,
+        "alive": false,
+        "source": "crt.sh",
+        "classification": "wildcard",
+        "filter_reason": "resolved to wildcard IP 104.21.5.12"
       }
     ]
   }
 }
 ```
+
+Wildcard filtering applies to CT-discovered names as well as brute-force
+results: the wildcard probe's IP set is compared against every resolved
+host. A match means the name is never HTTP-probed or counted alive, but the
+record stays in the report — `classification` separates `alive` / `dead` /
+`wildcard` / `unresolved` so a wildcard domain's output is auditable.
 
 **`reports/report.json`** - main report gains a `"subdomain_recon"` top-level key containing the same data.
 
