@@ -1,8 +1,12 @@
 import contextlib
+import sys
 from typing import Tuple
 
 from rpapy.core.locator import LocatorImage, max_wait_attr
+from rpapy.core.locator_outcome import LocatorOutcome, is_locator_outcome
 from rpapy.core.prepare_text import prepare_text_for_pyautogui
+from rpapy.core.snipps.snippingtools import (ImageNotDisappearError,
+                                             ImageNotFoundError)
 
 ###########################################################
 _identifier_img = LocatorImage()
@@ -13,6 +17,44 @@ def toast_process_start_notifier():
     print('\n>>>> Robo.py iniciando processo...')
 
 
+def _report_locator_outcome(outcome) -> None:
+    """Emit a failed lookup so it is visible even when it is not raised."""
+    message = f'[RPAPY][LOCATOR FAILURE] {outcome}'
+    try:
+        print(message, file=sys.stderr)
+    except (UnicodeEncodeError, OSError):
+        print(message.encode('ascii', 'backslashreplace').decode('ascii'),
+              file=sys.stderr)
+
+
+def _raise_for_outcome(outcome) -> None:
+    """Raise the exception that matches the failed lookup outcome."""
+    message = str(outcome)
+    if getattr(outcome, 'kind', None) == LocatorOutcome.WAIT_VANISH_TIMEOUT:
+        error = ImageNotDisappearError(message)
+    elif getattr(outcome, 'kind', None) == LocatorOutcome.MAINTENANCE_ABORTED:
+        error = ImageNotFoundError(
+            f'{message} (maintenance re-capture was not completed)'
+        )
+    else:
+        error = ImageNotFoundError(message)
+    error.outcome = outcome
+    raise error
+
+
+def _handle_locator_outcome(outcome, ignore_error: bool):
+    """Stop the activity chain when the lookup failed.
+
+    The outcome is always reported.  When ``ignore_error`` is false the
+    failure is raised so the caller/robot run stops; when it is true the
+    outcome object is returned to the caller instead of a coordinate.
+    """
+    _report_locator_outcome(outcome)
+    if not ignore_error:
+        _raise_for_outcome(outcome)
+    return outcome
+
+
 def _get_ui_element(x: int, y: int,*,attr_name: str, backend: 'Desktop', wait_attr: float):
     from pywinauto import Desktop
     UI_element = Desktop(backend=backend).from_point(x, y)
@@ -21,7 +63,9 @@ def _get_ui_element(x: int, y: int,*,attr_name: str, backend: 'Desktop', wait_at
 
 
 def wait_element_vision(*args, **kwargs):
-    get_element_vision(*args, **kwargs)
+    # Returns the coordinate on success or the LocatorOutcome on failure, so
+    # callers can tell the two apart instead of guessing a return value.
+    return get_element_vision(*args, **kwargs)
 
 
 def get_element_vision(image_name: str, *args,        
@@ -52,16 +96,26 @@ def get_element_vision(image_name: str, *args,
     identifier_img = identifier_img or _identifier_img
     
     coordinate = identifier_img(
-        image_name, 
-        max_wait=max_wait, 
+        image_name,
+        max_wait=max_wait,
         confidence=confidence,
         wait_vanish=wait_vanish,
-        interval=interval, 
-        deslocar_x=move_x, 
+        interval=interval,
+        deslocar_x=move_x,
         deslocar_y=move_y,
         ignore_error=ignore_error
     )
-    
+
+    # A failed lookup returns a LocatorOutcome instead of a coordinate.  Never
+    # use it as a coordinate: report it and stop before clicking/typing.
+    if is_locator_outcome(coordinate):
+        return _handle_locator_outcome(coordinate, ignore_error)
+
+    if coordinate is None:
+        # wait_vanish=True succeeded: the image is gone, so there is no
+        # element left to click or type into.
+        return None
+
     if attr_name is None:
         return coordinate
 
@@ -320,12 +374,16 @@ def triple_click_coord(x: int, y: int,
     return get_element_coord(x, y, button=button, attr_name=attr_name, backend=backend, before=before, after=after, delay=delay, wait_attr=wait_attr)
 
 
-def get_text_ocr_vision(image_name, region:Tuple[int], *args, identifier_img: LocatorImage=None, lang: str='por', **kwargs) -> str:
+def get_text_ocr_vision(image_name, region:Tuple[int], *args, identifier_img: LocatorImage=None, lang: str='por', **kwargs):
     import pytesseract as ocr
     from pyautogui import screenshot
 
     coordinate = wait_element_vision(image_name,identifier_img=identifier_img, **kwargs)
-    
+
+    # When the image was not located, do not read an unrelated screen region.
+    if is_locator_outcome(coordinate):
+        return coordinate
+
     image_region = screenshot(region=region)
     ocr_text_result = ocr.image_to_string(image_region, lang=lang)
     return ocr_text_result

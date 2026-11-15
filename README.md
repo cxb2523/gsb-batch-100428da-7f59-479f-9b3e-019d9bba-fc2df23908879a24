@@ -90,6 +90,45 @@ robot -d log tasks
 
 - select the option no in the dialog box to choose the maintenance mode off.
 
+## Locating images on screen
+
+`LocatorImage.__call__` returns the ``(x, y)`` coordinate of the element on
+success. When the element cannot be located it returns a
+`rpapy.core.locator_outcome.LocatorOutcome` instead of raising, so the caller
+can inspect what happened:
+
+| `outcome.kind` | Meaning |
+| --- | --- |
+| `timeout_not_found` | The image did not appear before `max_wait` expired. |
+| `wait_vanish_timeout` | `wait_vanish=True` and the image was still on screen when `max_wait` expired. |
+| `maintenance_aborted` | Maintenance mode asked for a new capture, but the user cancelled/did not finish. |
+
+Every outcome carries `image_name`, `image_path` (the template that was used),
+`elapsed_seconds` (the time actually spent in the current wait — the timer is
+reset after a maintenance re-capture) and, for a plain timeout, the path of the
+diagnostic screenshot in `error_image_path`.
+
+```python
+from rpapy.core.locator import LocatorImage
+from rpapy.core.locator_outcome import is_locator_outcome
+
+locator = LocatorImage()
+result = locator('btn_salvar', max_wait=10)
+if is_locator_outcome(result):
+    print(result.kind, result.image_name, result.elapsed_seconds, result.image_path)
+else:
+    pyautogui.click(*result)
+```
+
+- `ignore_error=True` never raises; a failed lookup is returned as an outcome.
+- `raise_on_error=True` restores the old behaviour (`ImageNotFoundError` /
+  `ImageNotDisappearError`) for callers that prefer exceptions.
+
+`get_element_vision` (and the `*_vision` helpers built on it) detect an
+outcome and stop before clicking/typing with it: the failure is printed to
+stderr and raised unless `ignore_error=True`, in which case the outcome is
+returned to the caller.
+
 ## Credits
 
 Under the hood, RPAPY is built on some of the greatest open source libraries. Within RPAPY, the following libraries are currently included:
