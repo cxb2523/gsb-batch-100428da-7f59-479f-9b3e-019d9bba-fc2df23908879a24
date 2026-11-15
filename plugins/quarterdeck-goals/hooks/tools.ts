@@ -1,0 +1,566 @@
+/**
+ * Tools Claude can call (listed as mcp__quarterdeck-goals__<name>) and the
+ * slash commands. Reading is free; anything that changes a goal on Claude's
+ * behalf asks the person first.
+ */
+import type { EngineInterface } from 'claude-code'
+
+import type { GoalCard } from '../types'
+import { addTodo, answerItem, approve, createGoal, fetchOverview, editTodo, fetchTodos, reject, runNow, setGoalStatus, setSchedule, setTodo, updateGoal } from './api'
+import { ago, clip, describe, NEW_GOAL_MODEL, newGoalModelText, describeGoalChanges, editInstructions, fallbackTitle, findGoal, noMatch, parseSchedule, SCHEDULE_USAGE, scheduleLabel, soundsEventDriven, splitGoalArgs, WATCH_FALLBACK, watchSetupPrompt, summarize, type GoalChanges, toCard } from './model'
+import { kick } from './runner'
+import { sendToChat } from './chat'
+import { pickSchedule, readSchedule, suggestSchedule } from './schedule'
+import { describeTodo, describeTodos, findTodo } from './todos'
+import { act, refresh, refreshTodos } from './sync'
+import { phoneHint, readLastAlert, readLastPoll, readTrace } from './alerts'
+import { CV_FIND, CV_QUESTION, CV_SKIP, cvInstructions, FIRST_CHOICES, MORE, TEMPLATES } from './templates'
+
+type Engine = EngineInterface
+
+/** How much of a to-do the todos overview shows; the rest is one call away (item). */
+const TODO_LINE = 120
+
+const GOAL = { type: 'string', description: 'Goal name (or a unique part of it) or goal id.' }
+const ITEM = { type: 'string', description: 'The item id, as goals_status lists it.' }
+
+export const TOOLS = [
+  {
+    name: 'goals_status',
+    description: "Lists the person's Quarterdeck goals (persistent objectives run by scheduled agents): what waits for their approval (with item ids), whether a run is going, the last run and health. Read-only.",
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'goal_detail',
+    description: "One Quarterdeck goal in detail: objective, proposals, open items, recent runs with summaries, and its memory. Read-only.",
+    inputSchema: { type: 'object', properties: { goal: GOAL }, required: ['goal'] },
+  },
+  {
+    name: 'approve_item',
+    description: 'Approves a Quarterdeck proposal so the goal\'s next run carries it out. The person is asked to confirm first.',
+    inputSchema: { type: 'object', properties: { goal: GOAL, item_id: ITEM }, required: ['goal', 'item_id'] },
+  },
+  {
+    name: 'reject_item',
+    description: "Rejects a Quarterdeck proposal with feedback; the feedback is saved to the goal's memory so later runs learn from it. The person is asked to confirm first.",
+    inputSchema: { type: 'object', properties: { goal: GOAL, item_id: ITEM, feedback: { type: 'string', description: 'What should change.' } }, required: ['goal', 'item_id', 'feedback'] },
+  },
+  {
+    name: 'answer_item',
+    description: "Answers a question a Quarterdeck goal's run asked the person (an item marked as a question), with the person's own words. Only when they've given the answer.",
+    inputSchema: { type: 'object', properties: { goal: GOAL, item_id: ITEM, answer: { type: 'string', description: "The person's answer." } }, required: ['goal', 'item_id', 'answer'] },
+  },
+  {
+    name: 'new_goal',
+    description: "Creates a Quarterdeck goal (a standing objective a scheduled agent works on) in this project's directory, as /goal-new does: a small model suggests how often it runs and which model its runs use, and the person picks the schedule; dismissing that question creates nothing. Every action category starts at propose, so its runs ask before acting. Use it when the person asks for a goal; then add standing instructions, tool rules or a watch with update_goal (which asks them again).",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        objective: { type: 'string', description: 'What the goal keeps true, in their words, e.g. keep my inbox under 20 unread' },
+        name: { type: 'string', description: 'A short name, 2-5 words; left out, one is suggested' },
+      },
+      required: ['objective'],
+    },
+  },
+  {
+    name: 'run_goal',
+    description: 'Queues a run of a Quarterdeck goal now. The person is asked to confirm first.',
+    inputSchema: { type: 'object', properties: { goal: GOAL }, required: ['goal'] },
+  },
+  {
+    name: 'todos',
+    description: "The person's to-do lists for this project, with each open to-do's id, long ones cut to one line. Read-only. When they mean one to-do (\"to-do 31\", \"1.37\"), pass item to get just that one in full rather than every list; pass list for one list. Use it when they ask what's on their list, or refer to it after a compaction.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        item: { type: 'string', description: 'One to-do id, e.g. 31 or 1.4: answers with only that to-do, in full' },
+        list: { type: 'string', description: 'A list name or id: only that list (with item, when more than one list has that id)' },
+        include_done: { type: 'boolean', description: 'Also list ticked-off to-dos' },
+      },
+    },
+  },
+  {
+    name: 'add_todo',
+    description: "Adds a to-do to the person's list for this project, where it survives the conversation and shows in the Goals pane. Add what they ask you to; when an idea is clearly being put off for later, offer to add it rather than adding it unasked.",
+    inputSchema: {
+      type: 'object',
+      properties: { text: { type: 'string', description: 'The to-do, short and in their words' }, list: { type: 'string', description: 'A list name or id; left out, the "To do" list' } },
+      required: ['text'],
+    },
+  },
+  {
+    name: 'complete_todo',
+    description: "Ticks a to-do off the person's list. Only when they say it's done or ask you to.",
+    inputSchema: {
+      type: 'object',
+      properties: { item: { type: 'string', description: 'The to-do id from the todos tool, e.g. 3 or 1.4' }, list: { type: 'string', description: 'A list name or id, when more than one list has that id' } },
+      required: ['item'],
+    },
+  },
+  {
+    name: 'edit_todo',
+    description: "Rewords a to-do on the person's list, or changes its notes (give text, notes or both). Only when they ask you to; a changed wording's old one is shown to them so they can put it back.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        item: { type: 'string', description: 'The to-do id from the todos tool, e.g. 3 or 1.4' },
+        text: { type: 'string', description: 'The new wording, short and in their words; left out, the wording stays as it is' },
+        notes: { type: 'string', description: 'New notes; left out, the notes stay as they are' },
+        list: { type: 'string', description: 'A list name or id, when more than one list has that id' },
+      },
+      required: ['item'],
+    },
+  },
+  {
+    name: 'update_goal',
+    description: "Changes a Quarterdeck goal: name, objective, standing instructions, autonomy per action category (off / propose / auto; null puts one back to the default, propose), merging one action category into another, tool rules (tool name pattern → category; null removes one), memory to add or forget (ids from goal_detail), watches, the model its runs use, or pause / resume. A watch starts a run when something happens (a new issue, a feed entry, a file, an email): it is a shell command, run every few minutes in the goal's directory, that prints one line per current item, or a read-only connector tool called every few minutes; an item not there before starts a run, which is told the new ones. The answer says whether each new watch's command worked. Try the command or the tool yourself first; the goal-watches skill has recipes. The person sees each change and is asked to confirm first. For the schedule use set_schedule.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        goal: GOAL,
+        name: { type: 'string' },
+        objective: { type: 'string' },
+        instructions: { type: 'string', description: 'The new standing instructions in full; "" clears them. To change part of them, use instructions_edits instead' },
+        instructions_edits: {
+          type: 'array',
+          description: 'Changes to part of the standing instructions, like the Edit tool: each replaces old (copied exactly from goal_detail, there exactly once) with new ("" removes it), in order. The person sees just these. Not with instructions',
+          items: { type: 'object', properties: { old: { type: 'string' }, new: { type: 'string' } }, required: ['old', 'new'] },
+        },
+        autonomy: { type: 'object', additionalProperties: { type: ['string', 'null'], enum: ['off', 'propose', 'auto', null] } },
+        tool_map: { type: 'object', additionalProperties: { type: ['string', 'null'] } },
+        merge_categories: {
+          type: 'object',
+          additionalProperties: { type: 'string' },
+          description: "Old action category → the category to merge it into, when runs used two names for one kind of action: past items, the autonomy setting and tool rules take the new name, so earlier approvals count together toward Switch to auto. The merged category keeps its own autonomy if it has one",
+        },
+        add_memory: {
+          type: 'array',
+          items: { type: 'object', properties: { kind: { type: 'string', enum: ['fact', 'rule', 'preference'] }, text: { type: 'string' }, pinned: { type: 'boolean' } }, required: ['kind', 'text'] },
+        },
+        forget_memory: { type: 'array', items: { type: 'string' }, description: 'Memory ids' },
+        watches: {
+          type: 'object',
+          description: 'Watch name → the watch; null removes it. Giving an existing name changes that watch',
+          additionalProperties: {
+            type: ['object', 'null'],
+            description: 'Give a command or a tool, one of them',
+            properties: {
+              command: { type: 'string', description: 'Prints one line per current item and exits 0. Runs under cmd.exe on Windows and sh elsewhere, so quote with double quotes' },
+              tool: { type: 'string', description: 'For what only a connector reaches (mail, calendar, files): the full name of a tool that only reads, e.g. a mail search. The session running goals calls it with nobody asked' },
+              input: { type: 'object', description: "The tool's arguments. Ask for ids only, and few results" },
+              match: { type: 'string', description: 'A regular expression over the tool\'s answer; each match (its first group) is one item. Left out: every "id" in a JSON answer' },
+              every_minutes: { type: 'number', description: 'How often to check (default 5, at least 1)' },
+              fires: { type: 'string', enum: ['new', 'change'], description: "'new' (default): a line never seen before starts a run. 'change': for a state (git status, a health URL): a run starts when the output differs from the last check" },
+            },
+          },
+        },
+        status: { type: 'string', enum: ['active', 'paused'] },
+        model: { type: ['string', 'null'], description: "The model its runs use: haiku, sonnet, opus or a full model id; null: the model of the session that starts each run. Suggest a larger one when runs miss things or time out, a smaller one for routine work" },
+      },
+      required: ['goal'],
+    },
+  },
+  {
+    name: 'set_schedule',
+    description: 'Sets when a Quarterdeck goal runs on its own, or "off" for on demand only. The person is asked to confirm first.',
+    inputSchema: {
+      type: 'object',
+      properties: { goal: GOAL, schedule: { type: 'string', description: `One of: ${SCHEDULE_USAGE}` } },
+      required: ['goal', 'schedule'],
+    },
+  },
+] as const
+
+export type ToolName = (typeof TOOLS)[number]['name']
+
+export async function registerTools($: Engine): Promise<void> {
+  for (const tool of TOOLS) {
+    try {
+      await $.tool.register({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema })
+    } catch {
+      // The session isn't bound yet; the next start tries again.
+    }
+  }
+}
+
+type Resolved = { goal: GoalCard } | { error: string }
+
+async function resolveGoal($: Engine, query: unknown): Promise<Resolved> {
+  const s = await refresh($)
+  if (!s.reachable) return { error: `Quarterdeck isn't connected${s.error ? ` (${s.error})` : ''}. Check the quarterdeck MCP server with /mcp.` }
+  const found = findGoal(s.goals, typeof query === 'string' ? query : '')
+  return 'goal' in found ? found : { error: noMatch(s.goals, String(query ?? ''), found.matches) }
+}
+
+/** The goal with its full detail, fetched for it alone. */
+/** A goal's full detail, with its instructions uncut: goal_detail shows them, and update_goal checks instructions_edits against them. */
+async function withDetail($: Engine, goal: GoalCard): Promise<GoalCard> {
+  const res = await fetchOverview($, null, [goal.id], true)
+  const full = res.changed ? res.goals.find((g) => g.id === goal.id) : undefined
+  return full ? toCard(full) : goal
+}
+
+/** Asks the person; a dismissed dialog counts as no. */
+async function confirmWith($: Engine, question: string, yes: string): Promise<boolean> {
+  try {
+    return (await $.ui.ask(question, [yes, 'Cancel'])) === yes
+  } catch {
+    return false
+  }
+}
+
+/** The text a tool call answers with. */
+export async function runTool($: Engine, name: ToolName, input: Record<string, unknown>): Promise<{ text: string; isError: boolean }> {
+  const now = await $.clock.now()
+  const fail = (text: string) => ({ text, isError: true })
+
+  if (name === 'todos' || name === 'add_todo' || name === 'complete_todo' || name === 'edit_todo') return todoTool($, name, input)
+
+  if (name === 'goals_status') {
+    // Read the alert record first: the refresh below can raise an alert itself
+    const lastAlert = await readLastAlert($)
+    const lastPoll = await readLastPoll($)
+    const traced = await readTrace($)
+    const s = await refresh($)
+    if (!s.reachable) return fail(`Quarterdeck isn't connected${s.error ? ` (${s.error})` : ''}. Check the quarterdeck MCP server with /mcp.`)
+    const at = (ms: number) => `${new Date(ms).toISOString()}, ${ago(new Date(ms).toISOString(), now)}`
+    const alert = lastAlert
+      ? `\n\nLast alert (${at(lastAlert.at)}): ${lastAlert.text}. Notification: ${lastAlert.notify}. Phone: ${lastAlert.push}.`
+      : ''
+    const poll = lastPoll ? `\nLast background poll: ${at(lastPoll)}.` : '\nNo background poll recorded.'
+    const checks = traced.length ? `\nAlert checks (oldest first):\n${traced.map((l) => `- ${l}`).join('\n')}` : ''
+    return { text: summarize(s.goals, now) + alert + poll + checks, isError: false }
+  }
+
+  if (name === 'new_goal') {
+    const objective = String(input.objective ?? '').trim()
+    if (!objective) return fail('An objective is needed.')
+    const given = typeof input.name === 'string' && input.name.trim() ? input.name.trim() : null
+    const made = await createNewGoal($, given, objective, true)
+    return made.created ? { text: made.text, isError: false } : fail(made.text)
+  }
+
+  const found = await resolveGoal($, input.goal)
+  if ('error' in found) return fail(found.error)
+  let { goal } = found
+  // goal_detail and update_goal read the goal's full detail, which the overview gives only on request,
+  // and always fetch it: an expanded goal's detail has its instructions cut
+  if (name === 'goal_detail' || name === 'update_goal') goal = await withDetail($, goal)
+
+  if (name === 'goal_detail') return { text: describe(goal, now), isError: false }
+
+  if (name === 'update_goal') {
+    // Only the change fields: the call also carries the engine's own (tool, tool_use_id)
+    const keys = ['name', 'objective', 'instructions', 'instructions_edits', 'autonomy', 'tool_map', 'merge_categories', 'add_memory', 'forget_memory', 'watches', 'status', 'model'] as const
+    const changes = Object.fromEntries(keys.filter((k) => input[k] !== undefined).map((k) => [k, input[k]])) as GoalChanges
+    if (changes.instructions_edits !== undefined) {
+      if (!Array.isArray(changes.instructions_edits)) return fail('instructions_edits is a list of {old, new}.')
+      if (changes.instructions !== undefined) return fail('Give the instructions in full or as edits, not both.')
+      const edited = editInstructions(goal.instructions, changes.instructions_edits)
+      if ('error' in edited) return fail(edited.error)
+      if (edited.text === goal.instructions) delete changes.instructions_edits
+    }
+    const lines = describeGoalChanges(goal, changes)
+    if (lines.length === 0) return fail(`Nothing to change in ${goal.name}: give at least one new value.`)
+    if (!(await confirmWith($, `Change the goal "${goal.name}"?\n${lines.map((l) => `• ${l}`).join('\n')}`, 'Apply changes'))) return fail('The person declined; the goal is unchanged.')
+    let changed: string[] = []
+    let watches: { name: string; result: string }[] = []
+    const ok = await act($, `update:${goal.id}`, 'change the goal', async () => {
+      ({ changed, watches } = await updateGoal($, goal.id, changes))
+    })
+    if (!ok) return fail("The change didn't go through; see the Goals pane.")
+    // A new tool watch is first called by the session running goals: if that is this one, now
+    if (watches.length) void kick($).catch(() => {})
+    const checks = watches.map((w) => ` Watch "${w.name}": ${w.result}.`).join('')
+    return { text: `Changed ${goal.name}: ${changed.join('; ') || 'nothing (already so)'}.${checks}`, isError: false }
+  }
+
+  if (name === 'set_schedule') {
+    const parsed = await readSchedule($, String(input.schedule ?? ''))
+    if ('error' in parsed) return fail(parsed.error)
+    const label = parsed.oneOff ? 'once (one-off)' : scheduleLabel(parsed.schedule)
+    if (!(await confirmWith($, `Run the goal "${goal.name}" ${label}?`, 'Set schedule'))) return fail('The person declined; the schedule is unchanged.')
+    return { text: await applySchedule($, goal, parsed.schedule, parsed.oneOff), isError: false }
+  }
+
+  if (name === 'run_goal') {
+    if (goal.openRun) return fail(`${goal.name} already has a run ${goal.openRun.status}.`)
+    if (!(await confirmWith($, `Start a run of the goal "${goal.name}" now?`, 'Run it'))) return fail('The person declined; nothing was started.')
+    return (await act($, `run:${goal.id}`, 'start the run', () => runNow($, goal.id)))
+      ? { text: `Queued a run of ${goal.name}.`, isError: false }
+      : fail(`The run didn't start.`)
+  }
+
+  const item = goal.needsYou.find((i) => i.id === String(input.item_id ?? ''))
+  if (!item) {
+    const waiting = goal.needsYou.map((i) => `${i.id} (${i.title})`).join(', ')
+    return fail(`No proposal ${String(input.item_id)} waits in ${goal.name}.${waiting ? ` Waiting: ${waiting}.` : ' Nothing is waiting.'}`)
+  }
+  const key = `${goal.id}/${item.id}`
+
+  if (name === 'answer_item') {
+    const text = String(input.answer ?? '').trim()
+    if (!text) return fail('An answer is needed.')
+    if (!item.asksPerson) return fail(`"${item.title}" is a proposal, not a question: approve or reject it.`)
+    return (await act($, `answer:${key}`, 'answer', () => answerItem($, goal.id, item.id, text)))
+      ? { text: `Answered "${item.title}"; ${goal.name}'s next run carries on with it (queued now).`, isError: false }
+      : fail('The answer failed; see the Goals pane.')
+  }
+
+  if (name === 'approve_item') {
+    const what = `"${item.title}"${item.summary ? ` (${item.summary})` : ''}`
+    if (!(await confirmWith($, `Approve ${what} for the goal "${goal.name}"?`, 'Approve'))) return fail('The person declined; nothing was approved.')
+    return (await act($, `approve:${key}`, 'approve', () => approve($, goal.id, item.id)))
+      ? { text: `Approved "${item.title}". ${goal.name}'s next run will carry it out.`, isError: false }
+      : fail('The approval failed; see the Goals pane.')
+  }
+
+  const feedback = String(input.feedback ?? '').trim()
+  if (!feedback) return fail('Feedback is required to reject a proposal.')
+  if (!(await confirmWith($, `Reject "${item.title}" for "${goal.name}" with this feedback: "${feedback}"?`, 'Reject'))) return fail('The person declined; nothing was rejected.')
+  return (await act($, `reject:${key}`, 'reject', () => reject($, goal.id, item.id, feedback)))
+    ? { text: `Rejected "${item.title}"; the feedback is saved to ${goal.name}'s memory.`, isError: false }
+    : fail('The rejection failed; see the Goals pane.')
+}
+
+export const COMMANDS = [
+  { name: 'goals', description: 'Show Quarterdeck goals in a pane' },
+  { name: 'goal-run', description: 'Run a Quarterdeck goal now', argumentHint: '<goal>' },
+  { name: 'goal-new', description: 'Create a Quarterdeck goal in this directory (it suggests a title and a schedule)', argumentHint: '<objective> | <name>: <objective>' },
+  { name: 'goal-pause', description: 'Pause a Quarterdeck goal', argumentHint: '<goal>' },
+  { name: 'goal-resume', description: 'Resume a paused Quarterdeck goal', argumentHint: '<goal>' },
+  { name: 'todo', description: 'Your to-do list for this project: /todo <text> adds, /todo done <id> ticks off, /todo shows it', argumentHint: '<text> | done <id>' },
+  { name: 'goal-schedule', description: 'Set when a Quarterdeck goal runs on its own', argumentHint: '<goal> every 6h | cron ... | off' },
+] as const
+
+export async function registerCommands($: Engine): Promise<void> {
+  for (const c of COMMANDS) await $.command.register(c)
+}
+
+/** /goal-run, /goal-pause, /goal-resume: the person typed it, so no confirm. */
+export async function goalCommand($: Engine, command: 'goal-run' | 'goal-pause' | 'goal-resume', args: string): Promise<string> {
+  if (!args.trim()) {
+    const s = await refresh($)
+    return `Usage: /${command} <goal>. Goals: ${s.goals.map((g) => g.name).join(', ') || 'none'}.`
+  }
+  const found = await resolveGoal($, args)
+  if ('error' in found) return found.error
+  const { goal } = found
+  const ok = (done: boolean, text: string) => (done ? text : `That didn't work; see the Goals pane.`)
+
+  if (command === 'goal-run') {
+    if (goal.openRun) return `${goal.name} already has a run ${goal.openRun.status}.`
+    return ok(await act($, `run:${goal.id}`, 'start the run', () => runNow($, goal.id)), `Queued a run of ${goal.name}.`)
+  }
+  const status = command === 'goal-pause' ? 'paused' : 'active'
+  if (goal.status === status) return `${goal.name} is already ${status}.`
+  return ok(await act($, `${command}:${goal.id}`, `${command === 'goal-pause' ? 'pause' : 'resume'} the goal`, () => setGoalStatus($, goal.id, status)), `${goal.name} is ${status === 'paused' ? 'paused' : 'active again'}.`)
+}
+
+/**
+ * /goal-new alone: offers the ready-made goals, or takes one typed under Other.
+ * A template's own question (the job scan's criteria) completes it.
+ */
+async function newFromTemplate($: Engine): Promise<string> {
+  let picked: string
+  try {
+    // A question holds 4 choices: the first few templates, then More… for the rest
+    const first = TEMPLATES.slice(0, FIRST_CHOICES).map((t) => t.label)
+    const rest = TEMPLATES.slice(FIRST_CHOICES).map((t) => t.label)
+    picked = await $.ui.ask("What should I look after? Pick a ready-made goal, or type your own under Other (e.g. keep my inbox under 20 unread).", rest.length ? [...first, MORE] : first)
+    if (picked === MORE) picked = await $.ui.ask('More ready-made goals: pick one, or type your own under Other.', rest.length > 1 ? rest : [...rest, 'Cancel'])
+  } catch {
+    return 'No goal created.'
+  }
+  const template = TEMPLATES.find((t) => t.label === picked)
+  if (!template) return picked.trim() && !/^cancel$/i.test(picked.trim()) ? newGoal($, picked) : 'No goal created.'
+  let instructions = template.instructions
+  let answer = ''
+  if (template.ask) {
+    try {
+      answer = await $.ui.ask(template.ask.question, [template.ask.later, 'Cancel'])
+    } catch {
+      return 'No goal created.'
+    }
+    if (answer === 'Cancel' || !answer.trim()) return 'No goal created.'
+    let first: string
+    try {
+      first = answer === template.ask.later ? template.ask.laterText : template.ask.fill(answer.trim())
+    } catch (err) {
+      return `No goal created: ${err instanceof Error ? err.message : String(err)}.`
+    }
+    instructions = [first, template.instructions].filter(Boolean).join(' ')
+  }
+  if (template.cv) {
+    let answer = CV_SKIP
+    try {
+      answer = await $.ui.ask(CV_QUESTION, [CV_FIND, CV_SKIP])
+    } catch {
+      // dismissed: no CV
+    }
+    const cv = /^cancel$/i.test(answer.trim()) ? '' : cvInstructions(answer)
+    if (cv) instructions = `${instructions} ${cv}`
+  }
+  const cwd = await $.session.root()
+  let created
+  try {
+    const watches = template.watches?.(answer)
+    created = await createGoal($, {
+      name: template.name, objective: template.objective, working_dir: cwd, schedule: template.schedule, model: template.model,
+      instructions, autonomy: template.autonomy, tool_map: template.tool_map, ...(watches && { watches }),
+    })
+    // With no schedule nothing is due: the first run (setting up, catching up) starts now
+    if (!template.schedule) await runNow($, created.id)
+  } catch (err) {
+    return `Couldn't create the goal: ${err instanceof Error ? err.message : String(err)}`
+  }
+  await kick($)
+  await refresh($)
+  const checks = (created.watches ?? []).map((w) => ` Watch "${w.name}": ${w.result}.`).join('')
+  const when = template.schedule
+    ? `running ${scheduleLabel(template.schedule)}`
+    : `with no schedule: a run starts when its watch sees ${orList((created.watches ?? []).map((w) => w.name)) || 'something new'}`
+  return `Created the goal "${template.name}" in ${cwd}, ${when}; the first run starts within a minute.${checks}${newGoalModelText(template.model, template.modelReason)} It needs ${template.needs}. It asks before it acts: approve or reject its proposals under Needs you. Change anything by discussing the goal.${await phoneHint($)}`
+}
+
+/** "a", "a or b", "a, b or c". */
+function orList(names: string[]): string {
+  return names.length < 3 ? names.join(' or ') : `${names.slice(0, -1).join(', ')} or ${names[names.length - 1]}`
+}
+
+/** How long after /goal-new answers its watch prompt goes into the conversation. */
+const WATCH_PROMPT_DELAY_MS = 500
+
+/**
+ * /goal-new <objective> (a title is suggested) or /goal-new <name>: <objective>.
+ * Asks how often it runs, with a suggestion first. Alone, it offers templates.
+ */
+export async function newGoal($: Engine, args: string): Promise<string> {
+  const { name: given, objective } = splitGoalArgs(args)
+  if (!objective) return newFromTemplate($)
+  return (await createNewGoal($, given, objective, false)).text
+}
+
+/**
+ * /goal-new <objective> and the new_goal tool. For Claude (`byClaude`), the
+ * schedule question says Claude asked and is the person's yes: dismissing it
+ * creates nothing. The watch set-up comes back in the answer rather than as a prompt.
+ */
+async function createNewGoal($: Engine, given: string | null, objective: string, byClaude: boolean): Promise<{ created: boolean; text: string }> {
+  const cwd = await $.session.root()
+  const suggestion = await suggestSchedule($, given, objective)
+  const name = given ?? suggestion.title ?? fallbackTitle(objective)
+  const intro = byClaude ? `Claude asks to create the goal "${name}" in ${cwd}: ${objective}. Dismiss this to create nothing. ` : ''
+  const choice = await pickSchedule($, name, suggestion, { offerWatch: true, cancelable: byClaude, intro })
+  if (!choice) return { created: false, text: 'The person dismissed the question; no goal was created.' }
+  const model = suggestion.model ?? NEW_GOAL_MODEL
+  try {
+    await createGoal($, { name, objective, working_dir: cwd, schedule: choice.schedule, one_off: choice.oneOff, model })
+  } catch (err) {
+    return { created: false, text: `Couldn't create the goal: ${err instanceof Error ? err.message : String(err)}` }
+  }
+  await kick($) // a new interval or a one-off has a run due now
+  await refresh($)
+  const done = (text: string) => ({ created: true, text })
+  const where = `in ${cwd}`
+  const runsOn = newGoalModelText(model, suggestion.model && suggestion.modelReason)
+  if (choice.key === 'watch') {
+    const setUp = watchSetupPrompt(name, suggestion.watch ?? WATCH_FALLBACK)
+    const created = `Created the goal "${name}" ${where}, running daily as a backstop; the first run starts within a minute.`
+    if (byClaude) return done(`${created}${runsOn} The person chose to start it when something happens. Next: ${setUp}`)
+    // Writing and testing the watch is Claude's job (the person confirms it in update_goal). A command can't
+    // submit a prompt while it runs, so it goes once the command has answered.
+    $.clock.after(WATCH_PROMPT_DELAY_MS, () => void sendToChat($, setUp, `set up a watch for the goal "${name}"`)
+      .catch(() => $.ui.toast(`Ask Claude to add a watch to "${name}".`)))
+    return done(`${created} Claude sets up its watch next: you confirm the command before it is set.${runsOn}${await phoneHint($)}`)
+  }
+  if (choice.oneOff) return done(`Created the one-off goal "${name}" ${where}. It runs now and moves to Done when it finishes.${runsOn}${await phoneHint($)}`)
+  // A goal about things happening can also start when they do, not only on its timer
+  const watch = soundsEventDriven(objective) ? ` To start a run as soon as something happens, not only on a timer, ask Claude to add a watch to "${name}".` : ''
+  if (!choice.schedule) return done(`Created the goal "${name}" ${where}. It runs when you start it (/goal-run); give it a schedule any time with /goal-schedule.${runsOn}${watch}${await phoneHint($)}`)
+  return done(`Created the goal "${name}" ${where}, running ${scheduleLabel(choice.schedule)}; the first run starts within a minute.${runsOn}${watch}${await phoneHint($)}`)
+}
+
+/** Sets the schedule through the pane's action wrapper and says what happens next. */
+async function applySchedule($: Engine, goal: GoalCard, schedule: Parameters<typeof setSchedule>[2], oneOff = false): Promise<string> {
+  let next: string | null = null
+  const done = await act($, `schedule:${goal.id}`, 'set the schedule', async () => {
+    next = (await setSchedule($, goal.id, schedule, oneOff)).next_run_at
+  })
+  if (!done) return "That didn't work; see the Goals pane."
+  if (oneOff) return `${goal.name} is a one-off now: run it with /goal-run; it moves to Done when a run leaves nothing open.`
+  if (!schedule) return `${goal.name} now runs only on demand (/goal-run).`
+  const now = await $.clock.now()
+  const when = !next || Date.parse(next) <= now + 60_000 ? 'the next run starts within a minute' : `next run ${ago(next, now)}`
+  return `${goal.name} runs ${scheduleLabel(schedule)}; ${when}.`
+}
+
+/** /goal-schedule <goal> <every …|cron …|off>: the person typed it, so no confirm. */
+export async function scheduleCommand($: Engine, args: string): Promise<string> {
+  const usage = `Usage: /goal-schedule <goal> <when>, e.g. /goal-schedule inbox every 6h, or 30d, weekly, cron 0 9 * * 1-5, off (${SCHEDULE_USAGE})`
+  const words = args.trim().split(/\s+/).filter(Boolean)
+  if (words.length < 2) return usage
+  // The goal is the longest leading run of words that names one; the rest is when
+  let goal: GoalCard | null = null
+  let when = ''
+  const s = await refresh($)
+  for (let i = words.length - 1; i >= 1 && !goal; i--) {
+    const found = findGoal(s.goals, words.slice(0, i).join(' '))
+    if ('goal' in found) {
+      goal = found.goal
+      when = words.slice(i).join(' ')
+    }
+  }
+  if (!goal) {
+    const found = await resolveGoal($, words[0])
+    return 'error' in found ? found.error : usage
+  }
+  const parsed = await readSchedule($, when)
+  if ('error' in parsed) return parsed.error
+  const text = await applySchedule($, goal, parsed.schedule, parsed.oneOff)
+  return parsed.interpreted ? `${text} (Read "${when}" as ${parsed.interpreted}.)` : text
+}
+
+/** The to-do tools: no confirm, since the person asked and every change is undone with one press. */
+async function todoTool($: Engine, name: 'todos' | 'add_todo' | 'complete_todo' | 'edit_todo', input: Record<string, unknown>): Promise<{ text: string; isError: boolean }> {
+  const dir = await $.session.root()
+  const lists = await fetchTodos($, dir)
+  const listArg = typeof input.list === 'string' && input.list.trim() ? input.list.trim() : undefined
+  if (name === 'todos') {
+    const itemArg = typeof input.item === 'string' ? input.item.trim() : typeof input.item === 'number' ? String(input.item) : ''
+    if (itemArg) {
+      const found = findTodo(lists, itemArg, listArg)
+      return 'error' in found ? { text: found.error, isError: true } : { text: describeTodo(found.list, found.item), isError: false }
+    }
+    const shown = listArg ? lists.filter((l) => l.id === listArg || l.name.toLowerCase() === listArg.toLowerCase()) : lists
+    if (listArg && shown.length === 0) return { text: `No list "${listArg}". Lists: ${lists.map((l) => l.name).join(', ') || 'none'}.`, isError: true }
+    const text = describeTodos(shown, { withDone: input.include_done === true, clipAt: TODO_LINE })
+    return { text: `${text}\n\nLong to-dos are cut to one line; todos with item gives one in full.`, isError: false }
+  }
+  if (name === 'add_todo') {
+    const text = String(input.text ?? '').trim()
+    if (!text) return { text: 'A to-do needs some text.', isError: true }
+    const list = listArg ? lists.find((l) => l.id === listArg || l.name.toLowerCase() === listArg.toLowerCase()) : undefined
+    if (listArg && !list) return { text: `No list "${listArg}". Lists: ${lists.map((l) => l.name).join(', ') || 'none'}.`, isError: true }
+    const r = await addTodo($, { dir, text, listId: list?.id, by: 'agent' })
+    await refreshTodos($)
+    return { text: `Added to ${list?.name ?? 'To do'} as ${r.item_id}: ${text}`, isError: false }
+  }
+  const found = findTodo(lists, String(input.item ?? ''), listArg)
+  if ('error' in found) return { text: found.error, isError: true }
+  if (name === 'edit_todo') {
+    const text = typeof input.text === 'string' ? input.text.trim() : undefined
+    if (text === '') return { text: 'A to-do needs some text.', isError: true }
+    const notes = typeof input.notes === 'string' ? input.notes : undefined
+    const reworded = text !== undefined && text !== found.item.text
+    if (!reworded && notes === undefined) return { text: `Nothing to change on ${found.item.id}: give new text or notes.`, isError: text === undefined }
+    await editTodo($, found.list.id, found.item.id, { ...(reworded && { text }), notes, by: 'agent' })
+    await refreshTodos($)
+    if (!reworded) return { text: `Changed the notes on ${found.item.id}.`, isError: false }
+    $.ui.toast(`Reworded to-do ${found.item.id}. It said: ${clip(found.item.text, 80)}`)
+    return { text: `Reworded ${found.item.id}${notes !== undefined ? ' and its notes' : ''}: ${text} (it said: ${found.item.text})`, isError: false }
+  }
+  await setTodo($, found.list.id, found.item.id, 'completed')
+  await refreshTodos($)
+  return { text: `Ticked off ${found.item.id}: ${found.item.text}`, isError: false }
+}

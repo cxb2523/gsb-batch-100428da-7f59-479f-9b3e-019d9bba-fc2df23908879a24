@@ -1,0 +1,75 @@
+import { getTask, countAllTasks, nextChildId, insertTask, touchPlan } from '../db.js'
+import { getOpenPlan } from '../session.js'
+import { buildContext } from '../context.js'
+import { CreateTaskSchema } from '../schema.js'
+import { record } from '../history.js'
+import { gateFieldsFrom, gateSummary } from '../gates.js'
+
+export async function create_task(args: unknown) {
+  const input = CreateTaskSchema.parse(args)
+
+  const planId = getOpenPlan()
+  if (!planId) throw new Error('No plan is open. Use open_plan or create_plan first.')
+
+  let newId: string
+
+  if (input.parent_id === undefined || input.parent_id === null) {
+    // Creating root task — tree must be empty
+    const total = countAllTasks(planId)
+    if (total > 0) throw new Error('parent_id is required when the tree is non-empty.')
+    newId = '1'
+  } else {
+    const parent = getTask(planId, input.parent_id)
+    if (!parent) throw new Error(`Parent task ${input.parent_id} not found.`)
+    newId = nextChildId(planId, input.parent_id)
+  }
+
+  // Validate depends_on items exist as siblings and if status=active they're all completed
+  if (input.depends_on && input.depends_on.length > 0) {
+    for (const depId of input.depends_on) {
+      const dep = getTask(planId, depId)
+      if (!dep) throw new Error(`depends_on references unknown task: ${depId}`)
+
+      // Verify it's a sibling
+      const depSegments = depId.split('.')
+      const newSegments = newId.split('.')
+      const depParent = depSegments.slice(0, -1).join('.')
+      const newParent = newSegments.slice(0, -1).join('.')
+      if (depParent !== newParent) {
+        throw new Error(`depends_on task ${depId} is not a sibling of ${newId}. Dependencies must be between siblings.`)
+      }
+    }
+
+    if (input.status === 'active') {
+      const incomplete = input.depends_on.filter(depId => {
+        const dep = getTask(planId, depId)
+        return dep?.status !== 'completed'
+      })
+      if (incomplete.length > 0) {
+        throw new Error(`Cannot create active task: dependencies not completed: ${incomplete.join(', ')}`)
+      }
+    }
+  }
+
+  const now = new Date().toISOString()
+  const task = {
+    id: newId,
+    plan_id: planId,
+    goal: input.goal,
+    status: input.status,
+    result: null,
+    abandon_reason: null,
+    state: input.initial_state ?? {},
+    depends_on: input.depends_on ?? null,
+    notes: null,
+    ...gateFieldsFrom(input),
+    created_at: now,
+    updated_at: now,
+  }
+
+  insertTask(task)
+  touchPlan(planId)
+  record(planId, newId, 'task_created', { goal: input.goal, status: input.status, gates: gateSummary(input) })
+
+  return buildContext(planId, newId)
+}

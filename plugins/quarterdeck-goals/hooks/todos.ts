@@ -1,0 +1,206 @@
+/**
+ * The person's to-do lists: what was agreed in a conversation, kept outside
+ * it so it survives compaction. A list is an active plan in the project's
+ * directory; /todo and add_todo add to the "To do" list. Nothing is added to
+ * the conversation unless someone asks: no hooks, no reminders. Plan and
+ * Start bring a to-do into the conversation as a prompt.
+ */
+import type { EngineInterface } from 'claude-code'
+
+import type { HeldTodo, TodoItem, TodoList } from '../types'
+import { addTodo, editTodo, fetchTodos, setTodo } from './api'
+import { clip } from './model'
+import { act, refresh, refreshTodos } from './sync'
+import { getHeldTodos, setAskingAbout, setEditingTodo, setHeldTodos } from './state'
+
+type Engine = EngineInterface
+
+const isDone = (i: TodoItem) => i.status === 'completed' || i.status === 'abandoned'
+
+/** The lists as text for Claude: each open to-do with the id to tick it off by. */
+export function describeTodos(lists: TodoList[], opts: { withDone?: boolean; clipAt?: number } = {}): string {
+  if (lists.length === 0) return 'No to-do lists for this project yet. Add one with /todo <text> (or the add_todo tool).'
+  // Clipped (Claude's todos tool): each to-do on one line, its notes only flagged, so the
+  // overview stays small; the full text is one call away (todos with item).
+  const line = (i: TodoItem) => {
+    if (!opts.clipAt) return `${i.text}${i.notes ? ` (${i.notes})` : ''}`
+    const text = clip(i.text.replace(/\s+/g, ' ').trim(), opts.clipAt)
+    return `${text}${i.notes ? ' (+ notes)' : ''}`
+  }
+  return lists.map((l) => {
+    const items = l.items.filter((i) => opts.withDone || !isDone(i))
+    const lines = items.map((i) => `${'  '.repeat(i.depth)}- [${mark(i)}] ${i.id}: ${line(i)}`)
+    return [`## ${l.name} (list ${l.id}): ${l.open} open, ${l.done} done`, ...(lines.length ? lines : ['  nothing open'])].join('\n')
+  }).join('\n\n')
+}
+
+const mark = (i: TodoItem) => (isDone(i) ? 'x' : i.status === 'active' ? '~' : ' ')
+
+/** One to-do in full, for Claude's todos tool with item. */
+export function describeTodo(list: TodoList, item: TodoItem): string {
+  const status = isDone(item) ? item.status : item.status === 'active' ? 'under way' : 'open'
+  return [`To-do ${item.id} on "${list.name}" (list ${list.id}), ${status}:`, '', item.text, ...(item.notes ? ['', `Notes: ${item.notes}`] : [])].join('\n')
+}
+
+/** Finds a to-do by its id, in the given list or the only list that has it. */
+export function findTodo(lists: TodoList[], itemId: string, listId?: string): { list: TodoList; item: TodoItem } | { error: string } {
+  const matches = lists.filter((l) => !listId || l.id === listId || l.name.toLowerCase() === listId.toLowerCase())
+    .flatMap((l) => l.items.filter((i) => i.id === itemId).map((item) => ({ list: l, item })))
+  if (matches.length === 1) return matches[0]!
+  if (matches.length === 0) return { error: `No to-do ${itemId}${listId ? ` in ${listId}` : ''}.` }
+  return { error: `More than one list has a to-do ${itemId}: ${matches.map((m) => m.list.name).join(', ')}. Say which list.` }
+}
+
+/** /todo <text> adds; /todo done <id> ticks off; /todo alone shows the lists. */
+export async function todoCommand($: Engine, args: string): Promise<string> {
+  const dir = await $.session.root()
+  const text = args.trim()
+  if (!text) {
+    const lists = await fetchTodos($, dir)
+    return describeTodos(lists)
+  }
+  const done = /^(done|undo)\s+(\S+)$/i.exec(text)
+  if (done) {
+    const found = findTodo(await fetchTodos($, dir), done[2]!)
+    if ('error' in found) return found.error
+    const status = done[1]!.toLowerCase() === 'done' ? 'completed' : 'pending'
+    await setTodo($, found.list.id, found.item.id, status)
+    await refresh($)
+    return `${status === 'completed' ? 'Ticked off' : 'Back on the list'}: ${found.item.text}`
+  }
+  const r = await addTodo($, { dir, text })
+  await refreshTodos($)
+  return `Added to your to-do list (${r.item_id}): ${text}`
+}
+
+/**
+ * The prompt that brings a to-do into this conversation. Plan asks Claude to
+ * plan it in plan mode for the person to review; Start asks it to begin. Work
+ * on a to-do happens here, where Claude can ask questions, not in a
+ * background run (background runs are for goals).
+ */
+export function todoPrompt(list: TodoList, item: TodoItem, mode: 'plan' | 'start' | 'ask', question?: string, opts: { planModeOn?: boolean } = {}): string {
+  if (mode === 'ask' && question?.trim()) {
+    return `About to-do ${item.id} on my list "${list.name}":\n\n${item.text}${item.notes ? `\n\n(Notes: ${item.notes})` : ''}\n\nMy question: ${question.trim()}\n\nAnswer it. Don't change anything or start work on it.`
+  }
+  if (mode === 'ask') {
+    return `What do you think of to-do ${item.id} on my list "${list.name}"?\n\n${item.text}${item.notes ? `\n\n(Notes: ${item.notes})` : ''}\n\nGive me your opinion and the trade-offs. Don't change anything or start work on it.`
+  }
+  const from = `From my to-do list "${list.name}", item ${item.id}:\n\n${item.text}${item.notes ? `\n\n(Notes: ${item.notes})` : ''}`
+  const end = `When it's done, tick it off with complete_todo (item ${item.id}${list.name !== 'To do' ? `, list "${list.name}"` : ''}).`
+  const plan = opts.planModeOn
+    ? 'Plan this before changing anything (plan mode should be on; if it isn\'t, enter it first)'
+    : 'Enter plan mode and plan this before changing anything'
+  return mode === 'plan'
+    ? `${from}\n\n${plan}: explore what it involves, ask me what you need to, and present the plan for me to review. ${end}`
+    : `${from}\n\nLet's work on this now. Ask me if anything is unclear. ${end}`
+}
+
+/**
+ * Turns plan mode on with Claude Code's own /plan, when this session has it:
+ * then plan mode doesn't depend on Claude choosing to enter it. Only the
+ * built-in counts (a skill or command of the same name may do something else).
+ * False when there's none or it failed; the prompt then asks Claude instead.
+ */
+export async function enterPlanMode($: Engine): Promise<boolean> {
+  try {
+    const commands = await $.command.list()
+    if (!commands.some((c) => c.name === 'plan' && c.source === 'builtin')) return false
+    await $.command.run({ command: 'plan' })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Plan / Start: marks the to-do under way and sends it to this conversation (it starts when Claude is free). */
+export async function workOnTodo($: Engine, list: TodoList, item: TodoItem, mode: 'plan' | 'start'): Promise<void> {
+  // Marking it under way is a convenience: sending it is what the press is for.
+  // In plan mode Claude Code refuses this write, so carry on without it.
+  try {
+    await setTodo($, list.id, item.id, 'active', mode === 'plan' ? 'Planning it in the conversation' : 'Working on it in the conversation')
+  } catch {
+    // shown as ☐ instead of ◐ until the next change
+  }
+  const planModeOn = mode === 'plan' && (await enterPlanMode($))
+  await $.prompt.submit({ text: todoPrompt(list, item, mode, undefined, { planModeOn }) })
+}
+
+/**
+ * Ask: the person's question about a to-do (typed in the pane's box), or
+ * Claude's opinion when they leave it empty. Nothing is changed or started.
+ */
+export async function askAboutTodo($: Engine, list: TodoList, item: TodoItem, question?: string): Promise<void> {
+  await $.prompt.submit({ text: todoPrompt(list, item, 'ask', question) })
+}
+
+/** The pane's actions, through the shared busy/notice/re-read wrapper. */
+export async function toggleTodo($: Engine, list: TodoList, item: TodoItem): Promise<boolean> {
+  const ticking = !isDone(item)
+  const ok = await act($, `todo:${list.id}/${item.id}`, 'update the to-do', () => setTodo($, list.id, item.id, ticking ? 'completed' : 'pending'))
+  if (ok) $.ui.toast(ticking ? `Ticked off ${item.id}. To undo, open "done" under ${list.name} and press it.` : `${item.id} is back on ${list.name}.`)
+  return ok
+}
+export function addFromPane($: Engine, dir: string, list: TodoList, text: string): Promise<boolean> {
+  return act($, `todo-add:${list.id}`, 'add the to-do', async () => void (await addTodo($, { dir, text, listId: list.id })))
+}
+/** Sends the question and closes the box. */
+export async function askFromPane($: Engine, list: TodoList, item: TodoItem, question: string): Promise<boolean> {
+  const ok = await act($, `todo-ask:${list.id}/${item.id}`, 'ask about it', () => askAboutTodo($, list, item, question))
+  if (ok) await setAskingAbout($, null)
+  return ok
+}
+/** Saves the new wording from the pane's edit box and closes it; the toast keeps the old wording. */
+export async function editFromPane($: Engine, list: TodoList, item: TodoItem, text: string): Promise<boolean> {
+  const wording = text.trim()
+  if (!wording || wording === item.text) {
+    await setEditingTodo($, null)
+    return true
+  }
+  const ok = await act($, `todo-edit:${list.id}/${item.id}`, 'change the to-do', () => editTodo($, list.id, item.id, { text: wording, by: 'human' }))
+  if (ok) {
+    await setEditingTodo($, null)
+    $.ui.toast(`Changed ${item.id}. It said: ${clip(item.text, 80)}`)
+  }
+  return ok
+}
+/**
+ * Whether the conversation's own turn is under way (its turn.start seen, its
+ * turn.complete not yet). Claude Code can't take a prompt back once it is
+ * submitted, so while this is set Plan / Start hold the to-do here instead,
+ * where Cancel can drop it, and send it when the turn ends. A reload forgets
+ * it: then a press sends straight away, as before.
+ */
+let midTurn = false
+
+const heldKey = (h: { list: { id: string }; item: { id: string } }) => `${h.list.id}/${h.item.id}`
+
+/** The conversation's turn began (main loop only). */
+export function turnStarted(): void {
+  midTurn = true
+}
+
+/** The conversation's turn ended: send the oldest held to-do (its own turn sends the next when it ends). */
+export async function turnEnded($: Engine): Promise<void> {
+  midTurn = false
+  const [next] = await getHeldTodos($)
+  if (!next) return
+  await setHeldTodos($, (held) => held.filter((h) => heldKey(h) !== heldKey(next)))
+  await act($, `todo-${next.mode}:${heldKey(next)}`, next.mode === 'plan' ? 'plan it' : 'start it', () => workOnTodo($, next.list, next.item, next.mode))
+}
+
+export function workFromPane($: Engine, list: TodoList, item: TodoItem, mode: 'plan' | 'start'): Promise<boolean> {
+  if (midTurn) return holdTodo($, { list, item, mode })
+  return act($, `todo-${mode}:${list.id}/${item.id}`, mode === 'plan' ? 'plan it' : 'start it', () => workOnTodo($, list, item, mode))
+}
+
+/** Keeps a to-do back until the turn ends; nothing about it changes until it is sent. A second press changes Plan to Start or back. */
+async function holdTodo($: Engine, held: HeldTodo): Promise<boolean> {
+  await setHeldTodos($, (all) => [...all.filter((h) => heldKey(h) !== heldKey(held)), held])
+  return true
+}
+
+/** Cancel beside Sending…: the held to-do is never sent, and its Plan / Start come back. */
+export async function cancelHeldTodo($: Engine, list: TodoList, item: TodoItem): Promise<void> {
+  await setHeldTodos($, (all) => all.filter((h) => heldKey(h) !== `${list.id}/${item.id}`))
+}
