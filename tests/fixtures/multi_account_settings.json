@@ -1,0 +1,55 @@
+{
+  "api_version": "v25.0",
+  "date_range": {
+    "start": "2026-11-01",
+    "end": "2026-11-07"
+  },
+  "google": {
+    "api_key_file": "fake-google-api-key.json",
+    "raw_worksheet": "RAW_DATA",
+    "analytics_worksheet": "ANALYTICS"
+  },
+  "sheet_columns": [
+    "Date Start",
+    "Ad ID",
+    "Ad Name",
+    "Spend",
+    "Clicks",
+    "Impressions"
+  ],
+  "field_map": {
+    "Date Start": "date_start",
+    "Ad ID": "ad_id",
+    "Ad Name": "ad_name",
+    "Spend": "spend",
+    "Clicks": "clicks",
+    "Impressions": "impressions"
+  },
+  "accounts": [
+    {
+      "id": "acc-001",
+      "name": "North America Store",
+      "meta_token": "FAKE-TOKEN-A",
+      "ad_account_id": "act_111111111",
+      "sheet_id": "fake-sheet-aaa"
+    },
+    {
+      "id": "acc-002",
+      "name": "Europe Store",
+      "meta_token": "FAKE-TOKEN-B",
+      "ad_account_id": "act_222222222",
+      "sheet_id": "fake-sheet-bbb"
+    },
+    {
+      "id": "acc-003",
+      "name": "APAC Store",
+      "meta_token": "FAKE-TOKEN-C",
+      "ad_account_id": "act_333333333",
+      "sheet_id": "fake-sheet-ccc"
+    }
+  ],
+  "telegram": {
+    "bot_token": "FAKE-BOT-TOKEN",
+    "chat_id": "FAKE-CHAT-ID"
+  }
+}
