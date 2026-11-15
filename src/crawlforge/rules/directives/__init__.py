@@ -1,0 +1,30 @@
+"""Directives rules."""
+
+from crawlforge.rules.directives import disallowed_css  # noqa: F401
+from crawlforge.rules.directives import disallowed_image  # noqa: F401
+from crawlforge.rules.directives import disallowed_js_file  # noqa: F401
+from crawlforge.rules.directives import form_with_get_method  # noqa: F401
+from crawlforge.rules.directives import head_invalid_html  # noqa: F401
+from crawlforge.rules.directives import head_noscript_tag  # noqa: F401
+from crawlforge.rules.directives import head_noscript_with_image  # noqa: F401
+from crawlforge.rules.directives import html_over_2mb  # noqa: F401
+from crawlforge.rules.directives import internal_disallowed_links  # noqa: F401
+from crawlforge.rules.directives import nofollow  # noqa: F401
+from crawlforge.rules.directives import nofollow_html_and_header  # noqa: F401
+from crawlforge.rules.directives import nofollow_html_vs_header_mismatch  # noqa: F401
+from crawlforge.rules.directives import nofollow_multiple  # noqa: F401
+from crawlforge.rules.directives import nofollow_only_in_source  # noqa: F401
+from crawlforge.rules.directives import noimageindex  # noqa: F401
+from crawlforge.rules.directives import noindex  # noqa: F401
+from crawlforge.rules.directives import noindex_html_and_header  # noqa: F401
+from crawlforge.rules.directives import noindex_html_vs_header_mismatch  # noqa: F401
+from crawlforge.rules.directives import noindex_multiple  # noqa: F401
+from crawlforge.rules.directives import noindex_nofollow_combined  # noqa: F401
+from crawlforge.rules.directives import noindex_only_in_source  # noqa: F401
+from crawlforge.rules.directives import none  # noqa: F401
+from crawlforge.rules.directives import noodp  # noqa: F401
+from crawlforge.rules.directives import nosnippet  # noqa: F401
+from crawlforge.rules.directives import notranslate  # noqa: F401
+from crawlforge.rules.directives import noydir  # noqa: F401
+from crawlforge.rules.directives import robots_meta_outside_head  # noqa: F401
+from crawlforge.rules.directives import unavailable_after  # noqa: F401
