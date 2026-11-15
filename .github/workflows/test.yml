@@ -1,0 +1,54 @@
+# https://docs.github.com/en/actions/how-tos/reuse-automations/reuse-workflows
+
+on:
+  workflow_call:
+    inputs:
+      os:
+        required: true
+        type: string
+      python-version:
+        required: true
+        type: string
+
+jobs:
+  build-and-test:
+    runs-on: ${{ inputs.os }}
+
+    # https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/deploy-to-environment
+    environment: Test
+
+    defaults:
+      run:
+        shell: ${{ startsWith(inputs.os, 'windows') && 'cmd' || 'bash' }}
+
+    steps:
+      # https://github.com/actions/checkout
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ inputs.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run git hooks
+        run: pre-commit run --all-files
+
+      # https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-variables#detecting-the-operating-system
+
+      - run: |
+          echo "PYTHONPATH=$(pwd):$PYTHONPATH" >> $GITHUB_ENV
+        if: runner.os != 'Windows'
+
+      # PYTHONPATH ending with ; might cause errors
+      - run: |
+          echo PYTHONPATH=%cd% >> %GITHUB_ENV%
+        if: runner.os == 'Windows'
+
+      - name: Run tests
+        run: |
+          python -m unittest -v

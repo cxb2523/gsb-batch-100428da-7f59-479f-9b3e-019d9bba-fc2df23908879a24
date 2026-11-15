@@ -1,0 +1,23 @@
+# https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax
+
+name: Test (single)
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - "**.py"
+      - ".pre-commit-config.yaml"
+      - ".github/workflows/test-single.yml"
+      - ".github/workflows/test.yml"
+      - ".github/workflows/publish.yml"
+      - "pyproject.toml"
+      - "MANIFEST.in"
+
+jobs:
+  build-and-test:
+    uses: ./.github/workflows/test.yml
+    with:
+      os: ubuntu-latest
+      python-version: "3.12"
+    secrets: inherit

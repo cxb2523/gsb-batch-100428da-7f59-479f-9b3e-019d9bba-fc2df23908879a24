@@ -1,0 +1,48 @@
+import logging
+
+import requests
+
+from dl_coursera.lib.TaskScheduler import TaskScheduler
+from dl_coursera.Crawler import Crawler
+
+
+def test_crawler():
+    with TaskScheduler() as ts, requests.Session() as sess:
+        ts.start(n_worker=1)
+        crawler = Crawler(ts=ts, sess=sess)
+        crawler.login()
+
+        courses = [
+            '20cnwm',
+            'advanced-modeling',
+            'algorithms-part1',
+            'complex-analysis',
+            'crypto',
+            'game-theory-1',
+            'genetic-lab',
+            'happiness',
+            'learning-how-to-learn',
+            'lisan-youhua-jianmo-jichupian',
+            'ma-ke-si',
+            'machine-design1',
+            'machine-learning',
+            'mathematical-thinking',
+            'modern-postmodern-1',
+            'networks-illustrated',
+            'renqun-wangluo',
+            'shengwu-yanhua',
+            'understanding-arguments',
+            'yoga',
+        ]
+        for _ in courses:
+            crawler.crawl(slug=_, is_spec=False)
+
+
+if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        style='%',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    )
+    test_crawler()
