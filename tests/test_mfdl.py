@@ -1,4 +1,5 @@
 import argparse
+import threading
 import tomllib
 import urllib.parse
 import urllib.request
@@ -180,6 +181,176 @@ def test_download_urls_writes_to_output_dir(
     mfdl.download_urls(["https://cdn.example/1.jpg"], "Demo", 1.0, output_dir=output_dir)
 
     assert (output_dir / "Demo" / "1" / "000.jpg").read_bytes() == b"jpegbytes"
+
+
+def test_download_urls_keeps_successful_pages_after_partial_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(mfdl.time, "sleep", lambda _: None)
+    requests: list[str] = []
+
+    def fake_get_page_content(url: str, **_kwargs: object) -> tuple[int, str, bytes]:
+        requests.append(url)
+        if "bad.jpg" in url:
+            return 200, "text/html", b"not an image"
+        return 200, "image/jpeg", url.encode()
+
+    monkeypatch.setattr(mfdl, "get_page_content", fake_get_page_content)
+
+    urls = [
+        "https://cdn.example/good-a.jpg",
+        "https://cdn.example/bad.jpg",
+        "https://cdn.example/good-b.jpg",
+    ]
+
+    with pytest.raises(
+        SystemExit, match=r"failed to download 1 image\(s\).*for chapter 1: 001\.jpg$"
+    ):
+        mfdl.download_urls(
+            urls,
+            "Demo",
+            1.0,
+            output_dir=tmp_path,
+            avg_delay=0.0,
+            max_retries=2,
+        )
+
+    chapter_dir = tmp_path / "Demo" / "1"
+    assert (chapter_dir / "000.jpg").read_bytes() == urls[0].encode()
+    assert not (chapter_dir / "001.jpg").exists()
+    assert (chapter_dir / "002.jpg").read_bytes() == urls[2].encode()
+
+
+def test_download_urls_resume_only_requests_missing_pages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(mfdl.time, "sleep", lambda _: None)
+    image_urls = [
+        "https://cdn.example/1.jpg",
+        "https://cdn.example/2.jpg",
+        "https://cdn.example/3.jpg",
+    ]
+    successful_urls = {image_urls[0], image_urls[2]}
+
+    requests: list[str] = []
+
+    def fake_get_page_content(url: str, **_kwargs: object) -> tuple[int, str, bytes]:
+        requests.append(url)
+        if url in successful_urls:
+            return 200, "image/jpeg", url.encode()
+        return 200, "text/html", b"not an image"
+
+    monkeypatch.setattr(mfdl, "get_page_content", fake_get_page_content)
+
+    with pytest.raises(SystemExit):
+        mfdl.download_urls(
+            image_urls,
+            "Demo",
+            1.0,
+            output_dir=tmp_path,
+            avg_delay=0.0,
+            max_retries=1,
+        )
+
+    requests.clear()
+
+    def fake_get_page_content_resume(url: str, **_kwargs: object) -> tuple[int, str, bytes]:
+        requests.append(url)
+        return 200, "image/jpeg", url.encode()
+
+    monkeypatch.setattr(mfdl, "get_page_content", fake_get_page_content_resume)
+
+    mfdl.download_urls(image_urls, "Demo", 1.0, output_dir=tmp_path, avg_delay=0.0)
+
+    chapter_dir = tmp_path / "Demo" / "1"
+    assert requests == [image_urls[1]]
+    for index, url in enumerate(image_urls):
+        assert (chapter_dir / f"{index:03}.jpg").read_bytes() == url.encode()
+
+
+def test_download_urls_skips_existing_pages_without_requests(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    chapter_dir = tmp_path / "Demo" / "1"
+    chapter_dir.mkdir(parents=True)
+    image_urls = ["https://cdn.example/1.jpg", "https://cdn.example/2.jpg"]
+    for index, url in enumerate(image_urls):
+        (chapter_dir / f"{index:03}.jpg").write_bytes(url.encode())
+
+    requests: list[str] = []
+
+    def fake_get_page_content(url: str, **_kwargs: object) -> tuple[int, str, bytes]:
+        requests.append(url)
+        raise AssertionError("existing pages should never be requested")
+
+    monkeypatch.setattr(mfdl, "get_page_content", fake_get_page_content)
+
+    mfdl.download_urls(image_urls, "Demo", 1.0, output_dir=tmp_path, workers=4)
+
+    assert requests == []
+    for index, url in enumerate(image_urls):
+        assert (chapter_dir / f"{index:03}.jpg").read_bytes() == url.encode()
+
+
+def test_download_urls_replaces_empty_page_files(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    chapter_dir = tmp_path / "Demo" / "1"
+    chapter_dir.mkdir(parents=True)
+    (chapter_dir / "000.jpg").write_bytes(b"")
+    (chapter_dir / "001.jpg").write_bytes(b"old")
+
+    requests: list[str] = []
+
+    def fake_get_page_content(url: str, **_kwargs: object) -> tuple[int, str, bytes]:
+        requests.append(url)
+        return 200, "image/jpeg", b"fresh"
+
+    monkeypatch.setattr(mfdl, "get_page_content", fake_get_page_content)
+
+    mfdl.download_urls(
+        ["https://cdn.example/1.jpg", "https://cdn.example/2.jpg"],
+        "Demo",
+        1.0,
+        output_dir=tmp_path,
+    )
+
+    assert requests == ["https://cdn.example/1.jpg"]
+    assert (chapter_dir / "000.jpg").read_bytes() == b"fresh"
+    assert (chapter_dir / "001.jpg").read_bytes() == b"old"
+
+
+def test_download_urls_concurrent_resume_keeps_written_pages_consistent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    chapter_dir = tmp_path / "Demo" / "1"
+    chapter_dir.mkdir(parents=True)
+    image_urls = [f"https://cdn.example/{index}.jpg" for index in range(4)]
+    (chapter_dir / "000.jpg").write_bytes(b"page-0")
+    (chapter_dir / "002.jpg").write_bytes(b"page-2")
+
+    requests: list[str] = []
+    requests_lock = threading.Lock()
+
+    def fake_get_page_content(url: str, **_kwargs: object) -> tuple[int, str, bytes]:
+        with requests_lock:
+            requests.append(url)
+        return 200, "image/jpeg", f"fresh-{url}".encode()
+
+    monkeypatch.setattr(mfdl, "get_page_content", fake_get_page_content)
+
+    mfdl.download_urls(image_urls, "Demo", 1.0, output_dir=tmp_path, workers=4)
+
+    assert requests == [image_urls[1], image_urls[3]]
+    assert (chapter_dir / "000.jpg").read_bytes() == b"page-0"
+    assert (chapter_dir / "001.jpg").read_bytes() == f"fresh-{image_urls[1]}".encode()
+    assert (chapter_dir / "002.jpg").read_bytes() == b"page-2"
+    assert (chapter_dir / "003.jpg").read_bytes() == f"fresh-{image_urls[3]}".encode()
 
 
 def test_unpack_eval_packer_extracts_payload() -> None:
@@ -459,6 +630,41 @@ def test_download_manga_force_redownloads_existing_cbz(
     mfdl.download_manga("Demo", force=True)
 
     assert downloaded_chapters == [1.0, 2.0]
+
+
+def test_download_manga_force_still_skips_complete_pages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    chapter_dir = tmp_path / "Demo" / "1"
+    chapter_dir.mkdir(parents=True)
+    (chapter_dir / "000.jpg").write_bytes(b"page-0")
+    (tmp_path / "Demo" / "1.cbz").write_bytes(b"existing")
+
+    monkeypatch.setattr(
+        mfdl,
+        "get_chapter_urls",
+        lambda _manga, **_kwargs: mfdl.OrderedDict([(1.0, "/demo/c001/1.html")]),
+    )
+    monkeypatch.setattr(
+        mfdl,
+        "get_chapter_image_urls",
+        lambda _url, **_kwargs: ["https://cdn.example/1.jpg", "https://cdn.example/2.jpg"],
+    )
+
+    requests: list[str] = []
+
+    def fake_get_page_content(url: str, **_kwargs: object) -> tuple[int, str, bytes]:
+        requests.append(url)
+        return 200, "image/jpeg", b"fresh"
+
+    monkeypatch.setattr(mfdl, "get_page_content", fake_get_page_content)
+
+    mfdl.download_manga("Demo", output_dir=tmp_path, force=True)
+
+    assert requests == ["https://cdn.example/2.jpg"]
+    assert (chapter_dir / "000.jpg").read_bytes() == b"page-0"
+    assert (chapter_dir / "001.jpg").read_bytes() == b"fresh"
 
 
 def test_download_manga_uses_output_dir_for_existing_cbz(

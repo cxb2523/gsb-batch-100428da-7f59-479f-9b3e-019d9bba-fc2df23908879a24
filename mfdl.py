@@ -8,6 +8,8 @@ import random
 import re
 import shutil
 import sys
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -311,7 +313,28 @@ def get_chapter_number(url_fragment: str) -> float | None:
 
 def write_binary_file(filename: Path, data: bytes) -> None:
     filename.parent.mkdir(parents=True, exist_ok=True)
-    filename.write_bytes(data)
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        dir=filename.parent,
+        prefix=f".{filename.name}.",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(file_descriptor, "wb") as temporary_file:
+            temporary_file.write(data)
+        os.replace(temporary_name, filename)
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except OSError:
+            pass
+        raise
+
+
+def page_file_is_complete(filename: Path) -> bool:
+    try:
+        return filename.is_file() and filename.stat().st_size > 0
+    except OSError:
+        return False
 
 
 def download_urls(
@@ -327,44 +350,52 @@ def download_urls(
     image_list = list(image_urls)
     chapter_label = f"{chapter_number:g}"
     download_dir = output_dir / manga_name / chapter_label
-    if download_dir.exists():
-        shutil.rmtree(download_dir)
-    download_dir.mkdir(parents=True)
+    download_dir.mkdir(parents=True, exist_ok=True)
 
     random.seed()
 
-    def download_image(index: int, url: str) -> str | None:
+    def download_image(index: int, url: str, file_lock: threading.Lock) -> str | None:
         filename = download_dir / f"{index:03}.jpg"
 
-        attempt = 0
-        while attempt < max_retries:
-            attempt += 1
-            try:
-                status, content_type, data = get_page_content(url, timeout=timeout)
-                if status < 200 or status >= 300:
-                    print(
-                        f"Warning: got status {status} for {url} (attempt {attempt}/{max_retries})"
-                    )
-                elif not content_type.startswith("image/"):
-                    print(
-                        f"Warning: expected image for {url}, got content-type "
-                        f"'{content_type}' (attempt {attempt}/{max_retries})"
-                    )
-                else:
-                    write_binary_file(filename, data)
-                    return None
-            except urllib.error.HTTPError as http_error:
-                print(f"HTTP error {http_error.code}: {http_error.reason}")
-                if http_error.code == 404:
-                    break
-            except urllib.error.URLError as url_error:
-                print(f"URL error: {url_error.reason}")
+        # Re-check under the lock so concurrent callers can never race on the same page.
+        with file_lock:
+            if page_file_is_complete(filename):
+                return None
 
-            if attempt < max_retries:
-                retry_delay = random.uniform(avg_delay * 0.6, avg_delay * 1.4)
-                time.sleep(retry_delay)
+            attempt = 0
+            while attempt < max_retries:
+                attempt += 1
+                try:
+                    status, content_type, data = get_page_content(url, timeout=timeout)
+                    if status < 200 or status >= 300:
+                        print(
+                            f"Warning: got status {status} for {url} "
+                            f"(attempt {attempt}/{max_retries})"
+                        )
+                    elif not content_type.startswith("image/"):
+                        print(
+                            f"Warning: expected image for {url}, got content-type "
+                            f"'{content_type}' (attempt {attempt}/{max_retries})"
+                        )
+                    else:
+                        try:
+                            write_binary_file(filename, data)
+                        except OSError as write_error:
+                            print(f"Warning: failed to write {filename}: {write_error}")
+                        else:
+                            return None
+                except urllib.error.HTTPError as http_error:
+                    print(f"HTTP error {http_error.code}: {http_error.reason}")
+                    if http_error.code == 404:
+                        break
+                except urllib.error.URLError as url_error:
+                    print(f"URL error: {url_error.reason}")
 
-        return filename.name
+                if attempt < max_retries:
+                    retry_delay = random.uniform(avg_delay * 0.6, avg_delay * 1.4)
+                    time.sleep(retry_delay)
+
+            return filename.name
 
     with tqdm(
         total=len(image_list),
@@ -373,9 +404,18 @@ def download_urls(
         disable=not sys.stderr.isatty(),
     ) as progress:
         failed_images: list[str] = []
+        pending_images: list[tuple[int, str]] = []
+        for index, url in enumerate(image_list):
+            if page_file_is_complete(download_dir / f"{index:03}.jpg"):
+                progress.update(1)
+            else:
+                pending_images.append((index, url))
+
+        file_locks = {index: threading.Lock() for index, _ in pending_images}
+
         if workers == 1:
-            for index, url in enumerate(image_list):
-                failed_image = download_image(index, url)
+            for index, url in pending_images:
+                failed_image = download_image(index, url, file_locks[index])
                 if failed_image is not None:
                     failed_images.append(failed_image)
                 progress.update(1)
@@ -383,8 +423,8 @@ def download_urls(
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = [
-                    executor.submit(download_image, index, url)
-                    for index, url in enumerate(image_list)
+                    executor.submit(download_image, index, url, file_locks[index])
+                    for index, url in pending_images
                 ]
                 for future in concurrent.futures.as_completed(futures):
                     failed_image = future.result()
