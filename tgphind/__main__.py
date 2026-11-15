@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from multiprocessing import cpu_count
 from urllib.parse import urlparse
 
@@ -12,6 +13,21 @@ __all__ = 'main',
 def _proxy_type(arg: str):
     parsed = urlparse(arg)
     return tgphind.Proxy(parsed.netloc, parsed.scheme or 'https')
+
+
+def _print_failures(failures, file, mirror_failures=()) -> None:
+    """Write the failure summary (title, mirror, reason) to ``file``."""
+    if mirror_failures:
+        print(f'Unavailable mirrors ({len(mirror_failures)}):', file=file)
+        for failure in mirror_failures:
+            line = f'  {failure.mirror}: {failure.reason}'
+            if failure.detail:
+                line += f' ({failure.detail})'
+            print(line, file=file)
+    if failures:
+        print(f'Failed probes ({len(failures)}):', file=file)
+        for failure in failures:
+            print(f'  {failure}', file=file)
 
 
 def main():
@@ -58,10 +74,21 @@ def main():
     )
     args = arg_parser.parse_args()
     se = tgphind.TGPhind(args.threads_count, args.proxy, args.brackets)
-    se.test_mirrors()
-    print(*tgphind.MIRRORS, sep=', ', end='\n\n')
-    print(*se.search(args.query), sep='\n')
+    mirrors = se.test_mirrors()
+    print(*mirrors, sep=', ', end='\n\n')
+    if not mirrors:
+        _print_failures((), sys.stderr, se.mirror_failures)
+        print(
+            'error: all mirrors are unavailable, no article could be probed',
+            file=sys.stderr,
+        )
+        return 1
+    result = se.search(args.query)
+    print(*result, sep='\n')
+    if result.failures:
+        _print_failures(result.failures, sys.stderr)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

@@ -15,6 +15,7 @@ TGPhind is a multithreaded tool and Python library for searching articles by tit
 - Automatic transliteration of Cyrillic titles into URL-compatible slugs.
 - Support for HTTP/HTTPS proxies.
 - Automatic mirror verification and URL mapping.
+- Verifiable results: every search reports which probes failed, on which mirror and why.
 - Command-line interface (CLI) and Python API.
 
 ## Installation
@@ -56,6 +57,49 @@ for urls in mapped_urls:
         print(url)
 ```
 
+### Reading failures
+
+`search()` and `search_iter()` return a `SearchResult`, a `tuple` subclass that
+still compares and iterates exactly like the plain tuple of hit paths returned by
+earlier versions. It additionally exposes what went wrong during the search:
+
+```python
+result = se.search('article<s>-<a-d>')
+
+for path in result:            # unchanged behaviour: the hits
+    print(path)
+
+for failure in result.failures:
+    print(failure.title, failure.mirror, failure.reason, failure.detail)
+
+print(result.available_mirrors.first)  # mirror used for the probes
+```
+
+`failure.reason` is one of `timeout`, `connection`, `http` or `error`, and
+`failure.detail` keeps the original message. A `404`/`410` answer means "no such
+article" and is *not* reported as a failure. A failing probe never stops the
+other titles; inside a numbered chain (`-2`, `-3`, ...) a failure stops that
+chain while keeping the pages already found.
+
+`TGPhind.failures` exposes the same list for code that does not keep the return
+value.
+
+### Mirrors
+
+`test_mirrors()` probes every mirror and returns a `MirrorSet` with the usable
+ones, in `MIRRORS` order. The global `MIRRORS` list is never modified, and
+`urlopen(path)` defaults to the first mirror of that set. When no mirror is
+usable, `search()`/`search_iter()` raise `NoMirrorsAvailable` (a `URLError`
+subclass) instead of returning an empty result, so "no articles" and "network or
+mirror problem" stay distinguishable.
+
+```python
+mirrors = se.test_mirrors()
+if not mirrors:
+    for failure in se.mirror_failures:
+        print(failure.mirror, failure.reason, failure.detail)
+```
+
 ### CLI Usage
 
 Execute directly via the installed executable:
@@ -77,6 +121,26 @@ python -m tgphind "article<s>-<a-d>" -tc 16
 - `-b`, `--brackets`: Custom template bracket delimiters (default: `<>`).
 - `-x`, `--proxy`: Proxy string formatted as `protocol://host:port`.
 
+Standard output keeps its historical layout: the available mirrors, a blank
+line, then the hit paths, one per line. The failure summary is written to
+standard error instead, so stdout stays machine readable:
+
+```
+$ tgphind "article<s>" -tc 8 2>failures.txt
+```
+
+`failures.txt` then contains the failed titles with their mirror and reason,
+for example:
+
+```
+Failed probes (1):
+  article @ telegra.ph: timeout (timed out) [article-01-01-3]
+```
+
+When every probe succeeds, nothing is written to standard error. If no mirror
+is available at all, the CLI reports it on standard error and exits with a
+non-zero status instead of printing an empty result.
+
 ## Template Syntax
 
 The search pattern generator expands patterns wrapped inside bracket delimiters `<>`:
@@ -96,11 +160,24 @@ Each expanded title is tested against publication date patterns (`MM-DD`) and in
 
 ## Supported Mirrors
 
-TGPhind automatically tests and maps links across these domains:
+TGPhind automatically tests and maps links across these domains, in this order:
 
-- `telegra.ph`
-- `graph.org`
 - `te.legra.ph`
+- `graph.org`
+- `telegra.ph`
+
+The first mirror that answers is used for the probes. A mirror that answers a
+`404`/`410` to the probe still counts as available: that response only means the
+root page is missing.
+
+## Running the tests
+
+The test suite does not use the network; probes are served by a controllable
+`urlopen` double.
+
+```bash
+python -m unittest discover -s tests -v
+```
 
 ## License
 
