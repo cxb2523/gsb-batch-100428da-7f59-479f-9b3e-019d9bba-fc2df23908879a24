@@ -434,12 +434,26 @@ async function main() {
     //   4. --probe → 探针整体免费,同样在这一行之前 return;它可能也发了 1 次(走的是同一个
     //      getReaderTab),但探针路径不 commit,所以不记。
     // ⚠️ 将来若让全失败也记账,第 2 条必须同步改成真实计数。
-    if (links.aborted?.reason === 'record_failed') {
-      // 已知账本不可写时，不让第二次写入失败把已抓列表也吞掉。
-      console.error('账本写入失败，本轮未完成次数及列表请求结算；结果仍导出，请修复账本后再运行。');
+    let ledgerUnsettled = links.aborted?.reason === 'record_failed';
+    if (!ledgerUnsettled) {
+      // 账本在最终结算这一步写不进去时,绝不能让异常把已经抓到的列表和补到的链接一并吞掉:
+      // 与转链阶段的 record_failed 同口径处理 —— 保留输出、非 0 退出、不自动重试/补发。
+      try {
+        commitRun(cfg, result, shelfRequests);
+      } catch (e) {
+        ledgerUnsettled = true;
+        console.error(`最终结算写入账本失败:${e.message}`);
+      }
+    }
+    if (ledgerUnsettled) {
+      // 能走到这里的都是「不算全败」的运行（全败在前面已 return），所以未结算的运行次数恒为 1；
+      // 列表请求数取实际值，书架请求单独带上 —— 三者正是 commitRun 本该写进去的账。
+      console.error(
+        '账本写入失败：本轮 1 次运行次数与 ' +
+          `${result.meta.requestsTotal} 个列表请求（另含书架请求 ${Number(shelfRequests) || 0} 个）尚未结算；` +
+          '已取得的链接和各条目状态都保留在本次输出里，请先修复账本后再运行，期间不会自动重试或补发请求。'
+      );
       process.exitCode = 1;
-    } else {
-      commitRun(cfg, result, shelfRequests);
     }
 
     // ★ 顺序:抓取 → 渲染(只发生一次) → 输出。两条输出路径共用同一个 normalizeOut,

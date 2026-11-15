@@ -274,9 +274,9 @@ node bin/weread.mjs --format md --pages 3      # 每个号翻 3 页
 
 - **每个合法且唯一的缺链 rid 增加1次请求**，同 rid 本轮最多一次，重跑可能重新请求。已有短链接零额外请求。
 - 单篇转链串行执行，相邻请求（包括最后一次列表到第一次转链）至少间隔3秒；配置更长间隔时沿用更长值。70个缺链项仅等待就约210秒，另加网络耗时。
-- 任何服务端拒绝、验证码、超时或元数据不符，都停止整个转链批次，不自动重试；已取得的链接及原列表保留。缺少合法 rid、未请求或失败的条目显示“原文链接未取得”，JSON 附状态和原因。
+- 任何服务端拒绝、验证码、超时或元数据不符，都停止整个转链批次，不自动重试；已取得的链接及原列表保留。每条缺链文章在 JSON 里都带 `linkStatus` 和 `linkReason`：已补到的为 `metadata_url`；仍缺链的为 `unresolved`，并区分两种原因——**请求过但失败**的条目保留具体失败原因，**批次停止后没排到（未尝试）**的条目统一标 `not_attempted`（“转链批次已停止，未请求此篇”），两者不混用；缺少合法 rid 等本就不会入队的条目另标各自原因。Markdown 里这些条目都显示“原文链接未取得”。
 - **单篇转链不占 `maxRequestsPerDay` 的40次列表/书架预算**，但会独立记录尝试次数，失败和超时同样计尝试；不额外扣一次运行次数。预算豁免不是风控豁免，请控制关注号数和翻页规模。
-- 账本无法写入时不会继续发送单篇请求。已抓列表仍尝试导出，但命令以非0状态退出，并明确提示该轮次数/列表请求未结算，需要先修复账本。
+- 账本无法写入时立即停止、不再发送任何新的单篇请求，也不自动重试或补发：本轮已补到的链接和各条目状态仍完整导出，未请求的条目标 `not_attempted`，整批中止原因写入 `meta.links.aborted`；命令以非 0 状态退出，并明确提示本轮运行次数与列表请求尚未结算、需要先修复账本。若账本是在最终结算（而非转链记账）那一步才写失败，转链批次本身视为正常完成（`aborted` 为 `null`），同样保留全部结果、非 0 退出并提示未结算。
 
 ## ⚠️ 关于限频：请务必看一眼
 
@@ -417,7 +417,7 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9333/json/version
 - ⚠️ 同一次群发的多篇文章 `t` **完全相同**，用 `>` 比较会把它们重复取出来。按 `url`/`rid` 去重更稳（工具内部跨页去重用的也是这个键）
 - 单个号一页能取约 20 次群发，展开后通常 70–80 篇
 - `meta.requestsTotal` 仅为本次列表请求尝试数（提前取完会比预告少）；`meta.links.requestsTotal` 是单篇转链尝试数，两者不混算
-- `linkStatus` 为 `short_token`（短链规则生成）、`metadata_url`（单篇元数据生成，未自动在线核验）或 `unresolved`（`url` 为空，附 `linkReason`）。`meta.links.resolved` 按唯一 rid 计数，`unresolved` 按仍缺链的文章行计数；`aborted` 记录批次中止原因，不包含原始 HTML 或临时票据
+- `linkStatus` 为 `short_token`（短链规则生成）、`metadata_url`（单篇元数据生成，未自动在线核验）或 `unresolved`（`url` 为空，附 `linkReason`）。`meta.links.resolved` 按唯一 rid 计数，`unresolved` 按仍缺链的文章行计数；`aborted` 记录转链批次中止原因（含触发的 `rid` 与可能的 `code`），不含原始 HTML 或临时票据，未中止时为 `null`。`linkReason` 区分“请求过但失败”（如 `http_error`、`title_mismatch`）与“批次停止、未尝试”（统一 `not_attempted`）；非法 rid 等不具备请求资格的条目保留 `invalid_review_id`、`conflicting_article` 等自身原因
 - `pageMeta` 逐页记 `{offset, reviews, items, oldest}`，用来核对翻页是不是真的翻动了：三页的 `oldest` 应当**严格递减**
 - 某个号的字段含义：`err` = 这个号**一篇都没取到**；`partialErr` = 翻到第 `pagesFetched+1` 页时停了，**前面的都在 `items` 里**
 

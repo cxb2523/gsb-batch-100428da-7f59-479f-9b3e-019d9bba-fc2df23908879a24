@@ -147,9 +147,89 @@ for (const reply of [
 });
 
 test('列表已有错误时，不能因页面恢复ready而继续单篇转链', async () => {
-  const { result, events } = await harness(batch([item()], { partialErr: 'errCode=-2041' }), []);
+  const rid2 = `${BOOK}_WR${'b'.repeat(73)}`;
+  const { result, events } = await harness(batch([item(RID), item(rid2)], { partialErr: 'errCode=-2041' }), []);
   assert.deepEqual(events, []);
   assert.equal(result.meta.links.aborted.reason, 'list_error');
+  // 一个请求都没发：所有候选都只能是「批次已停止、未尝试」，不许伪装成请求失败
+  assert.ok(result.sources[0].items.every(i => i.linkReason === 'not_attempted'));
+  assert.equal(result.meta.links.unresolved, 2);
+});
+
+test('请求前中止（记账失败/验证码/探针异常）：触发组与后续组一律 not_attempted', async () => {
+  const rid2 = `${BOOK}_WR${'b'.repeat(73)}`;
+  const rid3 = `${BOOK}_WR${'c'.repeat(73)}`;
+  const input = batch([item(RID, 300), item(rid2, 200), item(rid3, 100)]);
+  for (const options of [
+    { record: async () => { throw Error('disk full'); } },
+    { probe: async () => ({ verdict: 'captcha' }) },
+    { probe: async () => { throw Error('closed'); } },
+  ]) {
+    const { result } = await harness(input, [metadata(), metadata(), metadata()], options);
+    const reasons = result.sources[0].items.map(i => i.linkReason);
+    assert.deepEqual(reasons, ['not_attempted', 'not_attempted', 'not_attempted']);
+    assert.ok(result.sources[0].items.every(i => i.linkStatus === 'unresolved'));
+    assert.ok(!JSON.stringify(result.sources).includes('record_failed'),
+      '请求前停手的具体原因只许进 meta.aborted，不能贴在条目上冒充请求失败');
+    assert.ok(result.meta.links.aborted);
+    assert.equal(result.meta.links.requestsTotal, 0);
+    assert.equal(result.meta.links.resolved, 0);
+    assert.equal(result.meta.links.unresolved, 3);
+  }
+});
+
+test('记账在第二篇失败：已补到的链接保留，未请求的 not_attempted，且不补发', async () => {
+  const rid2 = `${BOOK}_WR${'b'.repeat(73)}`;
+  const rid3 = `${BOOK}_WR${'c'.repeat(73)}`;
+  let records = 0;
+  const { result, events } = await harness(
+    batch([item(RID, 300), item(rid2, 200), item(rid3, 100)]),
+    [metadata()],
+    { record: async () => { if (++records === 2) throw Error('disk full'); } }
+  );
+  const [first, second, third] = result.sources[0].items;
+  assert.equal(first.url, ARTICLE_URL);
+  assert.equal(first.linkStatus, 'metadata_url');
+  assert.equal(first.linkReason, undefined);
+  assert.equal(second.linkReason, 'not_attempted');
+  assert.equal(third.linkReason, 'not_attempted');
+  assert.equal(result.meta.links.aborted.reason, 'record_failed');
+  assert.equal(result.meta.links.aborted.rid, rid2);
+  assert.equal(result.meta.links.requestsTotal, 1);
+  assert.equal(result.meta.links.resolved, 1, 'resolved 按唯一 reviewId 计数');
+  assert.equal(result.meta.links.unresolved, 2, 'unresolved 按仍缺链的文章行计数');
+  assert.equal(events.filter(e => e[0] === 'run').length, 1, '账本失败后不得自动补发');
+});
+
+test('请求发出后失败：触发组保留具体原因，其后没排到的组才标 not_attempted', async () => {
+  const rid2 = `${BOOK}_WR${'b'.repeat(73)}`;
+  const rid3 = `${BOOK}_WR${'c'.repeat(73)}`;
+  const { result, events } = await harness(
+    batch([item(RID, 300), item(rid2, 200), item(rid3, 100)]),
+    [metadata(), { ok: false, reason: 'http_error', errCode: 429 }, metadata()]
+  );
+  const [first, second, third] = result.sources[0].items;
+  assert.equal(first.linkStatus, 'metadata_url');
+  assert.equal(second.linkReason, 'http_error', '请求过但失败必须留下具体原因');
+  assert.equal(second.linkStatus, 'unresolved');
+  assert.equal(third.linkReason, 'not_attempted', '未请求的条目不能和请求失败混为一谈');
+  assert.equal(result.meta.links.aborted.reason, 'http_error');
+  assert.equal(result.meta.links.resolved, 1);
+  assert.equal(result.meta.links.unresolved, 2);
+  assert.equal(events.filter(e => e[0] === 'run').length, 2, '即停不重试：第三个请求不许发出');
+});
+
+test('批次中止时，非法 rid 条目保留自身原因，不被 not_attempted 覆盖', async () => {
+  const rid2 = `${BOOK}_WR${'b'.repeat(73)}`;
+  const { result } = await harness(
+    batch([item('bad/rid', 50), item(rid2, 100)]),
+    [],
+    { record: async () => { throw Error('disk full'); } }
+  );
+  const [bad, valid] = result.sources[0].items;
+  assert.equal(bad.linkReason, 'invalid_review_id');
+  assert.equal(valid.linkReason, 'not_attempted');
+  assert.equal(result.meta.links.unresolved, 2);
 });
 
 test('验证码/探针异常或记账失败：请求前停手，不丢原列表', async () => {
