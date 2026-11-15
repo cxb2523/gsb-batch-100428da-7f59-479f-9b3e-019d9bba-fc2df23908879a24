@@ -24,6 +24,7 @@ cocoindex update -L main.py         # Live mode (continuous monitoring)
 ### Testing
 ```bash
 python3 test_results.py             # Run comprehensive tests
+python3 -m unittest test_collection_outcomes.py  # Per-competitor outcome handling (no credentials)
 ```
 
 See [TESTING.md](TESTING.md) for detailed testing procedures.
@@ -45,6 +46,13 @@ Sources → LLM Extraction → Dual Indexing → Query Handlers
    - Searches with query: `"{competitor} AND (funding OR partnership OR product launch OR acquisition OR executive hire)"`
    - Returns clean, full article content (not just snippets)
    - Configurable via `.env`: `COMPETITORS`, `REFRESH_INTERVAL_SECONDS`, `SEARCH_DAYS_BACK`
+   - One source per competitor. A failing search is caught inside the connector
+     and recorded as that competitor's outcome (`failed`/`empty`/`collected`)
+     instead of aborting the update. Outcomes are written to
+     `outcomes.json` in `COMPETITOR_OUTCOME_DIR` by `collection_outcomes.py`,
+     and read back by `run_cocoindex_update` because the parent process only
+     sees the child's `returncode`/`stdout`/`stderr`. Rows missing
+     `published_date` are still ingested with `NO_ORDINAL`.
 
 2. **LLM Extraction** ([main.py:136-164](main.py#L136-L164))
    - `ExtractByLlm` processes article content

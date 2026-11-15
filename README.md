@@ -118,6 +118,13 @@ Run the local and MCP smoke tests:
 python3 -m unittest test_local_intel.py
 ```
 
+Run the per-competitor collection outcome tests (fake Tavily responses, no
+network or credentials needed):
+
+```bash
+python3 -m unittest test_collection_outcomes.py
+```
+
 See [DEMO.md](DEMO.md) for the full agent-first demo script.
 
 ## Production Setup
@@ -272,6 +279,41 @@ python3 competitive_intel.py live \
   --max-results 2 \
   --slug perplexity-glean-live
 ```
+
+#### Per-competitor collection outcomes
+
+Each competitor has its own search source, and one competitor's failure no
+longer aborts the whole round. `run_cocoindex_update` returns one status per
+competitor:
+
+| status | meaning |
+| --- | --- |
+| `collected` | the search succeeded and returned usable articles |
+| `empty` | the search succeeded but returned no articles (no news) |
+| `failed` | the search raised; `failure_reason` says why |
+| `not_run` | the competitor was configured but recorded no outcome |
+
+The result also contains `collection_summary`, `failed_competitors`,
+`empty_competitors`, `not_run_competitors`, `collection_complete` and
+`outcome_file`. Existing fields (`ok`, `returncode`, `effective_config`,
+`missing_env`, `stdout`, `stderr`) keep their meaning: `ok` is still
+`returncode == 0`, while `status`/`partial` describe the competitor-level
+picture. A round where some competitors failed reports `status: "partial"`
+rather than silently succeeding.
+
+Outcomes are written by the `cocoindex update` child process and read back by
+the parent, because the parent only sees `returncode`/`stdout`/`stderr`. They
+live in `<repo>/.cocoindex/collection_outcomes/runs/<run-id>/outcomes.json`
+(or under `COMPETITOR_OUTCOME_DIR` when set), which stays on disk after the run
+for inspection.
+
+Articles without a `published_date` are still ingested; they use the existing
+`NO_ORDINAL` ordering fallback, so the missing date never fails the round.
+
+A failed competitor yields no rows for that round, so articles previously
+indexed for it are dropped while every other competitor stays intact. The
+`failed` status is what distinguishes that gap from a real "no longer covered"
+signal; retry the round to repopulate it.
 
 ### 4. Verify It's Working
 

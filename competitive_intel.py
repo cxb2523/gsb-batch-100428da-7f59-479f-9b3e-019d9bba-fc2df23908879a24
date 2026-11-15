@@ -54,6 +54,47 @@ def run_sample(args: argparse.Namespace) -> int:
     return 0
 
 
+def print_collection_outcomes(update: dict[str, Any]) -> None:
+    """Print each competitor's collection outcome for this round."""
+    competitors = update.get("competitors") or []
+    if not competitors:
+        return
+
+    labels = {
+        "collected": "collected",
+        "empty": "no results",
+        "failed": "REQUEST FAILED",
+        "not_run": "not run",
+    }
+    print("Competitor outcomes:")
+    for outcome in competitors:
+        status = outcome.get("status", "unknown")
+        label = labels.get(status, status)
+        detail = ""
+        if status == "collected":
+            detail = f" ({outcome.get('result_count', 0)} results"
+            missing = outcome.get("missing_published_date_count", 0)
+            if missing:
+                detail += f", {missing} without published_date"
+            detail += ")"
+        elif status == "failed" and outcome.get("failure_reason"):
+            detail = f" - {outcome['failure_reason']}"
+        elif status == "not_run":
+            detail = " - no outcome recorded for this round"
+        print(f"- {outcome.get('competitor', '?')}: {label}{detail}")
+
+    summary = update.get("collection_summary") or {}
+    print(
+        "Collection summary: "
+        f"{summary.get('collected', 0)} collected, "
+        f"{summary.get('empty', 0)} no results, "
+        f"{summary.get('failed', 0)} failed, "
+        f"{summary.get('not_run', 0)} not run"
+    )
+    if update.get("outcome_file"):
+        print(f"Outcome file: {update['outcome_file']}")
+
+
 def run_live(args: argparse.Namespace) -> int:
     event_query = args.event_query or focus_to_event_query(args.focus)
     result = live_demo_check.run_check(
@@ -81,6 +122,8 @@ def run_live(args: argparse.Namespace) -> int:
         if "missing_env" in result:
             print("Missing env: " + ", ".join(result["missing_env"]))
         elif update:
+            if update.get("competitors"):
+                print_collection_outcomes(update)
             stderr = update.get("stderr", "").strip()
             if stderr:
                 print(stderr[-1200:])
@@ -89,6 +132,13 @@ def run_live(args: argparse.Namespace) -> int:
     trends = result.get("trends", {}).get("results", [])
     search = result.get("search", {})
     print(f"Indexed events returned: {search.get('matched_events', 0)}")
+    print_collection_outcomes(update)
+    if update.get("failed_competitors"):
+        print(
+            "Warning: this round completed with partial data. "
+            "Competitors marked REQUEST FAILED were not collected; "
+            "the others were."
+        )
     if trends:
         print("Trending competitors:")
         for row in trends[:5]:

@@ -51,7 +51,7 @@ def run_check(
     dashboard = mcp_server.create_dashboard(
         mode="cocoindex", output_dir=output_dir, slug=f"{slug}-dashboard"
     )
-    return {
+    result = {
         "ok": True,
         "stage": "complete",
         "update": update,
@@ -60,6 +60,14 @@ def run_check(
         "brief": brief,
         "dashboard": dashboard,
     }
+    if update.get("failed_competitors") or update.get("not_run_competitors"):
+        # The round still produced usable artifacts, but the caller must be
+        # told that some competitors were not collected.
+        result["partial"] = True
+        result["failed_competitors"] = update.get("failed_competitors", [])
+        result["not_run_competitors"] = update.get("not_run_competitors", [])
+        result["collection_summary"] = update.get("collection_summary", {})
+    return result
 
 
 def main() -> None:
