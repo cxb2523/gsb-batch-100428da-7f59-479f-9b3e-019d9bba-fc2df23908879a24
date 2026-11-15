@@ -1,0 +1,23 @@
+{
+  "version": 2,
+  "functions": {
+    "api/**/*.js": {
+      "memory": 1024,
+      "maxDuration": 30
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/poster/:title",
+      "destination": "/api/poster/:title"
+    },
+    {
+      "source": "/poster-img/:title.jpg",
+      "destination": "/api/poster-img/:title"
+    },
+    {
+      "source": "/latest-poster.jpg",
+      "destination": "/api/latest-poster"
+    }
+  ]
+}
