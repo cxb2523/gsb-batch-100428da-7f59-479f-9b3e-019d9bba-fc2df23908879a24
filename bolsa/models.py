@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import List
+from typing import List, Optional
 
 from bolsa.constants import (
     ASSET_ACTION_TYPE_MAPPER,
@@ -90,3 +90,18 @@ class BrokerAssetExtract():
         value = value.replace(',', '').replace('.', '')
         value = f'{value[:-2]}.{value[-2:]}'
         return Decimal(value)
+
+
+@dataclass
+class BrokerAccountAssetsExtractResult():
+    """ Result of a single (broker, account) assets extract request.
+
+    A failed request keeps the same shape: ``assets`` is an empty list and
+    ``error`` holds the error message, so one account failing never removes
+    the other accounts' results from the batch.
+    """
+
+    broker_value: str
+    account_id: str
+    assets: List = field(default_factory=lambda: [])
+    error: Optional[str] = None

@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from bs4 import BeautifulSoup
@@ -29,6 +30,17 @@ class B3HttpClient():
         self.password = password
         self.session = session
         self.captcha_service = captcha_service
+        self._login_lock = asyncio.Lock()
+
+    async def _ensure_logged_in(self):
+        # Serializes concurrent requests that find the client logged out,
+        # so the login runs once and its session is reused by every task.
+        if self.IS_LOGGED:
+            return
+
+        async with self._login_lock:
+            if not self.IS_LOGGED:
+                await self.login()
 
     async def login(self):
         async with self.session.get(
@@ -99,8 +111,7 @@ class B3HttpClient():
             return await response.text()
 
     async def get_brokers(self):
-        if not self.IS_LOGGED:
-            await self.login()
+        await self._ensure_logged_in()
 
         logger.info(
             f'B3HttpClient getting brokers - username: {self.username}'
@@ -114,8 +125,7 @@ class B3HttpClient():
         return response
 
     async def get_broker_accounts(self, broker):
-        if not self.IS_LOGGED:
-            await self.login()
+        await self._ensure_logged_in()
 
         default_account = '0'
         start_date = broker.parse_extra_data.start_date
@@ -195,8 +205,7 @@ class B3HttpClient():
         broker_parse_extra_data,
         account_parse_extra_data
     ):
-        if not self.IS_LOGGED:
-            await self.login()
+        await self._ensure_logged_in()
 
         start_date = broker_parse_extra_data.start_date
         end_date = broker_parse_extra_data.end_date

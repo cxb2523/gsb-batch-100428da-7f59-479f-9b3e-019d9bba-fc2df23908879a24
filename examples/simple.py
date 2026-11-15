@@ -28,7 +28,25 @@ async def main():
             brokers=brokers
         )
     )
-    print(assets_extract)
+
+    print(
+        f'Assets extract collected for {len(assets_extract)} '
+        f'broker/account pair(s):'
+    )
+    for result in assets_extract:
+        if result.error:
+            print(
+                f'  broker {result.broker_value} / account '
+                f'{result.account_id}: ERROR - {result.error}'
+            )
+        else:
+            print(
+                f'  broker {result.broker_value} / account '
+                f'{result.account_id}: {len(result.assets)} asset(s)'
+            )
+            for asset in result.assets:
+                print(f'    - {asset}')
+
     await b3_httpclient.session_close()
     await b3_httpclient.connection_close()
 

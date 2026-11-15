@@ -51,7 +51,7 @@ Através da classe de client `B3AsyncBackend`, você terá acesso as seguintes f
 | get_broker_accounts      | broker      |   Através de um broker passado como parâmetro, obtém suas respectivas contas na B3. Retorna um `Broker` com uma lista de `BrokerAccount`. |
 | get_brokers_with_accounts | - | É uma junção entre os métodos `get_brokers` e `get_broker_accounts`. Retorna uma lista de `Broker` com uma lista de `BrokerAccount`. |
 | get_broker_account_portfolio_assets_extract | account_id: Número da conta no broker, broker_value: id do broker, broker_parse_extra_data: dados obtidos junto ao broker, account_parse_extra_data: dados obtidos junto a conta na corretora. | Utilizado para obter todos os dados de ativos consolidados na b3. Retorna uma lista de `BrokerAssetExtract`. |
-| get_brokers_account_portfolio_assets_extract | brokers      | Através dos brokers passados por parâmetro, é obtido uma lista de ativos para cada broker. Retorna uma lista de `BrokerAssetExtract`. |
+| get_brokers_account_portfolio_assets_extract | brokers      | Através dos brokers passados por parâmetro, é feita uma requisição para cada combinação de broker e conta. Retorna uma lista de `BrokerAccountAssetsExtractResult`, um resultado por (broker, conta), contendo o `broker_value`, o `account_id` e a lista de `BrokerAssetExtract` daquela conta. Se uma conta falhar, apenas o seu resultado vem com `assets` vazio e `error` preenchido; as demais contas continuam com seus resultados. Brokers sem conta são ignorados sem erro. |
 
 
 ### Models
@@ -72,6 +72,17 @@ Model responsável pelos dados da conta no broker.
 | Atributo        | Tipo           | Descrição  |
 | :-------------: |:-------------:| -----|
 | id      | str | Número da conta no broker. |
+
+
+#### BrokerAccountAssetsExtractResult
+Resultado da coleta de ativos de uma única combinação de broker e conta.
+
+| Atributo        | Tipo           | Descrição  |
+| :-------------: |:-------------:| -----|
+| broker_value      | str | Identificador da corretora na B3. |
+| account_id      | str      |   Número da conta no broker. |
+| assets | list      |    Lista de `BrokerAssetExtract` da conta; vazia quando a requisição falha. |
+| error | str      |    Mensagem de erro quando a requisição falha; `None` em caso de sucesso. |
 
 
 #### BrokerAssetExtract
