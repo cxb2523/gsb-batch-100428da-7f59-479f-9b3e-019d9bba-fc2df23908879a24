@@ -73,6 +73,17 @@ gphotos-export --headed --backward &     # backward: newest -> oldest
 - EXIF date extraction (falls back to HTML parsing)
 - Organized output: `downloads-2/year/month/filename`
 - Resume support via `.lastdone` / `backward.lastdone` checkpoints
+- Verifiable per-media completion records (`.completed.jsonl` /
+  `backward.completed.jsonl`): each downloaded item logs its cleaned media
+  URL and final disk path. On resume these records are the primary skip
+  source — the checkpoint URL is only a fallback — so a stale or dead
+  checkpoint URL can no longer trigger re-downloads. Appends are locked
+  across the two browser processes and tolerate corrupted lines
+- Safe two-worker rendezvous: each direction stops as soon as it reaches a
+  URL already present in the opposite worker's completion record. Matching
+  uses normalized URLs (Google's `/u/0/` redirect prefix and query
+  parameters are stripped), so the two workers can no longer pass each
+  other and duplicate media
 - Two-worker mode (`--backward`) for ~2x throughput
 - Auto-extracts zip bundles from Google into the right folder
 - Skip list: add URLs to `skiplist.txt` to skip specific items

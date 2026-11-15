@@ -9,6 +9,10 @@ logs/
 .lastdone.tmp
 backward.lastdone
 backward.lastdone.tmp
+.completed.jsonl
+.completed.jsonl.lock
+backward.completed.jsonl
+backward.completed.jsonl.lock
 
 # Python
 __pycache__/

@@ -6,9 +6,15 @@ import os
 import random
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
+
+try:
+    import msvcrt  # Windows
+except ImportError:  # pragma: no cover - platform branch
+    msvcrt = None
 
 
 SESSION_DIR = Path("./session")
@@ -18,12 +24,18 @@ STAGING_DIR = Path("./downloads-2/.staging")
 STAGING_DIR_BACKWARD = Path("./downloads-2/.staging-backward")
 LASTDONE_FILE = Path(".lastdone")
 LASTDONE_FILE_BACKWARD = Path("backward.lastdone")
+# One append-only JSON-lines completion record per direction. Every
+# successfully downloaded media gets one line: {"url", "path", "ts", ...}.
+COMPLETED_FILE = Path(".completed.jsonl")
+COMPLETED_FILE_BACKWARD = Path("backward.completed.jsonl")
 SKIPLIST_FILE = Path("skiplist.txt")
 GOOGLE_PHOTOS_URL = "https://photos.google.com"
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 2
 DOWNLOAD_TIMEOUT = 60
 HUMAN_DELAY_RANGE = (1.0, 3.0)
+# How long to wait on a contended cross-process record lock before giving up.
+LOCK_TIMEOUT_S = 30.0
 
 
 def setup_logging():
@@ -88,8 +100,210 @@ def save_progress(lastdone_path, url):
     os.replace(tmp, lastdone_path)
 
 
+# Per-process locks so threads inside one worker also serialize on a record
+# file. Cross-process safety is provided by the OS file lock in
+# _file_lock(); this dict is keyed by resolved path so two Path objects
+# pointing at the same file share one lock.
+_record_locks = {}
+_record_locks_guard = threading.Lock()
+
+
+def _get_record_lock(lock_path):
+    key = str(lock_path.resolve())
+    with _record_locks_guard:
+        lock = _record_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _record_locks[key] = lock
+        return lock
+
+
+class _file_lock:
+    """Exclusive cross-process advisory lock on a sidecar lock file.
+
+    Uses ``msvcrt.locking`` on Windows and ``fcntl.flock`` on POSIX. The
+    lock file is created next to the record file (``<record>.lock``) so the
+    record itself stays a pure JSONL stream. Acquires with a bounded retry
+    instead of blocking forever on a wedged lock holder.
+    """
+
+    def __init__(self, lock_path, timeout=LOCK_TIMEOUT_S):
+        self.lock_path = lock_path
+        self.timeout = timeout
+        self.fh = None
+
+    def __enter__(self):
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # "a+b" creates the file if missing and never truncates it.
+        self.fh = open(self.lock_path, "a+b")
+        deadline = time.time() + self.timeout
+        while True:
+            try:
+                if msvcrt is not None:
+                    # Lock one byte at the current position; LK_NBLCK raises
+                    # OSError when another process holds the region.
+                    self.fh.seek(0)
+                    msvcrt.locking(self.fh.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError:
+                if time.time() >= deadline:
+                    self.fh.close()
+                    self.fh = None
+                    raise TimeoutError(
+                        f"Timed out waiting for record lock: {self.lock_path}"
+                    )
+                time.sleep(0.05)
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if msvcrt is not None:
+                self.fh.seek(0)
+                msvcrt.locking(self.fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.fh.close()
+            self.fh = None
+
+
+def append_completed(completed_path, url, final_path, extra=None):
+    """Atomically append one completion record for a downloaded media item.
+
+    The record is a single JSON object on one line (JSONL) containing at
+    least:
+
+      * ``url``  — the cleaned media URL (identity key)
+      * ``path`` — the final on-disk path where the file landed
+
+    A timestamp and any ``extra`` fields are included when available. Writes
+    are serialized across processes (OS file lock on ``<record>.lock``) and
+    across threads (an in-process lock), flushed and fsynced before the lock
+    is released, so two workers can never overwrite each other or leave a
+    half-written line.
+    """
+    record = {
+        "url": clean_url(url),
+        "path": str(final_path),
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    if extra:
+        record.update(extra)
+    line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+
+    lock_path = completed_path.with_name(completed_path.name + ".lock")
+    thread_lock = _get_record_lock(lock_path)
+    with thread_lock, _file_lock(lock_path):
+        completed_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(completed_path, "ab") as fh:
+            fh.write(line)
+            fh.flush()
+            os.fsync(fh.fileno())
+    return record
+
+
+def read_completed(completed_path):
+    """Read a completion record file into a ``{cleaned_url: record}`` dict.
+
+    Missing files yield an empty dict. Corrupt or otherwise unparseable
+    lines — truncated JSON, non-object lines, records without a usable
+    ``url``/``path`` — are skipped (one warning each) instead of aborting
+    the resume, so a single bad line never blocks a whole rerun.
+    """
+    log = logging.getLogger("completed")
+    records = {}
+    if not completed_path.exists():
+        return records
+    with open(completed_path, "rb") as fh:
+        for line_no, raw in enumerate(fh, start=1):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                log.warning("Ignoring unparseable line %d in %s", line_no, completed_path)
+                continue
+            if not isinstance(record, dict):
+                log.warning("Ignoring non-object line %d in %s", line_no, completed_path)
+                continue
+            url = record.get("url")
+            path = record.get("path")
+            if not isinstance(url, str) or not url or not isinstance(path, str) or not path:
+                log.warning("Ignoring incomplete record on line %d in %s", line_no, completed_path)
+                continue
+            # Re-clean on read: older records may predate query stripping.
+            records[clean_url(url)] = record
+    return records
+
+
+def completed_urls(completed_path):
+    """Return the set of cleaned media URLs present in a completion record."""
+    return set(read_completed(completed_path).keys())
+
+
+class OtherCompletedIndex:
+    """Lazily refreshed view of the *other* direction's completion record.
+
+    Each worker rendezvous-checks against the record file owned by the
+    opposite worker. Re-reading that whole file on every photo would be
+    O(n²), so the file is only re-parsed when its mtime/size changes —
+    which happens exactly when the other worker appends.
+    """
+
+    def __init__(self, completed_path):
+        self.completed_path = completed_path
+        self._urls = set()
+        self._mtime_ns = None
+        self._size = None
+        self.refresh()
+
+    @property
+    def urls(self):
+        """Current snapshot of the other worker's cleaned URL set."""
+        return self.refresh()
+
+    def refresh(self):
+        try:
+            stat = self.completed_path.stat()
+        except OSError:
+            # File does not exist (other worker hasn't written yet) or is
+            # momentarily inaccessible: treat as empty and retry later.
+            self._mtime_ns = None
+            self._size = None
+            self._urls = set()
+            return self._urls
+        if stat.st_mtime_ns != self._mtime_ns or stat.st_size != self._size:
+            self._mtime_ns = stat.st_mtime_ns
+            self._size = stat.st_size
+            self._urls = completed_urls(self.completed_path)
+        return self._urls
+
+    def contains(self, url):
+        """True if a cleaned ``url`` appears in the other worker's record."""
+        self.refresh()
+        return clean_url(url) in self._urls
+
+    def __contains__(self, url):
+        return self.contains(url)
+
+
 def clean_url(url):
-    return re.sub(r"/u/\d+/", "/", url)
+    """Normalize a Google Photos URL for identity comparison.
+
+    Strips the ``/u/<n>/`` user segment (Google redirects through it at
+    random) plus any query string / fragment, so the same media reached via
+    different redirects compares equal:
+
+        https://photos.google.com/u/0/photo/abc?pli=1 -> https://photos.google.com/photo/abc
+    """
+    url = re.sub(r"/u/\d+/", "/", url)
+    # Drop query string and fragment — they carry no media identity.
+    url = re.split(r"[?#]", url, maxsplit=1)[0]
+    return url.rstrip("/")
 
 
 def get_media_date(file_path):
@@ -162,7 +376,9 @@ def _place_file(src_path, dest_dir, overwrite=False):
             dest = dest_dir / f"{stem} {counter}{src_path.suffix}"
             counter += 1
 
-    src_path.rename(dest)
+    # os.replace (unlike Path.rename) atomically overwrites an existing
+    # destination on both POSIX and Windows.
+    os.replace(src_path, dest)
     return dest
 
 

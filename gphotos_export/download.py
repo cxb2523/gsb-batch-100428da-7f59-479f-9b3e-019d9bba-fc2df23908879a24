@@ -12,14 +12,28 @@ from selenium.webdriver.common.action_chains import ActionChains
 from .utils import (
     create_driver, setup_logging, read_progress, save_progress, clean_url,
     organize_file, wait_for_download, human_delay, load_skiplist,
+    append_completed, read_completed, OtherCompletedIndex,
     SESSION_DIR, SESSION_DIR_BACKWARD, DOWNLOADS_DIR,
     STAGING_DIR, STAGING_DIR_BACKWARD,
-    LASTDONE_FILE, LASTDONE_FILE_BACKWARD, SKIPLIST_FILE,
+    LASTDONE_FILE, LASTDONE_FILE_BACKWARD,
+    COMPLETED_FILE, COMPLETED_FILE_BACKWARD,
+    SKIPLIST_FILE,
     GOOGLE_PHOTOS_URL, MAX_RETRIES, RETRY_BACKOFF_BASE,
     DOWNLOAD_TIMEOUT,
 )
 
 log = logging.getLogger("download")
+
+
+def reached_rendezvous(other_index, current_url):
+    """Rendezvous test: the other worker already finished this media.
+
+    Comparison is done on cleaned URL sets built from the opposite
+    direction's completion record, so Google's ``/u/0/`` redirects and
+    tracking query params can no longer make the two workers pass each
+    other and re-download the same media.
+    """
+    return other_index is not None and other_index.contains(clean_url(current_url))
 
 
 def get_latest_photo(driver):
@@ -166,12 +180,17 @@ def main():
         session_dir = SESSION_DIR_BACKWARD
         staging_dir = STAGING_DIR_BACKWARD
         lastdone_file = LASTDONE_FILE_BACKWARD
+        completed_file = COMPLETED_FILE_BACKWARD
+        # The opposite direction's record — rendezvous is decided against it.
+        other_completed_file = COMPLETED_FILE
         nav_fn = navigate_backward
         mode_label = "BACKWARD"
     else:
         session_dir = SESSION_DIR
         staging_dir = STAGING_DIR
         lastdone_file = LASTDONE_FILE
+        completed_file = COMPLETED_FILE
+        other_completed_file = COMPLETED_FILE_BACKWARD
         nav_fn = navigate_next
         mode_label = "FORWARD"
 
@@ -207,18 +226,32 @@ def main():
     if skiplist:
         log.info("[%s] Loaded %d URLs to skip", mode_label, len(skiplist))
 
+    # Completion records are the primary resume source: anything already on
+    # disk with a record is skipped even if the .lastdone checkpoint is
+    # stale or points at a URL that Google no longer resolves.
+    completed = read_completed(completed_file)
+    if completed:
+        log.info("[%s] Loaded %d completion records from %s",
+                 mode_label, len(completed), completed_file)
+    # Live view of the opposite worker's record for rendezvous detection.
+    other_index = OtherCompletedIndex(other_completed_file)
+    if other_index.urls:
+        log.info("[%s] Opposite worker has %d media recorded",
+                 mode_label, len(other_index.urls))
+
     try:
+        stop_url = None
         if args.backward:
             if start_url is None:
                 start_url = get_latest_photo(driver)
                 log.info("[%s] Starting from latest photo: %s", mode_label, start_url)
-            stop_url = None
-            if LASTDONE_FILE.exists():
-                text = LASTDONE_FILE.read_text().strip()
-                if text:
-                    stop_url = text
-                    log.info("[%s] Will stop at forward worker position: %s", mode_label, stop_url)
+            # Rendezvous with the forward worker is decided by its
+            # completion record (see OtherCompletedIndex), not by a raw
+            # stop URL string — see reached_rendezvous() in the main loop.
         else:
+            # Forward worker still stops at the newest library item; two
+            # forward-style boundaries can't exist, so no record is needed
+            # for this one.
             stop_url = get_latest_photo(driver)
             log.info("[%s] Latest photo: %s", mode_label, stop_url)
 
@@ -227,16 +260,40 @@ def main():
         driver.get(start_url)
         time.sleep(3)
 
-        # Download first photo (overwrite OK — may be resume point).
-        if not args.dry_run:
+        # Rendezvous check before the first download too: on resume the
+        # start URL may already belong to the opposite worker.
+        if reached_rendezvous(other_index, driver.current_url):
+            log.info(
+                "[%s] Rendezvous reached at start — %s is already in the "
+                "opposite worker's completion record; nothing to do.",
+                mode_label, clean_url(driver.current_url),
+            )
+            return
+
+        # Download first photo (overwrite OK — may be resume point), unless
+        # our own completion record proves it is already on disk. The
+        # .lastdone URL remains the fallback when no record exists.
+        if not args.dry_run and clean_url(driver.current_url) not in completed:
             status, path = download_single(driver, staging_dir, DOWNLOADS_DIR, overwrite=True)
             if status == "ok":
                 stats["downloaded"] += 1
                 log.info("[%s] [%d] %s", mode_label, stats["downloaded"], path.name)
+                try:
+                    record = append_completed(
+                        completed_file, driver.current_url, path,
+                        extra={"phase": "start"},
+                    )
+                    completed[record["url"]] = record
+                except Exception as e:
+                    log.warning("[%s] Could not write completion record: %s", mode_label, e)
             elif status == "skipped":
                 stats["skipped"] += 1
             elif status == "failed":
                 stats["failed"] += 1
+        elif not args.dry_run:
+            stats["skipped"] += 1
+            log.info("[%s] Resume point already completed, skipping: %s",
+                     mode_label, clean_url(driver.current_url))
 
         consecutive_errors = 0
         while True:
@@ -255,6 +312,17 @@ def main():
                 log.info("[%s] Reached stop point, done!", mode_label)
                 break
 
+            # Rendezvous: this media is already recorded as downloaded by
+            # the opposite-direction worker. Decided on cleaned URL sets,
+            # so /u/0/ prefixes and query params can't cause a miss.
+            if reached_rendezvous(other_index, current_url):
+                log.info(
+                    "[%s] Rendezvous reached — %s already in opposite "
+                    "worker's completion record (%s); stopping.",
+                    mode_label, clean_url(current_url), other_completed_file,
+                )
+                break
+
             if "photos.google.com" not in current_url:
                 log.error("[%s] Navigated away from Google Photos: %s", mode_label, current_url)
                 log.error("Session may have expired. Re-run gphotos-export-login to log in again.")
@@ -271,10 +339,36 @@ def main():
                 log.error("[%s] Navigation stuck at %s", mode_label, current_url)
                 break
 
+            # Re-check rendezvous against the freshly navigated URL: the
+            # opposite worker may have recorded this media while we were
+            # moving. Precedes the skiplist so we never re-download it.
+            try:
+                if reached_rendezvous(other_index, driver.current_url):
+                    log.info(
+                        "[%s] Rendezvous reached after navigation — %s "
+                        "already in opposite worker's completion record (%s); stopping.",
+                        mode_label, clean_url(driver.current_url), other_completed_file,
+                    )
+                    break
+            except Exception:
+                pass
+
             # Check skiplist.
             try:
                 if clean_url(driver.current_url) in skiplist:
                     log.info("[%s] Skipping (in skiplist): %s", mode_label, driver.current_url)
+                    stats["skipped"] += 1
+                    continue
+            except Exception:
+                pass
+
+            # Primary resume mechanism: if our own completion record shows
+            # this media already landed on disk, skip it without touching
+            # the network. .lastdone only decides where navigation starts.
+            try:
+                if clean_url(driver.current_url) in completed:
+                    log.info("[%s] Skipping (already downloaded per %s): %s",
+                             mode_label, completed_file, driver.current_url)
                     stats["skipped"] += 1
                     continue
             except Exception:
@@ -291,6 +385,13 @@ def main():
                 stats["downloaded"] += 1
                 consecutive_errors = 0
                 log.info("[%s] [%d] %s", mode_label, stats["downloaded"], path.name)
+                # Durable, verifiable completion record before the
+                # checkpoint URL is advanced.
+                try:
+                    record = append_completed(completed_file, driver.current_url, path)
+                    completed[record["url"]] = record
+                except Exception as e:
+                    log.warning("[%s] Could not write completion record: %s", mode_label, e)
             elif status == "skipped":
                 stats["skipped"] += 1
                 consecutive_errors = 0
