@@ -31,7 +31,12 @@
               </el-button>
               <div class="mx-2" style="width: 2px;background: rgba(116,116,116,0.41)">&nbsp;</div>
 
-              <div v-if="flowEditorInited" class="flex">
+              <div v-if="flowEditorInited" class="flex items-center">
+                <el-tooltip effect="dark" placement="bottom" :content="runResultTip">
+                  <div v-if="runResultView.show" class="run-result-tag" :class="'run-result-tag--' + runResultView.status">
+                    {{ runResultView.label }}
+                  </div>
+                </el-tooltip>
                 <el-button size="small" :dark='true' @click="stopFlow" v-if="flowEditor?.store?.flowRunning?.value">
                   <el-icon style="color: red;font-size: 1rem;" class="relative -left-1">
                     <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
@@ -168,7 +173,7 @@
   </div>
 </template>
 <script setup lang="ts">
-import {nextTick, onMounted, provide, reactive, ref} from "vue";
+import {nextTick, onMounted, provide, reactive, ref, computed} from "vue";
 import {FlowEditor} from "@/components/api-flow/engine/editor";
 import {DocumentChecked, FolderOpened, CaretRight, FolderChecked} from "@element-plus/icons-vue";
 import {getTeleport, register} from "@antv/x6-vue-shape";
@@ -274,6 +279,43 @@ function runNodeSelf() {
 function stopFlow() {
   flowEditor?.runner?.stop()
 }
+
+//本次运行的结局展示：成功 / 失败（含出错节点与原因） / 已停止
+const runResultView = computed(() => {
+  //显式依赖编辑器初始化状态，初始化完成后才能跟踪到结局对象的响应式字段
+  if (!flowEditorInited.value) {
+    return {show: false, status: '', label: ''}
+  }
+  const result = flowEditor?.store?.flowRunResult
+  if (!result || !result.finishedAt) {
+    return {show: false, status: '', label: ''}
+  }
+  const labels = {
+    success: t.t('words.run_result_success'),
+    failed: t.t('words.run_result_failed'),
+    stopped: t.t('words.run_result_stopped'),
+  }
+  return {show: true, status: result.status, label: labels[result.status] || ''}
+})
+
+const runResultTip = computed(() => {
+  if (!flowEditorInited.value) {
+    return ''
+  }
+  const result = flowEditor?.store?.flowRunResult
+  if (!result) {
+    return ''
+  }
+  const parts: string[] = []
+  if (result.errorNodeId) {
+    const nodeName = flowEditor?.store?.nodeMap?.[result.errorNodeId]?.name || result.errorNodeId
+    parts.push(`${t.t('words.run_result_error_node')}: ${nodeName}`)
+    parts.push(`${t.t('words.run_result_error_message')}: ${result.errorMessage}`)
+  }
+  parts.push(`${t.t('words.run_result_success_nodes')}: ${result.successNodeIds.length}`)
+  parts.push(`${t.t('words.run_result_not_executed_nodes')}: ${result.notExecutedNodeIds.length}`)
+  return parts.join(' | ')
+})
 
 function showFlowList() {
   flowSelectVisible.value = true
@@ -709,6 +751,28 @@ html.dark {
   border-radius: 0.2rem;
   background: #41414e;
   padding: 0.2rem 0.8rem;
+}
+
+.run-result-tag {
+  font-size: 0.72rem;
+  font-weight: bold;
+  border-radius: 0.2rem;
+  padding: 0.15rem 0.5rem;
+  margin-right: 0.35rem;
+  color: #101014;
+  background: #a6a6b4;
+
+  &--success {
+    background: #7eee7e;
+  }
+
+  &--failed {
+    background: #ff6b6b;
+  }
+
+  &--stopped {
+    background: #ffd166;
+  }
 }
 
 /*边的hover颜色*/

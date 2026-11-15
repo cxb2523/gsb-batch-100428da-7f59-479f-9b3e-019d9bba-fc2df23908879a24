@@ -44,6 +44,13 @@ export const message = {
         "premature_termination_of_process":"premature termination of process",
         "in_processing":"in processing",
         "processing":"processing",
+        "run_result_success":"run succeeded",
+        "run_result_failed":"run failed",
+        "run_result_stopped":"stopped",
+        "run_result_error_node":"error node",
+        "run_result_error_message":"error message",
+        "run_result_success_nodes":"success nodes",
+        "run_result_not_executed_nodes":"not executed nodes",
         add_success: 'add success',
     },
     portTooltip: {

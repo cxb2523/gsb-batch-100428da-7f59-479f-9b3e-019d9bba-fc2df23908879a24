@@ -35,6 +35,8 @@ import type {
     NodeInValueMap,
     NodeState,
     NodeRunState,
+    FlowRunResult,
+    FlowRunError,
 } from "./types";
 import type { Options as GraphOptions } from "@antv/x6/src/graph/options";
 import { computed, type ComputedRef, h, reactive, type Ref, render } from "vue";
@@ -893,92 +895,67 @@ class FlowEditor {
         this.runner.onSetEdgeState = (edgeId, state) => {
             this.render.setEdgeState(edgeId, state);
         };
+        this.runner.onRunStart = () => {
+            this.render.clearEdgesState();
+        };
         //增加配置获取功能
         getSystemConfig()
 
         console.log(this.render.graph);
     }
 
+    //最近一次运行的结局（flowRunResult 为响应式对象，可随运行状态变化）
+    get flowRunResult(): FlowRunResult {
+        return this.store.flowRunResult;
+    }
+
     async runFlowBySignal(handel: (nodeId: string) => any) {
         if (this.store.flowRunning.value) {
             return locales.t('words.in_processing')
         }
-        //清除之前的运行状态
-        this.store.flow.nodes.forEach((node) => {
-            this.store.setNodeRunState(node.id, "none", "");
-            this.render.updateNode(node.id);
-        });
-        this.render.clearEdgesState();
-        this.store.flowRunning.value = true;
         try {
-            await this.runner.run(handel);
-        } catch (e) {
+            //运行开始/结束时由 runner 重置节点状态与结局，这里只负责入口守卫
+            return await this.runner.run(handel);
+        } finally {
             this.store.flowRunning.value = false;
-            throw e;
         }
-        this.store.flowRunning.value = false;
     }
 
     async runFlowLoopBySignal(handel: (nodeId: string) => any) {
         if (this.store.flowRunning.value) {
             return locales.t('words.in_processing')
         }
-        //清除之前的运行状态
-        this.store.flow.nodes.forEach((node) => {
-            this.store.setNodeRunState(node.id, "none", "");
-            this.render.updateNode(node.id);
-        });
-        this.render.clearEdgesState();
         this.store.flowRunning.value = true;
         try {
             while (this.store.flowRunning.value) {
                 await this.runner.run(handel);
             }
-        } catch (e) {
+        } finally {
             this.store.flowRunning.value = false;
-            throw e;
         }
-        this.store.flowRunning.value = false;
+        return copy(this.store.flowRunResult);
     }
 
     async runStartAtNode(nodeId: string, handel: (nodeId: string) => any) {
         if (this.store.flowRunning.value) {
             return locales.t('words.processing');
         }
-        //清除之前的运行状态
-        // this.store.flow.nodes.forEach(node => {
-        //     this.store.setNodeRunState(node.id, 'none', '')
-        //     this.render.updateNode(node.id)
-        // })
-        // this.render.clearEdgesState()
-        this.store.flowRunning.value = true;
         try {
-            await this.runner.runStartAtNode(nodeId, handel);
-        } catch (e) {
+            return await this.runner.runStartAtNode(nodeId, handel);
+        } finally {
             this.store.flowRunning.value = false;
-            throw e;
         }
-        this.store.flowRunning.value = false;
     }
 
     async runNodeSelf(nodeId: string, handel: (nodeId: string) => any) {
         if (this.store.flowRunning.value) {
             return locales.t('words.processing');
         }
-        //清除之前的运行状态
-        // this.store.flow.nodes.forEach(node => {
-        //     this.store.setNodeRunState(node.id, 'none', '')
-        //     this.render.updateNode(node.id)
-        // })
-        // this.render.clearEdgesState()
-        this.store.flowRunning.value = true;
         try {
-            await this.runner.runNodeSelf(nodeId, handel);
-        } catch (e) {
+            return await this.runner.runNodeSelf(nodeId, handel);
+        } finally {
             this.store.flowRunning.value = false;
-            throw e;
         }
-        this.store.flowRunning.value = false;
     }
 
     addNode(node: Node) {
@@ -1043,6 +1020,21 @@ class FlowEditor {
 interface Server extends FlowServerModelType {
 }
 
+//一次运行的初始/空结局
+function createEmptyFlowRunResult(): FlowRunResult {
+    return {
+        status: "idle",
+        startedAt: null,
+        finishedAt: null,
+        errorNodeId: null,
+        errorMessage: null,
+        errors: [],
+        successNodeIds: [],
+        notExecutedNodeIds: [],
+        nodeStates: {},
+    };
+}
+
 class FlowStore {
     stateSync: StateSync;
     workId: string;
@@ -1054,6 +1046,8 @@ class FlowStore {
     sourceRelationMap: { [portId: PortId]: PortId[] } = reactive({});
     targetRelationMap: { [portId: PortId]: PortId } = reactive({});
     flowRunning: { value: boolean } = reactive({ value: false });
+    //本次运行的结局，由 FlowRunner 在运行开始/结束时维护，保留到下一次运行开始时才重置
+    flowRunResult: FlowRunResult = reactive(createEmptyFlowRunResult());
     nodeInputSignalMap: { [nodeId: string]: { [portId: PortId]: boolean } } = {};
     //使用edgeMap来提升性能
     edgeMap: { [edgeId: string]: Edge } = {}
@@ -1236,9 +1230,8 @@ class FlowStore {
     setNodeRunState(nodeId: string, state: NodeRunState, message?: string) {
         let nodeState = this.fineNodeMap[nodeId].states.nodeState;
         nodeState.runState = state;
-        if (state == "error" && message) {
-            nodeState.error.message = message;
-        }
+        //只有错误态才保留错误信息，避免上一次运行的报错信息残留到成功/未执行的节点上
+        nodeState.error.message = state == "error" && message ? message : "";
     }
 }
 
@@ -1258,68 +1251,200 @@ class FlowRunner {
     onSetEdgeState = (edgeId: string, state: "success" | "none"): any => {
     };
 
+    //运行开始时的回调，渲染层用来清理上一次运行的连线高亮
+    onRunStart = (): any => {
+    };
+
+    //是否有一次运行正在进行
+    private running = false;
+    //本次运行是否收到了用户的手动停止请求
+    private stopRequested = false;
+    //本次运行开始前 flowRunning 的值，运行结束时恢复，保证循环运行模式不受影响
+    private flowRunningBeforeRun = false;
+    //正在执行中的节点任务，停止时用于等待它们落定，避免结局与节点状态不一致
+    private pendingNodeRuns = new Set<Promise<any>>();
+    //本次运行的编号，用于丢弃上一轮运行遗留的异步回调结果
+    private runToken = 0;
+    //本次运行的停止信号，stop() 触发它来打断等待
+    private stopSignal: { promise: Promise<void>; resolve: () => void } | null = null;
+
     constructor(store: FlowStore) {
         this.store = store;
+        //默认直接写节点状态，便于不经过渲染层（如本地样例流程）时也能得到一致的节点态与结局
+        this.onSetNodeState = (nodeId, state, message) => {
+            this.store.setNodeRunState(nodeId, state, message);
+        };
+    }
+
+    //最近一次运行（或正在进行的运行）的结局，与 store.flowRunResult 是同一个对象
+    get lastRunResult(): FlowRunResult {
+        return this.store.flowRunResult;
     }
 
     async stop() {
+        //只有确实有运行在进行时，才把它记为“手动停止”，避免空闲时的停止影响上一次结局
+        if (this.running) {
+            this.stopRequested = true;
+        }
         this.store.flowRunning.value = false;
+        this.stopSignal?.resolve();
+    }
+
+    //开始一次新的运行：重置上一轮的结局和所有节点的运行状态，防止旧结局残留
+    private beginRun() {
+        this.running = true;
+        this.stopRequested = false;
+        this.runToken++;
+        //上一轮可能还有未落定的节点任务，本轮不再等待它们
+        this.pendingNodeRuns.clear();
+        this.flowRunningBeforeRun = this.store.flowRunning.value;
+        this.store.flowRunning.value = true;
+        let resolveStop: () => void = () => {
+        };
+        const promise = new Promise<void>((resolve) => {
+            resolveStop = resolve;
+        });
+        this.stopSignal = { promise, resolve: resolveStop };
+
+        const result = this.store.flowRunResult;
+        result.status = "running";
+        result.startedAt = Date.now();
+        result.finishedAt = null;
+        result.errorNodeId = null;
+        result.errorMessage = null;
+        result.errors = [];
+        result.successNodeIds = [];
+        result.notExecutedNodeIds = [];
+        result.nodeStates = {};
+
+        this.store.flow.nodes.forEach((node) => {
+            this.onSetNodeState(node.id, "none");
+        });
+        this.store.nodeInputSignalMap = {};
+        this.onRunStart();
+    }
+
+    //结束本次运行：根据每个节点的最终状态汇总出流程级结局
+    private async finishRun() {
+        //被手动停止时，先在有限时间内等待正在执行的节点自行中止，
+        //这样节点的最终状态能先落地，汇总出来的结局与节点状态不会互相矛盾
+        if (this.stopRequested) {
+            await this.waitPendingNodeRuns(1000);
+        }
+
+        const result = this.store.flowRunResult;
+        const successNodeIds: string[] = [];
+        const errors: FlowRunError[] = [];
+        const notExecutedNodeIds: string[] = [];
+        const nodeStates: { [nodeId: string]: NodeRunState } = {};
+
+        this.store.flow.nodes.forEach((node) => {
+            let nodeState = this.store.fineNodeMap[node.id]?.states?.nodeState;
+            //超时仍未落定的节点视为被打断，归入未执行，不能算成功
+            if (nodeState?.runState === "running") {
+                this.onSetNodeState(node.id, "none");
+                nodeState = this.store.fineNodeMap[node.id]?.states?.nodeState;
+            }
+            const runState = (nodeState?.runState || "none") as NodeRunState;
+            nodeStates[node.id] = runState;
+            if (runState === "success") {
+                successNodeIds.push(node.id);
+            } else if (runState === "error") {
+                errors.push({
+                    nodeId: node.id,
+                    message: nodeState.error?.message || "",
+                });
+            } else {
+                //没跑到的、被停止打断的、以及从未被信号触发的节点都算未执行
+                notExecutedNodeIds.push(node.id);
+            }
+        });
+
+        result.successNodeIds = successNodeIds;
+        result.nodeStates = nodeStates;
+        result.errors = errors;
+        result.errorNodeId = errors.length > 0 ? errors[0].nodeId : null;
+        result.errorMessage = errors.length > 0 ? errors[0].message : null;
+        result.notExecutedNodeIds = notExecutedNodeIds;
+
+        //有节点真正抛错时优先判失败，保证流程级结局与出错节点的错误态一致；否则再看是否被手动停止
+        if (errors.length > 0) {
+            result.status = "failed";
+        } else if (this.stopRequested) {
+            result.status = "stopped";
+        } else {
+            result.status = "success";
+        }
+        result.finishedAt = Date.now();
+
+        //让本次运行遗留的异步回调失效，避免它们在结局汇总之后又改写节点状态
+        this.runToken++;
+        this.stopSignal = null;
+        const stopped = this.stopRequested;
+        this.running = false;
+        this.stopRequested = false;
+        //被停止时保持停止态；正常结束时恢复运行标记，循环运行模式可继续下一轮
+        this.store.flowRunning.value = stopped ? false : this.flowRunningBeforeRun;
+
+        return result;
+    }
+
+    //等待正在执行的节点任务落定，最多等待 timeoutMs 毫秒
+    private async waitPendingNodeRuns(timeoutMs: number) {
+        if (this.pendingNodeRuns.size === 0) {
+            return;
+        }
+        await Promise.race([
+            Promise.allSettled(Array.from(this.pendingNodeRuns)),
+            sleep(timeoutMs),
+        ]);
+    }
+
+    //等待运行被停止（正常结束时由 finishRun 清理）
+    private watchStop(): Promise<void> {
+        if (!this.store.flowRunning.value || !this.stopSignal) {
+            return Promise.resolve();
+        }
+        return this.stopSignal.promise.then(() => undefined);
     }
 
     async run(handel: (nodeId: string) => any) {
-        const checkStop = () => {
-            return new Promise((resolve, reject) => {
-                if (this.store.flowRunning.value) {
-                    const it = setInterval(() => {
-                        if (!this.store.flowRunning.value) {
-                            clearInterval(it);
-                            reject(locales.t('words.premature_termination_of_process'));
-                        }
-                    }, 500);
-                }
-            });
-        };
-        return Promise.race([checkStop(), this.runFlowBySignal(handel)]);
+        this.beginRun();
+        try {
+            await Promise.race([this.watchStop(), this.runFlowBySignal(handel)]);
+        } finally {
+            await this.finishRun();
+        }
+        //返回快照，避免调用方持有的上一次结局被后续运行原地改写
+        return copy(this.store.flowRunResult);
     }
 
     //从某个节点开始执行
     async runStartAtNode(nodeId: string, handel: (nodeId: string) => any) {
-        const checkStop = () => {
-            return new Promise((resolve, reject) => {
-                if (this.store.flowRunning.value) {
-                    const it = setInterval(() => {
-                        if (!this.store.flowRunning.value) {
-                            clearInterval(it);
-                            reject(locales.t('words.premature_termination_of_process'));
-                        }
-                    }, 500);
-                }
-            });
-        };
-        return Promise.race([
-            checkStop(),
-            this.runNodeBySignal(nodeId, handel, false),
-        ]);
+        this.beginRun();
+        try {
+            await Promise.race([
+                this.watchStop(),
+                this.runNodeBySignal(nodeId, handel, false),
+            ]);
+        } finally {
+            await this.finishRun();
+        }
+        return copy(this.store.flowRunResult);
     }
 
     //执行节点自己
     async runNodeSelf(nodeId: string, handel: (nodeId: string) => any) {
-        const checkStop = () => {
-            return new Promise((resolve, reject) => {
-                if (this.store.flowRunning.value) {
-                    const it = setInterval(() => {
-                        if (!this.store.flowRunning.value) {
-                            clearInterval(it);
-                            reject(locales.t('words.premature_termination_of_process'));
-                        }
-                    }, 500);
-                }
-            });
-        };
-        return Promise.race([
-            checkStop(),
-            this.runNodeBySignal(nodeId, handel, false, false),
-        ]);
+        this.beginRun();
+        try {
+            await Promise.race([
+                this.watchStop(),
+                this.runNodeBySignal(nodeId, handel, false, false),
+            ]);
+        } finally {
+            await this.finishRun();
+        }
+        return copy(this.store.flowRunResult);
     }
 
     async runFlowBySignal(handel: (nodeId: string) => any) {
@@ -1348,12 +1473,40 @@ class FlowRunner {
         runOnBeforeSignaled = true,
         runAfterNodes = true
     ) {
+        //登记正在执行的节点任务，手动停止时据此等待节点状态落定
+        const pending = this.runNodeBySignalCore(
+            nodeId,
+            handel,
+            runOnBeforeSignaled,
+            runAfterNodes
+        );
+        this.pendingNodeRuns.add(pending);
+        try {
+            return await pending;
+        } finally {
+            this.pendingNodeRuns.delete(pending);
+        }
+    }
+
+    private async runNodeBySignalCore(
+        nodeId: string,
+        handel: (nodeId: string) => any,
+        runOnBeforeSignaled = true,
+        runAfterNodes = true
+    ) {
+        //记录本次运行编号，本轮结束或被新一轮取代后，遗留回调不再改写状态
+        const token = this.runToken;
         if (!this.store.flowRunning.value) {
             return false;
         }
         // console.log('执行节点', nodeId)
         //防止死循环
         await sleep(10);
+
+        //等待期间可能已经被停止，不再启动新节点
+        if (!this.store.flowRunning.value) {
+            return false;
+        }
 
         const nodeInputSignalMap = this.store.nodeInputSignalMap;
         const fineNod = this.store.fineNodeMap[nodeId];
@@ -1373,8 +1526,22 @@ class FlowRunner {
             //将NODE_IN节点参数的值加上
             resKeys.push("NODE_IN")
         } catch (e) {
-            this.onSetNodeState(nodeId, "error", String(e));
+            //上一轮运行遗留的回调不影响本轮结局与节点状态
+            if (token !== this.runToken) {
+                return;
+            }
+            if (this.stopRequested) {
+                //因手动停止而中断的节点不算失败，归入未执行
+                this.onSetNodeState(nodeId, "none");
+            } else {
+                this.onSetNodeState(nodeId, "error", String(e));
+            }
             console.warn(e);
+            //节点失败或被打断时，不再触发它的下游
+            return;
+        }
+        //本轮已被新的运行取代，丢弃这个结果
+        if (token !== this.runToken) {
             return;
         }
         this.onSetNodeState(nodeId, "success");
@@ -1461,4 +1628,4 @@ class FlowRunner {
     }
 }
 
-export { FlowEditor, FlowStore, FineNode };
+export { FlowEditor, FlowStore, FineNode, FlowRunner };

@@ -44,6 +44,13 @@ export const message = {
         "premature_termination_of_process":"提前终止流程",
         "in_processing":"正在执行",
         "processing":"执行中",
+        "run_result_success":"运行成功",
+        "run_result_failed":"运行失败",
+        "run_result_stopped":"已停止",
+        "run_result_error_node":"出错节点",
+        "run_result_error_message":"错误信息",
+        "run_result_success_nodes":"成功节点",
+        "run_result_not_executed_nodes":"未执行节点",
         add_success: '添加成功',
 
     },

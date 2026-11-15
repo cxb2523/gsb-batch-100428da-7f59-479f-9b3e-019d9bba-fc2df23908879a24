@@ -127,6 +127,33 @@ interface Edge {
 
 type NodeRunState = "running" | "success" | "error" | "none";
 
+//流程一次运行的结局：success=正常跑完，failed=有节点抛错，stopped=用户手动停止，idle/running=尚未开始/正在执行
+type FlowRunStatus = "idle" | "running" | "success" | "failed" | "stopped";
+
+interface FlowRunError {
+    nodeId: string;
+    message: string;
+}
+
+//一次流程运行结束后可核对的结局
+interface FlowRunResult {
+    status: FlowRunStatus;
+    //本次运行开始/结束的时间戳，未开始或未结束时为null
+    startedAt: number | null;
+    finishedAt: number | null;
+    //第一个抛错的节点及其错误信息（仅failed时有值）
+    errorNodeId: string | null;
+    errorMessage: string | null;
+    //本次运行中所有抛错的节点（并行分支可能多于一个）
+    errors: FlowRunError[];
+    //本次运行中执行成功（节点函数正常返回）的节点id
+    successNodeIds: string[];
+    //本次运行中未被信号触发、因而没有执行的节点id（含因上游失败或手动停止而没轮到的节点）
+    notExecutedNodeIds: string[];
+    //每个节点在本次运行结束时的最终状态，便于逐个核对
+    nodeStates: { [nodeId: string]: NodeRunState };
+}
+
 interface NodeState {
     runState: NodeRunState;
     error: { message: string };
@@ -156,6 +183,9 @@ export type {
     NodeInValueMap,
     NodeState,
     NodeRunState,
+    FlowRunStatus,
+    FlowRunError,
+    FlowRunResult,
     SystemConfig
 };
 
