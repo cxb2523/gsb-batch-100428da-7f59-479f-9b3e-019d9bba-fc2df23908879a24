@@ -12,6 +12,13 @@ PAGE_END = 183
 PROJECT_DIR = os.path.dirname(os.path.realpath(__file__))
 OUT_DIR = os.path.join(os.path.join(os.path.abspath(os.path.join(PROJECT_DIR, os.pardir)), "out"))
 CSV_FILE_PATH = os.path.join(OUT_DIR, "apartments.csv")
+# Apartments whose geocoding failed are kept next to the main CSV so they can be retried later
+PENDING_CSV_FILE_PATH = os.path.join(OUT_DIR, "apartments-pending.jsonl")
+
+# geocoding
+GEOCODE_TIMEOUT = 30
+GEOCODE_MIN_DELAY = 2
+GEOCODE_MAX_DELAY = 10
 
 # parsing
 NUM_CRITERIA = 3

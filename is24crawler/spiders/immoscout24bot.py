@@ -1,22 +1,22 @@
-import datetime
 import os
-import random
-from pprint import pprint
-from time import sleep
 
-import requests
 import scrapy
-import utm
 from scrapy.crawler import CrawlerProcess
 from scrapy.utils.project import get_project_settings
 
 from is24crawler import settings
-from is24crawler.apartment import Apartment
+from is24crawler.collect import collect_page, retry_pending, today
+from is24crawler.geocoding import GoogleMapsGeocodingClient
 from is24crawler.resultpage import ResultPage
 
 
 class Immoscout24Bot(scrapy.Spider):
     name = "immoscout24bot"
+
+    def __init__(self, geocoder = None, *args, **kwargs):
+        super(Immoscout24Bot, self).__init__(*args, **kwargs)
+        # injectable so tests can run against faked geocoding responses
+        self.geocoder = geocoder or GoogleMapsGeocodingClient()
 
     def start_requests(self):
         for i in range(settings.PAGE_START, settings.PAGE_END + 1):
@@ -37,97 +37,32 @@ class Immoscout24Bot(scrapy.Spider):
                 "Number of extracted criteria sets ({}) does not match number of extracted addresses ({})".format(
                     len(criteria), len(addresses)))
 
-        coordinates = Immoscout24Bot.get_coordinates(addresses)
-        apartments = Immoscout24Bot.parse_features(criteria, coordinates, addresses)
+        apartments, failures = collect_page(criteria, addresses, today(), self.geocoder)
         page = response.url.split("/")[5][2:]
-        yield ResultPage(apartments = apartments, page = page)
-
-    @staticmethod
-    def parse_features(criteria, coordinates, addresses):
-        """
-        parses all features of an apartment.
-        :param criteria: a list of parsed feature sets for each crawled apartment.
-        :param coordinates: tuples (lat,lng) for each crawled apartment.
-        :param addresses: the addresses for each crawled apartment.
-        :return: a list of feature sets.
-        """
-        parsed = []
-        date = datetime.datetime.now().strftime("%Y-%m-%d")
-        for i in range(len(coordinates)):
-            if len(coordinates[i]) != 2:
-                print("skipping invalid address: '{}'".format(addresses[i]))
-                continue
-
-            criteria_set = criteria[settings.NUM_CRITERIA * i:settings.NUM_CRITERIA * i + settings.NUM_CRITERIA:1]
-            if any('nach Vereinbarung' in x or '-' in x for x in criteria_set):
-                print("skipping invalid criteria set:")
-                pprint(criteria_set)
-                continue
-
-            price = float(criteria_set[0].split()[0].replace('.', '').replace(',', '.'))
-            size = float(criteria_set[1].split()[0].replace(',', '.'))
-            rooms = float(criteria_set[2].replace(',', '.'))
-            lat = coordinates[i][0]
-            lng = coordinates[i][1]
-            utm_coord = utm.from_latlon(lat, lng)
-
-            apartment = Apartment(price = price, size = size, rooms = rooms, address = addresses[i], lat = lat,
-                                  lng = lng, date = date, zone = utm_coord[2], band = utm_coord[3], east = utm_coord[0],
-                                  north = utm_coord[1])
-            parsed.append(apartment)
-        return parsed
-
-    @staticmethod
-    def get_coordinates(addresses):
-        """
-        gets the longitude and latitude for a given address from the google API.
-        :param addresses: a list of addresses.
-        :return: a list of tuples (lat,lng).
-        """
-        coords = []
-        for idx, addr in enumerate(addresses):
-            parts = addr.split(",")
-            if len(parts) != 3:
-                coords.append("incomplete address")
-                continue
-
-            street = parts[0]
-            area = parts[1].replace(")", "").split('(')
-            district = area[0].strip()
-            subdistrict = area[1]
-            city = parts[2].strip()
-
-            if district != subdistrict:  # duplicate params result in ambiguous results
-                request = 'http://maps.google.com/maps/api/geocode/json?address={},+{},+{},+{}'.format(street, district,
-                                                                                                       subdistrict,
-                                                                                                       city)
-            else:
-                request = 'http://maps.google.com/maps/api/geocode/json?address={},+{},+{}'.format(street, district,
-                                                                                                   city)
-
-            if idx > 0:
-                sleep(random.randint(2, 10))  # prevent getting blocked from the google API
-
-            r = requests.get(request)
-            results = r.json()["results"]
-            result_types = list(map(lambda x: ",".join(x["types"]), results))
-            exact_matches_idx = [index for index, value in enumerate(result_types) if
-                                 "street_address" in value or "establishment" in value or "premise" in value]
-
-            if len(exact_matches_idx) != 1:
-                coords.append("ambiguous address")
-            else:
-                idx = exact_matches_idx[0]
-                location = results[idx]["geometry"]["location"]
-                coords.append([location["lat"], location["lng"]])
-        return coords
+        yield ResultPage(apartments = apartments, failures = failures, page = page)
 
 
-os.environ["SCRAPY_SETTINGS_MODULE"] = "is24crawler.settings"
-print("------SETTINGS------ csv path: {}".format(settings.CSV_FILE_PATH))
-print("------SETTINGS------ start page: {}".format(settings.PAGE_START))
-print("------SETTINGS------ end page: {}".format(settings.PAGE_END))
+def run(retry_failed = True):
+    """
+    Runs the crawler and afterwards retries the apartments whose geocoding failed.
+    Failures are tracked in settings.PENDING_CSV_FILE_PATH and can therefore also be
+    retried later by calling ``is24crawler.collect.retry_pending()``.
+    """
+    os.environ["SCRAPY_SETTINGS_MODULE"] = "is24crawler.settings"
+    print("------SETTINGS------ csv path: {}".format(settings.CSV_FILE_PATH))
+    print("------SETTINGS------ pending file: {}".format(settings.PENDING_CSV_FILE_PATH))
+    print("------SETTINGS------ start page: {}".format(settings.PAGE_START))
+    print("------SETTINGS------ end page: {}".format(settings.PAGE_END))
 
-process = CrawlerProcess(get_project_settings())
-process.crawl(Immoscout24Bot)
-process.start()
+    process = CrawlerProcess(get_project_settings())
+    process.crawl(Immoscout24Bot)
+    process.start()
+
+    if retry_failed:
+        summary = retry_pending()
+        print("------RETRY------ retried: {retried}, recovered: {recovered}, still failing: {failed}".format(
+            **summary))
+
+
+if __name__ == "__main__":
+    run()
