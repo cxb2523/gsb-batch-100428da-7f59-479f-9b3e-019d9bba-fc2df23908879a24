@@ -294,6 +294,20 @@ function buildCommand(action: string, payload: Record<string, unknown>): Command
   };
 }
 
+function buildPostCollectionSummary(postCount: number, targetPosts = 20) {
+  return {
+    requestedPosts: postCount,
+    successfulPosts: postCount,
+    failedPosts: 0,
+    failures: [],
+    listing: {
+      targetPosts,
+      collectedPosts: postCount,
+      complete: postCount >= targetPosts,
+    },
+  };
+}
+
 test('primitive.tab.query returns current tab session map', async () => {
   const { chromeApi } = createChromeMock({
     sessionSeed: {
@@ -900,6 +914,7 @@ test('command.run waits for committed tab URL before site validation', async () 
     site: 'reddit.com',
     command: 'getPosts',
     posts: [{ kind: 'content.post', id: 'post-ready', title: 'Ready', author: 'eve' }],
+    summary: buildPostCollectionSummary(1),
   });
 });
 
@@ -988,6 +1003,7 @@ test('command.run executes when authenticated and returns posts', async () => {
     site: 'reddit.com',
     command: 'getPosts',
     posts: [{ kind: 'content.post', id: 'post-hello', title: 'Hello', author: 'alice' }],
+    summary: buildPostCollectionSummary(1),
   });
 });
 
@@ -1134,6 +1150,7 @@ test('command.run getPosts accepts optional minReturnedPosts input', async () =>
     site: 'reddit.com',
     command: 'getPosts',
     posts: [{ kind: 'content.post', id: 'post-min', title: 'Min', author: 'alice' }],
+    summary: buildPostCollectionSummary(1, 35),
   });
 });
 
@@ -1158,6 +1175,7 @@ test('legacy command.reddit_posts action is routed via command runtime', async (
     site: 'reddit.com',
     command: 'getPosts',
     posts: [{ kind: 'content.post', id: 'post-legacy', title: 'Legacy', author: 'bob' }],
+    summary: buildPostCollectionSummary(1),
   });
 });
 
@@ -2814,6 +2832,7 @@ test('command.test falls back to execute when command test hook is absent', asyn
     site: 'reddit.com',
     command: 'getPosts',
     posts: [{ kind: 'content.post', id: 'post-fallback', title: 'Fallback', author: 'zoe' }],
+    summary: buildPostCollectionSummary(1),
   });
 });
 
@@ -2846,6 +2865,7 @@ test('command.test falls back to execute and honors preloadHost compatibility', 
     site: 'reddit.com',
     command: 'getPosts',
     posts: [{ kind: 'content.post', id: 'post-fallback-2', title: 'from fallback execute', author: 'otto' }],
+    summary: buildPostCollectionSummary(1),
   });
 });
 
@@ -2978,6 +2998,7 @@ test('command.test waits for preload document readiness before execute fallback'
     site: 'reddit.com',
     command: 'getPosts',
     posts: [{ kind: 'content.post', id: 'post-ready-test', title: 'Ready in test', author: 'otto' }],
+    summary: buildPostCollectionSummary(1),
   });
 
   const readinessCalls = getExecuteScriptFunctionCalls().filter((name) => name === 'isDocumentReadyForCommandPreload');

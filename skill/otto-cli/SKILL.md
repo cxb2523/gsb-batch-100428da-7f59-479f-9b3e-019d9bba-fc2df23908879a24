@@ -192,16 +192,23 @@ Expected success signals:
 
 #### `getPosts`
 
-Extracts the Reddit feed with configurable post count and optional clipboard permission assist.
+Extracts the Reddit feed by collecting post links from listing pages and then fetching each post detail concurrently.
 
 **Inputs:**
 | Parameter | Type | Default | Notes |
 |---|---|---|---|
-| `minReturnedPosts` | number | `5` | Minimum posts to return (1–200) |
-| `getClipboardPermission` | boolean | `false` | Permission assist mode (1 post, keep alive for user clipboard grant) |
+| `source` | string | `home` | Feed source: `home`, `subreddit`, or `user` |
+| `subreddit` | string | — | Required when `source` is `subreddit` |
+| `username` | string | — | Required when `source` is `user` |
+| `sort` | string | `best` | `best`, `hot`, `new`, `top`, `rising` |
+| `t` | string | `day` | Time filter when `sort` is `top`: `hour`, `day`, `week`, `month`, `year`, `all` |
+| `minReturnedPosts` | number | `20` | Minimum posts to collect (1–100); also used as the listing `limit` |
 
 **Returns:**
-- `content.post[]` — Array of post entities with title, URL, subreddit, score, comment count, award count
+- `posts` — `content.post[]` in feed order (only successfully fetched posts).
+- `summary.requestedPosts` / `summary.successfulPosts` / `summary.failedPosts` — attempted, returned, and failed counts. `requestedPosts = successfulPosts + failedPosts`.
+- `summary.failures` — `{ url, reason, status?, message }[]` for posts whose detail fetch failed after up to 3 retries. `reason` is `rate_limited`, `timeout`, `http_error`, `parse_error`, or `network_error`; `url` is the canonical `www.reddit.com/.../comments/...` link. Empty on full success.
+- `summary.listing` — `{ targetPosts, collectedPosts, complete, failure? }`. When listing pagination fails midway, already-collected links are still fetched and the listing failure is recorded here.
 
 **Example:**
 ```bash

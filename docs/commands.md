@@ -114,6 +114,44 @@ Commands requiring auth never automate credential entry. In `authMode=auto`, run
 | `commentOnPost` | Navigates to post URL; fills `shreddit-composer`; submits top-level comment |
 | `getChatMessages` | Reads Matrix history/sync; can emit stream manifest with `network.http_intercept` |
 
+#### reddit.com getPosts inputs
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `source` | string | `home` | Feed source: `home`, `subreddit`, or `user` |
+| `subreddit` | string | — | Subreddit name without `r/` prefix. Required when `source` is `subreddit` |
+| `username` | string | — | Reddit username without `u/` prefix. Required when `source` is `user` |
+| `sort` | string | `best` | Sort order for `home` and `subreddit`: `best`, `hot`, `new`, `top`, `rising` |
+| `t` | string | `day` | Time filter when `sort` is `top`: `hour`, `day`, `week`, `month`, `year`, `all` |
+| `minReturnedPosts` | number | `20` | Minimum number of posts to collect. Runtime clamps to `1..100` and also uses it as the listing `limit` |
+
+Input validation behavior is unchanged: an unknown `source`, `sort`, or `t` value throws, and `subreddit`/`username` remain mandatory for their respective sources.
+
+#### reddit.com getPosts output semantics
+
+The command returns `{ posts, summary }`:
+
+- `posts` — `content.post` entities appended in feed order. Only posts that were fetched and mapped successfully are included.
+- `summary.requestedPosts` — number of post links collected from the listing stage whose details were attempted.
+- `summary.successfulPosts` — number of posts actually returned (equals `posts.length`).
+- `summary.failedPosts` — number of detail fetches that exhausted retries.
+- `summary.failures` — ordered list of `{ url, reason, status?, message }` for every failed post. `url` is the canonical `www.reddit.com/.../comments/...` URL. `reason` is one of `rate_limited`, `timeout`, `http_error`, `parse_error`, or `network_error`. `status` is present for HTTP-derived failures.
+- `summary.listing` — listing-stage diagnostics: `targetPosts`, `collectedPosts`, `complete`, and an optional `failure` with the same reason/message shape when pagination stopped early.
+
+Listing pagination is best-effort: if a later page fails after earlier pages produced links, the links already collected are still fetched and returned, and `summary.listing.failure` plus `summary.listing.complete=false` record the gap. `requestedPosts` intentionally counts only collected links, so `requestedPosts = successfulPosts + failedPosts` always holds; the shortfall against `targetPosts` is visible through `summary.listing`.
+
+Each post detail fetch is retried up to 3 additional times on retryable failures (429, timeouts, network errors, HTTP 5xx). Non-retryable HTTP statuses (for example 403/404) fail after a single attempt. All-success runs return `failedPosts: 0` with an empty `failures` array.
+
+#### reddit.com getPosts examples
+
+```bash
+# Default home feed, 20 posts
+otto test reddit.com getPosts
+
+# Subreddit top posts for the week, at least 30 posts
+otto test reddit.com getPosts --payload '{"source":"subreddit","subreddit":"programming","sort":"top","t":"week","minReturnedPosts":30}'
+```
+
 ### LinkedIn command notes
 
 | Command | Key behavior |
