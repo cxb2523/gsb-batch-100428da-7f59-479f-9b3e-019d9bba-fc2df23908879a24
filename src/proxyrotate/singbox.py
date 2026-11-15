@@ -440,16 +440,25 @@ class ActivityMonitor:
         Exact — closed connections still contribute to the totals —
         except that it includes the few hundred bytes of ProxyRotate's
         own verification requests.
+
+    Connections created by ProxyRotate's own switch verification are
+    excluded from ``new_connections``: they are recognised by the
+    health-check host in the connection metadata (including the IP-only
+    form, where the host was resolved before the tunnel was opened).
     """
 
     def __init__(self, manager, check_host: str | None = None,
-                 clock=time.monotonic, poll_interval: float = 0.25):
+                 clock=time.monotonic, poll_interval: float = 0.25,
+                 resolver=socket.getaddrinfo):
         from .logging import get_logger
 
         self._manager = manager
         self._clock = clock
         self._poll_interval = poll_interval
         self._check_host = check_host or urlsplit(DEFAULT_CHECK_URL).hostname or ""
+        self._resolver = resolver
+        self._resolved_ips: frozenset[str] | None = None
+        self._resolution_attempted = False
         self._seen: set[str] = set()
         self._last_totals: int | None = None
         self._next_poll_at = 0.0
@@ -473,26 +482,56 @@ class ActivityMonitor:
         try:
             payload = self._manager.connections_payload()
         except Exception as exc:
-            if not self._warned:
-                self._warned = True
-                self.log.warning(
-                    "connection tracking unavailable (%s); "
-                    "request-based rotation degraded", _brief(exc)
-                )
-            else:
-                self.log.debug("connections poll failed: %s", exc)
+            self._warn_tracking_unavailable(exc)
             return
 
+        self._ingest(payload)
+
+    def reset(self) -> None:
+        """Zero pending counters and re-baseline against the current state.
+
+        Called right after a successful switch (including its
+        verification). A fresh ``/connections`` snapshot is taken so that
+
+        * every connection still active from the previous round — the
+          verification tunnel included — joins the seen set and can never
+          be counted again, while IDs appearing afterwards count exactly
+          once; and
+        * the byte totals baseline moves to the value *now* on the wire,
+          so bytes transferred before the reset (verification traffic
+          included) cannot leak into the next round's ``new_bytes``.
+
+        If the activity endpoint is unavailable the existing baselines
+        are kept: they already exclude everything observed so far, and
+        degraded-mode polling resumes without raising.
+        """
+        self._pending_connections = 0
+        self._pending_bytes = 0
+        try:
+            payload = self._manager.connections_payload()
+        except Exception as exc:
+            self._warn_tracking_unavailable(exc)
+            return
+        self._ingest(payload, rebasing=True)
+
+    # -- internals -----------------------------------------------------------
+
+    def _ingest(self, payload: dict, rebasing: bool = False) -> None:
         current_ids: set[str] = set()
         for entry in payload.get("connections") or []:
             cid = entry.get("id")
-            metadata = entry.get("metadata") or {}
-            if metadata.get("host") == self._check_host:
-                continue  # our own health-check traffic
             if cid is None:
                 continue
+            metadata = entry.get("metadata") or {}
+            if self._is_health_check(metadata):
+                continue  # our own switch-verification traffic
             current_ids.add(cid)
-            if cid not in self._seen:
+            if rebasing:
+                # Re-aligning after a switch: connections active now
+                # belong to the previous round and must never be counted,
+                # but stay in the seen set so they cannot be counted later.
+                self._seen.add(cid)
+            elif cid not in self._seen:
                 self._seen.add(cid)
                 self._pending_connections += 1
 
@@ -500,11 +539,53 @@ class ActivityMonitor:
         self._seen &= current_ids
 
         totals = int(payload.get("downloadTotal") or 0) + int(payload.get("uploadTotal") or 0)
-        if self._last_totals is not None:
+        if rebasing or self._last_totals is None:
+            # Establish/move the baseline: totals observed up to now do
+            # not count towards the next round's byte delta.
+            self._last_totals = totals
+        else:
             self._pending_bytes += max(0, totals - self._last_totals)
-        self._last_totals = totals
+            self._last_totals = totals
 
-    def reset(self) -> None:
-        """Zero pending counters after a rotation (baselines stay put)."""
-        self._pending_connections = 0
-        self._pending_bytes = 0
+    def _is_health_check(self, metadata: dict) -> bool:
+        """Whether a /connections entry is ProxyRotate's own verification.
+
+        Clash metadata usually carries the SNI/HTTP host in ``host``;
+        connections whose host was resolved locally can instead show
+        only an IP in ``destinationIP``. Both forms are recognised.
+        """
+        if not self._check_host:
+            return False
+        host = metadata.get("host") or metadata.get("sniffHost") or ""
+        if host and host.rstrip(".").lower() == self._check_host.rstrip(".").lower():
+            return True
+        destination_ip = metadata.get("destinationIP")
+        return bool(
+            destination_ip and destination_ip in self._check_host_ips()
+        )
+
+    def _check_host_ips(self) -> frozenset[str]:
+        # Resolved lazily (only when a metadata entry carries no host)
+        # and cached, including the empty result: a failing DNS lookup
+        # must not add a multi-second stall to every later poll.
+        if not self._resolution_attempted:
+            self._resolution_attempted = True
+            self._resolved_ips = frozenset(self._resolve(self._check_host))
+        return self._resolved_ips or frozenset()
+
+    def _resolve(self, host: str) -> set[str]:
+        try:
+            infos = self._resolver(host, None)
+        except OSError:
+            return set()
+        return {info[4][0] for info in infos}
+
+    def _warn_tracking_unavailable(self, exc: Exception) -> None:
+        if not self._warned:
+            self._warned = True
+            self.log.warning(
+                "connection tracking unavailable (%s); "
+                "request-based rotation degraded", _brief(exc)
+            )
+        else:
+            self.log.debug("connections poll failed: %s", exc)

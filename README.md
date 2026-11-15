@@ -193,7 +193,7 @@ proxyrotate --every 0 --mb 50 opencode          # only after 50 MB
 proxyrotate --every 30 --requests 10 --mb 100 curl https://example.com
 ```
 
-* `--requests` counts **new sing-box tunnels** (connections), not HTTP requests inside TLS. Long-lived keep-alive tunnels count once; very short tunnels may be missed between polls. Traffic to `www.gstatic.com` (health-check) is excluded. For exact usage-based rotation, prefer `--mb`.
+* `--requests` counts **new sing-box tunnels** (connections), not HTTP requests inside TLS. Long-lived keep-alive tunnels count once; very short tunnels may be missed between polls. ProxyRotate's own switch-verification traffic (the `www.gstatic.com` health check, including connections reported by IP after local DNS resolution) is excluded, so the connection threshold reflects only the target command. After every switch the monitor re-baselines against the live `/connections` snapshot: connections already active cannot be recounted and the byte-total baseline moves to the current value. For exact usage-based rotation, prefer `--mb`.
 * `--mb` is exact (Δ of `downloadTotal + uploadTotal`).
 
 ### Failed Proxies & Cooldown

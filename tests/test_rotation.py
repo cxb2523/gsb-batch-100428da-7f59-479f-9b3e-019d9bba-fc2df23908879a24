@@ -1,4 +1,5 @@
 import threading
+import time
 
 import pytest
 
@@ -363,6 +364,90 @@ class TestRotator:
                     poll_interval=0.005)
         # Backed off instead of hammering the dead proxy.
         assert any(t and t >= 1.0 for t in waits)
+
+    def test_fallback_waits_pool_retry_delay_cooldown(self):
+        # Two proxies: proxy-0 active; when rotation triggers, proxy-1
+        # fails verification and the selector is restored to proxy-0.
+        # The loop must then sleep for the pool's cooldown, not re-fire
+        # immediately on the already-satisfied connection threshold.
+        manager = FakeManager(fail_verify=("proxy-1",))
+        clock = FakeClock()
+        pool = ProxyPool([p(1), p(2)], cooldown=30, clock=clock)
+        monitor = RecordingMonitor()
+        rotator = Rotator(
+            manager, pool,
+            ConnectionsRotationStrategy(max_connections=1),
+            activity_monitor=monitor,
+        )
+        assert rotator.select_initial() == 0
+        monitor.delta = ActivityDelta(new_connections=5)  # threshold hit
+
+        waits: list[float] = []
+
+        class ScriptedEvent:
+            """Never set; records requested wait durations."""
+
+            def wait(self, timeout=None):
+                waits.append(timeout)
+                return False
+
+            def is_set(self):
+                return False
+
+        iterations = {"n": 0}
+
+        def app_running():
+            iterations["n"] += 1
+            # One full loop iteration is enough to reach the back-off.
+            return iterations["n"] <= 2
+
+        rotator.run(app_running=app_running, stop_event=ScriptedEvent(),
+                    poll_interval=0.0)
+
+        # proxy-1 was tried once and marked failed...
+        assert pool.in_cooldown(p(2))
+        expected = pool.retry_delay()
+        assert expected > 0
+        # ...and the loop cooled down for exactly that long (the other
+        # recorded wait is the zero-length poll cadence), rather than
+        # retrying immediately at the satisfied connection threshold.
+        cooldown_waits = [t for t in waits if t and t > 0.0]
+        assert cooldown_waits == [expected]
+        # Failed rotation did not trigger a second candidate sweep.
+        assert manager.selected == ["proxy-0", "proxy-1", "proxy-0"]
+
+    def test_cooldown_wait_wakes_early_on_stop_event(self):
+        manager = FakeManager(fail_verify=("proxy-1",))
+        clock = FakeClock()
+        pool = ProxyPool([p(1), p(2)], cooldown=300, clock=clock)
+        rotator = Rotator(
+            manager, pool,
+            ConnectionsRotationStrategy(max_connections=1),
+            activity_monitor=RecordingMonitor(),
+        )
+        assert rotator.select_initial() == 0
+        rotator.activity_monitor.delta = ActivityDelta(new_connections=9)
+
+        stop_event = threading.Event()
+
+        def app_running():
+            return True
+
+        def stop_soon():
+            # Wake the loop well inside the 300s cooldown.
+            stop_event.wait(0.2)
+            stop_event.set()
+
+        thread = threading.Thread(target=stop_soon, daemon=True)
+        thread.start()
+        started = time.monotonic()
+        rotator.run(app_running=app_running, stop_event=stop_event,
+                    poll_interval=0.0)
+        elapsed = time.monotonic() - started
+        thread.join(timeout=2)
+        # Returned promptly instead of sitting out the full cooldown.
+        assert elapsed < 5.0
+        assert stop_event.is_set()
 
 
 class TestActivityDrivenRotation:

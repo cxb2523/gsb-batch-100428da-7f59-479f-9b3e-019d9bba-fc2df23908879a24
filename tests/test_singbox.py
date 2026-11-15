@@ -1,4 +1,5 @@
 import json
+import socket
 import stat
 from urllib.error import HTTPError, URLError
 
@@ -139,12 +140,26 @@ class ScriptedConnectionsManager:
         return item
 
 
-def conn(cid, host="api.example.com"):
-    return {"id": cid, "metadata": {"host": host}, "upload": 0, "download": 0}
+def conn(cid, host="api.example.com", **metadata):
+    meta = {"host": host}
+    meta.update(metadata)
+    return {"id": cid, "metadata": meta, "upload": 0, "download": 0}
+
+
+def fake_resolver(mapping):
+    """Build a getaddrinfo-style resolver from a host -> [ips] map."""
+
+    def resolve(host, port):
+        if host not in mapping:
+            raise socket.gaierror(f"no address for {host}")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, 0))
+                for ip in mapping[host]]
+
+    return resolve
 
 
 class TestActivityMonitor:
-    def make(self, payloads):
+    def make(self, payloads, resolver=None):
         import proxyrotate.singbox as sb
 
         state = {"now": 100.0}
@@ -156,7 +171,12 @@ class TestActivityMonitor:
             state["now"] += seconds
 
         mgr = ScriptedConnectionsManager(payloads)
-        monitor = sb.ActivityMonitor(mgr, check_host="www.gstatic.com", clock=clock)
+        monitor = sb.ActivityMonitor(
+            mgr, check_host="www.gstatic.com", clock=clock,
+            resolver=resolver or fake_resolver(
+                {"www.gstatic.com": ["203.0.113.7"]}
+            ),
+        )
         return monitor, mgr, advance
 
     def test_counts_new_connection_ids_once(self):
@@ -197,6 +217,123 @@ class TestActivityMonitor:
         monitor.poll()
         # verify traffic bytes remain in global totals (documented, tiny)
         assert monitor.activity.new_bytes == 500
+
+    def test_verification_connection_by_destination_ip_ignored(self):
+        # sing-box may report the resolved IP instead of the host when
+        # the local client (our verifier) resolved the name itself.
+        monitor, mgr, advance = self.make([
+            {"connections": [
+                conn("v", host="", destinationIP="203.0.113.7"),
+                conn("a"),
+             ],
+             "downloadTotal": 0, "uploadTotal": 0},
+            {"connections": [
+                conn("v2", host="", destinationIP="203.0.113.7"),
+                conn("a"),
+             ],
+             "downloadTotal": 0, "uploadTotal": 0},
+        ])
+        monitor.poll()
+        assert monitor.activity.new_connections == 1     # only a counted
+        advance(1)
+        monitor.poll()
+        assert monitor.activity.new_connections == 1     # v2 filtered too
+
+    def test_verification_connection_by_sniff_host_ignored(self):
+        monitor, mgr, advance = self.make([
+            {"connections": [
+                conn("v", host="", sniffHost="www.gstatic.com"),
+                conn("a"),
+             ],
+             "downloadTotal": 0, "uploadTotal": 0},
+        ])
+        monitor.poll()
+        assert monitor.activity.new_connections == 1
+
+    def test_unrelated_destination_ip_is_counted(self):
+        monitor, mgr, advance = self.make([
+            {"connections": [
+                conn("x", host="", destinationIP="198.51.100.9"),
+             ],
+             "downloadTotal": 0, "uploadTotal": 0},
+        ])
+        monitor.poll()
+        assert monitor.activity.new_connections == 1
+
+    def test_dns_failure_does_not_block_or_crash(self):
+        resolver = fake_resolver({})  # nothing resolvable
+        monitor, mgr, advance = self.make([
+            {"connections": [conn("x", host="", destinationIP="203.0.113.7")]},
+            {"connections": [conn("x", host="", destinationIP="203.0.113.7")]},
+        ], resolver=resolver)
+        monitor.poll()
+        advance(1)
+        monitor.poll()  # no retry storm: failed lookup is cached empty
+        assert mgr.calls == 2
+        # Without a usable IP match the connection simply counts normally.
+        assert monitor.activity.new_connections == 1
+
+    def test_reset_rebases_seen_set_against_live_connections(self):
+        # First round: one target connection and one verification tunnel
+        # still active at reset time.
+        monitor, mgr, advance = self.make([
+            {"connections": [conn("a")], "downloadTotal": 100, "uploadTotal": 0},
+            # reset() snapshot: "a" still open plus the verifier tunnel
+            {"connections": [conn("a"),
+                             conn("v", host="www.gstatic.com")],
+             "downloadTotal": 700, "uploadTotal": 0},
+            # next poll: a and v remain, a brand-new target tunnel appears
+            {"connections": [conn("a"),
+                             conn("v", host="www.gstatic.com"),
+                             conn("b")],
+             "downloadTotal": 900, "uploadTotal": 0},
+        ])
+        monitor.poll()
+        assert monitor.activity.new_connections == 1
+        advance(1)
+        monitor.reset()
+        assert monitor.activity.new_connections == 0
+        assert monitor.activity.new_bytes == 0
+        advance(1)
+        monitor.poll()
+        # "a" predates the reset and must not be double-counted; the
+        # verification tunnel never counts; only "b" is new.
+        assert monitor.activity.new_connections == 1
+        # byte baseline moved to 700 at reset: only the 200 after counts.
+        assert monitor.activity.new_bytes == 200
+
+    def test_reset_baseline_excludes_pre_reset_bytes(self):
+        monitor, mgr, advance = self.make([
+            {"connections": [], "downloadTotal": 1000, "uploadTotal": 0},
+            {"connections": [], "downloadTotal": 2500, "uploadTotal": 0},
+            {"connections": [], "downloadTotal": 2600, "uploadTotal": 0},
+        ])
+        monitor.poll()
+        advance(1)
+        monitor.reset()                              # rebased at 2500
+        assert monitor.activity.new_bytes == 0
+        advance(1)
+        monitor.poll()
+        assert monitor.activity.new_bytes == 100
+
+    def test_reset_with_unavailable_endpoint_keeps_baselines(self):
+        monitor, mgr, advance = self.make([
+            {"connections": [conn("a")], "downloadTotal": 100, "uploadTotal": 0},
+            RuntimeError("api down"),
+            {"connections": [conn("a"), conn("b")],
+             "downloadTotal": 300, "uploadTotal": 0},
+        ])
+        monitor.poll()
+        advance(1)
+        monitor.reset()                              # warns, does not raise
+        assert monitor.activity.new_connections == 0
+        assert monitor.activity.new_bytes == 0
+        advance(1)
+        monitor.poll()
+        # Old baseline still valid: "a" was already seen, "b" is new;
+        # byte delta is measured from the last successful total (100).
+        assert monitor.activity.new_connections == 1
+        assert monitor.activity.new_bytes == 200
 
     def test_reset_zeroes_and_rebases(self):
         monitor, mgr, advance = self.make([

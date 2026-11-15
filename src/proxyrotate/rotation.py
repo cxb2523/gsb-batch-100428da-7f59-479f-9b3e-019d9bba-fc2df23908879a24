@@ -258,6 +258,16 @@ class Rotator:
             if self.rotate_once():
                 started = time.monotonic()
             else:
+                # Every candidate failed and the selector fell back to
+                # the previous proxy. Wait out the pool's cooldown — not
+                # the ordinary poll cadence — so a time threshold cannot
+                # re-trigger an immediate retry. retry_delay() reports 0
+                # when no proxy is marked cooling (e.g. a single-proxy
+                # pool); keep a small floor instead of busy-looping.
                 delay = max(self.pool.retry_delay(), 1.0)
-                self.log.debug("no eligible proxy; retrying in %.1fs", delay)
-                stop_event.wait(delay)
+                self.log.debug("no eligible proxy; cooling down %.1fs", delay)
+                if stop_event.wait(delay):
+                    break
+                # Start a fresh timing window after the cooldown so the
+                # time-based threshold cannot already be satisfied.
+                started = time.monotonic()
