@@ -34,29 +34,39 @@ http://localhost:3000/list/daily  // 代表今日 可选参数：weekly,monthly
 http://localhost:3000/list/daily/JavaScript  // 代表今日的 JavaScript 分类 可选参数：任意语言
 ```
 
-稍微等待即可看到爬取完毕的返回数据：
+稍微等待即可看到爬取完毕的返回数据（`data` 中榜单条目字段保持原样）：
 ```
-[
- {
-  "title": "lib-pku / libpku",
-  "links": "https://github.com/lib-pku/libpku",
-  "description": "贵校课程资料民间整理",
-  "language": "JavaScript",
-  "stars": "14,297",
-  "forks": "4,360",
-  "info": "3,121 stars this week"
- },
- {
-  "title": "SqueezerIO / squeezer",
-  "links": "https://github.com/SqueezerIO/squeezer",
-  "description": "Squeezer Framework - Build serverless dApps",
-  "language": "JavaScript",
-  "stars": "3,212",
-  "forks": "80",
-  "info": "2,807 stars this week"
- },
- ...
-]
+{
+ "outcome": "success",   // 结局标记：success / cache / empty / error / invalid_time
+ "cached": false,        // 是否来自缓存
+ "data": [
+  {
+   "title": "lib-pku / libpku",
+   "links": "https://github.com/lib-pku/libpku",
+   "description": "贵校课程资料民间整理",
+   "language": "JavaScript",
+   "stars": "14,297",
+   "forks": "4,360",
+   "info": "3,121 stars this week"
+  },
+  ...
+ ]
+}
+```
+
+## 缓存与结局标记
+- 响应统一为 JSON 对象，`outcome` 字段标明本次请求结局：
+  - `success`：实时抓取并解析成功；
+  - `cache`：来自未过期缓存（上游失败时若存在未过期缓存也会回退返回缓存）；
+  - `empty`：页面取到但解析出零条目（与上游失败区分）；
+  - `error`：上游请求失败（网络错误或非 2xx）且无可用缓存，HTTP 502；
+  - `invalid_time`：`time` 不是 `daily` / `weekly` / `monthly`，HTTP 400，不发起上游抓取。
+- 缓存按 `time + language` 组合区分，默认有效期 5 分钟，有效期内不重复请求上游。
+- 单个条目解析异常时跳过该条目，保留其余条目。
+
+## 测试
+```
+npm test   // 使用 node:test，假上游页面 + 假请求，不访问真实 GitHub
 ```
 
 ## More
