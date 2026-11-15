@@ -1,0 +1,13 @@
+*.log
+*.pyc
+*.egg-info/
+__pycache__/
+.idea/
+build/
+dist/
+job_dir/
+.coverage
+.pytest_cache/
+.ruff_cache/
+.venv/
+.tox/
