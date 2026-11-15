@@ -3,6 +3,7 @@ import json
 import base64
 import urllib.parse
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 
 import requests
@@ -30,6 +31,13 @@ SUPPORTED_COUNTRIES = [
 ]
 
 
+class PageOutcome(Enum):
+    """Outcome of scraping a single search page."""
+    SUCCESS = 'success'    # page fetched and items parsed
+    FAILED = 'failed'      # request/parse error, still failing after retries
+    EMPTY = 'empty'        # page fetched but 0 items parsed
+
+
 def make_scrapingant_request(target_url, rapidapi_key, js_snippet=None, proxy_country=None):
     print(f'getting page {target_url}')
     headers = {
@@ -48,6 +56,7 @@ def make_scrapingant_request(target_url, rapidapi_key, js_snippet=None, proxy_co
         data=json.dumps(request_data),
         headers=headers
     )
+    r.raise_for_status()
     return r.text
 
 
@@ -82,30 +91,72 @@ def extract_data_from_html(page_html):
     return items_data_list
 
 
-@retry(stop=stop_after_attempt(3), retry_error_callback=lambda _: list())
+@retry(stop=stop_after_attempt(3))
 def extract_items_from_url(url_string, rapidapi_key, country):
+    """Fetch one page and parse items.
+
+    Raises the underlying exception if the request/parse still fails after
+    retries. A successfully fetched page with no items returns an empty
+    list, so callers can distinguish "still failing" from "genuinely empty".
+    """
     js_snippet = """
     window.scrollTo(0,document.body.scrollHeight);
     await new Promise(r => setTimeout(r, 5000));
     """  # scroll to the end of page and sleep 5 seconds to wait lazy load complete
     page_html = make_scrapingant_request(url_string, rapidapi_key, js_snippet=js_snippet, proxy_country=country)
-    data = extract_data_from_html(page_html)
-    assert data
-    return data
+    return extract_data_from_html(page_html)
+
+
+def fetch_page(page_number, page_url, rapidapi_key, country):
+    """Scrape one page, returning (PageOutcome, items).
+
+    Never raises: request/parse errors become PageOutcome.FAILED, a page
+    without items becomes PageOutcome.EMPTY.
+    """
+    try:
+        items = extract_items_from_url(page_url, rapidapi_key, country)
+    except Exception as exc:
+        print(f'page {page_number}: request/parse failed after retries: {exc!r}')
+        return PageOutcome.FAILED, []
+    if not items:
+        return PageOutcome.EMPTY, []
+    return PageOutcome.SUCCESS, items
 
 
 def get_search_results(search_string, rapidapi_key, pages, country):
+    """Scrape up to `pages` search pages.
+
+    Returns (items_list, page_reports). page_reports is a list of dicts
+    {'page', 'outcome', 'count'} — one entry per attempted page, so every
+    page's fate is auditable. Stops paginating at the first FAILED or EMPTY
+    page; items already collected are always preserved.
+    """
     search_params = urllib.parse.urlencode({'SearchText': search_string})
     search_url = f'https://www.alibaba.com/trade/search?{search_params}'
-    items_list = extract_items_from_url(search_url, rapidapi_key, country)
-    if items_list:
-        for page in range(2, pages + 1):
-            page_url = f'{search_url}&page={page}'
-            new_items = extract_items_from_url(page_url, rapidapi_key, country)
-            if not new_items:
-                break
-            items_list.extend(new_items)
-    return items_list
+    items_list = []
+    page_reports = []
+    for page in range(1, pages + 1):
+        page_url = search_url if page == 1 else f'{search_url}&page={page}'
+        outcome, new_items = fetch_page(page, page_url, rapidapi_key, country)
+        page_reports.append({'page': page, 'outcome': outcome, 'count': len(new_items)})
+        if outcome is not PageOutcome.SUCCESS:
+            # First page failed -> abort the run; a later page failed/empty ->
+            # keep what we have and stop. Either way: do not continue.
+            break
+        items_list.extend(new_items)
+    return items_list, page_reports
+
+
+def print_run_summary(page_reports, total_items):
+    """Print a per-page summary plus totals that must add up."""
+    print('\n===== Per-page summary =====')
+    for report in page_reports:
+        print(f"page {report['page']}: {report['outcome'].value} ({report['count']} items)")
+    success_pages = sum(1 for r in page_reports if r['outcome'] is PageOutcome.SUCCESS)
+    failed_pages = sum(1 for r in page_reports if r['outcome'] is PageOutcome.FAILED)
+    empty_pages = sum(1 for r in page_reports if r['outcome'] is PageOutcome.EMPTY)
+    print(f'successful pages: {success_pages}, failed pages: {failed_pages}, '
+          f'empty pages: {empty_pages}, total items: {total_items}')
 
 
 @click.command()
@@ -117,10 +168,11 @@ def get_search_results(search_string, rapidapi_key, pages, country):
 @click.option("--country", type=click.Choice(SUPPORTED_COUNTRIES, case_sensitive=False),
               default="us", help="Country of proxies location ")
 def main(search_string, rapidapi_key, pages, country):
-    results = get_search_results(search_string, rapidapi_key, pages, country)
+    results, page_reports = get_search_results(search_string, rapidapi_key, pages, country)
+    print_run_summary(page_reports, len(results))
     if results:
         header = ['item_url', 'listing_title', 'seller_name', 'store_url', 'price', 'image_url', 'seller_location']
-        filename = f'data/{search_string}_{datetime.now()}.csv'
+        filename = f'data/{search_string}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
         Path("data/").mkdir(parents=True, exist_ok=True)
         with open(filename, "w", newline="") as f:
             cw = csv.DictWriter(f, header, delimiter='\t', quotechar='|', quoting=csv.QUOTE_MINIMAL)
