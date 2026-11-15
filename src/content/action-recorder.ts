@@ -65,13 +65,32 @@ const DEFAULT_OPTIONS: ActionRecorderOptions = {
 type InputEndedBy = NonNullable<ActionRecord["inputBatch"]>["endedBy"];
 type DragEventKind = NonNullable<ActionRecord["dragDrop"]>["events"][number];
 
+/**
+ * A passive candidate (input batch, hover, scroll) has exactly one terminal
+ * transition: it is either completed (the input batch is flushed into a record,
+ * or a hover/scroll is promoted by a DOM/network result) or cancelled (pointer
+ * left, quiet window expired, replaced, recording stopped).
+ *
+ * The outcome is claimed on the candidate itself before its lifecycle event is
+ * emitted, so both racing directions are safe: a result that arrives after a
+ * cancellation finds a settled candidate and is ignored instead of producing a
+ * late record, and a repeated result for an already promoted candidate cannot
+ * produce a second record.
+ */
+type CandidateOutcome = "completed" | "cancelled";
+
+interface CandidateSettlement {
+  /** `null` while live; set by the candidate's single terminal transition. */
+  settled: CandidateOutcome | null;
+}
+
 interface InputBeforeSnapshot {
   value: string;
   domBefore: DomCapture;
   inputType: string;
 }
 
-interface InputBatchState {
+interface InputBatchState extends CandidateSettlement {
   token: CandidateToken;
   target: Element;
   domBefore: DomCapture;
@@ -83,7 +102,7 @@ interface InputBatchState {
   files?: { name: string; type: string; sizeBytes: number }[];
 }
 
-interface HoverCandidate {
+interface HoverCandidate extends CandidateSettlement {
   token: CandidateToken;
   target: Element;
   domBefore: DomCapture;
@@ -92,7 +111,7 @@ interface HoverCandidate {
   thresholdTimer: ReturnType<typeof setTimeout>;
 }
 
-interface ScrollCandidate {
+interface ScrollCandidate extends CandidateSettlement {
   token: CandidateToken;
   target: Element;
   domBefore: DomCapture;
@@ -263,48 +282,64 @@ export class ActionRecorder {
   }
 
   notifyCandidateResult(result: CandidateResult): void {
-    if (this.hoverCandidate !== null) {
-      const candidate = this.hoverCandidate;
-      this.clearHoverCandidate();
+    // Only a candidate that is still live and unsettled may be promoted. A
+    // candidate that was already cancelled has no owner for this result, and a
+    // candidate that was already promoted must not yield a second record when
+    // the same result is delivered again.
+    const hover = this.takeHoverCandidate("completed");
+    if (hover !== null) {
       this.emit(
         {
           type: "hover",
           occurredAt: this.options.now(),
-          modifiers: candidate.modifiers,
+          modifiers: hover.modifiers,
           hover: {
-            dwellMs: Math.max(0, this.options.now() - candidate.startedAt),
+            dwellMs: Math.max(0, this.options.now() - hover.startedAt),
             thresholdMs: this.options.hoverDwellThresholdMs,
             promotedBy: result,
           },
         },
-        candidate.domBefore,
+        hover.domBefore,
         true,
-        candidate.token,
+        hover.token,
       );
     }
-    if (this.scrollCandidate !== null) {
-      const candidate = this.scrollCandidate;
-      this.clearScrollCandidate();
+    const scroll = this.takeScrollCandidate("completed");
+    if (scroll !== null) {
       this.emit(
         {
           type: "scroll",
           occurredAt: this.options.now(),
           modifiers: { ...EMPTY_MODIFIERS },
           scroll: {
-            fromX: candidate.fromX,
-            fromY: candidate.fromY,
-            toX: candidate.toX,
-            toY: candidate.toY,
-            ...(isDocumentScroller(this.documentValue, candidate.target)
+            fromX: scroll.fromX,
+            fromY: scroll.fromY,
+            toX: scroll.toX,
+            toY: scroll.toY,
+            ...(isDocumentScroller(this.documentValue, scroll.target)
               ? {}
-              : { containerLocators: createDomLocators(candidate.target) }),
+              : { containerLocators: createDomLocators(scroll.target) }),
           },
         },
-        candidate.domBefore,
+        scroll.domBefore,
         true,
-        candidate.token,
+        scroll.token,
       );
     }
+  }
+
+  /**
+   * Claim a candidate's one terminal transition. Returns false when the
+   * candidate was already settled, so a repeated result notification or a
+   * cancellation racing a promotion can never add a second record or a second
+   * lifecycle event for the same candidate.
+   */
+  private claimSettlement(candidate: CandidateSettlement, outcome: CandidateOutcome): boolean {
+    if (candidate.settled !== null) {
+      return false;
+    }
+    candidate.settled = outcome;
+    return true;
   }
 
   private listen(type: string, listener: EventListener): void {
@@ -452,6 +487,7 @@ export class ActionRecorder {
         inputType,
         batchStartedAt: now,
         batchEndedAt: now,
+        settled: null,
         ...(files === undefined ? {} : { files }),
       };
       this.emitCandidateLifecycle({
@@ -492,13 +528,22 @@ export class ActionRecorder {
     }, this.options.inputQuietWindowMs);
   }
 
+  /** Take the live input batch and settle it in one step; see takeHoverCandidate. */
+  private takeInputBatch(outcome: CandidateOutcome): InputBatchState | null {
+    const batch = this.inputBatch;
+    if (batch === null || !this.claimSettlement(batch, outcome)) {
+      return null;
+    }
+    this.inputBatch = null;
+    return batch;
+  }
+
   private flushInput(endedBy: InputEndedBy): void {
     if (this.inputTimer !== null) {
       clearTimeout(this.inputTimer);
       this.inputTimer = null;
     }
-    const batch = this.inputBatch;
-    this.inputBatch = null;
+    const batch = this.takeInputBatch("completed");
     if (batch === null) {
       return;
     }
@@ -579,6 +624,7 @@ export class ActionRecorder {
       startedAt,
       modifiers: modifiersOf(event),
       thresholdTimer,
+      settled: null,
     };
     this.emitCandidateLifecycle({
       kind: "started",
@@ -596,18 +642,34 @@ export class ActionRecorder {
     }
   };
 
+  /**
+   * Take a live hover candidate and settle it in one step. Returns null when
+   * the candidate is absent or was already settled, which is what makes a late
+   * result after cancellation and a repeated result after promotion no-ops.
+   */
+  private takeHoverCandidate(outcome: CandidateOutcome): HoverCandidate | null {
+    const candidate = this.hoverCandidate;
+    if (candidate === null || !this.claimSettlement(candidate, outcome)) {
+      return null;
+    }
+    this.hoverCandidate = null;
+    clearTimeout(candidate.thresholdTimer);
+    return candidate;
+  }
+
   private clearHoverCandidate(
     reason?: Extract<CandidateLifecycleObservation, { kind: "cancelled" }>[
       "reason"
     ],
   ): void {
-    if (this.hoverCandidate !== null) {
-      const token = this.hoverCandidate.token;
-      clearTimeout(this.hoverCandidate.thresholdTimer);
-      this.hoverCandidate = null;
-      if (reason !== undefined) {
-        this.emitCandidateLifecycle({ kind: "cancelled", token, type: "hover", reason });
-      }
+    const candidate = this.takeHoverCandidate("cancelled");
+    if (candidate !== null && reason !== undefined) {
+      this.emitCandidateLifecycle({
+        kind: "cancelled",
+        token: candidate.token,
+        type: "hover",
+        reason,
+      });
     }
   }
 
@@ -644,6 +706,7 @@ export class ActionRecorder {
         toX: current.x,
         toY: current.y,
         quietTimer,
+        settled: null,
       };
       this.emitCandidateLifecycle({
         kind: "started",
@@ -663,18 +726,33 @@ export class ActionRecorder {
     this.scrollPositions.set(target, current);
   };
 
+  /**
+   * Take a live scroll candidate and settle it in one step; see the hover
+   * counterpart for why a null result must suppress the record.
+   */
+  private takeScrollCandidate(outcome: CandidateOutcome): ScrollCandidate | null {
+    const candidate = this.scrollCandidate;
+    if (candidate === null || !this.claimSettlement(candidate, outcome)) {
+      return null;
+    }
+    this.scrollCandidate = null;
+    clearTimeout(candidate.quietTimer);
+    return candidate;
+  }
+
   private clearScrollCandidate(
     reason?: Extract<CandidateLifecycleObservation, { kind: "cancelled" }>[
       "reason"
     ],
   ): void {
-    if (this.scrollCandidate !== null) {
-      const token = this.scrollCandidate.token;
-      clearTimeout(this.scrollCandidate.quietTimer);
-      this.scrollCandidate = null;
-      if (reason !== undefined) {
-        this.emitCandidateLifecycle({ kind: "cancelled", token, type: "scroll", reason });
-      }
+    const candidate = this.takeScrollCandidate("cancelled");
+    if (candidate !== null && reason !== undefined) {
+      this.emitCandidateLifecycle({
+        kind: "cancelled",
+        token: candidate.token,
+        type: "scroll",
+        reason,
+      });
     }
   }
 

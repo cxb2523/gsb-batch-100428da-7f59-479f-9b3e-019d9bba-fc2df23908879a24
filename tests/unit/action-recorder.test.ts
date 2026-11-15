@@ -65,6 +65,32 @@ describe("ActionRecorder", () => {
     return { recorder, observations };
   };
 
+  /** Recorder plus the raw lifecycle trail, for candidate terminal-state tests. */
+  const startLifecycleRecorder = (): {
+    recorder: ActionRecorder;
+    observations: CapturedActionObservation[];
+    lifecycle: CandidateLifecycleObservation[];
+  } => {
+    const observations: CapturedActionObservation[] = [];
+    const lifecycle: CandidateLifecycleObservation[] = [];
+    const recorder = new ActionRecorder(
+      document,
+      (observation) => {
+        observations.push(observation);
+      },
+      {
+        onCandidateLifecycle: (observation) => {
+          lifecycle.push(observation);
+          if (observation.kind === "completed") {
+            observations.push(observation.observation);
+          }
+        },
+      },
+    );
+    recorder.start();
+    return { recorder, observations, lifecycle };
+  };
+
   it("captures click pointer data, modifiers and explicit checkbox state", () => {
     const { recorder, observations } = startRecorder();
     const checkbox = requireElement("#remember", HTMLInputElement);
@@ -279,6 +305,152 @@ describe("ActionRecorder", () => {
       kind: "completed",
       observation: { action: { type: "hover" }, candidate: true },
     });
+  });
+
+  it("ignores a hover result that arrives after the candidate was cancelled", () => {
+    const { recorder, observations, lifecycle } = startLifecycleRecorder();
+    const menu = requireElement("#hover-menu", HTMLDivElement);
+
+    menu.dispatchEvent(new Event("pointerenter", { bubbles: true }));
+    menu.dispatchEvent(new Event("pointerleave", { bubbles: true }));
+    recorder.notifyCandidateResult("dom_change");
+    recorder.notifyCandidateResult("network_request");
+
+    expect(observations).toHaveLength(0);
+    expect(lifecycle.map((item) => item.kind)).toEqual(["started", "cancelled"]);
+    expect(lifecycle[1]).toMatchObject({
+      kind: "cancelled",
+      type: "hover",
+      reason: "pointer_leave",
+    });
+    recorder.stop();
+  });
+
+  it("ignores a scroll result that arrives after the quiet-window cancellation", () => {
+    const { recorder, observations, lifecycle } = startLifecycleRecorder();
+    const scrollbox = requireElement("#scrollbox", HTMLDivElement);
+
+    scrollbox.scrollTop = 30;
+    scrollbox.dispatchEvent(new Event("scroll", { bubbles: true }));
+    vi.advanceTimersByTime(800);
+    recorder.notifyCandidateResult("dom_change");
+
+    expect(observations).toHaveLength(0);
+    expect(lifecycle.at(-1)).toMatchObject({
+      kind: "cancelled",
+      type: "scroll",
+      reason: "quiet_window",
+    });
+    recorder.stop();
+  });
+
+  it("ignores repeated results for a hover candidate that was already promoted", () => {
+    const { recorder, observations, lifecycle } = startLifecycleRecorder();
+    const menu = requireElement("#hover-menu", HTMLDivElement);
+
+    menu.dispatchEvent(new Event("pointerenter", { bubbles: true }));
+    recorder.notifyCandidateResult("dom_change");
+    recorder.notifyCandidateResult("dom_change");
+    recorder.notifyCandidateResult("network_request");
+
+    expect(observations.map((item) => item.action.type)).toEqual(["hover"]);
+    expect(observations[0]?.action.hover?.promotedBy).toBe("dom_change");
+    expect(lifecycle.filter((item) => item.kind === "completed")).toHaveLength(1);
+    expect(lifecycle.filter((item) => item.kind === "cancelled")).toHaveLength(0);
+    recorder.stop();
+  });
+
+  it("ignores repeated results for a scroll candidate that was already promoted", () => {
+    const { recorder, observations, lifecycle } = startLifecycleRecorder();
+    const scrollbox = requireElement("#scrollbox", HTMLDivElement);
+
+    scrollbox.scrollTop = 40;
+    scrollbox.dispatchEvent(new Event("scroll", { bubbles: true }));
+    recorder.notifyCandidateResult("network_request");
+    recorder.notifyCandidateResult("network_request");
+    recorder.notifyCandidateResult("dom_change");
+
+    expect(observations.map((item) => item.action.type)).toEqual(["scroll"]);
+    expect(observations[0]?.action.scroll?.toY).toBe(40);
+    expect(lifecycle.filter((item) => item.kind === "completed")).toHaveLength(1);
+    expect(lifecycle.filter((item) => item.kind === "cancelled")).toHaveLength(0);
+    recorder.stop();
+  });
+
+  it("ignores results that repeat after an input candidate was completed", () => {
+    const { recorder, observations, lifecycle } = startLifecycleRecorder();
+    const query = requireElement("#query", HTMLInputElement);
+
+    query.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText" }));
+    vi.advanceTimersByTime(800);
+    recorder.notifyCandidateResult("dom_change");
+    recorder.notifyCandidateResult("network_request");
+
+    expect(observations.map((item) => item.action.type)).toEqual(["input"]);
+    expect(lifecycle.filter((item) => item.kind === "completed")).toHaveLength(1);
+    recorder.stop();
+  });
+
+  it("does not attribute a result to a hover candidate replaced by a later scroll", () => {
+    const { recorder, observations, lifecycle } = startLifecycleRecorder();
+    const menu = requireElement("#hover-menu", HTMLDivElement);
+    const scrollbox = requireElement("#scrollbox", HTMLDivElement);
+
+    menu.dispatchEvent(new Event("pointerenter", { bubbles: true }));
+    scrollbox.scrollTop = 25;
+    scrollbox.dispatchEvent(new Event("scroll", { bubbles: true }));
+    recorder.notifyCandidateResult("dom_change");
+    recorder.notifyCandidateResult("dom_change");
+
+    expect(observations.map((item) => item.action.type)).toEqual(["scroll"]);
+    expect(
+      lifecycle.map((item) => [
+        item.kind,
+        item.kind === "completed" ? item.observation.action.type : item.type,
+        item.kind === "cancelled" ? item.reason : undefined,
+      ]),
+    ).toEqual([
+      ["started", "hover", undefined],
+      ["cancelled", "hover", "replaced_by_candidate"],
+      ["started", "scroll", undefined],
+      ["completed", "scroll", undefined],
+    ]);
+    recorder.stop();
+  });
+
+  it("records exactly one hover observation on the normal promotion path", () => {
+    const { recorder, observations, lifecycle } = startLifecycleRecorder();
+    const menu = requireElement("#hover-menu", HTMLDivElement);
+
+    menu.dispatchEvent(new Event("pointerenter", { bubbles: true }));
+    recorder.notifyCandidateResult("dom_change");
+    menu.dispatchEvent(new Event("pointerleave", { bubbles: true }));
+    recorder.stop();
+
+    expect(observations.map((item) => item.action.type)).toEqual(["hover"]);
+    expect(observations[0]?.candidate).toBe(true);
+    expect(lifecycle.map((item) => item.kind)).toEqual(["started", "completed"]);
+    const startedToken = lifecycle[0]?.token;
+    expect(startedToken).toBeDefined();
+    expect(lifecycle.map((item) => item.token)).toEqual([startedToken, startedToken]);
+  });
+
+  it("ignores a late result for a candidate cancelled by the next action", () => {
+    const { recorder, observations, lifecycle } = startLifecycleRecorder();
+    const menu = requireElement("#hover-menu", HTMLDivElement);
+    const dragSource = requireElement("#drag-source", HTMLDivElement);
+
+    menu.dispatchEvent(new Event("pointerenter", { bubbles: true }));
+    dragSource.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    recorder.notifyCandidateResult("dom_change");
+
+    expect(observations.map((item) => item.action.type)).toEqual(["click"]);
+    expect(lifecycle.at(-1)).toMatchObject({
+      kind: "cancelled",
+      type: "hover",
+      reason: "replaced_by_action",
+    });
+    recorder.stop();
   });
 
   it("starts an input candidate before the quiet-window action is emitted", () => {
