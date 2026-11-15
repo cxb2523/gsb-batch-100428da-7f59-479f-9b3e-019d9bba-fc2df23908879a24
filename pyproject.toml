@@ -1,0 +1,28 @@
+[project]
+name = "kuryana"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "beautifulsoup4>=4.15.0",
+    "fastapi[standard]>=0.162.7",
+    "lxml>=6.1.3",
+    "msgspec>=0.22.0",
+    "primp>=2.0.1",
+]
+
+[dependency-groups]
+dev = ["mypy>=2.4.1", "pytest>=9.2.0", "ruff>=0.17.5"]
+
+
+[tool.ruff]
+line-length = 88
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["C", "E", "F", "W", "B", "B9"]
+ignore = ["E501", "E203"]
+
+[tool.pytest.ini_options]
+markers = ["live: calls the real MyDramaList site (needs network, can break when MDL changes)"]

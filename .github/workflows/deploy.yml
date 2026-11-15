@@ -1,0 +1,29 @@
+name: Deployment
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  deployment:
+    # only deploy pushes to main that passed CI, not PRs or failed runs
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    environment: deploy
+    steps:
+      - name: deploy
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USERNAME }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          # the VPS shell is fish: keep this plain commands joined with `&&`
+          # (works in fish and bash, and stops at the first failure)
+          script: |
+            cd ${{ secrets.FOLDER_PATH }} &&
+              git checkout main &&
+              git pull origin main &&
+              docker compose up -d --build
