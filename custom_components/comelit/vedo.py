@@ -1,0 +1,317 @@
+"""Platform for sensor integration."""
+
+import json
+import logging
+from threading import Thread
+import time
+
+from homeassistant.components.alarm_control_panel import AlarmControlPanelState
+from homeassistant.const import STATE_OFF, STATE_ON
+import requests
+from wrapt_timeout_decorator import timeout
+
+from custom_components.comelit.alarm_control_panel import VedoAlarm
+from custom_components.comelit.binary_sensor import VedoSensor
+from custom_components.comelit.exception import (
+    CookieException,
+    VedoDataException,
+    VedoLoginException,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+DEFAULT_HEADERS = {
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Accept-Language": "it-IT,it;q=0.8,en-US;q=0.5,en;q=0.3",
+}
+
+DEFAULT_TIMEOUT = 10
+ARM_DISARM_ATTEMPT = 5
+
+
+class VedoRequest:
+    ZONE_STAT = "user/zone_stat.json"
+    AREA_STAT = "user/area_stat.json"
+    ZONE_DESC = "user/zone_desc.json"
+    AREA_DESC = "user/area_desc.json"
+    LOGIN = "login.cgi"
+    ACTION = "action.cgi"
+
+
+# Manage the Comelit Vedo Central. Fetches the alarm status and the motion status.
+class ComelitVedo:
+    def __init__(self, host, port, password, scan_interval, expose_bin_sensors):
+        """Initialize the sensor."""
+        _LOGGER.info(f"Initialising ComelitVedo with host {host}, port {port}")
+        self.sensors = {}
+        self.areas = {}
+        self.host = host
+        self.port = port
+        self.password = password
+        self.expose_bin_sensors = expose_bin_sensors
+        self.vedo_updater = SensorUpdater("Thread#BS", scan_interval, self)
+
+    def start(self):
+        self.vedo_updater.start()
+
+    # Build the HTTP request
+    def build_http(self, headers, uid, path):
+        if headers is None:
+            headers = {}
+
+        headers["User-Agent"] = (
+            "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:78.0) Gecko/20100101 Firefox/78.0"
+        )
+        headers["X-Requested-With"] = "XMLHttpRequest"
+        headers["Accept"] = "*/*"
+        headers["Connection"] = "keep-alive"
+
+        if uid is not None:
+            headers["Cookie"] = uid
+
+        millis = int(round(time.time() * 1000))
+        # The Vedo central only serves plain HTTP on the local network.
+        base_url = f"http://{self.host}:{self.port}"  # NOSONAR
+        separator = "&" if "?" in path else "?"
+        url = f"{base_url}/{path}{separator}_={millis}"
+        return url, headers
+
+    # Do the GET from the vedo IP
+    @timeout(DEFAULT_TIMEOUT, use_signals=True)
+    def get(self, uid, path, is_response):
+        _LOGGER.info(f"Running GET with uid {uid}, path {path}")
+        url, headers = self.build_http(None, uid, path)
+        _LOGGER.info(f"GET: url {url}, headers {headers}")
+        response = requests.get(url, headers=headers, timeout=DEFAULT_TIMEOUT)
+        response.raise_for_status()
+        text = response.content.decode("iso-8859-1").encode("utf-8")
+        if is_response:
+            payload = json.loads(text)
+            return payload
+        return text
+
+    # Do the POST to the vedo IP
+    @timeout(DEFAULT_TIMEOUT, use_signals=True)
+    def post(self, url, params, headers):
+        response = requests.post(
+            url, data=params, headers=headers, timeout=DEFAULT_TIMEOUT
+        )
+        return response
+
+    # Do the login. Raise an exception if not able to get the cookie
+    def login(self):
+        headers = DEFAULT_HEADERS.copy()
+        url, headers = self.build_http(headers, None, VedoRequest.LOGIN)
+        params = {"code": self.password}
+        response = self.post(url, params, headers)
+        response.raise_for_status()
+        if response.status_code == 200:
+            uid = response.headers.get("set-cookie")
+            if uid is not None:
+                _LOGGER.debug("Logged in, %s", response.text)
+                return uid
+            _LOGGER.warning("Error doing the login %s", response.text)
+            raise VedoLoginException("Unable to obtain the cookie")
+        _LOGGER.error("Bad login response! - %s", response.text)
+        return None
+
+    # Do the logout. Ignore errors
+    def logout(self, uid):
+        if uid is None:
+            return
+
+        try:
+            headers = DEFAULT_HEADERS.copy()
+            url, headers = self.build_http(headers, uid, VedoRequest.LOGIN)
+            params = {"logout": 1}
+            self.post(url, params, headers)  # Ignore the error
+        except Exception:
+            pass
+
+    # Arm/Disarm the alarm. Try 5 times
+    def arm_disarm(self, key, id):
+        for i in range(1, ARM_DISARM_ATTEMPT + 1):
+            try:
+                uid = self.login()
+                path = f"{VedoRequest.ACTION}?vedo=1&{key}={id}&force=1"
+                self.get(uid, path, False)
+                _LOGGER.info("Armed/Disarmed the area %s", id)
+                self.logout(uid)
+                break
+            except Exception as e:
+                if i == ARM_DISARM_ATTEMPT:
+                    _LOGGER.exception("Error arming/disarming %s %s", id, e)
+                else:
+                    _LOGGER.exception("Error arming/disarming. Trying again.")
+
+            time.sleep(DEFAULT_TIMEOUT)
+
+    # arm the alarm
+    def arm(self, id):
+        _LOGGER.info("Arming the area %s", id)
+        self.arm_disarm("tot", id)
+
+    def arm_night(self, id):
+        _LOGGER.info("Night mode armed for area %s", id)
+        self.arm_disarm("p1", id)
+
+    # disarm the alarm
+    def disarm(self, id):
+        _LOGGER.info("Disarming the area %s", id)
+        self.arm_disarm("dis", id)
+
+    # update the binary motion detection sensor
+    def update_sensor(self, s):
+        if s is None:
+            return
+        try:
+            sensor_id = s["id"]
+            name = s["name"]
+            zone_status = int(s["status"], 16)
+            if (zone_status & 1) != 0:
+                state = STATE_ON
+            else:
+                state = STATE_OFF
+            if sensor_id not in self.sensors:
+                # Add new sensor
+                if hasattr(self, "binary_sensor_add_entities"):
+                    sensor = VedoSensor(sensor_id, name, state)
+                    self.binary_sensor_add_entities([sensor])
+                    self.sensors[sensor_id] = sensor
+                    _LOGGER.info(
+                        "added the binary sensor %s %s", name, sensor.entity_name
+                    )
+            else:
+                # update existing sensor
+                self.sensors[sensor_id].update_state(state)
+                _LOGGER.debug("updated the binary sensor %s", name)
+        except Exception as e:
+            _LOGGER.exception("Error updating the sensor %s", e)
+
+    # update the alarm area
+    def update_area(self, area):
+        _LOGGER.debug(f"Updating the alarm area {area}")
+        try:
+            area_id = area["id"]
+            name = area["name"]
+            if area["armed"] == 4:
+                state = AlarmControlPanelState.ARMED_AWAY
+            elif area["armed"] == 1:
+                state = AlarmControlPanelState.ARMED_NIGHT
+            else:
+                state = AlarmControlPanelState.DISARMED
+
+            if area_id not in self.areas:
+                if hasattr(self, "alarm_add_entities"):
+                    alarm_area = VedoAlarm(area_id, name, state, self)
+                    self.alarm_add_entities([alarm_area])
+                    self.areas[area_id] = alarm_area
+                    _LOGGER.info(
+                        "added the alarm area %s %s", name, alarm_area.entity_name
+                    )
+            else:
+                self.areas[area_id].update_state(state)
+                _LOGGER.debug("updated the alarm area %s", name)
+
+        except Exception as e:
+            _LOGGER.exception("Error updating the alarm area %s", e)
+
+
+# Update the binary sensors
+class SensorUpdater(Thread):
+    def __init__(self, name, scan_interval, vedo: ComelitVedo):
+        Thread.__init__(self)
+        self.name = name
+        self._scan_interval = scan_interval
+        self._vedo = vedo
+        self._active = True
+        self._uid = None
+
+    # Invalidate the uid
+    def logout(self):
+        if self._vedo is not None:
+            self._vedo.logout(self._uid)
+        self._uid = None
+
+    # Polls the sensors
+    def run(self):
+        _LOGGER.debug("Comelit Vedo status snapshot started")
+        self._uid = None
+
+        while self._active:
+            try:
+                if self._uid is None:
+                    self._uid = self._vedo.login()
+                    if self._uid is None:
+                        continue
+                self.poll()
+            except CookieException:
+                self.logout()
+            except Exception as e:
+                _LOGGER.exception("Error getting data! %s", e)
+                self.logout()
+            finally:
+                time.sleep(self._scan_interval)
+
+    # Fetch the zones and the areas and update the entities
+    def poll(self):
+        zone_desc = self._vedo.get(self._uid, VedoRequest.ZONE_DESC, True)
+        zone_status = self._vedo.get(self._uid, VedoRequest.ZONE_STAT, True)
+        areas_desc = self._vedo.get(self._uid, VedoRequest.AREA_DESC, True)
+        areas_stat = self._vedo.get(self._uid, VedoRequest.AREA_STAT, True)
+
+        zone_statuses = zone_status["status"].split(",")
+        if len(zone_desc["in_area"]) != len(zone_statuses) or len(
+            areas_desc["description"]
+        ) != len(areas_stat["ready"]):
+            raise VedoDataException("error getting area")
+
+        sensors = self.parse_zones(zone_desc, zone_statuses)
+
+        if self._vedo.expose_bin_sensors:
+            for sensor in sensors:
+                self._vedo.update_sensor(sensor)
+
+        for area in self.parse_areas(areas_desc, areas_stat):
+            self._vedo.update_area(area)
+
+    # Build the sensors of the zones assigned to an area
+    @staticmethod
+    def parse_zones(zone_desc, zone_statuses):
+        sensors = []
+        for i, value in enumerate(zone_desc["in_area"]):
+            if value == "Not logged":
+                raise CookieException("cookie expired")
+
+            if value != 0:
+                sensor_dict = {
+                    "index": i,
+                    "id": i,
+                    "name": zone_desc["description"][i],
+                    "status": zone_statuses[i],
+                }
+                _LOGGER.debug(f"Updating the zone {sensor_dict}")
+                sensors.append(sensor_dict)
+        return sensors
+
+    # Build the alarm areas
+    @staticmethod
+    def parse_areas(areas_desc, areas_stat):
+        desc_fields = ("p1_pres", "p2_pres")
+        stat_fields = (
+            "ready",
+            "armed",
+            "alarm",
+            "alarm_memory",
+            "sabotage",
+            "anomaly",
+            "in_time",
+            "out_time",
+        )
+        areas = []
+        for i, name in enumerate(areas_desc["description"]):
+            area = {"name": name, "id": i}
+            area.update({field: areas_desc[field][i] for field in desc_fields})
+            area.update({field: areas_stat[field][i] for field in stat_fields})
+            areas.append(area)
+        return areas

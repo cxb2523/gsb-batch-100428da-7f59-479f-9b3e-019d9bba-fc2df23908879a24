@@ -1,0 +1,14 @@
+version: '2.4'
+
+services:
+  homeassistant:
+    image: homeassistant/home-assistant:latest
+    container_name: homeassistant
+    networks:
+      default: { }
+    ports:
+      - "8123:8123"
+      - "5678:5678"
+    volumes:
+      - ../custom_components/comelit:/config/custom_components/comelit
+      - ./configuration.yaml:/config/configuration.yaml
