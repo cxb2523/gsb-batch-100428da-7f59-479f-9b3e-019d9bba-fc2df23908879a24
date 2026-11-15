@@ -41,3 +41,15 @@ Click this badge for the process demo ? [![Workflow Video](https://img.shields.i
 - The csv file is encoded in utf-8
 - Unfortunately this version(1.0) has no pause button nor multithreading, So the iteration of 1200 books or above will take some significant amount of time and if stopped it will again iterate from beginning, duplicating files into csv.
 - I have not tested the iteration over 1200 books, So any issue please ping me up.
+
+# Failure handling (list fallback)
+- When a detail page is missing any required element, that single book no longer aborts the run. A row is assembled instead from the fields already visible on its list card (title, subtitle, author, narrator, runtime, rating, price); fields absent from the card stay blank and detail-only columns (Audiobook_Type, Categories) are blank.
+- The last column "Data Source" marks every row as detail_page or list_fallback. The original column order is unchanged and the number of review columns always equals showmore_open_times * 10 (blank-padded on fallback).
+- Whether a book succeeds or falls back, its detail tab is closed and the driver switches back to the list tab, so the remaining books and the next page keep being collected.
+- The product list is traversed from its first card (1-based xpath index, no skipped item), and reaching the end of the list or hitting a pagination error prints an explicit message instead of exiting silently.
+- duplicate_remover() still produces Audible_Dataset_final.csv, now with exactly one header row and all duplicate data rows removed (it also reports counts and handles a missing input file gracefully).
+
+# Local verification (no browser, no network)
+A fake Selenium driver with in-memory HTML-shaped data exercises the success path, list fallback, pagination and dedup logic:
+
+    python -I tests/test_audible_fake.py
