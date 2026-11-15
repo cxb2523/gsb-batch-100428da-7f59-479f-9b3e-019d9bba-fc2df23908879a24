@@ -7,9 +7,28 @@ from collections.abc import Sequence
 
 from .config import Settings
 from .content_extraction import ContentExtractor, TrafilaturaExtractor
-from .exceptions import SearchEngineError
+from .exceptions import (
+    RateLimitError,
+    ResponseRejectedError,
+    SearchEngineError,
+    UnsafeURLError,
+)
 from .indexer import Indexer
-from .models import Document, PipelineFailure, SearchResponse, SearchResult
+from .models import (
+    OUTCOME_EXTRACTION_FAILED,
+    OUTCOME_FETCH_FAILED,
+    OUTCOME_RATE_LIMITED,
+    OUTCOME_REJECTED_NON_PUBLIC,
+    OUTCOME_REJECTED_RESPONSE,
+    OUTCOME_SNIPPET_FALLBACK,
+    OUTCOME_SUCCESS,
+    OUTCOME_SUCCESS_AFTER_REDIRECT,
+    Document,
+    PageOutcome,
+    PipelineFailure,
+    SearchResponse,
+    SearchResult,
+)
 from .query import DDGSSearchProvider, SearchProvider
 from .retrieval import Retriever
 from .scraper import HttpFetcher, PageFetcher
@@ -71,7 +90,7 @@ class SearchPipeline:
 
     def run(self, query: str) -> SearchResponse:
         results = list(self.search_provider.search(query, self.settings.search_results))
-        documents, failures = self._collect_documents(results)
+        documents, failures, page_outcomes = self._collect_documents(results)
         self.indexer.index_documents(documents)
         hits = Retriever(self.indexer).search(
             query,
@@ -90,40 +109,105 @@ class SearchPipeline:
             indexed_chunks=self.indexer.get_index_size(),
             context_tokens=sum(hit.token_count for hit in hits),
             failures=failures,
+            page_outcomes=page_outcomes,
         )
 
     def _collect_documents(
         self, results: Sequence[SearchResult]
-    ) -> tuple[list[Document], list[PipelineFailure]]:
+    ) -> tuple[list[Document], list[PipelineFailure], list[PageOutcome]]:
         documents: list[Document] = []
         failures: list[PipelineFailure] = []
+        page_outcomes: list[PageOutcome] = []
         for result in results:
             try:
                 page = self.fetcher.fetch(result.url)
+            except (SearchEngineError, ValueError) as exc:
+                logger.warning("Skipping %s: %s", result.url, exc)
+                category = self._classify_fetch_error(exc)
+                failures.append(PipelineFailure(url=result.url, reason=str(exc)))
+                page_outcomes.append(
+                    PageOutcome(original_url=result.url, category=category, reason=str(exc))
+                )
+                self._append_snippet_fallback(result, str(exc), documents, page_outcomes)
+                continue
+
+            try:
                 content = self.extractor.extract(page.text, url=page.url)
                 text = content.as_document_text()
                 if not text:
                     raise ValueError("extracted document was empty")
-                documents.append(
-                    Document(
-                        text=text,
-                        source=content.canonical_url or page.url,
-                        title=content.title or result.title,
-                        metadata={"search_snippet": result.snippet},
-                    )
-                )
             except (SearchEngineError, ValueError) as exc:
                 logger.warning("Skipping %s: %s", result.url, exc)
                 failures.append(PipelineFailure(url=result.url, reason=str(exc)))
-                if self.settings.use_search_snippets_on_failure and result.snippet:
-                    documents.append(
-                        Document(
-                            text="\n\n".join(
-                                part for part in (result.title, result.snippet) if part
-                            ),
-                            source=result.url,
-                            title=result.title,
-                            metadata={"snippet_only": True},
-                        )
+                page_outcomes.append(
+                    PageOutcome(
+                        original_url=result.url,
+                        category=OUTCOME_EXTRACTION_FAILED,
+                        reason=str(exc),
+                        final_url=page.url,
                     )
-        return documents, failures
+                )
+                self._append_snippet_fallback(result, str(exc), documents, page_outcomes)
+                continue
+
+            if page.redirected:
+                category = OUTCOME_SUCCESS_AFTER_REDIRECT
+                reason = f"Fetched after redirect and extracted content from {page.url}"
+                final_url: str | None = page.url
+            else:
+                category = OUTCOME_SUCCESS
+                reason = f"Fetched and extracted content from {page.url}"
+                final_url = None
+            page_outcomes.append(
+                PageOutcome(
+                    original_url=result.url,
+                    category=category,
+                    reason=reason,
+                    final_url=final_url,
+                )
+            )
+            documents.append(
+                Document(
+                    text=text,
+                    source=content.canonical_url or page.url,
+                    title=content.title or result.title,
+                    metadata={"search_snippet": result.snippet},
+                )
+            )
+        return documents, failures, page_outcomes
+
+    @staticmethod
+    def _classify_fetch_error(exc: BaseException) -> str:
+        # UnsafeURLError is also a ValueError, so check the policy error first.
+        if isinstance(exc, UnsafeURLError):
+            return OUTCOME_REJECTED_NON_PUBLIC
+        if isinstance(exc, ResponseRejectedError):
+            return OUTCOME_REJECTED_RESPONSE
+        if isinstance(exc, RateLimitError):
+            return OUTCOME_RATE_LIMITED
+        return OUTCOME_FETCH_FAILED
+
+    def _append_snippet_fallback(
+        self,
+        result: SearchResult,
+        failure_reason: str,
+        documents: list[Document],
+        page_outcomes: list[PageOutcome],
+    ) -> None:
+        if not (self.settings.use_search_snippets_on_failure and result.snippet):
+            return
+        documents.append(
+            Document(
+                text="\n\n".join(part for part in (result.title, result.snippet) if part),
+                source=result.url,
+                title=result.title,
+                metadata={"snippet_only": True},
+            )
+        )
+        page_outcomes.append(
+            PageOutcome(
+                original_url=result.url,
+                category=OUTCOME_SNIPPET_FALLBACK,
+                reason=f"Indexed the search snippet after page failure: {failure_reason}",
+            )
+        )

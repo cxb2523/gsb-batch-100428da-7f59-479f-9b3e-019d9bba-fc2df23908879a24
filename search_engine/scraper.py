@@ -15,7 +15,12 @@ from requests.adapters import HTTPAdapter
 from requests.compat import chardet
 from urllib3.util.retry import Retry
 
-from .exceptions import FetchError, UnsafeURLError
+from .exceptions import (
+    FetchError,
+    RateLimitError,
+    ResponseRejectedError,
+    UnsafeURLError,
+)
 from .models import FetchedPage
 
 Resolver = Callable[..., list[tuple]]
@@ -126,6 +131,7 @@ class HttpFetcher:
 
     def fetch(self, url: str) -> FetchedPage:
         current_url = url
+        redirected = False
         for redirect_count in range(self.max_redirects + 1):
             self.url_policy.validate(current_url)
             try:
@@ -136,6 +142,10 @@ class HttpFetcher:
                     allow_redirects=False,
                     stream=True,
                 )
+            except requests.exceptions.RetryError as exc:
+                raise RateLimitError(
+                    f"Retries exhausted while fetching {current_url}: {exc}"
+                ) from exc
             except requests.RequestException as exc:
                 raise FetchError(f"Failed to fetch {current_url}: {exc}") from exc
 
@@ -147,6 +157,10 @@ class HttpFetcher:
                     if not location:
                         raise FetchError(f"Redirect from {current_url} had no Location header")
                     current_url = urljoin(current_url, location)
+                    # The next hop is validated at the top of the loop before any
+                    # request is issued, so non-public redirect targets are never
+                    # contacted.
+                    redirected = True
                     continue
 
                 try:
@@ -160,12 +174,16 @@ class HttpFetcher:
                     "application/xhtml+xml",
                     "text/plain",
                 }:
-                    raise FetchError(f"Unsupported content type {content_type!r} at {current_url}")
+                    raise ResponseRejectedError(
+                        f"Unsupported content type {content_type!r} at {current_url}"
+                    )
                 declared_size = response.headers.get("Content-Length")
                 if declared_size:
                     try:
                         if int(declared_size) > self.max_response_bytes:
-                            raise FetchError(f"Response from {current_url} exceeds the size limit")
+                            raise ResponseRejectedError(
+                                f"Response from {current_url} exceeds the size limit"
+                            )
                     except ValueError:
                         pass
 
@@ -174,7 +192,13 @@ class HttpFetcher:
                     for block in response.iter_content(chunk_size=64 * 1024):
                         body.extend(block)
                         if len(body) > self.max_response_bytes:
-                            raise FetchError(f"Response from {current_url} exceeds the size limit")
+                            raise ResponseRejectedError(
+                                f"Response from {current_url} exceeds the size limit"
+                            )
+                except requests.exceptions.RetryError as exc:
+                    raise RateLimitError(
+                        f"Retries exhausted while reading {current_url}: {exc}"
+                    ) from exc
                 except requests.RequestException as exc:
                     raise FetchError(f"Failed while reading {current_url}: {exc}") from exc
 
@@ -192,6 +216,7 @@ class HttpFetcher:
                     text=text,
                     content_type=content_type or "text/html",
                     status_code=response.status_code,
+                    redirected=redirected,
                 )
         raise FetchError(f"Too many redirects while fetching {url}")
 

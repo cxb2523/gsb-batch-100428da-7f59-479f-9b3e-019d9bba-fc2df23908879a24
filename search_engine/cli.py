@@ -70,4 +70,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(hit.text)
     if response.failures and args.verbose:
         print(f"\nSkipped or fell back on {len(response.failures)} result(s).")
+    if response.page_outcomes and args.verbose:
+        print("\nPer-page outcomes:")
+        for outcome in response.page_outcomes:
+            target = ""
+            if outcome.final_url and outcome.final_url != outcome.original_url:
+                target = f" -> {outcome.final_url}"
+            print(f"- [{outcome.category}] {outcome.original_url}{target}: {outcome.reason}")
     return 0

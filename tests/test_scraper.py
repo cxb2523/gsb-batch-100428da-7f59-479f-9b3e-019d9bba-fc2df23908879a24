@@ -3,7 +3,12 @@ import socket
 import pytest
 import requests
 
-from search_engine.exceptions import FetchError, UnsafeURLError
+from search_engine.exceptions import (
+    FetchError,
+    RateLimitError,
+    ResponseRejectedError,
+    UnsafeURLError,
+)
 from search_engine.scraper import HttpFetcher, URLPolicy
 
 
@@ -89,3 +94,66 @@ def test_fetcher_validates_redirect_target_before_following() -> None:
     with pytest.raises(UnsafeURLError):
         fetcher.fetch("https://example.com/")
     assert len(calls) == 1
+
+
+def test_fetcher_flags_redirect_on_returned_page() -> None:
+    session = requests.Session()
+    responses = [
+        response(302, Location="https://example.com/final"),
+        response(200, b"<p>ok</p>", **{"Content-Type": "text/html"}),
+    ]
+    session.get = lambda *args, **kwargs: responses.pop(0)  # type: ignore[method-assign]
+    fetcher = HttpFetcher(
+        session=session,
+        url_policy=URLPolicy(allow_private_network=True),
+    )
+
+    page = fetcher.fetch("https://example.com/start")
+
+    assert page.url == "https://example.com/final"
+    assert page.redirected is True
+
+
+def test_fetcher_marks_unredirected_page_as_not_redirected() -> None:
+    session = requests.Session()
+    session.get = lambda *args, **kwargs: response(  # type: ignore[method-assign]
+        200, b"<p>ok</p>", **{"Content-Type": "text/html"}
+    )
+    fetcher = HttpFetcher(
+        session=session,
+        url_policy=URLPolicy(allow_private_network=True),
+    )
+
+    page = fetcher.fetch("https://example.com/")
+
+    assert page.redirected is False
+
+
+def test_fetcher_rejects_unsupported_content_type_with_typed_error() -> None:
+    session = requests.Session()
+    session.get = lambda *args, **kwargs: response(  # type: ignore[method-assign]
+        200, b"binary", **{"Content-Type": "application/pdf"}
+    )
+    fetcher = HttpFetcher(
+        session=session,
+        url_policy=URLPolicy(allow_private_network=True),
+    )
+
+    with pytest.raises(ResponseRejectedError, match="Unsupported content type"):
+        fetcher.fetch("https://example.com/file.pdf")
+
+
+def test_fetcher_maps_exhausted_retries_to_rate_limit_error() -> None:
+    session = requests.Session()
+
+    def raise_retry_error(*args, **kwargs):
+        raise requests.exceptions.RetryError("too many 429 error responses")
+
+    session.get = raise_retry_error  # type: ignore[method-assign]
+    fetcher = HttpFetcher(
+        session=session,
+        url_policy=URLPolicy(allow_private_network=True),
+    )
+
+    with pytest.raises(RateLimitError, match="Retries exhausted"):
+        fetcher.fetch("https://example.com/")

@@ -25,5 +25,13 @@ class UnsafeURLError(FetchError, ValueError):
     """Raised when a URL violates the configured network policy."""
 
 
+class ResponseRejectedError(FetchError):
+    """Raised when a fetched response is unusable (oversized or wrong content type)."""
+
+
+class RateLimitError(FetchError):
+    """Raised when retries are exhausted due to rate limiting or upstream failures."""
+
+
 class ExtractionError(SearchEngineError):
     """Raised when useful content cannot be extracted from a page."""

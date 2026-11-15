@@ -3,7 +3,31 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Final
+
+# Page-level outcome categories. Stored as plain strings so serialized
+# responses stay JSON-friendly and remain stable across process boundaries.
+OUTCOME_SUCCESS: Final = "success"
+OUTCOME_SUCCESS_AFTER_REDIRECT: Final = "success_after_redirect"
+OUTCOME_REJECTED_NON_PUBLIC: Final = "rejected_non_public"
+OUTCOME_REJECTED_RESPONSE: Final = "rejected_response"
+OUTCOME_RATE_LIMITED: Final = "rate_limited"
+OUTCOME_EXTRACTION_FAILED: Final = "extraction_failed"
+OUTCOME_FETCH_FAILED: Final = "fetch_failed"
+OUTCOME_SNIPPET_FALLBACK: Final = "snippet_fallback"
+
+PAGE_OUTCOME_CATEGORIES: Final = frozenset(
+    {
+        OUTCOME_SUCCESS,
+        OUTCOME_SUCCESS_AFTER_REDIRECT,
+        OUTCOME_REJECTED_NON_PUBLIC,
+        OUTCOME_REJECTED_RESPONSE,
+        OUTCOME_RATE_LIMITED,
+        OUTCOME_EXTRACTION_FAILED,
+        OUTCOME_FETCH_FAILED,
+        OUTCOME_SNIPPET_FALLBACK,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +43,7 @@ class FetchedPage:
     text: str
     content_type: str
     status_code: int
+    redirected: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +108,26 @@ class PipelineFailure:
 
 
 @dataclass(frozen=True, slots=True)
+class PageOutcome:
+    """Per-result audit record describing how a single search result ended.
+
+    ``original_url`` is the URL returned by the search provider. ``final_url``
+    is the URL the content was actually loaded from and is ``None`` when no
+    redirect happened or no page could be fetched at all. ``category`` is one
+    of the ``OUTCOME_*`` constants and ``reason`` carries a human-readable
+    explanation.
+    """
+
+    original_url: str
+    category: str
+    reason: str
+    final_url: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
 class SearchResponse:
     query: str
     hits: list[SearchHit]
@@ -91,6 +136,7 @@ class SearchResponse:
     indexed_chunks: int
     context_tokens: int
     failures: list[PipelineFailure] = field(default_factory=list)
+    page_outcomes: list[PageOutcome] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

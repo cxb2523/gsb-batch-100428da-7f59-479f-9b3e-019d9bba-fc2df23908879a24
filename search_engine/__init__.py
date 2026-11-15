@@ -2,13 +2,22 @@
 
 from .config import Settings
 from .indexer import Indexer
-from .models import Document, SearchHit, SearchResponse, SearchResult
+from .models import (
+    Document,
+    PageOutcome,
+    PipelineFailure,
+    SearchHit,
+    SearchResponse,
+    SearchResult,
+)
 from .pipeline import SearchPipeline
 from .retrieval import Retriever
 
 __all__ = [
     "Document",
     "Indexer",
+    "PageOutcome",
+    "PipelineFailure",
     "Retriever",
     "SearchHit",
     "SearchPipeline",
