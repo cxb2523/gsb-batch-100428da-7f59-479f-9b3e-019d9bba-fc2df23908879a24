@@ -1,14 +1,13 @@
 import logging
+import os
 import time
-import sys
 import random
-import csv
-import signal
 
 from playwright.sync_api import sync_playwright
 from playwright._impl._errors import Error as PlaywrightError
 
 from . import konstanta
+from .utilitas import tulis_csv
 
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
@@ -33,13 +32,17 @@ class PengikisInstagram:
         self.file_cookie = file_cookie
         self.hasil_scrape = []
         self.output_file = None
+        self.status_akhir = None
         self._konfigurasi_mode()
 
         self.playwright = None
         self.browser = None
         self.page = None
 
-        signal.signal(signal.SIGINT, self._signal_handler)
+        # Handler SIGINT kustom sengaja tidak dipasang di sini. Ctrl+C dibiarkan
+        # menjadi KeyboardInterrupt biasa agar jalankan() dapat menyimpan data
+        # parsial lalu meneruskannya, dan pemanggil (main) tetap dapat
+        # membersihkan berkas cookie sementara di blok finally.
 
     def _konfigurasi_mode(self) -> None:
         """Mengatur path URL dan teks tombol berdasarkan mode yang dipilih."""
@@ -53,7 +56,13 @@ class PengikisInstagram:
             raise ValueError("Mode tidak valid. Pilih 'followers' atau 'following'.")
 
     def jalankan(self) -> list:
-        """Memulai dan menjalankan seluruh alur proses scraping."""
+        """Memulai dan menjalankan seluruh alur proses scraping.
+
+        Semua jalur keluarnya (selesai normal, error Playwright, error tak
+        terduga, maupun Ctrl+C) akan menyimpan data yang sudah terkumpul
+        lebih dulu melalui _auto_save_data(), sehingga tidak ada entri
+        yang hilang saat proses terhenti di tengah jalan.
+        """
         with sync_playwright() as p:
             self.playwright = p
             try:
@@ -67,15 +76,19 @@ class PengikisInstagram:
                 if self.hasil_scrape:
                     logging.info(f"Scraping berhasil! Mengumpulkan {len(self.hasil_scrape)} data.")
             except KeyboardInterrupt:
+                logging.warning("\nProgram dihentikan oleh pengguna (Ctrl+C)")
+                self._auto_save_data()
                 raise
             except PlaywrightError as e:
                 logging.error(f"Terjadi kesalahan pada Playwright: {e}")
                 logging.info("Mencoba menyimpan data yang sudah dikumpulkan...")
                 self._auto_save_data()
+                raise
             except Exception as e:
                 logging.error(f"Terjadi kesalahan tidak terduga: {e}")
                 logging.info("Mencoba menyimpan data yang sudah dikumpulkan...")
                 self._auto_save_data()
+                raise
             finally:
                 self.tutup()
 
@@ -304,76 +317,122 @@ class PengikisInstagram:
         
         logging.info(f"Total {len(self.hasil_scrape)} data pengguna berhasil diekstrak.")
 
-    def simpan_ke_csv(self, nama_file: str) -> None:
+    def simpan_ke_csv(self, nama_file: str) -> bool:
         """
-        Menyimpan data hasil scraping ke dalam sebuah file CSV.
+        Menyimpan data hasil scraping ke dalam sebuah file CSV final.
+
+        Penulisan bersifat atomik sehingga Ctrl+C atau crash di tengah
+        penulisan tidak meninggalkan file yang rusak.
 
         Args:
             nama_file: Path file CSV untuk menyimpan hasil.
+
+        Returns:
+            True jika data ditulis, False jika tidak ada data sehingga
+            tidak ada file (termasuk file header saja) yang dibuat.
         """
         if not self.hasil_scrape:
-            logging.warning("Tidak ada data untuk disimpan.")
-            return
+            logging.warning("Tidak ada data untuk disimpan; file CSV final tidak dibuat.")
+            return False
 
         logging.info(f"Menyimpan {len(self.hasil_scrape)} data ke {nama_file}...")
         try:
-            with open(nama_file, 'w', newline='', encoding='utf-8') as f:
-                penulis = csv.writer(f)
-                penulis.writerow(['Username', 'Full Name'])
-                penulis.writerows(self.hasil_scrape)
-            logging.info(f"Data berhasil disimpan ke {nama_file}.")
-        except IOError as e:
+            tulis_csv(nama_file, self.hasil_scrape)
+        except Exception as e:
             logging.error(f"Gagal menyimpan file: {e}")
+            return False
+
+        logging.info(f"Data berhasil disimpan ke {nama_file}.")
+        return True
 
     def set_output_file(self, output_file: str) -> None:
         """
         Set path file output untuk auto-save.
-        
-        Args:d
+
+        Args:
             output_file: Path file CSV untuk auto-save.
         """
         self.output_file = output_file
 
-    def _signal_handler(self, signum=None, frame=None) -> None:
+    def _nama_file_parsial(self) -> str:
         """
-        Handler untuk menangani sinyal interrupt (Ctrl+C).
-        """
-        logging.warning("\nProgram dihentikan oleh pengguna (Ctrl+C)")
-        self._auto_save_data()
-        self.tutup()
-        sys.exit(0)
+        Membentuk path file parsial yang memuat mode dan username target.
 
-    def _auto_save_data(self):
+        Nama file sengaja tidak memakai timestamp agar hasil dari beberapa
+        interrupt pada target yang sama saling menimpa, bukan menumpuk.
+
+        Returns:
+            Path absolut file CSV parsial.
         """
-        Otomatis menyimpan data yang sudah dikumpulkan ke file CSV.
-        """
-        if self.hasil_scrape and self.output_file:
-            parts = self.output_file.rsplit('.', 1)
-            if len(parts) == 2:
-                auto_save_file = f"{parts[0]}_partial.{parts[1]}"
-            else:
-                auto_save_file = f"{self.output_file}_partial"
-                
-            logging.info(f"Auto-save: Menyimpan {len(self.hasil_scrape)} data yang sudah dikumpulkan...")
-            try:
-                with open(auto_save_file, 'w', newline='', encoding='utf-8') as f:
-                    penulis = csv.writer(f)
-                    penulis.writerow(['Username', 'Full Name'])
-                    penulis.writerows(self.hasil_scrape)
-                logging.info(f"Data berhasil disimpan ke {auto_save_file}")
-                logging.info(f"Total data yang tersimpan: {len(self.hasil_scrape)} {self.teks_tombol}")
-            except IOError as e:
-                logging.error(f"Gagal menyimpan auto-save: {e}")
-        elif self.hasil_scrape:
-            logging.warning("Ada data yang dikumpulkan tapi tidak ada path output yang di-set")
+        if self.output_file:
+            direktori = os.path.dirname(os.path.abspath(self.output_file))
         else:
-            logging.info("Tidak ada data yang dikumpulkan untuk disimpan")
+            direktori = os.path.abspath(konstanta.DIREKTORI_DATA)
+
+        nama_aman = self._sanitasi_nama_berkas(self.target_username)
+        nama_file = f"{self.mode_kikis}_{nama_aman}{konstanta.SUFIKS_FILE_PARSIAL}"
+        return os.path.join(direktori, nama_file)
+
+    @staticmethod
+    def _sanitasi_nama_berkas(nama: str) -> str:
+        """Mengganti karakter yang tidak aman dipakai pada nama file."""
+        hasil = nama.strip()
+        for karakter in ('/', '\\', ':', '*', '?', '"', '<', '>', '|', ' '):
+            hasil = hasil.replace(karakter, '_')
+        return hasil or "tanpa_nama"
+
+    def simpan_hasil_parsial(self) -> str | None:
+        """
+        Menyimpan data yang sudah dikumpulkan ke file CSV parsial.
+
+        File hanya dibuat jika ada minimal satu entri. Jika belum ada
+        data, tidak ada file header saja yang ditulis dan hasilnya
+        dicatat secara eksplisit pada log.
+
+        Returns:
+            Path file parsial jika ditulis, None jika tidak ada data.
+        """
+        if not self.hasil_scrape:
+            logging.warning(
+                "Tidak ada data yang terkumpul; file parsial tidak dibuat "
+                f"untuk target '{self.target_username}' mode '{self.mode_kikis}'."
+            )
+            self.status_akhir = "tidak_ada_data"
+            return None
+
+        auto_save_file = self._nama_file_parsial()
+        logging.info(
+            f"Auto-save: Menyimpan {len(self.hasil_scrape)} data yang sudah "
+            f"dikumpulkan ke {auto_save_file}..."
+        )
+        try:
+            tulis_csv(auto_save_file, self.hasil_scrape)
+        except Exception as e:
+            logging.error(f"Gagal menyimpan auto-save: {e}")
+            self.status_akhir = "gagal_menyimpan_parsial"
+            return None
+
+        self.status_akhir = "parsial_tersimpan"
+        logging.info(f"Data berhasil disimpan ke {auto_save_file}")
+        logging.info(
+            f"Total data yang tersimpan: {len(self.hasil_scrape)} {self.teks_tombol}"
+        )
+        return auto_save_file
+
+    def _auto_save_data(self) -> str | None:
+        """Alias kompatibilitas untuk simpan_hasil_parsial()."""
+        return self.simpan_hasil_parsial()
 
     def tutup(self):
         """Menutup browser jika sedang berjalan."""
         if self.browser:
             logging.info("Menutup browser.")
-            self.browser.close()
+            try:
+                self.browser.close()
+            except Exception as e:
+                logging.warning(f"Gagal menutup browser: {e}")
+            finally:
+                self.browser = None
     
     def _ekstrak_data_real_time(self, username_terproses: set):
         """

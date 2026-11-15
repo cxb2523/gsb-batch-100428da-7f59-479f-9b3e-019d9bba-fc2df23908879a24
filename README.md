@@ -9,6 +9,7 @@
 - **Scraping Fleksibel**: Dapat mengambil data *followers* maupun *following*.
 - **Otentikasi Berbasis Cookie**: Menggunakan sesi *login* yang aman melalui *cookie* untuk mengakses data.
 - **Output CSV**: Menyimpan hasil *scraping* dalam format `.csv` yang rapi dengan kolom `Username` dan `Full Name`.
+- **Penyimpanan Aman Saat Terhenti**: Data yang sudah terkumpul disimpan otomatis ke `<mode>_<username>_partial.csv` pada jalur keluar mana pun (selesai, error, maupun Ctrl+C).
 - **Antarmuka Baris Perintah (CLI)**: Interaksi yang mudah melalui argumen di terminal.
 - **Logging Profesional**: Memberikan informasi status proses yang jelas dan informatif.
 
@@ -86,6 +87,23 @@ python -m pyinstadump.main --username rozhak_official --mode following --cookie 
 ```
 
 Hasil *scraping* akan secara otomatis tersimpan di dalam folder `data/`.
+
+### 5. Perilaku Saat Proses Terhenti
+
+- Hasil akhir ditulis ke `data/<mode>_<username>.csv` hanya jika proses selesai normal dan ada data.
+- Jika proses berhenti karena error, pop-up tertutup, jaringan putus, atau Ctrl+C, entri yang sudah terkumpul disimpan ke `data/<mode>_<username>_partial.csv`. Nama file hanya bergantung pada mode dan username, sehingga interrupt berulang pada target yang sama menimpa file yang sama (tidak menumpuk).
+- File parsial dan file final sama-sama memakai header `Username,Full Name`.
+- Jika belum ada satu pun entri yang terkumpul, tidak ada file CSV (termasuk file berisi header saja) yang dibuat; log mencatat dengan jelas bahwa hasilnya kosong.
+- Cookie sesi sementara ditulis ke `cookies/temp_cookie_state.json` (bukan direktori kerja) dan selalu dihapus saat proses berakhir, termasuk saat error dan Ctrl+C.
+
+## Pengujian
+
+```bash
+python -m pytest tests/ -q
+```
+
+Test memakai daftar hasil palsu dan tidak memerlukan browser atau akun Instagram.
+
 
 ## Lisensi
 
