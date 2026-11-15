@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-11-15 — `verify.py` distinguishes a failed request from an absent package
+
+`scripts/verify.py` treated every fetch failure — timeout, HTTP error, rate limiting,
+malformed body — the same as a package that is simply not published: both came out as
+`—`, and the two were indistinguishable in STATUS.md. A run that was throttled by
+GitHub looked identical to a run where nothing had been released.
+
+### Changed
+
+- **Per-source outcome tracking.** Each source (GitHub repo health, GitHub release,
+  contributors, and every PyPI and npm package) now records *ok*, *missing*, or
+  *failed* independently, instead of collapsing to `None`. A failed request renders
+  `!` in its own cell; a source that answered and had nothing to report still renders
+  `—`. The rest of the tool's row keeps the values that did succeed in the same run.
+- **"Sources not confirmed" section.** Every failed request is listed under the
+  project-health table with its HTTP status or error, so `!` is actionable rather
+  than just visible.
+- **Rate limiting and unexpected failures are named.** HTTP 403/429 with an exhausted
+  `X-RateLimit-Remaining` is reported as rate limiting rather than a generic error, an
+  unexpected exception in one source becomes a failed result for that source alone,
+  and a 204/empty response body is treated as "reported nothing", not as a failure
+  (GitHub sends 204 for a repository with no contributors).
+- **Missing token is stated in the output.** Without `GITHUB_TOKEN` the script still
+  exits 0, but both stdout and the written STATUS.md say the GitHub values may be
+  limited or unconfirmed.
+
+The success path is byte-identical to the previous renderer: no-failure output, table
+columns, TOOLS order, and value formatting are unchanged. Verified offline against the
+pre-change script with stubbed responses, and by real runs with and without a token.
+
+---
+
 ## 2026-10-13 — Re-verification against upstream (all ten tools)
 
 Every tool page, the README tables, the code review and the interactive matrix were

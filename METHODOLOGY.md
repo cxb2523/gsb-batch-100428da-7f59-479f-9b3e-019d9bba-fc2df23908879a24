@@ -129,6 +129,20 @@ date across nine tools without any visible signal that it had — hand-maintaine
 version tables always lose. Every claim in STATUS.md is reproducible by re-running one
 command.
 
+Each source is recorded independently, so a transient failure is visible instead of
+looking like an empty result:
+
+- a normal value means the source answered;
+- `—` means the source answered and genuinely had nothing to report (the package is
+  not published on that registry, the repository has no releases);
+- `!` means the request failed or was rate-limited, so the value is **unknown**. The
+  other cells in the same row are still live data from the same run, and the
+  "Sources not confirmed" section lists the HTTP status or error per request.
+
+Without `GITHUB_TOKEN`, GitHub requests are unauthenticated and capped at 60/hour;
+the script still runs to completion, prints a notice, and records the notice in
+STATUS.md when `--write` is used.
+
 Health columns are selected for build-decision relevance: **license** (redistribution
 and commercial-use constraints), **last push** (commit recency), **contributors**
 (maintenance concentration). Star counts are included for completeness; they measure
