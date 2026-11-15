@@ -13,6 +13,7 @@ import pdfkit
 import time
 import requests
 import os
+from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 
@@ -43,30 +44,65 @@ def get_url_list_from_site(homepage_url):
     """Web crawler to get all linked urls from a website.
     Converts relative paths to absolute paths.
 
+    Only crawlable absolute http/https addresses are returned:
+
+    - anchors without an ``href`` attribute and empty hrefs are skipped;
+    - ``javascript:``, ``mailto:`` and other non-http(s) links are skipped;
+    - relative links (root paths starting with ``/`` and ``../`` fallbacks)
+      are resolved against the homepage address;
+    - duplicate links found on the same page are only kept once;
+    - an unusable link is skipped instead of aborting the whole crawl.
+
     Args:
         homepage_url (str): The url of the website to crawl. eg. https://www.example.com
 
     Returns:
-        list: list of urls
+        list: list of urls. An empty list is returned when the homepage
+        itself cannot be requested.
 
     TODO: Add recursion to get all urls from a website.
-    Refer: https://stackoverflow.com/questions/59347372/how-extract-all-urls-in-a-website-using-beautifulsoup
+    Refer: https://stackoverflow.com/questions/59347672/how-extract-all-urls-in-a-website-using-beautifulsoup
     """
 
-    reqs = requests.get(homepage_url)
+    try:
+        reqs = requests.get(homepage_url, timeout=30)
+        reqs.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(
+            "Unable to collect links from {0} due to {1}. "
+            "Returning empty URL list.".format(homepage_url, e)
+        )
+        return []
+
     soup = BeautifulSoup(reqs.text, "html.parser")
 
     urls = []
+    seen = set()
     for link in soup.find_all("a"):
-        link_href = link.get("href")
-        if (not link_href.startswith("http://")) and (
-            not link_href.startswith("https://")
-        ):
-            if homepage_url.endswith("/"):
-                link_href = homepage_url + link_href
-            else:
-                link_href = homepage_url + "/" + link_href
-        urls.append(link_href)
+        try:
+            link_href = link.get("href")
+            if not link_href or not isinstance(link_href, str):
+                # Anchor without a usable href attribute.
+                continue
+            link_href = link_href.strip()
+            if not link_href or link_href.startswith("#"):
+                continue
+
+            # Resolve root-relative ("/path"), relative ("../path") and
+            # absolute links uniformly against the homepage address.
+            absolute_url = urljoin(homepage_url, link_href)
+            parsed = urlparse(absolute_url)
+            if parsed.scheme not in ("http", "https"):
+                # Drop javascript:, mailto:, tel:, data: etc.
+                continue
+
+            if absolute_url not in seen:
+                seen.add(absolute_url)
+                urls.append(absolute_url)
+        except Exception as e:
+            # A single unusable link must not interrupt the whole crawl.
+            print("Skipping link {0!r} due to {1}".format(link.get("href"), e))
+            continue
     return urls
 
 

@@ -34,6 +34,25 @@ or
 :arrow_forward: All URLs will be saved as .pdf to the `output/` directory from source *website-to-pdf.py*
 </br></br>
 
+## Link collection (`get_url_list_from_site`):
+
+- only absolute `http://` / `https://` addresses are returned — anchors without `href`, empty `href`, fragment-only (`#...`) links and `javascript:`, `mailto:`, `tel:`, `data:` etc. are skipped;
+- relative links are resolved against the homepage with standard URL rules, including root-relative paths (`/path`) and parent fallbacks (`../path`);
+- duplicate links on the same page are only collected once;
+- if the homepage request itself fails, a message is printed and an empty list is returned (no unhandled exception), so `set_url_list_to_file` can still write `input/urls_from_site.txt`.
+</br></br>
+
+## Tests:
+
+Offline unit tests (no real network access — `requests.get` is mocked) live in `tests/`:
+
+```
+python -m unittest discover -s tests -v
+```
+
+They use an HTML fragment containing absolute links, `/`-relative links, `../` fallback links, duplicates, anchors without `href` and `javascript:`/`mailto:` links, and assert that only the deduplicated, correctly expanded `http`/`https` URLs remain.
+</br></br>
+
 ## License:
 
 MIT license compliant. Software provided as is. All content is free to use and modify.
