@@ -1,0 +1,1 @@
+javascript:(function(){var btn=document.querySelector('[data-testid="headerClapButton"]');if(!btn){alert('Clap button not found');return;}var i=0;function clapLoop(){if(i>=50)return;btn.dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));btn.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));btn.click();i++;setTimeout(clapLoop,30);}clapLoop();})();

@@ -1,0 +1,1 @@
+javascript:(function(){document.querySelectorAll('div[role="button"],button,span[role="button"]').forEach(b=>{const t=(b.innerText||b.getAttribute("aria-label")||"").toLowerCase().trim();if(t==="add friend"){b.scrollIntoView({behavior:"instant"});b.style.background="red";b.click();}});})();
