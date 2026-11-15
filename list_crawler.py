@@ -92,7 +92,8 @@ def start():
 
 	# 开始抓取该用户 follower 列表
 	printx('开始抓取该用户 follower 列表……')
-	follower_list = get_followerList(urlToken,people['followerCount']) 
+	# follower_list 为所有成功页抓取到的用户，failed_pages 为抓取失败的页码列表
+	follower_list,failed_pages = get_followerList(urlToken,people['followerCount'])
 
 	# 将 follower 列表中用户加入到待抓取集合
 	push_success_num = 0
@@ -111,15 +112,23 @@ def start():
 	printx('目前列表抓取成功节点集合中有 %d 人'%redis_client.scard(list_success_set))
 	printx('目前列表抓取失败节点集合中有 %d 人'%redis_client.scard(list_failed_set))
 
-	printx('将该用户 %s 放入列表抓取成功节点集合'%urlToken)
-	redis_client.sadd(list_success_set,urlToken)
+	# 只要存在抓取失败的页，该用户就放入列表抓取失败节点集合；全部页成功才放入成功集合
+	if failed_pages:
+		printx('用户 %s 有 %d 页关注列表抓取失败（失败页码：%s），将该用户放入列表抓取失败节点集合'%(urlToken,len(failed_pages),failed_pages))
+		redis_client.sadd(list_failed_set,urlToken)
+	else:
+		printx('将该用户 %s 放入列表抓取成功节点集合'%urlToken)
+		redis_client.sadd(list_success_set,urlToken)
 
 	printx('该用户关注列表抓取完毕')
 	printx('')
 	
 
-def get_per_followerList(urlToken,page,sum_page):
-	''' 抓取 follower 列表的每一页'''
+def get_per_followerList(urlToken,page,sum_page,crawler_factory=None):
+	''' 抓取 follower 列表的每一页
+	返回 dict：{'page':页码, 'success':是否抓取成功, 'followers':本页抓取到的用户列表}
+	重试耗尽后 success 为 False 且 followers 为空列表，失败页不会混入成功结果。
+	crawler_factory 仅供测试注入假抓取器，为 None 时使用真实的 Crawler + 代理IP。'''
 	printx('正在抓取第 %d/%d 页……'%(page,sum_page))
 	try_cnt = try_limit
 
@@ -129,13 +138,17 @@ def get_per_followerList(urlToken,page,sum_page):
 	while try_cnt > 0:
 		try:
 			# 设置抓取器
-			c = Crawler(isCookie=False,timeout=socket_timeout)
-			# 手动设置代理IP
-			ip = proxyip.get()
-			c.set_proxyip(ip)
+			if crawler_factory is None:
+				c = Crawler(isCookie=False,timeout=socket_timeout)
+				# 手动设置代理IP
+				ip = proxyip.get()
+				c.set_proxyip(ip)
+			else:
+				# 测试用：由调用方提供可控的假抓取器
+				c = crawler_factory()
 
 
-			# 解析当前页的 html   
+			# 解析当前页的 html
 			url = '%s/people/%s/followers?page=%d'%(host,urlToken,page)
 			html = c.get_html(url)
 			s = BS(html,'html.parser')
@@ -156,17 +169,20 @@ def get_per_followerList(urlToken,page,sum_page):
 			break
 	if try_cnt <= 0:
 		printx('放弃抓取用户 %s 第 %d 页'%(urlToken,page))
+		return {'page':page,'success':False,'followers':[]}
 	else:
 		printx('用户 %s 的关注列表第 %d/%d 页抓取成功！'%(urlToken,page,sum_page))
-
-	return follower_list
+		return {'page':page,'success':True,'followers':follower_list}
 
 
 def get_followerList(urlToken,followerCount):
-	# 获取该用户的所有关注用户
-	# 该用户没有关注人，直接返回空列表，退出
+	''' 抓取该用户的所有关注用户
+	返回 (follower_list, failed_pages)：
+	follower_list 为所有成功页抓取到的用户，failed_pages 为抓取失败的页码列表（升序）。
+	只要存在失败页，调用方就应将该用户放入 list_failed 而不是 list_success。'''
+	# 该用户没有关注人，直接返回空列表，退出（不产生失败页）
 	if followerCount == 0:
-		return []
+		return [],[]
 
 	# 计算总页数
 	sum_page = int( (followerCount - 1) / per_page ) + 1
@@ -190,14 +206,26 @@ def get_followerList(urlToken,followerCount):
 	printx('总用时 : %f s'%(total_time))
 	printx('平均每个进程用时 : %f s'%(total_time/sum_page))
 
-	# 获取抓取结果
+	# 获取抓取结果：逐页核对页码与状态，失败页不混入成功结果
 	printx('获取抓取结果……')
 	follower_list = []
+	failed_pages = []
+	success_page_num = 0
 	for result in results:
-		follower_list += result.get()
+		page_result = result.get()
+		if page_result['success']:
+			success_page_num += 1
+			follower_list += page_result['followers']
+		else:
+			failed_pages.append(page_result['page'])
+	failed_pages.sort()
 
 	printx('抓取到的用户 %s 的关注列表总人数为 %d 人！'%(urlToken,len(follower_list)))
-	return follower_list
+	if failed_pages:
+		printx('用户 %s 的关注列表存在抓取失败的页：成功 %d 页，失败 %d 页，失败页码：%s'%(urlToken,success_page_num,len(failed_pages),failed_pages))
+	else:
+		printx('用户 %s 的关注列表全部 %d 页抓取成功！'%(urlToken,success_page_num))
+	return follower_list,failed_pages
 
 
 def get_Info(c,urlToken):
