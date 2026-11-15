@@ -1,0 +1,232 @@
+<samp>[🇰🇷 한국어](README.md) · 🇺🇸 English</samp>
+
+# ir-search
+
+> ⚠️ **This skill covers South Korean government / public-agency support programs only.** It does not cover programs from any other country, and the announcements it processes are written in Korean.
+
+A plugin for **exhaustive surveys of Korean government support programs** (startup grants, commercialization funding, incubation space, R&D calls, vouchers, competitions) — installable in **Claude Code, Codex, agy (Antigravity CLI), Cursor, Gemini CLI, and Grok Build (x.ai)**.
+
+It crawls every currently-open announcement from K-Startup, Bizinfo, NIPA, KOCCA, and SMTECH, matches them against the profile of the project in your working folder — founding stage, region, needs (funding / space / R&D) — verifies eligibility against the original announcement text, and produces a report with a three-tier classification:
+
+- **Group A — Apply right now**: eligible as-is (sorted by deadline, imminent ones flagged)
+- **Group B — Unlocked by a requirement (roadmap)**: triggers like incorporation or securing investment, with chained paths spelled out (e.g., competition prize → non-metro incorporation → Pre-TIPS → TIPS)
+- **Group C — Eligible with reframing**: concrete angles for re-describing your item in another domain's language (content production, social services, art×tech, ...)
+
+Why exhaustive review instead of keyword search: the programs an "AI startup" can actually win — content-production grants, art×tech residencies, social-service startup funds — never match the keyword "AI".
+
+## Sample output (excerpt)
+
+A run saves the report (md), raw jsonl, and verified announcement texts to `~/Documents/지원사업조사_<target>_<date>/`. The report looks like this (announcements themselves are in Korean):
+
+```markdown
+# Support-program survey — ○○ (AI voice SaaS, pre-founder, Chungnam)
+Surveyed 2026-07-11 · reviewed all 262 K-Startup + 300 Bizinfo items → verified 31 candidates
+
+## Group A — Apply right now (by deadline)
+
+1. **2026 Youth Startup Academy, extra round** — KOSME
+   - Support: up to ₩100M commercialization fund + space + mentoring
+   - Eligibility: pre-founders ✓ · under 39 ✓ · nationwide ✓
+   - Deadline: 2026-07-18 16:00 (D-7) ⚠️ imminent
+   - https://www.k-startup.go.kr/web/contents/bizpbanc-ongoing.do?schM=view&pbancSn=1784xx
+
+## Group B — Unlocked by a requirement (roadmap)
+
+- **Pre-TIPS**: trigger = incorporating outside the capital region.
+  Chain: competition prize/seed → Chungnam incorporation → Pre-TIPS → TIPS
+
+## Group C — Eligible with reframing
+
+- **Content production grant (KOCCA)**: reframe "AI voice tech" as an
+  "audio-content production pipeline". Risk: deliverable must be content
+
+## Absence check
+- Pre-Startup Package: not currently open (usually announced in Feb)
+
+## Priority actions
+- by 7/18: apply to A-1 (note the 16:00 cutoff)
+- by 7/25: draft C-1 content framing, then call the agency to confirm
+```
+
+Every mentioned announcement carries its original URL; anything not stated in the announcement text is marked "unknown" rather than guessed.
+
+## Covered sources
+
+| Source                                  | What it is                                        | Crawler               |
+| --------------------------------------- | ------------------------------------------------- | --------------------- |
+| [K-Startup](https://www.k-startup.go.kr) | Unified startup-support portal (default)          | `kstartup_crawl.py` (+ `kstartup_api.py`) |
+| [Bizinfo](https://www.bizinfo.go.kr)     | All-ministry/region SME support (widest coverage) | `sources_crawl.py`  |
+| [NIPA](https://www.nipa.kr)              | AI / ICT programs                                 | `sources_crawl.py`  |
+| [KOCCA](https://www.kocca.kr)            | Content-industry programs                         | `sources_crawl.py`  |
+| [SMTECH](https://www.smtech.go.kr)       | SME R&D calls                                     | `sources_crawl.py`  |
+
+More sources (NIA, IITP, IRIS, regional agencies) are catalogued in `skills/ir-search/references/sources.md`.
+
+## Choose the research scope
+
+You do not have to sweep every portal on every run. `scope_plan.py` freezes the requested
+scope first, separates automated, manual, and candidate sources, and emits a stable
+`scope_fingerprint`. It makes no network, API, or model call, so it consumes no tokens or
+external quota.
+
+| Preset | Purpose |
+|---|---|
+| `quick` | Fast pass over K-Startup only |
+| `focused` | Exactly one registered source selected by the user |
+| `recommended` | K-Startup, Bizinfo, plus profile-relevant automated sources |
+| `all_registered` | Every currently automated source |
+| `all_known` | Include candidate and manual-verification sources in the plan |
+| `custom` | Only sources named with `--include` |
+
+```bash
+python3 skills/ir-search/scripts/scope_plan.py \
+  --preset recommended --need ai --need rnd \
+  --out survey-20260730/scope-plan.json
+
+# K-Startup only
+python3 skills/ir-search/scripts/scope_plan.py \
+  --preset custom --source kstartup --out /tmp/ir-scope.json
+```
+
+With `all_known`, IRIS, IITP, NIA, KIAT, Export Voucher, CCEI, and regional agencies remain
+explicitly `manual` or `candidate`; they are never presented as successful automated
+coverage. Diff mode only concludes disappearance when both the fingerprint and collection
+completeness permit it, so a scope change is not misreported as GONE.
+
+### K-Startup official API (optional — more accurate & faster when present, crawl otherwise)
+
+`kstartup_crawl.py list` uses the official [data.go.kr](https://www.data.go.kr/data/15125364/openapi.do) K-Startup Open API (dataset 15125364) when a **data.go.kr service key** is available, and **automatically falls back to the public-page crawler when no key is present or the API fails / is blocked / returns an unexpected shape** (identical output schema and manifest). The key is read from the repo-root `.env` (`DATA_GO_KR_KEY=...`), the `DATA_GO_KR_KEY` env var, or the shared `~/.config/data_go_kr_key`, and is **never printed to logs, errors, or the command line** (`.env` is gitignored). The same key is reused by sole-search's gov24.
+
+- **Coverage honesty**: this dataset is ordered newest-registration-first, so if the API proves exhaustion via `totalCount` it records `stop_reason: api` (status `ok`, exit 0); if it stops early on the newest-first window it records `stop_reason: api-window` (status `partial`, **exit 2**). The crawl is the authority for exhaustive coverage, and diff mode does not conclude GONE from a partial (`api-window`) run.
+- **Bizinfo stays crawl** — its official API needs a separate `crtfcKey` (issued by Bizinfo, distinct from the data.go.kr key) and the crawler already provides full coverage, so no API is used there.
+
+## Install
+
+**One-command install** — detects installed host CLIs (claude/codex/agy/gemini) and installs for each; falls back to cloning into `~/.agents/skills/` (for Cursor / Grok Build) when no CLI is found. Also handles the `curl_cffi` dependency:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/djfksjd/ir-search/main/install.sh | bash
+```
+
+To install manually instead, pick the method for the agent you use — one tree supports all hosts.
+
+### Claude Code
+
+```bash
+claude plugin marketplace add djfksjd/ir-search
+claude plugin install ir-search@djfksjd
+```
+
+The `curl_cffi` dependency is auto-installed by a SessionStart hook.
+
+### Codex
+
+```bash
+codex plugin marketplace add djfksjd/ir-search
+codex plugin add ir-search@djfksjd
+```
+
+### agy (Antigravity CLI)
+
+```bash
+agy plugin install djfksjd/ir-search
+agy plugin enable ir-search
+pip3 install 'curl_cffi>=0.15'   # no SessionStart hook in agy — install manually
+```
+
+### Gemini CLI
+
+```bash
+gemini extensions install https://github.com/djfksjd/ir-search
+pip3 install 'curl_cffi>=0.15'
+```
+
+The extension manifest (`gemini-extension.json`) auto-discovers the skill under `skills/` and loads `AGENTS.md` as context.
+
+### Cursor / Grok Build (x.ai)
+
+Both read the shared skills directory (`~/.agents/skills/`) as well as `~/.claude/skills/`. A single clone is enough:
+
+```bash
+mkdir -p ~/.agents/skills
+git clone https://github.com/djfksjd/ir-search.git ~/.agents/skills/ir-search
+pip3 install 'curl_cffi>=0.15'
+```
+
+(The root-level `SKILL.md` symlink makes the clone directory itself act as the skill folder. Grok Build also reads Claude Code plugins directly, so if you installed via the Claude Code method above, nothing extra is needed.)
+
+### Classic (clone directly as a Claude Code skill)
+
+```bash
+git clone https://github.com/djfksjd/ir-search.git ~/.claude/skills/ir-search
+pip3 install 'curl_cffi>=0.15'
+```
+
+## Use
+
+With your project folder open in any agent:
+
+```
+우리 아이템에 맞는 지원사업 전수조사 해줘
+(Survey the support programs that fit this project)
+```
+
+or `/ir-search` (Claude Code). The agent reads the project context from the folder and asks only for the missing profile fields (founding stage, region, needs) before starting.
+
+**Built for repeated use:**
+
+- The profile is saved to `ir-search-profile.md` in your project folder — subsequent surveys just confirm "anything changed?" instead of re-asking
+- Re-surveys are diffed against the previous run automatically, reporting only **new announcements / deadline changes / closed opportunities** instead of re-reading 250+ items every time
+
+The crawlers also work standalone (paths relative to the plugin directory):
+
+```bash
+python3 skills/ir-search/scripts/scope_plan.py --preset recommended -o scope-plan.json
+python3 skills/ir-search/scripts/kstartup_crawl.py list -o all.jsonl            # all open K-Startup announcements
+python3 skills/ir-search/scripts/kstartup_crawl.py detail 178481 -o details/    # K-Startup detail pages
+python3 skills/ir-search/scripts/sources_crawl.py list bizinfo -o biz.jsonl     # Bizinfo
+python3 skills/ir-search/scripts/sources_crawl.py list all -o sources.jsonl     # all four extra sources
+python3 skills/ir-search/scripts/sources_crawl.py detail <URL> -o details/      # detail page from any source
+```
+
+## Layout
+
+```
+ir-search/
+├── install.sh                        # one-command installer (auto-detects hosts)
+├── plugin.json                       # agy marker (name/version/description)
+├── gemini-extension.json             # Gemini CLI extension manifest
+├── AGENTS.md                         # shared agent guide (all hosts)
+├── SKILL.md → skills/ir-search/SKILL.md   # symlink — lets a plain clone act as the skill folder
+├── .claude-plugin/                   # Claude Code manifests
+│   ├── plugin.json                   # + inline SessionStart hook (curl_cffi auto-install)
+│   └── marketplace.json              # enables `claude plugin marketplace add`
+├── .codex-plugin/
+│   └── plugin.json                   # Codex manifest (+ interface)
+├── .agents/skills → skills          # symlink — shared standard (Cursor, Grok Build, …)
+├── .cursor/skills → skills          # symlink — Cursor project skills
+├── .gemini/skills → skills          # symlink — Gemini CLI workspace skills
+└── skills/
+    └── ir-search/
+        ├── SKILL.md                  # workflow (profile → collect all → review all → verify → 3-tier report)
+        ├── scripts/
+        │   ├── scope_plan.py         # offline scope/source-status/fingerprint execution plan
+        │   ├── kstartup_crawl.py     # K-Startup crawler (API-first, crawl fallback)
+        │   ├── kstartup_api.py       # K-Startup official Open API client (data.go.kr)
+        │   ├── sources_crawl.py      # Bizinfo / NIPA / KOCCA / SMTECH crawler
+        │   ├── attach_download.py    # shared attachment download (robots-safe, hash)
+        │   ├── run_manifest.py       # shared run_manifest.json writer (coverage)
+        │   └── diff_surveys.py       # incremental re-survey diff (new / changed / closed)
+        └── references/sources.md     # source registry (verified access recipes + secondary sources)
+```
+
+Note: `SKILL.md` is written in Korean — the whole domain (announcements, eligibility criteria, report vocabulary) is Korean, and the model works with it natively.
+
+## Caveats
+
+- Announcement details (deadlines, eligibility, amounts) change frequently. **Always confirm with the accepting agency before applying.** The report reflects the announcement text at survey time.
+- Only public announcement pages are accessed, with a delay between requests. Please respect the target sites' terms of service.
+
+## License
+
+MIT
