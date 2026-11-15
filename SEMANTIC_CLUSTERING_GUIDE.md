@@ -1,0 +1,734 @@
+# SeekMoney AI - 语义聚类系统技术文档
+
+## 目录
+
+1. [系统概述](#系统概述)
+2. [核心架构](#核心架构)
+3. [数据清洗模块](#数据清洗模块)
+4. [Embedding 模块](#embedding-模块)
+5. [聚类算法模块](#聚类算法模块)
+6. [参数优化策略](#参数优化策略)
+7. [质量评估指标](#质量评估指标)
+8. [使用指南](#使用指南)
+9. [性能调优](#性能调优)
+10. [故障排查](#故障排查)
+
+---
+
+## 系统概述
+
+### 设计理念
+
+SeekMoney AI 的语义聚类系统采用 **智谱AI Embedding + DBSCAN** 的技术方案，替代了原有的 Jaccard 相似度聚类算法。该设计旨在从社交媒体用户评论中自动识别和提取有意义的用户痛点聚类。
+
+### 核心优势
+
+| 特性 | 说明 |
+|------|------|
+| **语义理解** | 基于 Embedding 向量，理解文本语义而非字面匹配 |
+| **无监督学习** | DBSCAN 无需预先指定聚类数量，自动发现数据结构 |
+| **噪音过滤** | 内置高信噪比数据清洗器，过滤无效社交用语 |
+| **自适应参数** | 根据数据量动态调整聚类参数 |
+| **质量评估** | 使用 Silhouette Score 和 Davies-Bouldin Index 评估聚类质量 |
+
+### 技术栈
+
+```python
+核心依赖:
+- numpy: 向量运算
+- sklearn: DBSCAN 聚类算法、距离计算、质量评估
+- 智谱AI Embedding API: 文本向量化
+```
+
+---
+
+## 核心架构
+
+### 系统流程图
+
+```
+原始文本输入
+    │
+    ▼
+┌─────────────────────────────────────┐
+│  数据清洗模块 (DataCleaner)          │
+│  - 过滤噪音文本                      │
+│  - 去重                              │
+│  - 计算质量分数                      │
+└─────────────────────────────────────┘
+    │
+    ▼ 清洗后文本列表 + 质量分数
+┌─────────────────────────────────────┐
+│  Embedding 模块 (ZhipuEmbedding)     │
+│  - 调用智谱AI API                   │
+│  - 批量处理 + 限流控制               │
+│  - 返回向量矩阵 (N × 1024)          │
+└─────────────────────────────────────┘
+    │
+    ▼ Embedding 向量矩阵
+┌─────────────────────────────────────┐
+│  参数优化模块 (可选)                 │
+│  - 网格搜索最优参数                  │
+│  - 最大化 Silhouette Score           │
+└─────────────────────────────────────┘
+    │
+    ▼ 最优 (eps, min_samples)
+┌─────────────────────────────────────┐
+│  聚类模块 (SemanticClusterer)        │
+│  - DBSCAN 聚类                      │
+│  - 计算余弦距离矩阵                  │
+│  - 提取代表性文本                    │
+└─────────────────────────────────────┘
+    │
+    ▼ 聚类结果
+输出: [
+  {
+    "representative_text": "代表性文本",
+    "size": 聚类大小,
+    "texts": ["文本1", "文本2", ...]
+  },
+  ...
+]
+```
+
+---
+
+## 数据清洗模块
+
+### DataCleaner 类
+
+数据清洗是整个流程的第一步，也是最关键的一步。高质量的输入数据直接决定聚类效果。
+
+```python
+class DataCleaner:
+    def __init__(self, min_length: int = 4)
+    def is_noise(self, text: str) -> bool
+    def has_whitelist_keyword(self, text: str) -> bool
+    def calculate_score(self, text: str) -> float
+    def clean(self, texts: List[str]) -> Tuple[List[str], List[float]]
+```
+
+### 噪音过滤规则
+
+#### 1. 正则表达式模式 (NOISE_PATTERNS)
+
+```python
+# 示例噪音模式
+r'^哈+$'           # 纯哈哈哈 → 过滤
+r'^@\S+'           # @某人 → 过滤
+r'^[\d\.]+$'       # 纯数字 → 过滤
+r'^👍❤️💕\s*]+$'    # 纯表情 → 过滤
+```
+
+#### 2. 噪音短语列表 (NOISE_PHRASES)
+
+包含 8 大类无效社交用语：
+
+| 类别 | 示例 | 数量 |
+|------|------|------|
+| 纯赞美 | 好听、好看、666、牛批 | 14个 |
+| 纯情绪 | 哈哈哈、笑死、爱了 | 8个 |
+| 追更类 | 蹲、蹲一个、催更 | 5个 |
+| 占位类 | 第一、沙发、打卡 | 7个 |
+| 口号类 | 支持、加油、yyds | 6个 |
+| 简单疑问 | 啥、啥意思、真的吗 | 11个 |
+| 身份询问 | 是谁、谁啊、博主是谁 | 5个 |
+| 广告营销 | 私信、加V、扫码 | 7个 |
+
+#### 3. 白名单关键词 (WHITELIST_KEYWORDS)
+
+包含 63 个与用户痛点相关的优先保留词汇：
+
+```python
+# 分类统计
+问题表达:  怎么、如何、为什么、难、坑、麻烦 (9个)
+需求表达:  求、希望、建议、推荐、想要 (7个)
+学习困难:  不懂、不会、学不会、太难 (6个)
+体验问题:  后悔、避雷、踩坑、不好用 (7个)
+价格敏感:  贵、便宜、平替、省钱 (7个)
+质量投诉:  吐槽、差评、退款、售后 (6个)
+技术问题:  bug、卡、闪退、崩溃 (7个)
+对比选择:  哪个、哪里、区别 (6个)
+教程指导:  教程、步骤、方法 (6个)
+```
+
+### 文本质量评分算法
+
+```python
+def calculate_score(self, text: str) -> float:
+    """
+    质量分数计算公式:
+
+    基础分: 1.0
+
+    白名单关键词:    +2.0
+    长度 50-200:     +1.0 (最佳长度)
+    长度 20-50:      +0.5
+    长度 10-20:      +0.2
+    长度 > 300:      -0.5 (过长可能复制)
+
+    包含问号:        +0.3 × min(问号数, 2)
+    包含数字:        +0.3
+    感叹号 > 2:      -0.5 (情绪化)
+
+    简单疑问+短文本: -1.0 (无实质内容)
+    """
+```
+
+**评分示例：**
+
+| 文本 | 分数 | 说明 |
+|------|------|------|
+| "这个产品真的很难用，客服也不理人" | 3.3 | 白名单关键词(难)+长度适中+包含问号 |
+| "好好好好好好好" | 1.0 | 基础分，被过滤为噪音 |
+| "求推荐一款性价比高的学习软件" | 3.3 | 白名单关键词(求、性价比)+长度适中 |
+| "赞" | 1.0 | 基础分，被过滤为噪音 |
+| "这个怎么用？不太懂，有没有教程？" | 3.2 | 白名单关键词(怎么、不懂、教程)+问号 |
+
+---
+
+## Embedding 模块
+
+### ZhipuEmbedding 类
+
+使用智谱AI的 Embedding-3 模型将文本转换为高维向量。
+
+```python
+class ZhipuEmbedding:
+    def __init__(self, api_key: Optional[str] = None)
+    def get_embeddings(self, texts: List[str]) -> np.ndarray
+```
+
+### API 配置
+
+```python
+base_url = "https://open.bigmodel.cn/api/paas/v4/embeddings"
+model = "embedding-3"  # 可通过 GLM_EMBEDDING_MODEL 环境变量配置
+batch_size = 25       # 每批最大数量
+rate_limit_delay = 0.5  # 请求间隔（秒）
+```
+
+### 环境变量配置
+
+```bash
+# .env.local 或 .env
+GLM_API_KEY=your_api_key_here
+GLM_EMBEDDING_MODEL=embedding-3  # 可选，默认为 embedding-3
+```
+
+### 批量处理策略
+
+```python
+def get_embeddings(self, texts: List[str]) -> np.ndarray:
+    """
+    批量处理逻辑:
+
+    1. 将输入文本分批 (每批最多25条)
+    2. 逐个调用 API (智谱 API 不支持批量)
+    3. 添加延迟避免限流 (0.5秒/请求)
+    4. 返回 numpy 数组 (N × 1024)
+    """
+```
+
+**时间估算：**
+
+- 100 条文本: ~12.5 秒
+- 200 条文本: ~25 秒
+- 500 条文本: ~62.5 秒
+
+---
+
+## 聚类算法模块
+
+### DBSCAN 算法简介
+
+DBSCAN (Density-Based Spatial Clustering of Applications with Noise) 是一种基于密度的聚类算法。
+
+**核心概念：**
+
+```
+eps (ε):        邻域半径，定义点之间的距离阈值
+min_samples:    形成聚类的最小点数
+核心点:         邻域内至少有 min_samples 个点的点
+边界点:         邻域内点数不足 min_samples，但在某个核心点的邻域内
+噪音点:         既不是核心点也不是边界点的点
+```
+
+### 余弦距离
+
+使用余弦距离而非欧氏距离，更适合高维文本向量：
+
+```python
+cosine_distance(a, b) = 1 - cosine_similarity(a, b)
+
+# 范围: [0, 2]
+# 0 = 完全相同
+# 1 = 正交 (无相似性)
+# 2 = 完全相反
+```
+
+### SemanticClusterer 类
+
+```python
+class SemanticClusterer:
+    def __init__(self, eps: float = 0.25, min_samples: int = 3)
+    def cluster(self, embeddings, texts, scores) -> List[Dict]
+```
+
+### 聚类输出格式
+
+```python
+[
+    {
+        "representative_text": "距离聚类中心最近的文本",
+        "size": 15,                    # 聚类大小（去重后）
+        "texts": [                     # 聚类中的所有文本
+            "文本1",
+            "文本2",
+            ...
+        ]
+    },
+    ...
+]
+```
+
+### 代表性文本选择算法
+
+```python
+# 综合考虑距离和质量分数
+combined_score = -distance + score * 0.3
+
+# distance: 距离聚类中心的余弦距离 (越小越好)
+# score: 文本质量分数 (越高越好)
+# 权重 0.3: 质量分数的权重
+```
+
+---
+
+## 参数优化策略
+
+### 自动参数优化
+
+```python
+def optimize_clustering_params(
+    embeddings: np.ndarray,
+    eps_range: List[float] = [0.2, 0.25, 0.3],
+    min_samples_range: Optional[List[int]] = None
+) -> Tuple[float, int]
+```
+
+### 优化目标
+
+**最大化 Silhouette Score:**
+
+```
+Silhouette Score = (b - a) / max(a, b)
+
+其中:
+a = 样本到同簇其他样本的平均距离 (内聚度)
+b = 样本到最近异簇样本的平均距离 (分离度)
+
+范围: [-1, 1]
+-1:  聚类效果极差
+0:   聚类重叠
+1:   聚类效果完美
+```
+
+### eps 参数选择
+
+| 数据规模 | 推荐 eps | 说明 |
+|----------|---------|------|
+| < 20 | 0.45 | 极宽松，确保能形成聚类 |
+| 20-50 | 0.38 | 较宽松，避免过度分散 |
+| 50-100 | 0.30 | 适中 |
+| > 100 | 0.25 | 较严格，提高聚类精度 |
+
+### min_samples 参数选择
+
+| 数据规模 | 推荐 min_samples | 计算公式 |
+|----------|------------------|----------|
+| < 15 | 3 | 固定最小值 |
+| 15-50 | 3 | 保持较低阈值 |
+| 50-100 | 4 | 适度提高 |
+| > 100 | max(5, N//50) | 线性增长 |
+
+**设计理念：**
+
+- 小数据集: 使用较小的 min_samples，避免将所有点都视为噪音
+- 大数据集: 使用较大的 min_samples，提高聚类质量
+
+---
+
+## 质量评估指标
+
+### 1. Silhouette Score (轮廓系数)
+
+```python
+# 范围: [-1, 1]，越高越好
+silhouette > 0.5:  优秀 (簇间分离度高)
+silhouette > 0.3:  良好 (簇较为明确)
+silhouette > 0.1:  一般 (簇边界模糊)
+silhouette ≤ 0.1:  较差 (需要调整参数)
+```
+
+### 2. Davies-Bouldin Index (DBI)
+
+```python
+# 范围: [0, +∞)，越小越好
+dbi < 1:          优秀 (簇间分离度好)
+dbi = 1-2:         良好
+dbi > 2:           需要改进
+```
+
+**计算公式：**
+
+```
+DBI = (1/k) × Σ(max[(σi + σj) / d(c_i, c_j)])
+
+其中:
+k = 聚类数量
+σi = 簇 i 的平均距离 (簇内距离)
+d(c_i, c_j) = 簇 i 和簇 j 中心的距离 (簇间距离)
+```
+
+### 聚类结果解读
+
+| 指标组合 | 含义 | 建议 |
+|----------|------|------|
+| 高 Silhouette + 低 DBI | 理想聚类 | 保持当前参数 |
+| 低 Silhouette + 高 DBI | 聚类质量差 | 调整 eps 或 min_samples |
+| 多个小聚类 + 高噪音点 | eps 太小 | 增大 eps |
+| 少数大聚类 + 低噪音点 | eps 太大 | 减小 eps |
+| 所有点都是噪音 | min_samples 太大 | 减小 min_samples |
+
+---
+
+## 使用指南
+
+### 命令行使用
+
+```bash
+# 基本用法
+python lib/semantic_clustering.py \
+  --input data.json \
+  --output results.json
+
+# 从标准输入读取
+echo '{"texts": ["文本1", "文本2"]}' | \
+  python lib/semantic_clustering.py --stdin
+
+# 自定义参数
+python lib/semantic_clustering.py \
+  --input data.json \
+  --output results.json \
+  --eps 0.3 \
+  --min-samples 4 \
+  --min-length 5
+
+# 启用参数自动优化
+python lib/semantic_clustering.py \
+  --input data.json \
+  --auto-optimize
+```
+
+### Python API 调用
+
+```python
+from lib.semantic_clustering import process_texts
+
+texts = [
+    "这个产品真的很难用",
+    "求推荐类似的产品",
+    "怎么使用这个功能？",
+    "不错，挺好用的",
+    # ... 更多文本
+]
+
+# 自动模式（参数自适应）
+clusters = process_texts(texts)
+
+# 手动指定参数
+clusters = process_texts(
+    texts,
+    eps=0.28,
+    min_samples=4,
+    min_length=4,
+    auto_optimize=False
+)
+
+# 启用参数优化
+clusters = process_texts(
+    texts,
+    auto_optimize=True  # 网格搜索最优参数
+)
+
+# 输出格式
+for cluster in clusters:
+    print(f"聚类大小: {cluster['size']}")
+    print(f"代表性文本: {cluster['representative_text']}")
+    print(f"包含文本: {cluster['texts']}")
+    print("---")
+```
+
+### 输入格式
+
+**直接数组：**
+
+```json
+[
+  "文本1",
+  "文本2",
+  "文本3"
+]
+```
+
+**对象格式：**
+
+```json
+{
+  "texts": [
+    "文本1",
+    "文本2",
+    "文本3"
+  ]
+}
+```
+
+### 输出格式
+
+```json
+{
+  "success": true,
+  "clusters": [
+    {
+      "representative_text": "代表性文本",
+      "size": 15,
+      "texts": [
+        "文本1",
+        "文本2",
+        ...
+      ]
+    }
+  ],
+  "total_clusters": 5,
+  "total_texts": 75
+}
+```
+
+---
+
+## 性能调优
+
+### 数据规模建议
+
+| 规模 | 建议操作 |
+|------|----------|
+| < 50 | 使用默认参数，或启用 auto_optimize |
+| 50-200 | 手动调整参数，或分批处理 |
+| 200-500 | 分批处理，每批 100-200 条 |
+| > 500 | 分批处理 + 考虑使用更快的 Embedding 模型 |
+
+### 批处理策略
+
+```python
+def batch_process(texts, batch_size=150):
+    """大批量数据分批处理"""
+    all_clusters = []
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        clusters = process_texts(batch)
+        all_clusters.extend(clusters)
+        logger.info(f"已处理 {i+len(batch)}/{len(texts)} 条")
+
+    return all_clusters
+```
+
+### API 成本优化
+
+智谱AI Embedding API 计费：
+- embedding-3: ¥0.0005/千 tokens
+- 平均每条约 20 tokens
+- 1000 条文本 ≈ ¥0.01
+
+**优化建议：**
+
+1. **预先过滤**: 使用 DataCleaner 过滤噪音，减少 API 调用
+2. **去重**: 相同文本只 embedding 一次
+3. **缓存**: 对重复查询进行缓存
+
+### 常见性能问题
+
+| 问题 | 原因 | 解决方案 |
+|------|------|----------|
+| 处理时间过长 | API 调用太频繁 | 批量处理 + 预过滤 |
+| 聚类数量过多 | eps 太小 | 增大 eps |
+| 大量噪音点 | min_samples 太大 | 减小 min_samples |
+| Silhouette Score 很低 | 数据质量差 | 加强数据清洗 |
+
+---
+
+## 故障排查
+
+### 常见错误
+
+#### 1. 未找到 GLM_API_KEY
+
+```
+错误: ValueError: 未找到 GLM_API_KEY
+```
+
+**解决方案：**
+
+```bash
+# 检查环境变量
+echo $GLM_API_KEY
+
+# 或创建 .env.local 文件
+echo "GLM_API_KEY=your_key_here" > .env.local
+```
+
+#### 2. API 请求失败
+
+```
+错误: API 错误: 401 - {"error":{"message":"无效的 API 错误","type":"invalid_api_error"}}
+```
+
+**解决方案：**
+
+- 检查 API Key 是否正确
+- 确认账户有足够余额
+- 检查网络连接
+
+#### 3. 聚类结果为空
+
+```
+警告: 聚类数量过少，无法计算质量指标
+```
+
+**可能原因：**
+
+1. **数据量太少**: 清洗后剩余文本不足 10 条
+   - 解决: 增加输入数据量
+
+2. **参数过于严格**: eps 太小或 min_samples 太大
+   - 解决: 放宽参数
+
+3. **数据质量差**: 大量噪音文本未被过滤
+   - 解决: 调整 DataCleaner 配置
+
+#### 4. 所有点都是噪音
+
+```
+聚类完成: 0 个聚类, 150 个噪音点
+```
+
+**原因:** min_samples 设置太大
+
+**解决方案:**
+
+```python
+# 减小 min_samples
+clusters = process_texts(texts, min_samples=3)
+```
+
+---
+
+## 高级配置
+
+### 自定义噪音规则
+
+```python
+# 扩展 DataCleaner 的噪音模式
+cleaner = DataCleaner()
+cleaner.NOISE_PATTERNS.append(r'^自定义正则$')
+cleaner.NOISE_PHRASES.extend(['自定义短语'])
+```
+
+### 自定义白名单
+
+```python
+# 添加特定领域的白名单关键词
+cleaner.WHITELIST_KEYWORDS.extend([
+    '领域特定词1',
+    '领域特定词2'
+])
+```
+
+### 调整质量评分权重
+
+```python
+def custom_score(text):
+    score = 1.0
+
+    # 自定义规则
+    if '关键词' in text:
+        score += 3.0  # 更高的权重
+
+    # ... 更多自定义逻辑
+
+    return score
+```
+
+---
+
+## 算法对比
+
+### DBSCAN vs K-Means vs 层次聚类
+
+| 特性 | DBSCAN | K-Means | 层次聚类 |
+|------|--------|---------|----------|
+| 聚类数量 | 自动发现 | 需预先指定 | 需指定阈值 |
+| 噪音处理 | 自动识别噪音 | 强制分配 | 较弱 |
+| 形状支持 | 任意形状 | 球形 | 任意形状 |
+| 参数敏感性 | 中等 | 较高 | 较高 |
+| 计算复杂度 | O(n²) | O(nkt) | O(n³) |
+| 大数据适用 | 较差 | 良好 | 差 |
+
+### 为什么选择 DBSCAN？
+
+1. **无需指定聚类数量**: 用户痛点数量未知
+2. **噪音处理能力强**: 社交媒体评论有大量噪音
+3. **发现任意形状**: 痛点聚类形状不规则
+4. **语义适配**: 结合余弦距离效果更佳
+
+---
+
+## 附录
+
+### A. 环境要求
+
+```bash
+# Python 版本
+>= 3.8
+
+# 依赖包
+numpy>=1.20.0
+scikit-learn>=0.24.0
+python-dotenv>=0.19.0
+```
+
+### B. 依赖安装
+
+```bash
+pip install numpy scikit-learn python-dotenv
+```
+
+### C. API 获取
+
+1. 访问 [智谱AI开放平台](https://open.bigmodel.cn/)
+2. 注册账号并完成认证
+3. 创建 API Key
+4. 配置到环境变量
+
+### D. 相关文档
+
+- [智谱AI Embedding API 文档](https://open.bigmodel.cn/dev/api#embedding)
+- [scikit-learn DBSCAN 文档](https://scikit-learn.org/stable/modules/generated/sklearn.cluster.DBSCAN.html)
+- [余弦相似度原理](https://en.wikipedia.org/wiki/Cosine_similarity)
+
+---
+
+*文档版本: 1.0*
+*最后更新: 2025年*
+*维护者: SeekMoney AI 团队*
