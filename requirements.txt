@@ -1,0 +1,8 @@
+requests
+PyAutoGUI
+pandas
+beautifulsoup4
+PySimpleGUI
+opencv-contrib-python
+openpyxl
+dataclasses
