@@ -1,0 +1,120 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+from __future__ import annotations
+
+import json
+import math
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import requests
+
+
+def retry_request(func, *args, retries: int = 3, backoff: float = 2.0, **kwargs):
+    """Retry a request function with exponential backoff on exceptions and 5xx/429 errors."""
+    last_error = None
+    retries = max(1, retries)  # Ensure at least one attempt
+    for attempt in range(retries):
+        try:
+            response = func(*args, **kwargs)
+            # Retry on server errors (5xx) and rate limits (429)
+            if response.status_code >= 500 or response.status_code == 429:
+                last_error = requests.RequestException(f"HTTP {response.status_code}: {response.text[:200]}")
+                if attempt < retries - 1:
+                    wait = backoff * (2**attempt)
+                    print(f"Retry {attempt + 1}/{retries} after {wait}s: HTTP {response.status_code}")
+                    time.sleep(wait)
+                continue
+            return response
+        except (requests.RequestException, requests.Timeout) as e:
+            last_error = e
+            if attempt < retries - 1:
+                wait = backoff * (2**attempt)
+                print(f"Retry {attempt + 1}/{retries} after {wait}s: {e}")
+                time.sleep(wait)
+    raise last_error
+
+
+def post_json(url: str, headers: dict, payload: dict, timeout: int = 60, retries: int = 3) -> dict:
+    """POST JSON to URL with retry and error handling."""
+    last_error = None
+    for attempt in range(retries):
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+            # Retry on server errors (5xx), fail immediately on client errors (4xx)
+            if r.status_code >= 500:
+                last_error = f"HTTP {r.status_code}: {r.text[:200]}"
+                if attempt < retries - 1:
+                    wait = 2.0 * (2**attempt)
+                    print(f"Retry {attempt + 1}/{retries} after {wait}s: {last_error}")
+                    time.sleep(wait)
+                continue
+            sys.exit(f"HTTP {r.status_code}: {r.text[:200]}")
+        except (requests.RequestException, requests.Timeout) as e:
+            last_error = str(e)
+            if attempt < retries - 1:
+                wait = 2.0 * (2**attempt)
+                print(f"Retry {attempt + 1}/{retries} after {wait}s: {e}")
+                time.sleep(wait)
+    sys.exit(f"Failed after {retries} retries: {last_error}")
+
+
+def read_json(path: Path) -> dict:
+    """Read JSON file, return empty dict if not found or invalid."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _sanitize_floats(obj):
+    """Recursively replace NaN/Inf floats with 0 to ensure valid JSON."""
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return 0
+    if isinstance(obj, dict):
+        return {k: _sanitize_floats(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_floats(v) for v in obj]
+    return obj
+
+
+def write_json(path: Path, data: dict) -> None:
+    """Write readable JSON with trailing newline. Sanitizes NaN/Inf to 0 if present."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        text = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False)
+    except ValueError:
+        print(f"Warning: Sanitizing NaN/Inf values before writing {path.name}")
+        text = json.dumps(_sanitize_floats(data), ensure_ascii=False, indent=2, allow_nan=False)
+    path.write_text(text + "\n", encoding="utf-8")
+
+
+def is_valid(value, allow_zero: bool = True) -> bool:
+    """Check if a numeric value is valid (finite, not NaN/None/negative/non-numeric)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    return value >= 0 if allow_zero else value > 0
+
+
+def safe_merge(new_data: dict, old_data: dict, keys: tuple | list, label: str = "", allow_zero: bool = True) -> None:
+    """Merge numeric fields in-place: keep new value if valid, fall back to old, default to 0."""
+    for key in keys:
+        if not is_valid(new_data.get(key), allow_zero):
+            old_val = old_data.get(key)
+            prefix = f"{label}." if label else ""
+            if is_valid(old_val, allow_zero):
+                print(f"Warning: Keeping existing {prefix}{key}: {old_val} (new: {new_data.get(key)})")
+                new_data[key] = old_val
+            else:
+                new_data[key] = 0
+
+
+def get_timestamp() -> str:
+    """Return ISO 8601 timestamp with Z suffix."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")

@@ -1,0 +1,76 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# Update Ultralytics Analytics
+#
+# This workflow collects public analytics data for the Ultralytics organization:
+#
+# GitHub Data (data/github.json):
+#   - Repository star counts, fork counts, issues, and PRs across all public repos
+#   - Contributor counts per repository
+#   - Organization-wide totals and timestamps
+#
+# PyPI Data (data/pypi.json):
+#   - All-time total downloads per package and org-wide (via pepy.tech API with auth)
+#   - Daily, weekly, and monthly download counts (via pypistats.org API)
+#   - Tracked packages: ultralytics, ultralytics-actions, ultralytics-thop,
+#     hub-sdk, mkdocs-ultralytics-plugin, ultralytics-autoimport, ultralytics-platform
+#
+# Google Analytics Data (data/google_analytics.json):
+#   - Active users, sessions, events, and average session duration over 1d/7d/30d/90d/365d windows
+#   - Requires GA_CREDENTIALS_JSON secret
+#
+# Reddit Data (data/reddit.json):
+#   - r/ultralytics subscriber count (via shields.io)
+#
+# Platform Data (data/platform.json):
+#   - Ultralytics Platform projects, datasets, images, models, exports, and annotations (via portal.ultralytics.com)
+#   - Requires PORTAL_API_KEY secret
+#
+# Summary (data/summary.json) combines the headline totals from all sources.
+# GitHub, pypistats.org, pepy.tech, and shields.io data is public; pepy.tech needs the PEPY_API_KEY secret for totals.
+# Results are committed daily to main branch via automated PR.
+
+name: Update Analytics
+
+on:
+  schedule:
+    - cron: "7 2 * * *" # daily at 02:07 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  stats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ultralytics/actions/setup-uv@main
+        with:
+          enable-cache: true
+      - run: uv pip install -r requirements.txt
+      - name: Fetch analytics
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PEPY_API_KEY: ${{ secrets.PEPY_API_KEY }}
+          GA_CREDENTIALS_JSON: ${{ secrets.GA_CREDENTIALS_JSON }}
+          PORTAL_API_KEY: ${{ secrets.PORTAL_API_KEY }}
+        run: python fetch_stats.py
+      - name: Create PR and merge
+        env:
+          GH_TOKEN: ${{ secrets._GITHUB_TOKEN }}
+        run: |
+          if [[ -n "$(git status --porcelain)" ]]; then
+            BRANCH="analytics-$(date +%s)"
+            trap 'gh api -X DELETE "repos/${{ github.repository }}/git/refs/heads/$BRANCH" --silent 2>/dev/null || true' EXIT # Always delete the branch, even on early exit or failure
+            git config user.name "UltralyticsAssistant"
+            git config user.email "web@ultralytics.com"
+            git checkout -b "$BRANCH"
+            git add data/
+            git commit -m "Update analytics data"
+            git push origin "$BRANCH"
+            PR_URL=$(gh pr create --title "Update Ultralytics analytics" --body "Automated daily analytics update" --base main --head "$BRANCH")
+            sleep 300
+            gh pr merge "$PR_URL" --squash --delete-branch --admin
+          fi
