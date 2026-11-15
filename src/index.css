@@ -1,0 +1,84 @@
+@import "tailwindcss";
+
+/* ─── Class-based dark mode ─────────────────────────────────────────────── */
+@variant dark (&:where(.dark, .dark *));
+
+/* ─── Design tokens ─────────────────────────────────────────────────────── */
+:root {
+  --blue-600: #2563EB;
+  --blue-700: #1D4ED8;
+  --blue-50:  #EFF6FF;
+  --bg:       #F8FAFC;
+  --surface:  #FFFFFF;
+  --surface-2:#F1F5F9;
+  --border:   #E2E8F0;
+  --border-2: #CBD5E1;
+  --text-1:   #0F172A;
+  --text-2:   #475569;
+  --text-3:   #94A3B8;
+  --success:  #16A34A;
+  --warning:  #D97706;
+  --danger:   #DC2626;
+}
+
+/* ─── Base ──────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-1);
+  font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI',
+    Roboto, Oxygen, Ubuntu, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  line-height: 1.6;
+}
+
+/* ─── Tailwind custom utilities ─────────────────────────────────────────── */
+@layer utilities {
+  .text-balance { text-wrap: balance; }
+}
+
+/* ─── Print styles ───────────────────────────────────────────────────────── */
+/*
+ * DOM structure at print time:
+ *   <body>
+ *     <div class="screen-only">  ← hidden
+ *     <div id="miantrace-print-report">  ← shown
+ *
+ * PrintableReport is a sibling of .screen-only (rendered in App.tsx),
+ * so hiding .screen-only cannot affect it.
+ */
+@media print {
+  .screen-only {
+    display: none !important;
+  }
+
+  #miantrace-print-report {
+    display: block !important;
+  }
+
+  @page {
+    size: A4;
+    margin: 20mm 18mm 20mm 18mm;
+  }
+
+  body {
+    background: white !important;
+    color: #0f172a !important;
+    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+    font-size: 11pt;
+    line-height: 1.5;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .print-no-break {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* Suppress href display for decorative links */
+  a.no-print-href::after { content: none; }
+}

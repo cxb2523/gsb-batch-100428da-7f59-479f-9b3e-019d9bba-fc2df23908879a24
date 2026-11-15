@@ -1,0 +1,9 @@
+name = "miantrace-worker"
+main = "index.ts"
+compatibility_date = "2024-09-23"
+
+# Deploy with:
+#   cd worker
+#   npm install
+#   npx wrangler login
+#   npx wrangler deploy
