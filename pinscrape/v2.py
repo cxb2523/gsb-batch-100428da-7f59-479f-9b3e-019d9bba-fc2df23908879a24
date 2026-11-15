@@ -23,11 +23,20 @@ from .utils import (
 class Pinterest:
     BASE_URL = "https://in.pinterest.com"
 
+    # Per-page outcome categories recorded on ``self.last_search``.
+    PAGE_SUCCESS = "success"
+    PAGE_HTTP_ERROR = "http_error"
+    PAGE_PARSE_ERROR = "parse_error"
+    PAGE_EMPTY_DATA = "empty_data"
+    PAGE_NO_ORIG_IMAGE = "no_orig_image"
+
     def __init__(self, user_agent: str = "", proxies: dict = None, sleep_time: float = None):
         self.errors = []
         self.sleep_time = sleep_time
         self.proxies = proxies or {}
         self.unique_images = []
+        # Outcome of the most recent ``search`` run (None until the first run).
+        self.last_search = None
 
         self.user_agent = user_agent or (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -86,11 +95,23 @@ class Pinterest:
     # Pinterest API calls
     # -----------------------------
 
-    def search(self, query: str, page_size=26):
-        source_url = f"/search/pins/?q={quote(query)}&rs=typed"
+    @staticmethod
+    def _is_usable_bookmark(bookmark) -> bool:
+        """A pagination cursor is only usable as a non-empty string.
 
-        # Warm-up request (critical)
-        self.session.get(f"{self.BASE_URL}{source_url}", headers=self.BASE_HEADERS, timeout=REQUEST_TIMEOUT)
+        Pinterest returns ``"-end-"`` (and sometimes null/empty values) when
+        there are no further pages, so those must not trigger another request.
+        """
+        return isinstance(bookmark, str) and bookmark not in ("", "-end-")
+
+    def _build_search_url(self, query: str, page_size, bookmark=None) -> str:
+        """Build a BaseSearchResource request URL using the existing
+        source_url and ``data`` encoding scheme.
+
+        The pagination cursor is only added to the payload when Pinterest
+        actually supplied one; we never invent cursor parameters.
+        """
+        source_url = f"/search/pins/?q={quote(query)}&rs=typed"
 
         payload = {
             "options": {
@@ -123,6 +144,9 @@ class Pinterest:
             "context": {}
         }
 
+        if self._is_usable_bookmark(bookmark):
+            payload["options"]["bookmarks"] = [bookmark]
+
         encoded = quote_plus(json.dumps(payload).replace(" ", ""))
         encoded = (
             encoded.replace("%2520", "%20")
@@ -133,28 +157,70 @@ class Pinterest:
             .replace("%2526", "%26")
         )
 
-        url = (
+        return (
             f"{self.BASE_URL}/resource/BaseSearchResource/get/"
             f"?source_url={quote_plus(source_url)}&data={encoded}&_={self.time_epoch}"
         )
 
+    def _extract_bookmark_safely(self, response):
+        """Best-effort extraction of a pagination cursor from a raw response
+        (used for pages that failed before model validation)."""
+        try:
+            raw = response.json()
+            data = (raw or {}).get("resource_response", {}).get("data")
+            if isinstance(data, dict):
+                bookmarks = data.get("bookmark")
+                if self._is_usable_bookmark(bookmarks):
+                    return bookmarks
+        except Exception:
+            pass
+        return None
+
+    def _fetch_search_page(self, url: str, source_url: str):
+        """Request and parse one search page.
+
+        Returns ``(outcome, image_urls, page_image_count, bookmark)`` where
+        ``outcome`` is one of the PAGE_* categories. A failure on one page is
+        contained here so the caller can keep paging with the next cursor.
+        """
         headers = self.BASE_HEADERS.copy()
         headers["X-Pinterest-Source-Url"] = source_url
 
-        response = self.session.get(url, headers=headers, proxies=self.proxies, timeout=REQUEST_TIMEOUT)
+        try:
+            response = self.session.get(
+                url, headers=headers, proxies=self.proxies, timeout=REQUEST_TIMEOUT
+            )
+        except Exception as e:
+            logging.warning(f"Image search request failed: {e}")
+            return self.PAGE_HTTP_ERROR, [], 0, None
 
         if self.sleep_time:
             time.sleep(self.sleep_time)
 
         if response.status_code != 200:
             logging.warning(f"Image search failed: {response.status_code}")
-            return []
+            return (
+                self.PAGE_HTTP_ERROR, [], 0,
+                self._extract_bookmark_safely(response),
+            )
 
-        data = SearchResponse(**response.json())
-        results = data.resource_response.data.results
+        try:
+            data = SearchResponse(**response.json())
+        except Exception as e:
+            logging.warning(f"Image search response could not be parsed: {e}")
+            return (
+                self.PAGE_PARSE_ERROR, [], 0,
+                self._extract_bookmark_safely(response),
+            )
+
+        search_data = data.resource_response.data
+        if not search_data or not search_data.results:
+            logging.warning("Image search returned an empty resource_response.data")
+            bookmark = search_data.bookmark if search_data is not None else None
+            return self.PAGE_EMPTY_DATA, [], 0, bookmark if self._is_usable_bookmark(bookmark) else None
+
         image_urls = []
-
-        for result in results:
+        for result in search_data.results:
             if not result.images:
                 continue
 
@@ -163,6 +229,90 @@ class Pinterest:
                 continue
 
             image_urls.append(str(orig.url))
+
+        if not image_urls:
+            logging.warning("Image search page contained no usable orig images")
+            bookmark = search_data.bookmark
+            return (
+                self.PAGE_NO_ORIG_IMAGE, [], 0,
+                bookmark if self._is_usable_bookmark(bookmark) else None,
+            )
+
+        bookmark = search_data.bookmark
+        return (
+            self.PAGE_SUCCESS,
+            image_urls,
+            len(image_urls),
+            bookmark if self._is_usable_bookmark(bookmark) else None,
+        )
+
+    def search(self, query: str, page_size=26, max_pages: int = 1):
+        """Search Pinterest pins and return their ``orig.url`` image URLs.
+
+        ``max_pages`` limits how many search pages are requested, following
+        Pinterest's own pagination cursor. It defaults to 1 so the historical
+        single-page behaviour is unchanged. Paging stops early when Pinterest
+        stops returning a usable cursor.
+
+        A failing page (non-200 HTTP status, unparseable JSON, empty
+        ``resource_response.data`` or a page without any usable ``orig``
+        image) is recorded on ``self.last_search`` and never discards images
+        already collected from earlier pages.
+
+        The returned list is ordered by first appearance across pages with
+        cross-page duplicates removed. Per-run details (whether at least one
+        image was found, how many pages were requested, each page's number and
+        outcome category, and the cumulative image count of successful pages)
+        are exposed on ``self.last_search``.
+        """
+        if not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages < 1:
+            raise ValueError("max_pages must be a positive integer")
+
+        source_url = f"/search/pins/?q={quote(query)}&rs=typed"
+
+        # Warm-up request (critical) — once per search run, as before.
+        self.session.get(f"{self.BASE_URL}{source_url}", headers=self.BASE_HEADERS, timeout=REQUEST_TIMEOUT)
+
+        self.last_search = {
+            "found_image": False,
+            "pages_requested": 0,
+            "page_results": [],
+            "images_count": 0,
+        }
+
+        image_urls = []
+        seen_urls = set()
+        bookmark = None
+        pages_requested = 0
+
+        while pages_requested < max_pages:
+            page_number = pages_requested + 1
+            url = self._build_search_url(query, page_size, bookmark)
+            outcome, page_urls, page_image_count, next_bookmark = self._fetch_search_page(
+                url, source_url
+            )
+            pages_requested += 1
+
+            if outcome == self.PAGE_SUCCESS:
+                for image_url in page_urls:
+                    if image_url not in seen_urls:
+                        seen_urls.add(image_url)
+                        image_urls.append(image_url)
+                self.last_search["images_count"] += page_image_count
+
+            self.last_search["page_results"].append({
+                "page": page_number,
+                "outcome": outcome,
+                "images": page_image_count,
+            })
+
+            bookmark = next_bookmark
+            # No usable cursor returned by Pinterest: stop, do not fabricate one.
+            if not self._is_usable_bookmark(bookmark):
+                break
+
+        self.last_search["pages_requested"] = pages_requested
+        self.last_search["found_image"] = bool(image_urls)
 
         return image_urls
 

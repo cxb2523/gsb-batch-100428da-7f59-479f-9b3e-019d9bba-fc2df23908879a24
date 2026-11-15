@@ -40,3 +40,23 @@ def using_pinterest_apis():
     print(board_details)
     print(board_details.get('resource_response', {}).get('data', {}).get('created_at'))
 ```
+
+### Paginated search
+`Pinterest.search` accepts an optional `max_pages` argument that follows
+Pinterest's own pagination cursor. It defaults to `1`, so omitting it keeps the
+historical single-page behaviour; pass a larger number to collect across pages,
+and paging stops automatically once Pinterest no longer returns a cursor.
+
+```python
+p = Pinterest()
+images_url = p.search("messi", max_pages=3)  # up to 3 pages
+```
+
+The returned list contains `orig.url` strings in first-appearance order with
+cross-page duplicates removed. Per-run details are exposed on `p.last_search`:
+whether at least one image was found (`found_image`), how many pages were
+requested (`pages_requested`), each page's number and outcome category
+(`page_results`: `success`, `http_error`, `parse_error`, `empty_data` or
+`no_orig_image`), and the cumulative image count of successful pages
+(`images_count`). A failed page is reported there but never discards images
+collected from earlier pages.

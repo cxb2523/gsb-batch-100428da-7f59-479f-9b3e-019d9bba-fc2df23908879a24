@@ -12,6 +12,9 @@ class PinResult(BaseModel):
 
 class SearchData(BaseModel):
     results: List[PinResult] = []
+    # Pinterest's pagination cursor for the next page; None, "" or "-end-"
+    # means there is no further page.
+    bookmark: Optional[str] = None
 
 
 class ResourceResponse(BaseModel):
