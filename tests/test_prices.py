@@ -45,12 +45,78 @@ class DatabaseCase(unittest.TestCase):
         self.assertEqual(snapshot["dollar"], 61000)
         self.assertEqual(snapshot["updated_at"].tzinfo, timezone.utc)
 
+    def test_partial_snapshot_is_stored_with_missing_values(self):
+        db.create_table()
+        db.add_row(60000, None, 65000)
+        snapshot = db.retrieve_latest()
+        self.assertEqual(snapshot["dollar"], 60000)
+        self.assertIsNone(snapshot["pound"])
+        self.assertEqual(snapshot["euro"], 65000)
+
+    def test_latest_partial_snapshot_shadows_older_complete_one(self):
+        db.create_table()
+        db.add_row(60000, 75000, 65000)
+        db.add_row(None, 76000, None)
+        snapshot = db.retrieve_latest()
+        self.assertIsNone(snapshot["dollar"])
+        self.assertEqual(snapshot["pound"], 76000)
+        self.assertIsNone(db.retrieve_dollar())
+        self.assertEqual(db.retrieve_pound(), 76000)
+
+    def test_empty_partial_snapshot_is_rejected(self):
+        db.create_table()
+        db.add_row(60000, 75000, 65000)
+        with self.assertRaises(ValueError):
+            db.add_row(None, None, None)
+        self.assertEqual(db.retrieve_dollar(), 60000)
+
+    def test_invalid_currency_in_partial_snapshot_is_rejected(self):
+        with self.assertRaises(ValueError):
+            db.add_row(None, 0, 65000)
+        with self.assertRaises(ValueError):
+            db.add_row(-5, None, None)
+
     def test_invalid_legacy_row_does_not_hide_last_good_prices(self):
         db.create_table()
         db.add_row(60000, 75000, 65000)
         with closing(db.get_db_connection()) as con, con:
             con.execute("INSERT INTO tgju(dollar, pound, euro) VALUES ('', 'N/A', '')")
         self.assertEqual(db.retrieve_dollar(), 60000)
+
+    def test_legacy_row_with_mixed_invalid_values_keeps_valid_prices(self):
+        db.create_table()
+        with closing(db.get_db_connection()) as con, con:
+            con.execute("INSERT INTO tgju(dollar, pound, euro) VALUES ('60000', 'N/A', '')")
+        snapshot = db.retrieve_latest()
+        self.assertEqual(snapshot["dollar"], 60000)
+        self.assertIsNone(snapshot["pound"])
+        self.assertIsNone(snapshot["euro"])
+
+    def test_legacy_row_with_invalid_timestamp_is_skipped(self):
+        db.create_table()
+        db.add_row(60000, 75000, 65000)
+        with closing(db.get_db_connection()) as con, con:
+            con.execute(
+                "INSERT INTO tgju(dollar, pound, euro, created_at) "
+                "VALUES ('1', '2', '3', 'not-a-date')"
+            )
+        self.assertEqual(db.retrieve_dollar(), 60000)
+
+    def test_legacy_complete_row_still_reads_as_complete(self):
+        db.create_table()
+        with closing(db.get_db_connection()) as con, con:
+            con.execute(
+                "INSERT INTO tgju(dollar, pound, euro, created_at) "
+                "VALUES ('60000', '75000', '65000', '2026-01-01 00:00:00')"
+            )
+        snapshot = db.retrieve_latest()
+        self.assertEqual(
+            (snapshot["dollar"], snapshot["pound"], snapshot["euro"]),
+            (60000, 75000, 65000),
+        )
+        self.assertEqual(
+            snapshot["updated_at"], datetime(2026, 1, 1, tzinfo=timezone.utc)
+        )
 
     def test_invalid_insert_preserves_snapshot(self):
         db.create_table()
@@ -80,6 +146,27 @@ class DatabaseCase(unittest.TestCase):
             crawler.refresh_prices()
         self.assertEqual(db.retrieve_latest()["euro"], 65000)
 
+    def test_partial_refresh_saves_missing_currencies(self):
+        with patch.object(crawler, "fetch_prices", return_value=(60000, None, 65000)):
+            with self.assertLogs(crawler.logger, level="WARNING"):
+                crawler.refresh_prices()
+        snapshot = db.retrieve_latest()
+        self.assertEqual(snapshot["dollar"], 60000)
+        self.assertIsNone(snapshot["pound"])
+        self.assertEqual(snapshot["euro"], 65000)
+
+    def test_all_missing_refresh_preserves_previous_snapshot(self):
+        db.create_table()
+        db.add_row(60000, 75000, 65000)
+        before = db.retrieve_latest()
+        with patch.object(
+            crawler, "fetch_prices",
+            side_effect=ValueError("no valid currency price"),
+        ):
+            with self.assertRaises(ValueError):
+                crawler.refresh_prices()
+        self.assertEqual(db.retrieve_latest(), before)
+
 
 class CrawlerTests(unittest.TestCase):
     def test_numeric_toman_conversion(self):
@@ -97,10 +184,27 @@ class CrawlerTests(unittest.TestCase):
     def test_nested_cell_text(self):
         self.assertEqual(crawler.parse_prices(html()), (60000, 75000, 65000))
 
-    def test_missing_or_invalid_currency_rejects_entire_snapshot(self):
-        for page in (html().replace("price_gbp", "missing"), html(("600,000", "N/A", "650,000"))):
-            with self.subTest(page=page), self.assertRaises(ValueError):
-                crawler.parse_prices(page)
+    def test_missing_currency_yields_none_instead_of_failing(self):
+        pages = {
+            "missing_usd": (html().replace("price_dollar_rl", "missing"), (None, 75000, 65000)),
+            "invalid_gbp": (html(("600,000", "N/A", "650,000")), (60000, None, 65000)),
+            "missing_eur": (html().replace("price_eur", "other"), (60000, 75000, None)),
+        }
+        for name, (page, expected) in pages.items():
+            with self.subTest(name=name):
+                self.assertEqual(crawler.parse_prices(page), expected)
+
+    def test_partial_snapshot_logs_warnings(self):
+        page = html(("600,000", "N/A", "650,000"))
+        with self.assertLogs(crawler.logger, level="WARNING"):
+            crawler.parse_prices(page)
+
+    def test_all_currencies_missing_rejects_snapshot(self):
+        page = html(("N/A", "", "0"))
+        with self.assertRaises(ValueError):
+            crawler.parse_prices(page)
+        with self.assertRaises(ValueError):
+            crawler.parse_prices("<table></table>")
 
     def test_import_does_not_make_network_requests(self):
         with patch("requests.get") as get:
@@ -115,6 +219,12 @@ class CrawlerTests(unittest.TestCase):
             response.raise_for_status.assert_called_once()
             self.assertTrue(get.call_args.args[0].startswith("https://"))
             self.assertEqual(get.call_args.kwargs["timeout"], (5, 15))
+
+    def test_fetch_returns_partial_snapshot_with_missing_currency(self):
+        with patch("requests.get") as get:
+            response = get.return_value.__enter__.return_value
+            response.text = html(("600,000", "N/A", "650,000"))
+            self.assertEqual(crawler.fetch_prices(), (60000, None, 65000))
 
     def test_http_errors_are_not_parsed(self):
         with patch("requests.get") as get, patch.object(crawler, "parse_prices") as parse:
@@ -146,6 +256,41 @@ class ReplyTests(unittest.TestCase):
 
     def test_missing_data_message(self):
         self.assertIn("not available yet", bot.format_price("dollar", None))
+
+    def test_missing_currency_in_snapshot_is_explained(self):
+        snapshot = {
+            "dollar": 60000, "pound": None, "euro": 65000,
+            "updated_at": self.now,
+        }
+        message = bot.format_price("pound", snapshot, self.now)
+        self.assertIn("not available in this update", message)
+        self.assertIn("Snapshot time: 2026-01-01 00:00:00 UTC", message)
+        self.assertIn("Source: TGJU", message)
+        self.assertNotIn("tomans", message.splitlines()[0])
+
+    def test_present_currency_still_shows_price_in_partial_snapshot(self):
+        snapshot = {
+            "dollar": 60000, "pound": None, "euro": 65000,
+            "updated_at": self.now,
+        }
+        message = bot.format_price("euro", snapshot, self.now)
+        self.assertIn("Euro: 65,000 tomans", message)
+        self.assertIn("2026-01-01 00:00:00 UTC", message)
+        self.assertIn("Source: TGJU", message)
+
+    def test_missing_currency_message_can_still_warn_about_staleness(self):
+        snapshot = {"dollar": None, "pound": 1, "euro": 1, "updated_at": self.now}
+        message = bot.format_price(
+            "dollar", snapshot, self.now + timedelta(seconds=3600)
+        )
+        self.assertIn("not available in this update", message)
+        self.assertIn("Warning: this snapshot is stale", message)
+
+    def test_present_price_stale_warning_still_says_price(self):
+        message = bot.format_price(
+            "dollar", self.snapshot, self.now + timedelta(seconds=900)
+        )
+        self.assertIn("Warning: this price is stale", message)
 
 
 class PollingStartupTests(unittest.TestCase):
@@ -185,6 +330,33 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, "retrieve_latest", return_value=None):
             await bot.euro(update, context)
         self.assertIn("not available yet", context.bot.send_message.call_args.kwargs["text"])
+
+    async def test_missing_currency_reply_reports_update_time(self):
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=123))
+        context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+        snapshot = {
+            "dollar": 60000, "pound": None, "euro": 65000,
+            "updated_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        }
+        with patch.object(bot, "retrieve_latest", return_value=snapshot):
+            await bot.pound(update, context)
+        text = context.bot.send_message.call_args.kwargs["text"]
+        self.assertIn("British Pound: not available in this update", text)
+        self.assertIn("Snapshot time: 2026-01-01 00:00:00 UTC", text)
+        self.assertIn("Source: TGJU", text)
+
+    async def test_missing_currency_does_not_fall_back_to_old_price(self):
+        update = SimpleNamespace(effective_chat=SimpleNamespace(id=123))
+        context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()))
+        snapshot = {
+            "dollar": None, "pound": 76000, "euro": 70000,
+            "updated_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        }
+        with patch.object(bot, "retrieve_latest", return_value=snapshot):
+            await bot.dollar(update, context)
+        text = context.bot.send_message.call_args.kwargs["text"]
+        self.assertIn("not available in this update", text)
+        self.assertNotIn("tomans", text.splitlines()[0])
 
     async def test_refresh_failure_is_logged_and_does_not_stop_scheduler(self):
         for failure in (requests.Timeout(), ValueError(), sqlite3.OperationalError()):

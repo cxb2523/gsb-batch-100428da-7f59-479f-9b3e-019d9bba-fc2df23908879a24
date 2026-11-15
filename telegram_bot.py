@@ -53,13 +53,23 @@ def format_price(currency, snapshot, now=None):
     now = now or datetime.now(timezone.utc)
     updated = snapshot["updated_at"]
     labels = {"dollar": "US Dollar", "pound": "British Pound", "euro": "Euro"}
-    message = (
-        f"{labels[currency]}: {snapshot[currency]:,} tomans\n"
-        f"Last successful update: {updated:%Y-%m-%d %H:%M:%S} UTC\n"
-        "Source: TGJU"
-    )
+    price = snapshot.get(currency)
+    if price is None:
+        message = (
+            f"{labels[currency]}: not available in this update "
+            "(the latest TGJU snapshot did not include it)\n"
+            f"Snapshot time: {updated:%Y-%m-%d %H:%M:%S} UTC\n"
+            "Source: TGJU"
+        )
+    else:
+        message = (
+            f"{labels[currency]}: {price:,} tomans\n"
+            f"Last successful update: {updated:%Y-%m-%d %H:%M:%S} UTC\n"
+            "Source: TGJU"
+        )
     if (now - updated).total_seconds() >= STALE_AFTER_SECONDS:
-        message += "\nWarning: this price is stale (15 minutes or older)."
+        subject = "price" if price is not None else "snapshot"
+        message += f"\nWarning: this {subject} is stale (15 minutes or older)."
     return message
 
 

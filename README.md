@@ -22,10 +22,11 @@ Prices refresh every **5 minutes** while the bot is running. Each reply includes
 - **Automatic refresh:** fetches at startup and every 5 minutes, without a separate cron job.
 - **Update timestamps:** shows the last successful fetch time in UTC.
 - **Stale-price warnings:** warns when a snapshot is 15 minutes old or older.
-- **Safe storage:** a failed request or an incomplete/invalid scrape preserves the last successful snapshot.
+- **Safe storage:** a failed request or an entirely missing scrape preserves the last successful snapshot; a partially missing scrape is still saved.
+- **Partial snapshots:** if only some currencies are available, the missing ones are reported as unavailable instead of discarding the whole update.
 - **Friendly fallback:** missing prices and database failures produce helpful messages.
 - **Lightweight storage:** SQLite requires no separate database server.
-- **Offline regression tests:** cover conversion, parsing, storage, replies, and scheduling.
+- **Offline regression tests:** cover conversion, complete and partial parsing, storage, legacy-database compatibility, replies, and scheduling.
 
 > This README is bilingual. The bot's current replies are in English; choosing a README language does not change the bot's language.
 
@@ -114,13 +115,24 @@ If that snapshot becomes stale, the reply also includes:
 Warning: this price is stale (15 minutes or older).
 ```
 
+If TGJU did not return a particular currency in the latest update, that command reports the gap instead of showing an old price:
+
+```text
+US Dollar: not available in this update (the latest TGJU snapshot did not include it)
+Snapshot time: 2026-01-01 12:00:00 UTC
+Source: TGJU
+```
+
+The other currencies in the same snapshot are still displayed normally.
+
 ## How prices are fetched and stored
 
 1. The crawler requests TGJU over HTTPS and checks the HTTP response status.
-2. It extracts and validates all three currency prices before saving anything.
-3. Prices are converted numerically from rials to whole tomans, rounding down any fractional toman.
-4. A complete snapshot is saved to SQLite with a UTC timestamp.
-5. Telegram commands read the latest valid saved snapshot.
+2. Each currency is parsed and validated independently.
+3. Valid prices are converted numerically from rials to whole tomans, rounding down any fractional toman.
+4. A snapshot is saved to SQLite with a UTC timestamp; currencies that were missing or invalid are stored as `NULL`.
+5. Only when **all three** currencies are missing or invalid is the update treated as failed and the previous snapshot kept.
+6. Telegram commands read the latest saved snapshot that contains at least one valid price; missing currencies appear as `None`.
 
 Requests use a **5-second connection timeout** and a **15-second read timeout**. Network errors, HTTP failures, and missing or invalid prices are logged; failed refreshes leave previous prices and their timestamp intact.
 
@@ -141,7 +153,7 @@ To fetch and save one snapshot manually:
 python currency_crawler.py
 ```
 
-Existing databases from the original version remain compatible: their prices were already converted to tomans. **Do not divide those saved values by 10 again.** Invalid legacy rows are skipped when reading prices. If an older installation created its database outside the project directory, stop the bot and move that database beside the source files before restarting.
+Existing databases from the original version remain compatible: their prices were already converted to tomans. **Do not divide those saved values by 10 again.** Legacy rows are read even when some of their cells are invalid: usable cells are returned and damaged ones become `None`, while rows with no usable price or an unreadable timestamp are skipped. If an older installation created its database outside the project directory, stop the bot and move that database beside the source files before restarting.
 
 ## Project structure
 
@@ -209,10 +221,11 @@ Released under the [MIT License](LICENSE). See the license for its warranty and 
 - **به‌روزرسانی خودکار:** دریافت قیمت هنگام شروع و سپس هر ۵ دقیقه، بدون نیاز به کران‌جاب جداگانه.
 - **نمایش زمان دریافت:** زمان آخرین دریافت موفق با منطقه زمانی UTC.
 - **هشدار قدیمی بودن قیمت:** نمایش هشدار وقتی از آخرین دریافت موفق ۱۵ دقیقه یا بیشتر گذشته باشد.
-- **حفظ قیمت‌های معتبر:** در صورت خطای شبکه یا دریافت داده ناقص و نامعتبر، اطلاعات موفق قبلی حفظ می‌شوند.
+- **حفظ قیمت‌های معتبر:** در صورت خطای شبکه یا دریافت داده کاملاً ناموجود، اطلاعات موفق قبلی حفظ می‌شوند؛ دریافت ناقص اما معتبر همچنان ذخیره می‌شود.
+- **پشتیبانی از دریافت ناقص:** اگر فقط بخشی از ارزها در دسترس باشند، به‌جای دور ریختن کل به‌روزرسانی، ارزهای ناموجود به‌صورت «در این به‌روزرسانی موجود نیست» گزارش می‌شوند.
 - **پیام مناسب هنگام خطا:** مدیریت نبود قیمت و خطاهای پایگاه داده.
 - **ذخیره‌سازی سبک:** استفاده از SQLite بدون نیاز به سرور پایگاه داده جداگانه.
-- **آزمون‌های آفلاین:** بررسی تبدیل واحد، استخراج قیمت، ذخیره‌سازی، پاسخ‌ها و زمان‌بندی.
+- **آزمون‌های آفلاین:** بررسی تبدیل واحد، استخراج قیمت کامل و ناقص، ذخیره‌سازی، سازگاری با پایگاه داده قدیمی، پاسخ‌ها و زمان‌بندی.
 
 > این راهنما دوزبانه است، اما پاسخ‌های فعلی ربات به زبان انگلیسی هستند. انتخاب زبان در README زبان خود ربات را تغییر نمی‌دهد.
 
@@ -329,17 +342,33 @@ Warning: this price is stale (15 minutes or older).
 
 </div>
 
+اگر TGJU در آخرین به‌روزرسانی یکی از ارزها را برنگردانده باشد، همان دستور به‌جای نمایش قیمت قدیمی، نبود آن ارز را گزارش می‌کند:
+
+<div dir="ltr">
+
+```text
+US Dollar: not available in this update (the latest TGJU snapshot did not include it)
+Snapshot time: 2026-01-01 12:00:00 UTC
+Source: TGJU
+```
+
+</div>
+
+سایر ارزهای همان مجموعه همچنان به‌صورت عادی نمایش داده می‌شوند.
+
 ## روش دریافت و ذخیره قیمت‌ها
 
 ۱. خزنده صفحه TGJU را از طریق HTTPS دریافت می‌کند و وضعیت پاسخ HTTP را بررسی می‌کند.
 
-۲. قیمت هر سه ارز استخراج و اعتبارسنجی می‌شود؛ تا پیش از تأیید همه قیمت‌ها، داده‌ای ذخیره نمی‌شود.
+۲. قیمت هر ارز به‌صورت جداگانه استخراج و اعتبارسنجی می‌شود.
 
-۳. قیمت‌ها به‌صورت عددی از ریال به تومان تبدیل می‌شوند. بخش کسری تومان به پایین گرد می‌شود.
+۳. قیمت‌های معتبر به‌صورت عددی از ریال به تومان تبدیل می‌شوند. بخش کسری تومان به پایین گرد می‌شود.
 
-۴. مجموعه کامل قیمت‌ها همراه با زمان دریافت به UTC در SQLite ذخیره می‌شود.
+۴. مجموعه قیمت‌ها همراه با زمان دریافت به UTC در SQLite ذخیره می‌شود؛ ارزهای ناموجود یا نامعتبر با مقدار `NULL` ذخیره می‌شوند.
 
-۵. دستورهای تلگرام آخرین مجموعه معتبر ذخیره‌شده را نمایش می‌دهند.
+۵. فقط زمانی که **هر سه** ارز ناموجود یا نامعتبر باشند، دریافت ناموفق تلقی می‌شود و مجموعه قبلی حفظ می‌شود.
+
+۶. دستورهای تلگرام آخرین مجموعه ذخیره‌شده‌ای را نمایش می‌دهند که حداقل یک قیمت معتبر دارد؛ ارزهای ناموجود به‌صورت `None` برگردانده می‌شوند.
 
 مهلت اتصال شبکه **۵ ثانیه** و مهلت خواندن پاسخ **۱۵ ثانیه** است. خطاهای شبکه، پاسخ ناموفق HTTP و قیمت‌های نامعتبر در گزارش‌ها ثبت می‌شوند. دریافت ناموفق، قیمت قبلی و زمان آن را تغییر نمی‌دهد.
 
@@ -364,7 +393,7 @@ python currency_crawler.py
 
 </div>
 
-پایگاه داده نسخه اولیه همچنان قابل استفاده است؛ قیمت‌های آن قبلاً به تومان تبدیل شده‌اند. **مقادیر ذخیره‌شده را دوباره بر ۱۰ تقسیم نکنید.** ردیف‌های نامعتبر نسخه قدیمی هنگام خواندن نادیده گرفته می‌شوند. اگر نسخه قبلی پایگاه داده را بیرون از پوشه پروژه ساخته است، ربات را متوقف کنید و فایل پایگاه داده را پیش از اجرای مجدد به کنار فایل‌های پروژه منتقل کنید.
+پایگاه داده نسخه اولیه همچنان قابل استفاده است؛ قیمت‌های آن قبلاً به تومان تبدیل شده‌اند. **مقادیر ذخیره‌شده را دوباره بر ۱۰ تقسیم نکنید.** ردیف‌های قدیمی حتی با داشتن بعضی سلول‌های نامعتبر خوانده می‌شوند: سلول‌های قابل استفاده برگردانده و سلول‌های خراب `None` می‌شوند، اما ردیف‌هایی که هیچ قیمت قابل استفاده یا زمان قابل خواندن ندارند نادیده گرفته می‌شوند. اگر نسخه قبلی پایگاه داده را بیرون از پوشه پروژه ساخته است، ربات را متوقف کنید و فایل پایگاه داده را پیش از اجرای مجدد به کنار فایل‌های پروژه منتقل کنید.
 
 ## ساختار پروژه
 
@@ -399,6 +428,7 @@ python -m unittest discover -s tests -v
 | ربات اجرا نمی‌شود | توکن فایل `config.py` را بررسی کنید و وابستگی‌ها را داخل محیط مجازی فعال نصب کنید. |
 | هنوز قیمتی موجود نیست | گزارش خطای دریافت اولیه را بررسی کنید؛ ربات در نوبت زمان‌بندی‌شده بعدی دوباره تلاش می‌کند. |
 | هشدار قدیمی بودن قیمت نمایش داده می‌شود | اتصال شبکه و گزارش‌های دریافت قیمت را بررسی کنید؛ ربات آخرین اطلاعات موفق را نمایش می‌دهد. |
+| یک ارز «not available in this update» نشان داده می‌شود | TGJU در آخرین به‌روزرسانی آن ارز را برنگردانده است؛ ربات در نوبت بعدی دوباره تلاش می‌کند. سایر ارزها از همان مجموعه نمایش داده می‌شوند. |
 | استخراج قیمت دیگر کار نمی‌کند | ممکن است HTML سایت TGJU تغییر کرده باشد یا درخواست مسدود شده باشد؛ منبع صفحه و گزارش استخراج را بررسی کنید. |
 | پایگاه داده در دسترس نیست | مجوز نوشتن و فضای خالی دیسک در پوشه پروژه را بررسی کنید. |
 | PowerShell اجازه فعال‌سازی محیط را نمی‌دهد | مستقیماً از پایتون محیط مجازی استفاده کنید: ابتدا `.\venv\Scripts\python.exe -m pip install -r requirements.txt` و سپس `.\venv\Scripts\python.exe telegram_bot.py`. |

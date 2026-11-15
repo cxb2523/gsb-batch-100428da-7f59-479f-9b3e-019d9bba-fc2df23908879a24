@@ -1,4 +1,4 @@
-"""Fetch complete TGJU currency snapshots in tomans."""
+"""Fetch TGJU currency snapshots in tomans, tolerating missing currencies."""
 import logging
 import re
 import sqlite3
@@ -26,19 +26,33 @@ def fix_string(price_with_commas: str) -> int:
 
 
 def parse_prices(html: str) -> tuple:
-    """Reject the entire snapshot if any currency is missing or malformed."""
+    """Parse each currency independently, using None for missing/invalid cells.
+
+    A snapshot is only rejected when no currency at all could be parsed.
+    """
     soup = BeautifulSoup(html, "lxml")
     prices = []
     for market in MARKETS:
         cell = soup.select_one(f'tr[data-market-row="{market}"] td')
         if cell is None:
-            raise ValueError(f"Missing price cell for {market}")
-        prices.append(fix_string(cell.get_text(strip=True)))
+            logger.warning("Missing price cell for %s", market)
+            prices.append(None)
+            continue
+        try:
+            prices.append(fix_string(cell.get_text(strip=True)))
+        except ValueError as exc:
+            logger.warning("Invalid price for %s: %s", market, exc)
+            prices.append(None)
+    if all(price is None for price in prices):
+        raise ValueError("Snapshot does not contain any valid currency price")
     return tuple(prices)
 
 
 def fetch_prices() -> tuple:
-    """Fetch with bounded waits; propagate network and HTTP errors."""
+    """Fetch with bounded waits; propagate network and HTTP errors.
+
+    The returned tuple may contain None for currencies missing from the page.
+    """
     with requests.get(
         URL, headers={"User-Agent": "ArzTelegramBot/1.0"}, timeout=REQUEST_TIMEOUT
     ) as response:
@@ -47,8 +61,11 @@ def fetch_prices() -> tuple:
 
 
 def refresh_prices() -> None:
-    # Validate everything before touching the last successful snapshot.
+    # Parse each currency independently; only an entirely missing snapshot fails.
     prices = fetch_prices()
+    missing = [market for market, price in zip(MARKETS, prices) if price is None]
+    if missing:
+        logger.warning("Snapshot is missing currencies: %s", ", ".join(missing))
     create_table()
     add_row(*prices)
     logger.info("Saved a new currency snapshot in tomans")
