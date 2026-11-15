@@ -1,0 +1,514 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- **Vulnerability Confidence System:**
+  - Introduced confidence levels (`LOW`, `MEDIUM`, `HIGH`) for all vulnerability
+    findings.
+  - Added the `nc_min_confidence` option to allow users to filter findings based
+    on a minimum confidence threshold.
+  - Findings now include the confidence level in console logs and report data.
+- **Dynamic False Positive Verification:**
+
+  - **XSS:** Implemented DOM-aware verification using `BeautifulSoup` to
+    distinguish between harmless text reflection and executable injection. The
+    scanner now verifies if injected tags are actually parsed as elements or if
+    `javascript:` URIs land in executable attributes (e.g., `href`, `onclick`).
+  - **SQLi & Command Injection (Time-based):** Added proportional delay
+    verification (e.g., verifying a 5s sleep against a 2s sleep) to filter out
+    network lag and confirm server-side execution.
+  - **SQLi (Boolean) & IDOR:** Integrated structural similarity checking using
+    `difflib` and stability checks to distinguish between vulnerable responses
+    and generic error pages or dynamic content noise.
+  - **Directory Traversal:** Shifted from status-code heuristics to
+    deterministic content signature matching (e.g., detecting `root:x:0:0`).
+  - **SSTI & Command Injection (Output-based):** Replaced generic payloads with
+    high-entropy mathematical operations (`1337*1337 -> 1787569`) for
+    definitive, deterministic results.
+
+- **Automated POC Generation:**
+  - Implemented automatic `curl` command generation for all detected
+    vulnerabilities to facilitate rapid reproduction.
+  - Included the Proof of Concept (POC) commands in both terminal logs and
+    findings reports.
+- **XSS Smart Targeting:**
+  - Added an optional `nc_smart_targeting` flag to drastically speed up scans by
+    skipping unlikely targets (e.g., purely numeric parameters) for XSS
+    scanning.
+- **Improved Test Coverage for Critical Scanners:**
+  - Added a dedicated test suite for the SQLi scanner
+    (`tests/test_sqli_scanner.py`), covering error-based, boolean-based (with
+    stability checks), and time-based (with dynamic verification) detection.
+  - Added a dedicated test suite for the IDOR scanner
+    (`tests/test_idor_scanner.py`), validating structural similarity checking
+    and stability logic.
+- **Enhanced Sensitive Data Exposure Checks:**
+  - Refactored the info disclosure scanner (`passive_scans/content.py`) to be
+    more modular and extensible using a data-driven approach.
+  - Added new regex patterns for detecting a wider range of sensitive
+    information, including Google API keys, Stripe API keys, Slack tokens,
+    generic API keys, credit card numbers, and Social Security Numbers.
+  - Created a new test suite (`tests/test_passive_content.py`) to validate the
+    new patterns.
+- **Open Redirect Scanner:**
+  - Added a new active scanner module (`active_scans/open_redirect.py`) to
+    detect open redirect vulnerabilities.
+  - The scanner identifies parameters that look like URLs, injects a test URL,
+    and checks for 3xx redirects to the injected URL.
+  - Integrated the scanner into the main active scan worker in `addon.py`.
+  - Added comprehensive tests (`tests/test_active_open_redirect.py`) to verify
+    its functionality.
+- **Automated Vulnerable Dependency Checking:**
+  - Enhanced the passive JavaScript scanner (`passive_scans/javascript.py`) to
+    automatically query the OSV.dev API for known vulnerabilities for identified
+    JavaScript libraries and their versions.
+  - Introduced a new asynchronous worker (`_vuln_check_worker`) in `addon.py` to
+    handle these external API calls efficiently without blocking the main event
+    loop.
+  - Updated the relevant tests (`tests/test_passive_javascript.py`) to verify
+    this new functionality.
+
+### Changed
+
+- **Architectural Refactor:**
+  - Moved all active scanners (`sqli`, `xss`, `idor`) to
+    `nightcrawler/active_scans/` for better organization.
+  - Implemented a `PassiveScanner` and `ActiveScanner` base class system.
+  - Introduced dynamic scanner discovery in `addon.py`, removing hardcoded
+    scanner calls and enabling modular extensibility.
+- **Test Suite Improvements:**
+
+  - Refactored all active and passive scanner tests to use the new class-based
+    registry system.
+  - Standardized test assertions to correctly handle keyword arguments in
+    logging.
+  - Improved `respx` mocking strategies for more robust and accurate
+    vulnerability detection testing.
+
+- Updated existing active scanner tests to accommodate new confidence parameters
+  and revised verification logic.
+- Refined confidence levels across all passive and active scanners to ensure
+  high-signal reporting.
+
+### Fixed
+
+- Fixed an issue where the boolean SQLi scanner was skipped if the custom
+  payload list was empty.
+- Fixed a URL handling bug in `httpx` requests within active scanners that
+  caused query parameters to be improperly processed during tests.
+- Resolved various `AttributeError` and `IndexError` issues in the test suite by
+  correcting mock configurations and assertion logic.
+
+## [0.11.0] - 2026-02-18
+
+### Added
+
+- **IDOR Scanner:** Added a new active scanner module
+  (`nightcrawler/idor_scanner.py`) to detect Insecure Direct Object References
+  by manipulating numeric parameters.
+
+### Changed
+
+- **Scanner Effectiveness:**
+  - Expanded the default payload lists in `config.py` for both SQLi and
+    Reflected XSS to improve detection rates for common vulnerabilities.
+  - Enhanced the SQLi scanner (`sqli_scanner.py`) to support both `append` and
+    `replace` modes for fuzzing parameters.
+  - Implemented boolean-based blind SQLi detection logic in the SQLi scanner.
+  - Changed the Stored XSS probe to a more distinct and active format
+    (`nightcrawler_xss_probe_{probe_id}`) for more reliable detection.
+
+### Fixed
+
+- **Test Suite:** Fixed multiple failing tests and improved the stability of the
+  test suite by correcting mocking strategies and assertions.
+
+## [0.10.0] - 2025-07-17
+
+### Added
+
+- On-Demand URL Dumping:
+
+  - On startup, Nightcrawler now prints its Process ID (PID). Users on
+    Linux/macOS can send a SIGUSR1 signal (kill -USR1 <PID>) to dump all
+    discovered URLs to nightcrawler_links.txt on the fly without stopping the
+    tool.
+
+The dump_urls command was refactored into a standard method to support this.
+
+- Passive WebSocket Authentication Scanner:
+  - Added a new passive check module (passive_scans/websockets.py).
+  - The scanner analyzes WebSocket upgrade requests and warns if no common
+    session cookie is present, indicating a potentially unauthenticated
+    endpoint.
+  - Integrated the check into the websocket_start hook in addon.py.
+  - Added a new test suite (tests/test_passive_websockets.py) to verify the new
+    scanner's logic.
+
+### Changed
+
+- Improved Contributor Experience: Refactored the project structure by moving
+  the scanner template (skeleton_scanner.py) from the core source code into a
+  dedicated top-level examples/ directory. This creates a clearer separation
+  between application code and developer documentation.
+
+- Updated CONTRIBUTING.md to reflect the new location of the skeleton scanner.
+
+### Fixed
+
+- _Future fixes go here_
+
+## [0.9.0] - 2025-06-26
+
+### Changed
+
+- **Major Refactor (Build System):** Overhauled the versioning system to use a
+  "single source of truth."
+  - The package version is now defined only once in `nightcrawler/__init__.py`.
+  - `pyproject.toml` has been updated to read this version dynamically during
+    the build process (`dynamic = ["version"]`).
+  - This change significantly simplifies the release workflow and prevents
+    version number inconsistencies between the package metadata and the running
+    application.
+
+### Fixed
+
+- All previously identified test failures have been resolved, resulting in a
+  stable test suite.
+
+## [0.8.0] - 2025-06-26
+
+### Added
+
+- **Enhanced Passive Scanning:**
+  - Added a new passive scanner module (`passive_scans/javascript.py`) to
+    identify common JavaScript libraries and their versions.
+  - Enhanced the JWT scanner (`passive_scans/jwt.py`) to validate `exp`
+    (expiration) and `nbf` (not before) claims, and to flag insecure `alg:none`
+    as an error.
+  - Enhanced the header scanner (`passive_scans/headers.py`) to check for a
+    wider range of security headers (Permissions-Policy, COOP/COEP/CORP), weak
+    HSTS configurations, and basic CSP weaknesses.
+- **Testing:**
+  - Added a dedicated test suite (`tests/test_passive_javascript.py` and
+    `tests/test_passive_csp.py`) for the new passive scanning logic.
+
+### Changed
+
+- **Major Test Suite Overhaul:** Completed the migration of all HTTP mocking
+  tests from `pytest-httpx` to the more direct and stable `respx` library. This
+  provides more reliable and predictable test execution.
+- **Decoupled Scanner Logic:** All active and passive scanner functions are now
+  fully decoupled from `mitmproxy.ctx` and accept a logger object as a
+  parameter, making them properly unit-testable.
+
+### Fixed
+
+- **All Test Failures:** Resolved all outstanding `pytest` errors and failures,
+  achieving a fully passing ("green") test suite. This includes fixing
+  `fixture not found`, `AssertionError`, `NameError`, and `AttributeError`
+  exceptions that were occurring during test setup and execution.
+- Corrected numerous specific test assertions to align with the refactored
+  code's actual output.
+- Fixed a `NameError` in `active_scans/traversal.py` caused by a missing import.
+- Fixed `TypeError` in `passive_scans/headers.py` and `cookies.py` by aligning
+  function signatures to accept the `logger` argument.
+
+## [0.7.0] - 2025-06-23
+
+### Added
+
+- **JavaScript Library Scanner:** Added a new passive scanner module
+  (`passive_scans/javascript.py`) to identify common JavaScript libraries (e.g.,
+  jQuery, React, Vue, Bootstrap) and their versions from the `src` attribute of
+  `<script>` tags.
+- **Testing:** Added a dedicated test suite (`tests/test_passive_javascript.py`)
+  to verify the new JS library scanner's logic.
+
+### Changed
+
+- **Finalized Test Suite Overhaul:** Completed the migration of all HTTP mocking
+  tests (including `test_xss_scanner.py` and `test_active_discovery.py`) from
+  the problematic `pytest-httpx` to the more direct and stable `respx` library.
+- **Centralized Test Fixtures:** All shared `pytest` fixtures (`mock_addon`,
+  `target_info_*`, `sample_url`) have been moved into a single
+  `tests/conftest.py` file to be automatically available to all test modules,
+  resolving all `fixture not found` errors.
+
+### Fixed
+
+- **All Test Failures:** Resolved all outstanding `pytest` errors and failures,
+  achieving a fully passing ("green") test suite. This includes:
+  - Fixed persistent `AssertionError` failures in active scanner tests by
+    correcting the `respx` mocking strategy to match the way the scanner code
+    makes requests.
+  - Fixed assertion mismatches in `test_passive_headers.py` by aligning test
+    expectations with the scanner's actual output.
+  - Fixed all `NameError` and `AttributeError` exceptions that were occurring
+    only within the `pytest` environment by decoupling scanner functions from
+    the `mitmproxy.ctx` object.
+
+## [0.6.0] - 2025-06-23
+
+### Added
+
+- **Configuration File Support:**
+  - Nightcrawler now supports a dedicated YAML configuration file (default:
+    `~/.config/nightcrawler-mitm/config.yaml`).
+  - Implemented configuration precedence: Command-line `--set` options > Config
+    file > Built-in defaults.
+  - Added `--set nc_config=/path/to/file.yaml` to specify a custom config file.
+- **Content Discovery Scanner:**
+  - Added a new active scanner module (`active_scans/discovery.py`) to probe for
+    hidden files and directories from a wordlist.
+  - Includes a built-in default wordlist and supports custom lists via
+    `--set nc_discovery_wordlist=...`.
+  - Integrated a new asynchronous worker (`_discovery_worker`) to manage
+    discovery scans.
+- **Testing:**
+  - Added a dedicated test suite for the new content discovery scanner
+    (`tests/test_active_discovery.py`).
+  - Created a central `tests/conftest.py` to provide shared fixtures to all test
+    modules.
+- **Dependencies:**
+  - Added `PyYAML` for parsing the configuration file.
+  - Added `respx` for robust HTTP request mocking in tests.
+
+### Changed
+
+- **Major Test Suite Overhaul:** Refactored the entire test suite for stability
+  and correctness.
+  - Replaced the `pytest-httpx` library with `respx` for all mocking.
+  - Decoupled all active scanner functions from `mitmproxy.ctx` by passing a
+    dedicated logger object.
+- `addon.py` was significantly refactored to handle the new configuration logic
+  and discovery worker.
+- Output file paths with relative paths are now resolved against a default data
+  directory (e.g., `~/.local/share/nightcrawler-mitm`).
+
+### Fixed
+
+- **All test failures:** Resolved all outstanding `pytest` errors, including
+  persistent `AssertionError`s, `AttributeError: ctx.log`, `NameError`, and
+  `fixture not found` errors, resulting in a fully passing test suite.
+- Removed the deprecated `cookies=` argument from all `httpx` calls in scanners,
+  fixing `DeprecationWarning`s.
+
+### Removed
+
+- Removed the `pytest-httpx` library from testing dependencies.
+
+## [0.5.0] - 2025-04-09
+
+### Added
+
+- **Structured Output:** Added `--set nc_output_file=path/to/file.jsonl` option
+  to save findings in JSON Lines format. Implemented `_log_finding` helper in
+  `MainAddon` for centralized logging to console and file.
+- **Enhanced Passive Scanning:**
+  - Added checks for more security headers (`Permissions-Policy`, COOP, COEP,
+    CORP).
+  - Added basic check for weak HSTS `max-age` and incorrect
+    `X-Content-Type-Options`.
+  - Added basic check for weak CSP directives (`unsafe-inline`, `unsafe-eval`,
+    wildcard source).
+  - Added basic JWT detection and decoding (no signature check) in request
+    headers (`Authorization: Bearer`) and JSON responses
+    (`passive_scans/jwt.py`).
+  - Added basic info disclosure pattern checks for Keywords, AWS Key IDs, and
+    Private Key headers (`passive_scans/content.py`). _(Note: User might need to
+    manually integrate `content.py` code due to previous generation issues)._
+- **WebSocket Handling:**
+  - Added detection of WebSocket connection establishment (`websocket_start`
+    hook), logging only once per host.
+  - Added option (`--set nc_inspect_websocket=false`) to disable/enable detailed
+    WebSocket message logging (`websocket_message` hook).
+
+### Changed
+
+- **Major Refactor (Passive Scans):** Moved passive scan logic into a
+  `nightcrawler/passive_scans/` sub-package (`headers.py`, `cookies.py`,
+  `jwt.py`, `content.py`). `passive_scanner.py` now acts as an orchestrator
+  importing from the sub-package.
+- **Major Refactor (WebSockets):** Moved WebSocket handling logic into
+  `nightcrawler/websocket_handler.py`. `addon.py` now calls handlers via wrapper
+  methods.
+- Updated signatures of scanner and passive check functions to accept
+  `addon_instance` for calling the centralized `_log_finding` method.
+- Refactored finding logging across applicable modules to use
+  `MainAddon._log_finding`.
+
+### Fixed
+
+- Fixed various `TypeError` and `NameError` exceptions during addon loading and
+  execution:
+  - Corrected `loader.add_option` calls in `addon.py` to use `typespec=` instead
+    of `type=` (for mitmproxy v11 compatibility).
+  - Added missing imports (`traceback` in `addon.py`, `Optional` in
+    `passive_scanner.py`).
+  - Corrected calls to scanner functions (`scan_xss_reflected_basic`,
+    `scan_sqli_basic`) in `addon.py` to pass `addon_instance` (`self`).
+  - Corrected `NameError` for undefined `payload_info` variable within an
+    exception handler in `xss_scanner.py`.
+- Fixed `AttributeError: module 'mitmproxy.http' has no attribute 'Cookie'` by
+  correcting the type hint in `passive_scans/cookies.py` to use `MultiDictView`.
+- Fixed `AttributeError: module 'mitmproxy.ctx' has no attribute 'log'` by
+  moving initial logging from `MainAddon.__init__` to the `running` hook.
+- Fixed `AttributeError: 'MainAddon' object has no attribute '_log_finding'` by
+  adding the `_log_finding` method definition to `MainAddon`.
+- Fixed `AttributeError: cannot access attribute _queue for class Queue` by
+  replacing direct queue inspection with a separate tracking set
+  (`revisit_in_progress`).
+- Fixed `Too much data for declared Content-Length` error in active scanners by
+  filtering `Content-Length`, `Host`, and `Transfer-Encoding` headers before
+  sending modified requests via `httpx`.
+- Resolved `No such script: nightcrawler.addon` errors by diagnosing loading
+  issues related to editable installs and mitmproxy's script loader, culminating
+  in using the absolute file path workaround in `runner.py` (though the root
+  cause might be specific to mitmproxy/environment interaction).
+  _Self-correction: Reverted runner to use dotted path after user confirmed
+  direct mitmproxy call worked with fixes._ [Note: Final state uses dotted
+  path in runner after fixing internal errors].
+
+## 0.4.0 - 2025-04-03
+
+### Added
+
+- Configuration via mitmproxy command-line options:
+  - Added `--nc-max-concurrency` option.
+  - Added `--nc-user-agent` option.
+  - Added `--nc-sqli-payload-file` option to load SQLi payloads from a file.
+  - Added `--nc-xss-reflected-payload-file` option to load Reflected XSS
+    payloads from a file.
+  - Added `--nc-xss-stored-prefix` option.
+  - Added `--nc-xss-stored-format` option.
+- Helper function in `addon.py` (`_load_payloads_from_file`) to load payloads
+  from files specified by options, with fallback to internal defaults.
+
+### Changed
+
+- Removed user configuration constants (`MAX_CONCURRENT_SCANS`, `USER_AGENT`,
+  payload lists, stored XSS format/prefix) from `nightcrawler/config.py`.
+- Modified `addon.py` (`MainAddon`) to define, process (`configure` hook), and
+  store configuration values from `ctx.options`.
+- Updated `addon.py` (`running` hook) to initialize `Semaphore` and
+  `httpx.AsyncClient` using values derived from options.
+- Modified scanner functions (`scan_sqli_basic`, `scan_xss_reflected_basic`,
+  `scan_xss_stored_inject`) to accept configuration (payloads, prefix, format)
+  as arguments instead of importing them.
+- Updated calls in `_scan_worker` (`addon.py`) to pass the configured values to
+  scanner functions.
+- Updated `README.txt` to document the new command-line configuration options.
+
+### Fixed
+
+- Ensured HTTP client and Semaphore are initialized/re-initialized correctly in
+  the `running` hook after options are processed by `configure`.
+
+## [0.3.0] - 2025-03-27
+
+### Added
+
+- **Basic Stored XSS Detection:** Implemented initial capability to detect
+  stored XSS vulnerabilities.
+  - Injects unique, trackable probes (e.g., ``) via `scan_xss_stored_inject`.
+  - Tracks injected probes in memory within the main addon
+    (`MainAddon.injected_payloads`).
+  - Added a background "Revisit Worker" (`_revisit_worker`) and queue
+    (`revisit_queue`) to re-fetch URLs after potential storage actions
+    (POST/PUT).
+  - Checks HTML content of revisited pages, regular browser responses, and
+    crawler responses for the presence of previously injected unique probes via
+    `check_response_for_stored_payloads`.
+  - Added basic time-based and count-based cleanup for tracked payloads to limit
+    memory usage.
+  - Added `--nc-payload-max-age` command-line option (via `ctx.options`) to
+    configure the maximum age (in seconds) for tracked payloads.
+- Separated XSS scanning logic into distinct functions
+  (`scan_xss_reflected_basic`, `scan_xss_stored_inject`) in `xss_scanner.py` for
+  better maintainability.
+- Added check for stored payloads in responses fetched by the `_crawl_worker`.
+
+### Changed
+
+- Significantly updated `addon.py` (`MainAddon`) to manage state (queues,
+  tracked payloads) and the new `_revisit_worker` required for Stored XSS
+  detection.
+- Renamed original XSS scan function `scan_xss_basic` to
+  `scan_xss_reflected_basic`.
+- Updated `config.py` to hold separate configuration/payloads for reflected
+  (`XSS_REFLECTED_PAYLOADS`) vs. stored (`XSS_STORED_PROBE_PREFIX`,
+  `XSS_STORED_PAYLOAD_FORMAT`) XSS checks.
+- Modified `xss_scanner.py` to include the new `scan_xss_stored_inject` function
+  and pass the addon instance for state access (`register_injection`).
+- Added cleanup logic in the `done` hook for the new `revisit_worker_task`.
+
+## [0.2.0] - 2025-03-25
+
+### Added
+
+- Packaged the project using `pyproject.toml` for installation via `pip` and
+  distribution on PyPI (as `nightcrawler`).
+- Introduced a console script entry point: the `nightcrawler` command now wraps
+  `mitmdump` and loads the addon automatically.
+- Added a **mandatory** command-line option `--nc-scope` to define the target
+  domain(s) for scanning and crawling (comma-separated).
+- Implemented `--version` handling for the `nightcrawler` command to display the
+  package's own version alongside mitmproxy's version.
+- Added basic addon lifecycle management using `running` and `done` hooks
+  (starting workers, closing shared HTTP client).
+- Included basic `try...except` blocks in worker loops to improve resilience
+  against unexpected errors.
+
+### Changed
+
+- **Major Refactor:** Restructured the single-script addon into multiple Python
+  modules (`addon.py`, `config.py`, `utils.py`, `passive_scanner.py`,
+  `crawler.py`, `sqli_scanner.py`, `xss_scanner.py`, `runner.py`) within a
+  `nightcrawler` package directory for better organization and maintainability.
+- Internal imports updated to use absolute package paths (e.g.,
+  `from nightcrawler.utils import ...`).
+
+### Removed
+
+- Removed the hardcoded `TARGET_SCOPE_DOMAINS` constant from `config.py`; scope
+  must now be provided via `--nc-scope`.
+
+## [0.1.0] - 2025-03-20
+
+### Added
+
+- Initial version based on concept discussions.
+- Core functionality as a `mitmproxy` addon script.
+- Acts as an HTTP/HTTPS proxy.
+- Basic passive scanning infrastructure (header/cookie checks - conceptual).
+- Background crawling functionality (link discovery via `BeautifulSoup`, queuing
+  via `asyncio.Queue`, basic `_crawl_worker`).
+- Background active scanning worker (`_scan_worker`).
+- Basic Reflected XSS scanning (`scan_xss_basic` checking immediate response).
+- Basic SQLi scanning (`scan_sqli_basic` checking for errors/time delays).
+- Concurrency limiting for background tasks using `asyncio.Semaphore`.
+- Basic debug logging implemented using `ctx.log`.
+- Support for `mitmproxy` options like `--ssl-insecure` passed through via the
+  runner.
+
+[Unreleased]:
+  https://github.com/thesp0nge/nightcrawler-mitm/compare/v0.10.0...HEAD
+[0.10.0]:
+  https://github.com/thesp0nge/nightcrawler-mitm/compare/v0.9.0...v0.10.0
+[0.9.0]: https://github.com/thesp0nge/nightcrawler-mitm/compare/v0.8.0...v0.9.0
+[0.8.0]: https://github.com/thesp0nge/nightcrawler-mitm/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/thesp0nge/nightcrawler-mitm/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/thesp0nge/nightcrawler-mitm/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/thesp0nge/nightcrawler-mitm/compare/v0.4.0...v0.5.0
+[0.3.0]: https://github.com/thesp0nge/nightcrawler-mitm/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/thesp0nge/nightcrawler-mitm/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/thesp0nge/nightcrawler-mitm/releases/tag/v0.1.0

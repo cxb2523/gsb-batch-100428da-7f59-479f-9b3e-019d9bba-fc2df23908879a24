@@ -1,0 +1,17 @@
+# Development and Testing Dependencies for Nightcrawler-MITM
+-r requirements.txt # Include runtime dependencies (includes PyYAML now)
+
+# Testing Frameworks & Plugins
+pytest>=7.0.0
+pytest-asyncio>=0.18.0
+pytest-mock>=3.5.0
+
+# Packaging and Uploading
+build>=0.10.0
+twine>=4.0.0
+respx>=0.22.0
+
+# Optional Linters/Formatters/Type Checkers
+# ruff
+# black
+# mypy
