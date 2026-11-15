@@ -25,6 +25,11 @@ def pil2cv(image):
     return new_image
 
 
+# Highest TM_SQDIFF_NORMED score still accepted as a hit.
+# A perfect match scores 0.0; clearly different images score well above this.
+MATCH_THRESHOLD = 0.1
+
+
 class ImgDetector:
     def __init__(self, workspace_path):
         self.workspace_path = workspace_path
@@ -50,10 +55,31 @@ class ImgDetector:
         return self.img_coord_detector(target_img_path, template)
 
     def img_coord_detector(self, target_img_path, screen_img):
+        '''
+        Locate target_img inside screen_img.
+
+        Returns the (x, y) center of the match, or None when there is no
+        trustworthy match (target unreadable, target larger than the screen,
+        or match score above MATCH_THRESHOLD).
+        '''
         target_img = cv2.imread(os.path.abspath(target_img_path), 0)
+        if target_img is None:
+            print("Target image not found or unreadable: " + str(target_img_path))
+            return None
+        if screen_img is None:
+            print("Screen image is unavailable")
+            return None
+
         template = screen_img
         # template = cv2.imread(os.path.abspath(screen_img_path), 0)
         w, h = target_img.shape[::-1]
+
+        # OpenCV silently swaps image/template when the template is bigger,
+        # which would yield a bogus coordinate, so reject it explicitly.
+        if target_img.shape[0] > template.shape[0] or target_img.shape[1] > template.shape[1]:
+            print("Target image is larger than the screen; cannot match: "
+                  + str(target_img_path))
+            return None
 
         img = target_img.copy()
         method = eval('cv2.TM_SQDIFF')
@@ -62,6 +88,15 @@ class ImgDetector:
         try:
             res = cv2.matchTemplate(img, template, method)
             min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
+
+            # Confidence check: TM_SQDIFF_NORMED gives a scale-independent
+            # score in which 0.0 is a perfect match.
+            confidence_res = cv2.matchTemplate(img, template, cv2.TM_SQDIFF_NORMED)
+            score = cv2.minMaxLoc(confidence_res)[0]
+            if score > MATCH_THRESHOLD:
+                print("No confident match (score %.4f > threshold %.4f): %s"
+                      % (score, MATCH_THRESHOLD, target_img_path))
+                return None
 
             # If the method is TM_SQDIFF or TM_SQDIFF_NORMED, take minimum
             if method in [cv2.TM_SQDIFF, cv2.TM_SQDIFF_NORMED]:
@@ -84,6 +119,7 @@ class ImgDetector:
         except Exception as e:
             print("An exception occurred")
             print(e)
+            return None
 
 
 

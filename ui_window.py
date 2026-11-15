@@ -203,7 +203,12 @@ class UI_Action(object):
             # QMessageBox.information(None, "Information", "Start!")
             workspace_path = self.qt.lineEdit.text()
             self.menu_save()
-            tor_runner.run(workspace_path)
+            result = tor_runner.run(workspace_path)
+            if result is not None and not result.success:
+                QMessageBox.warning(
+                    None, "Script Aborted",
+                    "Script aborted at line %s: %s\n\nReason: %s"
+                    % (result.line_no, result.command_text, result.reason))
 
     def menu_exit(self):
         QCoreApplication.quit()
