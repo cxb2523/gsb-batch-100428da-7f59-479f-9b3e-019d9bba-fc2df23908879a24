@@ -1,0 +1,15 @@
+services:
+  douyin-live-monitor:
+    build: .
+    container_name: douyin-live-monitor
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./browser_cookies.json:/app/browser_cookies.json
+    environment:
+      - BROWSER_MODE=headless
+      - DOUYIN_COOKIE=${DOUYIN_COOKIE:-}
+      - PROXY_URL=${PROXY_URL:-}
+      - PORT=8000
+    restart: unless-stopped

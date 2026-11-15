@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>抖音直播数据监控</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, 'Segoe UI', sans-serif; background: #0f0f0f; color: #e0e0e0; min-height: 100vh; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+        .header h1 { font-size: 24px; color: #fff; }
+        .header .subtitle { color: #999; font-size: 14px; }
+
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 30px; }
+        .stat-card { background: #1a1a2e; border-radius: 12px; padding: 20px; text-align: center; border: 1px solid #2a2a4a; }
+        .stat-card .num { font-size: 32px; font-weight: bold; color: #00d4aa; }
+        .stat-card .label { font-size: 13px; color: #888; margin-top: 5px; }
+        .stat-card.live .num { color: #ff4757; }
+
+        .card { background: #1a1a2e; border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid #2a2a4a; }
+        .card h2 { font-size: 18px; margin-bottom: 15px; color: #ccc; }
+
+        .add-form { display: flex; gap: 10px; flex-wrap: wrap; }
+        .add-form input { flex: 1; min-width: 200px; padding: 12px 16px; border-radius: 8px; border: 1px solid #333; background: #0f0f0f; color: #fff; font-size: 14px; }
+        .add-form input:focus { outline: none; border-color: #00d4aa; }
+        .add-form button { padding: 12px 24px; border-radius: 8px; border: none; background: #00d4aa; color: #000; font-weight: bold; cursor: pointer; font-size: 14px; }
+        .add-form button:hover { background: #00e6b8; }
+
+        .room-list { display: grid; gap: 10px; }
+        .room-item { display: flex; justify-content: space-between; align-items: center; padding: 15px; background: #0f0f0f; border-radius: 8px; border: 1px solid #2a2a4a; }
+        .room-item .info { flex: 1; }
+        .room-item .nickname { color: #fff; font-weight: bold; }
+        .room-item .url { color: #666; font-size: 12px; margin-top: 3px; word-break: break-all; }
+        .room-item .actions button { padding: 6px 12px; border-radius: 6px; border: none; cursor: pointer; background: #ff4757; color: #fff; font-size: 12px; }
+
+        .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .data-table th { text-align: left; padding: 10px 8px; border-bottom: 1px solid #2a2a4a; color: #888; font-weight: normal; font-size: 12px; }
+        .data-table td { padding: 10px 8px; border-bottom: 1px solid #1a1a2e; }
+        .data-table tr:hover td { background: #1f1f35; }
+        .badge-live { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
+        .badge-live.yes { background: #00d4aa22; color: #00d4aa; }
+        .badge-live.no { background: #555; color: #999; }
+        .num-highlight { color: #00d4aa; font-weight: bold; }
+        .text-muted { color: #666; font-size: 12px; }
+
+        .toast { position: fixed; top: 20px; right: 20px; padding: 15px 25px; border-radius: 8px; color: #fff; font-weight: bold; z-index: 999; display: none; }
+        .toast.success { background: #00d4aa; color: #000; }
+        .toast.error { background: #ff4757; }
+
+        @media (max-width: 768px) {
+            .container { padding: 10px; }
+            .add-form { flex-direction: column; }
+            .add-form input { min-width: auto; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div>
+                <h1>📺 抖音直播数据监控</h1>
+                <div class="subtitle">贴一个抖音链接，自动采集直播数据</div>
+            </div>
+            <div class="subtitle" id="status-text">加载中...</div>
+            <div class="subtitle" style="font-size:12px">自动保留 <span id="retention-text">7</span> 天
+                | <a href="/api/export/csv" style="color:#00d4aa;text-decoration:none" download>⬇ 下载 CSV</a></div>
+        </div>
+
+        <div class="stats">
+            <div class="stat-card">
+                <div class="num" id="stat-rooms">-</div>
+                <div class="label">监控房间</div>
+            </div>
+            <div class="stat-card live">
+                <div class="num" id="stat-live">-</div>
+                <div class="label">正在直播</div>
+            </div>
+            <div class="stat-card">
+                <div class="num" id="stat-snapshots">-</div>
+                <div class="label">数据条数</div>
+            </div>
+            <div class="stat-card">
+                <div class="num" id="stat-sessions">-</div>
+                <div class="label">直播场次</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>➕ 添加监控</h2>
+            <div class="add-form">
+                <input type="text" id="room-url" placeholder="粘贴抖音直播间链接..." />
+                <input type="text" id="room-nickname" placeholder="备注名（可选）" style="min-width:120px;max-width:160px" />
+                <button onclick="addRoom()">开始监控</button>
+            </div>
+            <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                <span class="text-muted" style="font-size:12px">数据保留:</span>
+                <select id="retention-select" style="padding:6px 10px;border-radius:6px;border:1px solid #333;background:#0f0f0f;color:#fff;font-size:13px">
+                    <option value="3">3天</option>
+                    <option value="7" selected>7天</option>
+                    <option value="14">14天</option>
+                    <option value="30">30天</option>
+                    <option value="0">不清理</option>
+                </select>
+                <button onclick="cleanupData()" style="padding:6px 12px;border-radius:6px;border:none;background:#ff4757;color:#fff;cursor:pointer;font-size:12px">立即清理过期数据</button>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>📋 监控列表</h2>
+            <div class="room-list" id="room-list">
+                <div class="text-muted" style="text-align:center;padding:30px">加载中...</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>🎯 本场直播监控总结</h2>
+            <div id="session-summary" style="overflow-x:auto">
+                <div class="text-muted" style="text-align:center;padding:20px">加载中...</div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>📈 在线人数趋势</h2>
+            <div style="position:relative;height:250px">
+                <canvas id="viewersChart"></canvas>
+            </div>
+            <div class="text-muted" style="font-size:12px;margin-top:8px;text-align:center">采样间隔 ~2 分钟，数据保留 7 天</div>
+        </div>
+
+        <div class="card">
+            <h2>📊 最近数据</h2>
+            <div style="overflow-x:auto">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>时间</th>
+                            <th>房间</th>
+                            <th>状态</th>
+                            <th>标题</th>
+                            <th>在线</th>
+                            <th>点赞</th>
+                            <th>评论</th>
+                            <th>分享</th>
+                            <th>商品</th>
+                        </tr>
+                    </thead>
+                    <tbody id="data-body">
+                        <tr><td colspan="9" class="text-muted" style="text-align:center">加载中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        // === 加载数据 ===
+        async function loadData() {
+            try {
+                const [statsResp, roomsResp, snapsResp] = await Promise.all([
+                    fetch('/api/stats'),
+                    fetch('/api/rooms'),
+                    fetch('/api/snapshots?limit=50'),
+                ]);
+                const stats = await statsResp.json();
+                const rooms = await roomsResp.json();
+                const snaps = await snapsResp.json();
+
+                // 统计
+                document.getElementById('stat-rooms').textContent = stats.rooms;
+                document.getElementById('stat-live').textContent = stats.live_now;
+                document.getElementById('stat-snapshots').textContent = stats.snapshots;
+                document.getElementById('stat-sessions').textContent = stats.sessions;
+
+                // 房间列表
+                const roomList = document.getElementById('room-list');
+                if (rooms.rooms && rooms.rooms.length > 0) {
+                roomList.innerHTML = rooms.rooms.map(r => `
+                    <div class="room-item">
+                        <div class="info">
+                            <div class="nickname">${r.nickname || '未命名'}</div>
+                            <div class="url"><a href="${r.url}" target="_blank" style="color:#00d4aa;text-decoration:none">${r.url}</a></div>
+                        </div>
+                        <div class="actions">
+                            <button onclick="deleteRoom(${r.id})">删除</button>
+                        </div>
+                    </div>
+                `).join('');
+                } else {
+                    roomList.innerHTML = '<div class="text-muted" style="text-align:center;padding:30px">还没有监控房间，在上面贴一个链接开始</div>';
+                }
+
+                // 数据表格
+                const tbody = document.getElementById('data-body');
+                if (snaps.snapshots && snaps.snapshots.length > 0) {
+                    tbody.innerHTML = snaps.snapshots.map(s => {
+                        const prods = typeof s.products === 'string' ? JSON.parse(s.products || '[]') : (s.products || []);
+                        return `<tr>
+                            <td class="text-muted">${(s.checked_at || '').slice(11,19)}</td>
+                            <td><a href="${s.url || '#'}" target="_blank" style="color:#00d4aa;text-decoration:none">${(s.room_id || '?').slice(0,8)}</a>..</td>
+                            <td><span class="badge-live ${s.is_live ? 'yes' : 'no'}">${s.is_live ? '直播中' : '未直播'}</span></td>
+                            <td style="max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${s.title || '-'}</td>
+                            <td class="num-highlight">${s.viewers ?? '-'}</td>
+                            <td>${s.likes ?? '-'}</td>
+                            <td>${s.comments ?? '-'}</td>
+                            <td>${s.shares ?? '-'}</td>
+                            <td>${prods.length || 0}</td>
+                        </tr>`;
+                    }).join('');
+                } else {
+                    tbody.innerHTML = '<tr><td colspan="9" class="text-muted" style="text-align:center">暂无数据</td></tr>';
+                }
+
+                // 本场直播总结
+                loadSessionSummary();
+
+                // 在线人数趋势图
+                renderViewersChart(snaps.snapshots || []);
+
+                document.getElementById('status-text').textContent = `上次更新: ${new Date().toLocaleTimeString()}`;
+            } catch (e) {
+                console.error('load error', e);
+            }
+        }
+
+        // === 添加房间 ===
+        async function addRoom() {
+            const url = document.getElementById('room-url').value.trim();
+            const nickname = document.getElementById('room-nickname').value.trim();
+            if (!url) { showToast('请输入抖音链接', 'error'); return; }
+
+            try {
+                const resp = await fetch('/api/rooms', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({url, nickname: nickname || undefined}),
+                });
+                const data = await resp.json();
+                if (resp.ok) {
+                    showToast('✅ 已添加监控: ' + (nickname || url), 'success');
+                    document.getElementById('room-url').value = '';
+                    document.getElementById('room-nickname').value = '';
+                    loadData();
+                } else {
+                    showToast('❌ ' + (data.detail || '添加失败'), 'error');
+                }
+            } catch (e) {
+                showToast('❌ 网络错误', 'error');
+            }
+        }
+
+        // === 删除房间 ===
+        async function deleteRoom(id) {
+            if (!confirm('确定删除这个监控？')) return;
+            try {
+                const resp = await fetch('/api/rooms/' + id, { method: 'DELETE' });
+                if (resp.ok) {
+                    showToast('已删除', 'success');
+                    loadData();
+                }
+            } catch (e) {
+                showToast('删除失败', 'error');
+            }
+        }
+
+        // === Toast ===
+        function showToast(msg, type) {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.className = 'toast ' + type;
+            t.style.display = 'block';
+            setTimeout(() => t.style.display = 'none', 3000);
+        }
+
+        // === 加载本场直播总结 ===
+        async function loadSessionSummary() {
+            try {
+                const resp = await fetch('/api/live-sessions');
+                const data = await resp.json();
+                const container = document.getElementById('session-summary');
+
+                if (!data.sessions || data.sessions.length === 0) {
+                    container.innerHTML = '<div class="text-muted" style="text-align:center;padding:20px">暂无直播记录</div>';
+                    return;
+                }
+
+                container.innerHTML = data.sessions.map(s => {
+                    const live = s.still_live;
+                    return `<div style="background:#0f0f0f;border-radius:8px;padding:15px;margin-bottom:10px;border:1px solid ${live ? '#00d4aa44' : '#2a2a4a'}">
+                        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:5px">
+                            <span style="color:#fff;font-weight:bold;font-size:15px">
+                                ${live ? '🔴 直播中' : '⚫ 已结束'}
+                            </span>
+                            <span class="text-muted" style="font-size:12px">
+                                <a href="${s.url || '#'}" target="_blank" style="color:#00d4aa;text-decoration:none">${s.room_id ? s.room_id.slice(0,12) : '?'}</a>
+                                | ${s.snap_count} 次采样 | ${s.duration_minutes} 分钟</span>
+                        </div>
+                        <div style="display:grid;grid-template-columns:repeat(auto-fit, minmax(100px, 1fr));gap:8px">
+                            <div><span class="text-muted" style="font-size:11px">最高在线</span><br><span class="num-highlight" style="font-size:18px">${s.max_viewers ?? '-'}</span></div>
+                            <div><span class="text-muted" style="font-size:11px">平均在线</span><br><span style="font-size:18px;color:#e0e0e0">${s.avg_viewers ?? '-'}</span></div>
+                            <div><span class="text-muted" style="font-size:11px">最高点赞</span><br><span style="font-size:18px;color:#e0e0e0">${s.max_likes ?? '-'}</span></div>
+                            <div><span class="text-muted" style="font-size:11px">最高评论</span><br><span style="font-size:18px;color:#e0e0e0">${s.max_comments ?? '-'}</span></div>
+                            <div><span class="text-muted" style="font-size:11px">最高分享</span><br><span style="font-size:18px;color:#e0e0e0">${s.max_shares ?? '-'}</span></div>
+                            <div><span class="text-muted" style="font-size:11px">首见</span><br><span style="font-size:12px;color:#999">${(s.first_seen || '').slice(11,19)}</span></div>
+                        </div>
+                    </div>`;
+                }).join('');
+            } catch (e) {
+                console.error('session summary error', e);
+            }
+        }
+
+        // === 在线人数趋势图 ===
+        let viewersChartInstance = null;
+        function renderViewersChart(snapshots) {
+            if (!snapshots || snapshots.length === 0) return;
+
+            // 取最近 2 小时的直播快照，按时间正序
+            const twoHoursAgo = Date.now() - 2 * 60 * 60 * 1000;
+            const liveSnaps = snapshots
+                .filter(s => s.is_live && s.viewers != null)
+                .filter(s => new Date(s.checked_at).getTime() > twoHoursAgo)
+                .sort((a, b) => new Date(a.checked_at) - new Date(b.checked_at));
+
+            if (liveSnaps.length < 2) return;
+
+            const labels = liveSnaps.map(s => s.checked_at.slice(11, 19));
+            const data = liveSnaps.map(s => s.viewers);
+
+            const ctx = document.getElementById('viewersChart').getContext('2d');
+
+            if (viewersChartInstance) {
+                viewersChartInstance.destroy();
+            }
+
+            viewersChartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: labels,
+                    datasets: [{
+                        label: '在线人数',
+                        data: data,
+                        borderColor: '#00d4aa',
+                        backgroundColor: 'rgba(0, 212, 170, 0.1)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.3,
+                        pointRadius: 3,
+                        pointBackgroundColor: '#00d4aa',
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { display: false }
+                    },
+                    scales: {
+                        x: {
+                            ticks: { color: '#666', font: { size: 10 }, maxTicksLimit: 12 },
+                            grid: { color: '#2a2a4a' }
+                        },
+                        y: {
+                            beginAtZero: true,
+                            ticks: { color: '#00d4aa', font: { size: 11 } },
+                            grid: { color: '#2a2a4a' }
+                        }
+                    },
+                    interaction: {
+                        intersect: false,
+                        mode: 'index'
+                    }
+                }
+            });
+        }
+
+        // === 清理数据 ===
+        async function cleanupData() {
+            const days = document.getElementById('retention-select').value;
+            if (days == 0) {
+                showToast('已选择不清理', 'success');
+                return;
+            }
+            if (!confirm(`确定清理 ${days} 天前的数据？不可恢复`)) return;
+            try {
+                const resp = await fetch(`/api/cleanup?days=${days}`);
+                const data = await resp.json();
+                showToast(`已清理 ${data.deleted} 条数据`, 'success');
+                loadData();
+            } catch (e) {
+                showToast('清理失败', 'error');
+            }
+        }
+
+        // === 回车提交 ===
+        document.getElementById('room-url').addEventListener('keydown', e => {
+            if (e.key === 'Enter') addRoom();
+        });
+
+        // === 启动 ===
+        loadData();
+        setInterval(loadData, 10000);
+    </script>
+</body>
+</html>
