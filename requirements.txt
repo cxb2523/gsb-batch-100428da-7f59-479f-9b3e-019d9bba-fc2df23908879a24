@@ -1,0 +1,13 @@
+scrapy
+scrapy-redis
+scrapy-redis-bloomfilter
+scrapy-splash
+environs
+supervisor
+pymysql
+pymongo
+redis
+requests
+twisted
+fake-headers
+fake-useragent
