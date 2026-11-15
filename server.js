@@ -30,6 +30,31 @@ const MIRROR_AT_ROOT = process.env.MIRROR_AT_ROOT === '1';
 // REQUEST_TIMEOUT_MS：单个远程请求超时时间，防止某个资源一直卡住。
 const REQUEST_TIMEOUT_MS = Number(process.env.PROXY_TIMEOUT_MS || 30000);
 
+// MIRROR_RETRY_FAILED：显式重试开关，默认关闭。
+// 设为 1 启动时读取上次补抓结局清单，把上次失败或被拒的路径加入待重试集合；
+// 这些路径再次被请求时强制重新补抓，已成功的路径不会因此重抓。
+const RETRY_FAILED_ENABLED = process.env.MIRROR_RETRY_FAILED === '1';
+
+// 补抓结局清单（机器可读 JSON），固定放在镜像文件夹根目录。
+// 只做记账：不会被服务器当成本地资源响应，也不会被代理回源补抓。
+const MANIFEST_FILENAME = 'mirror-fetch-manifest.json';
+const MANIFEST_TMP_FILENAME = `.${MANIFEST_FILENAME}.tmp`;
+const MANIFEST_PATH = path.join(__dirname, MIRROR_NAME, MANIFEST_FILENAME);
+const MANIFEST_TMP_PATH = path.join(__dirname, MIRROR_NAME, MANIFEST_TMP_FILENAME);
+
+// 结局类别（机器可读代码，含义见 README）：
+// saved        成功保存
+// http_error   源站 HTTP 非成功
+// rejected     内容校验被拒（例如 HTML 错误页伪装成图片/JSON）
+// network_error 超时或网络异常
+const OUTCOME = {
+    SAVED: 'saved',
+    HTTP_ERROR: 'http_error',
+    REJECTED: 'rejected',
+    NETWORK_ERROR: 'network_error'
+};
+const FAILED_OUTCOMES = new Set([OUTCOME.HTTP_ERROR, OUTCOME.REJECTED, OUTCOME.NETWORK_ERROR]);
+
 // REMOTE_MIRRORS：手动远程资源映射。
 // 这个数组不是绑定某一个网站的规则；如果别的网站也有同样结构，也可以继续用。
 // 例子：
@@ -391,6 +416,141 @@ function getTargetUrl(req, reqPath) {
     return `${TARGET_HOST}${targetPath}${requestUrl.search}`;
 }
 
+// ====== 补抓结局清单 ======
+// 内存里始终保留最新一份清单；同一路径多次补抓只覆盖、不追加历史。
+const manifestEntries = new Map();
+
+// 待重试集合：仅在 MIRROR_RETRY_FAILED=1 时从上次清单的失败项构建。
+const retryPaths = new Set();
+
+// 清单写盘串行化：并发补抓结束时排队写入，杜绝互相覆盖或半截内容。
+// manifestWriteQueue 始终代表“最后一次排队写盘”的完成状态，
+// 优雅停机或测试时可 await flushFetchManifestWrites() 等待落盘。
+let manifestWriteQueue = Promise.resolve();
+
+function isManifestLocalPath(localPath) {
+    if (!localPath) return false;
+    const resolved = path.resolve(localPath);
+    return resolved === path.resolve(MANIFEST_PATH) || resolved === path.resolve(MANIFEST_TMP_PATH);
+}
+
+// 等待所有已排队的清单写盘完成；正常请求流程不需要调用它。
+async function flushFetchManifestWrites() {
+    try {
+        await manifestWriteQueue;
+    } catch {
+        // 写盘错误已在记录时告警，这里吞掉，保证 flush 本身不会抛出。
+    }
+}
+
+// 启动时读取上次清单。文件不存在或无法解析都只打印提示，绝不中断启动。
+function loadFetchManifest() {
+    // 上次进程被强杀时可能残留临时文件；它没有任何用途，先清掉避免污染目录。
+    try {
+        if (fs.existsSync(MANIFEST_TMP_PATH)) fs.rmSync(MANIFEST_TMP_PATH, { force: true });
+    } catch { /* 清理失败不影响启动 */ }
+
+    if (!fs.existsSync(MANIFEST_PATH)) {
+        if (RETRY_FAILED_ENABLED) {
+            console.log(`[Manifest] No previous manifest at ${MANIFEST_PATH}; starting without retry queue.`);
+        }
+        return;
+    }
+
+    try {
+        const parsed = JSON.parse(fs.readFileSync(MANIFEST_PATH, 'utf8'));
+        const records = parsed && Array.isArray(parsed.records) ? parsed.records : [];
+
+        for (const record of records) {
+            if (!record || typeof record.path !== 'string' || typeof record.outcome !== 'string') continue;
+            manifestEntries.set(record.path, {
+                path: record.path,
+                outcome: record.outcome,
+                reason: typeof record.reason === 'string' ? record.reason : null,
+                updatedAt: typeof record.updatedAt === 'string' ? record.updatedAt : null
+            });
+            if (RETRY_FAILED_ENABLED && FAILED_OUTCOMES.has(record.outcome)) {
+                retryPaths.add(record.path);
+            }
+        }
+
+        if (RETRY_FAILED_ENABLED) {
+            console.log(`[Manifest] Loaded ${manifestEntries.size} record(s); ${retryPaths.size} failed path(s) queued for retry.`);
+        }
+    } catch (err) {
+        console.warn(`[Manifest] Unable to parse ${MANIFEST_PATH}: ${err.message}. Continuing with an empty manifest.`);
+    }
+}
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// 原子写盘：先写同目录临时文件，再 rename 替换。
+// 任何时刻正式清单要么是旧的完整内容，要么是新的完整内容，不会出现半截 JSON。
+// Windows 上杀毒软件或文件监视可能短暂占用文件导致 rename 报 EPERM/EBUSY，
+// 因此 rename 失败时短暂异步重试；最终仍失败则退化为直接覆写并清理临时文件，
+// 保证清单尽量更新，同时把异常限制在记账逻辑内。
+// 全程异步：绝不能在请求链路里同步忙等，否则会饿死事件循环并触发 libuv 句柄断言。
+async function persistFetchManifest() {
+    const records = [...manifestEntries.values()];
+    const payload = JSON.stringify({
+        version: 1,
+        generatedAt: new Date().toISOString(),
+        recordCount: records.length,
+        records
+    }, null, 2);
+
+    await fs.promises.mkdir(path.dirname(MANIFEST_PATH), { recursive: true });
+    await fs.promises.writeFile(MANIFEST_TMP_PATH, payload, 'utf8');
+
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            await fs.promises.rename(MANIFEST_TMP_PATH, MANIFEST_PATH);
+            return;
+        } catch (err) {
+            lastError = err;
+            if (err.code !== 'EPERM' && err.code !== 'EACCES' && err.code !== 'EBUSY') break;
+            await delay(50 * (attempt + 1));
+        }
+    }
+
+    try {
+        await fs.promises.writeFile(MANIFEST_PATH, payload, 'utf8');
+        await fs.promises.rm(MANIFEST_TMP_PATH, { force: true });
+    } catch (err) {
+        await fs.promises.rm(MANIFEST_TMP_PATH, { force: true }).catch(() => {});
+        throw err || lastError;
+    }
+}
+
+// 记录一次补抓结局并排队落盘。读写失败只告警，不影响正常请求响应。
+function recordFetchOutcome(reqPath, outcome, reason = null) {
+    try {
+        manifestEntries.set(reqPath, {
+            path: reqPath,
+            outcome,
+            reason: reason ? String(reason) : null,
+            updatedAt: new Date().toISOString()
+        });
+
+        if (outcome === OUTCOME.SAVED) {
+            retryPaths.delete(reqPath);
+        } else if (FAILED_OUTCOMES.has(outcome)) {
+            // 重试模式下失败项继续留在集合里，方便下次启动继续重试。
+            if (RETRY_FAILED_ENABLED) retryPaths.add(reqPath);
+        }
+
+        // 串行排队：上一笔落盘完成后才开始下一笔，并发补抓不会互相覆盖。
+        manifestWriteQueue = manifestWriteQueue
+            .then(() => persistFetchManifest())
+            .catch(err => console.warn(`[Manifest] Failed to write ${MANIFEST_PATH}: ${err.message}`));
+    } catch (err) {
+        console.warn(`[Manifest] Failed to record outcome for ${reqPath}: ${err.message}`);
+    }
+}
+
 async function proxyAndCache(req, res, localPath, reqPath) {
     const targetUrl = getTargetUrl(req, reqPath);
     console.log(`\x1b[33m[Cache Miss] ${req.url} -> ${targetUrl}\x1b[0m`);
@@ -400,6 +560,7 @@ async function proxyAndCache(req, res, localPath, reqPath) {
 
         if (!response.ok) {
             console.error(`\x1b[31m[Failed] Origin status ${response.status}: ${req.url}\x1b[0m`);
+            recordFetchOutcome(reqPath, OUTCOME.HTTP_ERROR, `HTTP ${response.status} ${response.statusText || ''}`.trim());
             res.writeHead(response.status, { 'Content-Type': 'text/plain; charset=utf-8' });
             res.end(`Origin responded with status: ${response.status}`);
             return;
@@ -409,6 +570,7 @@ async function proxyAndCache(req, res, localPath, reqPath) {
         if (!isValidCachedResponse(localPath, response, buffer)) {
             const contentType = response.headers.get('content-type') || 'unknown';
             console.error(`\x1b[31m[Rejected] Not caching unexpected content for ${req.url} (${contentType})\x1b[0m`);
+            recordFetchOutcome(reqPath, OUTCOME.REJECTED, `unexpected content-type: ${contentType}`);
             res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
             res.end(`Rejected unexpected content for ${req.url}`);
             return;
@@ -417,6 +579,7 @@ async function proxyAndCache(req, res, localPath, reqPath) {
         ensureDirExists(localPath);
         fs.writeFileSync(localPath, buffer);
         console.log(`\x1b[32m[Saved] ${localPath}\x1b[0m`);
+        recordFetchOutcome(reqPath, OUTCOME.SAVED, `saved ${buffer.length} byte(s)`);
 
         // Make the first cache-miss response behave like later cache hits.
         // Otherwise newly visited pages still point at the live site until reload.
@@ -436,6 +599,11 @@ async function proxyAndCache(req, res, localPath, reqPath) {
     } catch (err) {
         const status = err.name === 'AbortError' ? 504 : 500;
         console.error(`\x1b[31m[Error] ${req.url}: ${err.message}\x1b[0m`);
+        recordFetchOutcome(
+            reqPath,
+            OUTCOME.NETWORK_ERROR,
+            err.name === 'AbortError' ? `timeout after ${REQUEST_TIMEOUT_MS}ms` : `${err.name || 'Error'}: ${err.message}`
+        );
         res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8' });
         res.end(`Proxy error: ${err.message}`);
     }
@@ -498,12 +666,60 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    if (fs.existsSync(localPath) && fs.statSync(localPath).isFile()) {
+    // 结局清单只是记账文件：不响应、不回源、不参与缓存判断。
+    if (isManifestLocalPath(localPath)) {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Not found');
+        return;
+    }
+
+    // 重试模式下，上次失败或被拒的路径强制重新补抓；
+    // 已成功保存的路径不在集合里，仍然正常读本地，不会因此重抓。
+    const shouldRetry = RETRY_FAILED_ENABLED && retryPaths.has(reqPath);
+    if (!shouldRetry && fs.existsSync(localPath) && fs.statSync(localPath).isFile()) {
         serveLocalFile(localPath, res);
         return;
     }
 
+    if (shouldRetry) {
+        console.log(`\x1b[36m[Retry] Re-fetching previously failed path: ${req.url}\x1b[0m`);
+    }
+
     await proxyAndCache(req, res, localPath, reqPath);
+});
+
+loadFetchManifest();
+
+// 优雅停机：先让排队中的清单写盘落盘，再停止接收新连接并退出。
+// 清单写盘是异步排队的，强杀进程可能丢掉最后一笔，所以先 flush。
+let shuttingDown = false;
+async function shutdown(reason) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\n${reason}; flushing fetch manifest before exit...`);
+    try {
+        await flushFetchManifestWrites();
+    } catch { /* flush 内部已保证不抛出，这里仅作防御 */ }
+
+    // 先停止接收新连接、断开现存连接，再让事件循环自然排空退出。
+    // 不直接 process.exit：Node 在 Windows 上配合 undici keep-alive 句柄
+    // 强制退出时偶发 libuv 的 UV_HANDLE_CLOSING 断言；自然停机更稳。
+    server.close(() => {
+        console.log('HTTP server closed.');
+    });
+    server.closeAllConnections && server.closeAllConnections();
+
+    // 兜底：若仍有句柄让进程退不掉，延时强制退出（unref 不阻止自然退出）。
+    const forceExitTimer = setTimeout(() => process.exit(0), 4000);
+    forceExitTimer.unref();
+}
+process.on('SIGTERM', () => shutdown('Received SIGTERM'));
+process.on('SIGINT', () => shutdown('Received SIGINT'));
+// Windows 下 kill('SIGTERM') 不会执行 JS 信号处理器；通过 IPC 消息实现跨平台优雅停机。
+process.on('message', (message) => {
+    if (message === 'graceful-shutdown' || (message && message.type === 'graceful-shutdown')) {
+        shutdown('Received graceful-shutdown message');
+    }
 });
 
 server.listen(PORT, () => {
@@ -516,11 +732,17 @@ server.listen(PORT, () => {
     console.log(`Mirror entry: \x1b[32mhttp://localhost:${PORT}${getMirrorEntryPath()}\x1b[0m`);
     console.log(`Mirror at root: ${MIRROR_AT_ROOT ? '\x1b[32menabled\x1b[0m' : 'disabled'}`);
     console.log(`Request timeout: ${REQUEST_TIMEOUT_MS}ms`);
+    console.log(`Retry failed fetches (MIRROR_RETRY_FAILED): ${RETRY_FAILED_ENABLED ? '\x1b[32menabled\x1b[0m' : 'disabled'}`);
+    console.log(`Fetch manifest: \x1b[32m${MANIFEST_PATH}\x1b[0m`);
     console.log('Unexpected HTML fallback responses will not be cached as assets.');
     console.log('----------------------------------------------------------\n');
 
     const url = `http://localhost:${PORT}/`;
     const startCmd = process.platform === 'win32' ? 'start' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+    if (process.env.NODE_ENV === 'test') {
+        console.log('Test environment detected; skipping automatic browser open.');
+        return;
+    }
     exec(`${startCmd} ${url}`, (err) => {
         if (err) console.error('Failed to auto-open browser:', err.message);
     });

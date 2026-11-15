@@ -378,6 +378,114 @@ node tools\validate-assets.js
 
 It helps detect cases where an HTML error page was accidentally saved as an image, JSON file, font, or other asset.
 
+### Fetch Outcome Manifest And Failed-Fetch Retry (built into server.js)
+
+While browsing the mirror, resources missing locally are fetched from the origin by
+`server.js` on demand and saved to disk. When the origin returns an error, times out,
+or the response fails content validation, every proxy fetch outcome is now recorded in a
+machine-readable manifest so you can see afterwards which paths were never filled and
+retry only those gaps.
+
+#### Where the manifest lives
+
+The manifest is always stored at the root of the mirror folder:
+
+```text
+<MIRROR_NAME>/mirror-fetch-manifest.json
+```
+
+For example, with a mirror folder named `example.com`:
+
+```text
+example.com/mirror-fetch-manifest.json
+```
+
+Writes go to a sibling temp file `.mirror-fetch-manifest.json.tmp` first and are then
+atomically renamed over the real manifest, so concurrent fetches never overwrite each
+other and no half-written JSON can appear.
+
+The manifest is bookkeeping only:
+
+```text
+it is never served as a local resource (requesting it returns 404)
+it is never proxied back to the origin
+it is ignored by the bad-cache and video-reference scanners in tools
+```
+
+#### Manifest format
+
+The manifest is UTF-8 JSON with this top-level shape:
+
+```json
+{
+  "version": 1,
+  "generatedAt": "2026-11-15T08:00:00.000Z",
+  "recordCount": 2,
+  "records": [
+    {
+      "path": "/example.com/assets/a.png",
+      "outcome": "saved",
+      "reason": "saved 1234 byte(s)",
+      "updatedAt": "2026-11-15T08:00:00.000Z"
+    },
+    {
+      "path": "/example.com/assets/b.png",
+      "outcome": "rejected",
+      "reason": "unexpected content-type: text/html; charset=utf-8",
+      "updatedAt": "2026-11-15T08:00:01.000Z"
+    }
+  ]
+}
+```
+
+Each record contains:
+
+```text
+path       the request path (the full path used against server.js)
+outcome    outcome code, see the table below
+reason     optional human-readable reason; null when absent
+updatedAt  when this outcome was written (ISO 8601)
+```
+
+The `outcome` field distinguishes at least these four categories:
+
+| outcome code   | meaning |
+| -------------- | ------- |
+| `saved`        | saved successfully |
+| `http_error`   | origin returned an unsuccessful HTTP status (e.g. 404, 503) |
+| `rejected`     | content validation rejected it (e.g. an HTML error page pretending to be an image/JSON); nothing is written to disk |
+| `network_error`| timeout or network error |
+
+Repeated fetches of the same path keep only the latest outcome: records are keyed by
+`path` and overwritten, never appended as history.
+
+#### Retrying only failed or rejected paths
+
+This is off by default and does not change the existing "fetch on demand when missing"
+behavior. To enable retry, start the server with `MIRROR_RETRY_FAILED=1`:
+
+```bat
+set MIRROR_RETRY_FAILED=1
+node server.js
+```
+
+On startup the server reads the previous manifest and puts every path whose outcome is
+`http_error`, `rejected`, or `network_error` into a retry set. When those paths are
+requested again, they are re-fetched from the origin first, even if a same-named (bad)
+file already exists locally. Paths with a `saved` outcome are not in the set and are
+still served from local disk, so they are never re-fetched because of this switch.
+
+Once a retry succeeds, that path's outcome becomes `saved` and it is automatically removed
+from the retry set; later visits read the local copy. Paths that still fail or are rejected
+keep their failed outcome, so they remain retryable on the next switch-enabled start.
+
+If the manifest does not exist or cannot be parsed, the server prints a clear message and
+continues with normal behavior; it never crashes.
+
+Note that the switch only affects paths that the browser requests again; it does not issue
+batch requests on its own. For a bulk bad-cache rescan, keep using
+`tools\mirror-assets.js --retry-bad`.
+
 ## 3. Recommended Workflow
 
 ### Ordinary Website
@@ -611,6 +719,12 @@ text/html
 ```
 
 That is usually a 404 page, redirect page, or fallback page. Rejecting it is normal protection.
+
+These rejected paths, together with origin errors, timeouts, and network errors, are written
+to `mirror-fetch-manifest.json` inside the mirror folder (with outcomes `rejected`,
+`http_error`, and `network_error`). To fill only these gaps, restart the server with
+`MIRROR_RETRY_FAILED=1` and visit the affected paths again in the browser. See the
+"Fetch Outcome Manifest And Failed-Fetch Retry" section above for the full format.
 
 ### Menus, Carousels, Or Modals Do Not Open
 

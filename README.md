@@ -380,6 +380,106 @@ node tools\validate-assets.js
 
 它会检查有没有把 HTML 错误页误保存成图片、JSON、字体等资源。
 
+### 6. 补抓结局清单与失败重试（server.js 内置）
+
+浏览镜像时，本地缺失的资源由 `server.js` 即时向源站补抓并落盘。
+源站报错、超时或内容校验被拒时，现在会把每次补抓的结局记录到一份机器可读清单里，
+方便事后查看哪些路径没补上，并只重试这些缺口。
+
+#### 清单文件在哪里
+
+清单固定保存在镜像文件夹根目录：
+
+```text
+<MIRROR_NAME>/mirror-fetch-manifest.json
+```
+
+例如镜像文件夹是 `example.com`，清单就是：
+
+```text
+example.com/mirror-fetch-manifest.json
+```
+
+写盘时先写同目录临时文件 `.mirror-fetch-manifest.json.tmp`，再原子替换正式清单，
+并发补抓不会互相覆盖，也不会出现半截 JSON。
+
+清单只是记账文件：
+
+```text
+不会被服务器当成本地资源响应（请求它返回 404）
+不会被代理回源补抓
+不会被 tools 里的坏缓存扫描、视频引用扫描当成资源
+```
+
+#### 清单格式
+
+清单是 UTF-8 编码的 JSON，顶层结构：
+
+```json
+{
+  "version": 1,
+  "generatedAt": "2026-11-15T08:00:00.000Z",
+  "recordCount": 2,
+  "records": [
+    {
+      "path": "/example.com/assets/a.png",
+      "outcome": "saved",
+      "reason": "saved 1234 byte(s)",
+      "updatedAt": "2026-11-15T08:00:00.000Z"
+    },
+    {
+      "path": "/example.com/assets/b.png",
+      "outcome": "rejected",
+      "reason": "unexpected content-type: text/html; charset=utf-8",
+      "updatedAt": "2026-11-15T08:00:01.000Z"
+    }
+  ]
+}
+```
+
+每条记录字段：
+
+```text
+path       请求路径（浏览器访问 server.js 用的完整路径）
+outcome    结局类别代码，见下表
+reason     可选原因说明，便于排查；没有时为 null
+updatedAt  本次结局写入时间（ISO 8601）
+```
+
+`outcome` 至少区分以下四类：
+
+| outcome 代码   | 含义 |
+| -------------- | ---- |
+| `saved`        | 成功保存 |
+| `http_error`   | 源站 HTTP 非成功（如 404、503） |
+| `rejected`     | 内容校验被拒（例如 HTML 错误页伪装成图片/JSON，不会落盘） |
+| `network_error`| 超时或网络异常 |
+
+同一路径多次补抓只保留最新结局，按 `path` 覆盖更新，不追加历史。
+
+#### 只重试失败或被拒的路径
+
+默认关闭，不改变现有“本地没有就即时补抓”的行为。
+需要重试时，用环境变量 `MIRROR_RETRY_FAILED=1` 启动服务器：
+
+```bat
+set MIRROR_RETRY_FAILED=1
+node server.js
+```
+
+开启后服务器启动时读取上次清单，把结局为 `http_error`、`rejected`、`network_error`
+的路径加入待重试集合。之后这些路径再次被请求时，会优先重新回源补抓，
+即使本地已经存在同名（坏）文件也会绕过它重新抓取；结局为 `saved` 的路径不在集合里，
+仍然正常读本地，不会因此重抓。
+
+某次重试成功后，该路径结局更新为 `saved` 并自动移出待重试集合，之后再访问就读本地。
+仍然失败或被拒的路径会继续保留失败结局，下次带开关启动时还能继续重试。
+
+清单文件不存在或内容无法解析时，服务器只打印明确提示并按普通流程继续，不会崩溃。
+
+注意：这个开关只影响“再次被浏览器请求到”的路径，不会主动批量发起请求。
+需要批量重扫坏缓存时，仍可使用 `tools\mirror-assets.js --retry-bad`。
+
 ## 三、推荐流程
 
 ### 普通网站
@@ -620,6 +720,11 @@ text/html
 ```
 
 这通常是 404、跳转页、fallback 页面。脚本拒绝缓存是正常保护。
+
+这类被拒路径，连同源站报错、超时或网络异常的路径，都会写进镜像文件夹里的
+`mirror-fetch-manifest.json`（结局分别记为 `rejected`、`http_error`、`network_error`）。
+想只补这些缺口时，带上 `MIRROR_RETRY_FAILED=1` 重启服务器，再在页面里重新访问对应路径即可。
+清单的完整格式见上文「补抓结局清单与失败重试」。
 
 ### 4. 菜单、轮播、弹窗点不开
 

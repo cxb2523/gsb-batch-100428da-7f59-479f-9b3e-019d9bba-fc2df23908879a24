@@ -338,9 +338,13 @@ function collectLocalSources() {
     return [...new Set(sources)];
 }
 
+// 与 server.js 保持一致：补抓结局清单只是记账文件，不参与坏缓存扫描。
+const MANIFEST_FILENAME = 'mirror-fetch-manifest.json';
+
 function walk(dir, output = []) {
     if (!fs.existsSync(dir)) return output;
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name === MANIFEST_FILENAME || entry.name.startsWith(`.${MANIFEST_FILENAME}`)) continue;
         const fullPath = path.join(dir, entry.name);
         if (entry.isDirectory()) walk(fullPath, output);
         else output.push(fullPath);

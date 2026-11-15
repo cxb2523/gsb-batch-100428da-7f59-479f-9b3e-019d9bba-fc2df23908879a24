@@ -16,6 +16,7 @@ const TEXT_EXTS = new Set(['.html', '.js', '.mjs', '.json', '.css', '.txt']);
 function walk(dir, output = []) {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         if (entry.name === 'node_modules') continue;
+        if (entry.name === 'mirror-fetch-manifest.json' || entry.name.startsWith('.mirror-fetch-manifest.json')) continue;
         const fullPath = path.join(dir, entry.name);
         if (entry.isDirectory()) walk(fullPath, output);
         else output.push(fullPath);
