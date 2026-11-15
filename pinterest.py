@@ -133,7 +133,7 @@ class Pinterest():
         loop.close
         return fail_image
     
-    def batch_download(self, n=-1, url_list = [], dir_list = [], dir="./download"):
+    def batch_download(self, n=-1, url_list=[], dir_list=[], dir="./download"):
         global loop
         loop = asyncio.get_event_loop()
         url_count = len(url_list)
@@ -143,45 +143,109 @@ class Pinterest():
         if dir_list != [] and url_count != dir_count:
             print("url_list and dir_list must have same length.")
             exit()
+        if url_count == 0:
+            print("No link to crawl.")
+            return []
 
-        # Open all tabs
-        for i in range(url_count-1):
+        # Each link is bound to its own directory, tab handle, status and
+        # counters. The input lists are never mutated, so closing a tab or
+        # finishing one item can never shift the remaining items.
+        tasks = []
+        for uindex in range(url_count):
+            target_dir = dir_list[uindex] if dir_count != 0 else dir
+            if target_dir[0] == "/":
+                target_dir = target_dir[1:]
+            target_dir = os.path.join(self.currentdir, target_dir)
+            if not os.path.exists(target_dir):
+                os.makedirs(target_dir)
+            tasks.append({
+                "url": url_list[uindex],
+                "dir": target_dir,
+                "handle": None,
+                "status": "active",   # active | ended | failed | completed
+                "downloaded": 0,
+                "reason": "",
+            })
+
+        # Open one tab per link and remember the actual window handle, so a
+        # later reordering of window_handles cannot bind a link to another tab.
+        for i in range(url_count - 1):
             self.driver.execute_script("window.open('','_blank');")
 
-        for i in range(url_count):
-            self.driver.switch_to.window(self.driver.window_handles[i])
-            self.driver.get(url_list[i])
+        handles = self.driver.window_handles
+        for uindex, task in enumerate(tasks):
+            task["handle"] = handles[uindex]
+            self.driver.switch_to.window(handles[uindex])
+            self.driver.get(task["url"])
             self.driver.implicitly_wait(3)
 
-        for i in range(0,n):
-            for uindex in range(url_count):
-                dir = dir_list[uindex] if dir_count != 0 else dir
+        for i in range(n):
+            active_tasks = [task for task in tasks if task["status"] == "active"]
+            if not active_tasks:
+                break
 
-                if dir[0] == "/":
-                    dir = dir[1:]
-                dir = os.path.join(self.currentdir, dir)
-                if not os.path.exists(dir):
-                    os.mkdir(dir)
-                
+            for task in active_tasks:
+                # Snapshot how many images were already known before this
+                # scroll, so this item's count stays independent even though
+                # piclist itself is shared with single mode.
+                before_count = len(self.piclist)
                 try:
-                    self.driver.switch_to.window(self.driver.window_handles[uindex])
-                except:
+                    self.driver.switch_to.window(task["handle"])
+                except Exception as e:
+                    task["status"] = "failed"
+                    task["reason"] = f"switch to tab failed: {e}"
+                    print(f"Failed to switch tab for {task['url']}: {task['reason']}")
                     continue
 
-                download_pic_count = len(self.piclist)
-
                 try:
-                    self.crawl(dir)
-                except EndPageException as e:
-                    del url_list[uindex]
-                    del dir_list[uindex]
-                    self.driver.close()
-                    url_count -= 1
-                    dir_count -= 1
+                    self.crawl(task["dir"])
+                except EndPageException:
+                    # Normal end of this link: close only its own tab and keep
+                    # processing every remaining link.
+                    task["status"] = "ended"
+                    task["downloaded"] += len(self.piclist) - before_count
+                    try:
+                        self.driver.switch_to.window(task["handle"])
+                        self.driver.close()
+                    except Exception as e:
+                        # The tab/window is already gone; the item itself is
+                        # still a normal end, just record the cleanup issue.
+                        print(f"Note: could not close tab for {task['url']}: {e}")
+                    print(f"Reached the end of {task['url']}, downloaded {task['downloaded']} images, tab closed.")
+                    continue
+                except Exception as e:
+                    # Page read / crawl failure: keep the item and its record,
+                    # do not interrupt the rest of the batch.
+                    task["status"] = "failed"
+                    task["reason"] = f"crawl failed: {e}"
+                    task["downloaded"] += len(self.piclist) - before_count
+                    print(f"Failed while crawling {task['url']}: {task['reason']}")
+                    continue
 
-                print(f"Scroll down from {url_list[uindex]}, {i} Page, downloaded {download_pic_count} images.")
+                task["downloaded"] += len(self.piclist) - before_count
+                print(f"Scroll down from {task['url']}, {i} Page, downloaded {task['downloaded']} images.")
 
-        return
+        for task in tasks:
+            if task["status"] == "active":
+                task["status"] = "completed"
+
+        return self._print_batch_results(tasks)
+
+    def _print_batch_results(self, tasks):
+        print("===== Batch download result =====")
+        for task in tasks:
+            if task["status"] == "failed":
+                print(
+                    f"[FAILED] {task['url']} -> {task['dir']} | "
+                    f"downloaded {task['downloaded']} images | reason: {task['reason']}"
+                )
+            else:
+                print(
+                    f"[{task['status'].upper()}] {task['url']} -> {task['dir']} | "
+                    f"downloaded {task['downloaded']} images"
+                )
+        print("=================================")
+        return tasks
 
 
     def download_image(self, dir="./download"):
