@@ -61,6 +61,8 @@ class FakeEbsco:
         self.require_cookie = True
         self.hang_seconds = 5
         self.failures: Dict[str, List[Failure]] = {}
+        # Failures that apply to every request until the test removes them again, e.g. an artifact that stays down.
+        self.persistent_failures: Dict[str, Failure] = {}
         self.request_counts: Dict[str, int] = {}
         self.supports_ranges = False
         self.range_headers: Dict[str, List[str]] = {}
@@ -144,6 +146,8 @@ class FakeEbsco:
 
         planned = self.failures.get(key)
         failure = planned.pop(0) if planned else None
+        if failure is None:
+            failure = self.persistent_failures.get(key)
         if failure == 'hang':
             await asyncio.sleep(self.hang_seconds)
             return web.Response(status=504)

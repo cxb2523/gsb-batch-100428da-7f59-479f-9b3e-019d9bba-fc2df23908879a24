@@ -188,13 +188,12 @@ def main(args=None):
 
         # Check if it is a valid URL
         if parsed_url.path.startswith("/ehost/ebookviewer/ebook"):
-            EbscoDownloader(storage_path, args.url[0], skip_cert_verify).run()
+            download_result = EbscoDownloader(storage_path, args.url[0], skip_cert_verify).run()
         elif parsed_url.path.startswith("/c/") and "/ebook-viewer/" in parsed_url.path:
-            Ebsco2Downloader(storage_path, args.url[0], skip_cert_verify).run()
+            download_result = Ebsco2Downloader(storage_path, args.url[0], skip_cert_verify).run()
         else:
             raise NotImplementedError('This type of URL is yet not supported')
 
-        Log.success('All done. Exiting..')
         ProcessLock.unlock(storage_path)
     except BaseException as e:
         print('\n')
@@ -212,3 +211,14 @@ def main(args=None):
         logging.debug('Exception-Handling completed. Exiting...')
 
         sys.exit(1)
+
+    if isinstance(download_result, dict) and not download_result.get('epubWritten', True):
+        # A partial EPUB download keeps every page that worked and leaves a report; a rerun fetches only the rest.
+        pages = download_result.get('pages', {})
+        Log.error(
+            f'Download incomplete: {pages.get("missing", "?")} of {pages.get("total", "?")} pages are missing.'
+            ' The downloaded files were kept, see download-report.json in the book directory.'
+        )
+        sys.exit(1)
+
+    Log.success('All done. Exiting..')

@@ -9,6 +9,7 @@ import sys
 import uuid
 import zipfile
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
 from urllib.parse import ParseResult, quote, unquote, urlparse, urlsplit, urlunsplit
@@ -74,6 +75,40 @@ class FetchedArtifact:
 
 RETRYABLE_ERRORS = (ClientError, asyncio.TimeoutError, OSError, ValueError)
 RETRYABLE_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
+# Errors that make a single page/include fail. They are recorded in the report instead of aborting the whole book.
+# Anything outside this tuple is a bug or a broken session and is still allowed to propagate.
+ARTIFACT_DOWNLOAD_ERRORS = RETRYABLE_ERRORS
+
+# Written into the book directory instead of an incomplete .epub, so a partial run stays auditable and resumable.
+DOWNLOAD_REPORT_NAME = 'download-report.json'
+
+
+@dataclass
+class EpubPageResult:
+    """Outcome of one XHTML page download. Failures are reported, not raised, so one page cannot abort the book."""
+
+    path: str
+    url: str
+    includes: List[str] = field(default_factory=list)
+    failure_reason: str = None
+
+    @property
+    def ok(self) -> bool:
+        return self.failure_reason is None
+
+
+@dataclass
+class EpubIncludeResult:
+    """Outcome of one include download (image, stylesheet, font, ...)."""
+
+    path: str
+    url: str
+    failure_reason: str = None
+    discovered_includes: List[str] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return self.failure_reason is None
 
 
 class Ebsco2Downloader:
@@ -166,9 +201,9 @@ class Ebsco2Downloader:
             )
 
         if self.book_info.book_format == 'epub':
-            asyncio.run(self.download_epub())
+            return asyncio.run(self.download_epub())
         elif self.book_info.book_format == 'pdf':
-            self.download_pdf()
+            return self.download_pdf()
         else:
             raise NotImplementedError("This book format is not yet supported")
 
@@ -470,6 +505,57 @@ class Ebsco2Downloader:
     def is_ebsco_error_page(response_text: str) -> bool:
         return response_text.startswith('<script type="text/javascript">') and 'pageError' in response_text
 
+    @staticmethod
+    def extract_artifact_includes(xhtml_text: str, page_file_path: str) -> Tuple[List[str], List[str]]:
+        """Returns the artifact paths a page references and the external URLs that are skipped."""
+        split_xhtml = re.search(
+            r'^(.*?<body[^>]*>)(.*)(</body[^>]*>.*)$', xhtml_text, flags=re.DOTALL | re.IGNORECASE
+        )
+        if split_xhtml is None:
+            raise ValueError(f'Could not find the <body> of {page_file_path}')
+        xhtml_head, xhtml_body, _xhtml_footer = split_xhtml.groups()
+
+        # Find Header includes
+        raw_includes = re.findall(r'src\s*=\s*"([^"]+)"', xhtml_head)
+        raw_includes += re.findall(r'href\s*=\s*"([^"]+)"', xhtml_head)
+        # Find Body includes
+        raw_includes += re.findall(r'src\s*=\s*"([^"]+)"', xhtml_body)
+        raw_includes += re.findall(r'<image[^>]+href\s*=\s*"([^"]+)"', xhtml_body)
+
+        includes = []
+        external = []
+        for artifact_include in raw_includes:
+            # Ignore URLs, only download relative and absolute paths
+            if urlparse(artifact_include).scheme == '':
+                resolved = Ebsco2Downloader.resolve_epub_path(page_file_path, artifact_include)
+                if resolved not in includes:
+                    includes.append(resolved)
+            else:
+                external.append(artifact_include)
+        return includes, external
+
+    @staticmethod
+    def extract_css_includes(css_text: str, artifact_url_path: str) -> Tuple[List[str], List[str]]:
+        includes = []
+        external = []
+        for artifact_include in re.findall(r'url\s*\(["\']?([^"\')]+)["\']?\)', css_text):
+            if artifact_include.startswith(('http:', 'https:')):
+                external.append(artifact_include)
+                continue
+            correct_path = Ebsco2Downloader.resolve_epub_path(artifact_url_path, artifact_include)
+            if correct_path not in includes:
+                includes.append(correct_path)
+        return includes, external
+
+    @staticmethod
+    def remove_stale_file_and_part(file_path) -> None:
+        for candidate in (Path(file_path), Path(str(file_path) + '.part')):
+            if candidate.exists():
+                try:
+                    candidate.unlink()
+                except OSError as err:
+                    Log.debug(f'Could not remove stale {candidate}: {err}')
+
     async def download_epub_page(
         self,
         session: aiohttp.ClientSession,
@@ -477,52 +563,67 @@ class Ebsco2Downloader:
         artifact_url: str,
         artifact_file_path,
         page_file_path: str,
-    ):
-        async with semaphore:
-            response = await self.fetch_artifact(session, artifact_url)
+    ) -> EpubPageResult:
+        """Downloads one XHTML page. A failure is returned, not raised, so the remaining pages can still be fetched."""
 
-        if not response.ok:
-            raise RuntimeError(f'Could not download {page_file_path}: {response.status} {response.reason}')
-        if unquote(response.url) != unquote(artifact_url):
-            raise RuntimeError(f'We got rate limited! {response.reason}')
+        result = EpubPageResult(path=page_file_path, url=artifact_url)
 
-        response_text = response.text()
-        if response.content_type == 'text/html' and self.is_ebsco_error_page(response_text):
-            raise RuntimeError(f'Could not download {artifact_url}, epub is broken.')
+        if os.path.exists(artifact_file_path):
+            try:
+                async with aiofiles.open(artifact_file_path, 'r', encoding='utf-8') as cache_file:
+                    cached_text = await cache_file.read()
+                result.includes, external_includes = self.extract_artifact_includes(cached_text, page_file_path)
+            except (OSError, ValueError, UnicodeDecodeError) as err:
+                Log.warning(f'Cached page {page_file_path} is unusable ({err}), downloading it again')
+                self.remove_stale_file_and_part(artifact_file_path)
+            else:
+                for external_include in external_includes:
+                    logging.warning('Skipping external include: %s', external_include)
+                Log.info(f'{page_file_path} is already present')
+                return result
+
+        try:
+            async with semaphore:
+                response = await self.fetch_artifact(session, artifact_url)
+
+            if not response.ok:
+                result.failure_reason = f'{response.status} {response.reason}'
+                return result
+            if unquote(response.url) != unquote(artifact_url):
+                result.failure_reason = f'We got rate limited, were redirected to {response.url}'
+                return result
+
+            response_text = response.text()
+            if response.content_type == 'text/html' and self.is_ebsco_error_page(response_text):
+                result.failure_reason = 'EBSCO returned an error page instead of the XHTML'
+                return result
+
+            try:
+                result.includes, external_includes = self.extract_artifact_includes(response_text, page_file_path)
+            except ValueError:
+                result.failure_reason = f'EBSCO sent {response.content_type} instead of XHTML'
+                return result
+
+            for external_include in external_includes:
+                logging.warning('Skipping external include: %s', external_include)
+
+            # Only complete pages get the final name, so an interrupted run never leaves a truncated page behind.
+            part_path = str(artifact_file_path) + '.part'
+            async with aiofiles.open(part_path, 'w', encoding='utf-8') as fs:
+                await fs.write(response_text)
+            os.replace(part_path, artifact_file_path)
+
+        except ARTIFACT_DOWNLOAD_ERRORS as err:
+            result.failure_reason = self.describe_error(err)
+            self.remove_stale_file_and_part(artifact_file_path)
+
+        if not result.ok:
+            Log.error(f'Could not download page {page_file_path}: {result.failure_reason}')
+            return result
 
         Log.info(f'Loaded artifact url: `{artifact_url}`')
-
-        split_xhtml = re.search(
-            r'^(.*?<body[^>]*>)(.*)(</body[^>]*>.*)$', response_text, flags=re.DOTALL | re.IGNORECASE
-        )
-        if split_xhtml is None:
-            raise RuntimeError(
-                f'Could not find the <body> of {page_file_path}, EBSCO sent {response.content_type} instead of XHTML'
-            )
-        xhtml_head, xhtml_body, _xhtml_footer = split_xhtml.groups()
-
-        # Find Header includes
-        artifact_includes = re.findall(r'src\s*=\s*"([^"]+)"', xhtml_head)
-        artifact_includes += re.findall(r'href\s*=\s*"([^"]+)"', xhtml_head)
-        # Find Body includes
-        artifact_includes += re.findall(r'src\s*=\s*"([^"]+)"', xhtml_body)
-        artifact_includes += re.findall(r'<image[^>]+href\s*=\s*"([^"]+)"', xhtml_body)
-
-        async with aiofiles.open(artifact_file_path, 'w', encoding='utf-8') as fs:
-            await fs.write(response_text)
-
         Log.info(f'Written artifact: `{str(artifact_file_path)}`')
-
-        result_artifact_includes = []
-        # fix artifact_includes paths
-        for artifact_include in artifact_includes:
-            # Ignore URLs, only download relative and absolute paths
-            if urlparse(artifact_include).scheme == '':
-                result_artifact_includes.append(self.resolve_epub_path(page_file_path, artifact_include))
-            else:
-                logging.warning('Skipping external include: %s', artifact_include)
-
-        return result_artifact_includes
+        return result
 
     async def download_epub_include(
         self,
@@ -531,53 +632,76 @@ class Ebsco2Downloader:
         artifact_url: str,
         artifact_url_path: str,
         artifact_file_path,
-        all_css_includes: List[str],
-        skipped_includes: List[str],
-    ):
+    ) -> EpubIncludeResult:
+        """Downloads one include. Failures are skipped and reported, they never abort the book."""
+
+        result = EpubIncludeResult(path=artifact_url_path, url=artifact_url)
+
+        if os.path.exists(artifact_file_path):
+            if artifact_url.lower().endswith('.css'):
+                try:
+                    async with aiofiles.open(
+                        artifact_file_path, 'r', encoding='utf-8', errors='replace'
+                    ) as cache_file:
+                        cached_text = await cache_file.read()
+                    result.discovered_includes, external_includes = self.extract_css_includes(
+                        cached_text, artifact_url_path
+                    )
+                except OSError as err:
+                    Log.warning(f'Cached include {artifact_url_path} is unusable ({err}), downloading it again')
+                    self.remove_stale_file_and_part(artifact_file_path)
+                else:
+                    for external_include in external_includes:
+                        logging.warning('Skipping external include: %s', external_include)
+                    Log.info(f'{artifact_url_path} is already present')
+                    return result
+            else:
+                Log.info(f'{artifact_url_path} is already present')
+                return result
+
         async with semaphore:
             try:
                 response = await self.fetch_artifact(session, artifact_url)
-            except RETRYABLE_ERRORS as err:
-                logging.error('Could not download %s, epub could be broken: %s', artifact_url, self.describe_error(err))
-                skipped_includes.append(artifact_url)
-                return
+            except ARTIFACT_DOWNLOAD_ERRORS as err:
+                result.failure_reason = self.describe_error(err)
+                logging.error('Could not download %s, epub could be broken: %s', artifact_url, result.failure_reason)
+                return result
 
         if not response.ok:
-            if artifact_url not in skipped_includes:
-                logging.error('Could not download %s, epub could be broken.', artifact_url)
-                skipped_includes.append(artifact_url)
-            return
+            result.failure_reason = f'{response.status} {response.reason}'
+            logging.error('Could not download %s, epub could be broken: %s.', artifact_url, result.failure_reason)
+            return result
         if unquote(response.url) != unquote(artifact_url):
-            raise RuntimeError(f'We got rate limited! {response.reason}')
-
-        Log.info(f'Loaded artifact url: `{artifact_url}`')
+            result.failure_reason = f'We got rate limited, were redirected to {response.url}'
+            logging.error('Could not download %s, epub could be broken: %s', artifact_url, result.failure_reason)
+            return result
 
         if response.content_type == 'text/html' and self.is_ebsco_error_page(response.text()):
-            if artifact_url not in skipped_includes:
-                logging.error('Could not download %s, epub could be broken.', artifact_url)
-                skipped_includes.append(artifact_url)
-            return
+            result.failure_reason = 'EBSCO returned an error page instead of the artifact'
+            logging.error('Could not download %s, epub could be broken.', artifact_url)
+            return result
 
         if artifact_url.lower().endswith('.css'):
-            response_text = response.text()
-            artifact_includes = re.findall(r'url\s*\(["\']?([^"\')]+)["\']?\)', response_text)
-            for artifact_include in artifact_includes:
-                real_artifact_include = artifact_include
+            result.discovered_includes, external_includes = self.extract_css_includes(
+                response.text(), artifact_url_path
+            )
+            for external_include in external_includes:
+                logging.warning('Skipping external include: %s', external_include)
 
-                if artifact_include.startswith(('http:', 'https:')):
-                    # skip external includes
-                    if artifact_include not in skipped_includes:
-                        skipped_includes.append(artifact_include)
-                        logging.warning('Skipping external include: %s', real_artifact_include)
-                    continue
+        try:
+            part_path = str(artifact_file_path) + '.part'
+            async with aiofiles.open(part_path, 'wb') as fs:
+                await fs.write(response.body)
+            os.replace(part_path, artifact_file_path)
+        except OSError as err:
+            result.failure_reason = self.describe_error(err)
+            self.remove_stale_file_and_part(artifact_file_path)
+            logging.error('Could not write %s: %s', artifact_file_path, result.failure_reason)
+            return result
 
-                correct_path = self.resolve_epub_path(artifact_url_path, artifact_include)
-                if correct_path not in all_css_includes:
-                    all_css_includes.append(correct_path)
-
-        async with aiofiles.open(artifact_file_path, 'wb') as fs:
-            await fs.write(response.body)
+        Log.info(f'Loaded artifact url: `{artifact_url}`')
         Log.info(f'Written artifact: `{str(artifact_file_path)}`')
+        return result
 
     @staticmethod
     def escape(str_xml: str):
@@ -599,10 +723,8 @@ class Ebsco2Downloader:
         # Start downloading Artifacts
         book_directory = PT.path_of_book(self.storage_path, book_title)
 
-        all_includes = []
-        skipped_includes = []
-        epub_content_files = []
-        epub_include_files = []
+        page_results: List[EpubPageResult] = []
+        include_results: List[EpubIncludeResult] = []
 
         semaphore = asyncio.Semaphore(self.max_parallel_dl)
         async with self.create_client_session() as session:
@@ -612,7 +734,6 @@ class Ebsco2Downloader:
                 page_file_path = page_id
                 artifact_file_path = book_directory / page_id
                 os.makedirs(str(artifact_file_path.parent), exist_ok=True)
-                epub_content_files.append(artifact_file_path)
 
                 artifact_url = f'{self.book_info.on_page_json["runtimeConfig"]["BOOKS_CONTENT_EDGE_CLIENT_URL"]}/v1/artifact/{quote(page_id, safe="")}/{self.book_info.checkout_token}'
 
@@ -626,11 +747,12 @@ class Ebsco2Downloader:
                     )
                 )
 
-            result = await asyncio.gather(*page_tasks)
+            page_results = list(await asyncio.gather(*page_tasks))
 
             # Collect all artifacts
-            for artifact_includes in result:
-                for artifact_include in artifact_includes:
+            all_includes = []
+            for page_result in page_results:
+                for artifact_include in page_result.includes:
                     if artifact_include not in all_includes:
                         all_includes.append(artifact_include)
 
@@ -640,7 +762,6 @@ class Ebsco2Downloader:
             requested_includes = set()
             while len(all_includes) > 0:
                 requested_includes.update(all_includes)
-                all_css_includes = []
                 include_tasks = []
                 for artifact_url_path in all_includes:
                     artifact_url = base_artifact_url + artifact_url_path
@@ -662,7 +783,6 @@ class Ebsco2Downloader:
                     artifact_file_path = book_directory / artifact_url_path
                     os.makedirs(str(artifact_file_path.parent), exist_ok=True)
 
-                    epub_include_files.append(artifact_file_path)
                     include_tasks.append(
                         self.download_epub_include(
                             session,
@@ -670,18 +790,158 @@ class Ebsco2Downloader:
                             artifact_url,
                             artifact_url_path,
                             artifact_file_path,
-                            all_css_includes,
-                            skipped_includes,
                         )
                     )
 
-                await asyncio.gather(*include_tasks)
+                batch_results = await asyncio.gather(*include_tasks)
+                include_results.extend(batch_results)
+
+                # CSS files may reference further includes, continue until all are known.
+                all_css_includes = []
+                for include_result in batch_results:
+                    if not include_result.ok:
+                        continue
+                    for css_include in include_result.discovered_includes:
+                        if css_include not in all_css_includes:
+                            all_css_includes.append(css_include)
                 all_includes = [include for include in all_css_includes if include not in requested_includes]
 
-        # Compose E-Pub
-        epub_path = str(book_directory) + '.epub'
-        epub = zipfile.ZipFile(epub_path, 'w', zipfile.ZIP_DEFLATED)
+        report_path = book_directory / DOWNLOAD_REPORT_NAME
+        missing_pages = self.unique_failures_by_path(page_results)
 
+        if missing_pages:
+            report = self.write_download_report(book_directory, book_title, page_results, include_results)
+            Log.error(
+                f'Could not download {len(missing_pages)} of {len(page_results)} pages, so no EPUB was written.'
+                f' See `{report_path}` for the missing pages. Run the same command again to fetch only those pages.'
+            )
+            return report
+
+        # Every page is present, so the EPUB is complete. Only drop a previous report once the EPUB exists.
+        self.compose_epub(
+            book_directory,
+            [book_directory / page_result.path for page_result in page_results],
+            [book_directory / include_result.path for include_result in include_results],
+            book_title,
+            authors,
+            publication_year,
+        )
+
+        if os.path.exists(report_path):
+            os.unlink(report_path)
+            Log.info(f'Removed `{report_path}`, all pages are present now')
+
+        return None
+
+    @staticmethod
+    def unique_failures_by_path(results: List) -> List:
+        """Returns the failed results, with every path at most once.
+
+        Several tasks can race on the same artifact path, but the report must list each missing artifact once.
+        """
+        seen = set()
+        unique = []
+        for result in results:
+            if not result.ok and result.path not in seen:
+                seen.add(result.path)
+                unique.append(result)
+        return unique
+
+    def write_download_report(
+        self,
+        book_directory: Path,
+        book_title: str,
+        page_results: List[EpubPageResult],
+        include_results: List[EpubIncludeResult],
+    ) -> Dict:
+        """Writes a JSON manifest describing what is on disk and what is still missing."""
+        missing_pages = self.unique_failures_by_path(page_results)
+        skipped_includes = self.unique_failures_by_path(include_results)
+        total_pages = len({page_result.path for page_result in page_results})
+        total_includes = len({include_result.path for include_result in include_results})
+        report = {
+            'bookTitle': book_title,
+            'bookId': self.book_info.book_id,
+            'generatedAt': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+            'resumable': True,
+            'epubWritten': False,
+            'pages': {
+                'total': total_pages,
+                'downloaded': total_pages - len(missing_pages),
+                'missing': len(missing_pages),
+                'missingPages': [
+                    {
+                        'path': page_result.path,
+                        'url': page_result.url,
+                        'reason': page_result.failure_reason,
+                    }
+                    for page_result in missing_pages
+                ],
+            },
+            'includes': {
+                'total': total_includes,
+                'downloaded': total_includes - len(skipped_includes),
+                'skipped': len(skipped_includes),
+                'skippedIncludes': [
+                    {
+                        'path': include_result.path,
+                        'url': include_result.url,
+                        'reason': include_result.failure_reason,
+                    }
+                    for include_result in skipped_includes
+                ],
+            },
+        }
+
+        report_path = book_directory / DOWNLOAD_REPORT_NAME
+        tmp_path = report_path.with_name(report_path.name + '.part')
+        os.makedirs(str(book_directory), exist_ok=True)
+        with open(tmp_path, 'w', encoding='utf-8') as report_file:
+            json.dump(report, report_file, indent=2, ensure_ascii=False)
+            report_file.write('\n')
+        os.replace(tmp_path, report_path)
+        return report
+
+    def compose_epub(
+        self,
+        book_directory: Path,
+        epub_content_files: List[Path],
+        epub_include_files: List[Path],
+        book_title: str,
+        authors: List[str],
+        publication_year: str,
+    ):
+        # Write to a temporary name first, so an aborted run never leaves a truncated .epub behind.
+        epub_path = str(book_directory) + '.epub'
+        part_path = epub_path + '.part'
+        try:
+            with zipfile.ZipFile(part_path, 'w', zipfile.ZIP_DEFLATED) as epub:
+                self.fill_epub(
+                    epub,
+                    book_directory,
+                    epub_content_files,
+                    epub_include_files,
+                    book_title,
+                    authors,
+                    publication_year,
+                )
+            os.replace(part_path, epub_path)
+        except BaseException:
+            if os.path.exists(part_path):
+                os.unlink(part_path)
+            raise
+        return None
+
+    def fill_epub(
+        self,
+        epub: zipfile.ZipFile,
+        book_directory: Path,
+        epub_content_files: List[Path],
+        epub_include_files: List[Path],
+        book_title: str,
+        authors: List[str],
+        publication_year: str,
+    ):
         # Mimetype
         epub.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
 
@@ -820,9 +1080,6 @@ class Ebsco2Downloader:
 </ncx>
 '''
         epub.writestr('OEBPS/toc.ncx', self.prettify_xml(toc_tpl))
-
-        epub.close()
-        return None
 
     @staticmethod
     def fix_paths_in_structure(nav_dic) -> str:

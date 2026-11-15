@@ -1,11 +1,12 @@
+import json
 import zipfile
 
 import pypdf
 import pytest
-from fake_ebsco import BOOK_ID, BOOK_TITLE, USER_ID
+from fake_ebsco import BOOK_ID, BOOK_TITLE, USER_ID, XHTML_PAGE
 from lxml import etree
 
-from ebsco_dl.ebsco_2_downloader import Ebsco2Downloader
+from ebsco_dl.ebsco_2_downloader import DOWNLOAD_REPORT_NAME, Ebsco2Downloader
 from ebsco_dl.utils import PathTools
 
 
@@ -19,6 +20,25 @@ def epub_path(workdir):
 
 def pdf_path(workdir):
     return book_dir(workdir).with_name(book_dir(workdir).name + '.pdf')
+
+
+def report_path(workdir):
+    return book_dir(workdir) / DOWNLOAD_REPORT_NAME
+
+
+def read_report(workdir):
+    return json.loads(report_path(workdir).read_text(encoding='utf-8'))
+
+
+def add_pages(server, count):
+    """Extends an epub fake with further chapters, useful to have several pages fail at the same time."""
+    for idx in range(len(server.page_ids) + 1, count + 1):
+        page_id = f'EPUB/xhtml/ch{idx}.xhtml'
+        server.page_ids.append(page_id)
+        server.artifacts[page_id] = XHTML_PAGE.format(title=f'Chapter {idx}').encode()
+        server.sections[0]['children'].append(
+            {'id': f'sec{idx}', 'name': f'Chapter {idx}', 'artifactId': f'epub/xhtml/ch{idx}.xhtml'}
+        )
 
 
 class TestUrlParsing:
@@ -123,12 +143,142 @@ class TestEpub:
             assert b'Chapter 1' in epub.read('EPUB/xhtml/ch1.xhtml')
             assert 'EPUB/fonts/book.woff' in epub.namelist()
 
-    def test_page_that_keeps_failing_aborts(self, fake_epub, make_downloader, cookies_file, workdir):
+    def test_page_that_keeps_failing_reports_instead_of_aborting(
+        self, fake_epub, make_downloader, cookies_file, workdir
+    ):
         fake_epub.failures['EPUB/xhtml/ch2.xhtml'] = [503, 503, 503]
 
-        with pytest.raises(RuntimeError, match='ch2.xhtml: 503'):
-            make_downloader(fake_epub).run()
+        result = make_downloader(fake_epub).run()
+
+        assert result['pages']['missing'] == 1
         assert not epub_path(workdir).exists()
+        # The page that worked stays on disk, so a rerun does not download it again.
+        assert (book_dir(workdir) / 'EPUB/xhtml/ch1.xhtml').is_file()
+
+    def test_missing_page_is_written_to_a_json_report(self, fake_epub, make_downloader, cookies_file, workdir):
+        fake_epub.persistent_failures['EPUB/xhtml/ch2.xhtml'] = 503
+
+        make_downloader(fake_epub).run()
+
+        report = read_report(workdir)
+        assert report['pages']['total'] == 2
+        assert report['pages']['downloaded'] == 1
+        assert report['pages']['missing'] == 1
+        assert report['resumable'] is True
+        assert report['epubWritten'] is False
+        assert report['pages']['missingPages'] == [
+            {
+                'path': 'EPUB/xhtml/ch2.xhtml',
+                'url': fake_epub.base_url + '/edge/v1/artifact/EPUB%2Fxhtml%2Fch2.xhtml/checkout-token-1',
+                'reason': '503 Service Unavailable',
+            }
+        ]
+        assert not epub_path(workdir).exists()
+
+    def test_hanging_page_is_reported_as_missing(self, fake_epub, make_downloader, cookies_file, workdir):
+        fake_epub.persistent_failures['EPUB/xhtml/ch2.xhtml'] = 'hang'
+
+        make_downloader(fake_epub).run()
+
+        report = read_report(workdir)
+        assert [page['path'] for page in report['pages']['missingPages']] == ['EPUB/xhtml/ch2.xhtml']
+        assert report['pages']['missingPages'][0]['reason']
+        assert not epub_path(workdir).exists()
+
+    def test_report_separates_missing_pages_from_skipped_includes(
+        self, fake_epub, make_downloader, cookies_file, workdir
+    ):
+        fake_epub.persistent_failures['EPUB/xhtml/ch2.xhtml'] = 503
+        fake_epub.persistent_failures['EPUB/fonts/book.woff'] = 503
+
+        result = make_downloader(fake_epub).run()
+
+        report = read_report(workdir)
+        assert [page['path'] for page in report['pages']['missingPages']] == ['EPUB/xhtml/ch2.xhtml']
+        # Includes stay best effort: a broken font is reported, but never counted as a missing page.
+        skipped = {include['path']: include['reason'] for include in report['includes']['skippedIncludes']}
+        assert skipped['EPUB/fonts/book.woff'] == '503 Service Unavailable'
+        assert skipped['EPUB/images/missing.png'] == '404 Not Found'
+        assert report['includes']['skipped'] == 2
+        assert result['includes']['skipped'] == 2
+        assert not epub_path(workdir).exists()
+
+    def test_rerun_only_fetches_the_missing_page_and_removes_the_report(
+        self, fake_epub, make_downloader, cookies_file, workdir
+    ):
+        fake_epub.persistent_failures['EPUB/xhtml/ch2.xhtml'] = 503
+        make_downloader(fake_epub).run()
+        first_run_counts = dict(fake_epub.request_counts)
+        assert report_path(workdir).is_file()
+
+        del fake_epub.persistent_failures['EPUB/xhtml/ch2.xhtml']
+        result = make_downloader(fake_epub).run()
+
+        assert result is None
+        assert fake_epub.request_counts['EPUB/xhtml/ch1.xhtml'] == first_run_counts['EPUB/xhtml/ch1.xhtml']
+        assert fake_epub.request_counts['EPUB/fonts/book.woff'] == first_run_counts['EPUB/fonts/book.woff']
+        assert fake_epub.request_counts['EPUB/css/style.css'] == first_run_counts['EPUB/css/style.css']
+        assert fake_epub.request_counts['EPUB/xhtml/ch2.xhtml'] == first_run_counts['EPUB/xhtml/ch2.xhtml'] + 1
+        assert not report_path(workdir).exists()
+        with zipfile.ZipFile(epub_path(workdir)) as epub:
+            assert b'Chapter 1' in epub.read('EPUB/xhtml/ch1.xhtml')
+            assert b'Chapter 2' in epub.read('EPUB/xhtml/ch2.xhtml')
+            assert 'EPUB/fonts/book.woff' in epub.namelist()
+
+    def test_successful_run_writes_no_report(self, fake_epub, make_downloader, cookies_file, workdir):
+        assert make_downloader(fake_epub).run() is None
+        assert epub_path(workdir).is_file()
+        assert not report_path(workdir).exists()
+
+    def test_skipped_include_alone_still_produces_the_epub_without_report(
+        self, fake_epub, make_downloader, cookies_file, workdir
+    ):
+        # missing.png is always a 404, so the include gap exists although every page worked.
+        assert make_downloader(fake_epub).run() is None
+
+        with zipfile.ZipFile(epub_path(workdir)) as epub:
+            assert 'EPUB/images/missing.png' not in epub.namelist()
+        assert not report_path(workdir).exists()
+
+    def test_every_page_failure_appears_once_in_the_report(self, fake_epub, make_downloader, cookies_file, workdir):
+        add_pages(fake_epub, 4)
+        fake_epub.persistent_failures['EPUB/xhtml/ch2.xhtml'] = 503
+        fake_epub.persistent_failures['EPUB/xhtml/ch4.xhtml'] = 'hang'
+
+        make_downloader(fake_epub).run()
+
+        report = read_report(workdir)
+        missing = [page['path'] for page in report['pages']['missingPages']]
+        assert sorted(missing) == ['EPUB/xhtml/ch2.xhtml', 'EPUB/xhtml/ch4.xhtml']
+        assert len(missing) == len(set(missing))
+        assert report['pages']['total'] == 4
+        assert report['pages']['downloaded'] == 2
+
+    def test_cached_page_counts_as_downloaded_and_keeps_its_includes(
+        self, fake_epub, make_downloader, cookies_file, workdir
+    ):
+        pages_dir = book_dir(workdir) / 'EPUB/xhtml'
+        pages_dir.mkdir(parents=True)
+        (pages_dir / 'ch1.xhtml').write_text(XHTML_PAGE.format(title='Chapter 1'), encoding='utf-8')
+
+        fake_epub.persistent_failures['EPUB/xhtml/ch2.xhtml'] = 503
+        make_downloader(fake_epub).run()
+
+        assert 'EPUB/xhtml/ch1.xhtml' not in fake_epub.request_counts
+        report = read_report(workdir)
+        assert report['pages']['downloaded'] == 1
+        # The includes of the cached page are still known, so they are downloaded for the next run.
+        assert fake_epub.request_counts['EPUB/images/figure.png'] == 1
+
+    def test_broken_cached_page_is_downloaded_again(self, fake_epub, make_downloader, cookies_file, workdir):
+        pages_dir = book_dir(workdir) / 'EPUB/xhtml'
+        pages_dir.mkdir(parents=True)
+        (pages_dir / 'ch1.xhtml').write_text('<html>truncated', encoding='utf-8')
+
+        make_downloader(fake_epub).run()
+
+        assert fake_epub.request_counts['EPUB/xhtml/ch1.xhtml'] == 1
+        assert b'Chapter 1' in (pages_dir / 'ch1.xhtml').read_bytes()
 
 
 class TestPdf:
