@@ -18,6 +18,7 @@ from scrapy_zyte_api.responses import (
     ZyteAPIJsonResponse,
     ZyteAPIMixin,
     ZyteAPIResponse,
+    ZyteAPIResponseMaxSizeExceeded,
     ZyteAPITextResponse,
     ZyteAPIXmlResponse,
 )
@@ -699,3 +700,42 @@ def test__process_response_binary():
     response = _process_response(api_response, Request(URL))
     assert type(response) is ZyteAPIResponse
     assert response.body == body
+
+
+def test_max_size_exceeded_response():
+    """The oversize outcome is a recognizable Response carrying the request
+    URL and the actual body size, with the body itself dropped."""
+    request = Request(URL)
+    response = ZyteAPIResponseMaxSizeExceeded(
+        url=request.url, body_size=123456, request=request
+    )
+
+    # Recognizable both by class and by flag.
+    assert isinstance(response, Response)
+    assert isinstance(response, ZyteAPIMixin)
+    assert isinstance(response, ZyteAPIResponseMaxSizeExceeded)
+    assert "zyte-api" in response.flags
+    assert "zyte-api-max-size-exceeded" in response.flags
+
+    # Troubleshooting data.
+    assert response.url == request.url
+    assert response.body_size == 123456
+    assert response.request is request
+
+    # The oversize body is not kept.
+    assert response.body == b""
+    assert response.raw_api_response is None
+
+
+def test_max_size_exceeded_response_replace():
+    """replace() preserves the oversize-specific data and class."""
+    response = ZyteAPIResponseMaxSizeExceeded(
+        url=URL, body_size=42, request=Request(URL)
+    )
+    replaced = response.replace(status=503)
+    assert isinstance(replaced, ZyteAPIResponseMaxSizeExceeded)
+    assert replaced.body_size == 42
+    assert replaced.url == URL
+    assert replaced.status == 503
+    assert replaced.body == b""
+    assert "zyte-api-max-size-exceeded" in replaced.flags

@@ -1,6 +1,24 @@
 Changes
 =======
 
+0.38.0 (unreleased)
+-------------------
+
+-   When a response body fetched through Zyte API exceeds
+    :setting:`DOWNLOAD_MAXSIZE <scrapy:DOWNLOAD_MAXSIZE>`, the download
+    handler now returns a
+    :class:`~scrapy_zyte_api.responses.ZyteAPIResponseMaxSizeExceeded`
+    response instead of dropping the response silently (it previously
+    returned ``None``, which Scrapy treats as an internal download error).
+    The returned response carries the original request URL and the actual
+    body size, has an empty body and a ``"zyte-api-max-size-exceeded"``
+    flag, and can be recognized with an :func:`isinstance` check in spider
+    callbacks or downloader middlewares. This applies to both
+    :http:`response:browserHtml` and :http:`response:httpResponseBody`.
+    Responses over :setting:`DOWNLOAD_WARNSIZE <scrapy:DOWNLOAD_WARNSIZE>`
+    but under the max size are still returned normally with a warning, and
+    the meaning of both settings is otherwise unchanged.
+
 0.37.0 (2026-11-06)
 -------------------
 

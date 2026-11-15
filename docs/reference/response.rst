@@ -140,6 +140,62 @@ All response classes share a common base mixin,
         if isinstance(response, ZyteAPIMixin):
             ...  # any Zyte API response
 
+.. _response-max-size:
+
+Responses that exceed :setting:`DOWNLOAD_MAXSIZE <scrapy:DOWNLOAD_MAXSIZE>`
+===========================================================================
+
+When a response body, whether it comes from :http:`response:browserHtml` or
+:http:`response:httpResponseBody`, is larger than
+:setting:`DOWNLOAD_MAXSIZE <scrapy:DOWNLOAD_MAXSIZE>`, the response body is
+dropped. In that case the download handler does not raise and does not return
+an empty value: it returns a
+:class:`~scrapy_zyte_api.responses.ZyteAPIResponseMaxSizeExceeded` response
+instead, so that the outcome can be told apart from both a normal response
+and a request error.
+
+These responses are recognizable in two ways:
+
+-   With an :func:`isinstance` check::
+
+        from scrapy_zyte_api.responses import ZyteAPIResponseMaxSizeExceeded
+
+        def parse(self, response):
+            if isinstance(response, ZyteAPIResponseMaxSizeExceeded):
+                logger.warning(
+                    "Skipping %s: its %s-byte body exceeded "
+                    "DOWNLOAD_MAXSIZE",
+                    response.url,
+                    response.body_size,
+                )
+                return
+
+-   Through the ``"zyte-api-max-size-exceeded"`` entry in
+    ``response.flags`` (the regular ``"zyte-api"`` flag is also present).
+
+A :class:`~scrapy_zyte_api.responses.ZyteAPIResponseMaxSizeExceeded` response:
+
+-   keeps the URL of the original request in its
+    :attr:`~scrapy.http.Response.url` attribute,
+
+-   exposes the actual size of the dropped body, in bytes, through its
+    :attr:`~scrapy_zyte_api.responses.ZyteAPIResponseMaxSizeExceeded.body_size`
+    attribute,
+
+-   has an empty :attr:`~scrapy.http.Response.body` (the oversize body is not
+    stored),
+
+-   is a regular :class:`~scrapy.http.Response` subclass, so downloader
+    middlewares and spider callbacks receive it through the normal response
+    flow instead of the error/retry flow.
+
+Responses larger than
+:setting:`DOWNLOAD_WARNSIZE <scrapy:DOWNLOAD_WARNSIZE>` but not larger than
+:setting:`DOWNLOAD_MAXSIZE <scrapy:DOWNLOAD_MAXSIZE>` are returned normally;
+only a warning is logged. When
+:setting:`DOWNLOAD_MAXSIZE <scrapy:DOWNLOAD_MAXSIZE>` is ``0`` (the way an
+unset limit is stored), no response is ever considered oversize.
+
 .. autoclass:: scrapy_zyte_api.responses.ZyteAPIResponse
     :show-inheritance:
 
@@ -153,6 +209,24 @@ All response classes share a common base mixin,
         :type: bytes
 
     .. autoattribute:: raw_api_response
+
+.. autoclass:: scrapy_zyte_api.responses.ZyteAPIResponseMaxSizeExceeded
+    :show-inheritance:
+
+    .. autoattribute:: url
+
+    .. attribute:: body_size
+        :type: int
+
+        Actual size, in bytes, of the response body that was dropped because it
+        exceeded :setting:`DOWNLOAD_MAXSIZE <scrapy:DOWNLOAD_MAXSIZE>`.
+
+    .. attribute:: body
+        :type: bytes
+
+        Always empty: the oversize body is not stored.
+
+    .. autoattribute:: flags
 
 .. autoclass:: scrapy_zyte_api.responses.ZyteAPITextResponse
     :show-inheritance:

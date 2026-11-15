@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+from base64 import b64encode
 from copy import deepcopy
 from inspect import isclass
 from typing import Any
@@ -23,7 +24,10 @@ from scrapy_zyte_api.handler import (
     ScrapyZyteAPIHTTPSDownloadHandler,
     _body_max_size_exceeded,
 )
-from scrapy_zyte_api.responses import ZyteAPITextResponse
+from scrapy_zyte_api.responses import (
+    ZyteAPIResponseMaxSizeExceeded,
+    ZyteAPITextResponse,
+)
 from scrapy_zyte_api.utils import (  # type: ignore[attr-defined]
     _DOWNLOAD_REQUEST_RETURNS_DEFERRED,
     _REACTORLESS_SUPPORT,
@@ -860,7 +864,7 @@ def test_body_max_size_exceeded(
 
 @deferred_f_from_coro_f
 @pytest.mark.parametrize(
-    ("body_size", "warnsize", "maxsize", "expect_null"),
+    ("body_size", "warnsize", "maxsize", "expect_exceeded"),
     [
         (500, None, None, False),  # No limits, should return response
         (
@@ -869,18 +873,23 @@ def test_body_max_size_exceeded(
             None,
             False,
         ),  # Exceeds warnsize, should log warning but return response
-        (2500, 1000, 2000, True),  # Exceeds maxsize, should return None
+        (
+            2500,
+            1000,
+            2000,
+            True,
+        ),  # Exceeds maxsize, should return the oversize outcome
         (500, 1000, 2000, False),  # Within limits, should return response
         (
             1500,
             None,
             1000,
             True,
-        ),  # Exceeds maxsize with no warnsize, should return None
+        ),  # Exceeds maxsize with no warnsize, should return the oversize outcome
     ],
 )
 async def test_download_request_limits(
-    body_size, warnsize, maxsize, expect_null, mockserver
+    body_size, warnsize, maxsize, expect_exceeded, mockserver
 ):
     settings: SETTINGS_T = {"DOWNLOAD_WARNSIZE": warnsize, "DOWNLOAD_MAXSIZE": maxsize}
     async with make_handler(settings, mockserver.urljoin("/")) as handler:
@@ -903,7 +912,153 @@ async def test_download_request_limits(
             request = Request("https://example.com")
             result = await handler._download_request({}, request)
 
-            if expect_null:
-                assert result is None
+            if expect_exceeded:
+                assert isinstance(result, ZyteAPIResponseMaxSizeExceeded)
+                # The oversize outcome is still a Response, distinguishable
+                # from a request exception, and carries the troubleshooting
+                # data the callback needs.
+                assert result.url == request.url
+                assert result.body_size == body_size
+                assert result.body == b""
+                assert result.request is request
+                assert "zyte-api-max-size-exceeded" in result.flags
             else:
-                assert result is not None
+                assert result is mock_api_response
+                assert not isinstance(result, ZyteAPIResponseMaxSizeExceeded)
+
+
+# Zyte API returns response bodies through one of two outputs: browserHtml
+# (always a text response) or httpResponseBody (content-type based response).
+# The DOWNLOAD_MAXSIZE handling must apply identically to both.
+@deferred_f_from_coro_f
+@pytest.mark.parametrize(
+    ("api_response", "expected_response_cls"),
+    [
+        pytest.param(
+            lambda body: {
+                "url": "https://example.com",
+                "browserHtml": body.decode("utf-8"),
+            },
+            ZyteAPITextResponse,
+            id="browserHtml",
+        ),
+        pytest.param(
+            lambda body: {
+                "url": "https://example.com",
+                "httpResponseBody": b64encode(body).decode("ascii"),
+                "httpResponseHeaders": [
+                    {"name": "Content-Type", "value": "text/html"},
+                ],
+                "statusCode": 200,
+            },
+            ZyteAPITextResponse,
+            id="httpResponseBody",
+        ),
+    ],
+)
+async def test_download_request_max_size_exceeded_paths(
+    api_response, expected_response_cls, mockserver, caplog
+):
+    body = b"x" * 2500
+    settings: SETTINGS_T = {
+        "DOWNLOAD_WARNSIZE": 1000,
+        "DOWNLOAD_MAXSIZE": 2000,
+    }
+    async with make_handler(settings, mockserver.urljoin("/")) as handler:
+        await handler._session.close()
+        handler._session = mock.AsyncMock()
+        handler._session.get.return_value = api_response(body)
+
+        request = Request("https://example.com")
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            result = await handler._download_request({}, request)
+
+        assert isinstance(result, ZyteAPIResponseMaxSizeExceeded)
+        assert result.url == request.url
+        assert result.body_size == len(body)
+        assert result.body == b""
+        assert result.request is request
+        assert result.flags == ["zyte-api", "zyte-api-max-size-exceeded"]
+
+        # Both the warn-size and the max-size warnings are still logged, and
+        # the stats/logging behavior is otherwise unchanged.
+        assert (
+            f"Actual response size {len(body)} larger than download warn size "
+            f"1000 in request {request.url}." in caplog.text
+        )
+        assert (
+            f"Dropping the response for {request.url}: actual response size "
+            f"{len(body)} larger than download max size 2000." in caplog.text
+        )
+
+        # Sanity check: without the limit the same API response would be mapped
+        # to the regular response class and keep its full body.
+        handler._default_maxsize = 0
+        handler._session.get.return_value = api_response(body)
+        normal_result = await handler._download_request({}, request)
+        assert isinstance(normal_result, expected_response_cls)
+        assert normal_result.body == body
+        assert not isinstance(normal_result, ZyteAPIResponseMaxSizeExceeded)
+
+
+@deferred_f_from_coro_f
+async def test_download_request_warn_size_only(mockserver, caplog):
+    """A response over DOWNLOAD_WARNSIZE but under DOWNLOAD_MAXSIZE is
+    returned as-is, with only a warning logged."""
+    body = b"x" * 1500
+    settings: SETTINGS_T = {
+        "DOWNLOAD_WARNSIZE": 1000,
+        "DOWNLOAD_MAXSIZE": 2000,
+    }
+    async with make_handler(settings, mockserver.urljoin("/")) as handler:
+        await handler._session.close()
+        handler._session = mock.AsyncMock()
+        handler._session.get.return_value = {
+            "url": "https://example.com",
+            "browserHtml": body.decode("utf-8"),
+        }
+
+        request = Request("https://example.com")
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            result = await handler._download_request({}, request)
+
+        assert isinstance(result, ZyteAPITextResponse)
+        assert not isinstance(result, ZyteAPIResponseMaxSizeExceeded)
+        assert result.body == body
+        assert (
+            f"Actual response size 1500 larger than download warn size 1000 in "
+            f"request {request.url}." in caplog.text
+        )
+        assert "larger than download max size" not in caplog.text
+
+
+@deferred_f_from_coro_f
+async def test_download_request_no_size_limit(mockserver):
+    """With DOWNLOAD_MAXSIZE unset (0) no response is ever treated as
+    oversize, regardless of its body size."""
+    body = b"x" * 5000
+    settings: SETTINGS_T = {
+        "DOWNLOAD_WARNSIZE": None,
+        "DOWNLOAD_MAXSIZE": None,
+    }
+    async with make_handler(settings, mockserver.urljoin("/")) as handler:
+        assert handler._default_maxsize == 0
+        assert handler._default_warnsize == 0
+        await handler._session.close()
+        handler._session = mock.AsyncMock()
+        handler._session.get.return_value = {
+            "url": "https://example.com",
+            "httpResponseBody": b64encode(body).decode("ascii"),
+            "httpResponseHeaders": [
+                {"name": "Content-Type", "value": "text/html"},
+            ],
+        }
+
+        request = Request("https://example.com")
+        result = await handler._download_request({}, request)
+
+        assert isinstance(result, ZyteAPITextResponse)
+        assert not isinstance(result, ZyteAPIResponseMaxSizeExceeded)
+        assert result.body == body

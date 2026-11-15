@@ -157,6 +157,49 @@ class ZyteAPIResponse(ZyteAPIMixin, Response):
     pass
 
 
+class ZyteAPIResponseMaxSizeExceeded(ZyteAPIMixin, Response):
+    """Response returned when a Zyte API response body exceeds
+    :setting:`DOWNLOAD_MAXSIZE <scrapy:DOWNLOAD_MAXSIZE>`.
+
+    When the size of a response body (from either :http:`response:browserHtml`
+    or :http:`response:httpResponseBody`) is larger than
+    :setting:`DOWNLOAD_MAXSIZE <scrapy:DOWNLOAD_MAXSIZE>`, the download
+    handler does not return the (dropped) response and does not raise either:
+    it returns an instance of this class instead, so that spider callbacks and
+    downloader middlewares can tell the outcome apart from a normal response
+    and from a request error.
+
+    Callers can recognize the outcome with an :func:`isinstance` check::
+
+        from scrapy_zyte_api.responses import ZyteAPIResponseMaxSizeExceeded
+
+        def parse(self, response):
+            if isinstance(response, ZyteAPIResponseMaxSizeExceeded):
+                # The body was dropped because it exceeded DOWNLOAD_MAXSIZE.
+                log.warning(
+                    f"Skipped {response.url}: body of "
+                    f"{response.body_size} bytes exceeded the limit."
+                )
+                return
+
+    The response also carries the :class:`~scrapy_zyte_api.responses.ZyteAPIMixin`
+    ``"zyte-api"`` flag plus a dedicated ``"zyte-api-max-size-exceeded"`` flag,
+    so it can alternatively be detected through ``response.flags``.
+
+    The oversize body itself is not stored: :attr:`body` is empty. The
+    :attr:`body_size` attribute holds the actual size, in bytes, that the
+    response body would have had, and :attr:`url` is the URL of the request
+    that produced it.
+    """
+
+    def __init__(self, *, url: str, body_size: int, **kwargs: Any):
+        kwargs.setdefault("body", b"")
+        kwargs.setdefault("flags", ["zyte-api", "zyte-api-max-size-exceeded"])
+        super().__init__(url, **kwargs)
+        self.body_size = body_size
+        self.attributes += ("body_size",)
+
+
 _IMMUTABLE_JSON: TypeAlias = str | int | float | bool | None
 _JSON: TypeAlias = (
     str | int | float | bool | list["_JSON"] | dict[_IMMUTABLE_JSON, "_JSON"] | None

@@ -24,6 +24,7 @@ from ._params import _ParamParser
 from .responses import (
     ZyteAPIJsonResponse,
     ZyteAPIResponse,
+    ZyteAPIResponseMaxSizeExceeded,
     ZyteAPITextResponse,
     ZyteAPIXmlResponse,
     _process_response,
@@ -303,6 +304,7 @@ class _ScrapyZyteAPIBaseDownloadHandler:
         | ZyteAPIXmlResponse
         | ZyteAPIJsonResponse
         | ZyteAPIResponse
+        | ZyteAPIResponseMaxSizeExceeded
         | None
     ):
         # Define url by default
@@ -338,12 +340,22 @@ class _ScrapyZyteAPIBaseDownloadHandler:
             api_response=api_response, request=request, cookie_jars=self._cookie_jars
         )
         if response and _body_max_size_exceeded(
-            len(response.body),
+            (body_size := len(response.body)),
             self._default_warnsize,
             self._default_maxsize,
             request.url,
         ):
-            return None
+            # Do not return None here: Scrapy treats a None download result as
+            # an internal error, leaving the callback unable to tell the size
+            # limit apart from a failed request. Return a recognizable response
+            # instead, carrying the request URL and the actual body size, and
+            # drop the oversize body itself.
+            # See scrapy_zyte_api.responses.ZyteAPIResponseMaxSizeExceeded.
+            return ZyteAPIResponseMaxSizeExceeded(
+                url=request.url,
+                body_size=body_size,
+                request=request,
+            )
 
         return response
 
