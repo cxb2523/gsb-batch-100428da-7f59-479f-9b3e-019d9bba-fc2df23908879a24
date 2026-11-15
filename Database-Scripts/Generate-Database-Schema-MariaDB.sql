@@ -690,12 +690,17 @@ ON DUPLICATE KEY UPDATE exoValue = '2.0.0';
 CREATE FUNCTION num_tasks_with_active_rate_limit ()
 -- Number of tasks in the queue that do not yield a permanent error,
 -- but are currently affected by a rate limit.
+-- Beware: tasks without any error mark have causesError IS NULL and
+-- "NULL NOT IN (...)" evaluates to NULL (not TRUE). So check explicitly
+-- for NULL or those tasks would be invisible in this statistic.
 RETURNS INTEGER
 RETURN(
     SELECT COUNT(*) FROM queue
-    WHERE causesError NOT IN (
-        SELECT id FROM errorType
-        WHERE permanent = 1)
+    WHERE (
+        causesError IS NULL OR causesError NOT IN (
+            SELECT id FROM errorType
+            WHERE permanent = 1)
+        )
     AND fqdnhash IN (
         SELECT fqdnhash FROM rateLimits
         WHERE noContactUntil > NOW())
@@ -817,7 +822,9 @@ BEGIN
 -- Therefore: multiple steps instead of a Sub-Select.
 DECLARE var_url_hash CHAR(64);
 SET var_url_hash = (SELECT urlHash FROM queue WHERE id = uuid_p);
-UPDATE queue SET delayUntil = ADDTIME(NOW(), wait_time_p) WHERE urlHash = var_url_hash;
+-- Always use SEC_TO_TIME() to avoid unexpected behavior if just adding
+-- seconds as a plain number (it would be interpreted as HHMMSS).
+UPDATE queue SET delayUntil = ADDTIME(NOW(), SEC_TO_TIME(wait_time_p)) WHERE urlHash = var_url_hash;
 -- Add the error type to the specific task that caused the delay
 UPDATE queue SET causesError = error_type_p WHERE id = uuid_p;
 END $$

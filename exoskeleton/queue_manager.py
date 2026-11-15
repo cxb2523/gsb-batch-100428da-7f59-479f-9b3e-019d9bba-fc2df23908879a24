@@ -212,10 +212,18 @@ class QueueManager:
                     # Bot is configured to stop if queue is empty
                     # => check if that is only temporary or everything is done
 
-                    if self.stats.num_tasks_w_temporary_errors() > 0:
+                    # Tasks can be temporarily out of reach for two reasons:
+                    # 1. they caused a temporary error and wait out a delay
+                    # 2. their FQDN is on the rate limit list, so *all* tasks
+                    #    for that host pause until the backoff window ends.
+                    # Both cases require to wait instead of stopping:
+                    num_waiting = (self.stats.num_tasks_w_temporary_errors() +
+                                   self.stats.num_tasks_w_rate_limit())
+                    if num_waiting > 0:
                         # there are still tasks, but they have to wait
-                        logging.debug("Tasks with temporary errors: " +
-                                      "waiting %s seconds until next try.",
+                        logging.debug("Tasks with temporary errors or " +
+                                      "rate limited hosts: waiting %s " +
+                                      "seconds until next try.",
                                       self.queue_revisit)
                         time.sleep(self.queue_revisit)
                         continue

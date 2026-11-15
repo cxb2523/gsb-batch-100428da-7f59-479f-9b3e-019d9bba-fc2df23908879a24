@@ -4,6 +4,13 @@
 
 Replace the `requests` with `aiohttp` or `httpx` to parallelize tasks. This is not done *yet*, because the queue has to be modified in order to distribute the load evenly on multiple target hosts.
 * Update dependencies.
+* Improved coordination of host based rate limits and task level backoff:
+  * With `stop_if_queue_empty` the bot no longer stops while tasks remain that are only blocked by an active rate limit. It now waits for the backoff window to end.
+  * The SQL function `num_tasks_with_active_rate_limit` now also counts tasks whose `causesError` is NULL (previously those were invisible in the statistic).
+  * A task is marked as a permanent error once its number of tries reaches *or exceeds* `queue_max_retries` (previously only on an exact match, so a task could be retried forever).
+  * The stored procedure `add_crawl_delay_SP` now correctly interprets the wait time as seconds (`SEC_TO_TIME`).
+  * New methods `errorhandling.get_rate_limit_window` and `errorhandling.rate_limit_active` make the backoff window of a host observable.
+  * New tests cover the coordination without needing a database or network access.
 
 
 ## Version 2.1.1 (2022-04-27)

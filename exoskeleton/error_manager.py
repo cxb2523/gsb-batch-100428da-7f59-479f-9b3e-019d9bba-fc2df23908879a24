@@ -9,7 +9,9 @@ Source: https://github.com/RuedigerVoigt/exoskeleton
 Released under the Apache License 2.0
 """
 # standard library:
+import datetime
 import logging
+from typing import Optional
 
 # external dependencies:
 import userprovided
@@ -52,13 +54,18 @@ class CrawlingErrorManager:
         may affect the same URL, the delay is added to all of them."""
         wait_time = 0
 
-        # Increase the tries counter and get the new count
+        # Increase the tries counter and get the new count.
+        # If the task was removed from the queue in the meantime, the
+        # stored procedure returns nothing: treat the count as 0 instead
+        # of raising an exception.
         self.cur.callproc('increment_num_tries_SP', (queue_id, ))
         response = self.cur.fetchone()
         num_tries = int(response[0]) if response else 0
 
-        # Does the number of tries exceed the configured maximum?
-        if num_tries == self.queue_max_retries:
+        # Does the number of tries reach or exceed the configured maximum?
+        # (>= instead of == so a task cannot slip past the limit and get
+        # retried forever if the counter overshot the exact value.)
+        if num_tries >= self.queue_max_retries:
             # This is treated as a *permanent* failure!
             logging.error('Giving up: too many tries for task %s', queue_id)
             self.mark_permanent_error(queue_id, 3)
@@ -125,6 +132,24 @@ class CrawlingErrorManager:
                f"contact this host for {self.rate_limit_wait} seconds.")
         logging.error(msg)
         self.cur.callproc('add_rate_limit_SP', (fqdn, self.rate_limit_wait))
+
+    def get_rate_limit_window(self,
+                              fqdn: str
+                              ) -> Optional[datetime.datetime]:
+        """Return the moment until which the given FQDN must not be contacted
+           anymore, or None if there is no *active* rate limit for it.
+           This makes the backoff window observable for troubleshooting."""
+        self.cur.execute('SELECT noContactUntil FROM rateLimits ' +
+                         'WHERE fqdnHash = SHA2(%s,256) AND ' +
+                         'noContactUntil > NOW();',
+                         (fqdn, ))
+        result = self.cur.fetchone()
+        return result[0] if result else None
+
+    def rate_limit_active(self,
+                          fqdn: str) -> bool:
+        "Check if there is an active rate limit for the given FQDN."
+        return self.get_rate_limit_window(fqdn) is not None
 
     def forget_specific_rate_limit(self,
                                    fqdn: str) -> None:
