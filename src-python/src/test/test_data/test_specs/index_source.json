@@ -2,7 +2,7 @@
   "node_type": "indexSource",
   "description": "indexSource节点的完整测试套件",
   "test_data_file": "test_case.xlsx",
-  "total_test_cases": 14,
+  "total_test_cases": 18,
   "test_cases": [
     {
       "case_id": 1,
@@ -811,11 +811,228 @@
         "check_not_null": true,
         "expected_type": "list"
       }
+    },
+    {
+      "case_id": 15,
+      "test_id": "indexsource_Sheet9_Mixed_Index_code_manifest",
+      "test_name": "IndexSource - Sheet9_Mixed_Index Code 清单（空值/数字文本混排/首尾空白）",
+      "test_description": "测试按列提取的索引清单：唯一索引值、原始值明细、出现次数、跳过与合并记录",
+      "sheet_name": "Sheet9_Mixed_Index",
+      "header_row": 0,
+      "node_config": {
+        "id": "test-indexsource-Sheet9_Mixed_Index-Code-15",
+        "type": "indexSource",
+        "data": {
+          "id": "test-indexsource-Sheet9_Mixed_Index-Code-15",
+          "nodeType": "indexSource",
+          "label": "Code索引源",
+          "displayName": "Code",
+          "sourceFileID": "test-file-93fac9a3-f4b3-410a-932c-32620bd11122",
+          "bySheetName": false,
+          "sheetName": "Sheet9_Mixed_Index",
+          "byColumn": true,
+          "columnName": "Code"
+        }
+      },
+      "expected_result": {
+        "type": "index_manifest",
+        "unique_count": 5,
+        "unique_values": [
+          "1001",
+          "A-1",
+          "1001.0",
+          "1001.5",
+          "B-2"
+        ],
+        "manifest_entry_count": 6,
+        "skipped_count": 5,
+        "merged_index_count": 3,
+        "entries": [
+          {
+            "index_value": "1001",
+            "count": 4,
+            "skipped": false,
+            "merged": true,
+            "original_values": [
+              {
+                "original_value": 1001,
+                "raw_type": "number",
+                "count": 2
+              },
+              {
+                "original_value": "1001",
+                "raw_type": "text",
+                "count": 1
+              },
+              {
+                "original_value": " 1001 ",
+                "raw_type": "text",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "index_value": null,
+            "count": 5,
+            "skipped": true,
+            "merged": false
+          },
+          {
+            "index_value": "A-1",
+            "count": 2,
+            "skipped": false,
+            "merged": true,
+            "original_values": [
+              {
+                "original_value": "A-1",
+                "raw_type": "text",
+                "count": 1
+              },
+              {
+                "original_value": " A-1 ",
+                "raw_type": "text",
+                "count": 1
+              }
+            ]
+          },
+          {
+            "index_value": "1001.0",
+            "count": 1,
+            "skipped": false,
+            "merged": false
+          },
+          {
+            "index_value": "1001.5",
+            "count": 2,
+            "skipped": false,
+            "merged": true
+          },
+          {
+            "index_value": "B-2",
+            "count": 2,
+            "skipped": false,
+            "merged": false
+          }
+        ]
+      },
+      "validation_rules": {
+        "check_unique": true,
+        "check_not_null": true,
+        "expected_type": "list"
+      }
+    },
+    {
+      "case_id": 16,
+      "test_id": "indexsource_Sheet10_All_Blank_Index_code_manifest",
+      "test_name": "IndexSource - Sheet10_All_Blank_Index 全空列清单",
+      "test_description": "测试整列为空时只生成一条跳过记录且没有唯一索引值",
+      "sheet_name": "Sheet10_All_Blank_Index",
+      "header_row": 0,
+      "node_config": {
+        "id": "test-indexsource-Sheet10_All_Blank_Index-Code-16",
+        "type": "indexSource",
+        "data": {
+          "id": "test-indexsource-Sheet10_All_Blank_Index-Code-16",
+          "nodeType": "indexSource",
+          "label": "Code索引源",
+          "displayName": "Code",
+          "sourceFileID": "test-file-93fac9a3-f4b3-410a-932c-32620bd11122",
+          "bySheetName": false,
+          "sheetName": "Sheet10_All_Blank_Index",
+          "byColumn": true,
+          "columnName": "Code"
+        }
+      },
+      "expected_result": {
+        "type": "index_manifest",
+        "unique_count": 0,
+        "unique_values": [],
+        "manifest_entry_count": 1,
+        "skipped_count": 4,
+        "merged_index_count": 0,
+        "entries": [
+          {
+            "index_value": null,
+            "count": 4,
+            "skipped": true,
+            "merged": false
+          }
+        ]
+      },
+      "validation_rules": {
+        "check_unique": true,
+        "check_not_null": true,
+        "expected_type": "list"
+      }
+    },
+    {
+      "case_id": 17,
+      "test_id": "indexsource_missing_column_error",
+      "test_name": "IndexSource - 列不存在时报错包含文件、工作表、列名",
+      "test_description": "测试列缺失时错误信息包含文件、工作表、列名，且不返回清单",
+      "sheet_name": "Sheet9_Mixed_Index",
+      "header_row": 0,
+      "node_config": {
+        "id": "test-indexsource-Sheet9_Mixed_Index-NoSuchColumn-17",
+        "type": "indexSource",
+        "data": {
+          "id": "test-indexsource-Sheet9_Mixed_Index-NoSuchColumn-17",
+          "nodeType": "indexSource",
+          "label": "NoSuchColumn索引源",
+          "displayName": "NoSuchColumn",
+          "sourceFileID": "test-file-93fac9a3-f4b3-410a-932c-32620bd11122",
+          "bySheetName": false,
+          "sheetName": "Sheet9_Mixed_Index",
+          "byColumn": true,
+          "columnName": "NoSuchColumn"
+        }
+      },
+      "expected_result": {
+        "type": "error",
+        "error_contains": {
+          "file": "test_case.xlsx",
+          "sheet": "Sheet9_Mixed_Index",
+          "column": "NoSuchColumn"
+        },
+        "no_manifest": true
+      },
+      "validation_rules": {}
+    },
+    {
+      "case_id": 18,
+      "test_id": "indexsource_missing_sheet_and_column_config_error",
+      "test_name": "IndexSource - 配置缺失时报错包含文件、工作表、列名",
+      "test_description": "测试按列模式缺少配置时错误信息包含文件、工作表、列名",
+      "sheet_name": "Sheet9_Mixed_Index",
+      "header_row": 0,
+      "node_config": {
+        "id": "test-indexsource-missing-config-18",
+        "type": "indexSource",
+        "data": {
+          "id": "test-indexsource-missing-config-18",
+          "nodeType": "indexSource",
+          "label": "配置缺失索引源",
+          "displayName": "配置缺失",
+          "sourceFileID": "test-file-93fac9a3-f4b3-410a-932c-32620bd11122",
+          "bySheetName": false,
+          "byColumn": true,
+          "columnName": ""
+        }
+      },
+      "expected_result": {
+        "type": "error",
+        "error_contains": {
+          "file": "test_case.xlsx",
+          "column": "(missing)"
+        },
+        "no_manifest": true
+      },
+      "validation_rules": {}
     }
   ],
   "statistics": {
-    "total_cases": 14,
-    "sheets_covered": 7,
+    "total_cases": 18,
+    "sheets_covered": 9,
     "columns_covered": [
       "Category",
       "Status",

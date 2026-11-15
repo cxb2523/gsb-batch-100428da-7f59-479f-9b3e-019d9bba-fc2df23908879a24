@@ -191,7 +191,23 @@
       "worksheet": "Worksheet:",
       "selectSheet": "Select Sheet",
       "indexColumn": "Index Column:",
-      "selectIndexColumn": "Select Index Column"
+      "selectIndexColumn": "Select Index Column",
+      "manifestSheetName": "Index Manifest",
+      "manifestOriginalValue": "Original Value",
+      "manifestIndexValue": "Index Value",
+      "manifestCount": "Occurrences",
+      "manifestMergedInto": "Merged Into",
+      "manifestStatus": "Status",
+      "manifestStatusKept": "Kept",
+      "manifestStatusMerged": "Merged",
+      "manifestStatusSkipped": "Skipped",
+      "manifestSkippedIndex": "(Skipped)",
+      "manifestEmptyValue": "(empty)",
+      "manifestTypeText": "text",
+      "manifestTypeNumber": "number",
+      "manifestTypeBoolean": "boolean",
+      "manifestTypeDatetime": "datetime",
+      "manifestTypeEmpty": "empty"
     },
     "sheetSelectorNode": {
       "help": "Which table contains the information corresponding to your index items? If the index items correspond to the table name of an Excel file, please select automatic matching, otherwise please select manual matching."

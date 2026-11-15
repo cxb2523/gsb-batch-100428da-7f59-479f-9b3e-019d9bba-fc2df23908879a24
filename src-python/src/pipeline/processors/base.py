@@ -144,6 +144,83 @@ class AbstractNodeProcessor(ABC, Generic[InputType, OutputType]):
 
         return df
 
+    def load_raw_dataframe_from_file(
+        self, global_context: GlobalContext, file_id: str, sheet_name: str
+    ) -> pd.DataFrame:
+        """
+        从文件加载未经清洗的原始DataFrame（用于生成可核对清单）
+
+        与 load_dataframe_from_file 不同，这里不应用智能数据清洗，
+        因此能保留原始单元格的首尾空白与数字/文本类型差异。
+
+        Args:
+            global_context: 全局上下文
+            file_id: 文件ID
+            sheet_name: Sheet名称
+
+        Returns:
+            原始pandas DataFrame
+        """
+        if file_id not in global_context.files:
+            raise ValueError(f"File {file_id} not found in context")
+
+        file_info = global_context.files[file_id]
+
+        raw_cache_key = f"{file_id}_{sheet_name}"
+        if raw_cache_key in global_context.raw_dataframes:
+            self.analyzer.onCacheHit(f"raw::{raw_cache_key}")
+            return global_context.raw_dataframes[raw_cache_key]
+
+        self.analyzer.onCacheMiss(f"raw::{raw_cache_key}")
+
+        # 获取header row信息
+        header_row = 0
+        for sheet_meta in file_info.sheet_metas:
+            if sheet_meta.get("sheet_name") == sheet_name:
+                header_row = sheet_meta.get("header_row", 0)
+                break
+
+        read_id = self.analyzer.onExcelReadStart(file_info.path, sheet_name)
+        try:
+            df = pd.read_excel(file_info.path, sheet_name=sheet_name, header=header_row)
+            try:
+                import os
+
+                file_size = os.path.getsize(file_info.path)
+            except Exception:
+                file_size = None
+
+            self.analyzer.onExcelReadFinish(read_id, len(df), file_size)
+        except Exception as e:
+            self.analyzer.onExcelReadFinish(read_id, 0, None)
+            raise e
+
+        global_context.raw_dataframes[raw_cache_key] = df
+        return df
+
+    def load_raw_and_cleaned_dataframes_from_file(
+        self, global_context: GlobalContext, file_id: str, sheet_name: str
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        一次性加载同一Sheet的原始与清洗后DataFrame（只读取一次Excel）
+
+        Returns:
+            (raw_df, cleaned_df)
+        """
+        raw_df = self.load_raw_dataframe_from_file(global_context, file_id, sheet_name)
+
+        cache_key = f"{file_id}_{sheet_name}"
+        if cache_key in global_context.loaded_dataframes:
+            self.analyzer.onCacheHit(cache_key)
+            return raw_df, global_context.loaded_dataframes[cache_key]
+
+        self.analyzer.onCacheMiss(cache_key)
+        from ..utils.data_cleaner import clean_dataframe_with_smart_strategy
+
+        cleaned_df = clean_dataframe_with_smart_strategy(raw_df)
+        global_context.loaded_dataframes[cache_key] = cleaned_df
+        return raw_df, cleaned_df
+
     def apply_test_mode_limit(
         self, df: pd.DataFrame, global_context: GlobalContext, max_rows: int = 100
     ) -> pd.DataFrame:

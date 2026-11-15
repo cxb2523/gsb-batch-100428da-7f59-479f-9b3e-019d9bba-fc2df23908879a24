@@ -212,9 +212,40 @@ export interface NodePreviewResult {
   error?: string;
 }
 
+// 索引清单：原始值明细
+export interface IndexManifestOriginalValue {
+  original_value: string | number | boolean | null;
+  raw_type: "text" | "number" | "boolean" | "datetime" | "empty";
+  count: number;
+  skipped: boolean;
+  merged: boolean;
+  merged_into: string | null;
+}
+
+// 索引清单：每个唯一索引值一条（空值汇总为一条跳过记录）
+export interface IndexManifestEntry {
+  index_value: string | null;
+  original_value: string | number | boolean | null;
+  count: number;
+  skipped: boolean;
+  merged: boolean;
+  original_values: IndexManifestOriginalValue[];
+}
+
+export interface IndexManifestSummary {
+  total_rows: number;
+  unique_index_count: number;
+  skipped_count: number;
+  merged_index_count: number;
+  manifest_entry_count: number;
+  original_value_count: number;
+}
+
 export interface IndexSourcePreviewResult extends NodePreviewResult {
   index_values: string[];
   source_column?: string;
+  index_manifest?: IndexManifestEntry[];
+  manifest_summary?: IndexManifestSummary | null;
   preview_data: {
     sheet_name: string;
     columns: string[];

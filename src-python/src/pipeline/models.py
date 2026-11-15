@@ -168,6 +168,64 @@ class NodeOutput(BaseModel):
 
 
 # 1. 索引源节点
+class IndexManifestOriginalValue(BaseModel):
+    """索引清单中的原始值明细 - 同一原始形态出现多次时合并为一条"""
+
+    # 使用 Any 保留原始类型：文本 "1001" 与数字 1001 必须能区分开
+    original_value: Any = Field(
+        None, description="原始值（保留首尾空白等原始形态）；空值时为 None"
+    )
+    raw_type: str = Field(
+        ..., description="原始值类型：text/number/boolean/datetime/empty"
+    )
+    count: int = Field(..., description="该原始形态在源列中出现的次数")
+    skipped: bool = Field(False, description="是否因空值被跳过")
+    merged: bool = Field(False, description="是否被规范化 / 合并到索引值")
+    merged_into: Optional[str] = Field(
+        None, description="被合并 / 规范化后归并到的索引值"
+    )
+
+
+class IndexManifestEntry(BaseModel):
+    """索引清单条目 - 每个唯一索引值一条（空值汇总为一条跳过记录）
+
+    同一清单内 index_value 不重复；每个条目的 original_values 逐项记录
+    构成该索引值的原始值形态、出现次数与合并去向。
+    """
+
+    index_value: Optional[str] = Field(
+        None, description="规范化后的索引值；因空值被跳过的条目为 None"
+    )
+    original_value: Any = Field(
+        None, description="代表性原始值（便于快速核对）；跳过条目为 None"
+    )
+    count: int = Field(..., description="该索引值的出现次数（含合并的原始形态）")
+    skipped: bool = Field(False, description="是否因空值被跳过")
+    merged: bool = Field(
+        False, description="该索引值是否由多个 / 被规范化的原始形态合并得到"
+    )
+    original_values: List[IndexManifestOriginalValue] = Field(
+        default_factory=list, description="构成该索引值的原始值明细"
+    )
+
+
+class IndexManifestSummary(BaseModel):
+    """索引清单汇总信息"""
+
+    total_rows: int = Field(..., description="源列总行数（含空值）")
+    unique_index_count: int = Field(..., description="唯一索引值数量")
+    skipped_count: int = Field(..., description="因空值被跳过的行数")
+    merged_index_count: int = Field(
+        ..., description="存在合并 / 规范化原始形态的索引值数量"
+    )
+    manifest_entry_count: int = Field(
+        ..., description="清单条目数（含一条跳过记录）"
+    )
+    original_value_count: int = Field(
+        ..., description="清单中原始值明细条目数（去重后的原始形态数）"
+    )
+
+
 class IndexSourceInput(NodeInput):
     """索引源节点输入 - 无输入"""
 
@@ -179,6 +237,13 @@ class IndexSourceOutput(NodeOutput):
 
     index_values: List[IndexValue] = Field(..., description="提取的索引值列表")
     source_column: Optional[str] = Field(None, description="源列名（如果按列提取）")
+    index_manifest: List[IndexManifestEntry] = Field(
+        default_factory=list,
+        description="可核对的索引清单（仅按列提取时生成，按工作表名提取时为空）",
+    )
+    manifest_summary: Optional[IndexManifestSummary] = Field(
+        None, description="索引清单汇总信息（仅按列提取时生成）"
+    )
 
 
 # 2. 表选择节点
@@ -331,6 +396,11 @@ class GlobalContext(BaseModel):
     files: Dict[str, FileInfo] = Field(default_factory=dict, description="文件信息映射")
     loaded_dataframes: Dict[str, pd.DataFrame] = Field(
         default_factory=dict, description="已加载的DataFrame缓存"
+    )
+    # 原始（未清洗）DataFrame缓存，供索引源节点生成可核对清单；
+    # 与 loaded_dataframes 分开存放，避免下游节点误用未清洗数据
+    raw_dataframes: Dict[str, pd.DataFrame] = Field(
+        default_factory=dict, description="未清洗的原始DataFrame缓存"
     )
     execution_mode: ExecutionMode = Field(
         default=ExecutionMode.PRODUCTION, description="执行模式"
@@ -558,6 +628,9 @@ __all__ = [
     "NodeOutput",
     "IndexSourceInput",
     "IndexSourceOutput",
+    "IndexManifestEntry",
+    "IndexManifestOriginalValue",
+    "IndexManifestSummary",
     "SheetSelectorInput",
     "SheetSelectorOutput",
     "RowFilterInput",

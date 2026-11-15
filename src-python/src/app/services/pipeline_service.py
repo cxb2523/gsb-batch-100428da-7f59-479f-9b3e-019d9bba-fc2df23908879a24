@@ -106,11 +106,15 @@ class IndexSourcePreviewResult(NodePreviewResult):
         node_type: str,
         index_values: List[str] = None,
         source_column: str = None,
+        index_manifest: List[Dict[str, Any]] = None,
+        manifest_summary: Dict[str, Any] = None,
         error: str = None,
     ):
         super().__init__(success, node_id, node_type, error)
         self.index_values = index_values or []
         self.source_column = source_column
+        self.index_manifest = index_manifest or []
+        self.manifest_summary = manifest_summary
 
     def to_dict(self) -> Dict[str, Any]:
         result = super().to_dict()
@@ -130,6 +134,13 @@ class IndexSourcePreviewResult(NodePreviewResult):
                 },
             }
         )
+
+        # 只有按列提取成功时才返回清单字段：
+        # 按工作表名模式与失败场景都不应出现（不得返回半截清单）
+        if self.success and self.source_column is not None and self.manifest_summary:
+            result["index_manifest"] = self.index_manifest
+            result["manifest_summary"] = self.manifest_summary
+
         return result
 
 
@@ -466,6 +477,12 @@ class PipelineService:
                 node_type=node.type.value,
                 index_values=[str(idx) for idx in output.index_values],
                 source_column=output.source_column,
+                index_manifest=[entry.dict() for entry in output.index_manifest],
+                manifest_summary=(
+                    output.manifest_summary.dict()
+                    if output.manifest_summary is not None
+                    else None
+                ),
             )
 
         except Exception as e:

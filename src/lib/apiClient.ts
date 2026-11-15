@@ -7,6 +7,8 @@ import { useBackendStore } from "@/stores/useBackendStore";
 import {
   ApiResponse,
   FileInfoResponse,
+  IndexManifestEntry,
+  IndexManifestSummary,
   PipelineExecutionResult,
   TryReadHeaderRowResponse,
 } from "@/types";
@@ -70,6 +72,8 @@ interface NodePreviewResult {
 interface IndexSourcePreviewResult extends NodePreviewResult {
   index_values: string[];
   source_column?: string;
+  index_manifest?: IndexManifestEntry[];
+  manifest_summary?: IndexManifestSummary | null;
   preview_data: {
     sheet_name: string;
     columns: string[];

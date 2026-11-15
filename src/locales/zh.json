@@ -191,7 +191,23 @@
       "worksheet": "工作表:",
       "selectSheet": "选择工作表",
       "indexColumn": "索引列:",
-      "selectIndexColumn": "选择索引列"
+      "selectIndexColumn": "选择索引列",
+      "manifestSheetName": "索引清单",
+      "manifestOriginalValue": "原始值",
+      "manifestIndexValue": "索引值",
+      "manifestCount": "出现次数",
+      "manifestMergedInto": "合并去向",
+      "manifestStatus": "状态",
+      "manifestStatusKept": "保留",
+      "manifestStatusMerged": "合并",
+      "manifestStatusSkipped": "跳过",
+      "manifestSkippedIndex": "(已跳过)",
+      "manifestEmptyValue": "(空)",
+      "manifestTypeText": "文本",
+      "manifestTypeNumber": "数字",
+      "manifestTypeBoolean": "布尔",
+      "manifestTypeDatetime": "日期",
+      "manifestTypeEmpty": "空值"
     },
     "sheetSelectorNode": {
       "help": "您的索引项对应的信息在哪张表？如果索引项对应某个excel文件的表名，请选择自动匹配，否则请选择手动匹配"

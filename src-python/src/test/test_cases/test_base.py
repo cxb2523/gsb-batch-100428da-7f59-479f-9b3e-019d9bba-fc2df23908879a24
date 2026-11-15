@@ -103,6 +103,8 @@ class BaseTestFramework:
                 {"sheet_name": "Sheet6_Edge_Cases", "header_row": 0},
                 {"sheet_name": "Sheet7_Real_World_Sales", "header_row": 0},
                 {"sheet_name": "Sheet8_Inventory_Complex", "header_row": 0},
+                {"sheet_name": "Sheet9_Mixed_Index", "header_row": 0},
+                {"sheet_name": "Sheet10_All_Blank_Index", "header_row": 0},
             ]
         )
         
@@ -165,7 +167,10 @@ class BaseTestFramework:
                     return False, f"内容不匹配 - {', '.join(error_parts)}"
                 
                 return True, ""
-                
+
+            elif expected["type"] == "index_manifest":
+                return self._validate_index_manifest(actual, expected)
+
             elif expected["type"] == "dataframe":
                 if not hasattr(actual, 'dataframe') or not isinstance(actual.dataframe, pd.DataFrame):
                     return False, f"期望DataFrame对象，但得到: {type(actual)}"
@@ -214,12 +219,232 @@ class BaseTestFramework:
         except Exception as e:
             return False, f"验证过程中出错: {type(e).__name__}: {str(e)}"
     
-    def run_single_test(self, test_case: Dict[str, Any], processor, 
+    def _validate_index_manifest(self, actual: Any, expected: Dict[str, Any]) -> tuple[bool, str]:
+        """验证索引值与索引清单（唯一数量、条目、出现次数一致）"""
+        if not hasattr(actual, "index_manifest"):
+            return False, f"期望有index_manifest属性的对象，但得到: {type(actual)}"
+
+        actual_values = [str(val) for val in actual.index_values]
+        manifest = actual.index_manifest
+        summary = getattr(actual, "manifest_summary", None)
+
+        # 唯一索引值数量与清单去重后的索引值数量一致
+        manifest_index_values = [
+            entry.index_value for entry in manifest if not entry.skipped
+        ]
+        if len(manifest_index_values) != len(set(manifest_index_values)):
+            return False, "清单内的索引值出现重复"
+        if sorted(manifest_index_values) != sorted(actual_values):
+            return False, (
+                "清单索引值与index_values不一致: "
+                f"清单={sorted(manifest_index_values)}, 输出={sorted(actual_values)}"
+            )
+
+        expected_count = expected.get("unique_count")
+        if expected_count is not None and len(actual_values) != expected_count:
+            return False, (
+                f"唯一索引值数量不匹配: 期望{expected_count}，实际{len(actual_values)}"
+            )
+
+        expected_values = expected.get("unique_values")
+        if expected_values is not None and sorted(actual_values) != sorted(
+            expected_values
+        ):
+            return False, (
+                f"唯一索引值不匹配: 期望{sorted(expected_values)}，"
+                f"实际{sorted(actual_values)}"
+            )
+
+        # 清单条目数与出现次数一致
+        expected_entry_count = expected.get("manifest_entry_count")
+        if expected_entry_count is not None and len(manifest) != expected_entry_count:
+            return False, (
+                f"清单条目数不匹配: 期望{expected_entry_count}，实际{len(manifest)}"
+            )
+
+        if summary is not None:
+            if summary.unique_index_count != len(actual_values):
+                return False, (
+                    "汇总的唯一索引值数量与实际不一致: "
+                    f"{summary.unique_index_count} != {len(actual_values)}"
+                )
+            if summary.manifest_entry_count != len(manifest):
+                return False, (
+                    "汇总的清单条目数与实际不一致: "
+                    f"{summary.manifest_entry_count} != {len(manifest)}"
+                )
+            total_original_counts = sum(
+                original.count
+                for entry in manifest
+                for original in entry.original_values
+            )
+            if total_original_counts != summary.total_rows:
+                return False, (
+                    "清单原始值出现次数之和与总行数不一致: "
+                    f"{total_original_counts} != {summary.total_rows}"
+                )
+            if summary.skipped_count != sum(
+                original.count
+                for entry in manifest
+                for original in entry.original_values
+                if original.skipped
+            ):
+                return False, "汇总的跳过行数与清单不一致"
+
+        for entry in manifest:
+            if sum(original.count for original in entry.original_values) != entry.count:
+                return False, (
+                    f"条目 {entry.index_value!r} 的出现次数与原始值明细之和不一致"
+                )
+            if not entry.skipped and entry.count <= 0:
+                return False, f"条目 {entry.index_value!r} 的出现次数必须为正数"
+
+        # 期望的跳过与合并统计
+        expected_skipped = expected.get("skipped_count")
+        if expected_skipped is not None and summary is not None:
+            if summary.skipped_count != expected_skipped:
+                return False, (
+                    f"跳过行数不匹配: 期望{expected_skipped}，实际{summary.skipped_count}"
+                )
+
+        expected_merged = expected.get("merged_index_count")
+        if expected_merged is not None and summary is not None:
+            if summary.merged_index_count != expected_merged:
+                return False, (
+                    f"合并索引值数量不匹配: 期望{expected_merged}，"
+                    f"实际{summary.merged_index_count}"
+                )
+
+        # 每个被合并的原始形态都必须能看出归并去向
+        for entry in manifest:
+            for original in entry.original_values:
+                if original.merged and not original.merged_into:
+                    return False, (
+                        f"条目 {entry.index_value!r} 中被合并的原始值 "
+                        f"{original.original_value!r} 缺少 merged_into"
+                    )
+                if original.skipped and not entry.skipped:
+                    return False, "跳过标记与条目 skipped 不一致"
+
+        # 具体条目的期望（可选）
+        for expected_entry in expected.get("entries", []):
+            matched = self._find_manifest_entry(manifest, expected_entry)
+            if matched is None:
+                return False, f"清单中找不到条目: {expected_entry}"
+            for key in ("count", "skipped", "merged", "raw_type"):
+                if key in expected_entry and getattr(matched, key) != expected_entry[key]:
+                    return False, (
+                        f"条目 {expected_entry} 的 {key} 不匹配: "
+                        f"期望{expected_entry[key]}，实际{getattr(matched, key)}"
+                    )
+            expected_forms = expected_entry.get("original_values")
+            if expected_forms is not None:
+                actual_forms = sorted(
+                    (original.raw_type, str(original.original_value), original.count)
+                    for original in matched.original_values
+                )
+                wanted_forms = sorted(
+                    (form["raw_type"], str(form["original_value"]), form["count"])
+                    for form in expected_forms
+                )
+                if actual_forms != wanted_forms:
+                    return False, (
+                        f"条目 {expected_entry} 的原始值明细不匹配: "
+                        f"期望{wanted_forms}，实际{actual_forms}"
+                    )
+
+        return True, ""
+
+    @staticmethod
+    def _find_manifest_entry(manifest, expected_entry: Dict[str, Any]):
+        """按 index_value / original_value / skipped 定位清单条目"""
+        for entry in manifest:
+            if "index_value" in expected_entry and entry.index_value != expected_entry["index_value"]:
+                continue
+            if "original_value" in expected_entry and str(entry.original_value) != str(
+                expected_entry["original_value"]
+            ):
+                continue
+            if "skipped" in expected_entry and entry.skipped != expected_entry["skipped"]:
+                continue
+            return entry
+        return None
+
+    def _run_expect_error(
+        self, test_case: Dict[str, Any], processor, global_context: GlobalContext
+    ) -> TestResult:
+        """执行期望报错的用例，并检查错误信息包含必要定位信息"""
+        test_id = test_case["test_id"]
+        start_time = pd.Timestamp.now()
+
+        expected = test_case["expected_result"]
+        expected_error = expected.get("error_contains", {})
+
+        try:
+            node = self.create_node_from_config(test_case["node_config"])
+            path_context = PathContext(current_index=IndexValue("test"))
+            input_data = self._prepare_input_data(test_case, processor.node_type)
+
+            try:
+                result = processor.process(
+                    node=node,
+                    input_data=input_data,
+                    global_context=global_context,
+                    path_context=path_context,
+                )
+            except Exception as e:
+                error_message = str(e)
+                missing = [
+                    label
+                    for label, token in expected_error.items()
+                    if token and token not in error_message
+                ]
+                execution_time = (pd.Timestamp.now() - start_time).total_seconds()
+                if missing:
+                    return TestResult(
+                        test_id=test_id,
+                        success=False,
+                        error=(
+                            f"错误信息缺少必要信息 {missing}: {error_message}"
+                        ),
+                        execution_time=execution_time,
+                    )
+                return TestResult(
+                    test_id=test_id,
+                    success=True,
+                    actual_result={"error": error_message},
+                    expected_result=expected,
+                    execution_time=execution_time,
+                )
+
+            # 没有报错即为失败
+            execution_time = (pd.Timestamp.now() - start_time).total_seconds()
+            return TestResult(
+                test_id=test_id,
+                success=False,
+                error=f"期望报错但没有抛出异常，实际输出: {result}",
+                execution_time=execution_time,
+            )
+
+        except Exception as e:
+            execution_time = (pd.Timestamp.now() - start_time).total_seconds()
+            return TestResult(
+                test_id=test_id,
+                success=False,
+                error=f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}",
+                execution_time=execution_time,
+            )
+
+    def run_single_test(self, test_case: Dict[str, Any], processor,
                        global_context: GlobalContext) -> TestResult:
         """运行单个测试用例"""
         test_id = test_case["test_id"]
         start_time = pd.Timestamp.now()
-        
+
+        # 期望报错的用例走独立分支
+        if test_case.get("expected_result", {}).get("type") == "error":
+            return self._run_expect_error(test_case, processor, global_context)
+
         try:
             # 创建节点
             node = self.create_node_from_config(test_case["node_config"])

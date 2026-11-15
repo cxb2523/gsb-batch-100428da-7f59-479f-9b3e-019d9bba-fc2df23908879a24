@@ -13,6 +13,7 @@ from .models import (
     
     # 节点输入输出类型
     IndexSourceInput, IndexSourceOutput,
+    IndexManifestEntry, IndexManifestOriginalValue, IndexManifestSummary,
     SheetSelectorInput, SheetSelectorOutput,
     RowFilterInput, RowFilterOutput,
     RowLookupInput, RowLookupOutput,
@@ -81,6 +82,7 @@ __all__ = [
     
     # 节点输入输出类型
     "IndexSourceInput", "IndexSourceOutput",
+    "IndexManifestEntry", "IndexManifestOriginalValue", "IndexManifestSummary",
     "SheetSelectorInput", "SheetSelectorOutput", 
     "RowFilterInput", "RowFilterOutput",
     "RowLookupInput", "RowLookupOutput",
