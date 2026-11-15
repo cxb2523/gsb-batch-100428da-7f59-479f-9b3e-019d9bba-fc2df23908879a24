@@ -2,6 +2,46 @@
 
 ###Scrape Job portal data
 
+#### Running the MyCareersFuture scraper (`webscrapping.py`)
+
+The scraper is failure-tolerant: a page that fails to load or fails the title
+assertion is recorded as a failed page and collection continues; a job card
+that cannot be opened or whose detail fields cannot be extracted is skipped
+(page number and 1-based card index are recorded) while the rest of the run
+continues.
+
+Outputs:
+
+- `analyst_job.csv` — successfully collected jobs (header-only if none succeeded)
+- `scrape_outcome.json` — verifiable run summary containing `total_pages`,
+  `successful_pages`, `failed_pages`, `success_count` and `skipped_jobs`
+
+All previously hard-coded settings can be overridden with command line flags or
+`MCF_*` environment variables (defaults in parentheses):
+
+| Setting            | CLI flag            | Env variable           | Default                                  |
+|--------------------|---------------------|------------------------|------------------------------------------|
+| Chrome driver path | `--driver-path`     | `MCF_CHROMEDRIVER_PATH`| `/Users/janice/Developer/chromedriver`   |
+| Page limit         | `--max-pages`       | `MCF_MAX_PAGES`        | `64`                                     |
+| Cards per page     | `--cards-per-page`  | `MCF_CARDS_PER_PAGE`   | `20`                                     |
+| Page wait (s)      | `--page-wait`       | `MCF_PAGE_WAIT`        | `6`                                      |
+| Detail wait (s)    | `--detail-wait`     | `MCF_DETAIL_WAIT`      | `8`                                      |
+| Back wait (s)      | `--back-wait`       | `MCF_BACK_WAIT`        | `3`                                      |
+| Snackbar wait (s)  | `--snackbar-wait`   | `MCF_SNACKBAR_WAIT`    | `2`                                      |
+| Output CSV         | `--output`          | `MCF_OUTPUT_CSV`       | `analyst_job.csv`                        |
+| Outcome JSON       | `--outcome-file`    | `MCF_OUTCOME_FILE`     | `scrape_outcome.json`                    |
+| Search keyword     | `--search-keyword`  | `MCF_SEARCH_KEYWORD`   | `analyst`                                |
+
+If the driver is missing or Chrome fails to start, the script exits with code 1
+and a clear error message instead of silently producing an empty table.
+
+Offline verification (no network, no real browser — an injectable fake driver
+is used):
+
+```
+python -m pytest tests/
+```
+
 Step 1 :
 
 First go through the problem statement that which domain data I need to collect and which type of columns and information gather by scrape the site.
