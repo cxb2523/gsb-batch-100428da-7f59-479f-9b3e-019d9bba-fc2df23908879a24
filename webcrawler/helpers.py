@@ -111,7 +111,7 @@ def load_json_file(json_file):
 
 def load_yaml_file(yaml_file):
     with open(yaml_file, 'r') as stream:
-        return yaml.load(stream)
+        return yaml.safe_load(stream)
 
 def get_md5(content):
     return hashlib.md5(content).hexdigest()

@@ -66,10 +66,25 @@ class WebCrawler(object):
         self.bad_urls_mapping = {}
         self.current_depth_unvisited_urls_queue = queue.Queue()
 
+        # final outcome of every crawled url:
+        # {url: {'outcome': 'success'|'failed'|'skipped', 'status_code': ...,
+        #        'reason': ..., 'attempts': int, 'retries': int}}
+        self.url_outcomes_mapping = {}
+        # urls currently being fetched by a worker thread, mapped to the
+        # event/result holder, so concurrent duplicates are processed only once
+        self._inflight_urls = {}
+        self._outcome_lock = threading.RLock()
+        self._inflight_lock = threading.RLock()
+
     def reset_all(self):
         self.current_depth = 0
         self.current_depth_unvisited_urls_queue.queue.clear()
         self.url_queue.clear_unvisited_urls()
+
+        with self._outcome_lock:
+            self.url_outcomes_mapping.clear()
+        with self._inflight_lock:
+            self._inflight_urls.clear()
 
         for website in self.website_list:
             website_url = website['url']
@@ -199,27 +214,21 @@ class WebCrawler(object):
 
         return False
 
-    def get_hyper_links(self, url, depth, retry_times=3):
-        if url in self.whitelist_fullurls:
-            return set()
+    def _fetch_once(self, url, depth, kwargs, url_host):
+        """ fetch url once and return the result of this single attempt.
 
+        @return
+            (hyper_links_set, status_code, exception_str,
+             resp_content_md5, duration_time, retry_allowed)
+        Retrying is handled by the caller, so a retryable failure never
+        overwrites links/results produced by an earlier attempt.
+        """
         hyper_links_set = set()
-        kwargs = copy.deepcopy(self.kwargs)
-        if not self.grey_env:
-            kwargs['headers']['User-Agent'] = self.get_user_agent_by_url(url)
-        parsed_object = helpers.get_parsed_object_from_url(url)
-        url_host = parsed_object.netloc
-        if url_host in self.whitelist_host:
-            return set()
-        if self.is_url_has_whitelist_key(url):
-            return set()
-        if url_host in self.auth_dict and self.auth_dict[url_host]:
-            kwargs['auth'] = self.auth_dict[url_host]
-
         exception_str = ""
         status_code = '0'
         resp_content_md5 = None
         duration_time = 0
+        retry_allowed = True
         try:
             start_time = time.time()
             resp = requests.head(url, **kwargs)
@@ -239,8 +248,13 @@ class WebCrawler(object):
                 duration_time = time.time() - start_time
                 resp_content_md5 = helpers.get_md5(resp.content)
                 hyper_links_set = self.parse_page_links(resp.url, resp.content)
-                if url not in self.web_urls_mapping:
-                    self.web_urls_mapping[url] = list(hyper_links_set)
+                # merge links of every attempt: a failed early attempt may have
+                # stored an empty placeholder, so retries must be able to fill
+                # it in, while links already saved can never be removed
+                with self._outcome_lock:
+                    saved_links = set(self.web_urls_mapping.get(url, []))
+                    saved_links |= hyper_links_set
+                    self.web_urls_mapping[url] = list(saved_links)
                 status_code = str(resp.status_code)
                 self.url_queue.add_unvisited_urls(hyper_links_set)
                 if resp.status_code > 400:
@@ -249,7 +263,7 @@ class WebCrawler(object):
             color_logging("{}: {}".format(url, str(ex)), 'WARNING')
             exception_str = str(ex)
             status_code = 'SSLError'
-            retry_times = 0
+            retry_allowed = False
         except requests.exceptions.ConnectionError as ex:
             color_logging("ConnectionError {}: {}".format(url, str(ex)), 'WARNING')
             exception_str = str(ex)
@@ -263,39 +277,169 @@ class WebCrawler(object):
             color_logging("{}: {}".format(url, str(ex)), 'WARNING')
             exception_str = str(ex)
             status_code = 'InvalidSchema'
-            retry_times = 0
+            retry_allowed = False
         except requests.exceptions.ChunkedEncodingError as ex:
             color_logging("{}: {}".format(url, str(ex)), 'WARNING')
             exception_str = str(ex)
             status_code = 'ChunkedEncodingError'
-            retry_times = 0
+            retry_allowed = False
         except requests.exceptions.InvalidURL as ex:
             color_logging("{}: {}".format(url, str(ex)), 'WARNING')
             exception_str = str(ex)
             status_code = 'InvalidURL'
-            retry_times = 0
+            retry_allowed = False
         except lxml.etree.XMLSyntaxError as ex:
             color_logging("{}: {}".format(url, str(ex)), 'WARNING')
             exception_str = str(ex)
             status_code = 'XMLSyntaxError'
-            retry_times = 0
+            retry_allowed = False
 
         self._print_log(depth, url, status_code, duration_time)
-        if retry_times > 0:
-            if not status_code.isdigit() or int(status_code) > 400:
-                time.sleep((4-retry_times)*2)
-                return self.get_hyper_links(url, depth, retry_times-1)
-        else:
-            self.bad_urls_mapping[url] = exception_str
+        return (hyper_links_set, status_code, exception_str,
+                resp_content_md5, duration_time, retry_allowed)
 
-        self.save_categorised_url(status_code, url)
-        url_test_res = {
-            'status_code': status_code,
-            'duration_time': duration_time,
-            'md5': resp_content_md5
-        }
-        self.url_queue.add_visited_url(url, url_test_res)
-        return hyper_links_set
+    @staticmethod
+    def _should_retry(status_code):
+        return not status_code.isdigit() or int(status_code) > 400
+
+    def _fetch_with_retry(self, url, depth, kwargs, url_host, retry_times=3):
+        """ fetch url with retries and return the final result.
+
+        Results of every attempt are merged instead of being overwritten:
+        links parsed by a successful attempt survive a later failure.
+        """
+        hyper_links_set = set()
+        status_code = '0'
+        exception_str = ""
+        resp_content_md5 = None
+        duration_time = 0
+        remaining_retries = retry_times
+        attempts = 0
+
+        while True:
+            attempts += 1
+            (attempt_links, status_code, exception_str, attempt_md5,
+             duration_time, retry_allowed) = self._fetch_once(
+                url, depth, kwargs, url_host)
+
+            if attempt_links:
+                hyper_links_set |= attempt_links
+            if attempt_md5 is not None:
+                resp_content_md5 = attempt_md5
+
+            if remaining_retries > 0 and retry_allowed \
+                    and self._should_retry(status_code):
+                time.sleep((4 - remaining_retries) * 2)
+                remaining_retries -= 1
+                continue
+
+            break
+
+        return (hyper_links_set, status_code, exception_str,
+                resp_content_md5, duration_time, attempts)
+
+    def _register_skipped_outcome(self, url, reason):
+        """ record a url that is skipped without sending any request.
+        The same url only gets one outcome even under concurrency.
+        """
+        with self._outcome_lock:
+            if url in self.url_outcomes_mapping:
+                return
+            self.url_outcomes_mapping[url] = {
+                'outcome': 'skipped',
+                'reason': reason,
+                'status_code': None,
+                'attempts': 0,
+                'retries': 0
+            }
+
+    def _register_final_outcome(self, url, status_code, exception_str,
+                                resp_content_md5, duration_time, attempts):
+        """ register the final outcome of a url exactly once.
+
+        success: a response with a numeric HTTP status code is received;
+        failed:  retries exhausted (connection/timeout errors or HTTP 5xx);
+        side effects keep the original behaviour: failed urls are stored in
+        bad_urls_mapping and every url is still classified by status code.
+        """
+        with self._outcome_lock:
+            already_recorded = url in self.url_outcomes_mapping
+
+            is_failed = self._should_retry(status_code)
+            if is_failed:
+                outcome = 'failed'
+                # keep the exception text; never overwrite an existing one
+                self.bad_urls_mapping.setdefault(url, exception_str)
+            else:
+                outcome = 'success'
+
+            if not already_recorded:
+                self.url_outcomes_mapping[url] = {
+                    'outcome': outcome,
+                    'status_code': status_code,
+                    'reason': exception_str or None,
+                    'attempts': attempts,
+                    'retries': attempts - 1
+                }
+
+            # the following bookkeeping mirrors the original single-registration
+            # behaviour; guards ensure retries/concurrency never overwrite data
+            self.save_categorised_url(status_code, url)
+            url_test_res = {
+                'status_code': status_code,
+                'duration_time': duration_time,
+                'md5': resp_content_md5
+            }
+            self.url_queue.add_visited_url(url, url_test_res)
+
+    def get_hyper_links(self, url, depth, retry_times=3):
+        if url in self.whitelist_fullurls:
+            self._register_skipped_outcome(url, 'whitelist fullurl')
+            return set()
+
+        kwargs = copy.deepcopy(self.kwargs)
+        if not self.grey_env:
+            kwargs['headers']['User-Agent'] = self.get_user_agent_by_url(url)
+        parsed_object = helpers.get_parsed_object_from_url(url)
+        url_host = parsed_object.netloc
+        if url_host in self.whitelist_host:
+            self._register_skipped_outcome(url, 'whitelist host')
+            return set()
+        if self.is_url_has_whitelist_key(url):
+            self._register_skipped_outcome(url, 'whitelist include-key')
+            return set()
+        if url_host in self.auth_dict and self.auth_dict[url_host]:
+            kwargs['auth'] = self.auth_dict[url_host]
+
+        # under concurrency the same url must only be fetched once; duplicate
+        # workers wait for the in-flight fetch and share its parsed links
+        with self._inflight_lock:
+            inflight_holder = self._inflight_urls.get(url)
+            if inflight_holder is None:
+                inflight_holder = {'event': threading.Event(), 'result': None}
+                self._inflight_urls[url] = inflight_holder
+                is_owner = True
+            else:
+                is_owner = False
+
+        if not is_owner:
+            inflight_holder['event'].wait()
+            return set(inflight_holder['result'] or set())
+
+        try:
+            (hyper_links_set, status_code, exception_str, resp_content_md5,
+             duration_time, attempts) = self._fetch_with_retry(
+                url, depth, kwargs, url_host, retry_times)
+
+            self._register_final_outcome(
+                url, status_code, exception_str,
+                resp_content_md5, duration_time, attempts)
+            inflight_holder['result'] = hyper_links_set
+            return hyper_links_set
+        finally:
+            with self._inflight_lock:
+                self._inflight_urls.pop(url, None)
+            inflight_holder['event'].set()
 
     def get_referer_urls_set(self, url):
         """ get all referer urls of the specified url.
@@ -447,11 +591,55 @@ class WebCrawler(object):
 
         color_logging('=' * 120, color='yellow')
 
+    def get_url_outcomes(self):
+        """ return a copy of the final outcome registry, keyed by url.
+        """
+        with self._outcome_lock:
+            return dict(self.url_outcomes_mapping)
+
+    def print_outcome_summary(self):
+        """ print a checkable summary of the final outcome of every url:
+        counts grouped by outcome type and the urls still failing after
+        retries together with their failure reasons.
+        """
+        with self._outcome_lock:
+            outcomes = dict(self.url_outcomes_mapping)
+
+        outcome_counts = OrderedDict([
+            ('success', 0),
+            ('failed', 0),
+            ('skipped', 0)
+        ])
+        for result in outcomes.values():
+            outcome = result['outcome']
+            outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+
+        output = "\n" + "=" * 120 + "\n"
+        output += "URL final outcome summary, total: {}.\n".format(len(outcomes))
+        for outcome, count in outcome_counts.items():
+            output += "{} urls: {}.\n".format(outcome, count)
+
+        failed_items = sorted(
+            ((url, result) for url, result in outcomes.items()
+             if result['outcome'] == 'failed'),
+            key=lambda item: item[0]
+        )
+        output += "\nurls still failed after retries, total: {}.\n".format(
+            len(failed_items))
+        output += "urls list: \n"
+        for url, result in failed_items:
+            output += "---{} (status_code: {}, attempts: {}, retries: {}): {}\n"\
+                .format(url, result['status_code'], result['attempts'],
+                        result['retries'], result['reason'])
+
+        color_logging(output, 'ERROR' if failed_items else 'INFO')
+
     def print_result(self, canceled=False, save_results=False):
         status = "Canceled" if canceled else "Finished"
         color_logging("{}. The crawler has tested {} urls."\
             .format(status, self.url_queue.get_visited_urls_count()))
         self.print_categorised_urls()
+        self.print_outcome_summary()
 
         if save_results:
             urls_mapping_log_path = os.path.join(self.logs_folder, 'urls_mapping.yml')
