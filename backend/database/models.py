@@ -90,4 +90,6 @@ class RunLog(SQLModel, table=True):
     llm_call_count: int = 0
     cache_hit_count: int = 0
     failed_count: int = 0
+    no_readme_count: int = 0
+    rate_limited_count: int = 0
     error_summary: str | None = None

@@ -38,6 +38,8 @@ class RepositoryStore:
         llm_call_count: int,
         cache_hit_count: int,
         failed_count: int,
+        no_readme_count: int = 0,
+        rate_limited_count: int = 0,
     ) -> None:
         run_log.status = RunStatus.SUCCESS
         run_log.ended_at = datetime.utcnow()
@@ -48,6 +50,8 @@ class RepositoryStore:
         run_log.llm_call_count = llm_call_count
         run_log.cache_hit_count = cache_hit_count
         run_log.failed_count = failed_count
+        run_log.no_readme_count = no_readme_count
+        run_log.rate_limited_count = rate_limited_count
         self.session.add(run_log)
         self.session.commit()
 

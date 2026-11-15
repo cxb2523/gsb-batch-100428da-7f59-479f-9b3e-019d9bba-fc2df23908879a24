@@ -36,6 +36,8 @@ export function RunLogs({ runs, loading }: RunLogsProps) {
           { title: "LLM", dataIndex: "llm_call_count" },
           { title: "缓存", dataIndex: "cache_hit_count" },
           { title: "失败", dataIndex: "failed_count" },
+          { title: "无README", dataIndex: "no_readme_count" },
+          { title: "限流", dataIndex: "rate_limited_count" },
           {
             title: "错误摘要",
             dataIndex: "error_summary",

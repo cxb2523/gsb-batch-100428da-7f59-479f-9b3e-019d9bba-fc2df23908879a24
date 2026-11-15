@@ -17,6 +17,8 @@ export interface RunLog {
   llm_call_count: number;
   cache_hit_count: number;
   failed_count: number;
+  no_readme_count: number;
+  rate_limited_count: number;
   error_summary?: string | null;
 }
 

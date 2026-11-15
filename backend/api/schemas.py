@@ -16,6 +16,8 @@ class RunLogOut(BaseModel):
     llm_call_count: int
     cache_hit_count: int
     failed_count: int
+    no_readme_count: int = 0
+    rate_limited_count: int = 0
     error_summary: str | None = None
 
 

@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 
 import requests
@@ -8,6 +10,41 @@ from backend.core.config import Settings
 from backend.schemas.project import GithubMetrics, ProjectWithReadme, TrendingProject
 from backend.services.github_api import GithubApiClient
 from backend.services.preprocessor import ReadmePreprocessor
+
+
+class ReadmeFetchStatus(str, Enum):
+    """README 抓取的三种结局。"""
+
+    SUCCESS = "success"
+    NO_README = "no_readme"
+    RATE_LIMITED = "rate_limited"
+
+
+@dataclass
+class ReadmeFetchResult:
+    """fetch_readme 的返回结果，显式表达成功 / 无 README / 限流三种结局。
+
+    仅当 status 为 SUCCESS 时 project 才有值，其余结局 project 为 None。
+    """
+
+    status: ReadmeFetchStatus
+    project: ProjectWithReadme | None = None
+
+    @classmethod
+    def success(cls, project: ProjectWithReadme) -> "ReadmeFetchResult":
+        return cls(status=ReadmeFetchStatus.SUCCESS, project=project)
+
+    @classmethod
+    def no_readme(cls) -> "ReadmeFetchResult":
+        return cls(status=ReadmeFetchStatus.NO_README)
+
+    @classmethod
+    def rate_limited(cls) -> "ReadmeFetchResult":
+        return cls(status=ReadmeFetchStatus.RATE_LIMITED)
+
+    @property
+    def is_success(self) -> bool:
+        return self.status is ReadmeFetchStatus.SUCCESS
 
 
 class GithubFetcher:
@@ -43,16 +80,16 @@ class GithubFetcher:
         response.raise_for_status()
         return response
 
-    def fetch_readme(self, project: TrendingProject) -> ProjectWithReadme | None:
+    def fetch_readme(self, project: TrendingProject) -> ReadmeFetchResult:
         logger.info("正在获取 README: {}", project.name)
         response = self._request_readme(project.name)
 
         if response.status_code == 404:
             logger.warning("{} 没有 README 文件，跳过", project.name)
-            return None
+            return ReadmeFetchResult.no_readme()
         if response.status_code == 403:
             logger.warning("爬取readm.md时候, GitHub API 请求受限，建议配置 GITHUB_TOKEN")
-            return None
+            return ReadmeFetchResult.rate_limited()
 
         raw_content = response.text
         if self.settings.save_readme:
@@ -71,9 +108,11 @@ class GithubFetcher:
             logger.info("跳过github api 请求只爬取README.md")
             metrics = GithubMetrics()
 
-        return ProjectWithReadme(
-            **project.model_dump(),
-            readme_content=content,
-            raw_readme_length=len(raw_content),
-            metrics=metrics,
+        return ReadmeFetchResult.success(
+            ProjectWithReadme(
+                **project.model_dump(),
+                readme_content=content,
+                raw_readme_length=len(raw_content),
+                metrics=metrics,
+            )
         )

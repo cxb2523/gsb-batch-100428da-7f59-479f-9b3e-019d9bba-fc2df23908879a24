@@ -20,6 +20,7 @@ engine = create_engine(settings.database_url, **engine_args)
 def init_db() -> None:
     SQLModel.metadata.create_all(engine)
     _ensure_analysis_report_columns()
+    _ensure_runlog_columns()
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -55,6 +56,33 @@ def _ensure_analysis_report_columns() -> None:
             "risk_notes": "ALTER TABLE analysisreport ADD COLUMN risk_notes JSON DEFAULT '[]'",
             "metrics": "ALTER TABLE analysisreport ADD COLUMN metrics JSON DEFAULT '{}'",
         }
+
+    with engine.begin() as connection:
+        for column_name, sql in migrations.items():
+            if column_name not in existing_columns:
+                connection.execute(text(sql))
+
+
+def _ensure_runlog_columns() -> None:
+    """为旧版本数据库补齐 runlog 表中按跳过原因归类的计数字段。
+
+    新库由 SQLModel.metadata.create_all 直接建出完整字段；
+    仅当 runlog 表已存在但缺少新列（旧数据库文件）时执行 ALTER TABLE。
+    """
+    inspector = inspect(engine)
+    if not inspector.has_table("runlog"):
+        return
+
+    existing_columns = {
+        column["name"] for column in inspector.get_columns("runlog")
+    }
+
+    # MySQL 与 SQLite 均支持 INTEGER 类型；NOT NULL 由 SQLModel 模型层保证，
+    # 这里不写数据库级 NOT NULL，避免旧行回填失败。
+    migrations = {
+        "no_readme_count": "ALTER TABLE runlog ADD COLUMN no_readme_count INTEGER DEFAULT 0",
+        "rate_limited_count": "ALTER TABLE runlog ADD COLUMN rate_limited_count INTEGER DEFAULT 0",
+    }
 
     with engine.begin() as connection:
         for column_name, sql in migrations.items():

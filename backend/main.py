@@ -10,7 +10,7 @@ from backend.database.engine import engine, init_db
 from backend.schemas.project import AnalysisResult
 from backend.services.analyzer import LLMAnalyzer
 from backend.services.collector import GithubCollector
-from backend.services.fetcher import GithubFetcher
+from backend.services.fetcher import GithubFetcher, ReadmeFetchStatus
 from backend.services.notifier import FeishuNotifier
 from backend.services.repository_store import RepositoryStore
 
@@ -60,6 +60,8 @@ def run() -> list[AnalysisResult]:
         llm_call_count = 0
         cache_hit_count = 0
         failed_count = 0
+        no_readme_count = 0
+        rate_limited_count = 0
 
         try:
             projects = collector.get_trending_projects(
@@ -75,9 +77,29 @@ def run() -> list[AnalysisResult]:
             push_results: list[AnalysisResult] = []
             for project in target_projects:
                 logger.info("开始处理项目: {}", project.name)
-                project_with_readme = fetcher.fetch_readme(project)
+                fetch_result = fetcher.fetch_readme(project)
+
+                # 404：仓库无 README，单独计数后跳过，不进入分析/LLM，也不视为运行失败
+                if fetch_result.status is ReadmeFetchStatus.NO_README:
+                    no_readme_count += 1
+                    logger.info("{} 因无 README 被跳过（no_readme_count={}）", project.name, no_readme_count)
+                    continue
+
+                # 403：GitHub 接口限流，单独计数后跳过，不进入分析/LLM，也不视为运行失败
+                if fetch_result.status is ReadmeFetchStatus.RATE_LIMITED:
+                    rate_limited_count += 1
+                    logger.info(
+                        "{} 因 GitHub 接口限流被跳过（rate_limited_count={}）",
+                        project.name,
+                        rate_limited_count,
+                    )
+                    continue
+
+                project_with_readme = fetch_result.project
                 if project_with_readme is None:
+                    # 防御性分支：成功结局必须携带项目数据，缺失时按分析失败处理
                     failed_count += 1
+                    logger.error("{} 抓取结局为成功但未携带 README 数据，计入失败", project.name)
                     continue
 
                 project_with_readme, existing_report = store.mark_project_state(project_with_readme)
@@ -109,7 +131,13 @@ def run() -> list[AnalysisResult]:
 
                 time.sleep(1)
 
-            logger.info("全部完成，本次生成 {} 份报告", len(results))
+            logger.info(
+                "全部完成，本次生成 {} 份报告（无 README 跳过 {} 个，限流跳过 {} 个，失败 {} 个）",
+                len(results),
+                no_readme_count,
+                rate_limited_count,
+                failed_count,
+            )
             write_final_report(results, settings)
             logger.info(f"send_message_flag:{settings.send_message_flag}")
             if push_results and settings.send_message_flag:
@@ -126,6 +154,8 @@ def run() -> list[AnalysisResult]:
                 llm_call_count=llm_call_count,
                 cache_hit_count=cache_hit_count,
                 failed_count=failed_count,
+                no_readme_count=no_readme_count,
+                rate_limited_count=rate_limited_count,
             )
             return results
         except Exception as exc:

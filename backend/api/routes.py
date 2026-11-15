@@ -43,6 +43,8 @@ def run_to_out(run: RunLog | None) -> RunLogOut | None:
         llm_call_count=run.llm_call_count,
         cache_hit_count=run.cache_hit_count,
         failed_count=run.failed_count,
+        no_readme_count=getattr(run, "no_readme_count", 0) or 0,
+        rate_limited_count=getattr(run, "rate_limited_count", 0) or 0,
         error_summary=run.error_summary,
     )
 
