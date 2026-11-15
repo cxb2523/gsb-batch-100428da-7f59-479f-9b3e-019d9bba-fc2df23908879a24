@@ -37,7 +37,7 @@ ALIASES = {
 
 def get_status(wx):
     members = config.get_effective_members()
-    done = get_participated(wx)
+    done, _jielong_text, meta = get_participated(wx, return_meta=True)
     leave = get_leave_members(wx)
     not_done = [m for m in members if m not in done and m not in leave]
     return {
@@ -47,6 +47,10 @@ def get_status(wx):
         "done": done,
         "not_done": not_done,
         "leave": leave,
+        # 本次参与者数据是否可信：False 表示采集失败，
+        # 此时 done/not_done 不可作为"全员完成/全员未交"的依据。
+        "participants_data_reliable": bool(meta.get("evidence_reliable")),
+        "fallback_used": bool(meta.get("fallback_used")),
     }
 
 

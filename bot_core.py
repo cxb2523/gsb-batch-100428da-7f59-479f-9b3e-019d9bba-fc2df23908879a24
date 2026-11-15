@@ -854,24 +854,45 @@ def find_last_jielong(msgs):
     return pool[0][1].get('content', '')
 
 
-def get_participated(wx, use_search=True, return_jielong_text=False):
-    """获取已接龙的人；可选返回提取到的最新接龙正文。"""
+def get_participated(wx, use_search=True, return_jielong_text=False, return_meta=False):
+    """获取已接龙的人；可选返回提取到的最新接龙正文与采集元信息。
+
+    return_meta=True 时返回 (participated_list, jielong_text, meta)，meta 字段：
+    - evidence_reliable: 是否拿到任何有效接龙证据（搜索正文或历史接龙消息）。
+      为 False 时表示"采集失败"，此时空名单不可信，上层不得按"全员未交"催办。
+    - search_ok: 搜索窗口是否提取到当天接龙正文。
+    - fallback_used: 是否走了"搜索失败 -> 历史消息解析"的回退路径。
+    - history_jielong_found: 历史消息中是否找到当天接龙。
+    """
     participated = set()
     members = set(config.get_effective_members())
 
+    keyword = _native_jielong_keyword()
+    today_tag = datetime.now().strftime("%Y.%m.%d")
+
     raw_names = []
     latest_full = ""
+    search_ok = False
     if use_search:
         # 可选：按"顶部搜索 -> 搜索聊天记录"拿最新未折叠接龙（会操作微信搜索框）
         try:
             latest_full = _latest_jielong_via_wechat_search(wx) or ""
+            # 仅当文本确实包含"当天 #接龙"时才视为有效证据，
+            # 避免搜索窗口返回的兜底条目被误当成接龙正文。
+            search_ok = bool(latest_full) and keyword in latest_full and today_tag in latest_full
             raw_names.extend(parse_jielong_participants(latest_full))
         except Exception as e:
             log(f"  [WARN] 搜索窗口提取接龙失败，回退历史解析: {e}")
 
+    # 搜索没拿到有效接龙正文时，需要走历史消息回退路径。
+    fallback_used = use_search and not search_ok
+    if fallback_used:
+        log("  [INFO] 走回退路径：搜索窗口未获取有效接龙，改为解析群历史消息")
+
     # 仅在搜索提取失败/为空时才重拉历史，减少耗时。
     msgs = []
     jielong_msgs = []
+    history_read_ok = True
     try:
         if raw_names:
             msgs = get_all_messages(wx, prefer_history=False)
@@ -889,6 +910,13 @@ def get_participated(wx, use_search=True, return_jielong_text=False):
     except Exception as e:
         log(f"  [WARN] 获取群消息失败，跳过消息回退解析: {e}")
         jielong_msgs = []
+        history_read_ok = False
+
+    history_jielong_found = bool(jielong_msgs)
+    if fallback_used and history_jielong_found:
+        log(f"  [INFO] 回退路径生效：从历史消息中解析到 {len(jielong_msgs)} 条当天接龙消息")
+    if not history_read_ok:
+        log("  [WARN] 历史消息读取异常，参与者证据可能不完整")
 
     # 保序去重
     dedup_names = []
@@ -918,8 +946,6 @@ def get_participated(wx, use_search=True, return_jielong_text=False):
             participated.add(remark)
 
     # 兜底：按"当日接龙窗口内发送 #接龙 的发送人"计入已接龙，降低正文格式不规范导致的漏识别。
-    keyword = _native_jielong_keyword()
-    today_tag = datetime.now().strftime("%Y.%m.%d")
     for m in msgs:
         sender = m.get("sender", "")
         c = m.get("content", "")
@@ -928,8 +954,6 @@ def get_participated(wx, use_search=True, return_jielong_text=False):
             participated.add(sender)
 
     participated_list = list(participated)
-    if not return_jielong_text:
-        return participated_list
 
     jielong_text = str(latest_full or "").strip()
     if not jielong_text:
@@ -937,7 +961,21 @@ def get_participated(wx, use_search=True, return_jielong_text=False):
             jielong_text = str(find_last_jielong(msgs) or "").strip()
         except Exception:
             jielong_text = ""
-    return participated_list, jielong_text
+
+    meta = {
+        # 有任一有效证据（搜索正文 / 历史接龙消息）才认为名单可信；
+        # 两者皆空时说明采集失败，空名单不代表"全员未交"。
+        "evidence_reliable": bool(search_ok or history_jielong_found),
+        "search_ok": bool(search_ok),
+        "fallback_used": bool(fallback_used),
+        "history_jielong_found": bool(history_jielong_found),
+    }
+
+    if return_meta:
+        return participated_list, jielong_text, meta
+    if return_jielong_text:
+        return participated_list, jielong_text
+    return participated_list
 
 
 def get_leave_members(wx, cutoff_time=None, msgs=None):
@@ -992,7 +1030,24 @@ def cuiban(wx):
     try:
         log(f"[{datetime.now():%H:%M:%S}] 执行催办...")
         members = config.get_effective_members()
-        participated = get_participated(wx, use_search=True)
+        participated, _jielong_text, meta = get_participated(wx, use_search=True, return_meta=True)
+
+        # 采集结果不可信：搜索与消息回退都没有拿到任何有效接龙证据。
+        # 此时空名单是"采集失败"而非"全员未交"，绝不能按花名册全员 @。
+        if not meta.get("evidence_reliable"):
+            log("  [ERR] 未能读取到当天接龙的任何有效证据（搜索与消息回退均为空），"
+                "本次不发送 @ 催办，改为提示人工核对。")
+            try:
+                chat_with(wx, config.GROUP_NAME)
+                delay()
+                call_with_retry(
+                    lambda: wx.SendMsg(config.CUIBAN_READ_FAIL_TEXT, who=config.GROUP_NAME),
+                    "发送接龙读取失败提示",
+                )
+            except Exception as send_err:
+                log(f"  [WARN] 发送接龙读取失败提示异常: {send_err}")
+            return False
+
         # 复用 get_participated 已读取的消息，避免重复读取和窗口操作
         msgs = get_all_messages(wx)
         msgs = _slice_msgs_since_today(msgs)

@@ -74,7 +74,18 @@ class DryRunWeChat:
 
     def GetAllMessage(self, *args, **kwargs):
         print(f"[DRY_RUN] GetAllMessage(from={self.current_chat})")
-        return []
+        # 返回一条合成的"当天接龙模板"消息，让 DRY_RUN 下的催办/汇总
+        # 能拿到有效接龙证据、走完正常流程，而不是触发"采集失败"分支。
+        return [self._synthetic_jielong_message()]
+
+    @staticmethod
+    def _synthetic_jielong_message():
+        class _Msg:
+            type = "self"
+            sender = "AI助手"
+            sender_remark = "AI助手"
+            content = config.get_jielong_template()
+        return _Msg()
 
     # 业务层偶尔会探测以下方法/属性；提供无害默认值即可。
     def AtAll(self, *args, **kwargs):
@@ -242,7 +253,7 @@ def api_status():
     try:
         client = require_wx()
         members = config.get_effective_members()
-        participated = get_participated(client)
+        participated, _jielong_text, meta = get_participated(client, return_meta=True)
         leave = get_leave_members(client)
         not_done = [m for m in members
                     if m not in participated and m not in leave]
@@ -252,6 +263,10 @@ def api_status():
             "done": participated,
             "not_done": not_done,
             "leave": leave,
+            # 本次参与者数据是否可信：False 表示采集失败，
+            # 此时 done/not_done 不可作为"全员完成/全员未交"的依据。
+            "participants_data_reliable": bool(meta.get("evidence_reliable")),
+            "fallback_used": bool(meta.get("fallback_used")),
         }
     except HTTPException:
         raise

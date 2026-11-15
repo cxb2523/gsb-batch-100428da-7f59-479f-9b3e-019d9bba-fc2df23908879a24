@@ -73,6 +73,12 @@ CMD_STATUS = "status"
 JIELONG_AT_ALL_TEXT = "@所有人"
 CUIBAN_AT_TEXT = "写日报"
 HUIZONG_GROUP_ACK_TEXT = "日报已汇整发送，又是美好的一天"
+# 催办时未能读取到任何有效接龙证据（采集失败）的群内提示，避免误把空名单当全员未交
+CUIBAN_READ_FAIL_TEXT = (
+    "【小助手提示】本次催办未能读取到今天有效的接龙内容"
+    "（搜索与消息记录均未获取到），为避免误催，本次暂不 @ 提醒，"
+    "请值班同事人工核对今天的接龙情况。"
+)
 
 # 安全延迟（秒）
 MIN_DELAY = 1.5
