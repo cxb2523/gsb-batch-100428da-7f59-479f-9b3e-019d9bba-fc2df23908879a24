@@ -1,0 +1,12 @@
+.git
+.DS_Store
+.github
+.vscode
+node_modules
+.worktrees/
+.env
+.env.*
+!.env.example
+.linkout/
+chrome-profile/
+*.jsonl

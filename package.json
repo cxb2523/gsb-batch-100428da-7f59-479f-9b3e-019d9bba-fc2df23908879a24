@@ -1,0 +1,44 @@
+{
+  "name": "linkout-scraper",
+  "version": "2.0.0",
+  "description": "Local, visible-browser LinkedIn reading tools for Node.js, Claude Code, and Codex.",
+  "main": "lib/linkedin.service.js",
+  "bin": {
+    "linkout-mcp": "bin/linkout-mcp.js"
+  },
+  "files": [
+    ".claude-plugin",
+    ".codex-plugin",
+    ".mcp.json",
+    "bin",
+    "lib",
+    "skills",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "start:mcp": "node bin/linkout-mcp.js",
+    "test:live:read-only": "node --test test/live/read-only.smoke.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "author": "Sai-Adarsh <saiadarshsivakumar@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/linkoutapp/linkout-scraper.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "ghost-cursor": "^1.4.2",
+    "puppeteer-core": "^25.3.0",
+    "zod": "^4.4.3"
+  },
+  "overrides": {
+    "@hono/node-server": "2.1.8"
+  },
+  "devDependencies": {}
+}
