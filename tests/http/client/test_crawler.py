@@ -4,6 +4,7 @@ import pytest
 
 from wxpath.http.client.crawler import Crawler
 from wxpath.http.client.request import Request
+from wxpath.http.policy.retry import RetryPolicy
 
 # ------------------------
 # Fake HTTP primitives
@@ -47,6 +48,7 @@ class FakeResponse:
 class FakeSession:
     """
     Each .get() pops the next FakeResponse.
+    If the next item is an Exception instance, it is raised instead.
     """
     def __init__(self, responses):
         self._responses = list(responses)
@@ -54,10 +56,31 @@ class FakeSession:
     def get(self, *args, **kwargs):
         if not self._responses:
             raise RuntimeError("No more fake responses")
-        return self._responses.pop(0)
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
     async def close(self):
         pass
+
+
+class FastRetryPolicy(RetryPolicy):
+    """Retry policy with no backoff delay, to keep tests fast."""
+
+    def get_delay(self, request) -> float:
+        return 0
+
+
+class FixedDelayRetryPolicy(RetryPolicy):
+    """Retry policy with a fixed backoff delay."""
+
+    def __init__(self, delay: float, **kwargs):
+        super().__init__(**kwargs)
+        self._delay = delay
+
+    def get_delay(self, request) -> float:
+        return self._delay
 
 
 # ------------------------
@@ -88,7 +111,8 @@ async def test_single_request_success():
 
 @pytest.mark.asyncio
 async def test_retry_then_success():
-    crawler = Crawler(concurrency=1, respect_robots=False)
+    crawler = Crawler(concurrency=1, respect_robots=False,
+                      retry_policy=FastRetryPolicy())
 
     crawler._session = FakeSession([
         FakeResponse(500, b"fail"),
@@ -103,15 +127,26 @@ async def test_retry_then_success():
         crawler.submit(req)
 
         async for resp in crawler:
-            results.append(resp.body)
+            results.append(resp)
             break
 
-    assert results == [b"ok"]
+    assert len(results) == 1
+    assert results[0].status == 200
+    assert results[0].body == b"ok"
+    assert results[0].error is None
+    assert req.retries == 1
+    # Both the initial attempt and the retry went through the throttler
+    assert crawler._stats.throttle_waits == 2
 
 
 @pytest.mark.asyncio
-async def test_retry_exhaustion_yields_nothing():
-    crawler = Crawler(concurrency=1, respect_robots=False)
+async def test_retry_exhaustion_yields_error_response():
+    """
+    When retries are exhausted, the crawler must emit a terminal error
+    response (status 0, error set) instead of silently dropping the request.
+    """
+    crawler = Crawler(concurrency=1, respect_robots=False,
+                      retry_policy=FastRetryPolicy())
 
     crawler._session = FakeSession([
         FakeResponse(500, b"fail"),
@@ -120,15 +155,87 @@ async def test_retry_exhaustion_yields_nothing():
 
     req = Request("http://example.com", max_retries=1)
 
+    responses = []
+
     async with crawler:
         crawler.submit(req)
 
-        # Allow some time for retries to be processed
-        await asyncio.sleep(0.05)
+        async for resp in crawler:
+            responses.append(resp)
+            break
 
-        # No responses should be yielded
-        with pytest.raises(asyncio.TimeoutError):
-            await asyncio.wait_for(crawler.__aiter__().__anext__(), timeout=0.05)
+    # Exactly one terminal response, carrying an error
+    assert len(responses) == 1
+    assert responses[0].status == 0
+    assert responses[0].error is not None
+    assert req.retries == 1
+    # Initial attempt + one retry both passed through the throttler
+    assert crawler._stats.throttle_waits == 2
+
+    # No further responses for this request may appear
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(crawler._results.get(), timeout=0.1)
+
+
+@pytest.mark.asyncio
+async def test_retry_exhaustion_on_exception_yields_error_response():
+    """
+    Exceptions that keep failing must also produce a terminal error
+    response once retries are exhausted.
+    """
+    crawler = Crawler(concurrency=1, respect_robots=False,
+                      retry_policy=FastRetryPolicy())
+
+    crawler._session = FakeSession([
+        ConnectionError("boom"),
+        ConnectionError("boom again"),
+    ])
+
+    req = Request("http://example.com", max_retries=1)
+
+    responses = []
+
+    async with crawler:
+        crawler.submit(req)
+
+        async for resp in crawler:
+            responses.append(resp)
+            break
+
+    assert len(responses) == 1
+    assert responses[0].status == 0
+    assert responses[0].error is not None
+    assert req.retries == 1
+
+
+@pytest.mark.asyncio
+async def test_dont_retry_yields_error_response():
+    """
+    A request marked dont_retry that gets a retryable status must produce
+    a terminal error response immediately (no retries attempted).
+    """
+    crawler = Crawler(concurrency=1, respect_robots=False,
+                      retry_policy=FastRetryPolicy())
+
+    crawler._session = FakeSession([
+        FakeResponse(500, b"fail"),
+    ])
+
+    req = Request("http://example.com", dont_retry=True)
+
+    responses = []
+
+    async with crawler:
+        crawler.submit(req)
+
+        async for resp in crawler:
+            responses.append(resp)
+            break
+
+    assert len(responses) == 1
+    assert responses[0].status == 0
+    assert responses[0].error is not None
+    assert req.retries == 0
 
 
 @pytest.mark.asyncio
@@ -162,14 +269,15 @@ async def test_overlap_retry_does_not_block_other_requests():
     """
     This directly tests the scenario:
 
-    - request A retries
+    - request A fails and waits out its retry backoff
     - request B completes immediately
-    - B is yielded while A is retrying
+    - B is yielded while A is still waiting to retry
     """
-    crawler = Crawler(concurrency=2, respect_robots=False)
+    crawler = Crawler(concurrency=2, respect_robots=False,
+                      retry_policy=FixedDelayRetryPolicy(delay=0.3))
 
     crawler._session = FakeSession([
-        FakeResponse(500, b"fail"),   # A fails -> retry
+        FakeResponse(500, b"fail"),   # A fails -> retry after backoff
         FakeResponse(200, b"b"),      # B succeeds
         FakeResponse(200, b"a"),      # A retry succeeds
     ])
@@ -184,12 +292,20 @@ async def test_overlap_retry_does_not_block_other_requests():
         crawler.submit(fast)
 
         async for resp in crawler:
-            results.append(resp.body)
+            results.append(resp)
             if len(results) == 2:
                 break
 
-    # Order is not guaranteed — only non-blocking behavior is
-    assert set(results) == {b"a", b"b"}
+    bodies = [resp.body for resp in results]
+
+    # B must come back first: A was still in its retry backoff when B finished
+    assert bodies[0] == b"b"
+    assert set(bodies) == {b"a", b"b"}
+
+    # A eventually produced a successful, checkable outcome
+    assert results[1].error is None
+    assert results[1].status == 200
+    assert slow.retries == 1
 
 
 @pytest.mark.asyncio

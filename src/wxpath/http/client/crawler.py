@@ -124,6 +124,7 @@ class Crawler:
 
         self._session: aiohttp.ClientSession | None = None
         self._workers: list[asyncio.Task] = []
+        self._retry_tasks: set[asyncio.Task] = set()
         self._closed = False
         self._stats = CrawlerStats()
 
@@ -178,8 +179,10 @@ class Crawler:
         self._closed = True
         for w in self._workers:
             w.cancel()
+        for t in self._retry_tasks:
+            t.cancel()
 
-        await asyncio.gather(*self._workers, return_exceptions=True)
+        await asyncio.gather(*self._workers, *self._retry_tasks, return_exceptions=True)
 
         if self._session:
             await self._session.close()
@@ -227,10 +230,11 @@ class Crawler:
                 log.debug("cancelled error", extra={"url": req.url})
                 raise
 
-            except gaierror:
-                # Ignore DNS errors
+            except gaierror as exc:
+                # DNS failure: surface a terminal error response instead of
+                # silently dropping the request.
                 log.warning("DNS error", extra={"url": req.url})
-                pass
+                await self._results.put(Response(req, 0, b"", error=exc))
 
             except Exception as exc:
                 log.warning("exception", extra={"url": req.url})
@@ -290,8 +294,23 @@ class Crawler:
                     self.throttler.record_latency(host, latency)
 
                     if self.retry_policy.should_retry(req, response=resp):
-                        await self._retry(req)
+                        self._schedule_retry(req)
                         return None
+
+                    if resp.status in self.retry_policy.retry_statuses:
+                        # Retryable status, but retries are exhausted or disabled
+                        # (max_retries reached / dont_retry): emit a terminal
+                        # error response so the request never vanishes silently.
+                        err = RuntimeError(
+                            f"retries exhausted for {req.url}: "
+                            f"last response status {resp.status}"
+                        )
+                        log.error(
+                            "retries exhausted",
+                            extra={"url": req.url, "status": resp.status},
+                        )
+                        return Response(req, 0, b"", error=err,
+                                        request_start=_start, response_end=end)
 
                     return Response(req, resp.status, body, dict(resp.headers),
                                     request_start=_start, response_end=end)
@@ -305,14 +324,20 @@ class Crawler:
                 self.throttler.record_latency(host, latency)
 
                 if self.retry_policy.should_retry(req, exception=exc):
-                    await self._retry(req)
+                    self._schedule_retry(req)
                     return None
                 
                 log.error("request failed", extra={"url": req.url}, exc_info=exc)
                 return Response(req, 0, b"", error=exc, request_start=start, response_end=end)
 
-    async def _retry(self, req: Request) -> None:
-        """Reschedule a request according to the retry policy."""
+    def _schedule_retry(self, req: Request) -> None:
+        """Reschedule a request according to the retry policy.
+
+        The backoff delay is awaited in a detached task so the worker is
+        freed immediately and other requests keep flowing. The retried
+        request re-enters the pending queue and is fetched through the
+        concurrency semaphores and throttler like any other request.
+        """
         req.retries += 1
         delay = self.retry_policy.get_delay(req)
 
@@ -321,7 +346,33 @@ class Crawler:
             extra={"url": req.url, "retry": req.retries, "delay": delay},
         )
 
-        if delay:
-            await asyncio.sleep(delay)
+        if delay and delay > 0:
+            task = asyncio.create_task(
+                self._delayed_requeue(req, delay), name="crawler-retry"
+            )
+            self._retry_tasks.add(task)
+            task.add_done_callback(self._retry_tasks.discard)
+        else:
+            self._requeue(req)
 
-        self.submit(req)
+    async def _delayed_requeue(self, req: Request, delay: float) -> None:
+        """Wait out the backoff delay, then re-enqueue the request."""
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            # Shutting down: the crawler is closed and consumers are gone.
+            log.debug("retry cancelled during shutdown", extra={"url": req.url})
+            raise
+        self._requeue(req)
+
+    def _requeue(self, req: Request) -> None:
+        """Put a retried request back on the pending queue."""
+        if self._closed:
+            # Never drop a request silently: emit a terminal error response.
+            log.warning("crawler closed before retry", extra={"url": req.url})
+            self._results.put_nowait(
+                Response(req, 0, b"",
+                         error=RuntimeError("crawler closed before retry"))
+            )
+            return
+        self._pending.put_nowait(req)
