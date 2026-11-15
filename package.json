@@ -1,0 +1,89 @@
+{
+  "name": "@just-every/mcp-read-website-fast",
+  "version": "0.1.37",
+  "description": "Markdown Content Preprocessor - Fetch web pages, extract content, convert to clean Markdown",
+  "main": "dist/index.js",
+  "bin": {
+    "mcp-read-website-fast": "bin/mcp-read-website.js"
+  },
+  "files": [
+    "dist/**/*",
+    "bin/**/*",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.prod.json",
+    "build:dev": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "serve": "node dist/serve-restart.js",
+    "serve:dev": "tsx src/serve.ts",
+    "test": "vitest",
+    "test:deploy": "vitest run test/deployment.test.ts",
+    "lint": "eslint src",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "markdown",
+    "web-scraper",
+    "readability",
+    "content-extraction",
+    "rag",
+    "llm",
+    "claude",
+    "cursor",
+    "vscode"
+  ],
+  "author": "Just Every",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/just-every/mcp-read-website-fast.git"
+  },
+  "bugs": {
+    "url": "https://github.com/just-every/mcp-read-website-fast/issues"
+  },
+  "homepage": "https://github.com/just-every/mcp-read-website-fast#readme",
+  "license": "MIT",
+  "dependencies": {
+    "@just-every/crawl": "^1.0.8",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "commander": "^14.0.3",
+    "turndown-plugin-gfm": "^1.0.2",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^28.0.1",
+    "@types/node": "^25.5.2",
+    "@types/turndown": "^5.0.6",
+    "@typescript-eslint/eslint-plugin": "^8.58.0",
+    "@typescript-eslint/parser": "^8.58.0",
+    "eslint": "^9.39.4",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-prettier": "^5.5.5",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2",
+    "typescript-eslint": "^8.58.0",
+    "vitest": "^4.1.11"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "type": "module",
+  "overrides": {
+    "esbuild": "0.28.1",
+    "js-yaml": "4.3.2",
+    "undici": "7.29.1",
+    "vite": "6.4.3",
+    "ws": "8.21.0",
+    "hono": "4.13.5",
+    "fast-uri": "3.1.7",
+    "@humanfs/node": "0.16.8",
+    "qs": "6.16.0",
+    "ip-address": "10.5.1"
+  }
+}
