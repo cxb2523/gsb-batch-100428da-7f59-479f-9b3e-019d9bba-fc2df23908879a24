@@ -37,6 +37,12 @@ validate-website \- Web crawler for checking the validity of your documents
 validate\-website is a web crawler for checking the markup validity with XML
 Schema / DTD and not found urls.
 HTML5 support with Validator.nu Web Service.
+.sp
+\fB\-e\fP, \fB\-\-exclude\fP \fIEXCLUDE\fP applies to every url source: html links, img
+\fBsrc\fP and css \fBurl()\fP. At the end of the crawl, urls which were never visited
+are listed after the status line, once per url, with the reason (\fIexclude\fP or
+\fIfailure\fP plus the original error) and every page which referenced them.
+This listing does not change the exit status.
 .SH "OPTIONS"
 .sp
 \fB\-s\fP, \fB\-\-site\fP \fISITE\fP

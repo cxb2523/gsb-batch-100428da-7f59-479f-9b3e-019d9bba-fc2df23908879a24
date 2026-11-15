@@ -33,6 +33,20 @@ module ValidateWebsite
       end
     end
 
+    # Extract img urls from an html page
+    #
+    # @param [Spidr::Page] page an Spidr::Page object
+    # @return [Set] Lists of absolute urls
+    #
+    def self.extract_imgs_from_page(page)
+      return Set[] if page.is_redirect?
+
+      page.doc.search('//img[@src]').reduce(Set[]) do |result, elem|
+        u = elem.attributes['src'].content
+        result << page.to_absolute(URI.parse(WEBrick::HTTPUtils.escape(u)))
+      end
+    end
+
     # Extract urls from Crass nodes
     # @param [Array] Array of nodes from Crass
     # @param [Spidr::Page] a Spidr::Page object

@@ -15,6 +15,12 @@ validate-website is a web crawler for checking the markup validity with XML
 Schema / DTD and not found urls.
 HTML5 support with Validator.nu Web Service.
 
+*-e*, *--exclude* 'EXCLUDE' applies to every url source: html links, img
+*src* and css *url()*. At the end of the crawl, urls which were never visited
+are listed after the status line, once per url, with the reason ('exclude' or
+'failure' plus the original error) and every page which referenced them.
+This listing does not change the exit status.
+
 OPTIONS
 -------
 *-s*, *--site* 'SITE'::
