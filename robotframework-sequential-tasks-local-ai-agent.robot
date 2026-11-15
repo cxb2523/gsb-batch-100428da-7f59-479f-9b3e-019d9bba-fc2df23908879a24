@@ -22,6 +22,9 @@ Run Tasks From Local Goose AI Agent
     [Arguments]    ${GOOSE_AI_PROMPT}    ${INSTRUCTION_TYPE}    ${REPORT_NUMBER}
     ${TIMESTAMP}=    Get Current Date    result_format=%Y_%m_%d_%H-%M-%S-%f
     Set Suite Variable    ${TIMESTAMP}
-    Run Goose AI Based On Instruction Type    ${GOOSE_AI_PROMPT}    ${INSTRUCTION_TYPE}
-    Create Local Agent Report    ${REPORT_NUMBER}
+    ${REPORT_STEM}=    Set Variable    local-agent-report${REPORT_NUMBER}
+    Run Goose AI Based On Instruction Type    ${GOOSE_AI_PROMPT}    ${INSTRUCTION_TYPE}    ${REPORT_STEM}
+    IF    $AGENT_OUTCOME['status'] == 'SUCCESS'
+        Create Local Agent Report    ${REPORT_NUMBER}
+    END
     Display Goose AI Logs

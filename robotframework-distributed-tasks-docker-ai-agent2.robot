@@ -7,6 +7,10 @@ Library                   String
 Library     DataDriver    ${EXECDIR}/agent-instructions/docker-agent2-distributed-instructions.csv    dialect=unix    include=${INCLUDED_TAG}
 Test Template    Run Tasks From Goose AI Agent
 
+*** Variables ***
+
+${AI_AGENT_OUTPUT_FOLDER}    automation-resources/ai-agent-output-collector/ai-agent-output
+
 *** Tasks ***
 
 DISTRIBUTED RPA AI-AGENT2 TASKS : Run datadriven AI-Agent tasks with this data -> container_name = ${DOCKER_CONTAINER_NAME}, prompt_message = ${GOOSE_AI_PROMPT}, docker_agent2_report_number = ${REPORT_NUMBER}
@@ -16,5 +20,8 @@ DISTRIBUTED RPA AI-AGENT2 TASKS : Run datadriven AI-Agent tasks with this data -
 Run Tasks From Goose AI Agent
     [Arguments]    ${DOCKER_CONTAINER_NAME}    ${GOOSE_AI_PROMPT}    ${REPORT_NUMBER}
     ${TIMESTAMP}=    Get Current Date    result_format=%Y_%m_%d_%H-%M-%S-%f
-    Wait Until Docker Goose AI Prompt Succeeds    ${DOCKER_CONTAINER_NAME}    ${GOOSE_AI_PROMPT} write a detailed summary of that work in an docker-agent2-report${REPORT_NUMBER}-${TIMESTAMP}.md file and ${GOOSE_AI_DOCKER_OUTPUT_COLLECTOR}    npx -y @modelcontextprotocol/server-memory    npx -y @modelcontextprotocol/server-sequential-thinking
+    Set Suite Variable    ${TIMESTAMP}
+    ${REPORT_STEM}=    Set Variable    docker-agent2-report${REPORT_NUMBER}
+    ${OUTCOME}=    Collect Docker Goose AI Outcome    ${DOCKER_CONTAINER_NAME}    ${GOOSE_AI_PROMPT} write a detailed summary of that work in an docker-agent2-report${REPORT_NUMBER}-${TIMESTAMP}.md file and ${GOOSE_AI_DOCKER_OUTPUT_COLLECTOR}    npx -y @modelcontextprotocol/server-memory    npx -y @modelcontextprotocol/server-sequential-thinking    ${REPORT_STEM}
+    Handle Agent Outcome    ${OUTCOME}    ${REPORT_STEM}
     Display Goose AI Logs
