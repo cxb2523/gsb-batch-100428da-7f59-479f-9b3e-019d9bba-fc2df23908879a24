@@ -18,7 +18,8 @@ app/
 └── v2/
     ├── __init__.py        PREFIX = "/v2"
     ├── routes.py          endpoint definitions only
-    ├── scraper.py         scrape(): fetch a page, map errors, wrap the response
+    ├── scraper.py         scrape(): fetch a page, map errors, wrap the response;
+    │                      scrape_full(): detail page plus the cast/episodes/reviews fan-out
     ├── errors.py          MDLError and the exception handler
     └── parsers/
         ├── __init__.py    re-exports every parse_* function
@@ -35,6 +36,7 @@ tests/
 ├── test_main.py           v1 endpoints
 ├── test_fetch_dramalist.py
 ├── test_v2.py             v2 endpoints and parsers
+├── test_v2_full.py        offline tests for the /full aggregate endpoint (faked client.get)
 ├── test_regressions.py    offline tests with MDL faked (URL safety, errors, cache, parser edge cases)
 ├── conftest.py            blocks real MDL requests in any test not marked `live`
 └── fixture/               saved MDL pages for offline parser tests
@@ -51,6 +53,18 @@ GET /v2/dramas/18452-goblin
        -> non-200?  raise MDLError     (errors.py turns it into the error body)
        -> parse_drama(soup)            pure function: soup -> dict
   -> {"success": true, "data": ..., "link": ..., "scraped_at": ...}
+```
+
+`GET /v2/dramas/{slug}/full` uses `scraper.scrape_full()`:
+
+```
+GET /v2/dramas/18452-goblin/full
+  -> scraper.scrape_full(segment("18452-goblin"))
+       -> _fetch + _check the detail page first; failure raises like scrape()
+       -> asyncio.gather over cast/episodes/reviews, each via the same client.get
+       -> a sub page MDLError is caught per section: data null + sections error entry
+  -> {"success": true, "data": {details, cast, episodes, reviews},
+      "sections": {...per section status/http/message...}, "link": ..., "scraped_at": ...}
 ```
 
 Each module has one job:

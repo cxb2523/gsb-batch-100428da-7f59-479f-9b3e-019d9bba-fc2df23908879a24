@@ -89,6 +89,35 @@ def test_drama_subpages() -> None:
 
 
 @pytest.mark.live
+def test_drama_full() -> None:
+    r = client.get("/v2/dramas/18452-goblin/full")
+    assert r.status_code == 200
+    body = r.json()
+    assert set(body) == {"success", "data", "sections", "link", "scraped_at"}
+    assert body["link"] == "https://mydramalist.com/18452-goblin"
+
+    data, sections = body["data"], body["sections"]
+    assert set(data) == {"details", "cast", "episodes", "reviews"}
+    assert set(sections) == set(data)
+
+    # the detail page is required and carries the same payload as the solo endpoint
+    assert sections["details"] == {
+        "status": "ok",
+        "http": 200,
+        "message": "OK",
+    }
+    assert data["details"]["id"] == 18452
+
+    # a null section is reported as an error, and an error section is null
+    for name, status in sections.items():
+        if status["status"] == "ok":
+            assert data[name] is not None
+        else:
+            assert data[name] is None
+            assert status["http"] >= 400 and status["message"]
+
+
+@pytest.mark.live
 def test_unknown_drama() -> None:
     r = client.get("/v2/dramas/alkdjaklsdjklasd")
     assert r.status_code == 404

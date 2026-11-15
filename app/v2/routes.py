@@ -4,7 +4,7 @@ from fastapi import APIRouter, Query
 
 from app.client import segment
 from app.v2 import PREFIX, parsers
-from app.v2.scraper import scrape
+from app.v2.scraper import scrape, scrape_full
 
 router = APIRouter(prefix=PREFIX, tags=["v2"])
 
@@ -19,6 +19,11 @@ async def search(q: str = Query(..., min_length=1), page: int = Page) -> dict[st
 @router.get("/dramas/{slug}")
 async def drama(slug: str) -> dict[str, Any]:
     return await scrape(segment(slug), parsers.parse_drama)
+
+
+@router.get("/dramas/{slug}/full")
+async def drama_full(slug: str) -> dict[str, Any]:
+    return await scrape_full(segment(slug))
 
 
 @router.get("/dramas/{slug}/cast")

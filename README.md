@@ -65,6 +65,7 @@ Scrapes MyDramaList on request and returns clean, typed JSON.
 | --- | --- |
 | `GET /v2/search?q={query}&page=1` | Search dramas and people |
 | `GET /v2/dramas/{slug}` | Drama info |
+| `GET /v2/dramas/{slug}/full` | Drama info plus cast, episodes and the first reviews page in one response |
 | `GET /v2/dramas/{slug}/cast` | Full cast and crew, grouped by role |
 | `GET /v2/dramas/{slug}/episodes` | Episodes |
 | `GET /v2/dramas/{slug}/reviews?page=1` | Reviews |
