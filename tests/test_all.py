@@ -706,6 +706,294 @@ class ZyteSmartProxyMiddlewareTestCase(TestCase):
         self.assertTrue(mw._is_banned(res))
 
     @patch("random.uniform")
+    def test_backoff_per_slot_is_independent(self, random_uniform_patch):
+        # mock random.uniform to just return the max delay
+        random_uniform_patch.side_effect = lambda x, y: y
+
+        backoff_step = 15
+        max_delay = 70
+
+        self.settings["ZYTE_SMARTPROXY_BACKOFF_STEP"] = backoff_step
+        self.settings["ZYTE_SMARTPROXY_BACKOFF_MAX"] = max_delay
+
+        self.spider.zyte_smartproxy_enabled = True
+        crawler = self._mock_crawler(self.spider, self.settings)
+        mw = self.mwcls.from_crawler(crawler)
+        mw.open_spider(self.spider)
+
+        slot_a = MockedSlot()
+        slot_b = MockedSlot()
+        crawler.engine.downloader.slots["slot_a"] = slot_a
+        crawler.engine.downloader.slots["slot_b"] = slot_b
+
+        def throttle(slot_key):
+            request = Request("http://example.com", meta={"download_slot": slot_key})
+            response = self._mock_zyte_smartproxy_response(
+                "http://example.com",
+                status=503,
+                headers={"X-Crawlera-Error": "noslaves"},
+            )
+            mw.process_response(request, response, self.spider)
+
+        def succeed(slot_key):
+            request = Request("http://example.com", meta={"download_slot": slot_key})
+            response = self._mock_zyte_smartproxy_response(
+                "http://example.com", status=200
+            )
+            mw.process_response(request, response, self.spider)
+
+        # Throttling slot A only raises the backoff of slot A.
+        throttle("slot_a")
+        self.assertEqual(slot_a.delay, backoff_step)
+        self.assertEqual(slot_b.delay, 0)
+        self.assertEqual(mw._backoff_levels["slot_a"], 1)
+        self.assertEqual(mw._backoff_levels["slot_b"], 0)
+
+        # Throttling slot B starts from the first backoff level, and does not
+        # inherit the level reached by slot A.
+        throttle("slot_b")
+        self.assertEqual(slot_a.delay, backoff_step)
+        self.assertEqual(slot_b.delay, backoff_step)
+
+        # Alternating throttles increase each slot's level independently.
+        throttle("slot_a")
+        self.assertEqual(slot_a.delay, backoff_step * 2**1)
+        self.assertEqual(slot_b.delay, backoff_step)
+        throttle("slot_b")
+        self.assertEqual(slot_a.delay, backoff_step * 2**1)
+        self.assertEqual(slot_b.delay, backoff_step * 2**1)
+
+        # A successful response only resets the backoff of its own slot.
+        succeed("slot_a")
+        self.assertEqual(slot_a.delay, 0)
+        self.assertEqual(mw._backoff_levels["slot_a"], 0)
+        self.assertEqual(mw._backoff_levels["slot_b"], 2)
+
+        # Slot A restarts from the first level, slot B keeps escalating.
+        throttle("slot_a")
+        self.assertEqual(slot_a.delay, backoff_step)
+        throttle("slot_b")
+        self.assertEqual(slot_b.delay, backoff_step * 2**2)
+
+        # Per-slot stats exist and do not alter the meaning of global stats.
+        stats = crawler.stats
+        self.assertEqual(
+            stats.get_value("zyte_smartproxy/delay/backoff/level/slot_a"), 1
+        )
+        self.assertEqual(
+            stats.get_value("zyte_smartproxy/delay/backoff/level/slot_b"), 3
+        )
+        self.assertEqual(
+            stats.get_value("zyte_smartproxy/delay/backoff/throttle/slot_a"), 3
+        )
+        self.assertEqual(
+            stats.get_value("zyte_smartproxy/delay/backoff/throttle/slot_b"), 3
+        )
+        self.assertEqual(stats.get_value("zyte_smartproxy/delay/reset_backoff"), 1)
+        self.assertEqual(stats.get_value("zyte_smartproxy/delay/noslaves"), 6)
+
+    @patch("random.uniform")
+    def test_backoff_single_slot_keeps_escalating(self, random_uniform_patch):
+        # mock random.uniform to just return the max delay
+        random_uniform_patch.side_effect = lambda x, y: y
+
+        backoff_step = 15
+        max_delay = 70
+        slot_key = "example.com"
+
+        self.settings["ZYTE_SMARTPROXY_BACKOFF_STEP"] = backoff_step
+        self.settings["ZYTE_SMARTPROXY_BACKOFF_MAX"] = max_delay
+
+        self.spider.zyte_smartproxy_enabled = True
+        crawler = self._mock_crawler(self.spider, self.settings)
+        mw = self.mwcls.from_crawler(crawler)
+        mw.open_spider(self.spider)
+
+        slot = MockedSlot()
+        crawler.engine.downloader.slots[slot_key] = slot
+
+        request = Request("http://example.com", meta={"download_slot": slot_key})
+
+        expected_delays = [
+            backoff_step,
+            backoff_step * 2**1,
+            backoff_step * 2**2,
+            max_delay,
+            max_delay,
+        ]
+        for level, expected_delay in enumerate(expected_delays, start=1):
+            response = self._mock_zyte_smartproxy_response(
+                "http://example.com",
+                status=429,
+                headers={"Zyte-Error-Type": "/limits/over-domain-limit"},
+            )
+            mw.process_response(request, response, self.spider)
+            self.assertEqual(slot.delay, expected_delay)
+            self.assertEqual(mw._backoff_levels[slot_key], level)
+
+        stats = crawler.stats
+        self.assertEqual(
+            stats.get_value("zyte_smartproxy/delay/backoff/level/{}".format(slot_key)),
+            len(expected_delays),
+        )
+        self.assertEqual(
+            stats.get_value(
+                "zyte_smartproxy/delay/backoff/throttle/{}".format(slot_key)
+            ),
+            len(expected_delays),
+        )
+
+    @patch("random.uniform")
+    def test_backoff_success_resets_only_its_slot(self, random_uniform_patch):
+        # mock random.uniform to just return the max delay
+        random_uniform_patch.side_effect = lambda x, y: y
+
+        backoff_step = 15
+        max_delay = 70
+
+        self.settings["ZYTE_SMARTPROXY_BACKOFF_STEP"] = backoff_step
+        self.settings["ZYTE_SMARTPROXY_BACKOFF_MAX"] = max_delay
+
+        self.spider.zyte_smartproxy_enabled = True
+        crawler = self._mock_crawler(self.spider, self.settings)
+        mw = self.mwcls.from_crawler(crawler)
+        mw.open_spider(self.spider)
+
+        slot_a = MockedSlot()
+        slot_b = MockedSlot()
+        crawler.engine.downloader.slots["slot_a"] = slot_a
+        crawler.engine.downloader.slots["slot_b"] = slot_b
+
+        def response_for(slot_key, status, headers=None):
+            request = Request("http://example.com", meta={"download_slot": slot_key})
+            response = self._mock_zyte_smartproxy_response(
+                "http://example.com", status=status, headers=headers
+            )
+            mw.process_response(request, response, self.spider)
+
+        # Raise both slots to level 2.
+        for slot_key in ("slot_a", "slot_b"):
+            for _ in range(2):
+                response_for(slot_key, 503, {"X-Crawlera-Error": "noslaves"})
+        self.assertEqual(slot_a.delay, backoff_step * 2**1)
+        self.assertEqual(slot_b.delay, backoff_step * 2**1)
+
+        # A success for slot A resets only slot A.
+        response_for("slot_a", 200)
+        self.assertEqual(slot_a.delay, 0)
+        self.assertEqual(mw._backoff_levels["slot_a"], 0)
+        self.assertEqual(mw._backoff_levels["slot_b"], 2)
+
+        response_for("slot_a", 503, {"X-Crawlera-Error": "noslaves"})
+        self.assertEqual(slot_a.delay, backoff_step)
+        response_for("slot_b", 503, {"X-Crawlera-Error": "noslaves"})
+        self.assertEqual(slot_b.delay, backoff_step * 2**2)
+
+    @patch("random.uniform")
+    def test_backoff_falls_back_to_url_netloc(self, random_uniform_patch):
+        # mock random.uniform to just return the max delay
+        random_uniform_patch.side_effect = lambda x, y: y
+
+        backoff_step = 15
+
+        self.settings["ZYTE_SMARTPROXY_BACKOFF_STEP"] = backoff_step
+
+        self.spider.zyte_smartproxy_enabled = True
+        crawler = self._mock_crawler(self.spider, self.settings)
+        mw = self.mwcls.from_crawler(crawler)
+        mw.open_spider(self.spider)
+
+        def throttle(url):
+            # No ``download_slot`` meta key, so the URL netloc is used.
+            request = Request(url)
+            response = self._mock_zyte_smartproxy_response(
+                url,
+                status=503,
+                headers={"X-Crawlera-Error": "noslaves"},
+            )
+            mw.process_response(request, response, self.spider)
+
+        throttle("http://a.example")
+        throttle("http://b.example")
+        throttle("http://a.example")
+
+        self.assertEqual(mw._backoff_levels["a.example"], 2)
+        self.assertEqual(mw._backoff_levels["b.example"], 1)
+
+        stats = crawler.stats
+        self.assertEqual(
+            stats.get_value("zyte_smartproxy/delay/backoff/level/a.example"), 2
+        )
+        self.assertEqual(
+            stats.get_value("zyte_smartproxy/delay/backoff/throttle/b.example"), 1
+        )
+
+    @patch("random.uniform")
+    def test_backoff_stats_prefix_for_zyte_api(self, random_uniform_patch):
+        # mock random.uniform to just return the max delay
+        random_uniform_patch.side_effect = lambda x, y: y
+
+        settings = copy(self.settings)
+        settings["ZYTE_SMARTPROXY_URL"] = "http://api.zyte.com:8011"
+        self.spider.zyte_smartproxy_enabled = True
+        crawler = self._mock_crawler(self.spider, settings)
+        mw = self.mwcls.from_crawler(crawler)
+        mw.open_spider(self.spider)
+
+        crawler.engine.downloader.slots["example.com"] = MockedSlot()
+
+        request = Request("http://example.com", meta={"download_slot": "example.com"})
+        response = self._mock_zyte_smartproxy_response(
+            "http://example.com",
+            status=429,
+            headers={"Zyte-Error-Type": "/limits/over-user-limit"},
+        )
+        mw.process_response(request, response, self.spider)
+
+        stats = crawler.stats
+        self.assertEqual(
+            stats.get_value("zyte_api_proxy/delay/backoff/level/example.com"), 1
+        )
+        self.assertEqual(
+            stats.get_value("zyte_api_proxy/delay/backoff/throttle/example.com"), 1
+        )
+        self.assertEqual(
+            stats.get_value("zyte_smartproxy/delay/backoff/level/example.com"), None
+        )
+
+    @patch("random.uniform")
+    def test_backoff_stats_not_added_for_unproxied_requests(self, random_uniform_patch):
+        # mock random.uniform to just return the max delay
+        random_uniform_patch.side_effect = lambda x, y: y
+
+        self.spider.zyte_smartproxy_enabled = True
+        crawler = self._mock_crawler(self.spider, self.settings)
+        mw = self.mwcls.from_crawler(crawler)
+        mw.open_spider(self.spider)
+
+        crawler.engine.downloader.slots["example.com"] = MockedSlot()
+
+        # dont_proxy=True means the request is not handled by the plugin.
+        request = Request(
+            "http://example.com",
+            meta={"download_slot": "example.com", "dont_proxy": True},
+        )
+        response = self._mock_zyte_smartproxy_response(
+            "http://example.com",
+            status=429,
+            headers={"Zyte-Error-Type": "/limits/over-user-limit"},
+        )
+        mw.process_response(request, response, self.spider)
+
+        self.assertEqual(mw._backoff_levels["example.com"], 0)
+        self.assertNotIn("example.com", mw._backoff_sequences)
+        stats = crawler.stats.get_stats()
+        self.assertFalse(
+            any("delay/backoff" in key for key in stats),
+            stats,
+        )
+
+    @patch("random.uniform")
     def test_noslaves_delays(self, random_uniform_patch):
         # mock random.uniform to just return the max delay
         random_uniform_patch.side_effect = lambda x, y: y

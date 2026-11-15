@@ -67,6 +67,9 @@ Default: ``15``
 
 Step size used for calculating exponential backoff according to the formula: ``random.uniform(0, min(max, step * 2 ** attempt))``.
 
+The backoff sequence is tracked separately for each download slot, so that
+throttling on one site does not affect the delays of other sites.
+
 ZYTE_SMARTPROXY_BACKOFF_MAX
 ---------------------------
 

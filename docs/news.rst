@@ -3,6 +3,18 @@
 Changes
 =======
 
+v2.5.0 (unreleased)
+-------------------
+
+Exponential backoff is now tracked per download slot (``download_slot`` request
+metadata, or the URL netloc when it is unset) instead of globally. Throttling on
+one site no longer slows down other sites, and a successful response only resets
+the backoff of its own site.
+
+Added per-slot stats, ``<prefix>/delay/backoff/level/<slot>`` and
+``<prefix>/delay/backoff/throttle/<slot>``, to help tell which site is being
+throttled.
+
 v2.4.1 (2025-03-24)
 -------------------
 

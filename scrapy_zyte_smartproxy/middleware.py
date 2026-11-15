@@ -37,7 +37,6 @@ class ZyteSmartProxyMiddleware(object):
     conflicting_headers = ("X-Crawlera-Profile", "X-Crawlera-UA")
     backoff_step = 15
     backoff_max = 180
-    exp_backoff = None
     max_auth_retry_times = 10
     apikey = ""
 
@@ -47,6 +46,10 @@ class ZyteSmartProxyMiddleware(object):
         self.spider = None
         self._bans = defaultdict(int)
         self._saved_delays = defaultdict(lambda: None)
+        # Exponential backoff sequences and levels are tracked per download
+        # slot, so that throttling on one site does not slow down other sites.
+        self._backoff_sequences = defaultdict(self._make_backoff_sequence)
+        self._backoff_levels = defaultdict(int)
         self._auth_url = None
         self.enabled_for_domain = {}  # type: Dict[str, bool]
         self.force_enable_on_http_codes = []  # type: List[int]
@@ -110,11 +113,12 @@ class ZyteSmartProxyMiddleware(object):
         for k, type_ in self._settings:
             setattr(self, k, self._get_setting_value(spider, k, type_))
 
+        self._backoff_sequences.clear()
+        self._backoff_levels.clear()
         self._fix_url_protocol()
         self._headers = self.crawler.settings.get(
             "ZYTE_SMARTPROXY_DEFAULT_HEADERS", {}
         ).items()
-        self.exp_backoff = exp_backoff(self.backoff_step, self.backoff_max)
 
         if not self.enabled and not self.force_enable_on_http_codes:
             return
@@ -255,6 +259,10 @@ class ZyteSmartProxyMiddleware(object):
         prefix = "zyte_api_proxy" if targets_zyte_api else "zyte_smartproxy"
         self.crawler.stats.inc_value("{}/{}".format(prefix, stat), value)
 
+    def _set_stat(self, stat, value, targets_zyte_api):
+        prefix = "zyte_api_proxy" if targets_zyte_api else "zyte_smartproxy"
+        self.crawler.stats.set_value("{}/{}".format(prefix, stat), value)
+
     def process_request(self, request, spider):
         if self._is_enabled_for_request(request):
             if "proxy" not in request.meta:
@@ -344,6 +352,7 @@ class ZyteSmartProxyMiddleware(object):
             return response
 
         key = self._get_slot_key(request)
+        backoff_slot = self._get_backoff_slot(request)
         self._restore_original_delay(request)
 
         is_auth_error = self._is_auth_error(response)
@@ -354,15 +363,20 @@ class ZyteSmartProxyMiddleware(object):
             else:
                 assert throttle_error
                 reason = throttle_error.lstrip("/")
+            delay = self._next_backoff_delay(
+                backoff_slot, targets_zyte_api=targets_zyte_api
+            )
+            if throttle_error:
+                self._inc_throttle_stat(backoff_slot, targets_zyte_api=targets_zyte_api)
             self._set_custom_delay(
                 request,
-                next(self.exp_backoff),
+                delay,
                 reason=reason,
                 targets_zyte_api=targets_zyte_api,
             )
         else:
             self._inc_stat("delay/reset_backoff", targets_zyte_api=targets_zyte_api)
-            self.exp_backoff = exp_backoff(self.backoff_step, self.backoff_max)
+            self._reset_backoff(backoff_slot, targets_zyte_api=targets_zyte_api)
 
         if is_auth_error:
             # When Zyte Smart Proxy Manager has issues it might not be able to
@@ -484,6 +498,51 @@ class ZyteSmartProxyMiddleware(object):
 
     def _get_slot_key(self, request):
         return request.meta.get("download_slot")
+
+    def _get_backoff_slot(self, request):
+        """Return the download slot that a request belongs to.
+
+        Falls back to the URL netloc when the ``download_slot`` request meta
+        key is not set.
+        """
+        slot = request.meta.get("download_slot")
+        if slot is not None:
+            return slot
+        return self._get_url_domain(request.url)
+
+    def _make_backoff_sequence(self):
+        return exp_backoff(self.backoff_step, self.backoff_max)
+
+    def _next_backoff_delay(self, slot, targets_zyte_api):
+        """Get the next backoff delay for a slot and track its level."""
+        delay = next(self._backoff_sequences[slot])
+        self._backoff_levels[slot] += 1
+        self._set_stat(
+            "delay/backoff/level/{}".format(slot),
+            self._backoff_levels[slot],
+            targets_zyte_api=targets_zyte_api,
+        )
+        return delay
+
+    def _inc_throttle_stat(self, slot, targets_zyte_api):
+        self._inc_stat(
+            "delay/backoff/throttle/{}".format(slot),
+            targets_zyte_api=targets_zyte_api,
+        )
+
+    def _reset_backoff(self, slot, targets_zyte_api):
+        """Reset the backoff sequence and level of a single slot."""
+        if not self._backoff_levels.get(slot):
+            # Never throttled, nothing to reset. Avoid creating entries for
+            # slots that never back off.
+            return
+        self._backoff_sequences[slot] = self._make_backoff_sequence()
+        self._backoff_levels[slot] = 0
+        self._set_stat(
+            "delay/backoff/level/{}".format(slot),
+            0,
+            targets_zyte_api=targets_zyte_api,
+        )
 
     def _get_slot(self, request):
         key = self._get_slot_key(request)
