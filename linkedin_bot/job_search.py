@@ -6,6 +6,7 @@ reduces CC by extracting helper functions.
 
 import uuid
 from dataclasses import dataclass
+from enum import StrEnum
 from urllib.parse import urlencode
 
 from playwright.async_api import ElementHandle, Page
@@ -16,6 +17,11 @@ from linkedin_bot.logger import get_logger
 log = get_logger("job_search")
 
 JOBS_BASE_URL = "https://www.linkedin.com/jobs/search/?"
+
+# Prefix for identifiers of cards whose details could not be extracted.
+# Real LinkedIn job_ids are numeric, so this prefix keeps placeholders
+# distinguishable from genuine job_ids.
+FAILED_CARD_ID_PREFIX = "failed-card-"
 
 EXPERIENCE_MAP = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6"}
 DATE_POSTED_MAP = {1: "r86400", 2: "r604800", 3: "r2592000"}
@@ -72,6 +78,68 @@ class JobListing:
     url: str
     is_easy_apply: bool
     already_applied: bool
+
+
+class PageOutcome(StrEnum):
+    """Verifiable end state of scraping one search results page.
+
+    COMPLETE: every card on the page was extracted successfully.
+    PARTIAL_FAILURE: the container appeared but one or more cards failed
+        extraction; any successful listings are still returned, and the
+        all-cards-failed case is reported here with zero successes.
+    CONTAINER_MISSING: the results container never appeared, so the page
+        could not be scraped at all.
+    """
+
+    COMPLETE = "complete"
+    PARTIAL_FAILURE = "partial_failure"
+    CONTAINER_MISSING = "container_missing"
+
+
+@dataclass(frozen=True, slots=True)
+class FailedCard:
+    """A card whose detail extraction failed.
+
+    Attributes:
+        position: Zero-based position of the card on the page.
+        identifier: Placeholder identifier (FAILED_CARD_ID_PREFIX-based),
+            never a real numeric job_id.
+        error: String form of the exception that aborted extraction.
+    """
+
+    position: int
+    identifier: str
+    error: str
+
+
+@dataclass(frozen=True, slots=True)
+class PageExtractionResult:
+    """Outcome of scraping one search results page.
+
+    Attributes:
+        outcome: Page-level end state (complete / partial / missing).
+        listings: Successfully extracted JobListing objects. Failed cards
+            are never represented here, so no failure can be mistaken for
+            a real job downstream.
+        expected_card_count: Number of cards found on the page before
+            extraction (the number that should have been processed).
+        success_count: Number of successfully extracted cards.
+        failure_count: Number of cards whose extraction raised or returned
+            no listing.
+        failed_cards: Per-card failure details with positions/identifiers.
+    """
+
+    outcome: PageOutcome
+    listings: tuple[JobListing, ...] = ()
+    expected_card_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
+    failed_cards: tuple[FailedCard, ...] = ()
+
+    @property
+    def has_success(self) -> bool:
+        """True when at least one card was extracted successfully."""
+        return self.success_count > 0
 
 
 def build_search_url(
@@ -259,26 +327,62 @@ async def _extract_description(page: Page) -> str:
     return ""
 
 
-async def get_job_listings(page: Page, max_jobs: int = 25) -> list[JobListing]:
+def _card_placeholder_id(card: ElementHandle, position: int) -> str:
+    """Build a placeholder identifier for a card that failed extraction.
+
+    Uses the card's own job-id attributes when readable so failures can be
+    cross-checked against the page, otherwise falls back to the card
+    position. The result always carries FAILED_CARD_ID_PREFIX, so it can
+    never be confused with a real numeric LinkedIn job_id.
+
+    Args:
+        card: Playwright element handle for the failed job card.
+        position: Zero-based position of the card on the page.
+
+    Returns:
+        Placeholder identifier string, distinguishable from real job_ids.
+    """
+    raw_marker: str | None = None
+    try:
+        raw_marker = card.get_attribute("data-occludable-job-id")
+        if not raw_marker:
+            raw_marker = card.get_attribute("data-job-id")
+        if not raw_marker:
+            urn = card.get_attribute("data-occludable-entity-urn")
+            if urn:
+                # urn:li:jobPosting:1234567890 -> 1234567890
+                raw_marker = urn.rsplit(":", 1)[-1]
+    except Exception as attr_exc:
+        log.debug("failed_card_attribute_read", position=position, error=str(attr_exc))
+
+    marker = raw_marker.strip() if raw_marker and raw_marker.strip() else f"pos-{position}"
+    return f"{FAILED_CARD_ID_PREFIX}{marker}"
+
+
+async def get_job_listings(page: Page, max_jobs: int = 25) -> PageExtractionResult:
     """Extract job listings from the current search results page.
 
-    Scrolls to load lazy-loaded cards, extracts details for each,
-    and detects if the user has already applied.
+    Scrolls to load lazy-loaded cards, extracts details for each, and
+    detects if the user has already applied. Every card is processed
+    independently: a failure on one card is recorded but never aborts
+    the page, never removes already-extracted listings, and is never
+    turned into a fake successful listing.
 
     Args:
         page: Playwright page instance (on a search results page).
         max_jobs: Maximum number of jobs to extract per page.
 
     Returns:
-        List of JobListing objects.
+        PageExtractionResult carrying the page outcome (complete,
+        partial failure, or missing results container), the successful
+        listings, and expected/success/failure counts with per-card
+        failure identifiers.
     """
-    listings: list[JobListing] = []
-
     await human_delay(2.0, 4.0)
 
     if not await _wait_for_results(page):
         log.warning("no_job_results_container")
-        return []
+        return PageExtractionResult(outcome=PageOutcome.CONTAINER_MISSING)
 
     await _scroll_job_list(page)
 
@@ -289,25 +393,76 @@ async def get_job_listings(page: Page, max_jobs: int = 25) -> list[JobListing]:
         if job_cards:
             break
 
-    log.info("job_cards_found", count=len(job_cards))
+    cards_to_process = job_cards[:max_jobs]
+    expected_count = len(cards_to_process)
+    log.info("job_cards_found", count=len(job_cards), processing=expected_count)
 
-    for card in job_cards[:max_jobs]:
+    listings: list[JobListing] = []
+    failed_cards: list[FailedCard] = []
+
+    for position, card in enumerate(cards_to_process):
         try:
             listing = await _extract_single_card(page, card)
-            if listing:
-                listings.append(listing)
-                log.debug(
-                    "job_extracted",
-                    title=listing.title[:40],
-                    company=listing.company,
-                    easy_apply=listing.is_easy_apply,
-                    already_applied=listing.already_applied,
-                )
         except Exception as exc:
-            log.warning("job_card_extraction_error", error=str(exc))
+            # Preserve the existing skip-on-error behavior while making
+            # the loss auditable at page level.
+            identifier = _card_placeholder_id(card, position)
+            log.warning(
+                "job_card_extraction_error",
+                position=position,
+                card=identifier,
+                error=str(exc),
+            )
+            failed_cards.append(
+                FailedCard(position=position, identifier=identifier, error=str(exc))
+            )
             continue
 
-    return listings
+        if listing is None:
+            identifier = _card_placeholder_id(card, position)
+            log.warning("job_card_extraction_empty", position=position, card=identifier)
+            failed_cards.append(
+                FailedCard(
+                    position=position,
+                    identifier=identifier,
+                    error="extraction returned no listing",
+                )
+            )
+            continue
+
+        listings.append(listing)
+        log.debug(
+            "job_extracted",
+            position=position,
+            title=listing.title[:40],
+            company=listing.company,
+            easy_apply=listing.is_easy_apply,
+            already_applied=listing.already_applied,
+        )
+
+    success_count = len(listings)
+    failure_count = len(failed_cards)
+    outcome = PageOutcome.PARTIAL_FAILURE if failure_count else PageOutcome.COMPLETE
+
+    result = PageExtractionResult(
+        outcome=outcome,
+        listings=tuple(listings),
+        expected_card_count=expected_count,
+        success_count=success_count,
+        failure_count=failure_count,
+        failed_cards=tuple(failed_cards),
+    )
+
+    log.info(
+        "page_extraction_summary",
+        outcome=outcome.value,
+        expected=expected_count,
+        succeeded=success_count,
+        failed=failure_count,
+        failed_cards=[failed.identifier for failed in failed_cards],
+    )
+
+    return result
 
 
 def _extract_job_id(url: str) -> str:

@@ -27,6 +27,7 @@ from linkedin_bot.enums import ApplicationStatus
 from linkedin_bot.exceptions import BrowserDeadError
 from linkedin_bot.job_search import (
     JobListing,
+    PageOutcome,
     build_search_url,
     get_job_listings,
     should_skip_job,
@@ -402,11 +403,59 @@ async def _process_search_page(
             return total_applied, False, False
         return total_applied, True, False
 
-    listings = await get_job_listings(page)
-    if not listings:
+    extraction = await get_job_listings(page)
+
+    # The page-level outcome decides pagination, independent of later
+    # filtering: a missing results container or a page on which every
+    # card failed means we cannot trust further pages for this search.
+    if extraction.outcome is PageOutcome.CONTAINER_MISSING:
+        log.warning(
+            "pagination_stopped_container_missing",
+            keyword=keyword,
+            location=location,
+            page=page_num,
+        )
         if page_num == 0:
             console.print("  [dim]No jobs found[/]")
         return total_applied, True, False
+
+    if not extraction.has_success:
+        log.warning(
+            "pagination_stopped_zero_success",
+            keyword=keyword,
+            location=location,
+            page=page_num,
+            expected=extraction.expected_card_count,
+            failed=extraction.failure_count,
+            failed_cards=[failed.identifier for failed in extraction.failed_cards],
+        )
+        console.print(
+            "  [yellow]⚠ All "
+            f"{extraction.expected_card_count} card(s) on this page failed extraction; "
+            "stopping pagination for this search[/]"
+        )
+        return total_applied, True, False
+
+    if extraction.outcome is PageOutcome.PARTIAL_FAILURE:
+        # Successful listings are kept and processed normally; the lost
+        # cards are surfaced but do not stop the run or pagination.
+        log.warning(
+            "page_partial_failure_continuing",
+            keyword=keyword,
+            location=location,
+            page=page_num,
+            expected=extraction.expected_card_count,
+            succeeded=extraction.success_count,
+            failed=extraction.failure_count,
+            failed_cards=[failed.identifier for failed in extraction.failed_cards],
+        )
+        console.print(
+            f"  [yellow]⚠ {extraction.failure_count}/{extraction.expected_card_count} "
+            f"card(s) failed extraction; continuing with {extraction.success_count} "
+            "successful listing(s)[/]"
+        )
+
+    listings = list(extraction.listings)
 
     if page_num == 0:
         console.print(f"  [dim]Found {len(listings)} jobs[/]\n")

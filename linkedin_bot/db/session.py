@@ -4,6 +4,8 @@ Replaces global mutable state with a DatabaseManager singleton.
 Uses aiosqlite with WAL mode for concurrent reads.
 """
 
+from __future__ import annotations
+
 from collections.abc import AsyncGenerator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 
