@@ -449,6 +449,13 @@ def _state(relay, updater) -> dict:
         "storage_expected": getattr(relay, "_LAST_STORAGE_EXPECTED", 0),
         "storage_applied": getattr(relay, "_LAST_STORAGE_APPLIED_COUNT", 0),
         "storage_missing": len(getattr(relay, "_LAST_STORAGE_MISSING", []) or []),
+        "storage_refused": len(getattr(relay, "_LAST_STORAGE_REFUSED_ITEMS", []) or []),
+        # Cookie twin of the storage counters: NAMES only live in the relay,
+        # the diagnostic carries counts, never names or values.
+        "cookie_expected": getattr(relay, "_LAST_COOKIE_EXPECTED", 0),
+        "cookie_verified": getattr(relay, "_LAST_COOKIE_VERIFIED", 0),
+        "cookie_missing": len(getattr(relay, "_LAST_COOKIE_MISSING", []) or []),
+        "cookie_refused": len(getattr(relay, "_LAST_COOKIE_REFUSED_ITEMS", []) or []),
         "persisted_applied": getattr(relay, "_PERSISTED_APPLIED", False),
         "last_sync_origin": _short(last.get("origin")),
         "last_sync_cookies": len(last.get("cookies") or []),

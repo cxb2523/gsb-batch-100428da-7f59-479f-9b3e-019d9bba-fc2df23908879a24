@@ -424,21 +424,22 @@ class StorageVerificationTests(unittest.TestCase):
         ], {"user": "42", "token": "t"})
 
     def test_complete_snapshot_returns_verified_count(self):
-        cookies, storage = self._sync()
-        self.assertEqual(cookies, 1)
-        self.assertEqual(storage, 2)
+        report = self._sync()
+        self.assertTrue(report["complete"])
+        self.assertEqual(report["cookies"]["verified"], 1)
+        self.assertEqual(report["storage"]["verified"], 2)
 
-    def test_partial_snapshot_is_a_loud_failure(self):
+    def test_partial_snapshot_is_marked_incomplete_not_aborted(self):
         self._fake.missing_keys = 1
-        with self.assertRaises(RuntimeError) as ctx:
-            self._sync()
-        self.assertIn("incomplete", str(ctx.exception))
+        report = self._sync()
+        self.assertFalse(report["complete"])
+        self.assertTrue(report["storage"]["missing"])
 
     def test_failure_names_the_ratio_not_just_a_generic_error(self):
         self._fake.missing_keys = 2
-        with self.assertRaises(RuntimeError) as ctx:
-            self._sync()
-        self.assertIn("0/2", str(ctx.exception))
+        report = self._sync()
+        self.assertEqual(report["storage"]["verified"], 0)
+        self.assertEqual(report["storage"]["expected"], 2)
         # 4 tentatives d'ecriture ; le transport simule remet le compteur a 0
         # a chaque navigation (relance de la page entre deux tentatives).
         self.assertGreaterEqual(self._fake.storage_writes, 3)
@@ -446,29 +447,31 @@ class StorageVerificationTests(unittest.TestCase):
     def test_oversized_key_is_refused_by_name_not_dropped(self):
         cookie = {"name": "session", "value": "v", "domain": ".x.com",
                   "httpOnly": True, "secure": True}
-        with self.assertRaises(RuntimeError) as ctx:
-            server.set_session("https://x.com", [cookie],
-                               {"ok": "1", "huge": "x" * (server.MAX_VALUE_CHARS + 1)})
-        msg = str(ctx.exception)
-        self.assertIn("refused", msg)
-        self.assertIn("huge", msg)
-        self.assertIn("value too large", msg)
-        # la cle fautive est nommee, pas remplacee par un ratio trompeur
-        self.assertNotIn("incomplete", msg)
+        # An oversized key no longer aborts the import: the legal key lands and
+        # the refused one comes back by name with its reason.
+        report = server.set_session("https://x.com", [cookie],
+                                    {"ok": "1", "huge": "x" * (server.MAX_VALUE_CHARS + 1)})
+        self.assertFalse(report["complete"])
+        refused = report["storage"]["refused"]
+        self.assertEqual(len(refused), 1)
+        self.assertEqual(refused[0]["name"], "huge")
+        self.assertEqual(refused[0]["reason"], "value too large")
+        # The legal key was still injected and verified.
+        self.assertEqual(report["storage"]["expected"], 1)
+        self.assertEqual(report["storage"]["verified"], 1)
+        self.assertEqual(report["storage"]["missing"], [])
 
     def test_partial_failure_names_the_missing_keys(self):
         self._fake.missing_keys = 2
-        with self.assertRaises(RuntimeError) as ctx:
-            self._sync()
-        msg = str(ctx.exception)
-        self.assertIn("0/2", msg)
-        self.assertIn("missing:", msg)
-        self.assertIn("k0", msg)
+        report = self._sync()
+        self.assertEqual(report["storage"]["verified"], 0)
+        self.assertEqual(report["storage"]["expected"], 2)
+        self.assertEqual(report["storage"]["missing"], ["k0", "k1"])
 
     def test_partial_snapshot_still_persists_so_a_resync_can_finish(self):
         self._fake.missing_keys = 1
-        with self.assertRaises(RuntimeError):
-            self._sync()
+        report = self._sync()
+        self.assertFalse(report["complete"])
         self.assertTrue((Path(self._tmp) / "session.json").exists())
         self.assertEqual(server.list_sessions()[0]["host"], "a6api.com")
 
@@ -530,11 +533,17 @@ class PopupStorageReportingTests(unittest.TestCase):
     def test_extraction_is_retried_and_its_error_is_not_swallowed(self):
         self.assertIn("for (let attempt = 0; attempt < 2; attempt++)", self.js)
         self.assertIn("if (storageError && !storage)", self.js)
-        self.assertIn("result.storage_count < expectedKeys", self.js)
+        # The per-class import report drives the partial-transfer diagnosis,
+        # with the legacy flat fields kept as a fallback for an older relay.
+        self.assertIn("verifiedKeys < expectedKeys", self.js)
         self.assertIn("result.storage_missing", self.js)
         self.assertIn("result.storage_refused", self.js)
+        self.assertIn("result.complete === false", self.js)
         self.assertGreaterEqual(self.js.count("missingKeys:"), 10)
         self.assertGreaterEqual(self.js.count("errStorageRefused:"), 10)
+        # Cookies get the same by-name treatment as localStorage.
+        self.assertGreaterEqual(self.js.count("errPartialCookies:"), 10)
+        self.assertGreaterEqual(self.js.count("errCookiesRefused:"), 10)
 
 
 if __name__ == "__main__":

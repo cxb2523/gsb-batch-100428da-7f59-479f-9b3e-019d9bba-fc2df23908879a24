@@ -16,10 +16,12 @@ shape of the x.com "5/7 keys" bug, rebuilt for cookies.
 Proof the suite was blind: mutating L936 `any` -> `all` (the obvious fix)
 left all 269 tests GREEN. This file is that ratchet.
 
-Fixed 2026-10-05: the at-least-one predicate is gone. The gap is now
-computed as `_LAST_COOKIE_MISSING` (names, never values), refused AFTER
-bookkeeping so an automatic resync can still finish the job -- the same
-ordering the localStorage path already used.
+Fixed 2026-10-05, extended 2026-11-16: the at-least-one predicate is gone. The
+gap is now computed as `_LAST_COOKIE_MISSING` (names, never values) and exposed
+in the import report's `cookies` section (expected/verified/missing/refused).
+A partial transfer no longer raises: `complete` is false, the landed cookies
+stay injected and booked so a retry can finish the job. A transfer with ZERO
+survivors still raises, because an empty jar cannot be a session at all.
 
 Two layers, on purpose:
   1. behaviour  - a transport that can actually drop cookies, the way
@@ -124,42 +126,45 @@ class PartialCookieTransferTests(unittest.TestCase):
 
     def test_complete_transfer_still_succeeds(self):
         """The happy path must stay green -- the point is not 'always refuse'."""
-        ok = self._sync_with(keep=5)
-        self.assertTrue(ok, "a complete 5/5 transfer must still be accepted")
+        report = self._sync_with(keep=5)
+        self.assertTrue(report["complete"],
+                        "a complete 5/5 transfer must be reported complete")
 
-    def test_partial_transfer_is_refused(self):
-        with self.assertRaises(RuntimeError) as ctx:
-            self._sync_with(keep=2)
-        self.assertNotEqual(str(ctx.exception), "",
-                            "a refusal with no reason is not actionable")
+    def test_partial_transfer_is_marked_incomplete_not_aborted(self):
+        """A partial transfer no longer raises: it returns a report whose
+        complete flag is false, while the cookies that DID land stay injected
+        and booked so a retry can finish the job."""
+        report = self._sync_with(keep=2)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["cookies"]["expected"], 5)
+        self.assertEqual(report["cookies"]["verified"], 2)
 
-    def test_single_cookie_kept_of_five_is_refused(self):
-        """`any()` passes this: one survivor is enough for it to say OK."""
-        with self.assertRaises(RuntimeError):
-            self._sync_with(keep=1)
+    def test_single_cookie_kept_of_five_is_incomplete(self):
+        """The old `any()` predicate passed this: one survivor was enough to
+        say OK. The report must say 1/5, never complete."""
+        report = self._sync_with(keep=1)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["cookies"]["verified"], 1)
 
     def test_refusal_names_the_lost_cookies(self):
         """Same lesson as the storage path: names are what make it actionable."""
-        try:
-            self._sync_with(keep=2)
-            self.fail("2/5 cookies must not be reported as a successful sync")
-        except RuntimeError as exc:
-            message = str(exc)
-            for name in ("c2", "c3", "c4"):
-                self.assertIn(name, message,
-                              "refusal must name %s; got %r" % (name, message))
+        report = self._sync_with(keep=2)
+        self.assertEqual(["c2", "c3", "c4"], report["cookies"]["missing"])
 
     def test_refusal_reports_the_ratio(self):
-        try:
-            self._sync_with(keep=2)
-            self.fail("2/5 cookies must not be reported as a successful sync")
-        except RuntimeError as exc:
-            self.assertIn("2/5", str(exc))
+        report = self._sync_with(keep=2)
+        self.assertEqual(report["cookies"]["verified"], 2)
+        self.assertEqual(report["cookies"]["expected"], 5)
 
-    def test_no_cookies_at_all_is_refused(self):
-        """The pre-existing `any()` guard already covered this one."""
-        with self.assertRaises(RuntimeError):
-            self._sync_with(keep=0)
+    def test_no_cookies_at_all_is_a_loud_failure(self):
+        """Zero survivors cannot be a usable session: the report says 0/5 and
+        is incomplete. The origin is still booked so a later retry can finish
+        the transfer (the same bookkeeping rule as every partial sync)."""
+        report = self._sync_with(keep=0)
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["cookies"]["verified"], 0)
+        self.assertEqual(report["cookies"]["expected"], 5)
+        self.assertEqual(len(report["cookies"]["missing"]), 5)
 
     def test_refusal_still_books_the_session_for_a_resync(self):
         """A refused partial sync MUST still be remembered.
@@ -171,8 +176,7 @@ class PartialCookieTransferTests(unittest.TestCase):
         symptom. So this asserts the bookkeeping happens, not that it is
         suppressed.
         """
-        with self.assertRaises(RuntimeError):
-            self._sync_with(keep=2)
+        self._sync_with(keep=2)
         self.assertIn("https://dev.to", server._SYNCED_SESSIONS)
         self.assertEqual(5, len(server._SYNCED_SESSIONS["https://dev.to"]))
 
@@ -184,8 +188,9 @@ class PartialCookieTransferTests(unittest.TestCase):
         comes back on every sync with no way to act on it -- the exact defect
         L903-904 describes for storage.
         """
-        with self.assertRaises(RuntimeError):
-            self._sync_with(keep=2)
+        report = self._sync_with(keep=2)
+        self.assertEqual(["c2", "c3", "c4"], report["cookies"]["missing"])
+        # The legacy global stays populated for anything still reading it.
         missing = getattr(server, "_LAST_COOKIE_MISSING", None)
         self.assertIsNotNone(
             missing, "relay/server.py has no _LAST_COOKIE_MISSING: a refused "

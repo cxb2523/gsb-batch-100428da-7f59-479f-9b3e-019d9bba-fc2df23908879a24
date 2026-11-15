@@ -40,6 +40,8 @@ const I18N = {
     errNoRelay: "Local relay (port 8765) is not running.",
     errNoCookies: "No cookies found for this page.",
     errCookiesOutOfScope: "These cookies are outside the extension's permission scope. Reload the extension (chrome://extensions) and try again.",
+    errPartialCookies: (names) => `Incomplete transfer: some cookies did not reach Lightpanda (missing: ${names}). Sync again.`,
+    errCookiesRefused: (names) => `Some cookies could not be transferred: ${names}.`,
     errRefused: "Transfer refused by local relay.",
     updateLabel: "Bridge update",
     // Puce = etat court. La version/le hash vit sur la ligne du dessous :
@@ -119,6 +121,8 @@ const I18N = {
     errNoRelay: "Le relais local (port 8765) n’est pas démarré.",
     errNoCookies: "Aucun cookie trouvé pour cette page.",
     errCookiesOutOfScope: "Ces cookies sont hors du périmètre d'autorisation de l'extension. Rechargez l'extension (chrome://extensions) puis réessayez.",
+    errPartialCookies: (names) => `Transfert incomplet : certains cookies ne sont pas parvenus à Lightpanda (manquants: ${names}). Resynchronisez.`,
+    errCookiesRefused: (names) => `Certains cookies n'ont pas pu être transférés : ${names}.`,
     errRefused: "Transfert refusé par le relais local.",
     updateLabel: "Mise à jour du Bridge",
     // Puce = etat court. La version/le hash vit sur la ligne du dessous :
@@ -198,6 +202,8 @@ const I18N = {
     errNoRelay: "El relé local (puerto 8765) no está en ejecución.",
     errNoCookies: "No se encontraron cookies para esta página.",
     errCookiesOutOfScope: "Estas cookies están fuera de los permisos de la extensión. Recarga la extensión (chrome://extensions) e inténtalo de nuevo.",
+    errPartialCookies: (names) => `Transferencia incompleta: algunas cookies no llegaron a Lightpanda (faltan: ${names}). Sincroniza de nuevo.`,
+    errCookiesRefused: (names) => `Algunas cookies no se pudieron transferir: ${names}.`,
     errRefused: "Transferencia rechazada por el relé local.",
     updateLabel: "Actualización del Bridge",
     // Puce = etat court. La version/le hash vit sur la ligne du dessous :
@@ -277,6 +283,8 @@ const I18N = {
     errNoRelay: "Lokales Relais (Port 8765) läuft nicht.",
     errNoCookies: "Keine Cookies für diese Seite gefunden.",
     errCookiesOutOfScope: "Diese Cookies liegen außerhalb der Berechtigungen der Erweiterung. Lade die Erweiterung neu (chrome://extensions) und versuche es erneut.",
+    errPartialCookies: (names) => `Unvollständige Übertragung: Einige Cookies haben Lightpanda nicht erreicht (fehlen: ${names}). Erneut synchronisieren.`,
+    errCookiesRefused: (names) => `Einige Cookies konnten nicht übertragen werden: ${names}.`,
     errRefused: "Übertragung vom lokalen Relais abgelehnt.",
     updateLabel: "Bridge-Aktualisierung",
     // Puce = etat court. La version/le hash vit sur la ligne du dessous :
@@ -354,6 +362,8 @@ const I18N = {
     errNoRelay: "本地中继（端口 8765）未启动。",
     errNoCookies: "未找到此页面的 Cookie。",
     errCookiesOutOfScope: "这些 Cookie 超出扩展程序的权限范围。请重新加载扩展程序（chrome://extensions）后重试。",
+    errPartialCookies: (names) => `传输不完整：部分 Cookie 未到达 Lightpanda（缺失: ${names}）。请重新同步。`,
+    errCookiesRefused: (names) => `部分 Cookie 无法传输：${names}。`,
     errRefused: "本地中继拒绝了传输。",
     updateLabel: "Bridge 更新",
     // Puce = etat court. La version/le hash vit sur la ligne du dessous :
@@ -433,6 +443,8 @@ const I18N = {
     errNoRelay: "ローカルリレー（ポート8765）が起動していません。",
     errNoCookies: "このページのCookieが見つかりません。",
     errCookiesOutOfScope: "これらのCookieは拡張機能の権限範囲外です。拡張機能を再読み込み（chrome://extensions）して再試行してください。",
+    errPartialCookies: (names) => `転送が不完全です：一部のCookieがLightpandaに到達しませんでした（欠落: ${names}）。再同期してください。`,
+    errCookiesRefused: (names) => `一部のCookieを転送できませんでした：${names}。`,
     errRefused: "ローカルリレーによって転送が拒否されました。",
     updateLabel: "Bridge の更新",
     // Puce = etat court. La version/le hash vit sur la ligne du dessous :
@@ -514,6 +526,8 @@ const I18N = {
     errNoRelay: "Il relè locale (porta 8765) non è attivo.",
     errNoCookies: "Nessun cookie trovato per questa pagina.",
     errCookiesOutOfScope: "Questi cookie sono fuori dai permessi dell'estensione. Ricarica l'estensione (chrome://extensions) e riprova.",
+    errPartialCookies: (names) => `Trasferimento incompleto: alcuni cookie non sono arrivati a Lightpanda (mancanti: ${names}). Sincronizza di nuovo.`,
+    errCookiesRefused: (names) => `Alcuni cookie non sono stati trasferiti: ${names}.`,
     errRefused: "Trasferimento rifiutato dal relè locale.",
     updateLabel: "Aggiornamento Bridge",
     // Puce = etat court. La version/le hash vit sur la ligne du dessous :
@@ -593,6 +607,8 @@ const I18N = {
     errNoRelay: "O relé local (porta 8765) não está em execução.",
     errNoCookies: "Nenhum cookie encontrado para esta página.",
     errCookiesOutOfScope: "Estes cookies estão fora das permissões da extensão. Recarregue a extensão (chrome://extensions) e tente novamente.",
+    errPartialCookies: (names) => `Transferência incompleta: alguns cookies não chegaram ao Lightpanda (faltando: ${names}). Sincronize novamente.`,
+    errCookiesRefused: (names) => `Alguns cookies não puderam ser transferidos: ${names}.`,
     errRefused: "Transferência recusada pelo relé local.",
     updateLabel: "Atualização do Bridge",
     // Puce = etat court. La version/le hash vit sur la ligne du dessous :
@@ -670,6 +686,8 @@ const I18N = {
     errNoRelay: "المرحل المحلي (المنفذ 8765) لا يعمل.",
     errNoCookies: "لم يتم العثور على ملفات تعريف الارتباط.",
     errCookiesOutOfScope: "ملفات تعريف الارتباط هذه خارج نطاق أذونات الإضافة. أعد تحميل الإضافة (chrome://extensions) ثم أعد المحاولة.",
+    errPartialCookies: (names) => `النقل غير مكتمل: لم تصل بعض ملفات تعريف الارتباط إلى Lightpanda (المفقودة: ${names}). أعد المزامنة.`,
+    errCookiesRefused: (names) => `تعذّر نقل بعض ملفات تعريف الارتباط: ${names}.`,
     errRefused: "تم رفض النقل بواسطة المرحل المحلي.",
     updateLabel: "تحديث Bridge",
     // Puce = etat court. La version/le hash vit sur la ligne du dessous :
@@ -751,6 +769,8 @@ const I18N = {
     errNoRelay: "Локальное реле (порт 8765) не запущено.",
     errNoCookies: "Файлы cookie для этой страницы не найдены.",
     errCookiesOutOfScope: "Эти файлы cookie вне разрешений расширения. Перезагрузите расширение (chrome://extensions) и повторите попытку.",
+    errPartialCookies: (names) => `Перенос неполный: некоторые файлы cookie не достигли Lightpanda (отсутствуют: ${names}). Синхронизируйте снова.`,
+    errCookiesRefused: (names) => `Некоторые файлы cookie не удалось перенести: ${names}.`,
     errRefused: "Перенос отклонен локальным реле.",
     updateLabel: "Обновление Bridge",
     // Puce = etat court. La version/le hash vit sur la ligne du dessous :
@@ -1686,27 +1706,66 @@ transferEl.addEventListener('click', async () => {
       throw fetchErr;
     }
 
-    // The relay verifies EVERY key it was sent, so a short count means a
+    // The relay now answers EVERY processed import with one per-class report
+    // (expected/verified/missing/refused for cookies and localStorage) and a
+    // `complete` flag that is only true when BOTH classes landed fully. A
+    // refused oversized key or a domain-mismatched cookie no longer aborts the
+    // batch: the legal entries are already in Lightpanda and kept, so syncing
+    // again only has to finish the missing pieces. Names only - the relay
+    // never returns a value.
+    const report = (result && typeof result.report === 'object' && result.report) ? result.report : null;
+    const cookieSection = report ? report.cookies : null;
+    const storageSection = report ? report.storage : null;
+
+    // Cookie gap first: a jar missing a cookie answers 401/407 just as hard as
+    // a missing localStorage key, and one class succeeding must never mask the
+    // other. Falls back to the legacy flat fields for an older relay.
+    const cookieMissing = cookieSection
+      ? (cookieSection.missing || [])
+      : (Array.isArray(result.cookie_missing) ? result.cookie_missing : []);
+    if (cookieMissing.length) {
+      throw new Error(t('errPartialCookies', cookieMissing.join(', ')));
+    }
+    const cookieRefused = cookieSection
+      ? (cookieSection.refused || []).map((r) => r.name).filter(Boolean)
+      : (Array.isArray(result.cookie_refused)
+          ? result.cookie_refused.map((r) => (r && r.name) ? r.name : r).filter(Boolean)
+          : []);
+    if (cookieRefused.length) {
+      throw new Error(t('errCookiesRefused', cookieRefused.join(', ')));
+    }
+
+    // The relay verifies EVERY key it carried, so a short count means a
     // partial snapshot reached Lightpanda. It must never read as success here
-    // either: that is a session that looks synced and answers 401/407. Since
-    // v0.5.3 the relay also names the keys it could not carry, so the message
-    // says WHAT is missing - a bare ratio is what made "sync again" useless.
-    const expectedKeys = (typeof result.storage_expected === 'number' && result.storage_expected)
-      ? result.storage_expected : storageKeys;
-    if (typeof result.storage_count === 'number' && expectedKeys &&
-        result.storage_count < expectedKeys) {
-      const missing = Array.isArray(result.storage_missing) ? result.storage_missing : [];
-      const names = missing.length ? t('missingKeys', missing.join(', ')) : '';
-      throw new Error(t('errPartialStorage', result.storage_count, expectedKeys, names));
+    // either: that is a session that looks synced and answers 401/407. The
+    // message says WHAT is missing - a bare ratio is what made "sync again"
+    // useless.
+    const expectedKeys = storageSection
+      ? storageSection.expected
+      : ((typeof result.storage_expected === 'number' && result.storage_expected)
+          ? result.storage_expected : storageKeys);
+    const verifiedKeys = storageSection
+      ? storageSection.verified
+      : (typeof result.storage_count === 'number' ? result.storage_count : 0);
+    const storageMissing = storageSection
+      ? (storageSection.missing || [])
+      : (Array.isArray(result.storage_missing) ? result.storage_missing : []);
+    if (expectedKeys && verifiedKeys < expectedKeys) {
+      const names = storageMissing.length ? t('missingKeys', storageMissing.join(', ')) : '';
+      throw new Error(t('errPartialStorage', verifiedKeys, expectedKeys, names));
     }
 
     // Keys the relay refuses to carry (name or value past its size bounds) are
-    // reported BY NAME, never silently dropped.
-    if (Array.isArray(result.storage_refused) && result.storage_refused.length) {
-      throw new Error(t('errStorageRefused', result.storage_refused.join('; ')));
+    // reported BY NAME, never silently dropped, and they no longer block the
+    // legal keys from landing.
+    const storageRefused = storageSection
+      ? (storageSection.refused || []).map((r) => r.name).filter(Boolean)
+      : (Array.isArray(result.storage_refused) ? result.storage_refused : []);
+    if (storageRefused.length) {
+      throw new Error(t('errStorageRefused', storageRefused.join('; ')));
     }
 
-    if (!response.ok || !result.ok) {
+    if (!response.ok || !result.ok || result.complete === false) {
       // The relay speaks in short English codes ('origin refused',
       // 'unauthorized', 'session import refused', ...). Rendering them
       // verbatim put an English sentence in a French popup. Map the known

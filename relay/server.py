@@ -736,7 +736,10 @@ _LAST_STORAGE_EXPECTED = 0
 _LAST_STORAGE_MISSING: list = []
 _LAST_STORAGE_APPLIED_COUNT = 0
 # [name, size, reason] for every key the size bounds refused (reported, never
-# dropped in silence). Names only.
+# dropped in silence). Names only. The structured list feeds the import
+# response's per-item section; _LAST_STORAGE_REFUSED below is the legacy
+# preformatted string view kept for the popup/older callers.
+_LAST_STORAGE_REFUSED_ITEMS: list = []
 _LAST_STORAGE_REFUSED: list = []
 
 # Cookie twin of the three above, same reason (L903-904): Lightpanda silently
@@ -745,6 +748,47 @@ _LAST_STORAGE_REFUSED: list = []
 _LAST_COOKIE_EXPECTED = 0
 _LAST_COOKIE_VERIFIED = 0
 _LAST_COOKIE_MISSING: list = []
+# [name, reason] for cookies rejected on the way IN (bad shape, domain that
+# does not match the target origin...). A single bad cookie used to abort the
+# whole import before ANY cookie or storage key touched the page; it is now
+# skipped, reported by name, and the rest of the batch proceeds. Names only.
+_LAST_COOKIE_REFUSED_ITEMS: list = []
+
+
+def _import_report(origin: str = "") -> dict:
+    """The single, per-request, name-only outcome of one /v1/session/import.
+
+    Cookies and localStorage each get their own expected/verified/missing/
+    refused section, and ``complete`` is the AND of both sections: one class
+    landing fully must never mask the other failing. Nothing in here carries a
+    VALUE - refused/missing entries are names plus a short reason code.
+
+    Every field is read from the globals that set_session resets at the very
+    start of each request, so a failed import can never answer with another
+    site's leftovers.
+    """
+    cookies = {
+        "expected": int(_LAST_COOKIE_EXPECTED or 0),
+        "verified": int(_LAST_COOKIE_VERIFIED or 0),
+        "missing": [str(n) for n in _LAST_COOKIE_MISSING],
+        "refused": [{"name": str(n), "reason": str(w)}
+                    for n, w in _LAST_COOKIE_REFUSED_ITEMS],
+    }
+    storage = {
+        "expected": int(_LAST_STORAGE_EXPECTED or 0),
+        "verified": int(max(_LAST_STORAGE_APPLIED_COUNT or 0, 0)),
+        "missing": [str(n) for n in _LAST_STORAGE_MISSING],
+        "refused": [{"name": str(n), "size": int(sz), "reason": str(w)}
+                    for n, sz, w in _LAST_STORAGE_REFUSED_ITEMS],
+    }
+    complete = (
+        not cookies["missing"] and not cookies["refused"]
+        and not storage["missing"] and not storage["refused"]
+        and cookies["verified"] == cookies["expected"]
+        and storage["verified"] == storage["expected"]
+    )
+    return {"ok": bool(complete), "complete": bool(complete),
+            "origin": origin, "cookies": cookies, "storage": storage}
 
 
 def _missing_from_verify(raw) -> list:
@@ -880,49 +924,81 @@ def _inject_storage(origin: str, storage: dict) -> int:
     return -1
 
 
-def set_session(origin: str, cookies: list[dict], storage: dict | None = None) -> tuple[int, int]:
-    global _LAST_SESSION
-    if not valid_origin(origin):
-        raise ValueError("origin refused: HTTPS target origin required")
-    if not isinstance(cookies, list) or not cookies or len(cookies) > 500:
-        raise ValueError("cookie list refused")
-    converted = [cookie_for_cdp(c, origin) for c in cookies if isinstance(c, dict) and c.get("name")]
-    if not converted:
-        raise ValueError("no valid cookies")
+def set_session(origin: str, cookies: list[dict], storage: dict | None = None) -> dict:
+    """Import one browser session into Lightpanda and return its full outcome.
 
-    storage_count = 0
+    The return value is the per-request report (see ``_import_report``): one
+    expected/verified/missing/refused section per class, ``complete`` only when
+    BOTH classes landed fully. It never raises for a *partial* transfer anymore
+    - an oversized storage key or a cookie whose domain does not match the
+    target origin is reported by name while everything legal is still injected
+    and kept, so a retry can finish the missing pieces. It still raises for a
+    request that is structurally impossible (bad origin, empty/oversized
+    cookie list, no single usable cookie, or a dead CDP transport).
+    """
+    global _LAST_SESSION
     global _LAST_STORAGE_APPLIED_COUNT
-    global _LAST_STORAGE_REFUSED
+    global _LAST_STORAGE_REFUSED, _LAST_STORAGE_REFUSED_ITEMS
     global _LAST_STORAGE_EXPECTED
     global _LAST_STORAGE_MISSING
     global _LAST_COOKIE_EXPECTED
     global _LAST_COOKIE_VERIFIED
     global _LAST_COOKIE_MISSING
-    # Reset the WHOLE per-request state here, not just the two counters below.
-    # `_LAST_STORAGE_EXPECTED` was only assigned after the early `raise`s, so an
-    # import that failed on a refused key answered 400 with the PREVIOUS site's
-    # numbers: `storage_expected = 7` and `storage_missing = ['user','cart',…]`
-    # for a payload that carried one key. popup.js renders those names verbatim,
-    # so the user was told site A's storage was missing from site B's sync.
+    global _LAST_COOKIE_REFUSED_ITEMS
+    if not valid_origin(origin):
+        raise ValueError("origin refused: HTTPS target origin required")
+    if not isinstance(cookies, list) or not cookies or len(cookies) > 500:
+        raise ValueError("cookie list refused")
+
+    # Reset the WHOLE per-request state before anything can fail, not just the
+    # two counters. An import that used to fail on a refused key answered 400
+    # with the PREVIOUS site's numbers (`storage_expected = 7` and
+    # `storage_missing = ['user','cart',…]` for a payload that carried one key):
+    # popup.js renders those names verbatim, so the user was told site A's
+    # storage was missing from site B's sync. The cookie lists get the same
+    # treatment, including the new refused list - no name may survive a request
+    # that did not itself produce it.
     _LAST_STORAGE_APPLIED_COUNT = 0
     _LAST_STORAGE_REFUSED = []
+    _LAST_STORAGE_REFUSED_ITEMS = []
     _LAST_STORAGE_EXPECTED = 0
     _LAST_STORAGE_MISSING = []
-    # Same cross-site leak for cookies, same fix.
     _LAST_COOKIE_EXPECTED = 0
     _LAST_COOKIE_VERIFIED = 0
     _LAST_COOKIE_MISSING = []
+    _LAST_COOKIE_REFUSED_ITEMS = []
 
-    # Sanitize BEFORE the live page is touched. A key the relay cannot carry has
-    # to fail fast AND by name: the x.com bug was a silent removal here, which
-    # showed up as a permanent "5/7 keys" that no re-sync could ever clear.
+    # Convert cookies ONE BY ONE. A cookie whose domain does not match the
+    # target origin (or whose shape cookie_for_cdp cannot carry) used to raise
+    # here and abort the WHOLE batch before the page was touched: no cookie, no
+    # legal storage key ever landed. The bad entry is now recorded BY NAME with
+    # its reason and skipped; the remaining cookies proceed.
+    converted: list = []
+    for cookie in cookies:
+        if not isinstance(cookie, dict) or not cookie.get("name"):
+            _LAST_COOKIE_REFUSED_ITEMS.append(
+                (_short_key(str(cookie.get("name") or "<unnamed>"), 40),
+                 "invalid cookie entry"))
+            continue
+        try:
+            converted.append(cookie_for_cdp(cookie, origin))
+        except ValueError as err:
+            _LAST_COOKIE_REFUSED_ITEMS.append(
+                (_short_key(str(cookie.get("name")), 40), str(err)))
+    if not converted:
+        # Nothing the browser could receive: the import has no usable cookie at
+        # all, so touching the page would only register a hollow session.
+        raise ValueError("no valid cookies")
+
+    # Sanitize the storage snapshot BEFORE the live page is touched, but do not
+    # abort on a refused entry: the legal keys still get injected and the
+    # refused ones come back BY NAME with their size and reason (the x.com bug
+    # was a silent removal here, which showed up as a permanent "5/7 keys" that
+    # no re-sync could ever clear).
     safe_storage, refused_storage = _storage_plan(storage or {})
+    _LAST_STORAGE_REFUSED_ITEMS = [tuple(item) for item in refused_storage]
     _LAST_STORAGE_REFUSED = ["%s [%s, %d chars]" % (n, w, sz)
                              for n, sz, w in refused_storage]
-    if refused_storage:
-        detail = ", ".join("%s [%s, %d chars]" % (n, w, sz)
-                           for n, sz, w in refused_storage[:5])
-        raise RuntimeError("localStorage key(s) refused by relay: " + detail)
 
     with CDP_LOCK:
         try:
@@ -931,7 +1007,9 @@ def set_session(origin: str, cookies: list[dict], storage: dict | None = None) -
         except (websocket.WebSocketException, OSError, RuntimeError):
             # Connection lost (WSL / Lightpanda restarted under us) -> resync
             # and retry ONCE, exactly like proxy_cdp: an import must not keep
-            # failing in a loop on a dead socket that nothing else revives.
+            # failing in a loop on a dead socket that nothing else revives. A
+            # transport that stays dead propagates out of the retry, so this
+            # request answers 400 rather than claiming an unverifiable success.
             _connection_resync()
             storage_count = _apply_session(origin, converted, safe_storage)
         _LAST_STORAGE_APPLIED_COUNT = max(storage_count, 0)
@@ -947,62 +1025,31 @@ def set_session(origin: str, cookies: list[dict], storage: dict | None = None) -
             # Fallback verification without urls filter
             fallback = _CDP_TRANSPORT.request("Network.getCookies", {}, session_id=_CDP_SESSION_ID)
             names = {str(item.get("name")) for item in fallback.get("cookies", [])}
-        # ``all()``, not ``any()``: Lightpanda applies cookies per domain/path and
-        # silently DROPS the ones whose domain or path the navigation does not
-        # match. ``any()`` answered "did at least ONE survive", so a sync that lost
-        # 3 cookies out of 5 returned SUCCESS and popup.js rendered "synchronized"
-        # while every authenticated call came back 401/407 -- the same lie the
-        # localStorage path refuses below.
+        # A name gap, not an at-least-one predicate: Lightpanda applies cookies
+        # per domain/path and silently DROPS the ones whose domain or path the
+        # navigation does not match. Every expected name is checked, so a sync
+        # that lost 3 of 5 cookies can never read as complete.
         _LAST_COOKIE_MISSING = [str(item["name"]) for item in converted
                                 if str(item["name"]) not in names]
         _LAST_COOKIE_EXPECTED = len(converted)
         _LAST_COOKIE_VERIFIED = len(converted) - len(_LAST_COOKIE_MISSING)
 
+        # Storage expectation is the set the relay actually carried. The
+        # refused keys never reach the page, so they must not inflate the
+        # expected/verified pair: their names live in storage.refused instead.
+        _LAST_STORAGE_EXPECTED = len(safe_storage)
+
         # Remember the session for automatic resync after a Lightpanda restart
         # AND persist it, so a relay restart / reboot / watchdog restart no
-        # longer forces the user to click "Synchroniser" again.
+        # longer forces the user to click "Synchroniser" again. This runs even
+        # when the transfer is partial: what DID land must be kept, because a
+        # later retry only has to finish the missing pieces.
         _LAST_SESSION = {"origin": origin, "cookies": converted, "storage": safe_storage}
         with SESSIONS_LOCK:
             _SYNCED_SESSIONS[origin] = converted
         _persist_session(_LAST_SESSION)
 
-        # A half-transferred cookie jar is worse than a visible failure, for the
-        # same reason and with the same ordering as the storage check below:
-        # bookkeeping is already done (a resync can finish the job), but the
-        # caller is told the truth. ``x/y cookies verified (missing: <names>)``
-        # names are what makes this actionable -- without them the same mystery
-        # ratio came back on every single sync.
-        if _LAST_COOKIE_MISSING:
-            missing_detail = " (missing: %s)" % ", ".join(
-                _short_key(n, 40) for n in _LAST_COOKIE_MISSING[:5]
-            )
-            raise RuntimeError(
-                "cookie transfer incomplete: %d/%d cookies verified%s"
-                % (max(_LAST_COOKIE_VERIFIED, 0), _LAST_COOKIE_EXPECTED,
-                   missing_detail)
-            )
-
-        # A half-transferred localStorage snapshot is worse than a visible
-        # failure: cookies + some keys look "synced" while every authenticated
-        # call returns 401/407. Bookkeeping is done (a resync can finish the
-        # job), but the caller is told the truth.
-        expected_storage = len(safe_storage)
-        _LAST_STORAGE_EXPECTED = expected_storage
-        if expected_storage and storage_count != expected_storage:
-            # ``x/y keys verified (missing: <names>)``: the names are what makes
-            # this actionable. Without them the same mystery ratio came back on
-            # every single sync.
-            missing_detail = ""
-            if _LAST_STORAGE_MISSING:
-                missing_detail = " (missing: %s)" % ", ".join(
-                    _short_key(k, 40) for k in _LAST_STORAGE_MISSING[:5]
-                )
-            raise RuntimeError(
-                "localStorage transfer incomplete: %d/%d keys verified%s"
-                % (max(storage_count, 0), expected_storage, missing_detail)
-            )
-
-        return len(converted), storage_count
+        return _import_report(origin)
 
 
 _PERSISTED_LOADED = False
@@ -1549,27 +1596,56 @@ class Handler(BaseHTTPRequestHandler):
             cookies = payload.get("cookies", [])
             origin = payload.get("origin", "")
             storage = payload.get("storage")
-            cookie_count, storage_count = set_session(origin, cookies, storage)
-            self.send_json(200, {
-                "ok": True,
-                "cookie_count": cookie_count,
-                "storage_count": storage_count,
-                "storage_expected": _LAST_STORAGE_EXPECTED,
-                "storage_refused": list(_LAST_STORAGE_REFUSED),
-                "origin": origin
-            })
+            # set_session no longer raises on a PARTIAL transfer: oversized
+            # storage keys and domain-mismatched cookies are reported by name in
+            # the report while the legal entries still land. Only a structurally
+            # impossible request (bad origin, no usable cookie, dead transport)
+            # raises, and the handler below answers 400 with the same report
+            # shape so callers always have one contract to read.
+            report = set_session(origin, cookies, storage)
+            body = self._import_response_body(report)
+            self.send_json(200, body)
         except Exception as err:
-            # The counts and the missing NAMES ride along with the failure, so
-            # the popup can build a translated, specific message instead of
-            # showing the relay's raw text.
-            self.send_json(400, {
-                "ok": False,
-                "error": str(err) or "session import refused",
-                "storage_count": _LAST_STORAGE_APPLIED_COUNT,
-                "storage_expected": _LAST_STORAGE_EXPECTED,
-                "storage_missing": list(_LAST_STORAGE_MISSING[:5]),
-                "storage_refused": list(_LAST_STORAGE_REFUSED),
-            })
+            # The full per-request report rides along with the failure, so the
+            # popup can build translated, specific messages instead of showing
+            # the relay's raw text. Everything comes from THIS request's
+            # globals, which set_session reset before touching anything, so no
+            # previous site's names can leak into this answer.
+            report = _import_report(str(origin) if isinstance(origin, str) else "")
+            body = self._import_response_body(report)
+            body["ok"] = False
+            body["complete"] = False
+            body["error"] = str(err) or "session import refused"
+            self.send_json(400, body)
+
+    @staticmethod
+    def _import_response_body(report: dict) -> dict:
+        """Flatten the structured report onto the HTTP contract.
+
+        The nested ``cookies`` / ``storage`` sections are the canonical,
+        name-only outcome; the top-level scalars keep every older caller
+        (popup.js, sync_session.py, the acceptance gate) working unchanged.
+        Legacy lists are capped at five names exactly as before - the full
+        lists stay available inside the sections. No value ever appears here.
+        """
+        cookies = report.get("cookies", {})
+        storage = report.get("storage", {})
+        return {
+            "ok": bool(report.get("complete")),
+            "complete": bool(report.get("complete")),
+            "origin": report.get("origin", ""),
+            "report": report,
+            # Legacy scalar views, derived from the same per-request data.
+            "cookie_count": int(cookies.get("verified", 0)),
+            "cookie_expected": int(cookies.get("expected", 0)),
+            "cookie_missing": list(cookies.get("missing", []))[:5],
+            "cookie_refused": list(cookies.get("refused", []))[:5],
+            "storage_count": int(storage.get("verified", 0)),
+            "storage_expected": int(storage.get("expected", 0)),
+            "storage_missing": list(storage.get("missing", []))[:5],
+            # Legacy form: preformatted "name [reason, N chars]" strings.
+            "storage_refused": list(_LAST_STORAGE_REFUSED)[:5],
+        }
 
 
 def self_test() -> int:

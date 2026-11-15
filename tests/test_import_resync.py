@@ -52,13 +52,14 @@ class TestImportSurvivesDeadSocket(unittest.TestCase):
             # Network.getCookies verification has something to answer with
             server._CDP_TRANSPORT = fake_transport
             server._CDP_SESSION_ID = "fake-session"
-            cookie_count, storage_count = server.set_session(
+            report = server.set_session(
                 "https://github.com",
                 [{"name": "t", "value": "x", "domain": ".github.com", "path": "/",
                   "secure": True, "httpOnly": False, "sameSite": "no_restriction",
                   "expirationDate": 9999999999}],
                 {})
-            self.assertEqual(cookie_count, 1)
+            self.assertTrue(report["complete"])
+            self.assertEqual(report["cookies"]["verified"], 1)
             self.assertEqual(len(applies), 2)
             self.assertEqual(len(resynced), 1)
         finally:

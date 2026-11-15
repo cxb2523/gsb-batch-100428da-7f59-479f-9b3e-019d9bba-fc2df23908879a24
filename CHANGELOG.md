@@ -1,3 +1,40 @@
+## [0.7.42] - 2026-11-16
+
+### Changed
+- `/v1/session/import` now answers every processed request with one checkable,
+  per-class report instead of aborting the whole batch on the first rejected
+  entry. A localStorage key past the relay's size bounds (key name, value or
+  snapshot total) is refused BY NAME with its size and reason, but the legal
+  keys still get injected and verified; a cookie whose domain does not match
+  the target origin (or whose shape cannot be carried) is skipped and reported
+  in the same way instead of killing every cookie and storage key before the
+  page is touched.
+- The response carries nested `cookies` and `storage` sections, each with
+  `expected`, `verified`, `missing` (names only) and `refused` (name + reason,
+  plus size for storage), and a top-level `complete` flag. `complete` is the
+  AND of both sections: one class landing fully can no longer mask the other
+  failing, and HTTP 200 with `complete: false` replaces the old 400 abort for
+  partial transfers. Flat legacy fields (`cookie_count`, `storage_expected`,
+  `storage_missing`, `storage_refused`, ...) are kept and derived from the same
+  per-request data, so older callers keep working.
+- Partial transfers still book and persist everything that landed, so a later
+  retry only has to finish the missing pieces. All missing/refused state is
+  reset at the start of every request and comes from THAT request only; a
+  failed import can never answer with a previous site's names.
+
+### Added
+- `cookie_expected`, `cookie_missing`, `cookie_refused` and the structured
+  `report` object in the import response; `errPartialCookies` and
+  `errCookiesRefused` popup messages in all ten languages. The diagnostic
+  report gains cookie expected/verified/missing/refused counts (counts only,
+  never names or values).
+- `tests/test_import_itemized_outcome.py`: an end-to-end acceptance test over
+  the real HTTP route with a replaced CDP transport, covering a domain-mismatch
+  cookie plus an oversized localStorage key in one request (incomplete verdict,
+  legal entries injected, names only, state kept) followed by an entirely legal
+  retry (equal expected/verified counts, empty missing and refused lists) and a
+  cross-site no-leak check.
+
 ## [0.7.41] - 2026-10-04
 
 ### Fixed

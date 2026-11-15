@@ -268,31 +268,118 @@ class SessionsLockIsReal(unittest.TestCase):
 class ImportStateIsPerRequest(unittest.TestCase):
     """Finding 4."""
 
+    class _OfflineTransport:
+        """Stand-in for a browser: stores the cookies it is given and reports
+        them back verbatim, so verification reflects what was actually sent."""
+
+        def __init__(self):
+            self.cookies = []
+
+        def request(self, method, params=None, session_id=None):
+            params = params or {}
+            if method == "Network.setCookies":
+                self.cookies = list(params.get("cookies", []))
+                return {}
+            if method == "Network.getCookies":
+                return {"cookies": [{"name": c.get("name")} for c in self.cookies]}
+            if method == "Page.addScriptToEvaluateOnNewDocument":
+                return {"identifier": "1"}
+            if method == "Runtime.evaluate":
+                # The real page answers the per-key verification with an empty
+                # missing list: every legal key the relay writes is present.
+                expression = params.get("expression", "")
+                if "localStorage.getItem" in expression:
+                    return {"result": {"value": '{"missing": []}'}}
+                return {"result": {"value": 0}}
+            return {}
+
+    def _stub_browser(self):
+        transport = self._OfflineTransport()
+        saved = (relay._CDP_TRANSPORT, relay._CDP_SESSION_ID,
+                 relay._ensure_connection, relay._persist_session)
+        self.addCleanup(lambda: setattr(relay, "_CDP_TRANSPORT", saved[0]))
+        self.addCleanup(lambda: setattr(relay, "_CDP_SESSION_ID", saved[1]))
+        self.addCleanup(lambda: setattr(relay, "_ensure_connection", saved[2]))
+        self.addCleanup(lambda: setattr(relay, "_persist_session", saved[3]))
+        relay._CDP_TRANSPORT = transport
+        relay._CDP_SESSION_ID = "s"
+        relay._ensure_connection = lambda origin=None: True
+        relay._persist_session = lambda session: None
+        saved_settle = relay._NAV_SETTLE_SECONDS
+        relay._NAV_SETTLE_SECONDS = 0
+        self.addCleanup(lambda: setattr(relay, "_NAV_SETTLE_SECONDS", saved_settle))
+        return transport
+
     def test_a_refused_import_reports_nothing_from_the_previous_one(self):
         saved = (relay._LAST_STORAGE_EXPECTED, relay._LAST_STORAGE_MISSING,
                  relay._LAST_STORAGE_APPLIED_COUNT, relay._LAST_STORAGE_REFUSED,
+                 relay._LAST_STORAGE_REFUSED_ITEMS,
+                 relay._LAST_COOKIE_MISSING, relay._LAST_COOKIE_REFUSED_ITEMS,
                  relay._SYNCED_SESSIONS, relay._LAST_SESSION)
         self.addCleanup(lambda: (
             setattr(relay, "_LAST_STORAGE_EXPECTED", saved[0]),
             setattr(relay, "_LAST_STORAGE_MISSING", saved[1]),
             setattr(relay, "_LAST_STORAGE_APPLIED_COUNT", saved[2]),
             setattr(relay, "_LAST_STORAGE_REFUSED", saved[3]),
-            setattr(relay, "_SYNCED_SESSIONS", saved[4]),
-            setattr(relay, "_LAST_SESSION", saved[5])))
+            setattr(relay, "_LAST_STORAGE_REFUSED_ITEMS", saved[4]),
+            setattr(relay, "_LAST_COOKIE_MISSING", saved[5]),
+            setattr(relay, "_LAST_COOKIE_REFUSED_ITEMS", saved[6]),
+            setattr(relay, "_SYNCED_SESSIONS", saved[7]),
+            setattr(relay, "_LAST_SESSION", saved[8])))
         # Left over from a previous, successful import of another site.
         relay._LAST_STORAGE_EXPECTED = 7
         relay._LAST_STORAGE_MISSING = ["user", "cart", "tok"]
+        relay._LAST_COOKIE_MISSING = ["old_cookie"]
 
-        with self.assertRaises(Exception):
-            relay.set_session("https://x.com", [{"name": "a", "value": "v"}],
-                              {"k" * 5000: "v"})
-        self.assertEqual(relay._LAST_STORAGE_EXPECTED, 0,
-                         "a refused import answered 400 with the previous "
-                         "site's expected count: %r"
-                         % relay._LAST_STORAGE_EXPECTED)
+        # An oversized key no longer aborts the import: it is refused by name
+        # while the legal key still lands. The point under test is unchanged:
+        # the response must carry THIS request's state, never the previous
+        # site's names.
+        self._stub_browser()
+        report = relay.set_session("https://x.com",
+                                   [{"name": "a", "value": "v",
+                                     "domain": ".x.com"}],
+                                   {"k" * 5000: "v", "legal": "v"})
+        self.assertFalse(report["complete"])
+        self.assertEqual(relay._LAST_STORAGE_EXPECTED, 1,
+                         "the previous site's expected count leaked into this "
+                         "import: %r" % relay._LAST_STORAGE_EXPECTED)
         self.assertEqual(relay._LAST_STORAGE_MISSING, [],
                          "another site's storage key names leaked into this "
-                         "error: %r" % relay._LAST_STORAGE_MISSING)
+                         "import: %r" % relay._LAST_STORAGE_MISSING)
+        self.assertEqual(relay._LAST_COOKIE_MISSING, [],
+                         "another site's cookie names leaked: %r"
+                         % relay._LAST_COOKIE_MISSING)
+        refused_names = [r["name"] for r in report["storage"]["refused"]]
+        self.assertEqual(len(refused_names), 1)
+        self.assertTrue(refused_names[0].startswith("k" * 60),
+                        "the refused key must be named, got %r" % refused_names)
+        self.assertEqual(report["storage"]["expected"], 1)
+
+    def test_a_structurally_bad_request_also_resets_per_request_state(self):
+        """The hard-failure path (no usable cookie) must reset the globals
+        before it raises, so the 400 body cannot carry the previous site's
+        names either."""
+        saved = (relay._LAST_STORAGE_EXPECTED, relay._LAST_STORAGE_MISSING,
+                 relay._LAST_COOKIE_MISSING, relay._LAST_COOKIE_REFUSED_ITEMS)
+        self.addCleanup(lambda: (
+            setattr(relay, "_LAST_STORAGE_EXPECTED", saved[0]),
+            setattr(relay, "_LAST_STORAGE_MISSING", saved[1]),
+            setattr(relay, "_LAST_COOKIE_MISSING", saved[2]),
+            setattr(relay, "_LAST_COOKIE_REFUSED_ITEMS", saved[3])))
+        relay._LAST_STORAGE_EXPECTED = 7
+        relay._LAST_STORAGE_MISSING = ["user", "cart"]
+        relay._LAST_COOKIE_MISSING = ["old_cookie"]
+        with self.assertRaises(ValueError):
+            # Every cookie is rejected for domain mismatch and none survives.
+            relay.set_session(
+                "https://x.com",
+                [{"name": "foreign", "value": "v", "domain": ".other.example"}])
+        self.assertEqual(relay._LAST_STORAGE_EXPECTED, 0)
+        self.assertEqual(relay._LAST_STORAGE_MISSING, [])
+        self.assertEqual(relay._LAST_COOKIE_MISSING, [])
+        # The rejected cookie itself IS reported: it belongs to this request.
+        self.assertEqual(relay._LAST_COOKIE_REFUSED_ITEMS[0][0], "foreign")
 
 
 class AuthNeverRaises(unittest.TestCase):
