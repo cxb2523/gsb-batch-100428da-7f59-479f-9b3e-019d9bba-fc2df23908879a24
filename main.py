@@ -3,11 +3,11 @@ import json
 import logging
 import sys
 import re
+import tempfile
+import time
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import argparse
-import random
-import time
 
 from selenium import webdriver
 from selenium_stealth import stealth
@@ -27,11 +27,40 @@ AMOUNT_LABELS = ('Total cost', 'Total', 'Amount', 'Amount invested', 'Total valu
 NON_AMOUNT_LABEL_RE = re.compile(r'price|share|rate|quantity|fx', re.IGNORECASE)
 INACTIVE_STATUSES = {'cancelled', 'canceled', 'rejected', 'expired', 'failed'}
 
-# Wealthsimple renders negatives with a Unicode minus ("\u2212 $47.23 CAD").
+# Element locators for the Wealthsimple activity page.
+XPATH_ROWS = "//main//button[span[1]/span[3]]"
+XPATH_LOAD_MORE = "//button[.//span[text()='Load more']]"
+XPATH_HEADERS = "//main//h3"
+XPATH_ROW_DESCRIPTION = "./span[1]/span[2]/span[1]"
+XPATH_ROW_TYPE = "./span[1]/span[2]/span[2]/span[1]/span[1]/span[1]"
+XPATH_ROW_AMOUNT = "./span[1]/span[3]/span[last()]/span[1]/span[1]"
+XPATH_SECTION_HEADER = "ancestor::div[.//h3][1]//h3"
+
+# Wait/paging tuning, kept as module constants so tests can shrink them.
+PANEL_WAIT_TIMEOUT = 10
+DETAILS_WAIT_TIMEOUT = 5
+LOAD_MORE_MAX_CLICKS = 60
+PAGE_LOAD_WAIT_SECONDS = 2
+DEFAULT_AFTER_DAYS = 45
+
+
+class SkipTransaction(Exception):
+    """Raised when one transaction cannot be scraped and must be skipped."""
+
+
+class CutoffReached(Exception):
+    """Raised when a scraped transaction is older than the --after cutoff."""
+
+    def __init__(self, date):
+        super().__init__(f"cutoff reached at {date.isoformat()}")
+        self.date = date
+
+
+# Wealthsimple renders negatives with a Unicode minus ("− $47.23 CAD").
 # Normalize only for matching: the original string is kept in the output so
 # myResultParser.js keeps its existing type-based sign handling.
 def normalize_money(value):
-    text = str(value or '').replace('\u2212', '-').replace('\u2013', '-').replace('\u2014', '-').replace('\xa0', ' ')
+    text = str(value or '').replace('−', '-').replace('–', '-').replace('—', '-').replace(' ', ' ')
     text = re.sub(r'\s+', ' ', text).strip()
     return re.sub(r'^([+-])\s+', r'\1', text)
 
@@ -78,20 +107,313 @@ def convert_datetime(input_string):
 def click_visible(driver, element):
     driver.execute_script("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", element)
 
-# Main function
-if __name__ == "__main__":
-    # Validate arguments
-    output_path=""
-    after_str=None
+
+def _transaction_signature(transaction):
+    # Stable fingerprint of a full transaction record, used for resume dedup.
+    return json.dumps(transaction, sort_keys=True, ensure_ascii=False, separators=(',', ':'))
+
+
+def atomic_write_json(path, records):
+    """Serialize records as a JSON array and swap it into place atomically.
+
+    The temp file is created in the same directory as the target so os.replace
+    is atomic on both Linux and Windows. A crash or failed write therefore
+    leaves the previous file intact and parseable — never a half-written one.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix='.wealthsimpleton-', suffix='.tmp', dir=directory)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            json.dump(records, handle, indent=4)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+class IncrementalWriter:
+    """Keeps the output file as a valid JSON array after every transaction.
+
+    With no path the writer simply accumulates records in memory for the final
+    stdout print. On startup an existing file is loaded so an interrupted run
+    can be resumed without duplicating already-scraped transactions. Write
+    failures are counted and logged; scraping always continues.
+    """
+
+    def __init__(self, path, log, persist_fn=atomic_write_json):
+        self.path = path
+        self.log = log
+        self._persist_fn = persist_fn
+        self.records = []
+        self._signatures = set()
+        self.write_errors = 0
+        if path:
+            self._load_existing()
+
+    def _load_existing(self):
+        if not os.path.exists(self.path):
+            return
+        try:
+            with open(self.path, encoding='utf-8') as handle:
+                data = json.load(handle)
+            if not isinstance(data, list):
+                raise ValueError('top-level JSON value is not an array')
+        except (OSError, ValueError) as error:
+            # Never silently destroy an unreadable output file: move it aside
+            # and start a fresh array, then keep scraping.
+            backup = f"{self.path}.corrupt-{os.getpid()}"
+            try:
+                os.replace(self.path, backup)
+            except OSError:
+                backup = '(could not be moved)'
+            self.log.warning("Existing output %s is not a readable JSON array (%s); "
+                             "moved it to %s and starting a new file", self.path, error, backup)
+            return
+        self.records = data
+        self._signatures = {_transaction_signature(record) for record in data}
+        self.log.info("Resuming: loaded %d existing record(s) from %s", len(data), self.path)
+
+    def add(self, transaction):
+        """Append one transaction. Returns True if it was already on file.
+
+        Resumed duplicates are counted but not appended again, so the on-disk
+        array stays identical to the previous run instead of growing doubles.
+        """
+        signature = _transaction_signature(transaction)
+        if signature in self._signatures:
+            return True
+        self.records.append(transaction)
+        self._signatures.add(signature)
+        if self.path:
+            try:
+                self._persist_fn(self.path, self.records)
+            except Exception as error:  # noqa: BLE001 - scraping must survive disk errors
+                self.write_errors += 1
+                self.log.warning("Failed to incrementally write %s after %d record(s): %s. "
+                                 "Keeping the data in memory and continuing",
+                                 self.path, len(self.records), error)
+        return False
+
+    def flush(self):
+        """Final best-effort retry if any incremental write failed earlier."""
+        if not self.path or self.write_errors == 0:
+            return
+        try:
+            self._persist_fn(self.path, self.records)
+        except Exception as error:  # noqa: BLE001
+            self.log.warning("Final retry writing %s also failed: %s. "
+                             "All %d record(s) are still printed to stdout",
+                             self.path, error, len(self.records))
+        else:
+            self.log.info("Retry succeeded: %d record(s) saved to %s", len(self.records), self.path)
+            self.write_errors = 0
+
+
+# Keep clicking "Load more" until the button disappears or the oldest visible
+# section is confirmed older than the cutoff. An unparseable section header is
+# never fatal: log a warning and load the next page instead of stopping early.
+def load_all_activity(driver, cutoff, log):
+    cutoff_midnight = cutoff.replace(hour=0, minute=0, second=0, microsecond=0)
+    clicks = 0
+    for _ in range(LOAD_MORE_MAX_CLICKS):
+        try:
+            load_more = driver.find_element(By.XPATH, XPATH_LOAD_MORE)
+        except NoSuchElementException:
+            log.info("No 'Load more' button found, reached the end of the activity list")
+            break
+        headers = driver.find_elements(By.XPATH, XPATH_HEADERS)
+        if headers:
+            oldest_header_text = headers[-1].text
+            try:
+                oldest = convert_datetime(oldest_header_text)
+            except ValueError:
+                log.warning("Oldest section header %r could not be parsed as a date; "
+                            "loading the next page anyway instead of stopping pagination",
+                            oldest_header_text)
+            else:
+                if oldest < cutoff_midnight:
+                    log.info("Reached cutoff %s, stopping 'Load more'", cutoff.date().isoformat())
+                    break
+        click_visible(driver, load_more)
+        clicks += 1
+        time.sleep(PAGE_LOAD_WAIT_SECONDS)
+    return clicks
+
+
+def _read_panel_details(driver, panel):
+    try:
+        WebDriverWait(driver, DETAILS_WAIT_TIMEOUT).until(
+            lambda _: panel.find_elements(By.TAG_NAME, 'dt'))
+    except TimeoutException:
+        pass
+    # Pair each label with its own value; zipping the dt and dd lists
+    # globally mispairs every row after an unpaired dd.
+    details = {}
+    for dt in panel.find_elements(By.TAG_NAME, 'dt'):
+        dd = dt.find_elements(By.XPATH, './following-sibling::dd[1]')
+        if dd:
+            details[dt.text] = dd[0].text
+    return details
+
+
+# Scrape a single activity row into the unchanged output schema, or raise
+# SkipTransaction with a human-readable reason. Any exception type other than
+# SkipTransaction/CutoffReached is treated as an unexpected skip by the caller.
+def scrape_one(driver, index, cutoff, log):
+    ticker = driver.find_elements(By.XPATH, XPATH_ROWS)[index]
+    description = ticker.find_element(By.XPATH, XPATH_ROW_DESCRIPTION).text
+    transaction_type = ticker.find_element(By.XPATH, XPATH_ROW_TYPE).text
+
+    click_visible(driver, ticker)
+    panel_xpath = f"({XPATH_ROWS})[{index + 1}]/following-sibling::div[1]"
+    try:
+        panel = WebDriverWait(driver, PANEL_WAIT_TIMEOUT).until(
+            EC.presence_of_element_located((By.XPATH, panel_xpath)))
+    except TimeoutException:
+        raise SkipTransaction(f"activity panel did not open within {PANEL_WAIT_TIMEOUT}s")
+
+    details = _read_panel_details(driver, panel)
+    click_visible(driver, ticker)  # collapse
+
+    status = (details.get('Status') or '').strip()
+    if status.lower() in INACTIVE_STATUSES:
+        raise SkipTransaction(f"inactive status: {status}")
+
+    row_amount_matches = ticker.find_elements(By.XPATH, XPATH_ROW_AMOUNT)
+    row_amount = row_amount_matches[0].text.strip() if row_amount_matches else ''
+    amount = pick_amount(details)
+    if amount is None:
+        if row_amount and is_money(row_amount):
+            amount = row_amount
+            log.debug("  using row amount for %d: %s | %s", index + 1, description, transaction_type)
+        else:
+            suffix = f" (status: {status})" if status else ""
+            raise SkipTransaction(f"no transaction amount found in panel or row{suffix}")
+
+    date_str = details.get('Date')
+    if not date_str:
+        date_str = ticker.find_element(By.XPATH, XPATH_SECTION_HEADER).text
+    try:
+        date_dt = convert_datetime(date_str)
+    except ValueError:
+        raise SkipTransaction(f"unparseable date: {date_str!r}")
+
+    if date_dt < cutoff:
+        raise CutoffReached(date_dt)
+
+    return {
+        "description": description,
+        "type": transaction_type,
+        "amount": amount,
+        "date": date_dt.isoformat(),
+        "details": details,
+    }
+
+
+def _log_skip(log, stats, skipped, index, total, description, transaction_type, reason):
+    label = one_line(description) or f"index {index + 1}"
+    type_part = f" | {transaction_type}" if transaction_type else ""
+    log.warning("Skipped %d/%d: %s%s — %s", index + 1, total, label, type_part, reason)
+    stats['skipped'] += 1
+    skipped.append({
+        'index': index + 1,
+        'total': total,
+        'description': label,
+        'type': transaction_type,
+        'reason': reason,
+    })
+
+
+# Iterate over every loaded activity row. Successful transactions go to the
+# incremental writer immediately; every skip is logged with its position,
+# readable description and reason, and counted for the final summary.
+def scrape_all(driver, cutoff, writer, log):
+    tickers = driver.find_elements(By.XPATH, XPATH_ROWS)
+    total = len(tickers)
+    log.info("Found %d transactions, scraping...", total)
+    stats = {'succeeded': 0, 'written': 0, 'resumed': 0, 'skipped': 0, 'write_errors': 0}
+    skipped = []
+
+    for index in range(total):
+        description = f"index {index + 1}"
+        transaction_type = ""
+        ticker = None
+        try:
+            ticker = driver.find_elements(By.XPATH, XPATH_ROWS)[index]
+            description = ticker.find_element(By.XPATH, XPATH_ROW_DESCRIPTION).text
+            transaction_type = ticker.find_element(By.XPATH, XPATH_ROW_TYPE).text
+        except Exception as error:  # noqa: BLE001
+            _log_skip(log, stats, skipped, index, total, description, transaction_type,
+                      f"row header unreadable: {type(error).__name__}: {error}")
+            continue
+
+        try:
+            transaction = scrape_one(driver, index, cutoff, log)
+        except CutoffReached:
+            log.info("Cutoff %s reached, stopping", cutoff.date().isoformat())
+            break
+        except SkipTransaction as skip:
+            _log_skip(log, stats, skipped, index, total, description, transaction_type, str(skip))
+            continue
+        except Exception as error:  # noqa: BLE001
+            log.debug("  scrape error for %d/%d", index + 1, total, exc_info=True)
+            _log_skip(log, stats, skipped, index, total, description, transaction_type,
+                      f"{type(error).__name__}: {error}")
+            continue
+
+        resumed = writer.add(transaction)
+        stats['succeeded'] += 1
+        if resumed:
+            stats['resumed'] += 1
+            log.info("  %d/%d already present in output file, kept as-is: %s",
+                     index + 1, total, description)
+        else:
+            stats['written'] += 1
+            log.debug("  %d/%d: %s | %s | %s | %s", index + 1, total,
+                      description, transaction_type, transaction['amount'], transaction['date'])
+
+    stats['write_errors'] = writer.write_errors
+    return stats, skipped
+
+
+# Full scrape against an injected driver (real Selenium or a test fake).
+def run(driver, output_path, cutoff, log, persist_fn=atomic_write_json):
+    load_all_activity(driver, cutoff, log)
+    writer = IncrementalWriter(output_path or None, log, persist_fn=persist_fn)
+    stats, skipped = scrape_all(driver, cutoff, writer, log)
+    writer.flush()
+
+    # stdout stays a pure JSON array, exactly as myResultParser.js expects;
+    # all human-facing reporting (including the summary) goes to stderr.
+    print(json.dumps(writer.records, indent=4))
+
+    summary = (f"Scrape complete: {stats['succeeded']} succeeded "
+               f"({stats['written']} newly written, {stats['resumed']} already on file), "
+               f"{stats['skipped']} skipped")
+    if stats['write_errors']:
+        summary += f", {stats['write_errors']} file write error(s)"
+    log.info(summary)
+    for item in skipped:
+        log.info("  skipped #%d/%d: %s — %s",
+                 item['index'], item['total'], item['description'], item['reason'])
+    return stats, skipped, writer
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('--file', help='Where to save the output (can be an existing file for incremental scraping)')
     parser.add_argument('--after', help='A \'Y-m-d H:M\' string to filter out orders older than a certain date/time')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose/debug logging to stderr')
-    args = parser.parse_args()
-    if args.file:
-        output_path = args.file
-    if args.after:
-        after_str = args.after
+    args = parser.parse_args(argv)
+
+    output_path = args.file or ""
+    after_str = args.after
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -152,95 +474,16 @@ if __name__ == "__main__":
     WebDriverWait(driver, 3600).until(EC.url_changes(driver.current_url)) # Long timeout needed for manual login or 2FA
     log.info("Logged in, loading activity page")
     driver.get("https://my.wealthsimple.com/app/activity")
-    WebDriverWait(driver, 300).until(EC.presence_of_element_located((By.XPATH, "//main//button[span[1]/span[3]]")))
+    WebDriverWait(driver, 300).until(EC.presence_of_element_located((By.XPATH, XPATH_ROWS)))
     time.sleep(2)
     if after_str is not None:
         cutoff = datetime.strptime(after_str, '%Y-%m-%d %H:%M')
     else:
-        cutoff = datetime.now() - timedelta(days=45)  # ~1.5 months
-    for _ in range(60):
-        try:
-            load_more = driver.find_element(By.XPATH, "//button[.//span[text()='Load more']]")
-        except NoSuchElementException:
-            break
-        headers = driver.find_elements(By.XPATH, "//main//h3")
-        if headers:
-            oldest = convert_datetime(headers[-1].text)
-            if oldest < cutoff.replace(hour=0, minute=0, second=0, microsecond=0):
-                log.info("Reached cutoff %s, stopping 'Load more'", cutoff.date().isoformat())
-                break
-        click_visible(driver, load_more)
-        time.sleep(2)
-    tickers = driver.find_elements(By.XPATH, "//main//button[span[1]/span[3]]")
-    log.info("Found %d transactions, scraping...", len(tickers))
-    transactions = []
-    for x in range(len(tickers)):
-        ticker = None
-        try:
-            ticker = driver.find_elements(By.XPATH, "//main//button[span[1]/span[3]]")[x]
-            description = ticker.find_element(By.XPATH, "./span[1]/span[2]/span[1]").text
-            transactionType = ticker.find_element(By.XPATH, "./span[1]/span[2]/span[2]/span[1]/span[1]/span[1]").text
-            click_visible(driver, ticker)
-            panel = WebDriverWait(driver, 10).until(EC.presence_of_element_located((
-                By.XPATH, f"(//main//button[span[1]/span[3]])[{x + 1}]/following-sibling::div[1]")))
-            try:
-                WebDriverWait(driver, 5).until(lambda _: panel.find_elements(By.TAG_NAME, 'dt'))
-            except TimeoutException:
-                pass
-            # Pair each label with its own value; zipping the dt and dd lists
-            # globally mispairs every row after an unpaired dd.
-            details = {}
-            for dt in panel.find_elements(By.TAG_NAME, 'dt'):
-                dd = dt.find_elements(By.XPATH, './following-sibling::dd[1]')
-                if dd:
-                    details[dt.text] = dd[0].text
-            click_visible(driver, ticker)  # collapse
-            status = (details.get('Status') or '').strip()
-            if status.lower() in INACTIVE_STATUSES:
-                log.info("  Skipped %s transaction %d/%d: %s | %s",
-                         status, x + 1, len(tickers), description, transactionType)
-                continue
-            row_amount_matches = ticker.find_elements(
-                By.XPATH, "./span[1]/span[3]/span[last()]/span[1]/span[1]")
-            row_amount = row_amount_matches[0].text.strip() if row_amount_matches else ''
-            amount = pick_amount(details)
-            if amount is None:
-                if row_amount and is_money(row_amount):
-                    amount = row_amount
-                    log.debug("  using row amount for %d/%d: %s | %s",
-                              x + 1, len(tickers), description, transactionType)
-                else:
-                    suffix = f" (status: {status})" if status else ""
-                    log.warning("  Skipped %d/%d: %s | %s%s: no amount",
-                                x + 1, len(tickers), description, transactionType, suffix)
-                    continue
-            date_str = details.get('Date')
-            if not date_str:
-                date_str = ticker.find_element(By.XPATH, "ancestor::div[.//h3][1]//h3").text
-            date = convert_datetime(date_str).isoformat()
-        except Exception as e:
-            label = one_line(ticker.text) if ticker is not None else f"index {x}"
-            log.warning("  Skipped %d/%d: %s (%s)", x + 1, len(tickers), label, type(e).__name__)
-            log.debug("  scrape error for %d/%d", x + 1, len(tickers), exc_info=True)
-            continue
-        log.debug("  %d/%d: %s | %s | %s | %s", x + 1, len(tickers), description, transactionType, amount, date)
+        cutoff = datetime.now() - timedelta(days=DEFAULT_AFTER_DAYS)  # ~1.5 months
 
-        if datetime.fromisoformat(date) < cutoff:
-            log.info("Cutoff %s reached, stopping", cutoff.date().isoformat())
-            break
+    run(driver, output_path, cutoff, log)
 
-        transactions.append({
-            "description": description,
-            "type": transactionType,
-            "amount": amount,
-            "date": date,
-            "details": details,
-        })
 
-    log.info("Scraped %d transactions", len(transactions))
-    report = json.dumps(transactions, indent=4)
-    print(report)
-    if output_path:
-        log.info("Writing %s", output_path)
-        with open(output_path, 'w') as f:
-            f.write(report)
+# Main function
+if __name__ == "__main__":
+    main()
