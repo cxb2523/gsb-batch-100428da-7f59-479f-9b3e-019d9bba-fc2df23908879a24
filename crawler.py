@@ -293,44 +293,6 @@ def sanitize_entry(val):
         return None
     return val
 
-def load_existing_progress(filename):
-    """
-    Reads an existing markdown report file to recover:
-    1. Scanned URLs -> visited_urls
-    2. Outgoing discovered links -> unvisited queue
-    This ensures resuming continues scanning unvisited links instead of stopping!
-    """
-    visited_already = set()
-    discovered_links = set()
-    
-    if not os.path.exists(filename):
-        return visited_already, []
-        
-    print(f"🔄 Existing scan report found (`{filename}`). Reading previous progress...")
-    try:
-        with open(filename, "r", encoding="utf-8") as f:
-            current_section = None
-            for line in f:
-                line = line.strip()
-                if line.startswith("## 📍 Page: `"):
-                    extracted_url = line.split("`")[1]
-                    visited_already.add(extracted_url)
-                elif line.startswith("### 🔗 Outgoing Links"):
-                    current_section = "links"
-                elif line.startswith("###"):
-                    current_section = None
-                elif current_section == "links" and line.startswith("- `"):
-                    link_url = line.split("`")[1]
-                    discovered_links.add(link_url)
-    except Exception as e:
-        print(f"⚠️ Warning reading previous progress: {e}")
-        
-    # Queue only links that have NOT been visited yet
-    unvisited_queue = [(link, 1) for link in sorted(discovered_links) if link not in visited_already]
-    
-    print(f"▶️ Resuming scan: {len(visited_already)} pages already scanned, {len(unvisited_queue)} queued links remaining.")
-    return visited_already, unvisited_queue
-
 # ==========================================
 # LIVE REPORT WRITER (Real-time Append)
 # ==========================================
@@ -495,14 +457,40 @@ def ast_structure_aware_chunking(source_code, max_chunk_size=25000):
 
     return smart_chunks
 
+def _normalize_queue_items(items, default_depth=1):
+    """
+    Normalizes raw queue entries to (url, depth) tuples, preserving each
+    entry's real crawl depth and dropping duplicates (first occurrence wins).
+    """
+    normalized = []
+    seen = set()
+    for item in items or []:
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            url, depth = item[0], item[1]
+        else:
+            url, depth = item, default_depth
+        try:
+            depth = int(depth)
+        except (TypeError, ValueError):
+            depth = default_depth
+        if url and url not in seen:
+            seen.add(url)
+            normalized.append((url, depth))
+    return normalized
+
 def load_existing_progress(filename):
     """
     State Persistence & Checkpoint Recovery:
-    Loads visited URLs and queued links from disk if the scan was interrupted.
+    Loads visited URLs, the queued links (with their REAL depths), pages that
+    were fetched but never written to the report, and pages that failed mid-run.
+
+    Returns: (visited_urls, to_visit_queue, pending_report, failed_urls)
     """
     checkpoint_file = f"{filename}.checkpoint.json"
     visited_urls = set()
     restored_queue = []
+    pending_report = {}
+    failed_urls = []
 
     # Method 1: Load from dedicated JSON checkpoint file if available
     if os.path.exists(checkpoint_file):
@@ -510,58 +498,88 @@ def load_existing_progress(filename):
             with open(checkpoint_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 visited_urls = set(data.get("visited_urls", []))
-                restored_queue = [tuple(item) for item in data.get("to_visit_queue", [])]
-                print(f"🔄 Checkpoint found! Resuming scan: {len(visited_urls)} visited, {len(restored_queue)} queued.")
-                return visited_urls, restored_queue
+                # Each queued item keeps the depth it was enqueued with
+                restored_queue = _normalize_queue_items(data.get("to_visit_queue", []))
+                pending_report = data.get("pending_report", {}) or {}
+                failed_urls = _normalize_queue_items(data.get("failed_urls", []))
+                print(f"🔄 Checkpoint found! Resuming scan: {len(visited_urls)} visited, "
+                      f"{len(restored_queue)} queued, {len(pending_report)} pending report, "
+                      f"{len(failed_urls)} failed to retry.")
+                return visited_urls, restored_queue, pending_report, failed_urls
         except Exception as e:
             print(f"⚠️ Warning loading checkpoint JSON: {e}")
 
-    # Method 2: Fallback parse visited nodes AND unvisited links directly from existing Markdown report
+    # Method 2: Fallback parse visited nodes AND unvisited links directly from existing Markdown report.
+    # ONLY links listed under a page's "Outgoing Links" section are queued —
+    # loaded scripts and AI-discovered endpoints are NOT crawl queue entries.
     if os.path.exists(filename):
         try:
             with open(filename, "r", encoding="utf-8") as f:
-                content = f.read()
-                
-                # Extract visited pages and their recorded depths
-                visited_nodes = re.findall(r"## 📍 NODE PAGE: `(.*?)` \(Depth (\d+)\)", content)
-                node_depth_map = {}
-                for u, d in visited_nodes:
-                    visited_urls.add(u)
-                    node_depth_map[u] = int(d)
-                
-                # Extract all outgoing link edges from the report
-                all_discovered_links = set(re.findall(r"└── `(https?://[^\`]+)`", content))
-                
-                # Rebuild queue with unvisited links
-                queued_urls = set()
-                for link in all_discovered_links:
-                    if link not in visited_urls and link not in queued_urls:
-                        # Find parent depth if possible, default to depth 1
-                        restored_queue.append((link, 1))
-                        queued_urls.add(link)
+                current_page_url = None
+                current_page_depth = 0
+                in_outgoing_links_section = False
+                discovered = {}  # link -> depth to enqueue at (parent depth + 1)
+
+                for line in f:
+                    stripped = line.strip()
+
+                    page_match = re.match(r"## 📍 NODE PAGE: `(.*?)` \(Depth (\d+)\)", stripped)
+                    if page_match:
+                        current_page_url = page_match.group(1)
+                        current_page_depth = int(page_match.group(2))
+                        visited_urls.add(current_page_url)
+                        in_outgoing_links_section = False
+                        continue
+
+                    if stripped.startswith("#"):
+                        # Any new header switches section; only the Outgoing Links
+                        # section of a page node feeds the crawl queue.
+                        in_outgoing_links_section = stripped.startswith("### 🔗 Graph Edges: Outgoing Links")
+                        continue
+
+                    if in_outgoing_links_section and current_page_url:
+                        link_match = re.match(r"└── `(https?://[^`]+)`", stripped)
+                        if link_match:
+                            link = link_match.group(1)
+                            child_depth = current_page_depth + 1
+                            if link not in discovered or child_depth < discovered[link]:
+                                discovered[link] = child_depth
+
+                # Filter out already-visited pages only AFTER the whole file is
+                # parsed — a page's node header may appear later in the report
+                # than the section that links to it.
+                restored_queue = [(link, depth) for link, depth in sorted(discovered.items())
+                                  if link not in visited_urls]
 
                 if visited_urls:
                     print(f"📄 Report file found! Recovered {len(visited_urls)} previously scanned URLs.")
                 if restored_queue:
-                    print(f"🔄 Rebuilt unvisited crawl queue: {len(restored_queue)} links ready to resume!")
+                    print(f"🔄 Rebuilt unvisited crawl queue: {len(restored_queue)} links ready to resume (depths preserved)!")
 
         except Exception as e:
             print(f"⚠️ Warning reading markdown report: {e}")
 
-    return visited_urls, restored_queue
+    return visited_urls, restored_queue, pending_report, failed_urls
 
-def save_checkpoint(filename, visited_urls, to_visit_queue):
-    """Saves current crawling state to disk after each URL completes."""
+def save_checkpoint(filename, visited_urls, to_visit_queue, pending_report=None, failed_urls=None):
+    """
+    Saves current crawling state to disk. Every queued/failed entry keeps its
+    real (url, depth) pair, and `pending_report` holds pages that were fetched
+    & analyzed but not yet written to the report, so a rerun can rebuild their
+    report entries WITHOUT re-fetching or re-analyzing them.
+    """
     checkpoint_file = f"{filename}.checkpoint.json"
     try:
         data = {
-            "visited_urls": list(visited_urls),
-            "to_visit_queue": [list(item) for item in to_visit_queue]
+            "visited_urls": sorted(visited_urls),
+            "to_visit_queue": [[url, depth] for url, depth in to_visit_queue],
+            "pending_report": pending_report or {},
+            "failed_urls": [[url, depth] for url, depth in (failed_urls or [])]
         }
         with open(checkpoint_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
-        pass
+        print(f"⚠️ Warning saving checkpoint: {e}")
 
 BROWSER_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -601,39 +619,70 @@ def is_same_root_domain(target_netloc, base_domain):
 # 4. LLM-GUIDED CRAWLER LOOP WITH GRAPHIFY & LIVE REPORTING
 # ==========================================
 def crawling_website(start_url, max_depth, report_filename):
-    # Load previously scanned URLs and unvisited queued links from report file
-    visited_urls, restored_queue = load_existing_progress(report_filename)
-    
-    if restored_queue:
-        to_visit_queue = restored_queue
-    else:
+    # Load previously scanned URLs, queued links (real depths preserved),
+    # fetched-but-unreported pages, and failed pages from disk
+    visited_urls, restored_queue, pending_report, failed_urls = load_existing_progress(report_filename)
+
+    # 1. Flush pages that were fetched & analyzed but whose report entries were
+    #    never written (crash between analysis and report write). Rebuild their
+    #    report entries from checkpoint data — NO re-fetch, NO re-analysis.
+    if pending_report:
+        print(f"📝 Recovering {len(pending_report)} fetched-but-unreported page(s) from checkpoint (no re-fetch needed)...")
+        for pending_url, page_data in pending_report.items():
+            if pending_url in visited_urls:
+                continue
+            append_page_findings_to_report(
+                report_filename,
+                pending_url,
+                page_data.get("depth", 0),
+                page_data.get("scripts", []),
+                page_data.get("links", []),
+                [tuple(item) for item in page_data.get("ai_findings", [])]
+            )
+            visited_urls.add(pending_url)
+            print(f"  💾 Recovered report entry for {pending_url}")
+        pending_report = {}
+        save_checkpoint(report_filename, visited_urls, restored_queue, pending_report, failed_urls)
+
+    # 2. Rebuild the work queue: failed pages are re-queued (re-fetched, not
+    #    duplicated), then the restored queue, each keeping its real depth.
+    to_visit_queue = []
+    queued_urls = set()
+    for url, depth in failed_urls + restored_queue:
+        if url not in visited_urls and url not in queued_urls:
+            to_visit_queue.append((url, depth))
+            queued_urls.add(url)
+    if not to_visit_queue:
         to_visit_queue = [(start_url, 0)]
-        
+
     start_domain = urllib.parse.urlparse(start_url).netloc
-    
+
     while to_visit_queue:
         current_url, current_depth = to_visit_queue.pop(0)
-        
+
         if current_url in visited_urls or current_depth > max_depth:
             continue
-            
-        visited_urls.add(current_url)
+
         all_urls.add(current_url)
         print(f"\n🌐 [Depth {current_depth}/{max_depth}] Crawling: {current_url}")
-        
+
         try:
             response = requests.get(current_url, headers=BROWSER_HEADERS, timeout=15)
             if response.status_code != 200:
                 print(f"  ❌ Page returned status code: {response.status_code}")
+                # Not visited — record as failed so a rerun re-fetches it
+                if all(u != current_url for u, _ in failed_urls):
+                    failed_urls.append((current_url, current_depth))
+                save_checkpoint(report_filename, visited_urls, to_visit_queue, pending_report, failed_urls)
                 continue
-                
+
             html_text = response.text
-            
+
             # Extract links and populate Graphify Edges
             soup = BeautifulSoup(html_text, 'html.parser')
             page_links = [urllib.parse.urljoin(current_url, a['href'].strip()) for a in soup.find_all('a', href=True)]
             script_files = [urllib.parse.urljoin(current_url, s['src'].strip()) for s in soup.find_all('script', src=True)]
-            
+
             for link in page_links:
                 add_edge_to_graph(current_url, "links", link)
             for script in script_files:
@@ -641,17 +690,17 @@ def crawling_website(start_url, max_depth, report_filename):
 
             real_links = page_links + script_files
             print(f"  📌 BeautifulSoup extracted {len(real_links)} real links/scripts.")
-            
+
             for link in real_links:
                 parsed = urllib.parse.urlparse(link)
                 if is_same_root_domain(parsed.netloc, start_domain) and parsed.scheme in ('http', 'https'):
                     if link not in visited_urls:
                         to_visit_queue.append((link, current_depth + 1))
                         all_urls.add(link)
-            
+
             # 3. Analyze HTML text with AST-Aware Parallel LLM Chunks
             chunks = ast_structure_aware_chunking(html_text, max_chunk_size=25000)
-            
+
             # Fetch & analyze loaded external JavaScript files directly
             for js_url in script_files[:5]: # Analyze top 5 critical loaded JS assets per page
                 try:
@@ -661,10 +710,10 @@ def crawling_website(start_url, max_depth, report_filename):
                         chunks.extend(js_chunks[:3]) # Add JS chunks to LLM queue
                 except Exception:
                     pass
-            
+
             # Parallel LLM Analysis
             analysis_outputs = process_chunks_in_parallel(chunks, max_workers=5)
-            
+
             # Record findings to Graphify Node & Auto-Queue Discovered AI Endpoints
             for _, parsed in analysis_outputs:
                 add_edge_to_graph(current_url, "findings", parsed)
@@ -677,26 +726,54 @@ def crawling_website(start_url, max_depth, report_filename):
                             if full_ep_url not in visited_urls:
                                 to_visit_queue.append((full_ep_url, current_depth + 1))
                                 all_urls.add(full_ep_url)
-            
+
+            # CHECKPOINT FIRST: persist the fetched & analyzed page data BEFORE
+            # writing the report. If the report write (or anything below) crashes,
+            # the rerun rebuilds this page's report entry from the checkpoint
+            # instead of re-fetching / re-analyzing it.
+            pending_report[current_url] = {
+                "depth": current_depth,
+                "links": page_links,
+                "scripts": script_files,
+                "ai_findings": [[idx, parsed] for idx, parsed in analysis_outputs]
+            }
+            save_checkpoint(report_filename, visited_urls, to_visit_queue, pending_report, failed_urls)
+
             # LIVE REPORTING: Append findings immediately to markdown file
             append_page_findings_to_report(report_filename, current_url, current_depth, script_files, page_links, analysis_outputs)
             print(f"  💾 Live report updated in `{report_filename}`")
-            
+
+            # Only mark the page visited AFTER its report entry is durably written
+            visited_urls.add(current_url)
+            pending_report.pop(current_url, None)
+            failed_urls = [f for f in failed_urls if f[0] != current_url]
+
             # Save checkpoint state for instant resume support
-            save_checkpoint(report_filename, visited_urls, to_visit_queue)
-                
+            save_checkpoint(report_filename, visited_urls, to_visit_queue, pending_report, failed_urls)
+
             time.sleep(1)
-            
+
         except Exception as e:
             print(f"  ❌ Failed to crawl {current_url}: {e}")
-            
-    # Remove checkpoint file upon full completion
+            # Page was NOT successfully processed — record it as failed so the
+            # next run re-fetches it (unless it is already pending a report write).
+            if current_url not in pending_report and all(u != current_url for u, _ in failed_urls):
+                failed_urls.append((current_url, current_depth))
+            save_checkpoint(report_filename, visited_urls, to_visit_queue, pending_report, failed_urls)
+
+    # Remove checkpoint file upon full completion — but keep it if any page is
+    # still pending a report write or failed mid-run, so the next run can
+    # recover those pages instead of losing (or re-fetching) them.
     checkpoint_file = f"{report_filename}.checkpoint.json"
     if os.path.exists(checkpoint_file):
-        try:
-            os.remove(checkpoint_file)
-        except Exception:
-            pass
+        if not pending_report and not failed_urls:
+            try:
+                os.remove(checkpoint_file)
+            except Exception:
+                pass
+        else:
+            print(f"⚠️ Checkpoint kept at `{checkpoint_file}` "
+                  f"({len(pending_report)} pending report, {len(failed_urls)} failed) — rerun to recover those pages.")
 
     return visited_urls
 
