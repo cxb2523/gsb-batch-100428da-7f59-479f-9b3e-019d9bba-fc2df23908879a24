@@ -1,0 +1,35 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+dist/
+build/
+*.spec
+!Schinza.spec
+!Schinza-mac.spec
+*.spec.bak
+*.log
+.DS_Store
+Thumbs.db
+
+# Local runtime data (credentials / exports) - not for upload
+data/
+
+# Private CA material - do not publish keys
+mitmproxy-ca.pem
+mitmproxy-ca.p12
+mitmproxy-ca-cert.p12
+mitmproxy-ca-cert.cer
+
+# Standalone repo backup (removed nested .git) - never track
+.git.standalone-backup/
+
+# local test temp dirs
+.pytest_tmp*/
+.tmp/
+
+# Local test output dirs (never commit)
+.tmp_export_test/
+.tmp_stats_test/
+
+.superpowers/*
