@@ -38,6 +38,7 @@ __all__ = [
     "update_task_mode",
     "increment_task_cookie_failure_count",
     "reset_task_cookie_failure_count",
+    "clear_task_suspend_info",
 ]
 
 
@@ -353,8 +354,26 @@ def resume_task_to_pending(task_id):
     task = get_task(task_id)
     if not task or task["state"] not in {"paused", "waiting_cookie", "waiting_choice"}:
         return False
+    clear_task_suspend_info(task_id)
     update_task_status(task_id, state="pending", task_cookie_failure_count=0, log_msg="任务已恢复到队列")
     return True
+
+
+def clear_task_suspend_info(task_id):
+    """恢复任务时清除断点中的挂起说明（阶段/位置/原因），保留位置数据供续跑。"""
+    import json
+
+    task = get_task(task_id)
+    if not task or not task.get("checkpoint_json"):
+        return
+    try:
+        data = json.loads(task["checkpoint_json"])
+    except (TypeError, json.JSONDecodeError):
+        return
+    if not isinstance(data, dict) or "suspend" not in data:
+        return
+    data.pop("suspend", None)
+    save_task_checkpoint(task_id, data)
 
 
 def request_task_cancel(task_id):

@@ -476,7 +476,14 @@ onUnmounted(() => {
                   <div class="truncate font-bold text-xs leading-tight" :title="displayName(task.final_filename || task.filename || '自动命名')">
                     {{ displayName(task.final_filename || task.filename || '自动命名') }}
                   </div>
-                  <div class="truncate font-mono text-[10px] leading-tight text-subtle">
+                  <div
+                    v-if="task.suspend_position"
+                    class="truncate font-mono text-[10px] leading-tight text-warning-text"
+                    :title="task.suspend_reason || ''"
+                  >
+                    断点 {{ task.suspend_position }} · 已抓 {{ task.suspend_fetched_count ?? 0 }} 部
+                  </div>
+                  <div v-else class="truncate font-mono text-[10px] leading-tight text-subtle">
                     {{ (task.task_id || '').slice(0, 8) }}
                   </div>
                 </div>
@@ -512,6 +519,9 @@ onUnmounted(() => {
             <div v-if="currentTask.state === 'waiting_cookie'" class="basis-full rounded border border-soft bg-surface-sunken px-3 py-2 text-xs text-muted">
               <div><span>Cookie 状态：</span>{{ cookieStatusLabel }}</div>
               <div class="truncate" :title="waitingCookieReason(currentTask)"><span>失败原因：</span>{{ waitingCookieReason(currentTask) }}</div>
+              <div v-if="currentTask.suspend_position">
+                <span>断点位置：</span>{{ currentTask.suspend_position }}（已抓 {{ currentTask.suspend_fetched_count ?? 0 }} 部，恢复后从此处继续）
+              </div>
               <div><span>推荐处理：</span>{{ cookieRecommendation() }}</div>
               <div v-if="currentTask.task_cookie_failure_count"><span>累计次数：</span>{{ currentTask.task_cookie_failure_count }}</div>
             </div>

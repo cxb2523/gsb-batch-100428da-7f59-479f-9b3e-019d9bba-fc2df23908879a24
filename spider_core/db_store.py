@@ -833,4 +833,5 @@ from task_repo import (  # noqa: E402,F401
     update_task_mode,
     update_task_status,
     reset_task_cookie_failure_count,
+    clear_task_suspend_info,
 )

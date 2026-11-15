@@ -22,6 +22,11 @@ export interface Task {
   error_message?: string
   task_cookie_failure_count?: number
   can_copy_incremental_magnets?: boolean
+  suspend_reason?: string
+  suspend_stage?: string
+  suspend_position?: string
+  suspend_code?: string
+  suspend_fetched_count?: number
 }
 
 export interface QueueStatus {

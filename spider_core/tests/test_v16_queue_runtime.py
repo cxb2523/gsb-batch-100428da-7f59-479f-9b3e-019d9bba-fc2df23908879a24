@@ -471,7 +471,7 @@ class TaskEnqueueTest(unittest.TestCase):
         self.assertEqual(runtime["cookie_status"], "expired")
         self.assertIn("登录态", task["error_message"])
 
-    def test_runtime_network_error_pauses_without_invalidating_cookie(self):
+    def test_runtime_network_error_fails_without_invalidating_cookie(self):
         class FakeNetworkError(Exception):
             pass
 
@@ -488,10 +488,15 @@ class TaskEnqueueTest(unittest.TestCase):
 
         task = db_store.get_task(task_id)
         runtime = db_store.get_runtime_config(include_cookie=False)
-        self.assertEqual(task["state"], "waiting_cookie")
-        self.assertEqual(task["task_cookie_failure_count"], 1)
+        # 网络或代理错误 → 标记失败并保留断点，而不是挂起等待 Cookie
+        self.assertEqual(task["state"], "failed")
+        self.assertEqual(task["task_cookie_failure_count"], 0)
         self.assertEqual(runtime["cookie_status"], "network_error")
         self.assertIn("网络或代理", runtime["cookie_last_error"])
+        checkpoint = db_store.load_task_checkpoint(task_id)
+        self.assertEqual(checkpoint["phase"], 1)
+        self.assertEqual(checkpoint["suspend"]["stage"], "list")
+        self.assertEqual(checkpoint["suspend"]["reason_type"], "network_error")
 
     def test_resume_resets_cookie_failure_count_after_validation(self):
         task_id = db_store.create_task("https://javdb.com/actors/QDvG", filename="out.csv")

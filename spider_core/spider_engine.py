@@ -270,6 +270,50 @@ def classify_runtime_fetch_issue(response=None, error=None, stage_label="请求"
     return None
 
 
+def _suspend_position_label(stage, page=None, index=None, total=None):
+    if stage == "list":
+        return f"目录页第 {page or 1} 页"
+    return f"详情页第 {(index or 0) + 1}/{total or 0} 部"
+
+
+def attach_suspend_info(checkpoint, issue, stage, page=None, index=None, total=None, code="", fetched_count=0):
+    """挂起前把阶段、页码/影片序号、当前番号、已抓数量与原因写入断点，便于核对与续跑。"""
+    enriched = dict(checkpoint)
+    enriched["suspend"] = {
+        "stage": stage,
+        "reason": issue.get("message", ""),
+        "reason_type": issue.get("cookie_status", ""),
+        "position_label": _suspend_position_label(stage, page=page, index=index, total=total),
+        "page": page or 0,
+        "index": index if index is not None else 0,
+        "total": total or 0,
+        "code": code or "",
+        "fetched_count": fetched_count or 0,
+    }
+    return enriched
+
+
+def _suspend_log_note(checkpoint, kept=False):
+    suspend = (checkpoint or {}).get("suspend") or {}
+    stage = suspend.get("stage")
+    if not stage:
+        return ""
+    verb = "断点已保留" if kept else "断点已保存"
+    if stage == "list":
+        return f"{verb}：{suspend.get('position_label')}，已收集 {suspend.get('fetched_count', 0)} 部影片，恢复后从此页继续。"
+    return (
+        f"{verb}：{suspend.get('position_label')}（番号 {suspend.get('code') or '-'}），"
+        f"已入库 {suspend.get('fetched_count', 0)} 部，恢复后从该部继续，不重复已入库影片。"
+    )
+
+
+def _append_suspend_log(checkpoint, kept=False):
+    note = _suspend_log_note(checkpoint, kept=kept)
+    task_id = get_current_task_id()
+    if note and task_id:
+        db_store.append_task_log(task_id, note)
+
+
 def pause_for_cookie_recovery(progress, current, checkpoint, issue):
     message = issue["message"]
     cookie_status = issue["cookie_status"]
@@ -279,6 +323,24 @@ def pause_for_cookie_recovery(progress, current, checkpoint, issue):
     if task_id:
         db_store.increment_task_cookie_failure_count(task_id)
     update_status("paused_need_cookie", progress, current, message)
+    _append_suspend_log(checkpoint)
+
+
+def fail_task_with_checkpoint(progress, current, checkpoint, issue):
+    """网络或代理错误：标记任务失败但保留断点，避免误以为补 Cookie 就能解决。"""
+    message = issue["message"]
+    save_checkpoint(checkpoint)
+    db_store.update_cookie_validation_status("network_error", time.time(), message)
+    update_status("error", progress, current, message)
+    _append_suspend_log(checkpoint, kept=True)
+
+
+def handle_fetch_issue(progress, checkpoint, issue, current, failed_current=None):
+    """分流抓取问题：登录态失效/被拦截 → 等待 Cookie；网络或代理错误 → 失败并保留断点。"""
+    if issue.get("cookie_status") == "network_error":
+        fail_task_with_checkpoint(progress, failed_current or current, checkpoint, issue)
+    else:
+        pause_for_cookie_recovery(progress, current, checkpoint, issue)
 
 def parse_size(size_str):
     if not size_str: return 0.0
@@ -425,11 +487,18 @@ def run_spider(
 
                 issue = classify_runtime_fetch_issue(res, stage_label="列表页请求")
                 if issue:
-                    pause_for_cookie_recovery(
+                    handle_fetch_issue(
                         f"第 {page} 页",
-                        "等待登录态恢复",
-                        {"phase": 1, "current_url": current_url, "page": page, "movie_links": movie_links},
+                        attach_suspend_info(
+                            {"phase": 1, "current_url": current_url, "page": page, "movie_links": movie_links},
+                            issue,
+                            stage="list",
+                            page=page,
+                            fetched_count=len(movie_links),
+                        ),
                         issue,
+                        current="等待登录态恢复",
+                        failed_current="网络或代理错误",
                     )
                     return
 
@@ -493,10 +562,16 @@ def run_spider(
             except Exception as e:
                 if res is None:
                     issue = classify_runtime_fetch_issue(error=e, stage_label="目录页请求")
-                    pause_for_cookie_recovery(
+                    fail_task_with_checkpoint(
                         f"第 {page} 页",
                         "网络或代理错误",
-                        {"phase": 1, "current_url": current_url, "page": page, "movie_links": movie_links},
+                        attach_suspend_info(
+                            {"phase": 1, "current_url": current_url, "page": page, "movie_links": movie_links},
+                            issue,
+                            stage="list",
+                            page=page,
+                            fetched_count=len(movie_links),
+                        ),
                         issue,
                     )
                 else:
@@ -530,6 +605,12 @@ def run_spider(
 
         existing_codes = db_store.get_existing_codes(output_filename) if crawl_mode == 'incremental' else set()
         new_added_count = len(incremental_movie_codes) if crawl_mode == 'incremental' else 0
+        # 续跑保护：恢复时已入库的影片不再重复抓取（即使断点序号与库内状态有偏差）
+        resume_stored_codes = (
+            db_store.get_existing_codes(output_filename)
+            if is_resume and crawl_mode != 'incremental'
+            else set()
+        )
 
         for i in range(start_index, total_movies):
                 movie = movie_links[i]
@@ -549,6 +630,12 @@ def run_spider(
                     time.sleep(DETAIL_DELAY_SECONDS) # 稍微延迟让 UI 有时间刷新
                     continue
 
+                # 续跑跳过判断：已入库影片不重复抓取
+                if movie['code'] in resume_stored_codes:
+                    update_status("running", progress_str, movie['code'], "跳过: 已入库，续跑不重复抓取")
+                    time.sleep(DETAIL_DELAY_SECONDS)
+                    continue
+
                 update_status("running", progress_str, movie['code'], "正在解析详情页...")
 
                 res = None
@@ -559,11 +646,19 @@ def run_spider(
 
                     issue = classify_runtime_fetch_issue(res, stage_label="详情页请求")
                     if issue:
-                        pause_for_cookie_recovery(
+                        handle_fetch_issue(
                             progress_str,
-                            movie['code'],
-                            {"phase": 2, "movie_links": movie_links, "current_index": i, "incremental_movie_codes": incremental_movie_codes},
+                            attach_suspend_info(
+                                {"phase": 2, "movie_links": movie_links, "current_index": i, "incremental_movie_codes": incremental_movie_codes},
+                                issue,
+                                stage="detail",
+                                index=i,
+                                total=total_movies,
+                                code=movie.get("code", ""),
+                                fetched_count=new_added_count,
+                            ),
                             issue,
+                            current=movie['code'],
                         )
                         return
 
@@ -594,10 +689,18 @@ def run_spider(
                 except Exception as e:
                     if res is None:
                         issue = classify_runtime_fetch_issue(error=e, stage_label="详情页请求")
-                        pause_for_cookie_recovery(
+                        fail_task_with_checkpoint(
                             progress_str,
                             movie['code'],
-                            {"phase": 2, "movie_links": movie_links, "current_index": i, "incremental_movie_codes": incremental_movie_codes},
+                            attach_suspend_info(
+                                {"phase": 2, "movie_links": movie_links, "current_index": i, "incremental_movie_codes": incremental_movie_codes},
+                                issue,
+                                stage="detail",
+                                index=i,
+                                total=total_movies,
+                                code=movie.get("code", ""),
+                                fetched_count=new_added_count,
+                            ),
                             issue,
                         )
                     else:

@@ -156,10 +156,23 @@ def prepare_task_config(config: TaskConfig):
         "ranking_period": ranking_meta["ranking_period"] if ranking_meta else "",
     }
 
+def task_suspend_info(task):
+    """从断点中读取挂起说明（阶段/位置/原因），无挂起信息时返回空 dict。"""
+    try:
+        checkpoint = json.loads(task.get("checkpoint_json") or "{}")
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(checkpoint, dict):
+        return {}
+    suspend = checkpoint.get("suspend")
+    return suspend if isinstance(suspend, dict) else {}
+
+
 def task_to_response(task, include_logs=False):
     if not task:
         return None
     incremental_movie_codes = task_incremental_movie_codes(task)
+    suspend = task_suspend_info(task)
     data = {
         "task_id": task["task_id"],
         "start_url": task["start_url"],
@@ -181,6 +194,11 @@ def task_to_response(task, include_logs=False):
         "started_at": task.get("started_at") or 0,
         "finished_at": task.get("finished_at") or 0,
         "incremental_movie_count": len(incremental_movie_codes),
+        "suspend_reason": suspend.get("reason", ""),
+        "suspend_stage": suspend.get("stage", ""),
+        "suspend_position": suspend.get("position_label", ""),
+        "suspend_code": suspend.get("code", ""),
+        "suspend_fetched_count": suspend.get("fetched_count", 0),
         "can_copy_incremental_magnets": (
             task.get("state") == "finished"
             and task.get("crawl_mode") == "incremental"
