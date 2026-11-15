@@ -1,0 +1,157 @@
+networks:
+  analytics-net:
+    driver: bridge
+
+volumes:
+  localstack-data:
+  iceberg-warehouse:
+
+services:
+
+  localstack:
+    image: localstack/localstack:3.4
+    container_name: localstack
+    networks:
+      - analytics-net
+    ports:
+      - "4566:4566"
+    environment:
+      - SERVICES=s3
+      - AWS_DEFAULT_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - PERSISTENCE=1
+      - DATA_DIR=/var/lib/localstack/data
+    volumes:
+      - localstack-data:/var/lib/localstack
+      - /var/run/docker.sock:/var/run/docker.sock
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  s3-init:
+    image: amazon/aws-cli:2.15.36
+    container_name: s3-init
+    networks:
+      - analytics-net
+    depends_on:
+      localstack:
+        condition: service_healthy
+    environment:
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+    entrypoint: >
+      /bin/sh -c "
+        echo 'Creating S3 bucket...';
+        aws --endpoint-url=http://localstack:4566 s3 mb s3://github-archive-bucket --region us-east-1 || true;
+        aws --endpoint-url=http://localstack:4566 s3api put-bucket-acl --bucket github-archive-bucket --acl public-read-write || true;
+        echo 'Bucket ready.';
+      "
+    restart: "no"
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:0.10.0
+    container_name: iceberg-rest
+    networks:
+      - analytics-net
+    ports:
+      - "8181:8181"
+    depends_on:
+      s3-init:
+        condition: service_completed_successfully
+    environment:
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_REGION=us-east-1
+      - CATALOG_WAREHOUSE=s3://github-archive-bucket/warehouse/
+      - CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO
+      - CATALOG_S3_ENDPOINT=http://localstack:4566
+      - CATALOG_S3_PATH__STYLE__ACCESS=true
+      - CATALOG_S3_ACCESS__KEY__ID=test
+      - CATALOG_S3_SECRET__ACCESS__KEY=test
+    restart: unless-stopped
+
+  iceberg-rest-check:
+    image: curlimages/curl:8.7.1
+    container_name: iceberg-rest-check
+    networks:
+      - analytics-net
+    depends_on:
+      - iceberg-rest
+    entrypoint: /bin/sh -c "sleep 20 && echo 'Iceberg REST is up!'"
+    restart: "no"
+
+  spark-master:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    image: github-analytics-spark:3.5
+    container_name: spark-master
+    networks:
+      - analytics-net
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+      - "4040:4040"
+    environment:
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+    depends_on:
+      iceberg-rest-check:
+        condition: service_completed_successfully
+    volumes:
+      - ../:/opt/app
+      - iceberg-warehouse:/opt/iceberg-warehouse
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080
+
+  spark-worker:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    image: github-analytics-spark:3.5
+    container_name: spark-worker
+    networks:
+      - analytics-net
+    ports:
+      - "8081:8081"
+    environment:
+      - SPARK_WORKER_MEMORY=4G
+      - SPARK_WORKER_CORES=2
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_DEFAULT_REGION=us-east-1
+    depends_on:
+      spark-master:
+        condition: service_started
+    volumes:
+      - ../:/opt/app
+      - iceberg-warehouse:/opt/iceberg-warehouse
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --webui-port 8081
+
+  dashboard:
+    build:
+      context: ../dashboard
+      dockerfile: Dockerfile
+    image: github-analytics-dashboard
+    container_name: dashboard
+    networks:
+      - analytics-net
+    ports:
+      - "8501:8501"
+    environment:
+      - CATALOG_URI=http://iceberg-rest:8181
+      - S3_ENDPOINT=http://localstack:4566
+      - AWS_ACCESS_KEY_ID=test
+      - AWS_SECRET_ACCESS_KEY=test
+      - AWS_REGION=us-east-1
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+    volumes:
+      - ../:/opt/app
