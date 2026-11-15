@@ -1,0 +1,15 @@
+# Scrapy 核心框架
+Scrapy==2.17.0
+
+# 数据库相关
+PyMySQL==1.1.1
+DBUtils==3.1.0
+
+# 环境变量管理
+python-dotenv==1.1.1
+
+# 压缩编码支持
+brotli==1.2.0
+
+# 测试
+pytest==8.4.2
