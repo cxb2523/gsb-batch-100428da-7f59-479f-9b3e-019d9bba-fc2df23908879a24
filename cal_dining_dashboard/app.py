@@ -96,12 +96,14 @@ def create_app(bind_host: str | None = None) -> Flask:
         try:
             cfg = scanner.load_config(config_io.config_path())
             scanner.validate_config(cfg, require_email=False)
-            matches = scanner.run_scan(cfg, dry_run=True)
+            result = scanner.run_scan(cfg, dry_run=True)
         except Exception as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
+        notices = list(getattr(result, "notices", []) or [])
         return jsonify({
             "ok": True,
-            "matches": scanner.format_matches_text(matches),
+            "matches": scanner.format_matches_text(result),
+            "notices": notices,
         })
 
     @app.post("/github/configure")

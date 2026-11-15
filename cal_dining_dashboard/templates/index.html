@@ -282,7 +282,12 @@
     const data = await post("/test-scan", new FormData());
     unbusy($("test-btn"));
     if (data.ok) {
-      show(banner, "ok", "Test scan complete:\n\n" + data.matches);
+      let msg = "Test scan complete:\n\n" + data.matches;
+      if (data.notices && data.notices.length) {
+        msg += "\n\nWarnings (the scan still returned what it could):\n" +
+          data.notices.map((n) => "• " + n).join("\n");
+      }
+      show(banner, data.notices && data.notices.length ? "warn" : "ok", msg);
     } else {
       show(banner, "err", data.error);
     }

@@ -1,3 +1,4 @@
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,6 +6,97 @@ from unittest.mock import patch
 
 from cal_dining_dashboard import app as dashboard_app
 from cal_dining_dashboard import local_scheduler
+
+FIXTURE = Path(__file__).parent / "fixtures" / "cal_menu_sample.html"
+
+
+class _FakeResponse:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def raise_for_status(self) -> None:
+        return None
+
+
+class TestScanDashboardTests(unittest.TestCase):
+    def _run_scan(
+        self, tmpdir: str, html: str, locations: list[str], *, expect_status: int = 200
+    ) -> dict:
+        config_dir = Path(tmpdir)
+        (config_dir / "config.yaml").write_text(
+            "email: friend@example.com\n"
+            "locations:\n"
+            + "".join(f"  - {loc}\n" for loc in locations)
+            + "meals:\n  - Breakfast\n  - Lunch\n  - Dinner\n"
+            "keywords: [clam chowder, tofu]\n"
+            "schedule:\n"
+            "  timezone: America/Los_Angeles\n"
+            "  times: ['07:00']\n"
+            "  days: [mon, tue, wed, thu, fri, sat, sun]\n"
+            "  window_minutes: 20\n",
+            encoding="utf-8",
+        )
+        with (
+            patch("cal_dining_scanner.user_config_dir", return_value=config_dir),
+            patch(
+                "cal_dining_scanner.requests.get",
+                return_value=_FakeResponse(html),
+            ),
+        ):
+            app = dashboard_app.create_app()
+            client = app.test_client()
+            resp = client.post(
+                "/test-scan",
+                headers={"X-Setup-Token": app.config["SETUP_CSRF_TOKEN"]},
+            )
+        self.assertEqual(resp.status_code, expect_status, resp.get_data(as_text=True))
+        return resp.get_json()
+
+    def test_normal_scan_reports_matches_and_no_notices(self):
+        html = FIXTURE.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = self._run_scan(
+                tmpdir, html, ["Crossroads", "Foothill", "Clark Kerr"]
+            )
+
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["notices"], [])
+        self.assertIn("New England Clam Chowder", data["matches"])
+
+    def test_partial_failure_is_shown_as_notices_not_a_bare_error(self):
+        html = FIXTURE.read_text(encoding="utf-8").replace(
+            '<div class="location-title">\n          <span class="cafe-title">Foothill</span>\n        </div>',
+            '<div class="location-title"></div>',
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = self._run_scan(
+                tmpdir, html, ["Crossroads", "Foothill", "Clark Kerr"]
+            )
+
+        self.assertTrue(data["ok"])
+        self.assertIn("New England Clam Chowder", data["matches"])
+        self.assertTrue(
+            any("Foothill" in notice for notice in data["notices"]),
+            data["notices"],
+        )
+
+    def test_zero_items_page_still_returns_an_error(self):
+        html = re.sub(
+            r'<li class="recip[^"]*">.*?</li>',
+            "",
+            FIXTURE.read_text(encoding="utf-8"),
+            flags=re.DOTALL,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            data = self._run_scan(
+                tmpdir,
+                html,
+                ["Crossroads", "Foothill", "Clark Kerr"],
+                expect_status=400,
+            )
+
+        self.assertFalse(data["ok"])
+        self.assertIn("zero menu items", data["error"])
 
 
 class DashboardSecurityTests(unittest.TestCase):

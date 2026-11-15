@@ -122,6 +122,48 @@ class ScannerError(RuntimeError):
     """A user-fixable scanner error."""
 
 
+class ParsedMenus(dict):
+    """Parsed menu data keyed by location/meal, plus non-fatal parse notices.
+
+    This stays a plain ``dict`` so existing callers (``find_matches``, the email
+    builder, tests) see exactly the same mapping as before.  Partial failures are
+    attached as ``notices`` instead of raising away the successfully parsed data.
+    """
+
+    def __init__(self, *args: Any, notices: list[str] | None = None, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.notices: list[str] = list(notices or [])
+
+    @property
+    def warnings(self) -> list[str]:
+        """Alias for ``notices`` for callers that prefer the log-style name."""
+        return self.notices
+
+
+class ScanResult(dict):
+    """Keyword matches keyed by location/meal, plus non-fatal scan notices.
+
+    Behaves like the dict ``run_scan`` historically returned, so existing
+    comparisons, indexing, and ``find_matches`` output remain unchanged.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        notices: list[str] | None = None,
+        menus: dict[str, dict[str, list[str]]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.notices: list[str] = list(notices or [])
+        self.menus = menus if menus is not None else {}
+
+    @property
+    def warnings(self) -> list[str]:
+        """Alias for ``notices`` for callers that prefer the log-style name."""
+        return self.notices
+
+
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     merged = deepcopy(base)
     for key, value in override.items():
@@ -301,7 +343,7 @@ def parse_menus(
     html_text: str,
     target_locations: list[str],
     target_meals: list[str] | None = None,
-) -> dict[str, dict[str, list[str]]]:
+) -> ParsedMenus:
     """
     Parse the Cal Dining menu HTML.
 
@@ -312,6 +354,15 @@ def parse_menus(
             "Lunch": ["item3"],
         }
     }
+
+    The returned mapping is a normal dict (so ``find_matches`` and the email
+    builder behave exactly as before), but it also carries ``notices`` describing
+    any non-fatal parse problems: a configured location missing from today's
+    page, an unreadable meal-period title, or a meal period with no items.
+
+    ``ScannerError`` is still raised, preserving the original failure semantics,
+    only when the page has no location blocks at all or when no menu items could
+    be parsed for any configured location/meal.
     """
     soup = BeautifulSoup(html_text, "html.parser")
     location_lookup = {normalize_key(location): location for location in target_locations}
@@ -320,31 +371,156 @@ def parse_menus(
         if target_meals
         else None
     )
-    menus: dict[str, dict[str, list[str]]] = {}
+    menus = ParsedMenus()
+    seen_locations: set[str] = set()
+    detailed_locations: set[str] = set()
 
     location_blocks = soup.select("li.location-name")
     if not location_blocks:
         raise ScannerError("Could not find Cal Dining location blocks in the menu page.")
 
-    for block in location_blocks:
+    for block_index, block in enumerate(location_blocks, start=1):
         title_node = block.select_one(".cafe-title")
         if not title_node:
+            fallback_location = _location_from_block_attrs(block, location_lookup)
+            if fallback_location:
+                seen_locations.add(fallback_location)
+                detailed_locations.add(fallback_location)
+                menus.notices.append(
+                    f"{fallback_location}: Location title (.cafe-title) is missing from "
+                    "today's page; skipping this location's menu. The page structure may "
+                    "have changed."
+                )
+            else:
+                menus.notices.append(
+                    f"Menu block #{block_index} has no location title; skipping its "
+                    "contents. The page structure may have changed."
+                )
             continue
         page_location = title_node.get_text(" ", strip=True)
         configured_location = location_lookup.get(normalize_key(page_location))
         if not configured_location:
             continue
+        seen_locations.add(configured_location)
 
-        for period in block.select("li.preiod-name, li.period-name"):
+        try:
+            location_menus, block_noticed = _parse_location_block(
+                block, configured_location, meal_lookup, menus.notices
+            )
+        except Exception as exc:  # noqa: BLE001 - isolate one broken block
+            detailed_locations.add(configured_location)
+            menus.notices.append(
+                f"{configured_location}: Could not parse this location's menu block "
+                f"({exc}). The page structure may have changed."
+            )
+            continue
+
+        if block_noticed:
+            detailed_locations.add(configured_location)
+        for meal, items in location_menus.items():
+            menus.setdefault(configured_location, {}).setdefault(meal, []).extend(items)
+
+    for location, meals in menus.items():
+        for meal, items in meals.items():
+            meals[meal] = list(dict.fromkeys(items))
+
+    total_items = sum(len(items) for meals in menus.values() for items in meals.values())
+    if total_items == 0:
+        message = (
+            "Parsed zero menu items. The Cal Dining page structure may have changed, "
+            "or the configured locations/meals are not available today."
+        )
+        if menus.notices:
+            message += "\nDetails:\n" + "\n".join(
+                f"  - {notice}" for notice in menus.notices
+            )
+        raise ScannerError(message)
+
+    missing_locations = [
+        location for location in target_locations if location not in menus
+    ]
+    for location in missing_locations:
+        if location in detailed_locations:
+            # A specific notice above already explains this location.
+            continue
+        if location in seen_locations:
+            menus.notices.append(
+                f"{location}: Menu block was found but had no items for the configured "
+                "meal periods today."
+            )
+        else:
+            menus.notices.append(
+                f"{location}: No menu block found on today's page "
+                "(the location may be closed or not served today)."
+            )
+    if missing_locations:
+        log.warning("No menu items found for configured locations: %s", missing_locations)
+
+    return menus
+
+
+def _location_from_block_attrs(
+    block: Any, location_lookup: dict[str, str]
+) -> str | None:
+    """Best-effort location name from a block's class/id when its title is gone.
+
+    The page marks blocks like ``<li class="location-name Crossroads 20260506">``,
+    so the configured name is often still present even if the inner title span
+    was changed or removed.
+    """
+    candidates: list[str] = list(block.get("class") or [])
+    block_id = block.get("id")
+    if block_id:
+        candidates.append(block_id)
+    for candidate in candidates:
+        configured = location_lookup.get(normalize_key(str(candidate)))
+        if configured:
+            return configured
+    return None
+
+
+def _parse_location_block(
+    block: Any,
+    location: str,
+    meal_lookup: dict[str, str] | None,
+    notices: list[str],
+) -> tuple[dict[str, list[str]], bool]:
+    """Parse one location block, recording per-meal problems in ``notices``.
+
+    Returns ``(meals, noticed)`` where ``noticed`` indicates that at least one
+    location-specific problem was recorded for this block.
+    """
+    location_menus: dict[str, list[str]] = {}
+    noticed = False
+
+    periods = block.select("li.preiod-name, li.period-name")
+    if not periods:
+        notices.append(
+            f"{location}: No meal periods found in this location's block; "
+            "the page structure may have changed."
+        )
+        noticed = True
+
+    for period_index, period in enumerate(periods, start=1):
+        try:
             header_node = period.find("span", recursive=False)
-            meal = normalize_meal_name(
+            raw_title = (
                 header_node.get_text(" ", strip=True) if header_node else ""
             )
+            meal = normalize_meal_name(raw_title)
             if not meal:
+                label = raw_title or f"meal section #{period_index}"
+                notices.append(
+                    f"{location}: Could not recognize meal period title {label!r}; "
+                    f"skipping section #{period_index}."
+                )
+                noticed = True
                 continue
-            configured_meal = meal_lookup.get(normalize_key(meal), meal) if meal_lookup else meal
-            if meal_lookup and normalize_key(meal) not in meal_lookup:
+            if meal_lookup is not None and normalize_key(meal) not in meal_lookup:
                 continue
+            configured_meal = (
+                meal_lookup.get(normalize_key(meal), meal) if meal_lookup else meal
+            )
 
             items: list[str] = []
             for recipe in period.select("li.recip"):
@@ -355,29 +531,25 @@ def parse_menus(
                 if item_text:
                     items.append(item_text)
 
-            if items:
-                deduped_items = list(dict.fromkeys(items))
-                menus.setdefault(configured_location, {}).setdefault(configured_meal, [])
-                menus[configured_location][configured_meal].extend(deduped_items)
+            if not items:
+                notices.append(
+                    f"{location} / {configured_meal}: Meal period has no menu items "
+                    "(no dishes were listed for it today)."
+                )
+                noticed = True
+                continue
 
-    for location, meals in menus.items():
-        for meal, items in meals.items():
-            meals[meal] = list(dict.fromkeys(items))
+            location_menus.setdefault(configured_meal, []).extend(
+                list(dict.fromkeys(items))
+            )
+        except Exception as exc:  # noqa: BLE001 - isolate one broken meal section
+            notices.append(
+                f"{location}: Could not parse meal section #{period_index} ({exc}); "
+                "the page structure may have changed."
+            )
+            noticed = True
 
-    total_items = sum(len(items) for meals in menus.values() for items in meals.values())
-    if total_items == 0:
-        raise ScannerError(
-            "Parsed zero menu items. The Cal Dining page structure may have changed, "
-            "or the configured locations/meals are not available today."
-        )
-
-    missing_locations = [
-        location for location in target_locations if location not in menus
-    ]
-    if missing_locations:
-        log.warning("No menu items found for configured locations: %s", missing_locations)
-
-    return menus
+    return location_menus, noticed
 
 
 def find_matches(
@@ -595,7 +767,7 @@ def run_scan(
     dry_run: bool = False,
     fetcher: Callable[[], str] = fetch_menu_html,
     email_sender: Callable[[dict[str, Any], str, str], None] = send_email,
-) -> dict[str, dict[str, list[tuple[str, str]]]]:
+) -> ScanResult:
     keywords = load_keywords(config)
     if not keywords:
         raise ScannerError("No keywords found. Add foods to keywords.txt or KEYWORDS.")
@@ -604,8 +776,12 @@ def run_scan(
     menus = parse_menus(menu_html, config["locations"], config["meals"])
     total_items = sum(len(items) for meals in menus.values() for items in meals.values())
     log.info("Parsed %d menu items across %d locations", total_items, len(menus))
+    for notice in menus.notices:
+        log.warning("Scan notice: %s", notice)
 
-    matches = find_matches(menus, keywords)
+    matches = ScanResult(
+        find_matches(menus, keywords), notices=list(menus.notices), menus=menus
+    )
     log.info("Match preview:\n%s", format_matches_text(matches))
 
     if dry_run:

@@ -9,6 +9,8 @@ Automatically scans [UC Berkeley Dining menus](https://dining.berkeley.edu/menus
 3. Matches menu items against your keywords.
 4. Sends an HTML email when matches are found.
 
+If only part of the page can be parsed — a dining hall is missing today, a meal-period heading is unrecognizable, or a meal period lists no dishes — the scan still returns everything it could parse and reports each problem as a notice (also shown by the dashboard's **Run a test scan**). The scan only fails outright when no dining-hall block can be found or the page yields zero dishes for your configured locations and meals.
+
 ## Quick Start (one command)
 
 Install once, then launch the setup dashboard in your browser:
