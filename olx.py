@@ -2,11 +2,12 @@
 
 import csv
 import logging
+import re
 import sys
 from contextlib import contextmanager
 from functools import wraps
 from itertools import chain
-from typing import Any, Dict, Generator, List, Optional, Set, TextIO, Tuple
+from typing import Any, Dict, Generator, List, NamedTuple, Optional, Set, TextIO, Tuple
 
 import click
 import inject
@@ -64,8 +65,9 @@ def filter_fields(item: Dict[str, any], fieldnames: Set[str]) -> Dict[str, Any]:
 
 @inject.autoparams("fieldnames")
 def csv_writer(
-    fieldnames: Set[str], stdout: TextIO = sys.stdout
+    fieldnames: Set[str], stdout: Optional[TextIO] = None
 ) -> Generator[None, Optional[Dict[str, Any]], None]:
+    stdout = stdout if stdout is not None else sys.stdout
     writer = csv.DictWriter(stdout, list(sorted(fieldnames)))
     writer.writeheader()
 
@@ -187,14 +189,20 @@ def chrome(headless: bool = False, proxy: Optional[str] = None) -> Chrome:
         driver.quit()
 
 
-@inject.autoparams("driver")
-@return_on_failure(TimeoutException, return_value=[])
-def find_ads(
+def wait_ads(
     locator: Tuple[str, str], driver: WebDriver, timeout: int = 30
 ) -> List[WebElement]:
     return WebDriverWait(driver, timeout).until(
         presence_of_all_elements_located(locator)
     )
+
+
+@inject.autoparams("driver")
+@return_on_failure(TimeoutException, return_value=[])
+def find_ads(
+    locator: Tuple[str, str], driver: WebDriver, timeout: int = 30
+) -> List[WebElement]:
+    return wait_ads(locator, driver, timeout)
 
 
 def find_free_ads(skip: bool = False) -> List[WebElement]:
@@ -291,32 +299,123 @@ def parse_ad(card: WebElement, kind: str) -> Dict[str, Any]:
     return item
 
 
+# ------------------------------------------------------------------------------------ #
+# Page outcomes
+# ------------------------------------------------------------------------------------ #
+
+OUTCOME_OK = "ok"
+OUTCOME_END = "end"
+OUTCOME_FAILED = "failed"
+OUTCOME_SKIPPED = "skipped"
+
+REASON_LOAD_FAILED = "page load failed"
+REASON_NO_ADS = "no ad cards found"
+REASON_PAGINATION_FAILED = "pagination failed"
+REASON_PAGINATION_LOOP = "pagination loop detected"
+REASON_EXCLUDED = "free and paid ads excluded"
+
+
+class PageOutcome(NamedTuple):
+    page: int
+    status: str
+    reason: Optional[str] = None
+
+
+def format_page_outcome(outcome: PageOutcome) -> str:
+    line = f"page {outcome.page}: {outcome.status}"
+    if outcome.reason:
+        line = f"{line} ({outcome.reason})"
+    return line
+
+
+PAGE_NUMBER_PATTERN = re.compile(r"[?&]page=(\d+)")
+
+
+def parse_page_number(link: str) -> Optional[int]:
+    match = PAGE_NUMBER_PATTERN.search(link)
+    return int(match.group(1)) if match else None
+
+
+# ------------------------------------------------------------------------------------ #
+
+
 @inject.autoparams("driver", "fieldnames")
 def parse_ads(
     link: str,
     driver: WebDriver,
     exclude_free: bool = False,
     exclude_paid: bool = False,
+    outcomes: Optional[List[PageOutcome]] = None,
+    timeout: int = 30,
+    next_page_timeout: int = 5,
 ) -> Generator[Dict[str, Any], None, None]:
+
+    def record(page: int, status: str, reason: Optional[str] = None) -> None:
+        if outcomes is not None:
+            outcomes.append(PageOutcome(page, status, reason))
+
     if exclude_free and exclude_paid:
+        record(1, OUTCOME_SKIPPED, REASON_EXCLUDED)
         return
 
-    try:
-        driver.get(link)
-    except WebDriverException:
-        return
+    visited_links: Set[str] = set()
+    visited_pages: Set[int] = set()
 
-    free = map(lambda c: parse_ad(c, kind="free"), find_free_ads(exclude_free))
-    paid = map(lambda c: parse_ad(c, kind="paid"), find_paid_ads(exclude_paid))
+    page = 1
+    current: Optional[str] = link
 
-    for ad in filter(lambda a: a is not None, chain(free, paid)):
-        yield ad
+    while current is not None:
+        visited_links.add(current)
+        current_number = parse_page_number(current)
+        if current_number is not None:
+            visited_pages.add(current_number)
 
-    next_page = find_next_ads_page()
-    if next_page is not None:
-        yield from parse_ads(
-            next_page, exclude_free=exclude_free, exclude_paid=exclude_paid
-        )
+        try:
+            driver.get(current)
+        except WebDriverException:
+            record(page, OUTCOME_FAILED, REASON_LOAD_FAILED)
+            return
+
+        try:
+            free_cards = None if exclude_free else wait_ads(FREE_ADS, driver, timeout)
+        except TimeoutException:
+            free_cards = None
+
+        try:
+            paid_cards = None if exclude_paid else wait_ads(PAID_ADS, driver, timeout)
+        except TimeoutException:
+            paid_cards = None
+
+        if free_cards is None and paid_cards is None:
+            record(page, OUTCOME_FAILED, REASON_NO_ADS)
+            return
+
+        free = map(lambda c: parse_ad(c, kind="free"), free_cards or [])
+        paid = map(lambda c: parse_ad(c, kind="paid"), paid_cards or [])
+
+        for ad in filter(lambda a: a is not None, chain(free, paid)):
+            yield ad
+
+        try:
+            next_page = find_next_ads_page(driver=driver, timeout=next_page_timeout)
+        except WebDriverException:
+            record(page, OUTCOME_FAILED, REASON_PAGINATION_FAILED)
+            return
+
+        if next_page is None:
+            record(page, OUTCOME_END)
+            return
+
+        next_number = parse_page_number(next_page)
+        if next_page in visited_links or (
+            next_number is not None and next_number in visited_pages
+        ):
+            record(page, OUTCOME_FAILED, REASON_PAGINATION_LOOP)
+            return
+
+        record(page, OUTCOME_OK)
+        current = next_page
+        page += 1
 
 
 @inject.autoparams("driver")
@@ -421,8 +520,16 @@ def ads(
         next(writer)
 
         for link in links:
-            for item in parse_ads(link, exclude_free=no_free, exclude_paid=no_paid):
+            outcomes: List[PageOutcome] = []
+            for item in parse_ads(
+                link,
+                exclude_free=no_free,
+                exclude_paid=no_paid,
+                outcomes=outcomes,
+            ):
                 writer.send(item)
+            for outcome in outcomes:
+                click.echo(format_page_outcome(outcome), err=True)
 
 
 @cli.command()
