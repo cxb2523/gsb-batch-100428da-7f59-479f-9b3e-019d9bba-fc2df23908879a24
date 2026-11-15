@@ -202,6 +202,17 @@ def build_driver(browser: str, headless: bool):
     def apply_common_options(o, headless_):
         if headless_:
             o.add_argument('--headless=new')
+        # 某些受限环境（沙箱 / 服务账户）里浏览器解析不到默认 profile 路径，
+        # 启动即崩（DevToolsActivePort file doesn't exist）。这时可以用环境变量
+        # 显式指定一个可写的用户数据目录；本地 mock 测试也靠它跑。
+        user_data_dir = os.environ.get('YKT_BROWSER_USER_DATA_DIR')
+        if user_data_dir:
+            o.add_argument(f'--user-data-dir={user_data_dir}')
+        # 需要额外浏览器参数时（比如沙箱里要关掉后台联网才能存活），
+        # 用环境变量追加，空格分隔：YKT_BROWSER_EXTRA_ARGS="--disable-sync ..."
+        extra = os.environ.get('YKT_BROWSER_EXTRA_ARGS', '').split()
+        for arg in extra:
+            o.add_argument(arg)
         o.add_argument('--autoplay-policy=no-user-gesture-required')  # 允许自动播放
         o.add_argument('--mute-audio')                                # 浏览器级静音
         o.add_argument('--disable-gpu')
@@ -213,12 +224,22 @@ def build_driver(browser: str, headless: bool):
     # 默认先 Edge：Windows 10/11 自带，driver 也只有十几 MB。
     # 没装 Edge 再试 Chrome（Chrome 没装的话 Selenium 会下载 400MB+ 的测试版，很慢）。
     order = [browser] if browser in ('chrome', 'edge') else ['edge', 'chrome']
+    # 默认由 Selenium Manager 自动下载匹配的 driver；下载不了的受限网络里，
+    # 可以用环境变量直接指定一个本机已有的 driver 可执行文件。
+    driver_path = os.environ.get('YKT_BROWSER_DRIVER') or None
     for name in order:
         maker = chrome_options if name == 'chrome' else edge_options
         try:
             say(f'正在启动 {name} ...')
-            # Selenium Manager 会自动下载匹配版本的 driver（需要联网，第一次会慢一点）
-            d = (webdriver.Chrome if name == 'chrome' else webdriver.Edge)(options=maker())
+            kwargs = {'options': maker()}
+            if driver_path:
+                if name == 'chrome':
+                    from selenium.webdriver.chrome.service import Service as ChromeService
+                    kwargs['service'] = ChromeService(executable_path=driver_path)
+                else:
+                    from selenium.webdriver.edge.service import Service as EdgeService
+                    kwargs['service'] = EdgeService(executable_path=driver_path)
+            d = (webdriver.Chrome if name == 'chrome' else webdriver.Edge)(**kwargs)
             if not headless:
                 try:
                     d.maximize_window()
@@ -941,6 +962,30 @@ def list_pending(driver, ui: str, els):
             continue
     raw.sort(key=lambda x: x[0])
     return [(el, text, str(idx)) for _, idx, el, text in raw]
+
+
+def relocate_item(pending, info):
+    """
+    浏览器重启后，在新的待播列表里找回原来那一节。
+
+    info 是重启前记下的定位信息：{'key': 在整棵树里的序号, 'title': 标题}。
+    返回 (元素, 标题, 唯一键, 匹配方式)；找不到或无法唯一确定时返回 None。
+
+    匹配顺序：
+      1. 序号 + 标题都对上（列表没变，最稳）
+      2. 标题在待播列表里唯一（列表顺序变了也能找回来）
+    标题有重复、序号又对不上时，宁可判「定位失败」也不随便挑一个播 ——
+    播错一节会把别人的完成/失败记到目标小节头上。
+    """
+    for el, text, key in pending:
+        if key == info.get('key') and text == info.get('title'):
+            return el, text, key, '序号+标题'
+    same = [(el, text, key) for el, text, key in pending
+            if text == info.get('title')]
+    if len(same) == 1:
+        el, text, key = same[0]
+        return el, text, key, '标题（列表顺序有变化）'
+    return None
 
 
 def dump_debug(driver, ui: str, els):
@@ -1693,6 +1738,7 @@ def run(args, cfg, path):
         already = set()
         notified = set()   # 跳过提示只打一次，避免每轮刷屏
         seen_srcs = set()
+        retry_target = None   # 重启浏览器后要重试的那一节：{'key': 序号, 'title': 标题}
         prev_done = None
         just_played = False
         list_handle = driver.current_window_handle
@@ -1747,23 +1793,42 @@ def run(args, cfg, path):
                 say('=' * 56)
                 return
 
-            target = None
-            for el, text, key in pending:
-                if key in already:
+            if retry_target is not None:
+                # 浏览器刚因为片源异常重启过：课程页会按 URL 自动恢复上次节点，
+                # 当前播的很可能是别的节。必须先在新的列表里重新定位到原来那一节，
+                # 找不到就记一次失败，绝不能直接播页面自动恢复出来的视频。
+                info = retry_target
+                retry_target = None
+                attempt = media_tries.get(info['key'], 0)
+                found = relocate_item(pending, info)
+                if found is None:
+                    say(f'  第 {attempt} 次重启后重定位：目标小节定位失败'
+                        f'（{info["title"][:60]}，原序号 {info["key"]}），'
+                        f'这一节记一次失败，不播自动恢复的视频。')
+                    failed[info['key']] = failed.get(info['key'], 0) + 1
                     continue
-                if failed.get(key, 0) >= 2:
-                    if key not in notified:
-                        say(f'  [跳过] 这个视频试了 2 次都没播完：{text[:60]}')
-                        notified.add(key)
-                    continue
-                if played.get(key, 0) >= 3:
-                    # 播成功了但平台一直不记「已完成」，再播也没意义，避免死循环
-                    if key not in notified:
-                        say(f'  [跳过] 播过 3 次仍未记录完成，可能平台不认：{text[:60]}')
-                        notified.add(key)
-                    continue
+                el, text, key, how = found
+                say(f'  第 {attempt} 次重启后重定位：按{how}找到'
+                    f'「{text[:60]}」（序号 {key}），重试这一节。')
                 target = (el, text, key)
-                break
+            else:
+                target = None
+                for el, text, key in pending:
+                    if key in already:
+                        continue
+                    if failed.get(key, 0) >= 2:
+                        if key not in notified:
+                            say(f'  [跳过] 这个视频试了 2 次都没播完：{text[:60]}')
+                            notified.add(key)
+                        continue
+                    if played.get(key, 0) >= 3:
+                        # 播成功了但平台一直不记「已完成」，再播也没意义，避免死循环
+                        if key not in notified:
+                            say(f'  [跳过] 播过 3 次仍未记录完成，可能平台不认：{text[:60]}')
+                            notified.add(key)
+                        continue
+                    target = (el, text, key)
+                    break
 
             if target is None:
                 say('')
@@ -1793,6 +1858,9 @@ def run(args, cfg, path):
                 # 所以先整个重启浏览器、重新登录课程，再试同一节；两次都不行才跳过。
                 media_tries[key] = media_tries.get(key, 0) + 1
                 if media_tries[key] <= 2:
+                    # 记下这一节的定位信息（序号 + 标题），重启后靠它在新列表里
+                    # 重新找到同一节，而不是直接播页面自动恢复出来的那一节。
+                    retry_target = {'key': key, 'title': text}
                     say('')
                     say(f'  视频源异常，第 {media_tries[key]} 次重启浏览器后重试这一节……')
                     try:
