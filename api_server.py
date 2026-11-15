@@ -82,13 +82,19 @@ async def scrape_url(request: ScrapeRequest):
             request.config.extraction_mode
         )
 
-        # Unpack (html, api_data) tuple
+        # Unpack (html, api_data) tuple; ScrapeResult also carries a source marker
         html, api_data = scrape_result if isinstance(scrape_result, tuple) else (scrape_result, "")
+        data_source = getattr(scrape_result, "source", "browser")  # "browser" | "static" | "failed"
 
         if not html:
-            raise HTTPException(status_code=500, detail="Failed to fetch website content. The page may be blocking scrapers or the URL may be invalid.")
+            if request.config.extraction_mode == "network" and data_source == "failed":
+                detail = ("Network interception mode requires the headless browser, "
+                          "which could not be started. No data was captured.")
+            else:
+                detail = "Failed to fetch website content. The page may be blocking scrapers or the URL may be invalid."
+            raise HTTPException(status_code=500, detail=detail)
 
-        print(f"[API] HTML retrieved: {len(html):,} chars")
+        print(f"[API] HTML retrieved: {len(html):,} chars (source: {data_source})")
         if api_data:
             print(f"[API] API data captured: {len(api_data):,} chars")
 
@@ -117,6 +123,7 @@ async def scrape_url(request: ScrapeRequest):
         return {
             "status": "success",
             **serializable_payload,
+            "dataSource": data_source,
             "timestamp": datetime.now().isoformat(),
             "url": request.url
         }
