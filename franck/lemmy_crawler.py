@@ -206,28 +206,61 @@ class LemmyCommunityCrawler(Crawler):
         ]
 
     async def inspect_instance(self, host):
-        await self._inspect_instance_info(host)
+        instance_dict = await self._inspect_instance_info(host)
 
-        communities = []
         try:
-            communities = await self.crawl_community_list(host)
-        except CrawlerException as err:
-            self.logger.debug(
-                "Error while crawling the community list of %s: %s", host, str(err)
-            )
-            return
-
-        for community in communities:
             try:
-                await self.crawl_community_posts(host, community)
+                communities = await self.crawl_community_list(host)
             except CrawlerException as err:
+                # A failure on the community list prevents us from discovering the
+                # communities of this instance: give up on the whole instance.
                 self.logger.debug(
-                    "Error while crawling the posts of %s from %s: %s",
-                    community,
-                    host,
-                    str(err),
+                    "Error while crawling the community list of %s: %s", host, str(err)
                 )
-                return
+                self._append_instance_error(
+                    instance_dict,
+                    "Error while crawling the community list of "
+                    f"{host} ({err}) (0 communities processed successfully)",
+                )
+            else:
+                nb_processed_communities = 0
+                community_errors = []
+
+                for community in communities:
+                    try:
+                        await self.crawl_community_posts(host, community)
+                    except CrawlerException as err:
+                        # A failure on a single community must not prevent us from
+                        # crawling the other communities of this instance.
+                        self.logger.debug(
+                            "Error while crawling the posts of %s from %s: %s",
+                            community,
+                            host,
+                            str(err),
+                        )
+                        community_errors.append(
+                            "Error while crawling the posts of community "
+                            f"{community}@{host} ({err})"
+                        )
+                    else:
+                        nb_processed_communities += 1
+
+                if community_errors:
+                    self._append_instance_error(
+                        instance_dict,
+                        "; ".join(community_errors)
+                        + f" ({nb_processed_communities} communities processed"
+                        " successfully)",
+                    )
+        finally:
+            await self._write_instance_csv(instance_dict)
+
+    @staticmethod
+    def _append_instance_error(instance_dict, error_msg):
+        if instance_dict.get("error"):
+            instance_dict["error"] += "; " + error_msg
+        else:
+            instance_dict["error"] = error_msg
 
     async def _inspect_instance_info(self, host: str):
         instance_dict = {"host": host}
@@ -272,7 +305,7 @@ class LemmyCommunityCrawler(Crawler):
         except CrawlerException as err:
             instance_dict["error"] = str(err)
 
-        await self._write_instance_csv(instance_dict)
+        return instance_dict
 
     async def crawl_community_list(self, host):
         local_communities = []
@@ -286,9 +319,13 @@ class LemmyCommunityCrawler(Crawler):
                 "type_": "Local",
                 "sort": self.activity_scope,
             }
-            resp = await self._fetch_json(
-                "https://" + host + "/api/v3/community/list", params=params
-            )
+            try:
+                resp = await self._fetch_json(
+                    "https://" + host + "/api/v3/community/list", params=params
+                )
+            except CrawlerException as err:
+                # Report the failing page to ease the post-mortem analysis
+                raise CrawlerException(f"Page {page}: {err}") from err
 
             if not resp["communities"]:
                 break
@@ -350,9 +387,13 @@ class LemmyCommunityCrawler(Crawler):
                 "sort": self.activity_scope,
                 "community_name": community,
             }
-            resp = await self._fetch_json(
-                "https://" + host + "/api/v3/post/list", params=params
-            )
+            try:
+                resp = await self._fetch_json(
+                    "https://" + host + "/api/v3/post/list", params=params
+                )
+            except CrawlerException as err:
+                # Report the failing page to ease the post-mortem analysis
+                raise CrawlerException(f"Page {page}: {err}") from err
 
             if not resp["posts"]:
                 break
@@ -426,18 +467,30 @@ class LemmyCommunityCrawler(Crawler):
             for post_dict in reader:
                 instance = post_dict["user_instance"]
                 community = post_dict["community"]
-                try:
-                    user_instance_ind = instance_dict[instance]
-                except KeyError:
+                if instance not in instance_dict:
                     self.logger.debug(
                         "Ignoring post %s: instance unknown %s (community %s)",
                         post_dict["post_id"],
                         instance,
                         community,
                     )
-                else:
-                    community_ind = community_dict[community][0]
-                    interaction_mat[user_instance_ind, community_ind] += 1
+                    continue
+
+                # NB: a community may be missing from the ownership file if its
+                # crawl failed (or if the community list crawl failed). We skip
+                # its posts instead of crashing the postprocessing.
+                if community not in community_dict:
+                    self.logger.debug(
+                        "Ignoring post %s: community unknown %s (instance %s)",
+                        post_dict["post_id"],
+                        community,
+                        instance,
+                    )
+                    continue
+
+                user_instance_ind = instance_dict[instance]
+                community_ind = community_dict[community][0]
+                interaction_mat[user_instance_ind, community_ind] += 1
 
         intra_instance_mat = sp.coo_matrix(interaction_mat @ ownership_mat)
         bool_interaction_mat = (interaction_mat != 0).astype(int)
