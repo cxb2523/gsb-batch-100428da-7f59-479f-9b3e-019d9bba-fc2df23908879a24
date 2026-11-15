@@ -67,3 +67,58 @@ For more detailed instructions, please check out the video tutorial linked below
 ## Watch the Video Tutorial
 
 For a complete walkthrough and practical demonstration, check out our [YouTube Video Tutorial](https://www.youtube.com/watch?v=GqAcTrqKcrY).
+
+## User automation batch semantics
+
+The `user_automation` DAG (`dags/kafka_stream.py`) collects users from
+`randomuser.me` during a fixed 60 second window per run and writes each record
+to the `users_created` Kafka topic. Every run finishes with an explicit,
+machine-parseable outcome instead of silently logging and continuing.
+
+- HTTP requests always carry a timeout (default 10 s). Non-2xx responses,
+  payloads without `results`, and payloads missing required fields are counted
+  as **skipped** and never interrupt the loop.
+- Kafka send failures are also counted as **skipped** rather than raised.
+- Deduplication is per batch only: a record whose `login.username` **or**
+  `email` matches an already sent record in the same run is skipped with the
+  `duplicate` reason. Records from previous runs are not compared.
+- If the Kafka producer cannot be created, or sends fail consecutively
+  `USER_AUTOMATION_KAFKA_FAILURE_THRESHOLD` times (default 3), the run stops
+  requesting early. All collected-but-not-sent records are written to a local
+  pending file, one JSON message per line, using the exact Kafka message field
+  structure, for manual or next-run replay. Successfully sent records never
+  enter the pending file.
+
+Each run emits a single stable, parseable summary line to the Airflow log:
+
+```
+BATCH_SUMMARY {"attempts": 12, "batch_id": "20261115T090000-a1b2c3d4", "outcome": "completed", "pending": 0, "pending_file": "", "sent": 9, "skip_duplicate": 1, "skip_http_error": 1, "skip_invalid_payload": 0, "skip_kafka_send": 1, "skip_request_error": 0, "skip_timeout": 0, "skipped": 3, "topic": "users_created", ...}
+```
+
+Pending files are written to `USER_AUTOMATION_PENDING_DIR`
+(default `/opt/airflow/pending`, mounted from `./pending`) as
+`users_created_pending_<batch_id>.jsonl`, and a `BATCH_PENDING` log line
+records the count and path. A run that stopped early is marked
+`"outcome": "aborted_kafka_unavailable"`.
+
+To replay a spooled file once Kafka is reachable (messages are re-sent
+verbatim, and the spool is renamed to `*.jsonl.replayed` only on full
+success):
+
+```bash
+python script/replay_pending.py ./pending/users_created_pending_<batch_id>.jsonl
+```
+
+Tunable environment variables: `USER_AUTOMATION_WINDOW_SECONDS`,
+`USER_AUTOMATION_REQUEST_TIMEOUT_SECONDS`,
+`USER_AUTOMATION_KAFKA_FAILURE_THRESHOLD`, `USER_AUTOMATION_PENDING_DIR`,
+`USER_AUTOMATION_BOOTSTRAP_SERVERS`, `USER_AUTOMATION_API_URL`.
+
+### Tests
+
+The collection logic is fully testable without Airflow, Kafka or network
+access using fake HTTP responses and a fake producer:
+
+```bash
+python -m unittest discover -s tests -v
+```

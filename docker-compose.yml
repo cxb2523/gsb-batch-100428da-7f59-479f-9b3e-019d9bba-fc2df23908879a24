@@ -123,6 +123,7 @@ services:
       - ./dags:/opt/airflow/dags
       - ./script/entrypoint.sh:/opt/airflow/script/entrypoint.sh
       - ./requirements.txt:/opt/airflow/requirements.txt
+      - ./pending:/opt/airflow/pending
     ports:
       - "8080:8080"
     healthcheck:
@@ -142,6 +143,7 @@ services:
       - ./dags:/opt/airflow/dags
       - ./script/entrypoint.sh:/opt/airflow/script/entrypoint.sh
       - ./requirements.txt:/opt/airflow/requirements.txt
+      - ./pending:/opt/airflow/pending
     environment:
       - LOAD_EX=n
       - EXECUTOR=Sequential
