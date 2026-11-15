@@ -345,12 +345,20 @@ class BossZhipinAdapter(PlatformAdapter):
         # Method 3: Playwright persistent profile (requires manual login)
         if detail_url.startswith("http"):
             try:
-                from agent_core.platforms.boss_browser import fetch_jd as _boss_fetch_jd
+                from agent_core.platforms.boss_browser import FetchOutcome, fetch_jd_result
 
-                jd = await _boss_fetch_jd(detail_url, headless=False)
-                if jd:
-                    return jd
-                logger.warning(f"[Boss] persistent-browser JD empty for {detail_url}")
+                outcome = await fetch_jd_result(detail_url, headless=False)
+                if outcome.ok:
+                    return outcome.text
+                if outcome.outcome is FetchOutcome.SESSION_INVALID:
+                    logger.warning(
+                        f"[Boss] persistent browser session invalid for {detail_url} — "
+                        "请重新登录: python -m agent_core.platforms.boss_browser login"
+                    )
+                else:
+                    logger.warning(
+                        f"[Boss] persistent-browser JD {outcome.outcome} for {detail_url}"
+                    )
             except RuntimeError as e:
                 logger.warning(f"[Boss] persistent browser unavailable ({e})")
             except Exception as e:

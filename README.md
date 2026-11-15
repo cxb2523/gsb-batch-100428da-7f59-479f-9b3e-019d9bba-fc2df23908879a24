@@ -316,6 +316,7 @@ job-agent schedule run  # 启动 daemon（每 interval_hours 小时一次）
   - Dashboard「人工初筛」tab 勾选后点「📄 抓取JD」→ `/api/jd/fetch`（最多 20 条）
   - 精排/定制/面试准备前自动按需 enrich（`enrich_job_jd`，description 已有 JD 关键词则跳过）
   - CLI `rematch <job-id>` 单条模式也会先抓 JD
+- Boss 持久浏览器抓取结局可核对：`boss_browser.fetch_jd()` 仍只返回文本，`fetch_jd_result()` 额外返回 `FetchOutcome`（`success` / `session_invalid` 需重新登录 / `no_jd_found` 页面无有效 JD / `context_failed` 上下文失效且重试耗尽 / `error` 其他异常）
 - Boss 触发 code-37 时 120s 退避 + Toast 通知
 
 ### 平台支持

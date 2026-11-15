@@ -722,6 +722,103 @@ def test_fetch_full_jd_missing_security_id():
     assert result == ""
 
 
+# ── persistent-browser (method 3) outcome handling ───────────────────────
+
+
+def _boss_job_with_url(url="https://www.zhipin.com/job_detail/1.html"):
+    job = Job(
+        id="test",
+        title="T",
+        company="C",
+        description="",
+        platforms=["boss_zhipin"],
+        urls={"boss_zhipin": url},
+    )
+    job.security_id = "s1"
+    job.lid = url
+    return job
+
+
+def _disable_persistent_fallbacks(monkeypatch):
+    """Force methods 1 and 2 to miss so method 3 (persistent browser) runs."""
+    monkeypatch.setattr("agent_core.platforms.boss_zhipin._load_cookies", lambda p: [])
+    monkeypatch.setattr(
+        "agent_core.platforms.playwright_jd.fetch_jd_playwright",
+        _async_empty,
+    )
+
+
+async def _async_empty(*args, **kwargs):
+    return ""
+
+
+def test_fetch_full_jd_persistent_success_returns_text(monkeypatch):
+    """Method 3 returns the JD text when the persistent fetch succeeds."""
+    from agent_core.platforms.boss_browser import FetchOutcome, JDFetchResult
+
+    _disable_persistent_fallbacks(monkeypatch)
+
+    async def fake_result(url, headless=False):
+        assert headless is False
+        return JDFetchResult(FetchOutcome.SUCCESS, text="持久浏览器JD" * 10)
+
+    monkeypatch.setattr("agent_core.platforms.boss_browser.fetch_jd_result", fake_result)
+    adapter = BossZhipinAdapter()
+    result = asyncio.run(adapter.fetch_full_jd(_boss_job_with_url(), "/fake/cookies.json"))
+    assert result.startswith("持久浏览器JD")
+
+
+def test_fetch_full_jd_persistent_session_invalid_logs_relogin(monkeypatch, caplog):
+    """A SESSION_INVALID outcome yields "" and logs the re-login hint."""
+    from agent_core.platforms.boss_browser import FetchOutcome, JDFetchResult
+
+    _disable_persistent_fallbacks(monkeypatch)
+
+    async def fake_result(url, headless=False):
+        return JDFetchResult(FetchOutcome.SESSION_INVALID, detail=url)
+
+    monkeypatch.setattr("agent_core.platforms.boss_browser.fetch_jd_result", fake_result)
+    adapter = BossZhipinAdapter()
+    result = asyncio.run(adapter.fetch_full_jd(_boss_job_with_url(), "/fake/cookies.json"))
+    assert result == ""
+    assert any("session invalid" in r.message for r in caplog.records)
+    assert any("重新登录" in r.message for r in caplog.records)
+
+
+def test_fetch_full_jd_persistent_no_jd_logs_outcome(monkeypatch, caplog):
+    """A NO_JD_FOUND outcome yields "" and names the outcome in the log."""
+    from agent_core.platforms.boss_browser import FetchOutcome, JDFetchResult
+
+    _disable_persistent_fallbacks(monkeypatch)
+
+    async def fake_result(url, headless=False):
+        return JDFetchResult(FetchOutcome.NO_JD_FOUND)
+
+    monkeypatch.setattr("agent_core.platforms.boss_browser.fetch_jd_result", fake_result)
+    adapter = BossZhipinAdapter()
+    result = asyncio.run(adapter.fetch_full_jd(_boss_job_with_url(), "/fake/cookies.json"))
+    assert result == ""
+    assert any("no_jd_found" in r.message for r in caplog.records)
+
+
+def test_fetch_full_jd_persistent_context_failed_logs_outcome(monkeypatch, caplog):
+    """A CONTEXT_FAILED outcome yields "" and names the outcome in the log."""
+    from agent_core.platforms.boss_browser import FetchOutcome, JDFetchResult
+
+    _disable_persistent_fallbacks(monkeypatch)
+
+    async def fake_result(url, headless=False):
+        return JDFetchResult(FetchOutcome.CONTEXT_FAILED, detail="context closed")
+
+    monkeypatch.setattr("agent_core.platforms.boss_browser.fetch_jd_result", fake_result)
+    adapter = BossZhipinAdapter()
+    result = asyncio.run(adapter.fetch_full_jd(_boss_job_with_url(), "/fake/cookies.json"))
+    assert result == ""
+    assert any("context_failed" in r.message for r in caplog.records)
+    # The card.json fallback still needs a cookie string; none here → "".
+    assert result == ""
+
+
 def test_parse_salary_empty():
     """_parse_salary returns (None, None) for empty or no-K text."""
     from agent_core.platforms.boss_zhipin import _parse_salary

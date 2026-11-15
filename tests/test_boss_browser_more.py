@@ -15,9 +15,12 @@ import pytest
 from agent_core.platforms import boss_browser as bb
 from agent_core.platforms.boss_browser import (
     BossBrowser,
+    FetchOutcome,
+    JDFetchResult,
     _slice_jd_from_body,
     close_browser,
     fetch_jd,
+    fetch_jd_result,
     get_browser,
     login,
 )
@@ -47,11 +50,13 @@ class _FakePage:
         selector_texts=None,
         body_text="",
         goto_errors=None,
+        goto_redirect=None,
     ):
         self.url = url
         self.selector_texts = selector_texts or {}
         self.body_text = body_text
         self.goto_errors = list(goto_errors or [])
+        self.goto_redirect = goto_redirect
         self.closed = False
         self.goto_url = None
         self.load_state_called = False
@@ -62,7 +67,7 @@ class _FakePage:
             error = self.goto_errors.pop(0)
             if error is not None:
                 raise error
-        self.url = url
+        self.url = self.goto_redirect or url
 
     async def wait_for_load_state(self, state, timeout=None):
         self.load_state_called = True
@@ -453,6 +458,244 @@ async def test_fetch_jd_truncates_to_5000(monkeypatch, tmp_path):
     result = await browser.fetch_jd("https://www.zhipin.com/job_detail/1.html")
     assert len(result) == 5000
     assert result == "E" * 5000
+
+
+# ── fetch_jd_result() outcomes ───────────────────────────────────────────
+
+
+def test_fetch_outcome_values_are_distinct():
+    assert set(FetchOutcome) == {
+        FetchOutcome.SUCCESS,
+        FetchOutcome.SESSION_INVALID,
+        FetchOutcome.NO_JD_FOUND,
+        FetchOutcome.CONTEXT_FAILED,
+        FetchOutcome.ERROR,
+    }
+
+
+def test_jd_fetch_result_ok_only_for_success():
+    assert JDFetchResult(FetchOutcome.SUCCESS, text="JD").ok is True
+    assert JDFetchResult(FetchOutcome.NO_JD_FOUND).ok is False
+    assert JDFetchResult(FetchOutcome.SESSION_INVALID).ok is False
+    assert JDFetchResult(FetchOutcome.CONTEXT_FAILED).ok is False
+    assert JDFetchResult(FetchOutcome.ERROR).ok is False
+
+
+async def test_fetch_jd_result_success_selector(monkeypatch, tmp_path):
+    page = _FakePage(selector_texts={".job-detail .job-sec-text": "岗位职责\n" + "A" * 80})
+    browser, _ = await _browser_with_page(page, tmp_path)
+    monkeypatch.setattr(browser, "_ensure_browser", AsyncMock())
+
+    result = await browser.fetch_jd_result("https://www.zhipin.com/job_detail/1.html")
+    assert result.outcome is FetchOutcome.SUCCESS
+    assert result.ok is True
+    assert result.text.startswith("岗位职责")
+    assert page.closed is True
+
+
+async def test_fetch_jd_result_success_body_slice_fallback(monkeypatch, tmp_path):
+    page = _FakePage(body_text="岗位职责\n负责机器人调试\n举报\n底部")
+    browser, _ = await _browser_with_page(page, tmp_path)
+    monkeypatch.setattr(browser, "_ensure_browser", AsyncMock())
+
+    result = await browser.fetch_jd_result("https://www.zhipin.com/job_detail/1.html")
+    assert result.outcome is FetchOutcome.SUCCESS
+    assert "负责机器人调试" in result.text
+    assert "举报" not in result.text
+
+
+async def test_fetch_jd_result_truncates_to_5000(monkeypatch, tmp_path):
+    page = _FakePage(selector_texts={".text": "E" * 6000})
+    browser, _ = await _browser_with_page(page, tmp_path)
+    monkeypatch.setattr(browser, "_ensure_browser", AsyncMock())
+
+    result = await browser.fetch_jd_result("https://www.zhipin.com/job_detail/1.html")
+    assert result.outcome is FetchOutcome.SUCCESS
+    assert len(result.text) == 5000
+    assert result.text == "E" * 5000
+
+
+async def test_fetch_jd_result_security_page_returns_session_invalid_no_retry(
+    monkeypatch, tmp_path
+):
+    security_url = "https://www.zhipin.com/passport/zp/security?x=1"
+    job_url = "https://www.zhipin.com/job_detail/1.html"
+    # The detail URL redirects to the security challenge.
+    page = _FakePage(goto_redirect=security_url)
+    context = _FakeContext(page=page)
+    browser = BossBrowser(profile_dir=tmp_path / "profile")
+    browser._context = context
+    ensure = AsyncMock()
+    teardown = AsyncMock()
+    monkeypatch.setattr(browser, "_ensure_browser", ensure)
+    monkeypatch.setattr(browser, "_teardown_context", teardown)
+
+    result = await browser.fetch_jd_result(job_url)
+    assert result.outcome is FetchOutcome.SESSION_INVALID
+    assert result.text == ""
+    assert result.detail == security_url
+    # Security-page hits are not retried: one page, one attempt, page closed.
+    assert context.new_page.await_count == 1
+    assert ensure.await_count == 1
+    teardown.assert_not_awaited()
+    assert page.closed is True
+
+
+async def test_fetch_jd_result_no_jd_found(monkeypatch, tmp_path):
+    page = _FakePage(selector_texts={}, body_text="太短")
+    browser, _ = await _browser_with_page(page, tmp_path)
+    monkeypatch.setattr(browser, "_ensure_browser", AsyncMock())
+
+    result = await browser.fetch_jd_result("https://www.zhipin.com/job_detail/1.html")
+    assert result.outcome is FetchOutcome.NO_JD_FOUND
+    assert result.text == ""
+    assert page.closed is True
+
+
+async def test_fetch_jd_result_no_jd_found_when_all_selectors_empty(monkeypatch, tmp_path):
+    # Every selector resolves, but returns too-short text; body has no heading
+    # and is under the 100-char fallback threshold.
+    page = _FakePage(
+        selector_texts={
+            ".job-detail .job-sec-text": "  ",
+            ".job-sec-text": "短",
+            ".job-detail": "",
+        },
+        body_text="",
+    )
+    browser, _ = await _browser_with_page(page, tmp_path)
+    monkeypatch.setattr(browser, "_ensure_browser", AsyncMock())
+
+    result = await browser.fetch_jd_result("https://www.zhipin.com/job_detail/1.html")
+    assert result.outcome is FetchOutcome.NO_JD_FOUND
+    assert result.text == ""
+
+
+async def test_fetch_jd_result_context_failure_retries_exhausted(monkeypatch, tmp_path):
+    context = _FakeContext()
+    context.new_page = AsyncMock(
+        side_effect=RuntimeError("Target page, context or browser has been closed")
+    )
+    browser = BossBrowser(profile_dir=tmp_path / "profile")
+    browser._context = context
+    ensure = AsyncMock()
+    teardown = AsyncMock()
+    monkeypatch.setattr(browser, "_ensure_browser", ensure)
+    monkeypatch.setattr(browser, "_teardown_context", teardown)
+
+    result = await browser.fetch_jd_result("https://www.zhipin.com/job_detail/1.html")
+    assert result.outcome is FetchOutcome.CONTEXT_FAILED
+    assert result.text == ""
+    # Existing retry policy: two attempts, context rebuilt between them.
+    assert context.new_page.await_count == 2
+    assert ensure.await_count == 2
+    assert teardown.await_count == 1
+
+
+async def test_fetch_jd_result_context_failure_after_nav_errors(monkeypatch, tmp_path):
+    page = _FakePage(
+        goto_errors=[
+            RuntimeError("Target page, context or browser has been closed"),
+            RuntimeError("Target page, context or browser has been closed"),
+        ]
+    )
+    browser, _ = await _browser_with_page(page, tmp_path)
+    ensure = AsyncMock()
+    teardown = AsyncMock()
+    monkeypatch.setattr(browser, "_ensure_browser", ensure)
+    monkeypatch.setattr(browser, "_teardown_context", teardown)
+
+    result = await browser.fetch_jd_result("https://www.zhipin.com/job_detail/1.html")
+    assert result.outcome is FetchOutcome.CONTEXT_FAILED
+    assert result.text == ""
+    assert page.closed is True
+
+
+async def test_fetch_jd_result_launch_failure_retries_exhausted(monkeypatch, tmp_path):
+    browser, _ = await _browser_with_page(_FakePage(), tmp_path)
+    ensure = AsyncMock(side_effect=RuntimeError("Failed to launch"))
+    monkeypatch.setattr(browser, "_ensure_browser", ensure)
+    monkeypatch.setattr(browser, "_teardown_context", AsyncMock())
+
+    result = await browser.fetch_jd_result("https://www.zhipin.com/job_detail/1.html")
+    assert result.outcome is FetchOutcome.CONTEXT_FAILED
+    assert ensure.await_count == 2
+
+
+async def test_fetch_jd_result_generic_error(monkeypatch, tmp_path):
+    page = _FakePage(goto_errors=[ValueError("bad page")])
+    browser, _ = await _browser_with_page(page, tmp_path)
+    monkeypatch.setattr(browser, "_ensure_browser", AsyncMock())
+
+    result = await browser.fetch_jd_result("https://www.zhipin.com/job_detail/1.html")
+    assert result.outcome is FetchOutcome.ERROR
+    assert result.text == ""
+    assert page.closed is True
+
+
+async def test_fetch_jd_result_non_retryable_launch_error(monkeypatch, tmp_path):
+    browser, _ = await _browser_with_page(_FakePage(), tmp_path)
+    monkeypatch.setattr(browser, "_ensure_browser", AsyncMock(side_effect=ValueError("boom")))
+
+    result = await browser.fetch_jd_result("https://www.zhipin.com/job_detail/1.html")
+    assert result.outcome is FetchOutcome.ERROR
+
+
+async def test_fetch_jd_result_invalid_url_without_touching_browser(tmp_path):
+    browser = BossBrowser(profile_dir=tmp_path / "profile")
+    ensure = AsyncMock()
+    browser._ensure_browser = ensure
+
+    for bad in ("", "ftp://example.com", "not-a-url"):
+        result = await browser.fetch_jd_result(bad)
+        assert result.outcome is FetchOutcome.ERROR
+        assert result.text == ""
+    ensure.assert_not_awaited()
+
+
+async def test_fetch_jd_result_recovers_on_second_attempt(monkeypatch, tmp_path):
+    page = _FakePage(selector_texts={".job-sec-text": "B" * 60})
+    context = _FakeContext(page=page)
+    context.new_page = AsyncMock(
+        side_effect=[
+            RuntimeError("Target page, context or browser has been closed"),
+            page,
+        ]
+    )
+    browser = BossBrowser(profile_dir=tmp_path / "profile")
+    browser._context = context
+    monkeypatch.setattr(browser, "_ensure_browser", AsyncMock())
+    monkeypatch.setattr(browser, "_teardown_context", AsyncMock())
+
+    result = await browser.fetch_jd_result("https://www.zhipin.com/job_detail/1.html")
+    assert result.outcome is FetchOutcome.SUCCESS
+    assert result.text == "B" * 60
+    assert context.new_page.await_count == 2
+
+
+async def test_fetch_jd_still_returns_plain_text_from_result(monkeypatch, tmp_path):
+    page = _FakePage(selector_texts={".job-sec-text": "F" * 60})
+    browser, _ = await _browser_with_page(page, tmp_path)
+    monkeypatch.setattr(browser, "_ensure_browser", AsyncMock())
+
+    assert await browser.fetch_jd("https://www.zhipin.com/job_detail/1.html") == "F" * 60
+
+
+async def test_module_fetch_jd_result_uses_singleton(monkeypatch, tmp_path):
+    browser = BossBrowser(profile_dir=tmp_path / "profile")
+    expected = JDFetchResult(FetchOutcome.SUCCESS, text="JD TEXT")
+    browser.fetch_jd_result = AsyncMock(return_value=expected)
+
+    async def _fake_get_browser(*args, **kwargs):
+        return browser
+
+    monkeypatch.setattr(bb, "get_browser", _fake_get_browser)
+    result = await fetch_jd_result("https://www.zhipin.com/job_detail/1.html")
+    assert result is expected
+    browser.fetch_jd_result.assert_awaited_once_with(
+        "https://www.zhipin.com/job_detail/1.html", headless=False
+    )
+
 
 
 # ── close() ──────────────────────────────────────────────────────────────

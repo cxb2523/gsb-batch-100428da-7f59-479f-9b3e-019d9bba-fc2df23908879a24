@@ -25,6 +25,13 @@ Usage:
   from agent_core.platforms.boss_browser import fetch_jd, get_browser
   browser = await get_browser()
   jd = await fetch_jd("https://www.zhipin.com/job_detail/xxx.html")
+
+  # Callers that must tell "re-login" apart from "retry later" should use the
+  # outcome-aware entry instead; fetch_jd keeps returning plain text:
+  from agent_core.platforms.boss_browser import FetchOutcome, fetch_jd_result
+  result = await fetch_jd_result("https://www.zhipin.com/job_detail/xxx.html")
+  if result.outcome is FetchOutcome.SESSION_INVALID:
+      ...  # ask the user to re-login
 """
 
 from __future__ import annotations
@@ -32,6 +39,8 @@ from __future__ import annotations
 import asyncio
 import atexit
 import logging
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +77,62 @@ _TRAILING_MARKERS = [
     "相似职位",
     "友情链接",
 ]
+
+# Error substrings that mean the browser context/page died mid-flight.
+# These are the only failures we retry (after rebuilding the context).
+_CONTEXT_CLOSED_MSGS = (
+    "Target page, context or browser has been closed",
+    "Browser has been closed",
+    "Browser closed",
+)
+_LAUNCH_FAIL_MSGS = (
+    "Target page, context or browser has been closed",
+    "Failed to launch",
+    "Another instance",
+    "SingletonLock",
+)
+
+
+class FetchOutcome(StrEnum):
+    """Why a Boss JD fetch ended the way it did.
+
+    Callers use this to decide between "re-login", "retry later" and
+    "nothing to fix" instead of guessing from an empty string.
+    """
+
+    SUCCESS = "success"
+    """Valid JD text was captured (selector hit or body-slice fallback)."""
+
+    SESSION_INVALID = "session_invalid"
+    """Redirected to /passport/zp/security — the persistent session expired."""
+
+    NO_JD_FOUND = "no_jd_found"
+    """Page loaded, but neither the selectors nor the body fallback yielded a JD."""
+
+    CONTEXT_FAILED = "context_failed"
+    """Browser context became unusable and the two attempts were exhausted."""
+
+    ERROR = "error"
+    """Any other failure (bad URL, unexpected exception, non-retryable launch error)."""
+
+
+@dataclass(frozen=True)
+class JDFetchResult:
+    """Outcome category plus the JD text captured for a successful fetch.
+
+    ``text`` is non-empty only when ``outcome`` is SUCCESS (the text-only
+    ``fetch_jd`` wrapper simply returns it). ``detail`` carries supporting
+    context such as the security-page URL or the underlying error message so
+    callers can log something checkable without parsing free-form strings.
+    """
+
+    outcome: FetchOutcome
+    text: str = ""
+    detail: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.outcome is FetchOutcome.SUCCESS
 
 
 class BossBrowser:
@@ -188,8 +253,27 @@ class BossBrowser:
     async def fetch_jd(self, url: str, headless: bool = False, timeout_ms: int = 25000) -> str:
         """Fetch full JD text by rendering a Boss job-detail page.
 
+        Text-only wrapper kept for existing callers. Callers that need to
+        distinguish "re-login" from "retry later" should use
+        :meth:`fetch_jd_result` instead.
+
+        Returns:
+            JD text (truncated to 5000 chars) or "" on any failure.
+        """
+        result = await self.fetch_jd_result(url, headless=headless, timeout_ms=timeout_ms)
+        return result.text
+
+    async def fetch_jd_result(
+        self, url: str, headless: bool = False, timeout_ms: int = 25000
+    ) -> JDFetchResult:
+        """Fetch full JD text and report WHY the fetch ended the way it did.
+
         Uses the persistent logged-in profile, so the anti-bot security
         challenge is bypassed (session fingerprint is real).
+
+        Retry policy (unchanged from the previous text-only implementation):
+        a dead browser context is retried once after a context rebuild;
+        a redirect to the security challenge page is never retried.
 
         Args:
             url: Boss job-detail URL (https://www.zhipin.com/job_detail/{id}.html)
@@ -198,55 +282,54 @@ class BossBrowser:
             timeout_ms: Max wait for page load
 
         Returns:
-            JD text (truncated to 5000 chars) or "" on any failure.
+            JDFetchResult whose ``outcome`` says what happened and whose
+            ``text`` is the captured JD (truncated to 5000 chars) when one
+            was found. ``text`` is always "" unless the outcome is SUCCESS.
         """
         if not url or not url.startswith("http"):
-            return ""
-
-        _CONTEXT_CLOSED_MSGS = (
-            "Target page, context or browser has been closed",
-            "Browser has been closed",
-            "Browser closed",
-        )
-        _LAUNCH_FAIL_MSGS = (
-            "Target page, context or browser has been closed",
-            "Failed to launch",
-            "Another instance",
-            "SingletonLock",
-        )
+            return JDFetchResult(FetchOutcome.ERROR, detail="invalid url")
 
         for attempt in range(2):
             try:
                 await self._ensure_browser(headless=headless)
             except Exception as e:
-                if any(p in str(e) for p in _LAUNCH_FAIL_MSGS) and attempt == 0:
+                retryable = any(p in str(e) for p in _LAUNCH_FAIL_MSGS)
+                if retryable and attempt == 0:
                     logger.warning("[BossBrowser] launch failed (%s) — retrying", e)
                     await self._teardown_context()
                     continue
+                if retryable:
+                    logger.error("[BossBrowser] launch retries exhausted for %s: %s", url, e)
+                    return JDFetchResult(FetchOutcome.CONTEXT_FAILED, detail=str(e))
                 logger.error("[BossBrowser] _ensure_browser failed: %s", e)
-                return ""
+                return JDFetchResult(FetchOutcome.ERROR, detail=str(e))
 
             try:
                 page = await self._context.new_page()
             except Exception as e:
-                if any(p in str(e) for p in _CONTEXT_CLOSED_MSGS) and attempt == 0:
+                retryable = any(p in str(e) for p in _CONTEXT_CLOSED_MSGS)
+                if retryable and attempt == 0:
                     logger.warning("[BossBrowser] context dead on new_page — retrying")
                     await self._teardown_context()
                     continue
+                if retryable:
+                    logger.error("[BossBrowser] context retries exhausted for %s: %s", url, e)
+                    return JDFetchResult(FetchOutcome.CONTEXT_FAILED, detail=str(e))
                 logger.error("[BossBrowser] new_page failed: %s", e)
-                return ""
+                return JDFetchResult(FetchOutcome.ERROR, detail=str(e))
 
             try:
                 await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
                 # If redirected to the security challenge page, the session
                 # isn't logged in — bail out so the user knows to re-login.
+                # No retry: only a fresh manual login can fix this.
                 if "passport/zp/security" in page.url:
                     logger.error(
                         "[BossBrowser] redirected to anti-bot security page — "
                         "session not logged in. Run: python -m agent_core.platforms.boss_browser login"
                     )
-                    return ""
+                    return JDFetchResult(FetchOutcome.SESSION_INVALID, detail=page.url)
 
                 # Wait for JS to render the JD. Boss detail pages are SPA-like.
                 try:
@@ -279,24 +362,34 @@ class BossBrowser:
                         if not jd_text and len(body_text) >= 100:
                             jd_text = body_text
 
-                if jd_text and len(jd_text) > 5000:
-                    jd_text = jd_text[:5000]
-                return jd_text
+                if not jd_text:
+                    logger.warning("[BossBrowser] no JD content on %s", url)
+                    return JDFetchResult(
+                        FetchOutcome.NO_JD_FOUND,
+                        detail="selectors and body fallback produced no JD",
+                    )
+
+                return JDFetchResult(FetchOutcome.SUCCESS, text=jd_text[:5000])
             except Exception as e:
-                if any(p in str(e) for p in _CONTEXT_CLOSED_MSGS) and attempt == 0:
+                retryable = any(p in str(e) for p in _CONTEXT_CLOSED_MSGS)
+                if retryable and attempt == 0:
                     logger.warning("[BossBrowser] nav error (%s) — retrying", e)
                     await self._teardown_context()
                     continue
+                if retryable:
+                    logger.error("[BossBrowser] context retries exhausted for %s: %s", url, e)
+                    return JDFetchResult(FetchOutcome.CONTEXT_FAILED, detail=str(e))
                 logger.error("[BossBrowser] fetch error for %s: %s", url, e)
-                return ""
+                return JDFetchResult(FetchOutcome.ERROR, detail=str(e))
             finally:
                 try:
                     await page.close()
                 except Exception:
                     pass
 
+        # Unreachable with the two-attempt loop above; kept as a safe default.
         logger.error("[BossBrowser] retries exhausted for %s", url)
-        return ""
+        return JDFetchResult(FetchOutcome.CONTEXT_FAILED, detail="retries exhausted")
 
     async def close(self) -> None:
         await self._teardown_context()
@@ -370,9 +463,25 @@ async def close_browser() -> None:
 
 
 async def fetch_jd(url: str, headless: bool = False) -> str:
-    """Convenience: fetch JD using the singleton browser."""
+    """Convenience: fetch JD using the singleton browser.
+
+    Returns plain JD text (truncated to 5000 chars) or "" on failure — the
+    public behaviour existing callers rely on. Use :func:`fetch_jd_result`
+    when the failure category matters.
+    """
     browser = await get_browser()
     return await browser.fetch_jd(url, headless=headless)
+
+
+async def fetch_jd_result(url: str, headless: bool = False) -> JDFetchResult:
+    """Convenience: fetch JD + outcome using the singleton browser.
+
+    Distinguishes success, an expired session (redirected to the security
+    challenge page), a page that yielded no JD, an exhausted browser-context
+    retry, and other errors.
+    """
+    browser = await get_browser()
+    return await browser.fetch_jd_result(url, headless=headless)
 
 
 async def login(timeout_s: int = 300) -> bool:
@@ -432,7 +541,9 @@ if __name__ == "__main__":
             print("Usage: python -m agent_core.platforms.boss_browser fetch <url>")
             sys.exit(1)
         url = sys.argv[2]
-        jd = asyncio.run(fetch_jd(url, headless=False))
-        print(f"JD_LEN={len(jd)}")
-        print("JD_PREVIEW=" + (jd[:500] if jd else "(empty)"))
+        result = asyncio.run(fetch_jd_result(url, headless=False))
+        print(f"OUTCOME={result.outcome}")
+        print(f"JD_LEN={len(result.text)}")
+        print("JD_PREVIEW=" + (result.text[:500] if result.text else "(empty)"))
         asyncio.run(close_browser())
+        sys.exit(0 if result.ok else 1)
