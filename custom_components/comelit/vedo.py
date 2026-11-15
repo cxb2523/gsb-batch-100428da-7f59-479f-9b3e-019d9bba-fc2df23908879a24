@@ -2,7 +2,7 @@
 
 import json
 import logging
-from threading import Thread
+from threading import Event, Thread
 import time
 
 from homeassistant.components.alarm_control_panel import AlarmControlPanelState
@@ -53,6 +53,12 @@ class ComelitVedo:
 
     def start(self):
         self.vedo_updater.start()
+
+    def stop(self):
+        """Stop the polling thread, waking it from any wait or backoff."""
+        self.vedo_updater.stop()
+        if self.vedo_updater.is_alive():
+            self.vedo_updater.join()
 
     # Build the HTTP request
     def build_http(self, headers, uid, path):
@@ -219,13 +225,22 @@ class ComelitVedo:
 
 # Update the binary sensors
 class SensorUpdater(Thread):
+    # Cap for the exponential backoff between failed polling rounds.
+    MAX_BACKOFF = 300
+
     def __init__(self, name, scan_interval, vedo: ComelitVedo):
         Thread.__init__(self)
         self.name = name
         self._scan_interval = scan_interval
         self._vedo = vedo
-        self._active = True
         self._uid = None
+        self._failures = 0
+        # Do not call this _stop: Thread uses that name internally for join().
+        self._stop_event = Event()
+
+    # Ask the polling thread to stop. Wakes it up from any wait or backoff.
+    def stop(self):
+        self._stop_event.set()
 
     # Invalidate the uid
     def logout(self):
@@ -233,25 +248,56 @@ class SensorUpdater(Thread):
             self._vedo.logout(self._uid)
         self._uid = None
 
+    # Interruptible sleep: returns True when stop() was called meanwhile.
+    def _wait(self, delay):
+        return self._stop_event.wait(delay)
+
+    # Exponential backoff based on the consecutive failure count.
+    def _backoff_delay(self):
+        return min(self._scan_interval * (2 ** (self._failures - 1)), self.MAX_BACKOFF)
+
     # Polls the sensors
     def run(self):
         _LOGGER.debug("Comelit Vedo status snapshot started")
         self._uid = None
+        self._failures = 0
 
-        while self._active:
+        while not self._stop_event.is_set():
             try:
                 if self._uid is None:
                     self._uid = self._vedo.login()
                     if self._uid is None:
-                        continue
+                        raise VedoLoginException("login returned an empty cookie")
                 self.poll()
-            except CookieException:
+            except VedoLoginException as e:
+                # No session: do not send data requests, retry after a backoff.
+                _LOGGER.warning("Vedo login failed (%s), reconnecting", e)
+                self._failures += 1
+                self._uid = None
+            except CookieException as e:
+                # Session expired: drop the cookie and the whole round.
+                _LOGGER.warning("Vedo session expired (%s), reconnecting", e)
+                self._failures += 1
+                self.logout()
+            except VedoDataException as e:
+                # Inconsistent snapshot: discard it, keep the current state.
+                _LOGGER.warning("Discarding inconsistent Vedo data: %s", e)
+                self._failures += 1
                 self.logout()
             except Exception as e:
                 _LOGGER.exception("Error getting data! %s", e)
+                self._failures += 1
                 self.logout()
-            finally:
-                time.sleep(self._scan_interval)
+            else:
+                self._failures = 0
+
+            if self._stop_event.is_set():
+                break
+            delay = (
+                self._scan_interval if self._failures == 0 else self._backoff_delay()
+            )
+            if self._wait(delay):
+                break
 
     # Fetch the zones and the areas and update the entities
     def poll(self):
@@ -260,24 +306,27 @@ class SensorUpdater(Thread):
         areas_desc = self._vedo.get(self._uid, VedoRequest.AREA_DESC, True)
         areas_stat = self._vedo.get(self._uid, VedoRequest.AREA_STAT, True)
 
-        zone_statuses = zone_status["status"].split(",")
-        if len(zone_desc["in_area"]) != len(zone_statuses) or len(
-            areas_desc["description"]
-        ) != len(areas_stat["ready"]):
-            raise VedoDataException("error getting area")
-
-        sensors = self.parse_zones(zone_desc, zone_statuses)
+        # Parse and validate the whole snapshot first: a broken round must
+        # never overwrite the entities with partial data.
+        sensors = self.parse_zones(zone_desc, zone_status)
+        areas = self.parse_areas(areas_desc, areas_stat)
 
         if self._vedo.expose_bin_sensors:
             for sensor in sensors:
                 self._vedo.update_sensor(sensor)
 
-        for area in self.parse_areas(areas_desc, areas_stat):
+        for area in areas:
             self._vedo.update_area(area)
 
     # Build the sensors of the zones assigned to an area
     @staticmethod
-    def parse_zones(zone_desc, zone_statuses):
+    def parse_zones(zone_desc, zone_status):
+        zone_statuses = zone_status["status"].split(",")
+        if len(zone_desc["in_area"]) != len(zone_statuses) or len(
+            zone_desc["description"]
+        ) != len(zone_statuses):
+            raise VedoDataException("zone description and status length mismatch")
+
         sensors = []
         for i, value in enumerate(zone_desc["in_area"]):
             if value == "Not logged":
@@ -308,6 +357,14 @@ class SensorUpdater(Thread):
             "in_time",
             "out_time",
         )
+        count = len(areas_desc["description"])
+        for field in desc_fields:
+            if len(areas_desc[field]) != count:
+                raise VedoDataException(f"area description field {field} mismatch")
+        for field in stat_fields:
+            if len(areas_stat[field]) != count:
+                raise VedoDataException(f"area status field {field} mismatch")
+
         areas = []
         for i, name in enumerate(areas_desc["description"]):
             area = {"name": name, "id": i}

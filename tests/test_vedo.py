@@ -1,3 +1,4 @@
+from threading import Event, Thread
 from unittest.mock import MagicMock, Mock, patch
 
 from homeassistant.components.alarm_control_panel import AlarmControlPanelState
@@ -5,7 +6,7 @@ from homeassistant.const import STATE_OFF, STATE_ON
 import pytest
 
 from custom_components.comelit import ComelitVedo
-from custom_components.comelit.exception import CookieException
+from custom_components.comelit.exception import CookieException, VedoLoginException
 from custom_components.comelit.vedo import SensorUpdater, VedoRequest
 
 VEDO = "custom_components.comelit.vedo"
@@ -213,31 +214,38 @@ AREA_STAT = {
 }
 
 
-def run_once(updater, responses, iterations=1):
-    """Run the given number of polling iterations of the updater."""
-    vedo = updater._vedo
-    sleeps = []
+def run_rounds(updater, responses, iterations=1):
+    """Run the given number of polling iterations of the updater.
 
-    def stop(*args):
-        sleeps.append(args)
-        if len(sleeps) == iterations:
-            updater._active = False
+    Returns the list of delays the updater waited between rounds.
+    """
+    vedo = updater._vedo
+    waits = []
+
+    def fake_wait(delay):
+        waits.append(delay)
+        if len(waits) == iterations:
+            updater.stop()
+        return False
 
     vedo.get = Mock(side_effect=responses)
-    with patch(f"{VEDO}.time.sleep", side_effect=stop):
-        updater.run()
+    updater._wait = Mock(side_effect=fake_wait)
+    updater.run()
+    return waits
 
 
 def test_updater_polls_sensors_and_areas(vedo):
     updater = SensorUpdater("test", 1, vedo)
     vedo.login = Mock(return_value="uid")
 
-    run_once(updater, [ZONE_DESC, ZONE_STAT, AREA_DESC, AREA_STAT])
+    waits = run_rounds(updater, [ZONE_DESC, ZONE_STAT, AREA_DESC, AREA_STAT])
 
     assert list(vedo.sensors) == [0]
     assert vedo.sensors[0].state == STATE_ON
     assert vedo.areas[0].state == AlarmControlPanelState.ARMED_AWAY
     assert updater._uid == "uid"
+    # A successful round waits the configured scan_interval, no backoff.
+    assert waits == [1]
 
 
 def test_updater_logs_out_on_expired_cookie(vedo):
@@ -246,10 +254,35 @@ def test_updater_logs_out_on_expired_cookie(vedo):
     vedo.logout = Mock()
 
     expired = {"description": ["door"], "in_area": ["Not logged"]}
-    run_once(updater, [expired, {"status": "0"}, AREA_DESC, AREA_STAT])
+    run_rounds(updater, [expired, {"status": "0"}, AREA_DESC, AREA_STAT])
 
     vedo.logout.assert_called_once_with("uid")
     assert updater._uid is None
+    # The broken round must not create or update any entity.
+    assert vedo.sensors == {}
+    assert vedo.areas == {}
+
+
+def test_updater_relogs_in_after_expired_cookie(vedo):
+    updater = SensorUpdater("test", 1, vedo)
+    vedo.login = Mock(return_value="uid")
+    vedo.logout = Mock()
+
+    expired = {"description": ["door"], "in_area": ["Not logged"]}
+    responses = [
+        expired,
+        {"status": "0"},
+        AREA_DESC,
+        AREA_STAT,  # first round: cookie expired
+        ZONE_DESC,
+        ZONE_STAT,
+        AREA_DESC,
+        AREA_STAT,  # second round: fresh login, ok
+    ]
+    run_rounds(updater, responses, iterations=2)
+
+    assert vedo.login.call_count == 2
+    assert vedo.areas[0].state == AlarmControlPanelState.ARMED_AWAY
 
 
 def test_updater_logs_out_on_inconsistent_data(vedo):
@@ -257,20 +290,172 @@ def test_updater_logs_out_on_inconsistent_data(vedo):
     vedo.login = Mock(return_value="uid")
     vedo.logout = Mock()
 
-    run_once(updater, [ZONE_DESC, {"status": "0"}, AREA_DESC, AREA_STAT])
+    run_rounds(updater, [ZONE_DESC, {"status": "0"}, AREA_DESC, AREA_STAT])
+
+    vedo.logout.assert_called_once_with("uid")
+    assert updater._uid is None
+    assert vedo.sensors == {}
+
+
+def test_updater_discards_round_with_mismatched_area_fields(vedo):
+    updater = SensorUpdater("test", 1, vedo)
+    vedo.login = Mock(return_value="uid")
+    vedo.logout = Mock()
+
+    # "armed" is shorter than the area description: the snapshot is corrupt.
+    bad_area_stat = {**AREA_STAT, "armed": []}
+    run_rounds(updater, [ZONE_DESC, ZONE_STAT, AREA_DESC, bad_area_stat])
 
     vedo.logout.assert_called_once_with("uid")
     assert vedo.sensors == {}
+    assert vedo.areas == {}
+
+
+def test_updater_keeps_entity_state_after_a_broken_round(vedo):
+    updater = SensorUpdater("test", 1, vedo)
+    vedo.login = Mock(return_value="uid")
+    vedo.logout = Mock()
+
+    responses = [
+        ZONE_DESC,
+        ZONE_STAT,
+        AREA_DESC,
+        AREA_STAT,  # first round: ok
+        ZONE_DESC,
+        {"status": "0"},
+        AREA_DESC,
+        AREA_STAT,  # second round: length mismatch
+    ]
+    run_rounds(updater, responses, iterations=2)
+
+    # The broken round must not overwrite the state settled by the good one.
+    assert vedo.sensors[0].state == STATE_ON
+    assert vedo.areas[0].state == AlarmControlPanelState.ARMED_AWAY
+    vedo.logout.assert_called_once_with("uid")
 
 
 def test_updater_retries_failed_login(vedo):
     updater = SensorUpdater("test", 1, vedo)
     vedo.login = MagicMock(side_effect=[None, "uid"])
 
-    run_once(updater, [ZONE_DESC, ZONE_STAT, AREA_DESC, AREA_STAT], iterations=2)
+    run_rounds(updater, [ZONE_DESC, ZONE_STAT, AREA_DESC, AREA_STAT], iterations=2)
 
     assert vedo.login.call_count == 2
     assert vedo.get.call_count == 4
+
+
+def test_updater_backs_off_when_login_returns_empty_cookie(vedo):
+    updater = SensorUpdater("test", 1, vedo)
+    vedo.login = Mock(return_value=None)
+
+    waits = run_rounds(updater, [], iterations=3)
+
+    # No data request is ever sent without a cookie.
+    assert vedo.get.call_count == 0
+    assert vedo.login.call_count == 3
+    # The wait grows exponentially: scan_interval * 2**(failures - 1).
+    assert waits == [1, 2, 4]
+
+
+def test_updater_backs_off_when_login_raises(vedo):
+    updater = SensorUpdater("test", 2, vedo)
+    vedo.login = Mock(side_effect=VedoLoginException("Unable to obtain the cookie"))
+
+    waits = run_rounds(updater, [], iterations=2)
+
+    assert vedo.get.call_count == 0
+    assert waits == [2, 4]
+    assert updater._uid is None
+
+
+def test_updater_resets_backoff_after_a_successful_round(vedo):
+    updater = SensorUpdater("test", 1, vedo)
+    vedo.login = MagicMock(side_effect=[None, "uid"])
+
+    waits = run_rounds(
+        updater, [ZONE_DESC, ZONE_STAT, AREA_DESC, AREA_STAT], iterations=2
+    )
+
+    # First wait is the login-failure backoff, the second the scan_interval.
+    assert waits == [1, 1]
+
+
+def test_updater_stop_before_start_makes_no_requests(vedo):
+    updater = SensorUpdater("test", 1, vedo)
+    vedo.login = Mock()
+
+    updater.stop()
+    updater.run()
+
+    vedo.login.assert_not_called()
+
+
+def test_updater_stop_interrupts_the_backoff_wait(vedo):
+    updater = SensorUpdater("test", 60, vedo)
+    logged_in = Event()
+
+    def failed_login():
+        logged_in.set()
+        return
+
+    vedo.login = Mock(side_effect=failed_login)
+    vedo.get = Mock()
+
+    thread = Thread(target=updater.run)
+    thread.start()
+    try:
+        # The thread is now inside the 60s backoff wait.
+        assert logged_in.wait(timeout=2)
+        updater.stop()
+        thread.join(timeout=5)
+    finally:
+        updater.stop()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    # No new login or data request after the stop request.
+    assert vedo.login.call_count == 1
+    vedo.get.assert_not_called()
+
+
+def test_updater_stop_interrupts_the_scan_interval_wait(vedo):
+    updater = SensorUpdater("test", 60, vedo)
+    vedo.login = Mock(return_value="uid")
+    polled = Event()
+
+    def fake_get(uid, path, is_response):
+        if path == VedoRequest.AREA_STAT:
+            polled.set()
+        return {
+            VedoRequest.ZONE_DESC: ZONE_DESC,
+            VedoRequest.ZONE_STAT: ZONE_STAT,
+            VedoRequest.AREA_DESC: AREA_DESC,
+            VedoRequest.AREA_STAT: AREA_STAT,
+        }[path]
+
+    vedo.get = Mock(side_effect=fake_get)
+
+    thread = Thread(target=updater.run)
+    thread.start()
+    try:
+        # The first round is done, the thread waits the scan interval.
+        assert polled.wait(timeout=2)
+        updater.stop()
+        thread.join(timeout=5)
+    finally:
+        updater.stop()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert vedo.login.call_count == 1
+    assert vedo.get.call_count == 4
+
+
+def test_vedo_stop_stops_the_updater(vedo):
+    vedo.vedo_updater = Mock()
+    vedo.vedo_updater.is_alive.return_value = False
+    vedo.stop()
+    vedo.vedo_updater.stop.assert_called_once()
 
 
 def test_updater_logout_without_vedo():

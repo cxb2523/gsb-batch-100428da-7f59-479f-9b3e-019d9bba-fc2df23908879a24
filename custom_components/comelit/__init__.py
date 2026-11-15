@@ -111,6 +111,12 @@ def setup(hass, config):
             hass.data[DOMAIN]["vedo"] = vedo
             load_platform(hass, "binary_sensor", DOMAIN, {}, config)
             load_platform(hass, "alarm_control_panel", DOMAIN, {}, config)
+
+            async def async_stop_vedo(_event):
+                """Stop the Vedo polling thread before Home Assistant closes."""
+                await hass.async_add_executor_job(vedo.stop)
+
+            hass.bus.listen_once(EVENT_HOMEASSISTANT_STOP, async_stop_vedo)
             vedo.start()
             _LOGGER.info("Comelit Vedo integration started")
 
