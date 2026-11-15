@@ -19,6 +19,7 @@ export type SitemapperResponseSite = { [name in SitemapperField]?: string };
 export interface SitemapperErrorData {
   type: string;
   url: string;
+  message: string;
   retries: number;
 }
 

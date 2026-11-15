@@ -376,13 +376,45 @@ export default class Sitemapper {
             return !this.isExcluded(url);
           });
 
-        // Parse all child urls within the concurrency limit in the settings
+        // Parse all child urls within the concurrency limit in the settings.
+        // Wrap each child crawl so that a single failing sitemap can never
+        // reject the whole batch: its failure is converted into an error
+        // record instead of a rejected promise.
         const limit = pLimit(this.concurrency);
         const promiseArray = sitemap.map((site) =>
-          limit(() => this.crawl(site))
+          limit(() =>
+            this.crawl(site).then(
+              (result) =>
+                result || {
+                  sites: [],
+                  errors: [
+                    {
+                      type: 'UnknownStateError',
+                      message: `An unknown error occurred while crawling '${site}'.`,
+                      url: site,
+                      retries: this.retries,
+                    },
+                  ],
+                },
+              (error) => ({
+                sites: [],
+                errors: [
+                  {
+                    type: (error && error.name) || 'Error',
+                    message:
+                      (error && error.message) ||
+                      `An unknown error occurred while crawling '${site}'.`,
+                    url: site,
+                    retries: this.retries,
+                  },
+                ],
+              })
+            )
+          )
         );
 
-        // Make sure all the promises resolve then filter and reduce the array
+        // Make sure all the promises resolve then filter and reduce the
+        // array, preserving the original order of the child sitemaps
         const results = await Promise.all(promiseArray);
         const sites = results
           .filter((result) => result.errors.length === 0)
@@ -391,9 +423,25 @@ export default class Sitemapper {
           .filter((result) => result.errors.length !== 0)
           .reduce((prev, { errors }) => [...prev, ...errors], []);
 
+        // Normalize every error record so it always carries a readable
+        // url, type, message and retries count, and make sure each failed
+        // child sitemap is reported only once.
+        const seen = new Set();
+        const uniqueErrors = [];
+        for (const error of errors) {
+          if (seen.has(error.url)) continue;
+          seen.add(error.url);
+          uniqueErrors.push({
+            type: error.type || 'Error',
+            url: error.url,
+            message: error.message || 'An unknown error occurred.',
+            retries: typeof error.retries === 'number' ? error.retries : 0,
+          });
+        }
+
         return {
           sites,
-          errors,
+          errors: uniqueErrors,
         };
       }
 
@@ -527,11 +575,13 @@ export default class Sitemapper {
  *   errors: [
  *      {
  *        type: 'CancelError',
+ *        message: 'Request timed out after 15000 milliseconds',
  *        url: 'https://www.walmart.com/sitemap_tp1.xml',
  *        retries: 0
  *      },
  *      {
  *        type: 'HTTPError',
+ *        message: 'HTTP Error occurred: Response code 404 (Not Found)',
  *        url: 'https://www.walmart.com/sitemap_tp2.xml',
  *        retries: 0
  *      },
@@ -556,11 +606,13 @@ export default class Sitemapper {
  * @example [
  *    {
  *      type: 'CancelError',
+ *      message: 'Request timed out after 15000 milliseconds',
  *      url: 'https://www.walmart.com/sitemap_tp1.xml',
  *      retries: 0
  *    },
  *    {
  *      type: 'HTTPError',
+ *      message: 'HTTP Error occurred: Response code 404 (Not Found)',
  *      url: 'https://www.walmart.com/sitemap_tp2.xml',
  *      retries: 0
  *    },
@@ -573,10 +625,12 @@ export default class Sitemapper {
  * @typedef {Object} ErrorData
  *
  * @property {string} type - The error type which was returned
+ * @property {string} message - A readable message describing the failure
  * @property {string} url - The sitemap URL which returned the error
- * @property {number} errors - The total number of retries attempted after receiving the first error
+ * @property {number} retries - The total number of retries attempted after receiving the first error
  * @example {
  *    type: 'CancelError',
+ *    message: 'Request timed out after 15000 milliseconds',
  *    url: 'https://www.walmart.com/sitemap_tp1.xml',
  *    retries: 0
  * }
