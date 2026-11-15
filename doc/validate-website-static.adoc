@@ -1,0 +1,66 @@
+validate-website-static(1)
+==========================
+
+NAME
+----
+validate-website-static - check the validity of your documents
+
+SYNOPSIS
+--------
+*validate-website-static* ['OPTIONS']
+
+DESCRIPTION
+-----------
+validate-website-static check the markup validity of your local documents with
+XML Schema / DTD.
+HTML5 support with Validator.nu Web Service.
+
+OPTIONS
+-------
+*-s*, *--site* 'SITE'::
+  Where static files will be hosted (Default: http://www.example.com/)
+*-p*, *--pattern* 'PATTERN'::
+  Change filenames pattern (Default: \*\*/*.html)
+*-e*, *--exclude* 'EXCLUDE'::
+  Url to exclude (ex: 'redirect|news')
+*-i*, *--ignore* 'IGNORE'::
+  Ignore certain validation errors (ex: 'autocorrect')
+*-m*, *--[no-]markup*::
+  Markup validation (Default: true)
+*--css-syntax*::
+  Css validation (Default: false)
+*-n*, *--not-found*::
+  Log files not on filesystem, pwd considered as root « / » (Default: false)
+*--[no-]color*::
+  Show colored output (Default: true)
+*-x*, *--html5-validator* 'VALIDATOR'::
+  Change default html5 validator engine (tidy/nu/nokogiri)
+*-5*, *--html5-validator-service-url* 'URL'::
+  Change default html5 validator service URL for "nu" engine
+*-v*, *--verbose*::
+  Show detail of validator errors (Default: false).
+*-h*, *--help*::
+  Show help message and exit.
+
+EXIT STATUS
+-----------
+0::
+  Markup is valid.
+64::
+  Not valid markup found.
+65::
+  There are pages not found.
+66::
+  There are not valid markup and pages not found.
+
+AUTHOR
+------
+Laurent Arnoud mailto:laurent@spkdev.net[Laurent Arnoud]
+
+LICENSE
+-------
+The MIT License
+
+Copyright (c) 2009-2019 mailto:laurent@spkdev.net[Laurent Arnoud]
+
+// vim: set syntax=asciidoc:

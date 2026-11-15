@@ -1,0 +1,11 @@
+---
+AllCops:
+  TargetRubyVersion: 2.7
+Naming/FileName:
+  Enabled: false
+Lint/MissingCopEnableDirective:
+  Enabled: false
+Lint/InterpolationCheck:
+  Enabled: false
+Lint/UriEscapeUnescape:
+  Enabled: false

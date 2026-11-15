@@ -1,0 +1,132 @@
+'\" t
+.\"     Title: validate-website-static
+.\"    Author: [see the "AUTHOR(S)" section]
+.\" Generator: Asciidoctor 2.0.18
+.\"      Date: 2022-05-02
+.\"    Manual: \ \&
+.\"    Source: \ \&
+.\"  Language: English
+.\"
+.TH "VALIDATE\-WEBSITE\-STATIC" "1" "2022-05-02" "\ \&" "\ \&"
+.ie \n(.g .ds Aq \(aq
+.el       .ds Aq '
+.ss \n[.ss] 0
+.nh
+.ad l
+.de URL
+\fI\\$2\fP <\\$1>\\$3
+..
+.als MTO URL
+.if \n[.g] \{\
+.  mso www.tmac
+.  am URL
+.    ad l
+.  .
+.  am MTO
+.    ad l
+.  .
+.  LINKSTYLE blue R < >
+.\}
+.SH "NAME"
+validate-website-static \- check the validity of your documents
+.SH "SYNOPSIS"
+.sp
+\fBvalidate\-website\-static\fP [\fIOPTIONS\fP]
+.SH "DESCRIPTION"
+.sp
+validate\-website\-static check the markup validity of your local documents with
+XML Schema / DTD.
+HTML5 support with Validator.nu Web Service.
+.SH "OPTIONS"
+.sp
+\fB\-s\fP, \fB\-\-site\fP \fISITE\fP
+.RS 4
+Where static files will be hosted (Default: \c
+.URL "http://www.example.com/" "" ")"
+.RE
+.sp
+\fB\-p\fP, \fB\-\-pattern\fP \fIPATTERN\fP
+.RS 4
+Change filenames pattern (Default: *\(rs*/*.html)
+.RE
+.sp
+\fB\-e\fP, \fB\-\-exclude\fP \fIEXCLUDE\fP
+.RS 4
+Url to exclude (ex: \fIredirect|news\fP)
+.RE
+.sp
+\fB\-i\fP, \fB\-\-ignore\fP \fIIGNORE\fP
+.RS 4
+Ignore certain validation errors (ex: \fIautocorrect\fP)
+.RE
+.sp
+\fB\-m\fP, \fB\-\-[no\-]markup\fP
+.RS 4
+Markup validation (Default: true)
+.RE
+.sp
+\fB\-\-css\-syntax\fP
+.RS 4
+Css validation (Default: false)
+.RE
+.sp
+\fB\-n\fP, \fB\-\-not\-found\fP
+.RS 4
+Log files not on filesystem, pwd considered as root « / » (Default: false)
+.RE
+.sp
+\fB\-\-[no\-]color\fP
+.RS 4
+Show colored output (Default: true)
+.RE
+.sp
+\fB\-x\fP, \fB\-\-html5\-validator\fP \fIVALIDATOR\fP
+.RS 4
+Change default html5 validator engine (tidy/nu/nokogiri)
+.RE
+.sp
+\fB\-5\fP, \fB\-\-html5\-validator\-service\-url\fP \fIURL\fP
+.RS 4
+Change default html5 validator service URL for "nu" engine
+.RE
+.sp
+\fB\-v\fP, \fB\-\-verbose\fP
+.RS 4
+Show detail of validator errors (Default: false).
+.RE
+.sp
+\fB\-h\fP, \fB\-\-help\fP
+.RS 4
+Show help message and exit.
+.RE
+.SH "EXIT STATUS"
+.sp
+0
+.RS 4
+Markup is valid.
+.RE
+.sp
+64
+.RS 4
+Not valid markup found.
+.RE
+.sp
+65
+.RS 4
+There are pages not found.
+.RE
+.sp
+66
+.RS 4
+There are not valid markup and pages not found.
+.RE
+.SH "AUTHOR"
+.sp
+Laurent Arnoud \c
+.MTO "laurent\(atspkdev.net" "Laurent Arnoud" ""
+.SH "LICENSE"
+.sp
+The MIT License
+.sp
+Copyright (c) 2009\-2019 \c
+.MTO "laurent\(atspkdev.net" "Laurent Arnoud" ""
