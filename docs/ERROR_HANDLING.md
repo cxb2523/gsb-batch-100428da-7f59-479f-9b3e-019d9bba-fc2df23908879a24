@@ -13,6 +13,19 @@ Scrapi Reddit is designed to survive intermittent network failures while keeping
 - `rebuild_csv_from_cache` requires `post_jsons/` and `links.json`. If either is absent, a `FileNotFoundError` is raised. Re-run the original scrape or remove the incomplete directory.
 - Media manifests (`media_manifest.json`) are optional. When missing, the downloader repopulates them on the next run.
 
+## Media Download Outcomes
+
+Media downloads are best-effort per URL. A failed image or video is logged, recorded, and skipped; it never aborts the current post or the rest of the target. When `download_media` is enabled, every target writes `media_report.json` next to `media_manifest.json` with:
+
+- `saved` / `filtered` / `failed` / `resume_skipped` counts.
+- `outcome`, which distinguishes `no_media` (nothing to download) from `all_failed`, `partial_failure`, `success`, `filtered`, and `already_downloaded`.
+- `failures`: each failed URL plus a short reason (e.g. `HTTP 404`, `request error: ...`).
+- `posts`: per-post detail for listing targets.
+
+The completion log line carries the same key counts under `media_saved=`, `media_filtered=`, `media_failed=`, `media_skipped_resume=`, and `media_outcome=`, so a run is auditable both from logs and from the report file.
+
+Media is streamed to a `.part` sibling and renamed only after a successful download, so an interrupted request never leaves a truncated file behind. Files already recorded in the manifest are skipped (and counted as `resume_skipped`) when `--continue` is used. `media_manifest.json` is still only rewritten when a new record is actually added.
+
 ## Output Conflicts
 
 - The tool creates directories as needed. Lack of write permissions raises `OSError` with the offending path.

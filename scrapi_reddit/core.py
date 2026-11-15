@@ -67,6 +67,8 @@ STATIC_IMAGE_EXTENSIONS = {
 
 MEDIA_FILTER_CATEGORIES = {"video", "image", "animated"}
 
+MEDIA_REPORT_FILENAME = "media_report.json"
+
 SEARCH_SORT_OPTIONS = {"relevance", "hot", "top", "new", "comments"}
 SEARCH_TIME_FILTERS = {"all", "day", "week", "month", "year"}
 SEARCH_TYPE_OPTIONS = {"link", "post", "comment", "sr", "user", "media"}
@@ -674,6 +676,94 @@ def _persist_media_manifest(path: Path, manifest: dict[str, str]) -> None:
     path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+@dataclass(slots=True)
+class MediaDownloadSummary:
+    """Aggregated outcome of a media download pass.
+
+    Counts are cumulative when :meth:`merge` is used, allowing a listing target
+    to report per-post detail as well as a single target-level summary.
+    """
+
+    url_count: int = 0
+    saved: int = 0
+    filtered: int = 0
+    failed: int = 0
+    resume_skipped: int = 0
+    duplicate_skipped: int = 0
+    resumed_existing: int = 0
+    manifest_updated: bool = False
+    failures: list[dict[str, str]] = field(default_factory=list)
+    filtered_urls: list[str] = field(default_factory=list)
+
+    @property
+    def outcome(self) -> str:
+        """Classify the pass so "no media" is distinguishable from "all failed"."""
+        if self.url_count == 0:
+            return "no_media"
+        if self.failed == self.url_count:
+            return "all_failed"
+        if self.failed:
+            return "partial_failure"
+        if self.saved:
+            return "success"
+        if self.filtered:
+            return "filtered"
+        if self.resume_skipped or self.duplicate_skipped or self.resumed_existing:
+            return "already_downloaded"
+        return "skipped"
+
+    def record_failure(self, url: str, reason: str) -> None:
+        self.failed += 1
+        self.failures.append({"url": url, "reason": reason})
+
+    def merge(self, other: "MediaDownloadSummary") -> None:
+        self.url_count += other.url_count
+        self.saved += other.saved
+        self.filtered += other.filtered
+        self.failed += other.failed
+        self.resume_skipped += other.resume_skipped
+        self.duplicate_skipped += other.duplicate_skipped
+        self.resumed_existing += other.resumed_existing
+        self.manifest_updated = self.manifest_updated or other.manifest_updated
+        self.failures.extend(other.failures)
+        self.filtered_urls.extend(other.filtered_urls)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "outcome": self.outcome,
+            "url_count": self.url_count,
+            "saved": self.saved,
+            "filtered": self.filtered,
+            "failed": self.failed,
+            "resume_skipped": self.resume_skipped,
+            "duplicate_skipped": self.duplicate_skipped,
+            "resumed_existing": self.resumed_existing,
+            "manifest_updated": self.manifest_updated,
+            "failures": [dict(item) for item in self.failures],
+            "filtered_urls": list(self.filtered_urls),
+        }
+
+
+def _build_media_report(
+    target_label: str,
+    summary: MediaDownloadSummary,
+    posts: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "version": 1,
+        "target": target_label,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    report.update(summary.as_dict())
+    report["posts"] = list(posts)
+    return report
+
+
+def _persist_media_report(path: Path, report: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def _should_download_media(url: str, allowed_filters: set[str] | None) -> bool:
     if not allowed_filters:
         return True
@@ -861,6 +951,19 @@ def _collect_media_urls(
     return [entry[2] for entry in ordered]
 
 
+def _describe_media_error(exc: Exception) -> str:
+    """Return a short, human-readable reason for a media download failure."""
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None) if response is not None else None
+    if status_code:
+        return f"HTTP {status_code}"
+    if isinstance(exc, requests.exceptions.RequestException):
+        message = str(exc).strip()
+        return f"request error: {message}" if message else "request error"
+    message = str(exc).strip()
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
 def _download_single_media(
     session: requests.Session,
     url: str,
@@ -869,7 +972,13 @@ def _download_single_media(
     *,
     resume: bool,
     ext_hint: str,
-) -> tuple[Path | None, str]:
+) -> tuple[Path | None, str, str, str]:
+    """Download one media URL.
+
+    Returns ``(path, extension, status, reason)`` where ``status`` is one of
+    ``"saved"`` (newly written), ``"resumed"`` (already present on disk) or
+    ``"failed"`` (``reason`` describes the failure). Never raises.
+    """
     try:
         with closing(session.get(url, stream=True, timeout=60)) as response:
             response.raise_for_status()
@@ -887,18 +996,30 @@ def _download_single_media(
             dest_path = dest_dir / f"{base_name}{ext}"
             if resume and dest_path.exists():
                 logger.info("Media already exists, skipping %s", dest_path)
-                return dest_path, ext
+                return dest_path, ext, "resumed", ""
             dest_path.parent.mkdir(parents=True, exist_ok=True)
-            with dest_path.open("wb") as fh:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        fh.write(chunk)
-            return dest_path, ext
-    except requests.exceptions.RequestException as exc:  # pragma: no cover - network errors
-        logger.warning("Failed to download media %s: %s", url, exc)
+            # Download into a temporary sibling and rename on success so a
+            # failed/interrupted request never leaves a truncated file that
+            # later runs would mistake for a completed download.
+            temp_path = dest_path.with_name(f"{dest_path.name}.part")
+            try:
+                with temp_path.open("wb") as fh:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        if chunk:
+                            fh.write(chunk)
+                temp_path.replace(dest_path)
+            except Exception:
+                temp_path.unlink(missing_ok=True)
+                raise
+            return dest_path, ext, "saved", ""
+    except requests.exceptions.RequestException as exc:
+        reason = _describe_media_error(exc)
+        logger.warning("Failed to download media %s: %s", url, reason)
+        return None, "", "failed", reason
     except Exception as exc:  # pragma: no cover - IO errors
-        logger.warning("Failed to write media %s: %s", url, exc)
-    return None, ""
+        reason = _describe_media_error(exc)
+        logger.warning("Failed to write media %s: %s", url, reason)
+        return None, "", "failed", reason
 
 
 def _download_media_items(
@@ -913,25 +1034,54 @@ def _download_media_items(
     manifest_path: Path | None = None,
     allowed_filters: set[str] | None = None,
     scope: str,
+    summary: MediaDownloadSummary | None = None,
+    resume_urls: set[str] | frozenset[str] | None = None,
 ) -> int:
+    """Download media URLs for one post, recording outcomes into ``summary``.
+
+    Returns the number of media files available after this pass (freshly
+    written plus files found on disk during resume), preserving the historical
+    return contract. Per-URL failures are recorded in ``summary`` and never
+    interrupt the remaining URLs or later posts.
+
+    ``resume_urls`` identifies URLs already recorded by a *previous* run so
+    they can be reported as resume skips rather than duplicate work; when
+    omitted it defaults to the manifest keys loaded for this pass.
+    """
     if not urls:
         return 0
     if manifest is None:
         manifest = {}
-    saved = 0
+    if summary is None:
+        summary = MediaDownloadSummary()
+    if resume_urls is None:
+        resume_urls = frozenset(manifest.keys()) if resume else frozenset()
+
+    saved_or_present = 0
     updated_manifest = False
     total = len(urls)
     for index, media_url in enumerate(urls, start=1):
+        summary.url_count += 1
+        if media_url in resume_urls:
+            # Already recorded by a previous run: skip without counting it as
+            # a failure.
+            downloaded_urls.add(media_url)
+            summary.resume_skipped += 1
+            continue
         if media_url in downloaded_urls or media_url in manifest:
+            summary.duplicate_skipped += 1
             downloaded_urls.add(media_url)
             continue
         if allowed_filters and not _should_download_media(media_url, allowed_filters):
+            summary.filtered += 1
+            summary.filtered_urls.append(media_url)
             continue
+
         downloaded_urls.add(media_url)
         ext_hint = _infer_extension_from_url(media_url)
         suffix = f"_media{index:02d}" if total > 1 else "_media"
         candidate_name = shorten_component(f"{base_name}{suffix}", 140)
-        temp_path, final_ext = _download_single_media(
+        temp_path, final_ext, status, reason = _download_single_media(
             session,
             media_url,
             media_dir,
@@ -939,8 +1089,11 @@ def _download_media_items(
             resume=resume,
             ext_hint=ext_hint,
         )
-        if temp_path is not None:
-            saved += 1
+        if status == "failed" or temp_path is None:
+            summary.record_failure(media_url, reason or "download failed")
+            continue
+
+        try:
             effective_ext = final_ext or ext_hint or Path(temp_path.name).suffix
             format_label = _categorize_media_label(effective_ext, media_url)
             relocated = _relocate_media_file(
@@ -955,9 +1108,26 @@ def _download_media_items(
                 relative_path = relocated.name
             manifest[media_url] = relative_path
             updated_manifest = True
+        except Exception as exc:  # noqa: BLE001 - keep going with remaining media
+            message = _describe_media_error(exc)
+            logger.warning("Failed to finalize media %s: %s", media_url, message)
+            summary.record_failure(media_url, f"finalize error: {message}")
+            continue
+
+        if status == "resumed":
+            summary.resumed_existing += 1
+        else:
+            summary.saved += 1
+        saved_or_present += 1
+
     if updated_manifest and manifest_path is not None:
-        _persist_media_manifest(manifest_path, manifest)
-    return saved
+        try:
+            _persist_media_manifest(manifest_path, manifest)
+        except Exception as exc:  # noqa: BLE001 - reporting must not abort the run
+            logger.warning("Failed to write media manifest %s: %s", manifest_path, exc)
+        else:
+            summary.manifest_updated = True
+    return saved_or_present
 
 def derive_filename(link_info: dict[str, Any], post_data: dict[str, Any] | None) -> str:
     rank = link_info.get("rank")
@@ -1285,11 +1455,18 @@ def process_listing(
     posts_dir = base_dir / "post_jsons"
     media_dir = base_dir / "media"
     media_manifest_path = base_dir / "media_manifest.json"
+    media_report_path = base_dir / MEDIA_REPORT_FILENAME
+    media_summary = MediaDownloadSummary()
+    media_post_entries: list[dict[str, Any]] = []
     media_manifest: dict[str, str] = {}
     downloaded_media_urls: set[str] = set()
+    resume_manifest_urls: frozenset[str] = frozenset()
     if options.download_media:
         if options.resume:
             media_manifest = _load_media_manifest(media_manifest_path)
+            # Snapshot before this run adds entries so only genuinely
+            # pre-existing manifest records are reported as resume skips.
+            resume_manifest_urls = frozenset(media_manifest.keys())
         downloaded_media_urls = set(media_manifest.keys())
 
     listing_json, children, pages = _fetch_listing(session, target, options)
@@ -1336,7 +1513,6 @@ def process_listing(
     reused_count = 0
     skipped_count = 0
     rate_limit_events = 0
-    media_saved = 0
 
     for link_info in links:
         if not options.fetch_comments:
@@ -1347,7 +1523,8 @@ def process_listing(
                 post_id = str(link_info.get("id") or "")
                 child_data = child_lookup.get(post_id, {})
                 media_urls = _collect_media_urls(link_info, child_data, None)
-                media_saved += _download_media_items(
+                post_summary = MediaDownloadSummary()
+                _download_media_items(
                     session,
                     media_urls,
                     media_dir=media_dir,
@@ -1358,6 +1535,17 @@ def process_listing(
                     manifest_path=media_manifest_path,
                     allowed_filters=options.media_filters,
                     scope="posts",
+                    summary=post_summary,
+                    resume_urls=resume_manifest_urls,
+                )
+                media_summary.merge(post_summary)
+                media_post_entries.append(
+                    {
+                        "post_id": link_info.get("id"),
+                        "rank": link_info.get("rank"),
+                        "base_name": shorten_component(f"{link_info.get('id') or 'post'}", 120),
+                        **post_summary.as_dict(),
+                    }
                 )
             continue
 
@@ -1471,7 +1659,8 @@ def process_listing(
             post_id = str(link_info.get("id") or "")
             child_data = child_lookup.get(post_id, {})
             media_urls = _collect_media_urls(link_info, child_data, post_data)
-            media_saved += _download_media_items(
+            post_summary = MediaDownloadSummary()
+            _download_media_items(
                 session,
                 media_urls,
                 media_dir=media_dir,
@@ -1482,6 +1671,17 @@ def process_listing(
                 manifest_path=media_manifest_path,
                 allowed_filters=options.media_filters,
                 scope="posts",
+                summary=post_summary,
+                resume_urls=resume_manifest_urls,
+            )
+            media_summary.merge(post_summary)
+            media_post_entries.append(
+                {
+                    "post_id": link_info.get("id"),
+                    "rank": link_info.get("rank"),
+                    "base_name": base_name,
+                    **post_summary.as_dict(),
+                }
             )
 
     if "csv" in options.output_formats:
@@ -1537,8 +1737,20 @@ def process_listing(
         else:
             logger.info("Wrote CSV summary to %s", posts_csv_path)
 
+    if options.download_media:
+        report = _build_media_report(target.label, media_summary, media_post_entries)
+        try:
+            _persist_media_report(media_report_path, report)
+            logger.info("Media report saved to %s", media_report_path)
+        except Exception as exc:  # noqa: BLE001 - never fail the run over reporting
+            logger.warning("Failed to write media report %s: %s", media_report_path, exc)
+        media_outcome = media_summary.outcome
+    else:
+        media_outcome = "disabled"
+
     logger.info(
-        "Completed %s: total=%d fetched=%d reused=%d skipped=%d rate-limit-waits=%d comments=%d media=%d",
+        "Completed %s: total=%d fetched=%d reused=%d skipped=%d rate-limit-waits=%d comments=%d "
+        "media_saved=%d media_filtered=%d media_failed=%d media_skipped_resume=%d media_outcome=%s",
         target.label,
         total_links,
         fetched_count,
@@ -1546,7 +1758,11 @@ def process_listing(
         skipped_count,
         rate_limit_events,
         len(comments_records),
-        media_saved,
+        media_summary.saved,
+        media_summary.filtered,
+        media_summary.failed,
+        media_summary.resume_skipped,
+        media_outcome,
     )
 
 
@@ -1562,10 +1778,14 @@ def process_post(
     links_path = base_dir / "links.json"
     media_dir = base_dir / "media"
     media_manifest_path = base_dir / "media_manifest.json"
+    media_report_path = base_dir / MEDIA_REPORT_FILENAME
+    media_summary = MediaDownloadSummary()
     media_manifest: dict[str, str] = {}
     downloaded_media_urls: set[str] = set()
+    resume_manifest_urls: frozenset[str] = frozenset()
     if options.download_media and options.resume:
         media_manifest = _load_media_manifest(media_manifest_path)
+        resume_manifest_urls = frozenset(media_manifest.keys())
         downloaded_media_urls = set(media_manifest.keys())
 
     params = {"raw_json": 1, "limit": options.comment_limit}
@@ -1683,18 +1903,54 @@ def process_post(
             manifest_path=media_manifest_path,
             allowed_filters=options.media_filters,
             scope="posts",
+            summary=media_summary,
+            resume_urls=resume_manifest_urls,
         )
-        logger.info("Downloaded %d media file(s) for %s", media_saved, target.label)
+        logger.info(
+            "Downloaded %d media file(s) for %s (filtered=%d failed=%d skipped-resume=%d)",
+            media_saved,
+            target.label,
+            media_summary.filtered,
+            media_summary.failed,
+            media_summary.resume_skipped,
+        )
+        report = _build_media_report(
+            target.label,
+            media_summary,
+            [
+                {
+                    "post_id": link_info.get("id"),
+                    "rank": link_info.get("rank"),
+                    "base_name": base_name,
+                    **media_summary.as_dict(),
+                }
+            ],
+        )
+        try:
+            _persist_media_report(media_report_path, report)
+            logger.info("Media report saved to %s", media_report_path)
+        except Exception as exc:  # noqa: BLE001 - never fail the run over reporting
+            logger.warning("Failed to write media report %s: %s", media_report_path, exc)
+        media_outcome = media_summary.outcome
+    else:
+        media_outcome = "disabled"
 
     logger.info(
-        "Completed %s (comments=%d, media=%d)",
+        "Completed %s (comments=%d, media_saved=%d, media_filtered=%d, media_failed=%d, "
+        "media_skipped_resume=%d, media_outcome=%s)",
         target.label,
         len(comments_records),
-        media_saved,
+        media_summary.saved,
+        media_summary.filtered,
+        media_summary.failed,
+        media_summary.resume_skipped,
+        media_outcome,
     )
 __all__ = [
     "BASE_URL",
     "DEFAULT_USER_AGENT",
+    "MEDIA_REPORT_FILENAME",
+    "MediaDownloadSummary",
     "build_search_target",
     "ListingTarget",
     "PostTarget",

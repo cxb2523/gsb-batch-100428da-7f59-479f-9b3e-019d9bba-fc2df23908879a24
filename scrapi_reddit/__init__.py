@@ -2,6 +2,8 @@
 from .core import (
     BASE_URL,
     DEFAULT_USER_AGENT,
+    MEDIA_REPORT_FILENAME,
+    MediaDownloadSummary,
     build_search_target,
     ListingTarget,
     PostTarget,
@@ -23,7 +25,9 @@ __version__ = "0.1.0"
 __all__ = [
     "BASE_URL",
     "DEFAULT_USER_AGENT",
+    "MEDIA_REPORT_FILENAME",
     "ListingTarget",
+    "MediaDownloadSummary",
     "PostTarget",
     "ScrapeOptions",
     "build_search_target",

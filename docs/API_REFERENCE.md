@@ -62,6 +62,17 @@ Convert nested JSON structures into flat CSV-ready dictionaries. Used internally
 ### `normalize_media_filter_tokens(tokens)`
 Parses user-provided media filters (category names or extensions) into canonical tokens used by the downloader.
 
+### `MEDIA_REPORT_FILENAME` / `MediaDownloadSummary`
+When `download_media` is enabled, each target's output directory gains a `media_report.json` (`MEDIA_REPORT_FILENAME`) sitting next to `media_manifest.json`. It records the per-target media outcome so a run can be audited after the fact:
+
+- `outcome`: one of `no_media` (target yielded no media URLs), `all_failed`, `partial_failure`, `success`, `filtered`, `already_downloaded`, or `skipped`.
+- `url_count`, `saved`, `filtered`, `failed`, `resume_skipped`, `duplicate_skipped`, `resumed_existing`, `manifest_updated`.
+- `failures`: list of `{"url", "reason"}` entries for every URL that could not be saved.
+- `filtered_urls`: URLs skipped by `media_filters`.
+- `posts`: per-post breakdown of the same counts.
+
+`MediaDownloadSummary` is the in-memory accumulator used to build that report; it exposes `outcome`, `record_failure()`, `merge()`, and `as_dict()` for custom tooling.
+
 ## Error Handling Expectations
 
 - Network and rate limit failures bubble up after the configured retry attempts. Wrap top-level calls in a try/except block if you need custom recovery.

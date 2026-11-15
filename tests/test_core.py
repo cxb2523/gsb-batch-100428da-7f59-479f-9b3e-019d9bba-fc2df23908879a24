@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -612,3 +613,507 @@ def test_download_media_items_applies_filters(tmp_path: Path) -> None:
     assert session.calls == ["https://i.redd.it/example.mp4"]
     files = list((tmp_path / "posts" / "mp4").glob("*.mp4"))
     assert len(files) == 1
+
+
+class _FakeMediaResponse:
+    """Minimal stand-in for a streamed ``requests`` response."""
+
+    def __init__(
+        self,
+        *,
+        headers: dict[str, str] | None = None,
+        payload: bytes = b"bytes",
+        status_code: int = 200,
+    ) -> None:
+        self.headers = headers or {}
+        self._payload = payload
+        self.status_code = status_code
+        self.closed = False
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"{self.status_code} Client Error", response=self)
+
+    def iter_content(self, chunk_size: int = 8192):  # noqa: D401 - generator helper
+        yield self._payload
+
+    def close(self) -> None:  # pragma: no cover - interface compliance
+        self.closed = True
+
+
+class _FakeMediaSession:
+    """Local, network-free session that downloads ``<id>`` URLs."""
+
+    def __init__(self, routes: dict[str, Any], *, fail_markers: tuple[str, ...] = ()) -> None:
+        self.routes = routes
+        self.fail_markers = fail_markers
+        self.calls: list[str] = []
+
+    def get(self, url: str, *, stream: bool, timeout: int):  # noqa: D401
+        self.calls.append(url)
+        for marker in self.fail_markers:
+            if marker in url:
+                raise requests.exceptions.ConnectionError("simulated network failure")
+        for marker, factory in self.routes.items():
+            if marker in url:
+                return factory()
+        raise AssertionError(f"Unexpected URL {url}")
+
+
+def test_download_media_items_reports_success(tmp_path: Path) -> None:
+    routes = {
+        "example.png": lambda: _FakeMediaResponse(headers={"Content-Type": "image/png"}, payload=b"png"),
+        "example.mp4": lambda: _FakeMediaResponse(headers={"Content-Type": "video/mp4"}, payload=b"mp4"),
+    }
+    session = _FakeMediaSession(routes)
+    summary = core.MediaDownloadSummary()
+    manifest_path = tmp_path / "media_manifest.json"
+
+    returned = core._download_media_items(
+        session,
+        ["https://i.redd.it/example.png", "https://i.redd.it/example.mp4"],
+        media_dir=tmp_path,
+        base_name="post",
+        downloaded_urls=set(),
+        resume=False,
+        manifest={},
+        manifest_path=manifest_path,
+        scope="posts",
+        summary=summary,
+    )
+
+    assert returned == 2
+    data = summary.as_dict()
+    assert data["outcome"] == "success"
+    assert data["url_count"] == 2
+    assert data["saved"] == 2
+    assert data["filtered"] == 0
+    assert data["failed"] == 0
+    assert data["failures"] == []
+    assert data["manifest_updated"] is True
+    assert manifest_path.exists()
+
+
+def test_download_media_items_reports_filtered_urls(tmp_path: Path) -> None:
+    routes = {".mp4": lambda: _FakeMediaResponse(headers={"Content-Type": "video/mp4"})}
+    session = _FakeMediaSession(routes)
+    summary = core.MediaDownloadSummary()
+
+    returned = core._download_media_items(
+        session,
+        ["https://i.redd.it/example.mp4", "https://i.redd.it/example.jpg"],
+        media_dir=tmp_path,
+        base_name="post",
+        downloaded_urls=set(),
+        resume=False,
+        allowed_filters={".mp4"},
+        scope="posts",
+        summary=summary,
+    )
+
+    assert returned == 1
+    data = summary.as_dict()
+    assert data["outcome"] == "success"
+    assert data["saved"] == 1
+    assert data["filtered"] == 1
+    assert data["failures"] == []
+    assert data["filtered_urls"] == ["https://i.redd.it/example.jpg"]
+    assert session.calls == ["https://i.redd.it/example.mp4"]
+
+
+def test_download_media_items_continues_after_single_failure(tmp_path: Path) -> None:
+    routes = {
+        "good.png": lambda: _FakeMediaResponse(headers={"Content-Type": "image/png"}, payload=b"png"),
+        "good.jpg": lambda: _FakeMediaResponse(headers={"Content-Type": "image/jpeg"}, payload=b"jpg"),
+    }
+    session = _FakeMediaSession(routes, fail_markers=("bad.jpg",))
+    summary = core.MediaDownloadSummary()
+    manifest_path = tmp_path / "media_manifest.json"
+
+    returned = core._download_media_items(
+        session,
+        [
+            "https://i.redd.it/good.png",
+            "https://i.redd.it/bad.jpg",
+            "https://i.redd.it/good.jpg",
+        ],
+        media_dir=tmp_path,
+        base_name="post",
+        downloaded_urls=set(),
+        resume=False,
+        manifest={},
+        manifest_path=manifest_path,
+        scope="posts",
+        summary=summary,
+    )
+
+    assert returned == 2
+    data = summary.as_dict()
+    assert data["outcome"] == "partial_failure"
+    assert data["url_count"] == 3
+    assert data["saved"] == 2
+    assert data["failed"] == 1
+    assert [entry["url"] for entry in data["failures"]] == ["https://i.redd.it/bad.jpg"]
+    assert "simulated network failure" in data["failures"][0]["reason"]
+
+    # The success that followed the failure still landed on disk, and the
+    # failed URL was not recorded in the manifest.
+    png_files = list((tmp_path / "posts" / "png").glob("*.png"))
+    jpg_files = list((tmp_path / "posts" / "jpg").glob("*.jpg"))
+    assert len(png_files) == 1
+    assert len(jpg_files) == 1
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert "https://i.redd.it/bad.jpg" not in manifest
+    assert "https://i.redd.it/good.jpg" in manifest
+
+
+def test_download_media_items_reports_all_failed(tmp_path: Path) -> None:
+    session = _FakeMediaSession(
+        {},
+        fail_markers=("broken.png", "broken.mp4"),
+    )
+    summary = core.MediaDownloadSummary()
+
+    returned = core._download_media_items(
+        session,
+        ["https://i.redd.it/broken.png", "https://i.redd.it/broken.mp4"],
+        media_dir=tmp_path,
+        base_name="post",
+        downloaded_urls=set(),
+        resume=False,
+        scope="posts",
+        summary=summary,
+    )
+
+    assert returned == 0
+    data = summary.as_dict()
+    assert data["outcome"] == "all_failed"
+    assert data["failed"] == 2
+    assert data["saved"] == 0
+    assert len(data["failures"]) == 2
+
+
+def test_download_media_items_reports_no_media(tmp_path: Path) -> None:
+    summary = core.MediaDownloadSummary()
+
+    returned = core._download_media_items(
+        _FakeMediaSession({}),
+        [],
+        media_dir=tmp_path,
+        base_name="post",
+        downloaded_urls=set(),
+        resume=False,
+        scope="posts",
+        summary=summary,
+    )
+
+    assert returned == 0
+    data = summary.as_dict()
+    assert data["outcome"] == "no_media"
+    assert data["url_count"] == 0
+    assert data["failed"] == 0
+
+
+def test_download_media_items_reports_resume_skip(tmp_path: Path) -> None:
+    session = _FakeMediaSession({}, fail_markers=("already.png", "already.gif"))
+    manifest = {
+        "https://i.redd.it/already.png": "posts/png/post_media01.png",
+        "https://i.redd.it/already.gif": "posts/gif/post_media02.gif",
+    }
+    summary = core.MediaDownloadSummary()
+    manifest_path = tmp_path / "media_manifest.json"
+
+    returned = core._download_media_items(
+        session,
+        ["https://i.redd.it/already.png", "https://i.redd.it/already.gif"],
+        media_dir=tmp_path,
+        base_name="post",
+        downloaded_urls=set(),
+        resume=True,
+        manifest=manifest,
+        manifest_path=manifest_path,
+        scope="posts",
+        summary=summary,
+    )
+
+    assert returned == 0
+    data = summary.as_dict()
+    assert data["outcome"] == "already_downloaded"
+    assert data["resume_skipped"] == 2
+    assert data["failed"] == 0
+    assert data["failures"] == []
+    assert session.calls == []
+    assert not manifest_path.exists()
+
+
+def test_process_listing_writes_media_report_and_logs_counts(
+    tmp_path: Path, monkeypatch, caplog
+) -> None:
+    target = ListingTarget(
+        label="r/example hot",
+        output_segments=("subreddits", "example", "hot"),
+        url=f"{BASE_URL}/r/example/hot/.json",
+        context="example",
+    )
+
+    listing_json = {
+        "data": {
+            "children": [
+                {
+                    "data": {
+                        "id": "pq1",
+                        "title": "Post title",
+                        "created_utc": 1700000500,
+                        "permalink": "/r/example/comments/pq1/post_title/",
+                        "url_overridden_by_dest": "https://i.redd.it/good.png",
+                    }
+                },
+                {
+                    "data": {
+                        "id": "pq2",
+                        "title": "Second post",
+                        "created_utc": 1700000600,
+                        "permalink": "/r/example/comments/pq2/second_post/",
+                        "url_overridden_by_dest": "https://i.redd.it/broken.jpg",
+                    }
+                },
+            ],
+            "after": None,
+        }
+    }
+
+    monkeypatch.setattr(core, "fetch_json", lambda *a, **k: listing_json)
+    monkeypatch.setattr(core.time, "sleep", lambda seconds: None)
+
+    routes = {"good.png": lambda: _FakeMediaResponse(headers={"Content-Type": "image/png"}, payload=b"png")}
+    session = _FakeMediaSession(routes, fail_markers=("broken.jpg",))
+
+    options = ScrapeOptions(
+        output_root=tmp_path,
+        listing_limit=10,
+        comment_limit=250,
+        delay=1.0,
+        time_filter="day",
+        output_formats={"json"},
+        download_media=True,
+    )
+
+    with caplog.at_level("INFO", logger=core.logger.name):
+        core.process_listing(target, session=session, options=options)
+
+    base_dir = target.output_dir(tmp_path)
+    report_path = base_dir / core.MEDIA_REPORT_FILENAME
+    assert report_path.exists()
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert report["outcome"] == "partial_failure"
+    assert report["url_count"] == 2
+    assert report["saved"] == 1
+    assert report["filtered"] == 0
+    assert report["failed"] == 1
+    assert report["failures"][0]["url"] == "https://i.redd.it/broken.jpg"
+    assert len(report["posts"]) == 2
+    post_ids = {entry["post_id"] for entry in report["posts"]}
+    assert post_ids == {"pq1", "pq2"}
+
+    completion = [record.message for record in caplog.records if "Completed r/example hot" in record.message]
+    assert completion, "completion log line missing"
+    assert "media_saved=1" in completion[-1]
+    assert "media_failed=1" in completion[-1]
+    assert "media_outcome=partial_failure" in completion[-1]
+
+    # A successful sibling file survives the failure.
+    png_files = list((base_dir / "media" / "posts" / "png").glob("*.png"))
+    assert len(png_files) == 1
+
+
+def test_process_listing_media_report_distinguishes_no_media(
+    tmp_path: Path, monkeypatch
+) -> None:
+    target = ListingTarget(
+        label="r/example new",
+        output_segments=("subreddits", "example", "new"),
+        url=f"{BASE_URL}/r/example/new/.json",
+        context="example",
+    )
+
+    listing_json = {
+        "data": {
+            "children": [
+                {
+                    "data": {
+                        "id": "txt1",
+                        "title": "Text only",
+                        "created_utc": 1700000700,
+                        "permalink": "/r/example/comments/txt1/text_only/",
+                        "url_overridden_by_dest": "https://www.reddit.com/r/example/comments/txt1/text_only/",
+                    }
+                }
+            ],
+            "after": None,
+        }
+    }
+
+    monkeypatch.setattr(core, "fetch_json", lambda *a, **k: listing_json)
+    monkeypatch.setattr(core.time, "sleep", lambda seconds: None)
+
+    options = ScrapeOptions(
+        output_root=tmp_path,
+        listing_limit=10,
+        comment_limit=250,
+        delay=1.0,
+        time_filter="day",
+        output_formats={"json"},
+        download_media=True,
+    )
+
+    core.process_listing(target, session=_FakeMediaSession({}), options=options)
+
+    report = json.loads(
+        (target.output_dir(tmp_path) / core.MEDIA_REPORT_FILENAME).read_text(encoding="utf-8")
+    )
+    assert report["outcome"] == "no_media"
+    assert report["url_count"] == 0
+    assert report["failed"] == 0
+
+
+def test_process_post_writes_media_report(tmp_path: Path, monkeypatch) -> None:
+    target = core.PostTarget(
+        label="post r/example",
+        output_segments=("posts", "example", "pq1"),
+        url=f"{BASE_URL}/r/example/comments/pq1/.json",
+        context="r/example",
+    )
+
+    post_json = [
+        {
+            "data": {
+                "children": [
+                    {
+                        "data": {
+                            "id": "pq1",
+                            "title": "Media post",
+                            "created_utc": 1700000500,
+                            "permalink": "/r/example/comments/pq1/media_post/",
+                            "url_overridden_by_dest": "https://i.redd.it/ok.png",
+                        }
+                    }
+                ]
+            }
+        },
+        {"data": {"children": []}},
+    ]
+
+    return_values: list[Any] = [post_json]
+
+    def fake_fetch_json(session, url, *, params=None, retries=3, backoff=1.0):
+        return return_values.pop(0)
+
+    monkeypatch.setattr(core, "fetch_json", fake_fetch_json)
+
+    session = _FakeMediaSession(
+        {"ok.png": lambda: _FakeMediaResponse(headers={"Content-Type": "image/png"}, payload=b"png")},
+        fail_markers=("nope.jpg",),
+    )
+    # Add a second media URL to the post so one succeeds and one fails.
+    post_json[0]["data"]["children"][0]["data"]["preview"] = {
+        "images": [{"source": {"url": "https://i.redd.it/nope.jpg"}}]
+    }
+
+    options = ScrapeOptions(
+        output_root=tmp_path,
+        listing_limit=None,
+        comment_limit=250,
+        delay=1.0,
+        time_filter="day",
+        output_formats={"json"},
+        download_media=True,
+    )
+
+    core.process_post(target, session=session, options=options)
+
+    report = json.loads(
+        (target.output_dir(tmp_path) / core.MEDIA_REPORT_FILENAME).read_text(encoding="utf-8")
+    )
+    assert report["outcome"] == "partial_failure"
+    assert report["saved"] == 1
+    assert report["failed"] == 1
+    assert report["failures"][0]["url"] == "https://i.redd.it/nope.jpg"
+    assert report["posts"][0]["post_id"] == "pq1"
+
+
+def test_process_listing_resume_counts_manifest_hits_as_skips(
+    tmp_path: Path, monkeypatch
+) -> None:
+    target = ListingTarget(
+        label="r/example top",
+        output_segments=("subreddits", "example", "top"),
+        url=f"{BASE_URL}/r/example/top/.json",
+        context="example",
+    )
+    base_dir = target.output_dir(tmp_path)
+    base_dir.mkdir(parents=True)
+    manifest_path = base_dir / "media_manifest.json"
+    manifest_path.write_text(
+        json.dumps({"https://i.redd.it/already.png": "posts/png/pq1_media.png"}),
+        encoding="utf-8",
+    )
+
+    listing_json = {
+        "data": {
+            "children": [
+                {
+                    "data": {
+                        "id": "pq1",
+                        "title": "Already downloaded",
+                        "created_utc": 1700000500,
+                        "permalink": "/r/example/comments/pq1/already/",
+                        "url_overridden_by_dest": "https://i.redd.it/already.png",
+                    }
+                },
+                {
+                    "data": {
+                        "id": "pq2",
+                        "title": "Fresh post",
+                        "created_utc": 1700000600,
+                        "permalink": "/r/example/comments/pq2/fresh/",
+                        "url_overridden_by_dest": "https://i.redd.it/fresh.jpg",
+                    }
+                },
+            ],
+            "after": None,
+        }
+    }
+
+    monkeypatch.setattr(core, "fetch_json", lambda *a, **k: listing_json)
+    monkeypatch.setattr(core.time, "sleep", lambda seconds: None)
+
+    session = _FakeMediaSession(
+        {"fresh.jpg": lambda: _FakeMediaResponse(headers={"Content-Type": "image/jpeg"})}
+    )
+
+    options = ScrapeOptions(
+        output_root=tmp_path,
+        listing_limit=10,
+        comment_limit=250,
+        delay=1.0,
+        time_filter="day",
+        output_formats={"json"},
+        download_media=True,
+        resume=True,
+    )
+
+    core.process_listing(target, session=session, options=options)
+
+    report = json.loads(
+        (base_dir / core.MEDIA_REPORT_FILENAME).read_text(encoding="utf-8")
+    )
+    assert report["resume_skipped"] == 1
+    assert report["saved"] == 1
+    assert report["failed"] == 0
+    assert report["outcome"] == "success"
+    assert session.calls == ["https://i.redd.it/fresh.jpg"]
+    # The pre-existing manifest entry survives and the new one is added.
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["https://i.redd.it/already.png"] == "posts/png/pq1_media.png"
+    assert "https://i.redd.it/fresh.jpg" in manifest

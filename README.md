@@ -11,6 +11,7 @@ Scrapi Reddit is a zero-auth toolkit for scraping public Reddit listings. Use th
 - **Post deep dives:** Target individual posts to download full comment trees on demand.
 - **Resilient fetching:** Automatic pagination, exponential backoff for rate limits, and structured logging with adjustable verbosity.
 - **Media archiving:** Optional media capture downloads linked images, GIFs, and videos alongside post metadata.
+- **Media reports:** Each run writes `media_report.json` per target, recording saved/filtered/failed counts, failed URLs with reasons, and whether the target simply had no media.
 - **Media filters:** Media filters let you keep only the assets you need (e.g., videos only or static images only).
 - **Flexible exports:** Save outputs as JSON and optionally flatten posts/comments into CSV for downstream analysis.
 - **Scriptable tooling:** Configurable CLI (config files + wizard) alongside a Python API for scripting and integration.
@@ -133,6 +134,8 @@ process_post(post_target, session=session, options=options)
 ```
 Both helpers write JSON/CSV to the configured output directory and emit progress via logging.
 When `download_media=True` (or `--download-media` on the CLI) any discoverable images, GIFs, and videos are saved under a `media/` directory per target. Media is organized by the item that produced it: `media/posts/<format>/` for post attachments and (when comment scraping is enabled) `media/comments/<format>/` for comment attachments. Formats include `mp4`, `webm`, `gif`, `jpg`, and `png`; additional extensions fall back to an `other/` directory. Reddit preview URLs occasionally expire, so you may see warning logs for 404 responses when older links have been removed.
+
+Each target also gets a `media_report.json` beside `media_manifest.json` summarizing that run's media results: `saved`, `filtered`, `failed`, `resume_skipped`, an `outcome` such as `success` / `partial_failure` / `all_failed` / `no_media`, and a `failures` list with the exact URL and reason for every download that did not succeed. A failed URL never stops the remaining downloads, and files already saved are left untouched. The completion log line repeats the same counts (`media_saved=`, `media_filtered=`, `media_failed=`, `media_outcome=`), so you can tell "this post had no media" apart from "media exists but could not be downloaded".
 
 ## Documentation
 - [API Reference](docs/API_REFERENCE.md)
