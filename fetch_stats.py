@@ -11,6 +11,7 @@ import requests
 
 from utils import (
     get_timestamp,
+    is_valid,
     post_json,
     read_json,
     retry_request,
@@ -60,25 +61,35 @@ def fetch_github_repos(org: str, token: str) -> list[dict]:
     return repos
 
 
-def fetch_github_contributors(org: str, repo: str, token: str) -> int:
-    """Fetch contributor count for a repo using Link header pagination with retry."""
+def fetch_github_contributors(org: str, repo: str, token: str) -> tuple[int | None, str]:
+    """Fetch contributor count for a repo using Link header pagination with retry.
+
+    Returns:
+        (count, status): count is None when the fetch failed; status is 'success' or 'failed'.
+        An empty repository answers HTTP 204 and is a successful count of 0, not a failure.
+    """
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
     url = f"https://api.github.com/repos/{org}/{repo}/contributors"
     try:
         r = retry_request(requests.get, url, headers=headers, params={"per_page": 1, "anon": "true"}, timeout=60)
+        if r.status_code == 204:  # Empty repository: genuinely no contributors
+            return 0, "success"
         if r.status_code != 200:
             print(f"Warning: Failed to fetch contributors for {repo}: HTTP {r.status_code}")
-            return 0
+            return None, "failed"
         link = r.headers.get("Link", "")
         if "last" in link:
             # Parse last page number from Link header
-            return int(link.split("page=")[-1].split(">")[0])
+            return int(link.split("page=")[-1].split(">")[0]), "success"
         # No pagination - count items in response
         data = r.json()
-        return len(data) if isinstance(data, list) else 0
+        if not isinstance(data, list):
+            print(f"Warning: Failed to parse contributors for {repo}: unexpected response")
+            return None, "failed"
+        return len(data), "success"
     except Exception as e:
         print(f"Warning: Failed to fetch contributors for {repo}: {e}")
-        return 0
+        return None, "failed"
 
 
 def fetch_github_stats(org: str, token: str, output: Path) -> dict:
@@ -89,26 +100,34 @@ def fetch_github_stats(org: str, token: str, output: Path) -> dict:
     repos = fetch_github_repos(org, token)
     repo_data = []
     for r in sorted(repos, key=lambda x: -x["stargazerCount"]):
-        contributors = fetch_github_contributors(org, r["name"], token)
+        contributors, contributors_status = fetch_github_contributors(org, r["name"], token)
         new_repo = {
             "name": r["name"],
             "stars": r["stargazerCount"],
             "forks": r["forkCount"],
             "issues": r["issues"]["totalCount"],
             "pull_requests": r["pullRequests"]["totalCount"],
-            "contributors": contributors,
+            "contributors": contributors if contributors is not None else 0,
+            "contributors_status": contributors_status,
         }
         old_repo = old_repos.get(r["name"], {})
-        safe_merge(new_repo, old_repo, ("stars", "forks", "contributors"), r["name"], allow_zero=False)
+        safe_merge(new_repo, old_repo, ("stars", "forks"), r["name"], allow_zero=False)
         safe_merge(new_repo, old_repo, ("issues", "pull_requests"), r["name"])
+        if contributors is None:
+            old_contributors = old_repo.get("contributors")
+            if is_valid(old_contributors):
+                print(f"Warning: Keeping existing {r['name']}.contributors: {old_contributors} (fetch failed)")
+                new_repo["contributors"] = old_contributors
+                new_repo["contributors_status"] = "stale"
         repo_data.append(new_repo)
         time.sleep(0.1)
 
     # If API returned no repos, keep existing repos
     if not repo_data and existing.get("repos"):
         print("Warning: GitHub API returned no repos, keeping existing data")
-        repo_data = existing["repos"]
+        repo_data = [{**r, "contributors_status": "stale"} for r in existing["repos"]]
 
+    untrusted = [r["name"] for r in repo_data if r.get("contributors_status") != "success"]
     data = {
         "org": org,
         "total_stars": sum(r["stars"] for r in repo_data),
@@ -117,6 +136,8 @@ def fetch_github_stats(org: str, token: str, output: Path) -> dict:
         "total_pull_requests": sum(r["pull_requests"] for r in repo_data),
         "total_contributors": sum(r["contributors"] for r in repo_data),
         "public_repos": len(repo_data),
+        "contributors_untrusted_count": len(untrusted),
+        "contributors_untrusted_repos": untrusted,
         "timestamp": get_timestamp(),
         "repos": repo_data,
     }
@@ -329,6 +350,12 @@ if __name__ == "__main__":
     print(
         f"✅ GitHub: {len(github_data['repos'])} repos, {github_data['total_stars']:,} stars, {github_data['total_forks']:,} forks, {github_data['total_issues']:,} issues, {github_data['total_pull_requests']:,} PRs, {github_data['total_contributors']:,} contributors"
     )
+    if github_data["contributors_untrusted_repos"]:
+        failed = sum(r["contributors_status"] == "failed" for r in github_data["repos"])
+        stale = sum(r["contributors_status"] == "stale" for r in github_data["repos"])
+        print(
+            f"⚠️ GitHub: {github_data['contributors_untrusted_count']} repo(s) with untrusted contributor counts ({failed} failed, {stale} stale): {', '.join(github_data['contributors_untrusted_repos'])}"
+        )
 
     # PyPI stats
     pypi_packages = [
@@ -388,6 +415,8 @@ if __name__ == "__main__":
         "total_downloads": pypi_data["total_downloads"],
         "events_per_day": round(float(ga_data["periods"]["90d"]["events"]) / 90.0) if ga_data else 0,  # 90-day mean
         "total_contributors": github_data["total_contributors"],
+        "contributors_untrusted_count": github_data["contributors_untrusted_count"],
+        "contributors_untrusted_repos": github_data["contributors_untrusted_repos"],
         "reddit_subscribers": reddit_data["subscribers"],
         "platform_datasets": platform_data.get("total_datasets", 0),
         "platform_annotations": platform_data.get("total_annotations", 0),
@@ -397,9 +426,10 @@ if __name__ == "__main__":
         "platform_exports": platform_data.get("total_exports", 0),
         "timestamp": get_timestamp(),
     }
-    safe_merge(summary, existing_summary, [k for k in summary if k != "timestamp"], "summary", allow_zero=False)
+    untrusted_keys = ("contributors_untrusted_count", "contributors_untrusted_repos")
+    safe_merge(summary, existing_summary, [k for k in summary if k != "timestamp" and k not in untrusted_keys], "summary", allow_zero=False)
     summary_output = BASE_DIR / "data/summary.json"
     write_json(summary_output, summary)
     print(
-        f"✅ Summary: {summary['total_stars']:,} stars, {summary['total_forks']:,} forks, {summary['total_issues']:,} issues, {summary['total_pull_requests']:,} PRs, {summary['total_downloads']:,} downloads, {summary['events_per_day']:,} events/day, {summary['total_contributors']:,} contributors, {summary['reddit_subscribers']:,} reddit"
+        f"✅ Summary: {summary['total_stars']:,} stars, {summary['total_forks']:,} forks, {summary['total_issues']:,} issues, {summary['total_pull_requests']:,} PRs, {summary['total_downloads']:,} downloads, {summary['events_per_day']:,} events/day, {summary['total_contributors']:,} contributors ({summary['contributors_untrusted_count']} untrusted), {summary['reddit_subscribers']:,} reddit"
     )

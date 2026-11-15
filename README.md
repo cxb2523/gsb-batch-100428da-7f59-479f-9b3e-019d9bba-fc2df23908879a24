@@ -29,9 +29,11 @@ https://raw.githubusercontent.com/ultralytics/stars/main/data/github.json
 - `total_issues`: Total issues across all public repos (all-time)
 - `total_pull_requests`: Total pull requests across all public repos (all-time)
 - `total_contributors`: Sum of contributors across all repos (may include duplicates)
+- `contributors_untrusted_count`: Number of repos whose contributor count could not be refreshed
+- `contributors_untrusted_repos`: Names of those repos (contributor counts are stale or missing)
 - `public_repos`: Number of public repositories
 - `timestamp`: Last update time (ISO 8601)
-- `repos`: Array with per-repo `name`, `stars`, `forks`, `issues`, `pull_requests`, and `contributors`
+- `repos`: Array with per-repo `name`, `stars`, `forks`, `issues`, `pull_requests`, `contributors`, and `contributors_status` (`success`, `failed`, or `stale`)
 
 ### PyPI Downloads
 
