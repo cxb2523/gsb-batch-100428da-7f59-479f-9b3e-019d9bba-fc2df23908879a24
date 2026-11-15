@@ -24,6 +24,20 @@ public class EspnImageService {
     private static final String TEAM_LOGO_URL =
             "https://a.espncdn.com/i/teamlogos/nba/500/%s.png";
 
+    private final boolean downloadsEnabled;
+
+    public EspnImageService() {
+        this(true);
+    }
+
+    /**
+     * @param downloadsEnabled when {@code false}, headshot/logo requests are
+     *                         skipped entirely (used by offline tests)
+     */
+    public EspnImageService(boolean downloadsEnabled) {
+        this.downloadsEnabled = downloadsEnabled;
+    }
+
     private Optional<String> findEspnPlayerId(String playerName) {
         try {
             String encodedQuery = URLEncoder.encode(playerName, StandardCharsets.UTF_8);
@@ -57,6 +71,11 @@ public class EspnImageService {
             return;
         }
 
+        if (!downloadsEnabled) {
+            System.out.printf("Image downloads disabled, skipping: %s\n", fileName);
+            return;
+        }
+
         findEspnPlayerId(playerName).ifPresentOrElse(
                 espnId -> download(String.format(PLAYER_IMG_URL, espnId), destination),
                 () -> System.err.printf("ESPN ID not found for: %s\n", playerName)
@@ -69,6 +88,11 @@ public class EspnImageService {
 
         if (Files.exists(destination)) {
             System.out.printf("Logo already exists, skipping: %s\n", teamName);
+            return;
+        }
+
+        if (!downloadsEnabled) {
+            System.out.printf("Image downloads disabled, skipping logo: %s\n", teamName);
             return;
         }
 

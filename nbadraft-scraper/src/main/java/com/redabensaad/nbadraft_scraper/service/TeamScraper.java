@@ -8,7 +8,6 @@ import com.redabensaad.nbadraft_scraper.model.Player;
 import com.redabensaad.nbadraft_scraper.model.PlayerStats;
 import com.redabensaad.nbadraft_scraper.util.HtmlParser;
 import com.redabensaad.nbadraft_scraper.util.Jitter;
-import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
@@ -17,6 +16,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Consumer;
 
 public class TeamScraper {
     private static final String ROW_SELECTOR =
@@ -25,36 +25,68 @@ public class TeamScraper {
     private final PlayerScraper playerScraper;
     private final HtmlParser parser;
     private final EspnImageService espnImageService;
+    private final PageFetcher pageFetcher;
+    private final Runnable jitter;
 
     public TeamScraper(PlayerScraper playerScraper, HtmlParser parser, EspnImageService espnImageService) {
+        this(playerScraper, parser, espnImageService,
+                new JsoupPageFetcher(), Jitter::applyJitter);
+    }
+
+    /**
+     * Test-friendly constructor: the page fetcher can be swapped for local fake
+     * pages and the jitter can be replaced by a no-op to keep tests fast.
+     */
+    public TeamScraper(PlayerScraper playerScraper, HtmlParser parser, EspnImageService espnImageService,
+                       PageFetcher pageFetcher, Runnable jitter) {
         this.playerScraper = playerScraper;
         this.parser = parser;
         this.espnImageService = espnImageService;
+        this.pageFetcher = pageFetcher;
+        this.jitter = jitter;
     }
 
     public List<Player> scrapeTeam(String teamCode) {
-        String url = ScraperConfig.BASE_URL + "contracts/" + teamCode + ".html";
         List<Player> players = new ArrayList<>();
+        scrapeTeam(teamCode, players::add);
+        return players;
+    }
+
+    /**
+     * Scrapes one team and passes every successfully parsed player to
+     * {@code playerHandler} as soon as it is available, so partial results can
+     * be persisted before a mid-team failure.
+     *
+     * @throws ScraperException if the team page cannot be fetched or any row
+     *                          fails while scraping the team
+     */
+    public void scrapeTeam(String teamCode, Consumer<Player> playerHandler) {
+        String url = ScraperConfig.BASE_URL + "contracts/" + teamCode + ".html";
+        int fetched = 0;
 
         try {
-            Document doc = Jsoup.connect(url)
-                    .userAgent(ScraperConfig.USER_AGENT)
-                    .timeout(ScraperConfig.TIMEOUT_MS)
-                    .get();
-
+            Document doc = pageFetcher.fetch(url);
             Elements rows = doc.select(ROW_SELECTOR);
 
             for (Element row : rows) {
-                parseRow(row, teamCode).ifPresent(players::add);
-                Jitter.applyJitter();
+                Optional<Player> player = parseRow(row, teamCode);
+                if (player.isPresent()) {
+                    playerHandler.accept(player.get());
+                    fetched++;
+                }
+                jitter.run();
             }
 
+        } catch (ScraperException e) {
+            throw e;
         } catch (IOException e) {
             throw new ScraperException("Unable to access team " + teamCode, teamCode, e);
+        } catch (RuntimeException e) {
+            // Failures while parsing/enriching a row also abort the team run.
+            throw new ScraperException("Unexpected error while scraping team " + teamCode, teamCode, e);
         }
 
-        System.out.printf("Team %s: %d players fetched\n", teamCode, players.size());
-        return players;
+        System.out.printf("Team %s: %d players fetched\n", teamCode, fetched);
     }
 
     private Optional<Player> parseRow(Element row, String teamCode) {

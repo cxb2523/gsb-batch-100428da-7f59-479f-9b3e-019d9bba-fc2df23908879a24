@@ -4,7 +4,6 @@ import com.redabensaad.nbadraft_scraper.config.ScraperConfig;
 import com.redabensaad.nbadraft_scraper.model.PlayerStats;
 import com.redabensaad.nbadraft_scraper.util.HtmlParser;
 import org.jsoup.HttpStatusException;
-import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 
@@ -13,9 +12,15 @@ import java.util.Optional;
 
 public class PlayerScraper {
     private final HtmlParser parser;
+    private final PageFetcher pageFetcher;
 
     public PlayerScraper(HtmlParser parser) {
+        this(parser, new JsoupPageFetcher());
+    }
+
+    public PlayerScraper(HtmlParser parser, PageFetcher pageFetcher) {
         this.parser = parser;
+        this.pageFetcher = pageFetcher;
     }
 
     public Optional<PlayerStats> fetchStats(String playerPath) {
@@ -23,10 +28,7 @@ public class PlayerScraper {
 
         for (int attempt = 1; attempt <= ScraperConfig.MAX_RETRIES; attempt++) {
             try {
-                Document doc = Jsoup.connect(url)
-                        .userAgent(ScraperConfig.USER_AGENT)
-                        .timeout(ScraperConfig.TIMEOUT_MS)
-                        .get();
+                Document doc = pageFetcher.fetch(url);
 
                 return parseStats(doc);
 
@@ -46,12 +48,12 @@ public class PlayerScraper {
             }
         }
 
-        System.err.printf("Attempt %d/%d failed for %s: %s\n", ScraperConfig.MAX_RETRIES, url);
+        System.err.printf("Attempt %d/%d failed for %s\n", ScraperConfig.MAX_RETRIES, url);
         return Optional.empty();
     }
 
     private void handleRetry(int attempt, String url, String errorMessage) {
-        System.err.printf("Giving up after %d attempts for %s\n",
+        System.err.printf("Attempt %d/%d failed for %s (error: %s)%n",
                 attempt, ScraperConfig.MAX_RETRIES, url, errorMessage);
 
         if (attempt < ScraperConfig.MAX_RETRIES) {
@@ -68,7 +70,7 @@ public class PlayerScraper {
 
         double points   = parser.parseDoubleStat(parser.extractStat(pullout, "Points").orElse("0"));
         double assists  = parser.parseDoubleStat(parser.extractStat(pullout, "Assists").orElse("0"));
-        double rebounds = parser.parseDoubleStat(parser.extractStat(pullout, "Total Rebounds").orElse("0")); // J'ai retiré les guillemets échappés ici qui semblaient risqués
+        double rebounds = parser.parseDoubleStat(parser.extractStat(pullout, "Total Rebounds").orElse("0"));
         int    games    = parser.parseIntStat(parser.extractStat(pullout, "Games").orElse("0"));
         String position = parser.resolvePosition(doc);
 

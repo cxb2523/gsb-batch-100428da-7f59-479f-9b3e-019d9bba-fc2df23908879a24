@@ -1,8 +1,9 @@
 package com.redabensaad.nbadraft_scraper;
 
-import com.redabensaad.nbadraft_scraper.model.Player;
 import com.redabensaad.nbadraft_scraper.service.EspnImageService;
 import com.redabensaad.nbadraft_scraper.service.PlayerScraper;
+import com.redabensaad.nbadraft_scraper.service.ScrapeOrchestrator;
+import com.redabensaad.nbadraft_scraper.service.ScrapeReport;
 import com.redabensaad.nbadraft_scraper.service.TeamScraper;
 import com.redabensaad.nbadraft_scraper.util.DataSaver;
 import com.redabensaad.nbadraft_scraper.util.HtmlParser;
@@ -32,11 +33,10 @@ public class Main {
 
         if (askScrapeLogos()) {
             scrapeLogos(espnImageService);
+            System.out.println("\nScraping completed successfully!");
         } else {
             scrapePlayers(teamScraper, saver);
         }
-
-        System.out.println("\nScraping completed successfully!");
     }
 
     private static void scrapeLogos(EspnImageService espnImageService) {
@@ -47,34 +47,38 @@ public class Main {
     }
 
     private static void scrapePlayers(TeamScraper teamScraper, DataSaver saver) {
-        List<String> teamsToScrape = resolveTeamsToScrape(saver);
+        List<String> finishedTeams = resolveFinishedTeams(saver);
+        ScrapeOrchestrator orchestrator = new ScrapeOrchestrator(teamScraper, saver);
 
-        for (String teamCode : teamsToScrape) {
-            System.out.printf("\n--- STARTING SCRAPING: %s ---\n", teamCode);
+        // A single team failure is contained by the orchestrator: the batch
+        // keeps going and failed teams stay out of team-scraper.json so that
+        // the next resume run re-scrapes them.
+        ScrapeReport report = orchestrator.run(ALL_TEAMS, finishedTeams);
 
-            List<Player> teamPlayers = teamScraper.scrapeTeam(teamCode);
-            teamPlayers.forEach(p -> saver.addObject("players-data.json", p));
-
-            saver.addObject("team-scraper.json", teamCode);
-            saver.saveObjects();
-
-            System.out.printf("\nTeam %s completed — progress saved.\n", teamCode);
+        System.out.println(report.render());
+        if (report.hasFailures()) {
+            System.out.println("Scraping finished with failures — re-run and choose 'resume' "
+                    + "to retry the failed teams.");
+        } else {
+            System.out.println("Scraping completed successfully!");
         }
     }
 
-    private static List<String> resolveTeamsToScrape(DataSaver saver) {
+    private static List<String> resolveFinishedTeams(DataSaver saver) {
         if (askResume()) {
-            List<String> finished = saver.loadList("team-scraper.json", String.class);
+            List<String> finished = saver.loadList(
+                    ScrapeOrchestrator.TEAMS_FILE, String.class);
 
             List<String> remaining = new ArrayList<>(ALL_TEAMS);
             remaining.removeAll(finished);
 
-            System.out.printf("Resuming: %d/%d teams remaining.\n", remaining.size(), ALL_TEAMS.size());
-            return remaining;
+            System.out.printf("Resuming: %d/%d teams remaining.\n",
+                    remaining.size(), ALL_TEAMS.size());
+            return finished;
         }
 
         System.out.printf("Full scraping restart (%d teams).\n", ALL_TEAMS.size());
-        return new ArrayList<>(ALL_TEAMS);
+        return List.of();
     }
 
     private static boolean askResume() {
