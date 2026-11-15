@@ -343,15 +343,7 @@ def write_artifacts(d, folder: Path, video: Path, args, cover_bytes=None, cover_
         else j.ffprobe_info(video)
     nfo = folder / (stem + ".nfo")
     # smart 策略看的是「本轮之前」是否已有本工具的 nfo（<num> 签名）
-    had_our_nfo = False
-    if nfo.exists():
-        try:
-            txt = nfo.read_text(encoding="utf-8")
-            # 专属签名优先；兼容旧版（无签名）：customrating+num 是本工具的特征组合
-            had_our_nfo = ("xieyin:generated" in txt
-                           or ("<customrating>NC-17</customrating>" in txt and "<num>" in txt))
-        except OSError:
-            had_our_nfo = False
+    had_our_nfo = is_our_nfo(nfo)
     if cover_bytes and not args.no_images:
         policy = str(getattr(args, "image_policy", "") or "keep")
         allow = bool(getattr(args, "force_images", False)) or policy == "replace" \
@@ -579,6 +571,56 @@ def select_cover(urls, log, code=""):
     return None, None, None
 
 
+# 封面结局三分类（直接由 select_cover 的 kind 返回值判定，不靠日志文本反推）：
+#   ok     = 已写入：选到合格图（vertical/pl_right/still），有字节落盘
+#   lowres = 候选全部不合格：至少下载到一张但全部被像素/体积门槛拒收（仅回退 poster）
+#   failed = 下载失败：一张都没下载成功（含根本没有候选 URL）
+COVER_OK = "ok"
+COVER_LOWRES = "lowres"
+COVER_FAILED = "failed"
+COVER_STATUSES = (COVER_OK, COVER_LOWRES, COVER_FAILED)
+COVER_STATUS_LABEL = {
+    COVER_OK: "封面 已写入",
+    COVER_LOWRES: "封面 候选全部不合格",
+    COVER_FAILED: "封面 下载失败",
+}
+
+
+def cover_outcome(kind):
+    """把 select_cover 返回的 kind 归一成封面结局（ok/lowres/failed）。"""
+    if kind in ("vertical", "pl_right", "still"):
+        return COVER_OK
+    if kind == "lowres":
+        return COVER_LOWRES
+    return COVER_FAILED
+
+
+def is_our_nfo(nfo: Path):
+    """该 nfo 是否本工具产物（专属签名；兼容旧版 customrating+num 特征组合）。"""
+    if not nfo.exists():
+        return False
+    try:
+        txt = nfo.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return ("xieyin:generated" in txt
+            or ("<customrating>NC-17</customrating>" in txt and "<num>" in txt))
+
+
+def disk_cover_status(folder: Path, stem):
+    """按条目当前磁盘状态判定封面结局（--cover-status 筛选用，不看运行期日志）：
+
+      ok     = 已有本工具 nfo 且封面文件（<stem>-poster.jpg）存在
+      failed = 有本工具 nfo 但缺封面
+      lowres = 二者都不满足（nfo 都不是本工具的，封面结局无从谈起）
+    """
+    if not is_our_nfo(folder / (stem + ".nfo")):
+        return COVER_LOWRES
+    if (folder / (stem + "-poster.jpg")).exists():
+        return COVER_OK
+    return COVER_FAILED
+
+
 def export_target(args, folder, video):
     """export 模式落点：镜像源相对路径；视频不在 root 下则按文件夹名平铺。"""
     meta_dir = Path(getattr(args, "meta_dir", "") or "")
@@ -661,6 +703,7 @@ def race_one(code, pool, folder, video, args, log):
     merged = None
     cover_done = False
     cover_size = 0
+    cover_status = None       # 封面结局（ok/lowres/failed），仅 want_img 时赋值
     cover_urls = []          # 全部源的封面 URL 候选（问题①择优素材）
     push_results = []        # 每次 emit 的推送结果（None=非推送）
     timeline = []
@@ -708,6 +751,9 @@ def race_one(code, pool, folder, video, args, log):
     if sink != "push" and not args.no_images and not cover_done and merged:
         cov, used, kind = select_cover(cover_candidates(cover_urls, merged), log,
                                        code=(merged.get("code") or ""))
+        # 结局直接由 select_cover 的 kind 判定，不靠日志文本反推；
+        # lowres/failed 都不抛错——nfo 已在首次 emit 落盘，元数据任务仍算成功。
+        cover_status = cover_outcome(kind)
         if cov:
             cover_size = len(cov)
             emit(merged, cov, kind)
@@ -732,12 +778,19 @@ def race_one(code, pool, folder, video, args, log):
             log.write("   [复制] WARN %s\n" % e)
     first = next((t for t in timeline if t[2] == "FIRST"), None)
     want_img = sink != "push" and not args.no_images
+    if not want_img:
+        cover_part = ""                          # push 只推 URL / --no-images：行为不变
+    elif cover_status == COVER_OK:
+        cover_part = " | %s %dB" % (COVER_STATUS_LABEL[COVER_OK], cover_size)
+    elif cover_status in (COVER_LOWRES, COVER_FAILED):
+        cover_part = " | " + COVER_STATUS_LABEL[cover_status]
+    else:
+        cover_part = " | 封面 无"                # 防御兜底（正常流程不会走到）
     return ("OK    %s <- %s | %s | 首出 %ss | 完成 %ss | 字段 %d | 导演 %s | 类别 %d%s" % (
         folder.name, merged.get("code", code), (merged.get("title") or "")[:40],
         first[0] if first else "-", round(time.time() - t0, 2), len(merged),
         "有" if merged.get("director") else "无", len(merged.get("genres") or []),
-        (" | 封面 %dB" % cover_size) if (want_img and cover_size) else
-        (" | 封面 无" if want_img else "")))
+        cover_part))
 
 
 def main():
@@ -775,11 +828,17 @@ def main():
                     help="独立元数据目录（sink=export 时必填）")
     ap.add_argument("--copy-root", default=os.environ.get("XIEYIN_COPY_ROOT", ""),
                     help="刮削后复制到 <copy-root>/<番号>/（留空不复制）")
+    ap.add_argument("--cover-status", default="",
+                    help="只处理指定封面结局的条目（按当前磁盘状态判定）："
+                         "ok=本工具 nfo+封面齐全 / lowres=无本工具 nfo / "
+                         "failed=有 nfo 缺封面；留空不过滤（默认）")
     args = ap.parse_args()
     bad = [s for s in str(args.sink).split("+")
            if s not in ("push", "export", "preview", "inplace")]
     if bad:
         ap.error("--sink 只能是 push/export/preview/inplace 的组合（+连接），收到: %s" % args.sink)
+    if args.cover_status and args.cover_status not in COVER_STATUSES:
+        ap.error("--cover-status 只能是 ok/lowres/failed，收到: %s" % args.cover_status)
 
     base = Path(args.root)
     folders = folders_for(base, args.dirs, args.scan)
@@ -787,6 +846,11 @@ def main():
     if args.only:
         only = args.only
         units = [u for u in units if only in (u[0].name, u[1].stem, u[2])]
+    if args.cover_status:
+        # 按条目当前磁盘状态筛选，便于把 failed/lowres 条目挑出来单独重跑
+        want = args.cover_status
+        units = [u for u in units
+                 if disk_cover_status(u[0], u[1].stem) == want]
     if args.limit:
         units = units[:args.limit]
     print("共 %d 个刮削单元待处理" % len(units))

@@ -1495,7 +1495,346 @@ class DmmDomainRemapTest(unittest.TestCase):
 
     def test_ok_line_shows_cover_status(self):
         src = inspect.getsource(rs.race_one)
-        self.assertIn(" | 封面 ", src)   # OK 行必须能区分有无封面
+        self.assertIn("COVER_STATUS_LABEL", src)   # OK 行必须带可读封面结局标记
+        self.assertIn("cover_outcome", src)        # 结局由 select_cover 返回值判定
+
+
+def _make_jpeg(w, h, noise=False, quality=90):
+    """用 PIL 造一张真能解码的 JPEG；noise=True 时体积可超过 30KB 门槛。"""
+    from PIL import Image
+    import random
+    im = Image.new("RGB", (w, h))
+    if noise:
+        rnd = random.Random(7)
+        im.putdata([(rnd.randrange(256), rnd.randrange(256), rnd.randrange(256))
+                    for _ in range(w * h)])
+    buf = io.BytesIO()
+    im.save(buf, "JPEG", quality=quality)
+    return buf.getvalue()
+
+
+class CoverOutcomeClassifierTest(unittest.TestCase):
+    """封面结局必须能从 select_cover 的 kind 返回值直接判定，不靠日志文本。"""
+
+    def test_acceptable_kinds_map_to_ok(self):
+        for kind in ("vertical", "pl_right", "still"):
+            self.assertEqual(rs.cover_outcome(kind), rs.COVER_OK)
+
+    def test_lowres_kind_maps_to_lowres(self):
+        self.assertEqual(rs.cover_outcome("lowres"), rs.COVER_LOWRES)
+
+    def test_none_kind_maps_to_failed(self):
+        self.assertEqual(rs.cover_outcome(None), rs.COVER_FAILED)
+
+    def test_status_constants(self):
+        self.assertEqual(rs.COVER_STATUSES, ("ok", "lowres", "failed"))
+        self.assertEqual(set(rs.COVER_STATUS_LABEL), set(rs.COVER_STATUSES))
+        for label in rs.COVER_STATUS_LABEL.values():
+            self.assertIn("封面", label)
+
+
+class SelectCoverOutcomeTest(unittest.TestCase):
+    """打桩 download_cover 离线覆盖 select_cover 的三类结局。"""
+
+    def setUp(self):
+        self.orig = rs.rc.download_cover
+        self.orig_sleep = rs.time.sleep
+        rs.time.sleep = lambda *a, **k: None      # 选图间隔不拖测试
+        self.log = io.StringIO()
+
+    def tearDown(self):
+        rs.rc.download_cover = self.orig
+        rs.time.sleep = self.orig_sleep
+
+    def _patch(self, mapping, default=None):
+        def fake(u, timeout=12):
+            return mapping.get(u, default)
+        rs.rc.download_cover = fake
+
+    def test_vertical_cover_returns_ok_kind(self):
+        good = _make_jpeg(400, 600, noise=True)
+        self.assertGreaterEqual(len(good), rs.MIN_COVER_BYTES)
+        self._patch({"http://h/a.jpg": good})
+        cov, used, kind = rs.select_cover(["http://h/a.jpg"], self.log, code="ADN-888")
+        self.assertEqual(kind, "vertical")
+        self.assertEqual(cov, good)
+        self.assertEqual(used, "http://h/a.jpg")
+        self.assertEqual(rs.cover_outcome(kind), rs.COVER_OK)
+
+    def test_all_rejected_returns_lowres(self):
+        # 能下载但 147×200 / <30KB -> 拒收；最终回退 lowres（有字节）
+        small = _make_jpeg(147, 200)
+        self._patch({"http://h/a.jpg": small, "http://h/b.jpg": small})
+        cov, used, kind = rs.select_cover(["http://h/a.jpg", "http://h/b.jpg"],
+                                          self.log, code="ADN-888")
+        self.assertEqual(kind, "lowres")
+        self.assertIsNotNone(cov)
+        self.assertEqual(rs.cover_outcome(kind), rs.COVER_LOWRES)
+        self.assertIn("cover_lowres", self.log.getvalue())
+
+    def test_all_downloads_fail_returns_none(self):
+        self._patch({}, default=None)
+        cov, used, kind = rs.select_cover(["http://h/a.jpg", "http://h/b.jpg"],
+                                          self.log, code="ADN-888")
+        self.assertIsNone(kind)
+        self.assertIsNone(cov)
+        self.assertIsNone(used)
+        self.assertEqual(rs.cover_outcome(kind), rs.COVER_FAILED)
+
+    def test_no_candidates_is_failed_not_lowres(self):
+        # 源没给任何图：一张都没下到 -> failed（区别于「候选不合格」）
+        cov, used, kind = rs.select_cover([], self.log, code="ADN-888")
+        self.assertIsNone(kind)
+        self.assertEqual(rs.cover_outcome(kind), rs.COVER_FAILED)
+
+    def test_first_rejected_second_accepted_still_ok(self):
+        small = _make_jpeg(147, 200)
+        good = _make_jpeg(400, 600, noise=True)
+        self._patch({"http://h/small.jpg": small, "http://h/big.jpg": good})
+        cov, used, kind = rs.select_cover(["http://h/small.jpg", "http://h/big.jpg"],
+                                          self.log, code="ADN-888")
+        self.assertEqual(kind, "vertical")
+        self.assertEqual(used, "http://h/big.jpg")
+        self.assertEqual(rs.cover_outcome(kind), rs.COVER_OK)
+
+
+class RaceOneCoverOutcomeTest(unittest.TestCase):
+    """race_one 收尾：三类结局标记 + nfo 照常落盘 + 不合格/失败不让任务失败。"""
+
+    class Args:
+        no_probe = True
+        no_images = False
+        force_images = False
+        force = False
+        image_policy = "keep"
+        sink = "inplace"
+        fnos_url = ""
+        fnos_token = ""
+        meta_dir = ""
+        root = ""
+        copy_root = ""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="xieyin-cov-"))
+        self.folder = self.tmp / "ADN-888-UC"
+        self.folder.mkdir()
+        self.video = self.folder / "a@GROUP.mp4"
+        self.video.write_bytes(b"")
+        self.pool = [{"name": "x", "ips": [], "mode": ""}]
+        self.orig_scrape = rs.scrape_source
+        self.orig_dl = rs.rc.download_cover
+        self.orig_sleep = rs.time.sleep
+        rs.time.sleep = lambda *a, **k: None
+        rs.scrape_source = lambda n, code, cfg: {
+            "code": code, "title": "t", "cover": "http://img/cover.jpg"}
+
+    def tearDown(self):
+        rs.scrape_source = self.orig_scrape
+        rs.rc.download_cover = self.orig_dl
+        rs.time.sleep = self.orig_sleep
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self):
+        log = io.StringIO()
+        msg = rs.race_one("ADN-888", self.pool, self.folder, self.video,
+                          self.Args(), log)
+        return msg, log.getvalue()
+
+    def test_ok_outcome_written_with_bytes(self):
+        good = _make_jpeg(400, 600, noise=True)
+        rs.rc.download_cover = lambda u, timeout=12: good
+        msg, logtxt = self._run()
+        self.assertTrue(msg.startswith("OK"), msg)
+        self.assertIn(rs.COVER_STATUS_LABEL[rs.COVER_OK], msg)
+        self.assertIn("%dB" % len(good), msg)          # 保留封面字节数
+        self.assertTrue((self.folder / "a@GROUP.nfo").exists())
+        self.assertTrue((self.folder / "a@GROUP-poster.jpg").exists())
+
+    def test_lowres_outcome_keeps_nfo_and_still_ok(self):
+        small = _make_jpeg(147, 200)
+        rs.rc.download_cover = lambda u, timeout=12: small
+        msg, logtxt = self._run()
+        self.assertTrue(msg.startswith("OK"), msg)    # 候选不合格不得让任务失败
+        self.assertIn(rs.COVER_STATUS_LABEL[rs.COVER_LOWRES], msg)
+        self.assertNotIn(rs.COVER_STATUS_LABEL[rs.COVER_FAILED], msg)
+        self.assertTrue((self.folder / "a@GROUP.nfo").exists(), "nfo 必须照常落盘")
+
+    def test_failed_outcome_keeps_nfo_and_still_ok(self):
+        rs.rc.download_cover = lambda u, timeout=12: None
+        msg, logtxt = self._run()
+        self.assertTrue(msg.startswith("OK"), msg)    # 下载失败不得让任务失败
+        self.assertIn(rs.COVER_STATUS_LABEL[rs.COVER_FAILED], msg)
+        self.assertTrue((self.folder / "a@GROUP.nfo").exists(), "nfo 必须照常落盘")
+        self.assertFalse((self.folder / "a@GROUP-poster.jpg").exists())
+
+    def test_push_mode_has_no_cover_marker_and_downloads_nothing(self):
+        args = self.Args()
+        args.sink = "push"
+        args.fnos_url, args.fnos_token = "http://x", "T"
+        calls = []
+        rs.rc.download_cover = lambda u, timeout=12: calls.append(u) or b""
+        orig_push, orig_mark = fm.push_meta, fm.mark_pushed
+        fm.push_meta = lambda b, t, p, timeout=15: (True, "ok")
+        fm.mark_pushed = lambda v: None
+        log = io.StringIO()
+        try:
+            msg = rs.race_one("ADN-888", self.pool, self.folder, self.video, args, log)
+        finally:
+            fm.push_meta, fm.mark_pushed = orig_push, orig_mark
+        self.assertTrue(msg.startswith("OK"), msg)
+        self.assertNotIn("封面", msg)                  # push 成功判定/输出不变
+        self.assertEqual(calls, [])                    # push 只推 URL 不下图
+
+    def test_no_magnet_or_play_url_in_nfo_or_log(self):
+        # 合规边界在解析器的 rc.sanitize：脏数据经清洗后才进 race_one，
+        # 因此落盘 nfo 与日志里都不该出现 magnet/torrent/播放地址。
+        dirty = {"code": "ADN-888", "title": "t",
+                 "cover": "magnet:?xt=urn:btih:deadbeef",
+                 "desc": "http://x/watch/123 播放地址",
+                 "torrent_url": "http://x/a.torrent"}
+        clean = rc.sanitize(dirty)
+        rs.scrape_source = lambda n, code, cfg: dict(clean, code=code)
+        rs.rc.download_cover = lambda u, timeout=12: None
+        msg, logtxt = self._run()
+        nfo_txt = (self.folder / "a@GROUP.nfo").read_text(encoding="utf-8")
+        for blob in (nfo_txt, logtxt, msg):
+            low = blob.lower()
+            self.assertNotIn("magnet", low)
+            self.assertNotIn("torrent", low)
+            self.assertNotIn("/watch", blob)
+
+
+class DiskCoverStatusTest(unittest.TestCase):
+    """--cover-status 的判定完全基于条目当前磁盘状态。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="xieyin-disk-"))
+        self.stem = "ADN-888"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _our_nfo(self):
+        (self.tmp / (self.stem + ".nfo")).write_text(
+            "<!-- xieyin:generated -->\n<movie><num>ADN-888</num></movie>\n",
+            encoding="utf-8")
+
+    def test_our_nfo_plus_poster_is_ok(self):
+        self._our_nfo()
+        (self.tmp / (self.stem + "-poster.jpg")).write_bytes(b"jpeg")
+        self.assertEqual(rs.disk_cover_status(self.tmp, self.stem), rs.COVER_OK)
+
+    def test_our_nfo_without_poster_is_failed(self):
+        self._our_nfo()
+        self.assertEqual(rs.disk_cover_status(self.tmp, self.stem), rs.COVER_FAILED)
+
+    def test_no_nfo_is_lowres(self):
+        self.assertEqual(rs.disk_cover_status(self.tmp, self.stem), rs.COVER_LOWRES)
+
+    def test_foreign_nfo_without_ours_is_lowres(self):
+        # 发布组自带 nfo 但不是本工具产物 -> 不满足「已有本工具 nfo」-> lowres
+        (self.tmp / (self.stem + ".nfo")).write_text(
+            "<movie><title>发布组刮的</title></movie>", encoding="utf-8")
+        (self.tmp / (self.stem + "-poster.jpg")).write_bytes(b"jpeg")
+        self.assertEqual(rs.disk_cover_status(self.tmp, self.stem), rs.COVER_LOWRES)
+
+    def test_legacy_unsigned_our_nfo_recognized(self):
+        # 兼容旧版：无专属签名但有 customrating+num 特征组合也算本工具 nfo
+        (self.tmp / (self.stem + ".nfo")).write_text(
+            "<movie><customrating>NC-17</customrating><num>ADN-888</num></movie>",
+            encoding="utf-8")
+        self.assertEqual(rs.disk_cover_status(self.tmp, self.stem), rs.COVER_FAILED)
+        (self.tmp / (self.stem + "-poster.jpg")).write_bytes(b"jpeg")
+        self.assertEqual(rs.disk_cover_status(self.tmp, self.stem), rs.COVER_OK)
+
+
+class CoverStatusFilterMainTest(unittest.TestCase):
+    """main 的 --cover-status 过滤 + 非法值报错（全程离线，打桩 preflight/刮削/下载）。"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="xieyin-main-"))
+        self.orig_preflight = rc.preflight
+        self.orig_scrape = rs.scrape_source
+        self.orig_dl = rs.rc.download_cover
+        self.orig_sleep = rs.time.sleep
+        rc.preflight = lambda force=False, ttl=None, verbose=True: (
+            [{"name": "x", "ips": [], "mode": ""}], [])
+        rs.scrape_source = lambda n, code, cfg: {"code": code, "title": "t"}
+        rs.rc.download_cover = lambda u, timeout=12: None
+        rs.time.sleep = lambda *a, **k: None
+        self._argv = sys.argv
+
+    def tearDown(self):
+        rc.preflight = self.orig_preflight
+        rs.scrape_source = self.orig_scrape
+        rs.rc.download_cover = self.orig_dl
+        rs.time.sleep = self.orig_sleep
+        sys.argv = self._argv
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _unit(self, code):
+        f = self.tmp / (code + "-UC")
+        f.mkdir()
+        (f / (code + "-UC.mp4")).write_bytes(b"")
+        return f
+
+    def _run_main(self, *extra):
+        logp = str(self.tmp / "race.log")
+        sys.argv = ["race_scrape.py", "--root", str(self.tmp),
+                    "--jobs", "1", "--log", logp] + list(extra)
+        buf = io.StringIO()
+        old = sys.stdout
+        sys.stdout = buf
+        try:
+            rc_main = rs.main()
+        finally:
+            sys.stdout = old
+        return rc_main, buf.getvalue()
+
+    def test_filter_selects_only_matching_disk_status(self):
+        f_ok = self._unit("AAA-001")
+        (f_ok / "AAA-001-UC.nfo").write_text(
+            "<!-- xieyin:generated -->\n<movie><num>AAA-001</num></movie>",
+            encoding="utf-8")
+        (f_ok / "AAA-001-UC-poster.jpg").write_bytes(b"jpeg")
+        f_failed = self._unit("BBB-002")
+        (f_failed / "BBB-002-UC.nfo").write_text(
+            "<!-- xieyin:generated -->\n<movie><num>BBB-002</num></movie>",
+            encoding="utf-8")
+        f_low = self._unit("CCC-003")                       # 什么都没有
+        for status, expect in ((rs.COVER_OK, "AAA-001"),
+                               (rs.COVER_FAILED, "BBB-002"),
+                               (rs.COVER_LOWRES, "CCC-003")):
+            _, out = self._run_main("--cover-status", status)
+            self.assertIn("共 1 个刮削单元待处理", out)
+            self.assertIn(expect, out)
+            for other in ("AAA-001", "BBB-002", "CCC-003"):
+                if other != expect:
+                    self.assertNotIn(other, out)
+
+    def test_no_filter_processes_all_units(self):
+        self._unit("AAA-001")
+        self._unit("BBB-002")
+        _, out = self._run_main()
+        self.assertIn("共 2 个刮削单元待处理", out)
+
+    def test_invalid_value_exits_like_sink_validation(self):
+        self._unit("AAA-001")
+        with self.assertRaises(SystemExit) as cm:
+            self._run_main("--cover-status", "bogus")
+        self.assertEqual(cm.exception.code, 2)             # argparse error 退出码同 --sink
+
+    def test_failed_rerun_writes_nfo_and_reports_marker(self):
+        # 磁盘上只有本工具 nfo 没封面 -> --cover-status failed 选中并补跑
+        f = self._unit("ADN-888")
+        (f / "ADN-888-UC.nfo").write_text(
+            "<!-- xieyin:generated -->\n<movie><num>ADN-888</num></movie>",
+            encoding="utf-8")
+        rc_code, out = self._run_main("--cover-status", "failed")
+        self.assertEqual(rc_code, 0)
+        self.assertIn(rs.COVER_STATUS_LABEL[rs.COVER_FAILED], out)
+        # nfo 仍在（本工具 nfo 被正常重写），任务未因封面失败而报错
+        self.assertTrue((f / "ADN-888-UC.nfo").exists())
 
 
 if __name__ == "__main__":
