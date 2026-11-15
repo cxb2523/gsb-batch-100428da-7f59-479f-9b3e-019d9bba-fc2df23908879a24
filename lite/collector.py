@@ -47,6 +47,8 @@ class DouyinLiveCollector:
         self._page: Optional[Page] = None
         self._http_client: Optional[httpx.AsyncClient] = None
         self._is_ready = False
+        # 启动阶段浏览器不可用时的降级原因; None 表示未发生启动降级
+        self._startup_degrade_reason: Optional[str] = None
 
     @property
     def is_ready(self) -> bool:
@@ -66,12 +68,18 @@ class DouyinLiveCollector:
                 await self._start_cdp()
             except Exception as e:
                 logger.warning(f"[LiveCollector] CDP 启动失败: {e}, 降级为 HTTP 模式")
+                self._startup_degrade_reason = (
+                    f"startup_browser_unavailable: CDP 启动失败 ({type(e).__name__}: {e})"
+                )
                 self.browser_mode = "http"
         elif self.browser_mode == "headless":
             try:
                 await self._start_headless()
             except Exception as e:
                 logger.warning(f"[LiveCollector] 无头浏览器启动失败: {e}, 降级为 HTTP 模式")
+                self._startup_degrade_reason = (
+                    f"startup_browser_unavailable: 无头浏览器启动失败 ({type(e).__name__}: {e})"
+                )
                 self.browser_mode = "http"
 
         self._is_ready = True
@@ -196,8 +204,17 @@ class DouyinLiveCollector:
                 "comments": int or None,
                 "shares": int or None,
                 "products": [...],
-                "error": str or None
+                "error": str or None,
+                "source": "browser" | "http",
+                "degraded": bool,
+                "degrade_reason": str or None,
+                "fallback_reason": str or None  # degrade_reason 的别名
             }
+
+        来源标记说明:
+            source 仍然只表示本次实际使用的采集通道 (browser/http), 保持原有语义。
+            degraded 为 True 表示浏览器通道已尝试但失败, 本次数据来自 HTTP 兜底;
+            degrade_reason 记录失败类别与异常信息, 便于事后核对。
         """
         # 优先用浏览器采集
         if self.browser_mode == "cdp" and self._page:
@@ -205,10 +222,14 @@ class DouyinLiveCollector:
         elif self.browser_mode == "headless" and self._page:
             return await self._fetch_with_browser(url)
         else:
-            return await self._fetch_with_http(url)
+            result = await self._fetch_with_http(url)
+            if self._startup_degrade_reason:
+                # 浏览器在启动阶段就不可用, 本次数据的来源需要标注为降级
+                return self._mark_degraded(result, self._startup_degrade_reason)
+            return result
 
     async def _fetch_with_browser(self, url: str) -> Dict[str, Any]:
-        """用浏览器采集"""
+        """用浏览器采集; 失败时回落 HTTP 并记录降级原因"""
         try:
             start = time.time()
             await self._page.goto(url, wait_until="domcontentloaded", timeout=20000)
@@ -228,12 +249,74 @@ class DouyinLiveCollector:
             return await self._parse_live_data(html, url, source="browser", body_text=body_text, page_title=title)
 
         except Exception as e:
-            self._log(f"[Browser] 失败: {e}")
-            logger.warning(f"[Browser] 采集失败: {e}")
-            return await self._fetch_with_http(url)
+            reason = self._describe_browser_failure(e)
+            self._log(f"[Browser] 失败({reason}): {url[:60]}")
+            logger.warning(f"[Browser] 采集失败: {e}, 回落 HTTP 模式")
+            result = await self._fetch_with_http(url)
+            return self._mark_degraded(result, reason)
+
+    @staticmethod
+    def _describe_browser_failure(exc: BaseException) -> str:
+        """把浏览器异常归纳成可核对的降级原因
+
+        返回值同时包含机器可读的代码 (timeout / navigation_error / ...)
+        和原始异常类型与信息, 便于日志与数据库排查。
+        """
+        exc_name = type(exc).__name__
+        exc_name_lower = exc_name.lower()
+        message = str(exc) or ""
+        message_lower = message.lower()
+
+        if (
+            isinstance(exc, asyncio.TimeoutError)
+            or "timeout" in exc_name_lower
+            or "timeout" in message_lower
+            or "timed out" in message_lower
+        ):
+            kind, label = "timeout", "浏览器采集超时"
+        elif (
+            "net::" in message_lower
+            or "err_" in message_lower
+            or "navigation" in message_lower
+            or "navigat" in exc_name_lower
+        ):
+            kind, label = "navigation_error", "浏览器导航异常"
+        elif (
+            "target closed" in message_lower
+            or "disconnected" in message_lower
+            or "has been closed" in message_lower
+        ):
+            kind, label = "browser_unavailable", "浏览器连接不可用"
+        else:
+            kind, label = "browser_error", "浏览器采集异常"
+
+        detail = f"{exc_name}: {message}".strip().rstrip(":")
+        if len(detail) > 300:
+            detail = detail[:300] + "..."
+        return f"{kind}: {label} ({detail})"
+
+    @staticmethod
+    def _mark_degraded(result: Dict[str, Any], reason: str) -> Dict[str, Any]:
+        """给 HTTP 兜底结果打上降级标记
+
+        source 保持原有取值 (本次数据来自 http), degraded/degrade_reason
+        作为附加信息, 不覆盖已有 error 等字段。
+        """
+        result.setdefault("source", "http")
+        result["degraded"] = True
+        result["degrade_reason"] = reason
+        # 别名: 便于外部消费者按 fallback 语义读取, 值保持一致
+        result["fallback_reason"] = reason
+        return result
 
     async def _fetch_with_http(self, url: str) -> Dict[str, Any]:
-        """用 HTTP 采集"""
+        """用 HTTP 采集
+
+        返回值始终包含来源标记字段:
+            source: "http"
+            degraded: 默认 False, 由浏览器失败回落时由 _mark_degraded 置为 True
+            degrade_reason: 默认 None
+        """
         headers = {
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -246,25 +329,70 @@ class DouyinLiveCollector:
         if self.cookie_str:
             headers["Cookie"] = self.cookie_str
 
+        result: Dict[str, Any] = {
+            "is_live": False,
+            "source": "http",
+            "url": url,
+            "degraded": False,
+            "degrade_reason": None,
+            "fallback_reason": None,
+        }
+
         try:
             resp = await self._http_client.get(url, headers=headers)
             text = resp.text
 
-            # 检测风控
+            # 检测风控: 命中后直接返回, 不让后续解析覆盖风控错误
             if resp.status_code in (403, 429):
-                return {"is_live": False, "error": f"HTTP {resp.status_code} 被风控"}
+                result["error"] = f"HTTP {resp.status_code} 被风控"
+                return result
             if any(kw in text for kw in ("验证码", "安全验证", "滑块")):
-                return {"is_live": False, "error": "触发了验证码"}
+                result["error"] = "触发了验证码"
+                return result
 
-            return await self._parse_live_data(text, url, source="http")
+            parsed = await self._parse_live_data(
+                text, url, source="http", page_title=self._extract_page_title(text)
+            )
+            # 解析结果缺失部分指标时保留已解析到的字段, 只补齐来源/降级标记
+            parsed.setdefault("source", "http")
+            parsed.setdefault("url", url)
+            parsed.setdefault("degraded", False)
+            parsed.setdefault("degrade_reason", None)
+            parsed.setdefault("fallback_reason", parsed["degrade_reason"])
+            return parsed
         except Exception as e:
-            return {"is_live": False, "error": str(e)}
+            result["error"] = str(e)
+            return result
+
+    @staticmethod
+    def _extract_page_title(html: str) -> str:
+        """从 HTML 中提取可用于判断直播状态的 <title>
+
+        只在标题明确是直播间页面 (含 "直播间") 时返回, 避免未开播页的
+        通用站点标题 "抖音直播" 被误判为正在直播。
+        """
+        m = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+        if not m:
+            return ""
+        title = unescape(m.group(1)).strip()
+        return title if "直播间" in title else ""
 
     async def _parse_live_data(self, html: str, url: str, source: str = "http",
                          body_text: str = "", page_title: str = "") -> Dict[str, Any]:
-        """从页面 HTML + 渲染文本解析直播数据"""
+        """从页面 HTML + 渲染文本解析直播数据
+
+        解析失败或指标缺失时保留已解析到的字段 (缺的为 None), 不追加降级信息；
+        降级标记由调用方 (浏览器回落路径) 负责补写。
+        """
         text = unescape(html)
-        result = {"is_live": False, "source": source, "url": url}
+        result = {
+            "is_live": False,
+            "source": source,
+            "url": url,
+            "degraded": False,
+            "degrade_reason": None,
+            "fallback_reason": None,
+        }
         # 初始化字段
         for k in ("title", "room_id", "web_rid", "viewers", "likes", "comments", "shares", "error"):
             result[k] = None

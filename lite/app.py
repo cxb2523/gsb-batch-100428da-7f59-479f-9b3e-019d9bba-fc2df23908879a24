@@ -233,14 +233,21 @@ async def stats():
 
 @app.get("/api/export/csv")
 async def export_csv():
-    """导出全部采集数据为 CSV"""
+    """导出全部采集数据为 CSV
+
+    已有列的顺序与含义保持不变; 来源、降级标记、降级原因追加在末尾,
+    旧版消费方按列序/表头读取时不受影响。
+    """
     from fastapi.responses import PlainTextResponse
     import csv, io
 
     snapshots = db.get_all_live_snapshots(limit=10000)
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["时间", "房间ID", "是否直播", "标题", "在线人数", "点赞", "评论", "分享", "商品数", "错误"])
+    writer.writerow([
+        "时间", "房间ID", "是否直播", "标题", "在线人数", "点赞", "评论", "分享",
+        "商品数", "错误", "来源", "是否降级", "降级原因",
+    ])
     for s in snapshots:
         prods = s.get("products") or []
         prod_count = len(prods) if isinstance(prods, list) else 0
@@ -255,6 +262,9 @@ async def export_csv():
             s.get("shares", ""),
             prod_count,
             s.get("error", ""),
+            s.get("source", "") or "",
+            "是" if s.get("degraded") else "否",
+            s.get("degrade_reason", "") or "",
         ])
     return PlainTextResponse(output.getvalue(), media_type="text/csv",
                               headers={"Content-Disposition": "attachment; filename=douyin_data.csv"})

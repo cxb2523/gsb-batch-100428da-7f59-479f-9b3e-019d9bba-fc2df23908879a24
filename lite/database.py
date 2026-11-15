@@ -54,6 +54,8 @@ class Database:
                     products TEXT,
                     error TEXT,
                     source TEXT,
+                    degraded INTEGER NOT NULL DEFAULT 0,
+                    degrade_reason TEXT,
                     checked_at TEXT DEFAULT (datetime('now'))
                 );
 
@@ -74,9 +76,29 @@ class Database:
                     total_likes INTEGER
                 );
             """)
+            self._migrate_schema(conn)
             conn.commit()
         finally:
             conn.close()
+
+    def _migrate_schema(self, conn: sqlite3.Connection):
+        """为已存在的旧库补齐新增列 (幂等)
+
+        旧版本 live_snapshots 只有 source 列, 升级后新增:
+            degraded        INTEGER NOT NULL DEFAULT 0
+            degrade_reason  TEXT
+        历史数据 degraded=0 / degrade_reason=NULL, 语义为 "未记录降级"。
+        """
+        cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(live_snapshots)").fetchall()
+        }
+        if "degraded" not in cols:
+            conn.execute(
+                "ALTER TABLE live_snapshots ADD COLUMN degraded INTEGER NOT NULL DEFAULT 0"
+            )
+        if "degrade_reason" not in cols:
+            conn.execute("ALTER TABLE live_snapshots ADD COLUMN degrade_reason TEXT")
 
     # ======= 房间管理 =======
 
@@ -128,16 +150,27 @@ class Database:
     # ======= 数据存储 =======
 
     def save_snapshot(self, data: Dict[str, Any]):
-        """保存一次采集快照"""
+        """保存一次采集快照
+
+        新增字段:
+            degraded:       是否由浏览器失败回落 HTTP 得到
+            degrade_reason: 降级原因 (含异常类型与信息)
+        source 仍按原有语义写入 (browser/http), 默认 "http" 以兼容旧调用方。
+        兼容 fallback_reason 作为 degrade_reason 的别名。
+        """
         conn = self._get_conn()
         try:
             products_json = json.dumps(data.get("products", []), ensure_ascii=False)
             room_id = data.get("room_id") or data.get("web_rid") or str(hash(data.get("url", "")))
+            degrade_reason = data.get("degrade_reason") or data.get("fallback_reason")
+            degraded = data.get("degraded")
+            if degraded is None:
+                degraded = bool(degrade_reason)
             conn.execute(
                 """INSERT INTO live_snapshots
                    (room_id, url, is_live, title, viewers, likes, comments, shares,
-                    products, error, source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    products, error, source, degraded, degrade_reason)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     room_id,
                     data.get("url", ""),
@@ -150,6 +183,8 @@ class Database:
                     products_json,
                     data.get("error"),
                     data.get("source", "http"),
+                    1 if degraded else 0,
+                    degrade_reason,
                 ),
             )
             conn.commit()
@@ -164,15 +199,7 @@ class Database:
                    WHERE room_id = ? ORDER BY checked_at DESC LIMIT ?""",
                 (room_id, limit),
             ).fetchall()
-            result = []
-            for r in rows:
-                d = dict(r)
-                try:
-                    d["products"] = json.loads(d["products"]) if d["products"] else []
-                except Exception:
-                    d["products"] = []
-                result.append(d)
-            return result
+            return [self._row_to_snapshot(r) for r in rows]
         finally:
             conn.close()
 
@@ -184,17 +211,29 @@ class Database:
                    ORDER BY checked_at DESC LIMIT ?""",
                 (limit,),
             ).fetchall()
-            result = []
-            for r in rows:
-                d = dict(r)
-                try:
-                    d["products"] = json.loads(d["products"]) if d["products"] else []
-                except Exception:
-                    d["products"] = []
-                result.append(d)
-            return result
+            return [self._row_to_snapshot(r) for r in rows]
         finally:
             conn.close()
+
+    @staticmethod
+    def _row_to_snapshot(row: sqlite3.Row) -> Dict:
+        """把快照行转成接口/导出用的 dict
+
+        保持已有字段 (is_live 仍为 0/1 整数, source 仍为 browser/http) 不变;
+        新增 degraded 以布尔暴露, degrade_reason 原样字符串或 None。
+        旧库/旧数据没有降级信息时 degraded=False, degrade_reason=None。
+        """
+        d = dict(row)
+        try:
+            d["products"] = json.loads(d["products"]) if d["products"] else []
+        except Exception:
+            d["products"] = []
+        d["degraded"] = bool(d.get("degraded"))
+        d.setdefault("degrade_reason", None)
+        # 别名: 与 collector 返回结构保持一致, 便于消费者按 fallback 语义读取
+        d.setdefault("fallback_reason", d["degrade_reason"])
+        d.setdefault("source", None)
+        return d
 
     def get_live_sessions(self, limit: int = 50) -> List[Dict]:
         conn = self._get_conn()

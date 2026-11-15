@@ -144,10 +144,11 @@
                             <th>评论</th>
                             <th>分享</th>
                             <th>商品</th>
+                            <th>来源</th>
                         </tr>
                     </thead>
                     <tbody id="data-body">
-                        <tr><td colspan="9" class="text-muted" style="text-align:center">加载中...</td></tr>
+                        <tr><td colspan="10" class="text-muted" style="text-align:center">加载中...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -198,6 +199,10 @@
                 if (snaps.snapshots && snaps.snapshots.length > 0) {
                     tbody.innerHTML = snaps.snapshots.map(s => {
                         const prods = typeof s.products === 'string' ? JSON.parse(s.products || '[]') : (s.products || []);
+                        const sourceLabel = s.source === 'browser' ? '浏览器' : (s.source === 'http' ? 'HTTP' : (s.source || '-'));
+                        const sourceBadge = s.degraded
+                            ? `<span title="${escapeHtml(s.degrade_reason || '浏览器失败后回落 HTTP')}" style="color:#ffa502;cursor:help">⚠ 降级(${sourceLabel})</span>`
+                            : `<span class="text-muted">${sourceLabel}</span>`;
                         return `<tr>
                             <td class="text-muted">${(s.checked_at || '').slice(11,19)}</td>
                             <td><a href="${s.url || '#'}" target="_blank" style="color:#00d4aa;text-decoration:none">${(s.room_id || '?').slice(0,8)}</a>..</td>
@@ -208,10 +213,11 @@
                             <td>${s.comments ?? '-'}</td>
                             <td>${s.shares ?? '-'}</td>
                             <td>${prods.length || 0}</td>
+                            <td>${sourceBadge}</td>
                         </tr>`;
                     }).join('');
                 } else {
-                    tbody.innerHTML = '<tr><td colspan="9" class="text-muted" style="text-align:center">暂无数据</td></tr>';
+                    tbody.innerHTML = '<tr><td colspan="10" class="text-muted" style="text-align:center">暂无数据</td></tr>';
                 }
 
                 // 本场直播总结
@@ -267,6 +273,15 @@
         }
 
         // === Toast ===
+        function escapeHtml(value) {
+            return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        }
+
         function showToast(msg, type) {
             const t = document.getElementById('toast');
             t.textContent = msg;
