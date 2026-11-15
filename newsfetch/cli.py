@@ -74,6 +74,12 @@ def main(argv: list[str] | None = None) -> int:
     disc = sub.add_parser("discover", help="Discover article URLs from a news site")
     disc.add_argument("site", help="Homepage URL")
     disc.add_argument("--limit", type=int, default=20)
+    disc.add_argument(
+        "--max-requests",
+        type=int,
+        default=None,
+        help="Cap feed/sitemap/robots requests (default: built-in budget)",
+    )
     disc.add_argument("--json", action="store_true")
 
     args = parser.parse_args(argv)
@@ -104,11 +110,21 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "discover":
-        for item in discover(args.site, limit=args.limit):
+        kwargs = {} if args.max_requests is None else {"max_requests": args.max_requests}
+        result = discover(args.site, limit=args.limit, **kwargs)
+        for item in result:
             if args.json:
                 print(json.dumps(item, ensure_ascii=False))
             else:
                 print(item.get("url"))
+        if result.truncated:
+            print(
+                f"# truncated: {len(result)} returned, "
+                f"{result.remaining_entries} withheld by limit, "
+                f"{result.remaining_candidates} candidate source(s) not fetched"
+                + (" (request budget exhausted)" if result.budget_exhausted else ""),
+                file=sys.stderr,
+            )
         return 0
 
     # get

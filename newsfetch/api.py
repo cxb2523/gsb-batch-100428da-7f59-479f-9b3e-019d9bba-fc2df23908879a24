@@ -10,6 +10,7 @@ from newsfetch.client.cache import DiskCache
 from newsfetch.client.http import HttpClient
 from newsfetch.client.robots import RobotsCache
 from newsfetch.config import Config, ProgressCallback
+from newsfetch.discover import DEFAULT_MAX_REQUESTS
 from newsfetch.discover import discover as discover_site
 from newsfetch.errors import ExtractionError, FetchError, LowConfidenceExtractionError
 from newsfetch.extract.pipeline import Extractor
@@ -149,8 +150,16 @@ class NewsFetcher:
             for fut in as_completed(futures):
                 yield fut.result()
 
-    def discover(self, site_url: str, *, limit: int | None = 50) -> list[dict]:
-        return discover_site(site_url, limit=limit, timeout=self.config.timeout)
+    def discover(
+        self,
+        site_url: str,
+        *,
+        limit: int | None = 50,
+        max_requests: int | None = DEFAULT_MAX_REQUESTS,
+    ) -> list[dict]:
+        return discover_site(
+            site_url, limit=limit, timeout=self.config.timeout, max_requests=max_requests
+        )
 
     def close(self) -> None:
         self._client.close()

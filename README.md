@@ -118,9 +118,19 @@ except LowConfidenceExtractionError as e:
 ```python
 from newsfetch import discover
 
-for item in discover("https://www.bbc.com", limit=10):
+result = discover("https://www.bbc.com", limit=10)
+for item in result:
     print(item["url"], item.get("title"))
+
+# Discovery is bounded: max_requests caps feed/sitemap/robots.txt requests.
+# The result is still a list[dict], with truncation metadata attached.
+if result.truncated:
+    print(result.budget_exhausted, result.remaining_entries, result.unexpanded_candidates)
 ```
+
+`discover(..., max_requests=N)` stops issuing requests once the budget is spent and
+returns whatever was collected; `limit` still truncates the final entry list. Pass
+`max_requests=None` for no budget. A single failing feed is skipped, not fatal.
 
 ### Async
 

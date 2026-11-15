@@ -3,6 +3,7 @@
 from newsfetch.api import NewsFetcher, discover, extract, fetch, fetch_iter, fetch_many
 from newsfetch.async_api import fetch_async, fetch_many_async
 from newsfetch.config import Config
+from newsfetch.discover import DiscoveryResult
 from newsfetch.errors import (
     DiscoveryError,
     ExtractionError,
@@ -22,6 +23,7 @@ __all__ = [
     "Confidence",
     "Config",
     "DiscoveryError",
+    "DiscoveryResult",
     "Evidence",
     "ExtractionError",
     "ExtractionReport",
