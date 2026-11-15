@@ -1,0 +1,296 @@
+import assert from 'node:assert/strict'
+
+export async function runMarkdownTests(m) {
+  let passed = 0
+  const ok = (name, fn) => {
+    fn()
+    passed++
+    console.log(`  ok - ${name}`)
+  }
+
+  ok('offset inside a short paragraph preserves the requested source position', () => {
+    const text = 'abcdef\n\nghijkl\n\nmnopqr'
+    const result = m.smartTruncate(text, 10, 3)
+    assert.equal(result.text, 'def')
+    assert.equal(result.charsStart, 3)
+    assert.equal(result.text, text.slice(result.charsStart, result.charsStart + result.charsReturned))
+  })
+
+  ok('repeated continuation consumes every paragraph exactly once', () => {
+    const text = 'aaaaaa\n\nbbbbbb\n\ncccccc'
+    const pages = []
+    let offset = 0
+    for (let i = 0; i < 10; i++) {
+      const result = m.smartTruncate(text, 6, offset)
+      pages.push(result.text)
+      assert.equal(result.text, text.slice(result.charsStart, result.charsStart + result.charsReturned))
+      assert.ok(result.charsStart >= offset)
+      offset = result.charsStart + result.charsReturned
+      if (!result.truncated) break
+    }
+    assert.deepEqual(pages, ['aaaaaa', 'bbbbbb', 'cccccc'])
+    assert.equal(offset, text.length)
+  })
+
+  ok('continuation accounts for every character in long paragraph separators', () => {
+    const text = 'aaaa\n\n\n\nbbbb\n\ncccc'
+    for (const offset of [4, 5, 6, 7, 8]) {
+      const result = m.smartTruncate(text, 4, offset)
+      assert.equal(result.text, 'bbbb')
+      assert.equal(result.charsStart, 8)
+    }
+  })
+
+  ok('sentence continuation preserves the suffix of an oversized paragraph', () => {
+    const text = 'First sentence. Second sentence. Third sentence.'
+    const first = m.smartTruncate(text, 20)
+    const second = m.smartTruncate(text, 20, first.charsStart + first.charsReturned)
+    assert.equal(first.text, 'First sentence.')
+    assert.equal(second.text, ' Second sentence.')
+    assert.equal(second.charsStart, first.text.length)
+  })
+
+  ok('zero output budget and separators at the end terminate predictably', () => {
+    const empty = m.smartTruncate('abcdef', 0, 3)
+    assert.equal(empty.text, '')
+    assert.equal(empty.truncated, true)
+    assert.equal(empty.charsStart, 3)
+    const end = m.smartTruncate('abc\n\n\n', 4, 3)
+    assert.equal(end.text, '')
+    assert.equal(end.charsStart, 6)
+    assert.equal(end.truncated, false)
+  })
+
+  ok('short documents retain their original paragraph whitespace', () => {
+    const text = 'aaaa\n\n\n\nbbbb'
+    const result = m.smartTruncate(text, 100)
+    assert.equal(result.text, text)
+    assert.equal(result.charsReturned, text.length)
+    assert.equal(result.truncated, false)
+  })
+
+  ok('hard slicing avoids splitting an emoji when there is room to back off', () => {
+    const first = m.smartTruncate('ab😀cd', 3)
+    const second = m.smartTruncate('ab😀cd', 3, first.charsReturned)
+    assert.equal(first.text, 'ab')
+    assert.equal(second.text, '😀c')
+  })
+
+  ok('compact JSON preserves prototype-shaped keys at every copied level', () => {
+    const value = JSON.parse('{"__proto__":{"a":1},"items":[{"__proto__":"data","constructor":2}],"prototype":3}')
+    const output = JSON.parse(m.compactJson(value))
+    assert.deepEqual(output, value)
+    assert.equal(Object.getPrototypeOf(output), Object.prototype)
+    assert.equal(Object.prototype.a, undefined)
+  })
+
+  ok('compact JSON still clips strings stored under prototype-shaped keys', () => {
+    const value = JSON.parse('{"__proto__":{}}')
+    value.__proto__.text = 'x'.repeat(1600)
+    const output = JSON.parse(m.compactJson(value))
+    assert.equal(output.__proto__.text, 'x'.repeat(1500) + '…[+100 chars]')
+  })
+
+  ok('ordinary compact JSON stays byte-identical', () => {
+    assert.equal(m.compactJson({ a: [null, false, 1, 'x'], b: {} }), '{"a":[null,false,1,"x"],"b":{}}')
+  })
+
+  ok('inline code preserves punctuation, HTML entities and literal backticks', () => {
+    assert.equal(m.inlineMd('<code>foo_bar &amp;&amp; [x] &lt; y `z`</code>'), '`` foo_bar && [x] < y `z` ``')
+    assert.equal(m.inlineMd('<code>Array&lt;T&gt;</code>'), '`Array<T>`')
+  })
+
+  ok('nested inline code preserves multiple spaces without corrupting surrounding text', () => {
+    assert.equal(m.inlineMd('<span>Use <strong><code>a  b</code></strong> now</span>'), 'Use **`a  b`** now')
+    assert.equal(m.inlineMd('<code> x </code>'), '`  x  `')
+  })
+
+  ok('literal prose still escapes Markdown syntax outside code', () => {
+    assert.equal(m.inlineMd('a *b* and `c`'), 'a \\*b\\* and \\`c\\`')
+    assert.equal(m.inlineMd('<code></code>after'), 'after')
+  })
+
+  ok('code fences exceed every literal backtick run in their content', () => {
+    const output = m.blockMd('<pre><code class="language-markdown">```js\nx()\n```</code></pre>').trim()
+    assert.equal(output, '````markdown\n```js\nx()\n```\n````')
+  })
+
+  ok('fenced code retains indentation and language among multiple CSS classes', () => {
+    const output = m.blockMd('<pre><code class="source language-js highlight">\n  const x = 1\n    x++\n</code></pre>')
+    assert.equal(output, '\n\n```js\n  const x = 1\n    x++\n```\n\n')
+  })
+
+  ok('fenced code decodes escaped tags while removing highlighting wrappers', () => {
+    assert.equal(m.blockMd('<pre><code><span>&lt;div&gt;</span>x &amp; y&lt;/div&gt;</code></pre>').trim(), '```\n<div>x & y</div>\n```')
+    assert.equal(m.blockMd('<pre>a<br>b</pre>').trim(), '```\na\nb\n```')
+  })
+
+  ok('image and code placeholders remain distinct across nested inline nodes', () => {
+    const output = m.blockMd('<p><img alt="first" src="/first.png"><span><code>a  b</code><img alt="second" src="/second.png"></span></p>')
+    assert.ok(output.includes('![first](/first.png)'))
+    assert.ok(output.includes('![second](/second.png)'))
+    assert.ok(output.includes('`a  b`'))
+    assert.ok(!output.includes('\u0001'))
+  })
+
+  ok('void line breaks survive nested formatting and mixed-case HTML', () => {
+    assert.equal(m.inlineMd('name<br>address'), 'name  \naddress')
+    assert.equal(m.inlineMd('<SPAN>a<BR class="clear" />b</SPAN>'), 'a  \nb')
+    assert.equal(m.blockMd('<div>a<hr>b</div>').trim(), 'a\n\n---\n\nb')
+  })
+
+  ok('direct block-level links and emphasis keep their inline semantics', () => {
+    assert.equal(m.blockMd('<div><a href="/docs">Docs</a> <strong>Important</strong></div>').trim(), '[Docs](/docs) **Important**')
+    assert.equal(m.blockMd('<p><a href="/a(b)">Link</a></p>').trim(), '[Link](/a%28b%29)')
+  })
+
+  ok('Markdown links use real href attributes with spaces or unquoted values', () => {
+    for (const attrs of ['href = "/right"', 'href=/right', 'data-href="/wrong" href="/right"']) {
+      assert.equal(m.inlineMd(`<a ${attrs}>Read</a>`), '[Read](/right)')
+    }
+    assert.equal(m.inlineMd('<a data-href="/wrong">Read</a>'), 'Read')
+  })
+
+  ok('Markdown destinations decode URL entities and encode syntax delimiters', () => {
+    assert.equal(m.inlineMd('<a href="/a(b)?x=1&amp;y=2">Read</a>'), '[Read](/a%28b%29?x=1&y=2)')
+    assert.equal(m.inlineMd('<a href="/a b?x=&amp;amp;">Read</a>'), '[Read](/a%20b?x=&amp;)')
+  })
+
+  ok('Markdown images respect src and alt attribute boundaries', () => {
+    assert.equal(m.inlineMd('<img alt = "diagram" src = "/right.png">'), '![diagram](/right.png)')
+    assert.equal(m.inlineMd('<img alt=diagram src=/right.png>'), '![diagram](/right.png)')
+    assert.equal(m.inlineMd('<img data-alt="wrong" alt="right" data-src="/wrong.png" src="/right.png">'), '![right](/right.png)')
+    assert.equal(m.inlineMd('<img data-alt="wrong" src="/right.png">'), '')
+  })
+
+  ok('Markdown images retain lazy sources and escape decoded alternate text', () => {
+    assert.equal(m.inlineMd('<img alt="A &amp; [B]" src="data:image/gif;base64,AAA" data-src = "/figure(1).png?a=1&amp;b=2">'), '![A & \\[B\\]](/figure%281%29.png?a=1&b=2)')
+    assert.equal(m.inlineMd('<amp-img alt=diagram data-original=/right.png></amp-img>'), '![diagram](/right.png)')
+  })
+
+  ok('picture fallback reads srcset attributes while retaining real image sources', () => {
+    assert.equal(m.inlineMd('<picture><source srcset = "/first.png 1x, /second.png 2x"><img alt=diagram></picture>'), '![diagram](/first.png)')
+    assert.equal(m.inlineMd('<picture><source srcset="/first.png 1x"><img alt=diagram src = "/real.png"></picture>'), '![diagram](/real.png)')
+    assert.equal(m.inlineMd('<picture><source srcset="/first.png?a=1&amp;b=2 1x"><img alt="one&#10;two"></picture>'), '![one two](/first.png?a=1&b=2)')
+  })
+
+  ok('table separators follow the header and use actual cell counts', () => {
+    const output = m.blockMd('<table><tr><th>a|b</th><th>c</th></tr><tr><td>1</td><td>2</td></tr></table>').trim()
+    assert.equal(output, '| a\\|b | c |\n| --- | --- |\n| 1 | 2 |')
+  })
+
+  ok('table parsing handles uppercase markup and keeps links in cells', () => {
+    const output = m.blockMd('<TABLE><TR><TH>A</TH></TR><TR><TD><a href="/a">Link</a></TD></TR></TABLE>').trim()
+    assert.equal(output, '| A |\n| --- |\n| [Link](/a) |')
+  })
+
+  ok('mixed-case list markup keeps every list item', () => {
+    assert.equal(m.blockMd('<UL><LI>First</LI><li><strong>Second</strong></li></UL>').trim(), '- First\n- **Second**')
+  })
+
+  ok('table output caps content rows and reports all remaining nonempty rows', () => {
+    const rows = Array.from({ length: 40 }, (_, i) => `<tr><td>row${i}</td><td>value</td></tr>`).join('')
+    const output = m.blockMd(`<table><tr><th>A</th><th>B</th></tr>${rows}<tr></tr></table>`).trim()
+    assert.ok(output.endsWith('…+16 rows'))
+    assert.ok(output.includes('| row23 | value |'))
+    assert.ok(!output.includes('row24'))
+    assert.equal(output.split('\n')[1], '| --- | --- |')
+  })
+
+  ok('line breaks inside a table cell do not create extra Markdown rows', () => {
+    const output = m.blockMd('<table><tr><th>A</th></tr><tr><td>first<br>second</td></tr></table>').trim()
+    assert.equal(output, '| A |\n| --- |\n| first<br>second |')
+  })
+
+  ok('unclosed tags cannot swallow trailing prose', () => {
+    assert.equal(m.inlineMd('<span><code>unfinished'), 'unfinished')
+    assert.equal(m.blockMd('<table><tr><td>unfinished'), 'unfinished')
+  })
+
+  ok('table code retains long internal whitespace runs', () => {
+    const spaces = ' '.repeat(160000)
+    assert.ok(m.blockMd(`<table><tr><td><code>a${spaces}b</code></td></tr></table>`).includes(`a${spaces}b`))
+  })
+
+  const md = html => m.blockMd(html).replace(/\n{3,}/g, '\n\n').trim()
+  ok('nested containers separate inner paragraphs from parent trailing text', () => {
+    assert.equal(md('<main><div>First<div>Second</div>Third<div>Fourth</div>Fifth</div></main>'), 'First\n\nSecond\n\nThird\n\nFourth\n\nFifth')
+  })
+
+  ok('mixed-case structural containers preserve every nesting boundary', () => {
+    assert.equal(md('<MAIN><section>First<ARTICLE>Second<DIV>Third</DIV>Fourth</ARTICLE>Fifth</section></MAIN>'), 'First\n\nSecond\n\nThird\n\nFourth\n\nFifth')
+  })
+
+  ok('quoted fake container tags cannot move real paragraph boundaries', () => {
+    assert.equal(md('<div title="look </div> here <div>">First<div>Second</div>Third</div>'), 'First\n\nSecond\n\nThird')
+  })
+
+  ok('nested unordered lists preserve children, parent tail and following siblings', () => {
+    assert.equal(md('<ul><li>Parent<ul><li>Child one</li><li>Child two</li></ul>Parent tail</li><li>Next parent</li></ul>'), '- Parent\n\n  - Child one\n  - Child two\n\n  Parent tail\n- Next parent')
+  })
+
+  ok('mixed nested lists keep parent numbering and child indentation', () => {
+    assert.equal(md('<ol><li>Parent<ul><li>Child one</li><li>Child two</li></ul></li><li>Next parent</li></ol>'), '1. Parent\n\n   - Child one\n   - Child two\n2. Next parent')
+    const items = '<li>First</li>'.repeat(9) + '<li>Tenth<ul><li>Child</li></ul></li>'
+    assert.ok(md(`<ol>${items}</ol>`).endsWith('10. Tenth\n\n    - Child'))
+  })
+
+  ok('list items containing only a child list retain distinct parent markers', () => {
+    assert.equal(md('<ul><li><ul><li><ul><li>Leaf</li></ul></li></ul></li></ul>'), '-\n  -\n    - Leaf')
+  })
+
+  ok('paragraphs and sublists remain inside their parent list item', () => {
+    assert.equal(md('<ul><li><p>First paragraph</p><p>Second paragraph</p><ul><li>Child</li></ul></li><li>Sibling</li></ul>'), '- First paragraph\n\n  Second paragraph\n\n  - Child\n- Sibling')
+  })
+
+  ok('nested code fences close before parent tail and following ordered items', () => {
+    const output = md('<ol><li>First<pre><code>a\n&lt;li&gt;b&lt;/li&gt;</code></pre>Tail</li><li>Next</li></ol>')
+    assert.equal(output, '1. First\n\n   ```\n   a\n   <li>b</li>\n   ```\n\n   Tail\n2. Next')
+    assert.equal(output.split('\n').filter(line => line.trim() === '```').length, 2)
+  })
+
+  ok('nested blockquotes end before parent tail and following ordered items', () => {
+    assert.equal(md('<ol><li>First<blockquote>Quote<div>More</div></blockquote>Tail</li><li>Next</li></ol>'), '1. First\n\n   > Quote\n   > \n   > More\n\n   Tail\n2. Next')
+  })
+
+  ok('nested list prose retains literal punctuation, inline code and images', () => {
+    const output = md('<ul><li>Literal *text* <span>`quoted`</span> <strong>bold</strong> <code>a  b</code><ul><li><img alt="figure" src="/f.png"> Child</li></ul>Tail</li></ul>')
+    assert.equal(output, '- Literal \\*text\\* \\`quoted\\` **bold** `a  b`\n\n  - ![figure](/f.png) Child\n\n  Tail')
+    assert.ok(!output.includes('\u0001'))
+  })
+
+  ok('code examples cannot change surrounding container pairing', () => {
+    assert.equal(md('<div>Before<pre><code>&lt;div&gt;&lt;ul&gt;sample&lt;/ul&gt;&lt;/div&gt;</code></pre><div>After</div>Tail</div>'), 'Before\n\n```\n<div><ul>sample</ul></div>\n```\n\nAfter\n\nTail')
+  })
+
+  ok('excessive list nesting degrades without duplicating or dropping the leaf', () => {
+    const output = md('<ul><li>'.repeat(150) + 'Only leaf' + '</li></ul>'.repeat(150))
+    assert.equal(output.match(/Only leaf/g)?.length, 1)
+    assert.ok(output.length < 12000)
+    assert.ok(!/<\/?(?:ul|li)>/.test(output))
+  })
+
+  ok('container pairing preserves the long-attribute boundary and unclosed text', () => {
+    const long = `<div title="${'x'.repeat(1100)}">First<div>Second</div>Third</div>`
+    const output = md(long)
+    assert.ok(output.startsWith('div title="'))
+    assert.ok(output.endsWith('First\n\nSecond\n\nThird'))
+    assert.equal(md('<div>'.repeat(1000) + 'Visible tail'), 'Visible tail')
+  })
+
+  const tools = {}
+  const html = '<main><div>First<div>Second</div>Third</div><ol><li>Parent<ul><li>Child</li></ul></li><li>Sibling</li></ol></main>'
+  m.apply({
+    tools: { register: tool => { tools[tool.name] = tool } }, effect: () => {},
+    get: () => ({ fetch: async ({ url }) => ({ url, statusCode: 200, body: { kind: 'html', content: html } }) }),
+  }, { spaRender: false, paginate: false })
+  const args = { url: `https://markdown-fixture.invalid/nested/${Date.now()}`, mode: 'markdown' }
+  const result = await tools.read_url.execute(args)
+  ok('read_url execute and desktop rendering preserve nested Markdown structure', () => {
+    const expected = 'First\n\nSecond\n\nThird\n\n1. Parent\n\n   - Child\n2. Sibling'
+    assert.equal(result.text, expected)
+    assert.ok(tools.read_url.output.render(args, result)[0].text.includes(expected))
+  })
+
+  return passed
+}
