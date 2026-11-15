@@ -62,10 +62,15 @@ def run(
         con, summary = run_crawl_sync(config, db_path=db, progress_callback=cb)
 
     console.print(f"\n[bold green]Crawl finalizado[/bold green] en {summary['duration_s']:.1f}s")
-    console.print(f"  URLs:    {summary['urls_total']}")
-    console.print(f"  Reglas:  {summary['rules_run']}")
-    console.print(f"  Issues:  {summary['issues_total']}")
-    console.print(f"  Salida:  {db}")
+    console.print(f"  URLs:      {summary['urls_total']}")
+    console.print(
+        f"  Fallidas:  {summary['urls_failed']}"
+        f" (robots.txt: {summary['urls_blocked_by_robots']},"
+        f" errores de red: {summary['urls_request_errors']})"
+    )
+    console.print(f"  Reglas:    {summary['rules_run']}")
+    console.print(f"  Issues:    {summary['issues_total']}")
+    console.print(f"  Salida:    {db}")
 
     issue_summary = con.execute(
         """

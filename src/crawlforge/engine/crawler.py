@@ -49,6 +49,7 @@ class CrawlConfig:
 class CrawlStats:
     urls_total: int = 0
     urls_failed: int = 0
+    urls_blocked: int = 0
     started_at: datetime | None = None
     finished_at: datetime | None = None
 
@@ -114,6 +115,8 @@ async def crawl(config: CrawlConfig) -> AsyncIterator[dict[str, Any]]:
 
         async def fetch_one(url: str, depth: int) -> dict[str, Any] | None:
             if config.respect_robots and not await robots.allowed(url):
+                stats.urls_blocked += 1
+                stats.urls_failed += 1
                 return {
                     "url": url,
                     "final_url": url,
@@ -188,9 +191,33 @@ async def crawl(config: CrawlConfig) -> AsyncIterator[dict[str, Any]]:
                     row["from_robots"] = True
                     row["is_indexable"] = False
                     row["indexability_reason"] = "blocked by robots.txt"
+                elif fetched.get("_error"):
+                    # Real request failure (timeout, connection refused, ...) —
+                    # distinguishable from a robots block via from_robots=False.
+                    row["is_indexable"] = False
+                    row["indexability_reason"] = f"request failed: {fetched['_error']}"
 
                 stats.urls_total += 1
                 yield row
+
+                if fetched.get("_blocked_by_robots") or fetched.get("_error"):
+                    continue  # no link discovery from blocked/failed fetches
+
+                # Enqueue the redirect target as its own page so its title,
+                # canonical, etc. are captured. The original URL row above
+                # keeps final_url pointing here. Bounded by the same
+                # max_depth / max_urls / same_host_only rules as links, and
+                # the `seen` set guarantees it is crawled at most once.
+                final = row.get("final_url")
+                if (
+                    final
+                    and final != row["url"]
+                    and final not in seen
+                    and row["depth"] < config.max_depth
+                    and (not config.same_host_only or urlsplit(final).netloc == start_host)
+                ):
+                    seen.add(final)
+                    queue.append((final, row["depth"] + 1))
 
                 if row["depth"] >= config.max_depth:
                     continue

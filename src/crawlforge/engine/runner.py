@@ -25,9 +25,15 @@ async def run_crawl(
     started = datetime.now(timezone.utc)
 
     n = 0
+    n_blocked = 0
+    n_errors = 0
     async for row in crawl(config):
         write_url_row(con, row)
         n += 1
+        if row.get("from_robots"):
+            n_blocked += 1
+        elif not row.get("status_code"):
+            n_errors += 1
         if progress_callback:
             progress_callback(n, row)
 
@@ -54,6 +60,9 @@ async def run_crawl(
         "finished_at": finished.isoformat(),
         "duration_s": (finished - started).total_seconds(),
         "urls_total": n,
+        "urls_failed": n_blocked + n_errors,
+        "urls_blocked_by_robots": n_blocked,
+        "urls_request_errors": n_errors,
         "rules_run": len(rules),
         "issues_total": written,
     }
@@ -64,6 +73,18 @@ async def run_crawl(
     con.execute(
         "INSERT OR REPLACE INTO crawl_meta VALUES ('urls_total', ?)",
         [str(n)],
+    )
+    con.execute(
+        "INSERT OR REPLACE INTO crawl_meta VALUES ('urls_failed', ?)",
+        [str(n_blocked + n_errors)],
+    )
+    con.execute(
+        "INSERT OR REPLACE INTO crawl_meta VALUES ('urls_blocked_by_robots', ?)",
+        [str(n_blocked)],
+    )
+    con.execute(
+        "INSERT OR REPLACE INTO crawl_meta VALUES ('urls_request_errors', ?)",
+        [str(n_errors)],
     )
     con.execute(
         "INSERT OR REPLACE INTO crawl_meta VALUES ('issues_total', ?)",
