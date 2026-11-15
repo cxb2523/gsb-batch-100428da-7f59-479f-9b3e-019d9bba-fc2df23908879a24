@@ -49,9 +49,17 @@ async def get_page(url: str | list[str], proxy: Proxy | None) -> str | list[str]
                 headless=True, proxy=proxy.to_playwright_proxy() if proxy else None
             )
 
-            tasks = [_get_page_source(url, semaphore, browser) for url in url_list]
-            results = await asyncio.gather(*tasks)
-            await browser.close()
+            try:
+                tasks = [_get_page_source(url, semaphore, browser) for url in url_list]
+                # A single failing page must not discard the rest of the batch.
+                fetched = await asyncio.gather(*tasks, return_exceptions=True)
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+            results = [page_source if isinstance(page_source, str) else '' for page_source in fetched]
 
             return results[0] if isinstance(url, str) else results
 
@@ -66,17 +74,29 @@ async def _get_page_source(url: str, semaphore: asyncio.Semaphore, browser: Asyn
         return ''
 
     async with semaphore:
-        context = await browser.new_context(**PLAYWRIGHT_CONFIG)
-        page = await context.new_page()
+        context = None
+        page = None
 
         try:
+            context = await browser.new_context(**PLAYWRIGHT_CONFIG)
+            page = await context.new_page()
             await page.goto(url, wait_until='domcontentloaded', timeout=6000)
             await page.wait_for_timeout(2000)  # Wait an extra 2s for JS to populate content
-        except Exception:
-            page_source = ''
-        else:
             page_source = await page.content()
+        except Exception:
+            # Rendering errors and timeouts are reported as an empty source; the
+            # caller marks that individual result as failed instead of aborting.
+            page_source = ''
+        finally:
+            if page is not None:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
 
-        await page.close()
-        await context.close()
         return page_source

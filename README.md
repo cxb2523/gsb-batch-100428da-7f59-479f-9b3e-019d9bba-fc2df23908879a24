@@ -127,6 +127,40 @@ SearchResults.json(
 )
 ```
 
+#### Pages that fail to render
+
+When `extend=True` and a page fails to render, times out, or returns an empty
+document, that one result is marked as failed while every other result is still
+included. Failed entries keep their title, link, and original search-result
+description; the page body is left empty and the entry is explicitly flagged.
+
+Markdown:
+
+```plaintext
+**Title:** Example Title
+**Link:** https://example.com/broken
+**Description:** The description from the search results.
+**Fetch Failed:** Page content could not be retrieved.
+```
+
+JSON:
+
+```json
+{
+    "title": "Example Title",
+    "link": "https://example.com/broken",
+    "description": "The description from the search results.",
+    "page_preview": "",
+    "fetch_failed": true,
+    "fetch_error": "Page content could not be retrieved."
+}
+```
+
+Successful entries are unchanged. This applies to batch output (`SearchResults`
+and `AsyncSearchResults`) and to single-result output (`SearchResult` and
+`AsyncSearchResult`) alike. Unsupported file types are not treated as failures;
+they continue to return their basic title/link/description output.
+
 ### Using proxies
 
 If you'd like to use proxies, you can create a proxy object using `Proxy` and pass it into either `search` or `async_search`.
