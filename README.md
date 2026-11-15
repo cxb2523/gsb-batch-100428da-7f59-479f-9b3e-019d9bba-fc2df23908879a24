@@ -86,6 +86,22 @@ GitHub Actions checks the upstream Apify and CoreClaw category directories daily
 node settings/sync_catalog.js
 ```
 
+Each source is handled independently: if one source fails and its catalog file already exists locally, the previous file is kept (`kept-existing`) while the other source still syncs. A failure with no local file to fall back on is reported as `failed` and makes the exit code non-zero. Per-source outcomes (`updated`, `unchanged`, `kept-existing`, or `failed`, with a reason on failure) are printed to standard output.
+
+For offline or staging runs, override either upstream address with environment variables; both `http` and `https` URLs are accepted, defaulting to the addresses in `settings/repo.config.json` when unset:
+
+```bash
+APIFY_SOURCE_URL=http://127.0.0.1:8080/apify.md \
+CORECLAW_SOURCE_URL=http://127.0.0.1:8080/coreclaw.md \
+node settings/sync_catalog.js
+```
+
+The offline test suite uses only Node.js built-ins and needs no network access:
+
+```bash
+npm test
+```
+
 ## Related directories
 
 - [API Mega List](https://github.com/cporter202/API-mega-list)

@@ -1,0 +1,8 @@
+{
+  "name": "ecommerce-intelligence-apis",
+  "private": true,
+  "description": "Catalog sync tooling for the Ecommerce Intelligence APIs directory",
+  "scripts": {
+    "test": "node --test settings/sync_catalog.test.js"
+  }
+}
