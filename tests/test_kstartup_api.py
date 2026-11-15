@@ -3,9 +3,10 @@
 No network: _fetch_page / _OPENER are monkeypatched. Covers key loading &
 redaction (incl. mixed-case %XX), host validation, redirect refusal, block
 escalation (403 / CAPTCHA), transport-error redaction, both response
-envelopes, malformed-envelope fail-closed, pagination coverage (dup pages,
-zero-open streak, cap-without-exhaustion), normalization schema parity, and
-the cmd_list wiring (success / fallback / manual-escalation).
+envelopes, malformed-envelope fail-closed, pagination coverage (overlapping /
+duplicate ids -> partial proven=False, zero-open streak, cap-without-exhaustion),
+normalization schema parity, and the cmd_list wiring (success / partial-window /
+overlap-partial / fallback / manual-escalation).
 """
 import types
 import urllib.error
@@ -314,12 +315,15 @@ def test_list_below_min_raises(kstartup_api, monkeypatch):
         kstartup_api.list_announcements("key", min_expected=p + 100)
 
 
-def test_list_duplicate_page_fails_closed_to_crawl(kstartup_api, monkeypatch):
+def test_list_duplicate_page_returns_partial_not_proven(kstartup_api, monkeypatch):
     # A repeated page makes the position counter (scanned) overshoot while unique
     # coverage stalls: scanning positions 0..3p while only ids 0..2p exist would
     # declare `proven` one page early and silently drop the real tail [2p..3p).
-    # Overlap must fail closed to the crawl (the exhaustive-coverage authority),
-    # never claim proven exhaustion — the coverage-honesty contract.
+    # Overlap is common on the newest-first dataset, so instead of discarding the
+    # open announcements already collected and re-crawling from scratch, the scan
+    # STOPS at the overlap and returns the partial set with proven=False — never
+    # claiming proven exhaustion (the coverage-honesty contract). The crawl
+    # remains the exhaustive authority for the caller.
     p = kstartup_api.PER_PAGE
     tot = 3 * p
     page1 = {"totalCount": tot, "data": [_open(i) for i in range(p)]}
@@ -328,18 +332,55 @@ def test_list_duplicate_page_fails_closed_to_crawl(kstartup_api, monkeypatch):
     monkeypatch.setattr(
         kstartup_api, "_fetch_page", _fake_pages([page1, page2, page3])
     )
-    with pytest.raises(kstartup_api.ApiError):
-        kstartup_api.list_announcements("key", min_expected=1)
+    recs, total, pages, proven = kstartup_api.list_announcements("key", min_expected=1)
+    assert {r["pbancSn"] for r in recs} == {str(i) for i in range(p)}
+    assert total == tot and pages == 2 and proven is False  # stopped AT the overlap
 
 
-def test_list_within_page_duplicate_ids_fails_closed(kstartup_api, monkeypatch):
+def test_list_within_page_duplicate_ids_returns_partial(kstartup_api, monkeypatch):
     # A single page whose rows repeat an id (totalCount=2, rows [A, A]) would
     # dedup to one record while scanned positions reach totalCount → false
-    # proven exhaustion. Must fail closed to the crawl (Codex #3 residual).
+    # proven exhaustion. Stop on the repeated id, keep the first occurrence, and
+    # return proven=False (never a proven exhaustion).
     dup = {"totalCount": 2, "data": [_open("A"), _open("A")]}
     monkeypatch.setattr(kstartup_api, "_fetch_page", _fake_pages([dup]))
+    recs, total, pages, proven = kstartup_api.list_announcements("key", min_expected=1)
+    assert [r["pbancSn"] for r in recs] == ["A"]
+    assert total == 2 and pages == 1 and proven is False
+
+
+def test_list_overlap_keeps_open_records_from_validated_pages(
+        kstartup_api, monkeypatch):
+    # The partial result must retain OPEN announcements collected on earlier
+    # (validated) pages — the expensive re-crawl the contract is meant to avoid.
+    # The overlapping page contributes only ids not already seen.
+    p = kstartup_api.PER_PAGE
+    half = p // 2
+    page1 = {"totalCount": 3 * p,
+             "data": [_open(i) for i in range(p)]}
+    # page2 overlaps page1 on the first `half` ids and adds half new OPEN ids
+    page2 = {"totalCount": 3 * p,
+             "data": [_open(i) for i in range(half)]
+                     + [_open(10 * p + i) for i in range(half)]}
+    monkeypatch.setattr(kstartup_api, "_fetch_page", _fake_pages([page1, page2]))
+    recs, _total, pages, proven = kstartup_api.list_announcements("key", min_expected=1)
+    got = {r["pbancSn"] for r in recs}
+    assert {str(i) for i in range(p)} <= got                 # page-1 records kept
+    # the overlapping page's genuinely new open ids are kept too
+    assert {str(10 * p + i) for i in range(half)} <= got
+    assert pages == 2 and proven is False
+
+
+def test_list_overlap_partial_still_respects_min_expected(kstartup_api, monkeypatch):
+    # Below-minimum remains an ApiError (unchanged safety semantics): a partial
+    # set smaller than expected is too suspicious to trust, so the caller still
+    # falls back to the crawl.
+    p = kstartup_api.PER_PAGE
+    page1 = {"totalCount": 3 * p, "data": [_open(i) for i in range(p)]}
+    page2 = {"totalCount": 3 * p, "data": [_open(i) for i in range(p)]}
+    monkeypatch.setattr(kstartup_api, "_fetch_page", _fake_pages([page1, page2]))
     with pytest.raises(kstartup_api.ApiError):
-        kstartup_api.list_announcements("key", min_expected=1)
+        kstartup_api.list_announcements("key", min_expected=p + 500)
 
 
 def test_list_record_without_id_fails_closed(kstartup_api, monkeypatch):
@@ -358,7 +399,7 @@ def test_list_stops_after_zero_open_streak(kstartup_api, monkeypatch):
     openpage = {"data": [_open(i) for i in range(p)]}
     # each all-closed page carries DISTINCT ids (real pagination never repeats a
     # record across pages — identical ids would be an overlap anomaly, caught
-    # separately by test_list_duplicate_page_fails_closed_to_crawl)
+    # separately by test_list_duplicate_page_returns_partial_not_proven)
     closed_pages = [
         {"data": [{"pbanc_sn": f"c{pg}_{i}", "rcrt_prgs_yn": "N"} for i in range(p)]}
         for pg in range(stop)
@@ -385,8 +426,10 @@ def test_list_malformed_nonempty_page_raises(kstartup_api, monkeypatch):
 
 def test_list_cap_without_exhaustion_raises(kstartup_api, monkeypatch):
     p = kstartup_api.PER_PAGE
-    full = {"data": [_open(i) for i in range(p)]}
-    monkeypatch.setattr(kstartup_api, "_fetch_page", _fake_pages([full, full, full]))
+    # DISTINCT ids per page: this exercises the page-cap path, not the overlap
+    # path (identical pages are real overlap and now return a partial result).
+    pages = [{"data": [_open(pg * p + i) for i in range(p)]} for pg in range(3)]
+    monkeypatch.setattr(kstartup_api, "_fetch_page", _fake_pages(pages))
     with pytest.raises(kstartup_api.ApiError):
         kstartup_api.list_announcements("key", min_expected=1, max_pages=2)
 
@@ -445,6 +488,38 @@ def test_cmd_list_api_window_manifest(kstartup_crawl, kstartup_api, monkeypatch,
     entry = next(r for r in manifest["runs"] if r["source"] == "kstartup")
     assert entry["stop_reason"] == "api-window" and entry["status"] == "partial"
     assert any("recent-window" in e for e in entry["errors"])
+
+
+@pytest.mark.real_key_loader
+def test_cmd_list_api_overlap_writes_partial_manifest(
+        kstartup_crawl, kstartup_api, monkeypatch, tmp_path):
+    """End-to-end: real list_announcements hits overlapping pages -> cmd_list
+    keeps the already-collected open records, writes a partial/api-window
+    manifest and exits 2 (never exit 0, never a full re-crawl)."""
+    import json
+    p = kstartup_api.PER_PAGE
+    # two DISTINCT pages, but page2 repeats a few of page1's ids -> overlap
+    page1 = {"totalCount": 4 * p, "data": [_open(str(i)) for i in range(p)]}
+    page2 = {"totalCount": 4 * p,
+             "data": [_open(str(i)) for i in range(p - 3, 2 * p - 3)]}
+    monkeypatch.setattr(kstartup_api, "_fetch_page", _fake_pages([page1, page2]))
+    monkeypatch.setattr(kstartup_api, "load_key", lambda: "k")
+    crawled = {"called": False}
+    monkeypatch.setattr(
+        kstartup_crawl, "make_fetcher",
+        lambda: crawled.__setitem__("called", True) or (lambda u: (200, ""), "x"),
+    )
+    with pytest.raises(SystemExit) as ei:
+        kstartup_crawl.cmd_list(_args(tmp_path))
+    assert ei.value.code == 2
+    assert crawled["called"] is False  # keep API data; do NOT re-crawl
+    lines = (tmp_path / "kstartup.jsonl").read_text(encoding="utf-8").splitlines()
+    ids = {json.loads(x)["pbancSn"] for x in lines}
+    assert {str(i) for i in range(p)} <= ids  # page-1 open records preserved
+    manifest = json.loads((tmp_path / "run_manifest.json").read_text(encoding="utf-8"))
+    entry = next(r for r in manifest["runs"] if r["source"] == "kstartup")
+    assert entry["stop_reason"] == "api-window" and entry["status"] == "partial"
+    assert entry["exit_code"] == 2 and entry["collected"] == len(ids)
 
 
 @pytest.mark.real_key_loader

@@ -256,10 +256,12 @@ def cmd_list(args):
                 for i in seen.values():
                     f.write(json.dumps(i, ensure_ascii=False) + "\n")
             fail = min_expected > 0 and len(seen) < min_expected
-            # A non-proven (newest-first heuristic) stop is recent-window
-            # coverage, NOT exhaustive — honestly report it as partial/exit 2
-            # (matches the exit-code contract; the crawl is the exhaustive
-            # authority, and diff mode must not conclude GONE from a partial run).
+            # A non-proven stop (newest-first window heuristic OR overlapping/
+            # repeated pagination ids) is NOT exhaustive coverage — honestly
+            # report it as partial/exit 2 (matches the exit-code contract; the
+            # crawl is the exhaustive authority, and diff mode must not
+            # conclude GONE from a partial run). The API keeps the open
+            # announcements it already collected instead of discarding them.
             window = not proven
             partial = fail or window
             errors = []
@@ -268,9 +270,10 @@ def cmd_list(args):
                     f"only {len(seen)} items via API (< {min_expected} expected)")
             if window:
                 errors.append(
-                    "api-window: recent-window coverage via newest-first heuristic "
-                    "(not a proven exhaustive scan); the crawl is the exhaustive "
-                    "authority for late reopened announcements")
+                    "api-window: recent-window or overlapping-pagination coverage "
+                    "(newest-first heuristic stop or repeated ids; NOT a proven "
+                    "exhaustive scan); the crawl is the exhaustive authority for "
+                    "late reopened announcements")
             manifest_path = update_manifest(args.output, [make_run(
                 "kstartup", "partial" if partial else "ok", 2 if partial else 0,
                 pages_fetched=pages, collected=len(seen), reported_total=total,
@@ -278,7 +281,7 @@ def cmd_list(args):
             print(
                 f"[ir-search] K-Startup via official API: {len(seen)} announcements "
                 f"(dataset 15125364"
-                f"{'' if proven else ', recent-window — exit 2 partial, crawl is exhaustive'})"
+                f"{'' if proven else ', incomplete-coverage — exit 2 partial (window/overlap), crawl is exhaustive'})"
                 f" — {args.output}",
                 file=sys.stderr,
             )

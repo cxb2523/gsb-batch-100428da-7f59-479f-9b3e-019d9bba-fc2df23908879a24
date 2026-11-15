@@ -6,7 +6,9 @@ available, currently-recruiting announcements are fetched from the official
 dataset (15125364) instead of crawling the public HTML pages; with no key the
 caller falls back to `kstartup_crawl`. The crawl remains the coverage
 guarantee — the API is an optimization, so if the API cannot PROVE it covered
-the open set it raises ApiError and the caller crawls.
+the open set it either raises ApiError (caller crawls) or returns its partial
+result with proven=False (caller records the run as partial/exit 2 — never as
+an exhaustive scan).
 
 Endpoint (dataset 15125364):
   GET https://apis.data.go.kr/B552735/kisedKstartupService01/getAnnouncementInformation01
@@ -22,6 +24,14 @@ Fail-closed contract (mirrors the crawler):
     envelope, a page-cap without proven exhaustion, a below-minimum open set,
     a timeout/transport error -> ApiError (the caller falls back to the crawl,
     the coverage guarantee).
+  - Overlapping pages (an id repeats across pages) or a repeated id within one
+    page -> STOP paginating and return the open announcements collected from
+    the already-validated pages with proven=False. Repeated ids break the
+    position proof (scanned positions over-count unique coverage), so the full
+    scan cannot be proven; but the data already fetched is real and is kept
+    instead of being thrown away for a costly re-crawl. The caller records the
+    partial result honestly (stop_reason "api-window", exit 2) — it is NEVER
+    reported as exhaustive, and the crawl remains the coverage authority.
 
 Security: the service key is read from the environment or a local file, is
 NEVER printed, and is redacted (with its quote/quote_plus/unquote and
@@ -407,11 +417,17 @@ def list_announcements(key, min_expected=1, per_page=PER_PAGE, max_pages=MAX_PAG
     Returns (records, total_count, pages_fetched, proven). *proven* is True
     only when the scan reached a totalCount-consistent end of the dataset;
     False when it stopped on the newest-first zero-open window heuristic (the
-    recent window — the caller records this honestly, e.g. stop_reason
-    "api-window", and the crawl remains the exhaustive authority). Raises
-    ManualEscalation on a block signal, or ApiError on any transport failure,
-    envelope/total inconsistency, page-cap without a stop, or below-minimum
-    open set — in every ApiError case the caller falls back to the crawl.
+    recent window) or on overlapping/repeated ids (pagination can no longer
+    prove distinct coverage). In both cases the caller records the run
+    honestly as stop_reason "api-window" / partial / exit 2, and the crawl
+    remains the exhaustive authority. Overlap does NOT discard the open
+    announcements already collected from the validated pages — they are
+    returned as a partial result instead of triggering a full re-crawl.
+
+    Raises ManualEscalation on a block signal, or ApiError on any transport
+    failure, envelope/total inconsistency, missing-id/mixed-schema page, a
+    page-cap without a stop, or below-minimum open set — in every ApiError
+    case the caller falls back to the crawl.
     """
     redact = _make_redactor(key)
     out = {}
@@ -421,6 +437,7 @@ def list_announcements(key, min_expected=1, per_page=PER_PAGE, max_pages=MAX_PAG
     page = 1
     exhausted = False   # reached a totalCount-consistent end (proven coverage)
     heuristic = False   # stopped on the zero-open window heuristic (recent set)
+    overlap = False     # stopped on repeated ids — keep what we have, never proven
     while page <= max_pages:
         payload = _fetch_page(key, page, redact, per_page)
         page_total = _total(payload)
@@ -449,16 +466,24 @@ def list_announcements(key, min_expected=1, per_page=PER_PAGE, max_pages=MAX_PAG
         # every scanned position must map to a *distinct real id*. If a row has
         # no id, or an id repeats within this page, or overlaps an id already
         # seen on a prior page (duplicate/overlapping pagination), the position
-        # counter overshoots while unique coverage stalls — we'd declare `proven`
-        # early and silently drop the real tail. Any of these fails closed to the
-        # crawl (the exhaustive-coverage authority).
+        # counter overshoots while unique coverage stalls — we could declare
+        # `proven` early and silently drop the real tail. Overlap is common on
+        # this newest-first dataset, so instead of throwing away every open
+        # announcement already collected and re-crawling from scratch, STOP
+        # paginating and return the partial set with proven=False: the caller
+        # records it honestly (api-window / partial / exit 2) and the crawl
+        # remains the exhaustive-coverage authority. We still keep every open
+        # row whose id is new (first occurrence wins), so an overlapping page
+        # does not discard usable announcements.
         page_ids = [_pick(r, ("pbanc_sn", "biz_pbanc_sn", "pbancSn")) for r in recs]
         if not all(page_ids):
+            # A row with no id is a schema change, not pagination overlap; it is
+            # not salvageable as partial data and stays a fail-closed ApiError.
             raise ApiError("record without id; cannot prove coverage; using crawl")
-        if len(set(page_ids)) != len(page_ids):
-            raise ApiError("duplicate ids within a page; using crawl")
-        if seen_ids.intersection(page_ids):
-            raise ApiError("overlapping pages (duplicate ids); using crawl")
+        overlapped = (
+            len(set(page_ids)) != len(page_ids)
+            or bool(seen_ids.intersection(page_ids))
+        )
         seen_ids.update(page_ids)
         open_on_page = 0
         for r in recs:
@@ -471,7 +496,16 @@ def list_announcements(key, min_expected=1, per_page=PER_PAGE, max_pages=MAX_PAG
                 # do not silently drop it while counting it as scanned.
                 raise ApiError("open record failed to normalize; using crawl")
             if norm["pbancSn"] not in out:
+                # first occurrence wins, so a repeated id in an overlapping page
+                # is deduped here rather than collected twice.
                 out[norm["pbancSn"]] = norm
+        if overlapped:
+            # Distinct-coverage proof is broken; stop HERE and return what we
+            # have as an explicitly unproven (partial) result. Never raise: the
+            # whole point is to keep the already-collected open announcements
+            # (plus any new open rows on this page that dedup accepted).
+            overlap = True
+            break
         if total is not None and scanned >= total:
             exhausted = True
             break
@@ -488,7 +522,7 @@ def list_announcements(key, min_expected=1, per_page=PER_PAGE, max_pages=MAX_PAG
             zero_open_streak = 0
         page += 1
         time.sleep(DELAY)
-    if not exhausted and not heuristic:
+    if not exhausted and not heuristic and not overlap:
         raise ApiError(
             f"page cap ({max_pages}) reached without a stop; using crawl"
         )

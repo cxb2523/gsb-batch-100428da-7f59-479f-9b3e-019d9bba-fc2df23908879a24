@@ -100,7 +100,7 @@ python3 skills/ir-search/scripts/scope_plan.py \
 
 `kstartup_crawl.py list`는 [공공데이터포털](https://www.data.go.kr/data/15125364/openapi.do)의 **data.go.kr 서비스키**가 있으면 K-Startup 공식 오픈API로 모집중 공고를 받고, **키가 없거나 API가 실패·차단·이상이면 자동으로 공개 페이지 크롤로 폴백**합니다(출력 스키마·매니페스트 동일). 키는 리포 루트 `.env`(`DATA_GO_KR_KEY=...`), 환경변수 `DATA_GO_KR_KEY`, 또는 공용 `~/.config/data_go_kr_key`에서 읽으며 **로그·에러·명령행에 절대 출력되지 않습니다**(`.env`는 `.gitignore`). 같은 키가 sole-search의 gov24에도 재사용됩니다.
 
-- **커버리지 정직성**: 이 데이터셋은 등록순(최신우선)이라 API가 전수 소진을 증명하면 `stop_reason: api`·exit 0, 최신우선 조기종료(최근 창)면 `stop_reason: api-window`·**exit 2(partial)**로 남깁니다. 전수 보증은 크롤이 권위이며 diff는 partial 실행에서 소멸을 단정하지 않습니다.
+- **커버리지 정직성**: 이 데이터셋은 등록순(최신우선)이라 API가 전수 소진을 증명하면 `stop_reason: api`·exit 0, 최신우선 조기종료(최근 창)면 `stop_reason: api-window`·**exit 2(partial)**로 남깁니다. 페이지네이션 겹침(이전 페이지와 같은 공고 번호가 다시 나오거나 한 페이지 안에서 번호가 반복)도 같은 `api-window`·exit 2로 정직하게 남기되, 이미 모은 모집중 공고는 버리지 않고 부분 결과로 반환합니다(전수 증명 불가 → 크롤 재수집 없이 partial). 전수 보증은 크롤이 권위이며 diff는 partial 실행에서 소멸을 단정하지 않습니다.
 - **기업마당(bizinfo)은 크롤 유지** — 공식 API가 별도 `crtfcKey`(기업마당 발급, data.go.kr 키와 다름)를 요구하고 크롤이 이미 전수 커버리지를 제공하므로 API를 쓰지 않습니다.
 
 ## 설치
