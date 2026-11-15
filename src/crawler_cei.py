@@ -38,6 +38,10 @@ this = sys.modules[__name__]
 
 this.crawler_cei = None
 
+STATUS_SUCESSO = 'sucesso'
+STATUS_SEM_TRADES = 'sem_trades'
+STATUS_FALHA = 'falha'
+
 
 @cachier(stale_after=datetime.timedelta(hours=3), cache_dir=CACHE_DIR)
 def busca_trades(cpf, senha_cei):
@@ -62,8 +66,19 @@ class CrawlerCei(ComunsB3):
         self.id_mensagem_de_aviso = 'CEIMessageDIV'
         self.id_selecao_corretoras = 'ctl00_ContentPlaceHolder1_ddlAgentes'
         self.id_btn_consultar = 'ctl00_ContentPlaceHolder1_btnConsultar'
+        self.__resultado_corretoras = {}
+
+    @property
+    def resultado_corretoras(self):
+        """Resultado da ultima coleta, por corretora:
+        {nome_da_corretora: {'status': STATUS_SUCESSO|STATUS_SEM_TRADES|STATUS_FALHA,
+                             'motivo': str|None,
+                             'quantidade_trades': int}}.
+        """
+        return self.__resultado_corretoras
 
     def busca_trades(self, cpf, senha_cei):
+        self.__resultado_corretoras = {}
         try:
             self.driver.get(self.BASE_URL)
             self.__login(cpf, senha_cei)
@@ -74,8 +89,8 @@ class CrawlerCei(ComunsB3):
                                 'Data do Negócio': 'data',
                                 'Preço (R$)': 'preco',
                                 'Valor Total(R$)': 'valor'}
-            colunas_remover = ['Mercado', 
-                               'Prazo/Vencimento', 
+            colunas_remover = ['Mercado',
+                               'Prazo/Vencimento',
                                'Especificação do Ativo',
                                'Fator de Cotação']
             return self.converte_dataframe_para_formato_padrao(df, mapeamento_colunas, colunas_remover)
@@ -131,6 +146,12 @@ class CrawlerCei(ComunsB3):
         from selenium.webdriver.support.select import Select
         ddlAgentes = Select(self.driver.find_element_by_id(self.id_selecao_corretoras))
 
+        def __nome_corretora(i):
+            try:
+                return Select(self.driver.find_element_by_id(self.id_selecao_corretoras)).options[i].text
+            except Exception:
+                return 'corretora_indice_{}'.format(i)
+
         def __busca_trades_de_uma_corretora(i):
             if self.debug: self.driver.save_screenshot(self.directory + r'04_01.png')
             ddlAgentes = Select(self.driver.find_element_by_id(self.id_selecao_corretoras))
@@ -155,6 +176,7 @@ class CrawlerCei(ComunsB3):
             if aviso.text == 'Não foram encontrados resultados para esta pesquisa.\n×':
                 consultar_click(self.driver)
                 WebDriverWait(self.driver, 60).until(exists_and_not_disabled(self.id_selecao_corretoras))
+                return None
             else:
                 if not exists_and_not_disabled(self.id_tabela_negociacao_ativos)(self.driver):
                     consultar_click(self.driver)
@@ -162,18 +184,50 @@ class CrawlerCei(ComunsB3):
                 WebDriverWait(self.driver, 30).until(EC.visibility_of_element_located(
                     (By.ID, self.id_tabela_negociacao_ativos)))
 
-                dfs_to_concat.append(self.__converte_trades_para_dataframe())
+                df_corretora = self.__converte_trades_para_dataframe()
                 consultar_click(self.driver)
                 try:
                     WebDriverWait(self.driver, 20).until(exists_and_not_disabled(self.id_selecao_corretoras))
                 except:
                     self.driver.get(self.BASE_URL + 'negociacao-de-ativos.aspx')
+                return df_corretora
+
+        def __coleta_corretora(i):
+            nome_corretora = __nome_corretora(i)
+            try:
+                df_corretora = __busca_trades_de_uma_corretora(i)
+            except Exception as ex:
+                self.__resultado_corretoras[nome_corretora] = {
+                    'status': STATUS_FALHA,
+                    'motivo': '{}: {}'.format(type(ex).__name__, ex),
+                    'quantidade_trades': 0
+                }
+                return None
+
+            if df_corretora is None:
+                self.__resultado_corretoras[nome_corretora] = {
+                    'status': STATUS_SEM_TRADES,
+                    'motivo': None,
+                    'quantidade_trades': 0
+                }
+                return None
+
+            self.__resultado_corretoras[nome_corretora] = {
+                'status': STATUS_SUCESSO,
+                'motivo': None,
+                'quantidade_trades': len(df_corretora)
+            }
+            return df_corretora
 
         if len(ddlAgentes.options) == 1:
-            __busca_trades_de_uma_corretora(0)
+            df_corretora = __coleta_corretora(0)
+            if df_corretora is not None:
+                dfs_to_concat.append(df_corretora)
         else:
             for i in range(1, len(ddlAgentes.options)):
-                __busca_trades_de_uma_corretora(i)
+                df_corretora = __coleta_corretora(i)
+                if df_corretora is not None:
+                    dfs_to_concat.append(df_corretora)
 
         if len(dfs_to_concat):
             return pd.concat(dfs_to_concat)
