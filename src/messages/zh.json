@@ -270,5 +270,12 @@
     "keywordsRequired": "关键词是必需的",
     "noValidJobId": "未收到有效的任务ID",
     "networkError": "网络错误，请重试"
+  },
+  "commentDataNotice": {
+    "partialTitle": "评论数据不完整",
+    "partialMessage": "{count} 篇笔记的评论获取失败，其余笔记的评论和全部笔记正文已正常保留，分析结果可能缺少部分评论信号。",
+    "missingTitle": "评论数据全部缺失",
+    "missingMessage": "本次未能获取到任何笔记评论，分析仅基于笔记标题和描述文本，结论可能不够充分。",
+    "failedNotes": "{count} 篇失败"
   }
 }

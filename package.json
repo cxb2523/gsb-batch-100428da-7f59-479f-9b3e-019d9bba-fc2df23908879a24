@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "test": "ts-node lib/services/clustering/test-simple.ts",
-    "test:quick": "ts-node lib/services/clustering/test-simple.ts"
+    "test:quick": "ts-node lib/services/clustering/test-simple.ts",
+    "test:xiaohongshu": "ts-node --transpile-only --project tsconfig.test.json lib/services/xiaohongshu-service.test.ts"
   },
   "dependencies": {
     "axios": "^1.7.7",

@@ -1,7 +1,7 @@
 // 任务管理服务
 import { v4 as uuidv4 } from 'uuid';
 import { DataSourceFactory } from './data-source-factory';
-import { DataSourceType, TikTokCrawlOptions } from './data-source-interface';
+import { DataSourceType, TikTokCrawlOptions, CommentFetchStatus, aggregateCommentStatus } from './data-source-interface';
 import { ClusteringService, ClusterResult } from './clustering-service';
 import { GLMService } from './glm-service';
 import { PriorityScorer, PriorityScore } from './priority-scoring';
@@ -57,6 +57,10 @@ export interface Job {
     videoCount?: number;
     commentCount?: number;
     textCount?: number;
+    // 评论获取完整度（仅深度抓取的数据源会返回）
+    commentStatus?: 'complete' | 'partial' | 'missing';
+    failedNoteCount?: number;
+    failureReasons?: string[];
   };
   // 数据质量元信息
   dataQuality?: {
@@ -248,6 +252,10 @@ class JobManagerImpl {
       const textToSourceMap: Map<string, { type: 'video' | 'comment', data: RawVideoData | RawCommentData }> = new Map();
       let totalVideoCount = 0;
       let totalCommentCount = 0;
+      // 评论完整度统计（跨关键词累加）
+      let failedNoteCount = 0;
+      const commentFailureReasons: string[] = [];
+      const commentStatuses: CommentFetchStatus[] = [];
 
       for (let i = 0; i < job.keywords.length; i++) {
         const keyword = job.keywords[i];
@@ -273,6 +281,15 @@ class JobManagerImpl {
           allRawTexts.push(...result.rawTexts);
           totalVideoCount += result.videoCount || 0;
           totalCommentCount += result.commentCount || 0;
+
+          // 记录评论完整度（部分平台暂不返回该字段，此时不记录）
+          if (result.commentStatus) {
+            commentStatuses.push(result.commentStatus);
+            failedNoteCount += result.failedNoteCount || 0;
+            if (result.failureReasons) {
+              commentFailureReasons.push(...result.failureReasons);
+            }
+          }
 
           // 保存原始视频数据
           if (result.videos) {
@@ -348,11 +365,19 @@ class JobManagerImpl {
         }
       }
 
+      // 汇总评论完整度：全部关键词都完整才为 complete，全部缺失才为 missing，否则为 partial
+      const aggregatedCommentStatus = aggregateCommentStatus(commentStatuses);
+
       // 保存抓取统计
       job.crawlStats = {
         videoCount: totalVideoCount || allVideos.length,
         commentCount: totalCommentCount || allComments.length,
-        textCount: allRawTexts.length
+        textCount: allRawTexts.length,
+        ...(aggregatedCommentStatus && {
+          commentStatus: aggregatedCommentStatus,
+          failedNoteCount,
+          failureReasons: [...new Set(commentFailureReasons)].slice(0, 5)
+        })
       };
 
       // 保存原始数据

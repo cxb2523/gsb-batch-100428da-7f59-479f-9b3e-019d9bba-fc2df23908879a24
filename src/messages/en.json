@@ -268,5 +268,12 @@
     "keywordsRequired": "Keywords are required",
     "noValidJobId": "No valid job ID received",
     "networkError": "Network error, please retry"
+  },
+  "commentDataNotice": {
+    "partialTitle": "Incomplete comment data",
+    "partialMessage": "Comments failed for {count} note(s). Comments from the remaining notes and all note text were kept; some comment signals may be missing from the analysis.",
+    "missingTitle": "All comment data missing",
+    "missingMessage": "No comments could be fetched. The analysis is based only on note titles and descriptions, so conclusions may be less complete.",
+    "failedNotes": "{count} failed"
   }
 }

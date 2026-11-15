@@ -46,6 +46,14 @@ export async function GET(
         rawTexts: string[];
       };
       clusteredData?: ClusteredDataGroup[];
+      crawlStats?: {
+        videoCount?: number;
+        commentCount?: number;
+        textCount?: number;
+        commentStatus?: 'complete' | 'partial' | 'missing';
+        failedNoteCount?: number;
+        failureReasons?: string[];
+      };
       error?: string;
     } = {
       jobId: job.jobId,
@@ -53,6 +61,11 @@ export async function GET(
       progress: job.progress,
       keywords: job.keywords
     };
+
+    // 抓取统计（包含评论完整度），任务进行中也可能已有部分结果，直接透传
+    if (job.crawlStats) {
+      response.crawlStats = job.crawlStats;
+    }
 
     // 如果任务完成，包含结果
     if (job.status === "completed" && job.results) {

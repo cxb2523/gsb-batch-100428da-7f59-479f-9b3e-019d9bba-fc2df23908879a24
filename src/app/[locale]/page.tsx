@@ -11,6 +11,8 @@ import DetailModal from "@/components/DetailModal";
 import ExportButton from "@/components/ExportButton";
 import RawDataExportButton from "@/components/RawDataExportButton";
 import DataQualityBanner from "@/components/DataQualityBanner";
+import CommentDataNotice from "@/components/CommentDataNotice";
+import type { CrawlStats } from "@/components/CommentDataNotice";
 import LanguageSwitcher from "@/components/LanguageSwitcher";
 
 // ClusterResult 类型定义
@@ -107,6 +109,7 @@ interface JobResponse {
     clusterCount: number;
     averageClusterSize: number;
   };
+  crawlStats?: CrawlStats;
   error?: string;
 }
 
@@ -310,6 +313,9 @@ export default function Home() {
               </div>
 
               {/* 数据质量提示 */}
+              {jobData?.crawlStats?.commentStatus && jobData.crawlStats.commentStatus !== 'complete' && (
+                <CommentDataNotice crawlStats={jobData.crawlStats} />
+              )}
               {jobData?.dataQuality && (
                 <DataQualityBanner dataQuality={jobData.dataQuality} />
               )}
