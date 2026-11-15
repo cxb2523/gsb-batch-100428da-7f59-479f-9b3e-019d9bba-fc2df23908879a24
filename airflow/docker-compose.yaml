@@ -1,0 +1,23 @@
+version: '3.7'
+services:
+    airflow:
+        build:
+            context: .
+            dockerfile: Dockerfile
+            args:
+                - AIRFLOW_HOME=$AIRFLOW_HOME
+                - USER_ID=$USER_ID
+                - GROUP_ID=$GROUP_ID
+        environment:
+            - GOOGLE_CLOUD_PROJECT=$GOOGLE_CLOUD_PROJECT
+            - BQ_DATASET=$BQ_DATASET
+            - GCS_BUCKET=$GCS_BUCKET
+            - PYTHONPATH=$AIRFLOW_HOME/dags
+            - AIRFLOW__CORE__DAGS_FOLDER=$AIRFLOW_HOME/dags
+            - AIRFLOW__CORE__SQL_ALCHEMY_CONN=sqlite:///$AIRFLOW_HOME/airflow.db
+            - AIRFLOW__CORE__LOAD_EXAMPLES=FALSE
+            - AIRFLOW__WEBSERVER__EXPOSE_CONFIG=TRUE
+        volumes:
+            - ./dags:$AIRFLOW_HOME/dags
+        ports:
+            - 8080:8080
