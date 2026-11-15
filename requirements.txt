@@ -1,6 +1,7 @@
 praw
-pandas 
-numpy 
+pandas
+numpy
+pyarrow
 wheel
 requests
 tqdm

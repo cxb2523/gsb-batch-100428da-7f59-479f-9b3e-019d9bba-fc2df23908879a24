@@ -6,6 +6,13 @@ This repository will help you scrape various subreddits, and will return to you 
 
 You can pip install this to integrate with some other application, or use it as an commandline application.
 
+Tests can be run with `pytest`:
+
+```commandLine
+pip install -r dev-requirements.txt
+pytest tests
+```
+
 - PyPI Link:  https://pypi.org/project/reddit-multimodal-crawler/
 
 ```commandLine
@@ -21,6 +28,65 @@ Although, the easier way is to use the `pip install reddit-multimodal-crawler`.
 ## Functionalities
 
 This will help you scrape multiple subreddits just like `PRAW` but, will also return and save datasets for the same. Will scrape the posts and the comments as well.
+
+### Save formats
+
+`get_posts` and `get_comments` accept `save_format`:
+
+| `save_format` | Writer | File written into `base_dir` |
+| --- | --- | --- |
+| `csv` | `DataFrame.to_csv` | `posts.csv` / `comments.csv` |
+| `tsv` | `DataFrame.to_csv(sep="\t")` | `posts.tsv` / `comments.tsv` |
+| `parquet` | `DataFrame.to_parquet` | `posts.parquet` / `comments.parquet` |
+| `json` | `DataFrame.to_json(orient="records")` | `posts.json` / `comments.json` |
+| `sql` | `DataFrame.to_sql` | `posts.sql` / `comments.sql` (SQLite database) |
+| `pickle` | `DataFrame.to_pickle` | `posts.pkl` / `comments.pkl` |
+
+Any other format raises `NotImplementedError`. `base_dir` is created recursively if
+it does not exist, so a nested path such as `--base_dir deep/a/b/c` works.
+
+`save_format="sql"` writes to a SQLite database by default. To write somewhere
+else, pass a connection (a `sqlite3.Connection` or a SQLAlchemy engine) as
+`sql_connection`; the records are then written to the `posts` / `comments` table.
+
+### Per-subreddit outcome
+
+Each call records what happened to every subreddit, so a partial run is still
+traceable. The list is available on the crawler (`crawler.posts_outcome`,
+`crawler.comments_outcome`) and, when `save=True`, written next to the dataset as
+`posts_outcome.json` / `comments_outcome.json`.
+
+```json
+[
+  {
+    "subreddit": "python",
+    "status": "partial_success",
+    "collected": 42,
+    "failures": [
+      {"post_id": "abc123", "reason": "AttributeError: score is unavailable"}
+    ]
+  },
+  {
+    "subreddit": "private",
+    "status": "failure",
+    "collected": 0,
+    "failures": [{"post_id": null, "reason": "RuntimeError: 403 forbidden"}]
+  }
+]
+```
+
+Statuses are `success`, `partial_success` and `failure`. Outcomes are recorded per
+crawler method:
+
+- Posts: one broken post is skipped (and recorded) while the remaining posts of
+  that subreddit are collected. A subreddit that cannot be fetched at all is
+  recorded as `failure`; the other subreddits are still crawled.
+- Comments: if reading a post's comments breaks, the comments already read are
+  kept, the interruption is recorded and the next post is processed.
+
+Use `crawler.posts_outcome["python"]` (or `.get(...)`) to look a record up by
+subreddit name.
+
 
 ### Sample Code
 

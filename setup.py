@@ -14,7 +14,7 @@ setup(
     author="Aneesh Aparajit G",
     url="https://github.com/aneesh-aparajit/reddit-crawler",
     packages=["reddit_multimodal_crawler"],
-    install_requires=["praw", "pandas", "numpy", "requests", "bcrypt", "nltk"],
+    install_requires=["praw", "pandas", "numpy", "pyarrow", "requests", "bcrypt", "nltk"],
     keywords=["web-scraping", "webscraper", "reddit", "multimodal", "datascience"],
     author_email="aneeshaparajit.g2002@gmail.com",
 )
