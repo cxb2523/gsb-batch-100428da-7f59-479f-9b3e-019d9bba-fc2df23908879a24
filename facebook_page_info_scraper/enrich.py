@@ -242,6 +242,12 @@ class Fetched:
                                   # timeout|dns|error|http_NNN
     tier: str = "requests"        # requests | curl_cffi
     error: Optional[str] = None
+    source: str = "direct"        # which attempt produced this result:
+                                  # direct | proxy
+    direct_attempt: Optional[dict] = None   # summary of the direct attempt,
+                                  # or {"skipped": ...} when never tried
+    proxy_attempt: Optional[dict] = None    # summary of the proxy attempt,
+                                  # or {"skipped": ...} when never tried
 
     @property
     def ok(self) -> bool:
@@ -342,6 +348,16 @@ def _get_fingerprint(url: str, timeout: int) -> Fetched:
         )
 
 
+def _attempt_summary(fetched: Fetched) -> dict:
+    """One attempt's outcome, kept small enough to sit in a result dict."""
+    return {
+        "outcome": fetched.outcome,
+        "tier": fetched.tier,
+        "status": fetched.status,
+        "error": fetched.error,
+    }
+
+
 def _get_proxy(url: str, timeout: int, provider: Optional[str]) -> Fetched:
     """Tier 3 - come from a different address entirely.
 
@@ -355,7 +371,7 @@ def _get_proxy(url: str, timeout: int, provider: Optional[str]) -> Fetched:
     tier = answer["provider"] or "proxy"
     if answer["body"] is None:
         return Fetched(outcome="error", tier=tier, error=answer["error"],
-                       status=answer["status"])
+                       status=answer["status"], source="proxy")
     return Fetched(
         body=answer["body"],
         status=answer["status"],
@@ -363,6 +379,7 @@ def _get_proxy(url: str, timeout: int, provider: Optional[str]) -> Fetched:
                              answer["headers"]),
         tier=tier,
         error=answer["error"],
+        source="proxy",
     )
 
 
@@ -376,13 +393,24 @@ def _get(
     proxy_provider: Optional[str] = None,
     proxy_mode: str = "fallback",
 ) -> Fetched:
-    """Fetch one page, escalating through the tiers until one succeeds."""
+    """Fetch one page, escalating through the tiers until one succeeds.
+
+    Every attempt is recorded on the returned Fetched: `direct_attempt` and
+    `proxy_attempt` summarise each side (or say why it was skipped), and
+    `source` names which attempt the final result was adopted from. A
+    failed proxy never masks the real reason the site did not load.
+    """
     # proxy_mode="always" skips straight to the proxy - for callers on an
-    # unmetered plan who want every request to leave from one.
+    # unmetered plan who want every request to leave from one. The proxy
+    # result is the final answer even when it fails; the direct attempt is
+    # recorded as skipped so that is visible rather than implied.
     if use_proxy and proxy_mode == "always":
         viaproxy = _get_proxy(url, timeout, proxy_provider)
-        if viaproxy.ok:
-            return viaproxy
+        viaproxy.direct_attempt = {
+            "skipped": True, "reason": "proxy_mode=always",
+        }
+        viaproxy.proxy_attempt = _attempt_summary(viaproxy)
+        return viaproxy
 
     result = _get_requests(session, url, timeout)
 
@@ -391,15 +419,30 @@ def _get(
         # Keep the retry only if it actually got us further.
         if retried.ok or retried.outcome != "error":
             result = retried
-        if result.ok:
-            return result
 
-    if use_proxy and not result.ok and proxy.should_retry(result.outcome):
+    result.source = "direct"
+    result.direct_attempt = _attempt_summary(result)
+
+    if result.ok:
+        result.proxy_attempt = {"skipped": True, "reason": "direct_ok"}
+        return result
+
+    if not use_proxy:
+        result.proxy_attempt = {"skipped": True, "reason": "not_configured"}
+    elif proxy.should_retry(result.outcome):
         viaproxy = _get_proxy(url, timeout, proxy_provider)
         # Only adopt the proxy answer when it beat the direct one; a failed
         # proxy must never mask the real reason the site did not load.
         if viaproxy.ok:
+            viaproxy.direct_attempt = result.direct_attempt
+            viaproxy.proxy_attempt = _attempt_summary(viaproxy)
             return viaproxy
+        result.proxy_attempt = _attempt_summary(viaproxy)
+    else:
+        result.proxy_attempt = {
+            "skipped": True,
+            "reason": f"outcome {result.outcome} not retryable",
+        }
 
     return result
 
@@ -462,6 +505,7 @@ def _collect(
         "status": "ok",
         "tier": "requests",
         "fetch_outcome": "ok",
+        "fetch_source": "direct",
     }
 
     page = _get(session, url, timeout, use_fingerprint=use_fingerprint,
@@ -470,6 +514,9 @@ def _collect(
     result["pages_fetched"] += 1
     result["tier"] = page.tier
     result["fetch_outcome"] = page.outcome
+    result["fetch_source"] = page.source
+    result["direct_attempt"] = page.direct_attempt
+    result["proxy_attempt"] = page.proxy_attempt
     if page.error:
         result["error"] = page.error
 

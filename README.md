@@ -381,6 +381,9 @@ The `enrichment` dict holds everything, not just the winner:
 | `status` | `str` | Same as `_enrich_status` |
 | `tier` | `str` | Which fetch tier succeeded |
 | `fetch_outcome` | `str` | `ok`, `challenged`, `forbidden`, `not_found`, `timeout`, `dns`, `error`, `http_NNN` |
+| `fetch_source` | `str` | Which attempt the result was adopted from — `direct` or `proxy` |
+| `direct_attempt` | `dict` | How the direct attempt ended (`outcome`, `tier`, `status`, `error`), or `{"skipped": true, "reason": ...}` |
+| `proxy_attempt` | `dict` | How the proxy attempt ended, or `{"skipped": true, "reason": ...}` |
 | `error` | `str` | Exception name, when one occurred |
 | `pages_fetched` | `int` | Requests spent on this site |
 | `found_on_path` | `str` | Which contact path paid off, if one did |
@@ -389,6 +392,14 @@ The `enrichment` dict holds everything, not just the winner:
 `fetch_outcome` is the one to read when a site fails — it separates a dead
 domain (`dns`) from an expired certificate (`error`), a missing page
 (`not_found`) and a site that is up and refusing you (`challenged`).
+
+With a proxy configured, `fetch_outcome` and `error` describe the attempt
+that was *adopted* (`fetch_source`), while `direct_attempt` and
+`proxy_attempt` keep both sides: a failed proxy never overwrites the real
+reason the site did not load directly, so you can tell "switch proxies"
+(proxy failed, direct was fine) from "give up on this site" (both failed).
+With `proxy_mode="always"` the proxy result is the final answer and
+`direct_attempt` records that the direct fetch was skipped.
 
 ### Options
 

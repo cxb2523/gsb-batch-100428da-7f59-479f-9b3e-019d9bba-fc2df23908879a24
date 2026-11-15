@@ -53,12 +53,15 @@ PROVIDERS: dict[str, dict] = {
 
 PROVIDER_ORDER = ("custom", "scrapingant")
 
-# Outcomes worth a second attempt from another address.
-RETRYABLE = ("challenged", "forbidden", "error", "timeout")
+# Outcomes worth a second attempt from another address. "dns" qualifies:
+# a local DNS failure can be the resolver's problem (blocked or broken
+# DNS), and a proxy resolves the name from its own address, so it is the
+# one fix for that failure mode.
+RETRYABLE = ("challenged", "forbidden", "error", "timeout", "dns")
 
-# Never worth retrying: no proxy revives a domain nobody registered, and a
-# 404 is a 404 from every address on earth.
-NEVER_RETRY = ("ok", "dns", "not_found", "redirect")
+# Never worth retrying: a 404 is a 404 from every address on earth.
+NEVER_RETRY = ("ok", "not_found", "redirect")
+
 
 
 def should_retry(outcome: str) -> bool:
