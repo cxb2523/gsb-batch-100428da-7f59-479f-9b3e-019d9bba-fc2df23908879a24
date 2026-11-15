@@ -31,7 +31,7 @@ def normalize_activity(raw: dict, category: str) -> dict | None:
         start, end = end, start
 
     aid = raw.get("id") or make_id(title, source_url)
-    return {
+    act = {
         "id": aid,
         "title": title,
         "category": category,
@@ -47,6 +47,11 @@ def normalize_activity(raw: dict, category: str) -> dict | None:
         "last_seen": "",  # 由 merge 填
         "status": "active",  # 由 refresh_status 填
     }
+    # 抓取结局标记（云厂商采集器写入）：是「本次运行」的事实，需随条目落库保留，
+    # 否则数据里看不出这条是真实抓到还是受限回退
+    if raw.get("fetch_status"):
+        act["fetch_status"] = raw["fetch_status"]
+    return act
 
 
 def merge(old_list: list[dict], new_list: list[dict], today: date) -> list[dict]:
@@ -56,15 +61,17 @@ def merge(old_list: list[dict], new_list: list[dict], today: date) -> list[dict]
     - ID 相同视为同一活动
     - 已有字段（description/value/requirements/tags）若新值为空则保留旧值
     - 起止日期：旧值优先（一旦确定不轻易改），新值仅当旧值为空时采用
+    - fetch_status（抓取结局）：新条目带了就以新为准，成功抓取会清除旧回退标记
     - last_seen 更新为今天
-    - status 按日期重算
+    - status 按日期重算（回退条目不会被强制写成 active）
     """
     by_id = {a["id"]: a for a in old_list}
     for new in new_list:
         nid = new["id"]
         if nid in by_id:
             old = by_id[nid]
-            # 字段补全：旧值空时才用新值
+            # 字段补全：旧值空时才用新值——回退条目因此永远不会覆盖
+            # 已有的有效描述、标签等字段
             for k in ("description", "value", "source_url", "claim_url", "title"):
                 if not old.get(k) and new.get(k):
                     old[k] = new[k]
@@ -75,6 +82,10 @@ def merge(old_list: list[dict], new_list: list[dict], today: date) -> list[dict]
             for k in ("start_date", "end_date"):
                 if not old.get(k) and new.get(k):
                     old[k] = new[k]
+            # fetch_status 是「本次抓取的结局」，不是累积字段：新条目带了就以新为准
+            # （成功抓取会清掉旧的回退标记）；没带（如博客条目）则保留旧标记
+            if new.get("fetch_status"):
+                old["fetch_status"] = new["fetch_status"]
         else:
             by_id[nid] = new
         by_id[nid]["last_seen"] = today.isoformat()

@@ -12,9 +12,15 @@ from datetime import timedelta
 
 import requests
 
-from utils import log, now_bj, safe_text
+from utils import log, now_bj, parse_date, safe_text, status_of
 
 BJ = now_bj()
+
+# 抓取结局（写入条目 fetch_status 字段，随合并落库保留，
+# 用于区分「本次真实抓到」与「受限回退旧数据」）
+FETCH_OK = "fetched"                      # 正常抓到 title/meta
+FETCH_FALLBACK_NO_META = "fallback_no_meta"  # 页面能打开但无 meta（风控/改版/跳转），回退旧数据
+FETCH_FALLBACK_ERROR = "fallback_error"        # 请求失败（非 200/超时/异常），回退旧数据
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:140.0) Gecko/20100101 Firefox/140.0",
@@ -83,21 +89,27 @@ def fetch_page(url: str, referer: str = "") -> str | None:
         return None
 
 
-def _fallback_from_old(old_acts: list[dict] | None, url: str, vendor: str, section: str) -> list[dict]:
-    """抓取失败时（如海外 IP 被风控），从旧数据找回该 URL 的条目。
+def _fallback_from_old(old_acts: list[dict] | None, url: str, vendor: str, section: str, reason: str) -> list[dict]:
+    """抓取受限时（如海外 IP 被风控），从旧数据找回该 URL 的条目。
 
     云厂商活动是长期活动，页面抓不到不代表活动结束，
     沿用缓存数据并顺延 30 天。
+    只回退同 URL（稳定 id）的旧条目；没有旧数据时返回空，不凭空生成。
+    条目上写 fetch_status=reason 标明本次结局；status 按日期规则重算，
+    不强制 active（结束日期已过的条目仍会被后续状态刷新判为 ended）。
     """
     sid = _stable_id(url)
     for a in old_acts or []:
         if a.get("id") == sid:
             cached = dict(a)
             cached["end_date"] = (BJ + timedelta(days=30)).strftime("%Y-%m-%d")
-            cached["status"] = "active"
-            cached["title"] = f"{vendor}·{section}"
-            log(f"[{vendor}] {section}: 沿用缓存数据（页面抓取受限）")
+            cached["fetch_status"] = reason
+            cached["status"] = status_of(
+                parse_date(cached.get("start_date")), parse_date(cached["end_date"]), BJ.date()
+            )
+            log(f"[{vendor}] {section}: 沿用缓存数据（{reason}，页面抓取受限）")
             return [cached]
+    log(f"[{vendor}] {section}: 抓取受限且无同 URL 旧数据，本次不生成条目", level="WARN")
     return []
 
 
@@ -107,6 +119,12 @@ def collect_cloud_activities(old_acts: list[dict] | None = None) -> list[dict]:
     每个活动页生成一条活动：标题=厂商+板块，描述=title+description 摘要。
     ID 基于 URL，稳定去重；活动长期有效，end_date 顺延 30 天。
     抓取失败的页面从 old_acts 缓存回退（长期活动不会因网络问题误判过期）。
+
+    每个活动页有三种结局，写在条目 fetch_status 字段上：
+    - fetched：正常抓到 meta，条目来自本次真实抓取（同时清除旧回退标记）
+    - fallback_no_meta：页面能打开但无 title/description，回退同 URL 旧数据
+    - fallback_error：请求失败（风控/超时/非 200），回退同 URL 旧数据
+    回退只取自同 URL（稳定 id）的旧数据；没有旧数据时不生成条目。
     """
     activities: list[dict] = []
     today = BJ.strftime("%Y-%m-%d")
@@ -117,7 +135,7 @@ def collect_cloud_activities(old_acts: list[dict] | None = None) -> list[dict]:
         referer = "https://cloud.tencent.com/" if "cloud.tencent.com" in url else ""
         html = fetch_page(url, referer=referer)
         if not html:
-            activities.extend(_fallback_from_old(old_acts, url, vendor, section))
+            activities.extend(_fallback_from_old(old_acts, url, vendor, section, FETCH_FALLBACK_ERROR))
             continue
 
         title, desc = _get_meta(html)
@@ -125,7 +143,7 @@ def collect_cloud_activities(old_acts: list[dict] | None = None) -> list[dict]:
             # 诊断：打出返回内容片段，方便排查（如海外 IP 被风控/跳转）
             snippet = re.sub(r"\s+", " ", html[:300])
             log(f"[{vendor}] {url} 无 meta，返回内容: {snippet[:150]}", level="WARN")
-            activities.extend(_fallback_from_old(old_acts, url, vendor, section))
+            activities.extend(_fallback_from_old(old_acts, url, vendor, section, FETCH_FALLBACK_NO_META))
             continue
 
         # 拼活动标题和描述
@@ -144,6 +162,7 @@ def collect_cloud_activities(old_acts: list[dict] | None = None) -> list[dict]:
             "category": "ai",  # 归入 ai 板块（AI 算力/额度/代金券）
             "tags": [vendor, section],
             "status": "active",
+            "fetch_status": FETCH_OK,
             "discovered_at": now_bj().isoformat(),
         })
         log(f"[{vendor}] {section}: {detail[:60]}")

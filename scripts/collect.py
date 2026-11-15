@@ -475,7 +475,10 @@ def _merge_and_save(category: str, new_acts: list[dict], today) -> None:
 
     new_acts = dedupe_within(new_acts)
 
-    # 云厂商活动是长期活动：同 id 条目用新 end_date 刷新旧数据
+    # 云厂商活动是长期活动：同 id 条目用新 end_date 刷新旧数据（含回退条目的顺延）。
+    # 注意：回退条目（fetch_status=fallback_*）只顺延 end_date，描述/标签等字段
+    # 由 merge 的「旧值优先」保护不被覆盖；status 由 merge 末尾按日期重算，
+    # 不会因回退被强制写成 active。
     if category == "ai":
         new_by_id = {a["id"]: a for a in new_acts}
         for o in old:
