@@ -112,26 +112,18 @@ export async function runCrawler(options: RunOptions): Promise<CrawlReport> {
       const key = sourceKey(item.provider, item.source);
       const crawler = crawlerByProvider.get(item.provider);
       if (crawler === undefined) {
-        recordFailure(failures, stats[item.provider], item.provider, key, new Error(`No crawler for provider ${item.provider}`));
+        recordFailure(failures, stats[item.provider], item.provider, key, new Error(`No crawler for provider ${item.provider}`), 0);
         continue;
       }
 
-      try {
-        const jobs = await providerLimiters[item.provider].run(async () => {
-          const fetchedAt = new Date().toISOString();
-          return crawler.crawl(item.source, {
-            http: HTML_SCRAPING_PROVIDERS.has(item.provider) ? httpWithJitter : http,
-            fetchedAt: () => fetchedAt,
-            maxJobsPerSource: options.maxJobsPerSource,
-            urlTemplate: item.urlTemplate,
-            jobIdTemplate: item.jobIdTemplate
-          });
-        });
+      // Jobs streamed by paginating crawlers (onJobs) are persisted immediately,
+      // so a failure on a later page still keeps the pages already fetched.
+      let emitted = 0;
+      let streamed = false;
+      const emitJobs = async (jobs: NormalizedJob[]): Promise<void> => {
         if (catalogStore !== undefined) {
           catalogStore.recordJobs(jobs, startedAt);
         }
-
-        let emitted = 0;
         for (const job of jobs) {
           if (minUpdatedAtMs !== undefined && !isFreshEnough(job.posted_at ?? job.updated_at, minUpdatedAtMs)) {
             continue;
@@ -143,13 +135,38 @@ export async function runCrawler(options: RunOptions): Promise<CrawlReport> {
           seenJobs.add(dedupeKey);
           await writer.write(job);
           emitted += 1;
+          stats[item.provider].jobs += 1;
+        }
+      };
+
+      try {
+        const jobs = await providerLimiters[item.provider].run(async () => {
+          const fetchedAt = new Date().toISOString();
+          return crawler.crawl(item.source, {
+            http: HTML_SCRAPING_PROVIDERS.has(item.provider) ? httpWithJitter : http,
+            fetchedAt: () => fetchedAt,
+            maxJobsPerSource: options.maxJobsPerSource,
+            urlTemplate: item.urlTemplate,
+            jobIdTemplate: item.jobIdTemplate,
+            onJobs: (page) => {
+              streamed = true;
+              return emitJobs(page);
+            }
+          });
+        });
+
+        if (!streamed) {
+          // Non-paginating crawlers return the full batch at once.
+          await emitJobs(jobs);
         }
 
+        // A clean run is a success even when the source has no postings.
         stats[item.provider].succeeded += 1;
-        stats[item.provider].jobs += emitted;
       } catch (error) {
-        recordFailure(failures, stats[item.provider], item.provider, key, error);
-        if (stateDir && error instanceof HttpError && error.status !== undefined) {
+        recordFailure(failures, stats[item.provider], item.provider, key, error, emitted);
+        // Only quarantine sources that produced nothing. A partial source must
+        // stay eligible so a later rerun can fetch the missing pages.
+        if (stateDir && emitted === 0 && error instanceof HttpError && error.status !== undefined) {
           markDead(stateDir, item.provider, key, error.status);
         }
       } finally {
@@ -183,6 +200,7 @@ export async function runCrawler(options: RunOptions): Promise<CrawlReport> {
     skipped_sources: providers.reduce((sum, provider) => sum + stats[provider].skipped, 0),
     skipped_by_provider: Object.fromEntries(providers.map((provider) => [provider, stats[provider].skipped])) as Record<Provider, number>,
     providers: stats,
+    partial_sources: providers.reduce((sum, provider) => sum + stats[provider].partial, 0),
     total_jobs: providers.reduce((sum, provider) => sum + stats[provider].jobs, 0),
     failures
   };
@@ -210,6 +228,7 @@ function initStats(): Record<Provider, ProviderStats> {
         sources: 0,
         skipped: 0,
         succeeded: 0,
+        partial: 0,
         failed: 0,
         jobs: 0
       }
@@ -222,13 +241,32 @@ function recordFailure(
   stats: ProviderStats,
   provider: Provider,
   key: string,
-  error: unknown
+  error: unknown,
+  jobsEmitted: number
 ): void {
   const message = error instanceof Error ? error.message : String(error);
   const status = error instanceof HttpError ? error.status : undefined;
-  console.error(JSON.stringify({ event: "failure", provider, source_key: key, status, message }));
-  stats.failed += 1;
-  failures.push({ provider, source_key: key, status, message });
+  const partial = jobsEmitted > 0;
+  console.error(JSON.stringify({
+    event: "failure",
+    provider,
+    source_key: key,
+    status,
+    message,
+    partial,
+    jobs_emitted: jobsEmitted
+  }));
+  if (partial) {
+    stats.partial += 1;
+  } else {
+    stats.failed += 1;
+  }
+  const failure: CrawlFailure = { provider, source_key: key, status, message };
+  if (partial) {
+    failure.partial = true;
+    failure.jobs_emitted = jobsEmitted;
+  }
+  failures.push(failure);
 }
 
 export function writeJobForTest(job: NormalizedJob): string {
@@ -429,14 +467,16 @@ function logProgress(
   const percent = total === 0 ? 100 : Math.round((completed / total) * 100);
   let jobs = 0;
   let succeeded = 0;
+  let partial = 0;
   let failed = 0;
   const byProvider = Object.fromEntries(
     providers.map((provider) => {
       const s = stats[provider];
       jobs += s.jobs;
       succeeded += s.succeeded;
+      partial += s.partial;
       failed += s.failed;
-      return [provider, { done: s.succeeded + s.failed, total: s.sources, skipped: s.skipped, jobs: s.jobs, failed: s.failed }];
+      return [provider, { done: s.succeeded + s.partial + s.failed, total: s.sources, skipped: s.skipped, jobs: s.jobs, succeeded: s.succeeded, partial: s.partial, failed: s.failed }];
     })
   );
 
@@ -447,6 +487,7 @@ function logProgress(
     total_sources: total,
     percent,
     succeeded_sources: succeeded,
+    partial_sources: partial,
     failed_sources: failed,
     total_jobs: jobs,
     failures_recorded: failureCount,

@@ -105,6 +105,24 @@ Default output directory: `crawler/output/`
 - `current-jobs.jsonl` — All jobs from latest run
 - `report.json` — Statistics and failures summary
 
+### Source outcomes and partial success
+
+Every source ends a run in exactly one of three states, tracked per provider in
+`report.json` under `providers.<provider>`:
+
+- `succeeded` — the crawl finished without error (a source with zero postings still counts as succeeded).
+- `partial` — the source wrote one or more jobs, but the crawl still raised an error
+  afterwards (for example a request on a later pagination page failed). The jobs already
+  fetched are kept in the JSONL output and the SQLite catalog.
+- `failed` — the crawl raised an error before any job was written.
+
+`partial_sources` is the run-wide partial count. Each entry in `failures` keeps its
+existing fields; partial failures additionally carry `"partial": true` and
+`"jobs_emitted": <n>`, so fully failed entries remain unchanged. A partial source is not
+added to the dead-slug quarantine, so rerunning it can fetch the missing pages. On a
+successful rerun, in-memory and catalog dedupe guarantee the already-written jobs are not
+written twice.
+
 The repository ignores all local artifacts (only `.gitkeep` is tracked).
 
 ## Source Quarantine (Optional)

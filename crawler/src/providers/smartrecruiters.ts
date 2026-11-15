@@ -53,16 +53,23 @@ export const smartrecruitersCrawler: ProviderCrawler = {
     const urlTemplate = context.urlTemplate ?? defaultUrlTemplate;
     const jobIdTemplate = context.jobIdTemplate ?? defaultJobIdTemplate;
     const fetchedAt = context.fetchedAt();
-    const jobs = await fetchSmartRecruitersJobs(identifier, urlTemplate, context);
+    const normalizedJobs: NormalizedJob[] = [];
 
-    return jobs.map((job) => normalizeSmartRecruitersJob(identifier, job, fetchedAt, jobIdTemplate));
+    await fetchSmartRecruitersJobs(identifier, urlTemplate, context, (page) => {
+      const jobs = page.map((job) => normalizeSmartRecruitersJob(identifier, job, fetchedAt, jobIdTemplate));
+      normalizedJobs.push(...jobs);
+      return context.onJobs?.(jobs);
+    });
+
+    return normalizedJobs;
   }
 };
 
 export async function fetchSmartRecruitersJobs(
   identifier: string,
   urlTemplate: string,
-  context: CrawlContext
+  context: CrawlContext,
+  onPage?: (jobs: SmartRecruitersJob[]) => void | Promise<void>
 ): Promise<SmartRecruitersJob[]> {
   const jobs: SmartRecruitersJob[] = [];
   let offset = 0;
@@ -74,7 +81,15 @@ export async function fetchSmartRecruitersJobs(
     const page = extractJobs(response);
     jobs.push(...page);
 
-    if (context.maxJobsPerSource !== undefined && jobs.length >= context.maxJobsPerSource) {
+    const capped = context.maxJobsPerSource !== undefined && jobs.length >= context.maxJobsPerSource;
+    // Only emit the portion that still fits under the per-source cap.
+    const pageToEmit = capped
+      ? page.slice(0, Math.max(0, context.maxJobsPerSource! - (jobs.length - page.length)))
+      : page;
+    if (pageToEmit.length > 0) {
+      await onPage?.(pageToEmit);
+    }
+    if (capped) {
       return jobs.slice(0, context.maxJobsPerSource);
     }
 

@@ -21,8 +21,10 @@ fi
 added=0
 total_before=$(wc -l < "$EXCLUDE_FILE")
 
-# Extract 404/410 failures and add to exclude.jsonl
-jq -r '.failures[] | select(.status == 404 or .status == 410) | @json' "$REPORT_FILE" 2>/dev/null | while read failure; do
+# Extract 404/410 failures and add to exclude.jsonl.
+# Partial successes (partial: true) already emitted jobs, so they stay
+# rerunnable and must not be quarantined.
+jq -r '.failures[] | select((.status == 404 or .status == 410) and (.partial // false | not)) | @json' "$REPORT_FILE" 2>/dev/null | while read failure; do
   if [ -z "$failure" ]; then continue; fi
   
   provider=$(echo "$failure" | jq -r '.provider')

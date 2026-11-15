@@ -26,24 +26,35 @@ export const workdayCrawler: ProviderCrawler = {
   async crawl(source: SourceEntry, context: CrawlContext): Promise<NormalizedJob[]> {
     const workday = source as WorkdaySource;
     const jobs: WorkdayJob[] = [];
+    const key = `${workday.tenant}/${workday.shard}/${workday.site}`;
+    const fetchedAt = context.fetchedAt();
 
     for (let offset = 0; offset < pageLimit * maxPagesPerSource; offset += pageLimit) {
       const page = await fetchPage(workday, offset, context);
       const postings = page.jobPostings ?? [];
       jobs.push(...postings);
 
-      const total = typeof page.total === "number" ? page.total : undefined;
-      if (context.maxJobsPerSource !== undefined && jobs.length >= context.maxJobsPerSource) {
+      const capped = context.maxJobsPerSource !== undefined && jobs.length >= context.maxJobsPerSource;
+      // Emit only the slice of this page that still fits under the cap.
+      const pageToEmit = capped
+        ? postings.slice(0, Math.max(0, context.maxJobsPerSource! - (jobs.length - postings.length)))
+        : postings;
+      if (pageToEmit.length > 0) {
+        const normalizedPage = pageToEmit.map((job) => normalizeWorkdayJob(workday, key, job, fetchedAt));
+        await context.onJobs?.(normalizedPage);
+      }
+      if (capped) {
         break;
       }
+
+      const total = typeof page.total === "number" ? page.total : undefined;
       if (postings.length < pageLimit || (total !== undefined && offset + postings.length >= total)) {
         break;
       }
     }
 
-    const key = `${workday.tenant}/${workday.shard}/${workday.site}`;
     const jobsToReturn = context.maxJobsPerSource === undefined ? jobs : jobs.slice(0, context.maxJobsPerSource);
-    return jobsToReturn.map((job) => normalizeWorkdayJob(workday, key, job, context.fetchedAt()));
+    return jobsToReturn.map((job) => normalizeWorkdayJob(workday, key, job, fetchedAt));
   }
 };
 

@@ -54,6 +54,12 @@ export type CrawlFailure = {
   source_key: string;
   status?: number;
   message: string;
+  // Present (and true) when the source had already emitted one or more jobs
+  // before the crawl errored, e.g. a failure on a later pagination page.
+  partial?: boolean;
+  // Number of jobs from this source that were written to the JSONL output
+  // before the error. Only set alongside partial: true.
+  jobs_emitted?: number;
 };
 
 export type SourceExclusion = {
@@ -68,6 +74,9 @@ export type ProviderStats = {
   sources: number;
   skipped: number;
   succeeded: number;
+  // Sources that emitted at least one job but still raised an error afterwards.
+  partial: number;
+  // Sources that raised an error without emitting any jobs.
   failed: number;
   jobs: number;
 };
@@ -79,6 +88,8 @@ export type CrawlReport = {
   skipped_sources: number;
   skipped_by_provider: Record<Provider, number>;
   providers: Record<Provider, ProviderStats>;
+  // Total sources across providers that emitted some jobs but still errored.
+  partial_sources: number;
   total_jobs: number;
   failures: CrawlFailure[];
 };
@@ -95,6 +106,11 @@ export type CrawlContext = {
   maxJobsPerSource?: number;
   urlTemplate?: string;
   jobIdTemplate?: string;
+  // Streams already-fetched pages to the runner so jobs are persisted even when
+  // a later request (e.g. the next pagination page) fails. Paginating crawlers
+  // call this after normalizing each page. May return a promise that resolves
+  // once the jobs have been written to the JSONL output.
+  onJobs?: (jobs: NormalizedJob[]) => void | Promise<void>;
 };
 
 export type ProviderCrawler = {

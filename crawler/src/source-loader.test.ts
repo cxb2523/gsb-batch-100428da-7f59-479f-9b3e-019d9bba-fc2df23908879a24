@@ -10,6 +10,7 @@ test("parseProviderList supports all and comma-separated providers", () => {
     "ashby",
     "bamboohr",
     "greenhouse",
+    "icims",
     "lever",
     "smartrecruiters",
     "teamtailor",
