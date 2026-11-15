@@ -19,9 +19,8 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
-import { useEffect, useState } from "react";
-import { ArrowUpRight, Check, Clipboard } from "lucide-react";
-import JSONPretty from "react-json-pretty";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ArrowUpRight } from "lucide-react";
 import {
   Accordion,
   AccordionContent,
@@ -30,6 +29,19 @@ import {
 } from "@/components/ui/accordion";
 import { ThemeProvider } from "./components/theme-provider";
 import { ModeToggle } from "./components/mode-toggle";
+import {
+  describeError,
+  modeLabel,
+  readScrapeResponse,
+  truncate,
+} from "@/lib/submissions";
+import type {
+  CancelReason,
+  StoredContent,
+  Submission,
+  SubmissionOutcome,
+} from "@/lib/submissions";
+import { SubmissionResult } from "@/components/submission-result";
 
 const formSchema = z
   .object({
@@ -133,19 +145,26 @@ const scrapeOptions: ScrapeOption[] = [
   },
 ];
 
-function isValidJSON(str: string) {
+async function readRejectionDetail(response: Response): Promise<string> {
   try {
-    JSON.parse(str);
-    return true;
-  } catch (e) {
-    return false;
+    const body = await response.text();
+    return body.trim() ? truncate(body.trim()) : "The server returned an empty body.";
+  } catch (error) {
+    return `The server response body could not be read: ${describeError(error)}`;
   }
 }
 
 export default function App() {
-  const [content, setContent] = useState<string>("");
+  const [content, setContent] = useState<StoredContent | null>(null);
+  const [submissions, setSubmissions] = useState<Submission[]>([]);
   const [accordionOpen, setAccordionOpen] = useState(true);
   const [copied, setCopied] = useState(false);
+
+  const nextSubmissionId = useRef(1);
+  const activeRequest = useRef<{
+    id: number;
+    controller: AbortController;
+  } | null>(null);
 
   const form = useForm<z.infer<typeof formSchema>>({
     resolver: zodResolver(formSchema),
@@ -154,54 +173,176 @@ export default function App() {
     },
   });
 
+  function settleSubmission(id: number, outcome: SubmissionOutcome) {
+    setSubmissions((previous) =>
+      previous.map((submission) =>
+        submission.id === id ? { ...submission, outcome } : submission
+      )
+    );
+  }
+
+  const cancelActiveRequest = useCallback(
+    (reason: CancelReason, detail: string) => {
+      const active = activeRequest.current;
+      if (!active) {
+        return;
+      }
+      activeRequest.current = null;
+      active.controller.abort();
+      settleSubmission(active.id, {
+        kind: "cancelled",
+        reason,
+        detail,
+        finishedAt: Date.now(),
+      });
+    },
+    []
+  );
+
   async function onSubmit(values: z.infer<typeof formSchema>) {
-    const url = import.meta.env.VITE_BUILDSHIP_WORKFLOW;
+    const workflowUrl = import.meta.env.VITE_BUILDSHIP_WORKFLOW;
+
+    // Only one submission may own the result area: anything still in flight
+    // is explicitly cancelled rather than silently ignored.
+    cancelActiveRequest(
+      "superseded",
+      "A newer submission was started before this request finished."
+    );
+
+    const id = nextSubmissionId.current++;
+    const mode = values.mode;
+    const startedAt = Date.now();
+    const controller = new AbortController();
+    activeRequest.current = { id, controller };
+
+    setSubmissions((previous) => [
+      ...previous,
+      {
+        id,
+        mode,
+        url: values.url,
+        startedAt,
+        outcome: { kind: "pending" },
+      },
+    ]);
+
+    const isStillActive = () =>
+      activeRequest.current?.id === id && !controller.signal.aborted;
+
+    if (!workflowUrl) {
+      activeRequest.current = null;
+      settleSubmission(id, {
+        kind: "network-error",
+        message:
+          "No workflow endpoint is configured. Set VITE_BUILDSHIP_WORKFLOW to the deployed workflow URL.",
+        finishedAt: Date.now(),
+      });
+      return;
+    }
+
     try {
-      const response = await fetch(url, {
+      const response = await fetch(workflowUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify(values),
+        signal: controller.signal,
       });
-      if (response.ok) {
-        let content = "";
-        if (form.getValues().mode === "dynamic") {
-          content = await response.text();
-        } else {
-          const data = await response.json();
-          if (
-            form.getValues().mode === "crawl" ||
-            form.getValues().mode === "llmExtraction"
-          ) {
-            content = JSON.stringify(data, null, 2); // Render content as JSON for crawl mode
-            setAccordionOpen(false);
-          } else {
-            content = data.content;
-          }
+
+      if (!isStillActive()) {
+        return;
+      }
+
+      if (!response.ok) {
+        const detail = await readRejectionDetail(response);
+        if (!isStillActive()) {
+          return;
         }
-        setContent(content);
-      } else {
-        // Handle error response
-        console.error("Failed to post form values");
+        activeRequest.current = null;
+        settleSubmission(id, {
+          kind: "server-rejected",
+          httpStatus: response.status,
+          statusText: response.statusText,
+          detail,
+          finishedAt: Date.now(),
+        });
+        return;
+      }
+
+      let parsed: Awaited<ReturnType<typeof readScrapeResponse>>;
+      try {
+        parsed = await readScrapeResponse(mode, response);
+      } catch (error) {
+        if (!isStillActive()) {
+          return;
+        }
+        activeRequest.current = null;
+        settleSubmission(id, {
+          kind: "malformed-response",
+          httpStatus: response.status,
+          message: `The workflow responded, but its body could not be read: ${describeError(
+            error
+          )}`,
+          finishedAt: Date.now(),
+        });
+        return;
+      }
+
+      if (!isStillActive()) {
+        return;
+      }
+
+      activeRequest.current = null;
+      setContent({
+        submissionId: id,
+        mode,
+        renderKind: parsed.renderKind,
+        text: parsed.text,
+        receivedAt: Date.now(),
+      });
+      settleSubmission(id, {
+        kind: "success",
+        httpStatus: response.status,
+        finishedAt: Date.now(),
+      });
+      if (mode === "crawl" || mode === "llmExtraction") {
+        setAccordionOpen(false);
       }
     } catch (error) {
-      // Handle network or other errors
-      console.error("An error occurred while posting form values", error);
+      // A cancellation aborts the fetch; that outcome was already recorded by
+      // the code that cancelled the request, so it must not be overwritten.
+      if (!isStillActive()) {
+        return;
+      }
+      activeRequest.current = null;
+      settleSubmission(id, {
+        kind: "network-error",
+        message: describeError(error),
+        finishedAt: Date.now(),
+      });
     }
   }
 
   const copyToClipboard = () => {
-    navigator.clipboard.writeText(content);
+    if (!content) {
+      return;
+    }
+    navigator.clipboard.writeText(content.text);
     setCopied(true);
     setTimeout(() => {
       setCopied(false);
     }, 2000);
   };
 
+  const watchedMode = form.watch("mode");
+
   useEffect(() => {
     const mode = form.getValues().mode;
-    setContent("");
+    cancelActiveRequest(
+      "mode-change",
+      `The mode was switched to ${modeLabel(mode)} before this request finished.`
+    );
     if (mode !== "crawl") {
       form.reset({
         url: form.getValues().url,
@@ -209,7 +350,13 @@ export default function App() {
         mode: mode,
       });
     }
-  }, [form.watch("mode")]);
+    // The effect intentionally reruns only when the selected mode changes; the
+    // form instance and cancellation callback above are stable for its lifetime.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [watchedMode]);
+
+  const latestSubmission = submissions[submissions.length - 1];
+  const isPending = latestSubmission?.outcome.kind === "pending";
 
   return (
     <ThemeProvider defaultTheme="dark" storageKey="vite-ui-theme">
@@ -462,43 +609,13 @@ export default function App() {
                       </Accordion>
                     </div>
 
-                    {content && (
-                      <div>
-                        <div className="rounded p-4 relative bg-secondary mt-10">
-                          <div className="bg-primary-foreground rounded p-4 max-h-96 overflow-y-auto">
-                            <Button
-                              type="button"
-                              className="absolute top-2 right-2"
-                              size="sm"
-                              variant="secondary"
-                              onClick={copyToClipboard}
-                            >
-                              {copied ? (
-                                <Check size={16} />
-                              ) : (
-                                <Clipboard size={16} />
-                              )}
-                            </Button>
-                            {form.getValues().mode === "crawl" ||
-                            (form.getValues().mode == "llmExtraction" &&
-                              content !== "") ? (
-                              isValidJSON(content) ? (
-                                <JSONPretty
-                                  data={JSON.parse(content)}
-                                  style={{ fontSize: ".9em" }}
-                                />
-                              ) : (
-                                <div>{content}</div>
-                              )
-                            ) : (
-                              <div>{content}</div>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    )}
+                    <SubmissionResult
+                      submissions={submissions}
+                      content={content}
+                      copied={copied}
+                      onCopy={copyToClipboard}
+                    />
                   </div>
-
                   <div className="space-y-3">
                     <FormField
                       control={form.control}
@@ -585,12 +702,8 @@ export default function App() {
                       )}
                     />
                     <div className="sticky bottom-0 bg-background py-3 z-10">
-                      <Button
-                        type="submit"
-                        disabled={form.formState.isSubmitting}
-                        className="w-full"
-                      >
-                        {form.formState.isSubmitting
+                      <Button type="submit" className="w-full">
+                        {isPending
                           ? form.getValues().mode === "crawl"
                             ? "Crawling..."
                             : form.getValues().mode === "llmExtraction"
