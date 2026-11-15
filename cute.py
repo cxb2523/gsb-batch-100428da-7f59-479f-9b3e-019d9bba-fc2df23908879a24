@@ -37,7 +37,7 @@ def domains():
 cute(
 	pkg_name = "comiccrawler",
 	default = "python -m comiccrawler gui",
-	test = ['pylint comiccrawler', 'readme_build'],
+	test = ['pylint comiccrawler', 'pytest tests', 'readme_build'],
 	bump_pre = 'test',
 	bump = Bump("{version_file}", date_bumper),
 	bump_post = ['domains', 'dist', 'release', 'publish'],

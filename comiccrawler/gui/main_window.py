@@ -578,6 +578,40 @@ class MainWindow(ViewMixin, EventMixin):
 			err, mission = event.data
 			self.messagebox("error", mission.module.name, err)
 
+		@self.thread.listen("DOWNLOAD_EP_RESULT")
+		def _(event):
+			"""Show the per-episode download outcome in the log."""
+			result = event.data
+			if result.outcome == "paused":
+				pages = ", ".join(str(p) for p in result.paused_pages)
+				print(
+					"{} 暫停：下載完成 {} 頁（既有 {} 頁），暫停頁 {}（{}），可續跑".format(
+						result.title,
+						result.saved_count,
+						result.existed_count,
+						pages,
+						result.paused_reason
+					)
+				)
+			elif result.outcome == "skipped":
+				print(
+					"{} 跳過：下載完成 {} 頁（既有 {} 頁），錯誤跳過 {} 頁".format(
+						result.title,
+						result.saved_count,
+						result.existed_count,
+						result.skipped_count
+					)
+				)
+			else:
+				print(
+					"{} 完成：下載完成 {} 頁（既有 {} 頁），錯誤跳過 {} 頁".format(
+						result.title,
+						result.saved_count,
+						result.existed_count,
+						result.skipped_count
+					)
+				)
+
 		@self.thread.listen("ANALYZE_INVALID")
 		def _(event):
 			err, mission = event.data

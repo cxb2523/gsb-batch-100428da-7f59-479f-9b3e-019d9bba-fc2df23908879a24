@@ -118,12 +118,19 @@ class DownloadManager:
 						
 		@thread.listen("DOWNLOAD_FINISHED")
 		@thread.listen("DOWNLOAD_ERROR")
+		@thread.listen("DOWNLOAD_PAUSE")
 		def _(event):
 			"""After download, continue next mission"""
 			with self.lock:
 				mod = self.crawlers.inverse.pop(event.target, None)
 				if not mod:
 					return
+
+			# A paused mission is resumable and keeps its worker slot free;
+			# don't count the pause against the module error threshold.
+			if event.name == "DOWNLOAD_PAUSE":
+				self.start_download_all(continue_=True)
+				return
 
 			max_errors = int(mod.config.get("max_errors", 3))
 			if self.mod_errors[mod] >= max_errors:

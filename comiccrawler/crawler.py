@@ -1,6 +1,7 @@
 import hashlib
 import json
 import traceback
+from collections import namedtuple
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -9,13 +10,37 @@ from worker import WorkerExit, sleep
 from .save_path import SavePath
 from .module_grabber import ModuleGrabber
 from .image import Image
-from .error import LastPageError, PauseDownloadError, SkipEpisodeError, is_http, SkipPageError, ComicCrawlerError
+from .error import (
+	LastPageError,
+	PauseDownloadError,
+	PauseEpisodeError,
+	SkipEpisodeError,
+	is_http,
+	is_recoverable,
+	SkipPageError,
+	ComicCrawlerError
+)
 
 from .io import content_read, content_write
 from .util import url_extract_filename
 from .channel import download_ch, mission_ch
 from .safeprint import print
 from .logger import debug_log
+
+# Per-page download outcomes.
+PAGE_SAVED = "saved"
+PAGE_EXISTED = "existed"
+
+# Per-episode outcomes published through download_ch.
+EP_COMPLETE = "complete"
+EP_PAUSED = "paused"
+EP_SKIPPED = "skipped"
+
+EpisodeResult = namedtuple(
+	"EpisodeResult",
+	"mission episode title outcome success_count saved_count "
+	"existed_count skipped_count paused_pages paused_reason"
+)
 
 VALID_FILE_TYPES = (
 	# images
@@ -48,6 +73,49 @@ class Crawler:
 		self.image_ext = None
 		self.tempfile = None
 		self.tempfile_complete = False
+		# per-page outcome ledgers, used to build the episode result event
+		# pages written to disk during this run
+		self.saved_count = 0
+		# pages skipped because a complete file already exists
+		self.existed_count = 0
+		# (page number, reason) pages skipped by unrecoverable errors
+		self.skipped_pages = []
+		# (page number, reason) pages paused by recoverable errors
+		self.paused_pages = []
+		# page number of the page currently being downloaded (1-based)
+		self.current_page_number = None
+
+	def record_page(self, outcome):
+		"""Record the outcome of a single page."""
+		if outcome == PAGE_SAVED:
+			self.saved_count += 1
+		elif outcome == PAGE_EXISTED:
+			self.existed_count += 1
+
+	def build_result(self, outcome):
+		"""Build an EpisodeResult event from the collected counters."""
+		paused_reason = None
+		if self.paused_pages:
+			paused_reason = self.paused_pages[-1][1]
+		return EpisodeResult(
+			mission=self.mission,
+			episode=self.ep,
+			title=self.ep.title,
+			outcome=outcome,
+			# success = every page safely present on disk
+			success_count=self.saved_count + self.existed_count,
+			saved_count=self.saved_count,
+			existed_count=self.existed_count,
+			skipped_count=len(self.skipped_pages),
+			paused_pages=[page for page, _reason in self.paused_pages],
+			paused_reason=paused_reason
+		)
+
+	def publish_result(self, outcome):
+		"""Publish the checkable per-episode result event."""
+		result = self.build_result(outcome)
+		download_ch.pub("DOWNLOAD_EP_RESULT", result)
+		return result
 		
 	def init(self):
 		if not self.ep.current_url:
@@ -287,7 +355,7 @@ def download(mission, savepath):
 
 		# Check if mission is complete
 		for ep in mission.episodes:
-			if not ep.complete and not ep.skip:
+			if not ep.complete and not ep.skip and not ep.pause:
 				raise ComicCrawlerError("Mission is not completed")
 
 	except WorkerExit:
@@ -305,12 +373,23 @@ def download(mission, savepath):
 		raise
 
 	else:
-		mission.state = "FINISHED"
-		download_ch.pub("DOWNLOAD_FINISHED", mission)	
+		# At least one episode is paused by a recoverable error. Its .part
+		# fragments are kept and the mission stays resumable instead of being
+		# marked as failed.
+		if any(ep.pause for ep in mission.episodes):
+			mission.state = "PAUSE"
+			download_ch.pub("DOWNLOAD_PAUSE", mission)
+			print(
+				"Mission paused with resumable progress: "
+				+ mission.title
+			)
+		else:
+			mission.state = "FINISHED"
+			download_ch.pub("DOWNLOAD_FINISHED", mission)
 	
 def crawl(mission, savepath):
 	"""Crawl each episode."""
-	
+
 	print("total {} episode.".format(len(mission.episodes)))
 
 	for ep in mission.episodes:
@@ -318,7 +397,11 @@ def crawl(mission, savepath):
 			continue
 
 		print("Downloading ep {}".format(ep.title))
-		
+
+		# the episode is retried; clear the pause flag left by a previous
+		# recoverable failure and let crawlpage decide the new outcome.
+		ep.pause = False
+
 		try:
 			crawler = Crawler(mission, ep, savepath)
 			crawlpage(crawler)
@@ -326,18 +409,43 @@ def crawl(mission, savepath):
 		except LastPageError:
 			print("Episode download complete!")
 			ep.complete = True
+			ep.pause = False
 			download_ch.pub("DOWNLOAD_EP_COMPLETE", (mission, ep))
+			crawler.publish_result(EP_COMPLETE)
+
+		except PauseEpisodeError:
+			# Recoverable error (rate limit / interrupted transfer). The
+			# .part fragment is kept and the episode is marked resumable.
+			print(
+				"Episode paused on recoverable error, progress kept: "
+				+ ep.title
+			)
+			ep.pause = True
+			crawler.publish_result(EP_PAUSED)
+			print_paused_summary(crawler)
 
 		except SkipEpisodeError as err:
 			print("Something bad happened, skip the episode.")
 			if err.always:
 				ep.skip = True
+			crawler.publish_result(EP_SKIPPED)
+
+def print_paused_summary(crawler):
+	"""Log the paused page(s) and reason for manual verification."""
+	for page, reason in crawler.paused_pages:
+		print(
+			"Paused page {} of {}: {}".format(
+				page, crawler.ep.title, reason
+			)
+		)
 
 def crawlpage(crawler):
 	"""Crawl all pages of an episode.
 
 	To complete current episode, raise LastPageError.
 	To skip current episode, raise SkipEpisodeError.
+	To pause current episode while keeping .part progress, raise
+	PauseEpisodeError.
 	To stop downloading (fatal error), raise PauseDownloadError.
 	"""
 	
@@ -345,23 +453,25 @@ def crawlpage(crawler):
 		if not crawler.is_init:
 			debug_log("D_INIT")
 			crawler.init()
-			
+
 		if not crawler.html:
 			debug_log("D_INIT_IMAGE")
 			crawler.init_images()
-	
+
 		if not crawler.image:
 			debug_log("D_NEXT_PAGE")
 			crawler.next_page()
 			return
-			
+
 		if crawler.page_exists():
 			debug_log("D_NEXT_IMAGE")
 			print("page {} already exist".format(crawler.ep.total + 1))
+			crawler.record_page(PAGE_EXISTED)
 			crawler.next_image()
 			return
-			
+
 		debug_log("D_RESOLVE")
+		crawler.current_page_number = crawler.ep.total + 1
 		crawler.resolve_image()
 		print("Downloading {} page {}: {}\n".format(
 			crawler.ep.title, crawler.ep.total + 1, crawler.image.url))
@@ -372,6 +482,7 @@ def crawlpage(crawler):
 		debug_log("D_SAVE")
 		crawler.save_image()
 		debug_log("D_PUB")
+		crawler.record_page(PAGE_SAVED)
 		mission_ch.pub("MISSION_PROPERTY_CHANGED", crawler.mission)
 		debug_log("D_REST")
 		crawler.rest()
@@ -382,15 +493,27 @@ def crawlpage(crawler):
 		t = min(5 * 2 ** count, 600)
 		print(f"wait {t} seconds...")
 		if is_http(er, code=429):
-			# retry doesn't work with 429 error
+			# retry doesn't work with 429 error; wait for backoff then let
+			# error_loop retry (or pause the episode once the limit is hit)
 			sleep(t)
-			raise er
+			return
 		crawler.handle_error(er)
 		sleep(t)
 
-	error_loop(download, download_error)
+	error_loop(
+		download,
+		download_error,
+		crawler=crawler
+	)
 
-def error_loop(process, handle_error=None, limit=5):
+def describe_error(err):
+	"""Return a human-readable, checkable reason string."""
+	status = getattr(getattr(err, "response", None), "status_code", None)
+	if status:
+		return "HTTP {}".format(status)
+	return type(err).__name__
+
+def error_loop(process, handle_error=None, limit=5, crawler=None):
 	"""Loop process until error. Has handle error limit."""
 	errorcount = 0
 	while True:
@@ -401,6 +524,25 @@ def error_loop(process, handle_error=None, limit=5):
 			# FIXME: don't increase error count if some bytes are actually downloaded
 			errorcount += 1
 			if errorcount >= limit:
+				page = None
+				if crawler is not None:
+					page = (
+						crawler.current_page_number
+						or crawler.ep.total + 1
+					)
+				if crawler is not None and is_recoverable(er):
+					# Keep the .part fragment and mark the episode as
+					# resumable instead of dropping the whole episode.
+					crawler.paused_pages.append(
+						(page, describe_error(er))
+					)
+					raise PauseEpisodeError(er) from None
+				# Unrecoverable error (e.g. illegal file type): keep the
+				# original SkipEpisodeError semantics.
+				if crawler is not None:
+					crawler.skipped_pages.append(
+						(page, describe_error(er))
+					)
 				raise SkipEpisodeError(always=False) from None
 			if handle_error:
 				handle_error(er, errorcount)
