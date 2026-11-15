@@ -79,7 +79,10 @@ SPIDER_MIDDLEWARES = {
 DOWNLOADER_MIDDLEWARES = {
     "scrapy_utils.middlewares.ScrapyUtilsDownloaderMiddleware": 543,
     "scrapy_utils.middlewares.RandomUserAgentMiddleware": 400,
-    # 'scrapy_utils.middlewares.MyHttpProxyMiddleware': 750,
+    "scrapy_utils.middlewares.HttpProxyMiddleware": 750,
+    # The custom middleware owns proxy selection and rotation; disable the
+    # built-in one so it does not re-process the proxy meta / headers.
+    "scrapy.downloadermiddlewares.httpproxy.HttpProxyMiddleware": None,
     # 'scrapy_splash.SplashCookiesMiddleware': 723,
     # 'scrapy_splash.SplashMiddleware': 725,
     # 'scrapy.downloadermiddlewares.httpcompression.HttpCompressionMiddleware': 810
@@ -121,6 +124,8 @@ DOWNLOADER_MIDDLEWARES = {
 
 # The cipher of the docking agent
 proxyAuth = env.list("proxyAuth", [])
+# Proxy entry point used together with proxyAuth credentials
+PROXY_URL = env.str("PROXY_URL", "https://http-dyn.abuyun.com:9020")
 # @Custom handlers
 DOWNLOAD_HANDLERS = {
     "http": "scrapy_utils.handler.HTTPDownloadHandler11",
