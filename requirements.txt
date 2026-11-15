@@ -1,0 +1,17 @@
+# Core dependencies
+playwright>=1.40.0
+aiohttp>=3.9.0
+aiodns>=3.0.0
+tldextract>=5.0.0
+jsbeautifier>=1.14.0
+
+# Optional utilities used in analyzer and reporting
+markdown>=3.5.0
+
+# PDF output (-f pdf) needs ONE of: pandoc, markdown-pdf, or weasyprint.
+# None is installed by default - weasyprint in particular needs cairo/pango
+# system libraries, which is a hard install failure for a fallback backend.
+#   pip install weasyprint      # or: brew install pandoc
+
+# Development and logging helpers
+colorama>=0.4.6
