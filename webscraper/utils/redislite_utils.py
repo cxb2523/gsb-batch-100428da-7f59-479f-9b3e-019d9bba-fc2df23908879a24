@@ -1,4 +1,12 @@
-from redislite import Redis
+try:
+    from redislite import Redis
+except ImportError:  # redislite cannot be built on some platforms (e.g. Windows)
+    # fall back to an in-memory redis-compatible client so the crawler and
+    # its tests still run; install redislite for a persistent, file-backed db
+    import fakeredis
+
+    def Redis(dbfilename=None, decode_responses=True):  # noqa: N802 - mimic redislite API
+        return fakeredis.FakeStrictRedis(decode_responses=decode_responses)
 
 from utils.url_utils import get_filtered_links
 

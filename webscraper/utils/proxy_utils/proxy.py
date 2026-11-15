@@ -9,6 +9,8 @@ from utils.user_agent_utils.user_agent import UserAgent
 
 ua = UserAgent()
 
+PROXY_LIST_FILE = os.path.join(HOME_DIR, "utils/proxy_utils/proxy_list.json")
+
 
 class Proxy:
     def __init__(self):
@@ -21,9 +23,8 @@ class Proxy:
 
     @staticmethod
     def read_proxy_list():
-        filename = os.path.join(HOME_DIR, "utils/proxy_utils/proxy_list.json")
-        if os.path.exists(filename):
-            with open(filename, "r") as fp:
+        if os.path.exists(PROXY_LIST_FILE):
+            with open(PROXY_LIST_FILE, "r") as fp:
                 return json.load(fp)
         return None
 
@@ -46,14 +47,21 @@ class Proxy:
         return proxy_list
 
     def write_proxy_list(self):
-        with open("proxy_list.json", "w") as fp:
+        with open(PROXY_LIST_FILE, "w") as fp:
             json.dump(self.proxy_list, fp)
 
-    def generate_proxy(self):
-        """Choose a random proxy; keeps the same proxy for some number of times then changes it
+    def generate_proxy(self, force_refresh=False):
+        """Choose a random proxy; keeps the same proxy for some number of times then changes it.
+
+        Returns None when no proxy is available instead of raising.
         """
-        if self.count % 10 == 0:
-            self.proxy = random.choice(self.proxy_list)
+        if not self.proxy_list:
+            return None
+        if force_refresh or self.proxy is None or self.count % 10 == 0:
+            # prefer a proxy different from the current one when possible
+            choices = [p for p in self.proxy_list if p != self.proxy] or self.proxy_list
+            self.proxy = random.choice(choices)
+        self.count += 1
         return {
             "http": self.proxy,
             "https": self.proxy

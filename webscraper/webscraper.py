@@ -6,7 +6,7 @@ import uuid
 from random import randint
 
 from utils.extract_links_from_webpage import get_links
-from utils.request_client import ReqestClient
+from utils.request_client import ReqestClient, RequestFailure
 from utils.url_utils import get_filtered_links
 import config
 from utils.redislite_utils import redis_cleanup, redis_client as redis
@@ -32,10 +32,15 @@ class Websitescrap:
 
     def crawl(self, sleep_time_lower=30, sleep_time_upper=121):
         print("\ncrawling started\n")
+        succeeded = []
+        failed = {}  # url -> failure reason
         write_count = 0
         write_flag = 1
-        while len(redis.smembers("new_urls")):
+        while redis.scard("new_urls"):
             url = redis.spop("new_urls")
+            # each unique link is crawled only once
+            if redis.sismember("processed_urls", url):
+                continue
             redis.sadd("processed_urls", url)
 
             if write_count % 12 == 0:
@@ -48,25 +53,63 @@ class Websitescrap:
 
             write_count += 1
 
-            response = request_client.request_with_proxy_header(url)
-            if not response or not response.status_code == 200:
+            try:
+                response = request_client.request_with_proxy_header(url)
+            except Exception as exc:
+                # a failure of a single link must not abort the whole run
+                failed[url] = "request error: {}".format(exc)
                 continue
 
-            # write response.text to a json dump file
-            write_url_data(url, response.text)
+            if response is None:
+                failed[url] = "request failed (no response returned)"
+                continue
+            if isinstance(response, RequestFailure):
+                failed[url] = response.reason
+                continue
+            if response.status_code != 200:
+                failed[url] = "unexpected HTTP status code: {}".format(response.status_code)
+                continue
 
-            # get the urls for local page
-            local_urls = [*get_links(response.text, self.url).keys()]
+            try:
+                # get the urls for local page
+                local_urls = [*get_links(response.text, self.url).keys()]
 
-            # filter the urls of foreign urls or dummy urls
-            local_urls = get_filtered_links(local_urls, self.url)
+                # filter the urls of foreign urls or dummy urls
+                local_urls = get_filtered_links(local_urls, self.url)
 
-            for i in local_urls:
-                if not redis.sismember("processed_urls", i):
-                    redis.sadd("new_urls", i)
-            redis_cleanup(self.url)
+                # write response.text to a json dump file (only on success)
+                write_url_data(url, response.text)
+
+                for i in local_urls:
+                    if not redis.sismember("processed_urls", i):
+                        redis.sadd("new_urls", i)
+                redis_cleanup(self.url)
+            except Exception as exc:
+                failed[url] = "processing error: {}".format(exc)
+                continue
+
+            succeeded.append(url)
             if write_count % write_flag == 0:
                 print('Processed')
+
+        return self._print_summary(succeeded, failed)
+
+    def _print_summary(self, succeeded, failed):
+        summary = {
+            "succeeded": succeeded,
+            "failed": failed,
+            "success_count": len(succeeded),
+            "failure_count": len(failed),
+        }
+        print("\n========== Crawl summary ==========")
+        print("Succeeded: {}".format(summary["success_count"]))
+        print("Failed:    {}".format(summary["failure_count"]))
+        if failed:
+            print("Failed URLs:")
+            for url, reason in failed.items():
+                print("  - {} -> {}".format(url, reason))
+        print("===================================\n")
+        return summary
 
 
 def str2bool(v):
