@@ -1,28 +1,77 @@
 # coding:utf-8
+from __future__ import print_function
+
+import datetime
+import random
 import time
+
 import config as cfg
+import pymysql as mdb
 import requests
 from lxml import etree
-import pymysql as mdb
-import datetime
-from multiprocessing import Process, Manager
-import random
+from multiprocessing import Manager, Process
 
 
-class IPFactory:
+# Every source is crawled on its own, so one broken site can never stop the
+# others.  ``{page}`` is replaced with a 1-based page number.
+PROXY_SOURCES = [
+    {
+        'name': '66ip',
+        'url_template': 'http://www.66ip.cn/{page}.html',
+        'url_xpath': '/html/body/div[last()]//table//tr[position()>1]/td[1]/text()',
+        'port_xpath': '/html/body/div[last()]//table//tr[position()>1]/td[2]/text()',
+    },
+    {
+        'name': 'xicidaili',
+        'url_template': 'http://www.xicidaili.com/nn/{page}',
+        'url_xpath': '//table[@id="ip_list"]//tr[position()>1]/td[position()=2]/text()',
+        'port_xpath': '//table[@id="ip_list"]//tr[position()>1]/td[position()=3]/text()',
+    },
+    {
+        'name': 'mimiip',
+        'url_template': 'http://www.mimiip.com/gngao/{page}',
+        'url_xpath': '//table[@class="list"]//tr[position()>1]/td[1]/text()',
+        'port_xpath': '//table[@class="list"]//tr[position()>1]/td[2]/text()',
+    },
+    {
+        'name': 'kuaidaili',
+        'url_template': 'http://www.kuaidaili.com/free/inha/{page}/',
+        'url_xpath': '//td[@data-title="IP"]/text()',
+        'port_xpath': '//td[@data-title="PORT"]/text()',
+    },
+]
+
+
+def print_source_outcomes(outcomes):
+    """
+    Print one line per source so operators can see which source worked,
+    how many proxies it produced and why it failed.
+    """
+    print(">>>>>>>>>>>>> Crawl results by source <<<<<<<<<<")
+    for outcome in outcomes:
+        if outcome['success']:
+            print("[OK]   %s: %d proxies" % (outcome['name'], outcome['count']))
+        else:
+            print("[FAIL] %s: %d proxies, reason: %s" %
+                  (outcome['name'], outcome['count'], outcome['error']))
+
+
+class IPFactory(object):
     """
     * crawl
     * evaluation
     * storage
     """
 
-    def __init__(self):
+    def __init__(self, init_db=True):
         self.page_num = cfg.page_num
         self.timeout = cfg.timeout
         self.all_ip = set()
 
-        # init database
-        self.create_db()
+        # init database.  The crawl entry point can skip this when only the
+        # collection result is needed.
+        if init_db:
+            self.create_db()
 
     def create_db(self):
         """
@@ -52,7 +101,7 @@ class IPFactory:
             cursor.execute(create_table_str)
             conn.commit()
         except OSError:
-            print "cannot create database! please check your username & password."
+            print("cannot create database! please check your username & password.")
         finally:
             cursor.close()
             conn.close()
@@ -61,96 +110,116 @@ class IPFactory:
         """
         parse web html using xpath
         return ip list.
+
+        Request and parse errors are raised on purpose: the caller needs to
+        know that a source failed instead of silently treating it as empty.
         """
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 6.3; Trident/7.0; rv:11.0) like Gecko'}
+
+        results = requests.get(url, headers=headers, timeout=4)
+        tree = etree.HTML(results.text)
+
+        # parse [ip:port] pairs.
+        url_results = tree.xpath(url_xpath)
+        port_results = tree.xpath(port_xpath)
+        urls = [line.strip() for line in url_results]
+        ports = [line.strip() for line in port_results]
+
+        if len(urls) != len(ports):
+            raise ValueError('ip/port count mismatch: %d ip(s), %d port(s)' %
+                             (len(urls), len(ports)))
+
         ip_list = []
-
-        try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 6.3; Trident/7.0; rv:11.0) like Gecko'}
-
-            results = requests.get(url, headers=headers, timeout=4)
-            tree = etree.HTML(results.text)
-
-            # parse [ip:port] pairs.
-            url_results = tree.xpath(url_xpath)
-            port_results = tree.xpath(port_xpath)
-            urls = [line.strip() for line in url_results]
-            ports = [line.strip() for line in port_results]
-
-            if len(urls) == len(ports):
-                for i in range(len(urls)):
-                    # match each ip with it's port to the format like "127.0.0.1:80"
-                    full_ip = urls[i]+":"+ports[i]
-
-                    # if current ip has been crawled
-                    if full_ip in self.all_ip:
-                        continue
-
-                    ip_list.append(full_ip)
-        except Exception as e:
-            print 'get proxies error: ', e
+        for i in range(len(urls)):
+            # match each ip with it's port to the format like "127.0.0.1:80"
+            ip_list.append(urls[i] + ":" + ports[i])
 
         return ip_list
 
-    def get_all_ip(self):
+    def crawl_source(self, source):
         """
-        merge the ip crawled from several websites.
+        Crawl one source and return ``(captured_set, outcome)``.
+
+        A failure on any page stops this source only.  Proxies captured before
+        the failure are still returned, while the outcome records the failure
+        reason for operators.  An empty result is reported as a failure too.
         """
-        current_all_ip = set()
+        name = source['name']
+        captured = set()
+        error = ''
 
-        ##################################
-        # 66ip (http://www.66ip.cn/)
-        ###################################
-        url_xpath_66 = '/html/body/div[last()]//table//tr[position()>1]/td[1]/text()'
-        port_xpath_66 = '/html/body/div[last()]//table//tr[position()>1]/td[2]/text()'
-        for i in xrange(self.page_num):
-            url_66 = 'http://www.66ip.cn/' + str(i+1) + '.html'
-            results = self.get_content(url_66, url_xpath_66, port_xpath_66)
+        for page in range(1, self.page_num + 1):
+            try:
+                url = source['url_template'].format(page=page)
+                results = self.get_content(url, source['url_xpath'], source['port_xpath'])
+            except Exception as e:
+                error = str(e) or e.__class__.__name__
+                break
 
-            if len(results):
-                self.all_ip.update(results)
-                current_all_ip.update(results)
+            captured.update(results)
+            if results:
                 # wait 0.5 secs.
                 time.sleep(0.5)
 
-        ##################################
-        # xicidaili (http://www.xicidaili.com/nn/)
-        ###################################
-        url_xpath_xici = '//table[@id="ip_list"]//tr[position()>1]/td[position()=2]/text()'
-        port_xpath_xici = '//table[@id="ip_list"]//tr[position()>1]/td[position()=3]/text()'
-        for i in xrange(self.page_num):
-            url_xici = 'http://www.xicidaili.com/nn/' + str(i+1)
-            results = self.get_content(url_xici, url_xpath_xici, port_xpath_xici)
-            self.all_ip.update(results)
-            current_all_ip.update(results)
-            time.sleep(0.5)
+        if not error and not captured:
+            error = 'no proxies parsed'
 
-        ##################################
-        # mimiip (http://www.mimiip.com/gngao/)
-        ###################################
-        url_xpath_mimi = '//table[@class="list"]//tr[position()>1]/td[1]/text()'
-        port_xpath_mimi = '//table[@class="list"]//tr[position()>1]/td[2]/text()'
-        for i in xrange(self.page_num):
-            url_mimi = 'http://www.mimiip.com/gngao/' + str(i+1)
-            results = self.get_content(url_mimi, url_xpath_mimi, port_xpath_mimi)
-            self.all_ip.update(results)
-            current_all_ip.update(results)
-            time.sleep(0.5)
+        outcome = {
+            'name': name,
+            'success': not error,
+            'count': len(captured),
+            'error': error,
+        }
+        return captured, outcome
 
-        ##################################
-        # kuaidaili (http://www.kuaidaili.com/)
-        ###################################
-        url_xpath_kuaidaili = '//td[@data-title="IP"]/text()'
-        port_xpath_kuaidaili = '//td[@data-title="PORT"]/text()'
-        for i in xrange(self.page_num):
-            url_kuaidaili = 'http://www.kuaidaili.com/free/inha/' + str(i+1) + '/'
-            results = self.get_content(url_kuaidaili, url_xpath_kuaidaili, port_xpath_kuaidaili)
-            self.all_ip.update(results)
-            current_all_ip.update(results)
-            time.sleep(0.5)
+    def crawl_all(self):
+        """
+        Crawl every source independently, then merge and de-duplicate the
+        results.
 
-        print current_all_ip
-        print ">>>>>>>>>>>>>> All proxies has been crawled <<<<<<<<<<<"
-        return current_all_ip
+        Returns ``(current_all_ip, outcomes)`` where ``current_all_ip`` is the
+        merged, de-duplicated set of proxies captured in this round (entries
+        already crawled in an earlier round are excluded, as before) and
+        ``outcomes`` contains one record per source: ``name``, ``success``,
+        ``count`` (proxies parsed from that source) and ``error`` (empty
+        string when the source succeeded).
+        """
+        previously_crawled = set(self.all_ip)
+        captured_all = set()
+        outcomes = []
+
+        for source in PROXY_SOURCES:
+            try:
+                captured, outcome = self.crawl_source(source)
+            except Exception as e:
+                # Last-resort guard: a broken source must never abort the
+                # whole round.
+                captured = set()
+                outcome = {
+                    'name': source.get('name', 'unknown'),
+                    'success': False,
+                    'count': 0,
+                    'error': str(e) or e.__class__.__name__,
+                }
+            captured_all.update(captured)
+            outcomes.append(outcome)
+
+        # keep the crawl history used by the original implementation.
+        self.all_ip.update(captured_all)
+        current_all_ip = captured_all - previously_crawled
+
+        print(current_all_ip)
+        print(">>>>>>>>>>>>>> All proxies has been crawled <<<<<<<<<<<")
+        return current_all_ip, outcomes
+
+    def get_all_ip(self):
+        """
+        Backwards compatible helper: return only the merged proxy set.
+        Use :meth:`crawl_all` (or :func:`crawl_all_sources`) when the
+        per-source outcomes are needed.
+        """
+        current_ips, _ = self.crawl_all()
+        return current_ips
 
     def get_valid_ip(self, ip_set, manager_list, timeout):
         """
@@ -170,25 +239,30 @@ class IPFactory:
 
                 # judge if proxy valid
                 if r.status_code == 200:
-                    print 'succeed: ' + p + '\t' + " succeed in " + format(end-start, '0.4f') + 's!'
+                    print('succeed: ' + p + '\t' + " succeed in " + format(end-start, '0.4f') + 's!')
                     # add to result
                     manager_list.append(p)
             except Exception:
-                print p + "\t timeout."
+                print(p + "\t timeout.")
 
     def multi_thread_validation(self, ip_set, manager_list, timeout, thread=50):
         """
         use multiple process to accelerate the judgement of valid proxies.
         """
+        ip_set = set(ip_set)
+        if not ip_set:
+            return
+
         if len(ip_set) < thread:
             thread = len(ip_set)
+        thread = max(thread, 1)
 
         # divide ip_set to blocks for later multiprocess.
-        slice_len = len(ip_set) / thread
+        slice_len = len(ip_set) // thread
 
         jobs = []
-        for i in xrange(thread-1):
-            part = set(random.sample(ip_set, slice_len))
+        for i in range(thread-1):
+            part = set(random.sample(list(ip_set), slice_len))
             ip_set -= part
             p = Process(target=self.get_valid_ip, args=(part, manager_list, timeout))
             jobs.append(p)
@@ -201,19 +275,22 @@ class IPFactory:
 
         # join threads
         for job in jobs:
-            if job.is_alive():
-                job.join()
+            job.join()
 
     def save_to_db(self, valid_ips):
         """
         save all valid proxies into db
         """
+        # Take a plain snapshot first: a Manager list proxy must never leak
+        # into the storage loop, otherwise entries can be lost or raise.
+        valid_ips = list(valid_ips)
+
         if len(valid_ips) == 0:
-            print "not proxy available for this time."
+            print("not proxy available for this time.")
             return
 
         # store valid proxies into db.
-        print "\n>>>>>>>>>>>>>>>>>>>> Insert to database Start  <<<<<<<<<<<<<<<<<<<<<<"
+        print("\n>>>>>>>>>>>>>>>>>>>> Insert to database Start  <<<<<<<<<<<<<<<<<<<<<<")
         conn = mdb.connect(cfg.host, cfg.user, cfg.passwd, cfg.DB_NAME)
         cursor = conn.cursor()
         try:
@@ -227,19 +304,19 @@ class IPFactory:
                     conn.commit()
 
                     if n:
-                        print datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")+" "+item+" insert successfully."
+                        print(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")+" "+item+" insert successfully.")
                     else:
-                        print datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")+" "+item+" insert failed."
+                        print(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")+" "+item+" insert failed.")
 
                 else:
-                    print datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")+" "+ item + " exists."
+                    print(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")+" "+ item + " exists.")
         except Exception as e:
-            print "store to db failed：" + str(e)
+            print("store to db failed：" + str(e))
         finally:
             cursor.close()
             conn.close()
-        print ">>>>>>>>>>>>>>>>>>>> Insert to database Ended  <<<<<<<<<<<<<<<<<<<<<<"
-        print "Finished."
+        print(">>>>>>>>>>>>>>>>>>>> Insert to database Ended  <<<<<<<<<<<<<<<<<<<<<<")
+        print("Finished.")
 
     def get_proxies(self, manager_list):
         ip_list = []
@@ -258,13 +335,14 @@ class IPFactory:
                     ip_list.append(item[0])
             else:
                 # crawl more proxies.
-                current_ips = self.get_all_ip()
+                current_ips, outcomes = self.crawl_all()
+                print_source_outcomes(outcomes)
                 self.multi_thread_validation(current_ips, manager_list, cfg.timeout)
-                valid_ips = manager_list
+                valid_ips = list(manager_list)
                 self.save_to_db(valid_ips)
                 ip_list.extend(valid_ips)
         except Exception as e:
-            print "get ip from database failed." + str(e)
+            print("get ip from database failed." + str(e))
         finally:
             cursor.close()
             conn.close()
@@ -272,17 +350,52 @@ class IPFactory:
         return ip_list
 
 
+def crawl_all_sources(factory=None):
+    """
+    Directly callable crawl entry point.
+
+    Crawls every configured source independently, merges and de-duplicates the
+    results, and returns ``(merged_ip_set, outcomes)``.
+
+    ``factory`` may be an existing :class:`IPFactory` whose crawl state should
+    be reused.  When omitted a crawl-only factory is built, so this function
+    does not touch the database.
+    """
+    if factory is None:
+        factory = IPFactory(init_db=False)
+    return factory.crawl_all()
+
+
+def validate_and_save(factory, ip_set):
+    """
+    Run the original multiprocess validation on ``ip_set`` and store every
+    proxy that passed.  Returns the plain list of valid proxies.
+    """
+    manager = Manager()
+    manager_list = manager.list()
+    try:
+        factory.multi_thread_validation(ip_set, manager_list, cfg.timeout)
+        # Copy the Manager proxy into a normal list before using it; this is
+        # what has to be saved, all of it.
+        valid_ips = list(manager_list)
+    finally:
+        manager.shutdown()
+
+    print("\n>>>>>>>>>>>>> Valid proxies <<<<<<<<<<")
+    print(valid_ips)
+    print('')
+    factory.save_to_db(valid_ips)
+    return valid_ips
+
+
 def main():
     ip_pool = IPFactory()
     while True:
-        manager = Manager()
-        manager_list = manager.list()
-        current_ips = ip_pool.get_all_ip()
-        ip_pool.multi_thread_validation(current_ips, manager_list, cfg.timeout)
-        print "\n>>>>>>>>>>>>> Valid proxies <<<<<<<<<<"
-        print manager_list + '\n'
-        ip_pool.save_to_db(manager_list)
+        current_ips, outcomes = crawl_all_sources(ip_pool)
+        print_source_outcomes(outcomes)
+        validate_and_save(ip_pool, current_ips)
         time.sleep(cfg.CHECK_TIME_INTERVAL)
+
 
 if __name__ == '__main__':
     main()
