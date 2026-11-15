@@ -53,15 +53,47 @@ class History:
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8"
         )
 
-    def previous(self, source: str, chart_id: str, key: str) -> dict | None:
-        """Latest snapshot strictly older than `key`."""
+    def _snapshots(self, source: str, chart_id: str) -> list[Path]:
         d = self._dir(source, chart_id)
         if not d.is_dir():
+            return []
+        return sorted(d.glob("*.json"))
+
+    def _read(self, path: Path) -> dict | None:
+        """Read one snapshot; a corrupt file counts as 'no snapshot', never as a crash."""
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
             return None
-        older = sorted(p for p in d.glob("*.json") if p.stem < key)
-        if not older:
-            return None
-        return json.loads(older[-1].read_text(encoding="utf-8"))
+
+    def latest_snapshot(self, source: str, chart_id: str) -> tuple[str | None, dict | None]:
+        """(period_key, payload) of this chart's newest snapshot.
+
+        A missing directory gives (None, None); a corrupt newest file does too, so a
+        broken history never crashes a source run. Each chart id has its own folder,
+        so callers can never pick up another chart's snapshot (daily vs. weekly keys).
+        """
+        snaps = self._snapshots(source, chart_id)
+        if not snaps:
+            return None, None
+        newest = snaps[-1]
+        data = self._read(newest)
+        if data is None:
+            return None, None
+        return newest.stem, data
+
+    def latest(self, source: str, chart_id: str) -> dict | None:
+        """Payload of the newest snapshot saved for this chart."""
+        return self.latest_snapshot(source, chart_id)[1]
+
+    def previous(self, source: str, chart_id: str, key: str) -> dict | None:
+        """Latest snapshot strictly older than `key`."""
+        older = [p for p in self._snapshots(source, chart_id) if p.stem < key]
+        for path in reversed(older):  # newest first; skip unreadable files
+            data = self._read(path)
+            if data is not None:
+                return data
+        return None
 
     def fill_previous_ranks(self, source: str, chart: dict) -> None:
         """Set last_rank / is_new from the previous snapshot. Leaves None when there is none."""

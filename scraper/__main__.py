@@ -3,8 +3,12 @@
     python -m scraper                # all sources
     python -m scraper holiday dam    # only some
 
-A job that fails keeps the charts from the previous run (marked stale), so one broken
-site never blanks the page. Exit code is 1 only when every job of every source failed.
+A job that fails does not affect the other jobs of the same source: each chart id in
+job["charts"] falls back independently to its own newest history snapshot
+(data/history/<source>/<chart>/<period_key>.json) and is written with stale=true plus
+the job's error message. A chart with no usable snapshot (missing or corrupt) is left
+out of the file and reported in errors instead of being faked as an empty chart.
+Exit code is 1 only when every job of every source failed.
 """
 
 from __future__ import annotations
@@ -37,6 +41,31 @@ def load_json(path: Path) -> dict:
         return {}
 
 
+def stale_chart(history: History, source_id: str, cid: str, previous: dict, msg: str) -> dict | None:
+    """Rebuild one failed chart from its own newest history snapshot.
+
+    Each chart falls back independently (daily and weekly charts have different
+    period keys), so another chart's snapshot is never used. Returns None when the
+    chart has no usable snapshot -- including a corrupt one.
+    """
+    key, snap = history.latest_snapshot(source_id, cid)
+    if snap is None:
+        return None
+    old = previous.get(cid, {})
+    return {
+        "id": cid,
+        "title": old.get("title", cid),
+        "period": snap.get("period") or old.get("period"),
+        "source_url": old.get("source_url"),
+        "period_key": key,
+        "rank_change": old.get("rank_change", "history"),
+        "rows": snap.get("rows", []),
+        "fetched_at": old.get("fetched_at"),
+        "stale": True,
+        "error": msg,
+    }
+
+
 def run_source(module, history: History) -> tuple[dict, int, int]:
     src = module.SOURCE
     label = src["name"]["zh"] if isinstance(src["name"], dict) else src["name"]
@@ -50,16 +79,19 @@ def run_source(module, history: History) -> tuple[dict, int, int]:
     for job in module.JOBS:
         try:
             fresh = job["fetch"]()
-        except Exception as exc:  # noqa: BLE001 - any failure falls back to old data
+        except Exception as exc:  # noqa: BLE001 - any failure falls back per chart
             msg = f"{job['name']}: {exc}"
             errors.append(msg)
             print(f"::warning title={label} {job['name']} failed::{exc}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
+            # One failed chart must not take the other charts of this source down:
+            # each chart id falls back to its own newest snapshot, independently.
             for cid in job["charts"]:
-                if cid in previous:
-                    old = dict(previous[cid])
-                    old["stale"] = True
-                    charts.append(old)
+                chart = stale_chart(history, src["id"], cid, previous, msg)
+                if chart is None:
+                    errors.append(f"{job['name']}: no history snapshot for chart {cid}")
+                    continue
+                charts.append(chart)
             continue
         ok_jobs += 1
         stamp = now_iso()
