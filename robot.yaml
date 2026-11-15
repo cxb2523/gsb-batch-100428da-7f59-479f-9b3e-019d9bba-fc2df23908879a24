@@ -1,0 +1,17 @@
+tasks:
+  Process PDF invoices with Amazon Textract:
+    robotTaskName: Process PDF invoices with Amazon Textract
+  Create Invoices:
+    robotTaskName: Create Invoices
+  Delete Files From Amazon S3 Bucket:
+    robotTaskName: Delete Files From Amazon S3 Bucket
+
+condaConfigFile: conda.yaml
+artifactsDir: output
+PATH:
+  - .
+PYTHONPATH:
+  - .
+  - resources
+ignoreFiles:
+  - .gitignore
