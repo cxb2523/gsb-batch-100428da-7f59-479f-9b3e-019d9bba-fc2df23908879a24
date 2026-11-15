@@ -1,0 +1,93 @@
+name: Bump, Release, and Publish
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+  id-token: write # Required for OIDC/NPM trusted publisher
+
+jobs:
+  bump-release-publish:
+    runs-on: ubuntu-latest
+    if: github.actor != 'github-actions[bot]'
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm install -g npm@^11.5.1
+      - run: npm ci
+      - run: npm test
+      - name: Tag, publish, and bump version
+        id: release
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+          CURRENT_VERSION=$(node -p "require('./package.json').version.trim()")
+          echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+          # Create tag locally (not yet pushed)
+          if ! git rev-parse --verify "refs/tags/$CURRENT_VERSION" > /dev/null 2>&1; then
+            git tag -a "$CURRENT_VERSION" -m "Release $CURRENT_VERSION"
+          fi
+
+          # Publish to NPM BEFORE bumping (so package.json version is correct)
+          if ! npm view "sitemapper@$CURRENT_VERSION" version > /dev/null 2>&1; then
+            npm publish
+          fi
+
+          # Bump for next development cycle
+          npm version patch --no-git-tag-version
+          NEW_VERSION=$(node -p "require('./package.json').version.trim()")
+          git add package.json package-lock.json
+          git commit -m "chore: bump version to $NEW_VERSION"
+
+          # Push commits + annotated release tag together
+          git push --follow-tags
+
+          # Create GitHub Release (idempotent)
+          if ! gh release view "$CURRENT_VERSION" > /dev/null 2>&1; then
+            gh release create "$CURRENT_VERSION" \
+              --title "Release $CURRENT_VERSION" \
+              --notes "Releasing version $CURRENT_VERSION to NPM"
+          fi
+
+  test-published-npm:
+    needs: bump-release-publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test published CLI with npx
+        env:
+          VERSION: ${{ needs.bump-release-publish.outputs.version }}
+        run: |
+          MAX_RETRIES=5
+          RETRY_DELAY=10
+
+          for ((i=1; i<=MAX_RETRIES; i++)); do
+            echo "Attempt $i of $MAX_RETRIES to run npx sitemapper@$VERSION..."
+
+            if npx sitemapper@$VERSION https://wp.seantburke.com/sitemap.xml; then
+              echo "Successfully executed npx sitemapper!"
+              exit 0
+            else
+              echo "Attempt $i failed. Package might not be available yet."
+              if [ $i -lt $MAX_RETRIES ]; then
+                echo "Waiting $RETRY_DELAY seconds before next attempt..."
+                sleep $RETRY_DELAY
+              else
+                echo "All attempts failed after $(($MAX_RETRIES * $RETRY_DELAY)) seconds."
+                exit 1
+              fi
+            fi
+          done

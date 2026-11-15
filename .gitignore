@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+.DS_Store
+.idea
+.vscode
+tmp
+lib
+.nyc_output
+coverage
+.claude/settings.local.json
