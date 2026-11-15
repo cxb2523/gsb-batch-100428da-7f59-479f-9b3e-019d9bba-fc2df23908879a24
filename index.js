@@ -51,25 +51,57 @@ function pageNotFound($, pageNF) { // Not completed tested yet
 }
 
 function crawlList($, $listElems, crawlData, [ _option, ..._list ]) {
-  const elemLength = $listElems.length
+  const total = $listElems.length
+  const crawlAt = i => crawlContent($, $listElems.eq(i), crawlData)
+  const wrap = (option, items, dropped = 0, truncated = 0) =>
+    ({ items, summary: { option, count: items.length, dropped, truncated } })
 
-  const crawlInRange = ([ start, _end = elemLength ]) => {
-    const end = (_end <= elemLength) ? _end : elemLength
-    return _.times((end - start), i => crawlContent($, $listElems.eq(start + i), crawlData))
+  // Convert negative indices to count-from-end, then drop out-of-range and duplicated ones
+  const normalize = list => {
+    const seen = new Set()
+    const indices = []
+    let dropped = 0
+
+    for(const raw of list) {
+      const i = (raw < 0) ? (raw + total) : raw
+      if(i < 0 || i >= total || seen.has(i)) {
+        dropped++
+        continue
+      }
+      seen.add(i)
+      indices.push(i)
+    }
+
+    return { indices: indices.sort((a, b) => a - b), dropped }
   }
 
-  const crawlInFocus = focusList =>
-    focusList.map(i => (i < elemLength) ? crawlContent($, $listElems.eq(i), crawlData) : null)
-
-  const option = _list.length ? _option : ''
-  const list   = _list.map(i => (i < 0) ? (i + elemLength) : i)
+  const option = _list.length ? _option : 'all'
 
   switch(option) {
-    case 'ignore': return crawlInFocus(_.difference(_.range(elemLength), list))
-    case 'focus': return crawlInFocus(list)
-    case 'range': return crawlInRange(list)
-    case 'limit': return crawlInRange([ 0, list[0] ])
-    default: return crawlInRange([ 0 ])
+    case 'ignore': {
+      const { indices, dropped } = normalize(_list)
+      const items = _.difference(_.range(total), indices).map(crawlAt)
+      return wrap(option, items, dropped)
+    }
+    case 'focus': {
+      const { indices, dropped } = normalize(_list)
+      return wrap(option, indices.map(crawlAt), dropped)
+    }
+    case 'range': {
+      const [ start = 0, _end = total ] = _list
+      const end = Math.min(_end, total)
+      const truncated = Math.max(0, _end - total)
+      const items = (start >= end) ? [] : _.times(end - start, i => crawlAt(start + i))
+      return wrap(option, items, 0, truncated)
+    }
+    case 'limit': {
+      const n = _list[0]
+      const end = Math.min(n, total)
+      const truncated = Math.max(0, n - total)
+      return wrap(option, _.times(end, crawlAt), 0, truncated)
+    }
+    default:
+      return wrap('all', _.times(total, crawlAt))
   }
 }
 

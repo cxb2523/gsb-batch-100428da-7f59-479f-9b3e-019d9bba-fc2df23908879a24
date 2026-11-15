@@ -67,8 +67,9 @@ console.info('Crawl the popular list at Kickstarter.')
     const bodyHTML = await page.content()
     const result = bodyHTML ? await crawl(bodyHTML, setting) : 'No content'
 
-    console.log('Result:', result)
-    console.log('Total:', result.length)
+    console.log('Result:', result.items)
+    console.log('Summary:', result.summary)
+    console.log('Total:', result.items.length)
     await browser.close()
   } catch (err) { console.error(err) }
 })()

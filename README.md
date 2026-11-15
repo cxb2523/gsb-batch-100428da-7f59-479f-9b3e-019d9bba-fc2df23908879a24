@@ -38,10 +38,17 @@ DOM element that will focus on. If type is `list`, it will crawl each container 
 
 Optional, enable in `list` type only, use when you don't want to crawl the whole list. ** ALL STRAT FROM 0 **
 
-- `[ 'limit', 10 ]`: ten elements only (eq(0) ~ eq(9)).
-- `[ 'range', 6, 12 ]`: from eq(6) to eq(12 - 1). If without end, it will continue to the last one.
-- `[ 'focus', 0, 3, 7, ... ]`: specific elements in list (eq(0), eq(3), eq(7), ...). You can use -1, -2 to count from backward.
-- `[ 'ignore', 1, 2, 5 ]`: elements you want to ignore it. You can use -1, -2 to count from backward.
+- `[ 'limit', 10 ]`: ten elements only (eq(0) ~ eq(9)). `0` returns an empty list; a number larger than the list returns all elements.
+- `[ 'range', 6, 12 ]`: from eq(6) to eq(12 - 1). If without end, it will continue to the last one. An end beyond the list length is truncated to the list length; if start >= end, it returns an empty list.
+- `[ 'focus', 0, 3, 7, ... ]`: specific elements in list (eq(0), eq(3), eq(7), ...). You can use -1, -2 to count from backward. Indices still out of range after conversion and duplicated indices are dropped.
+- `[ 'ignore', 1, 2, 5 ]`: elements you want to ignore it. You can use -1, -2 to count from backward. If everything is ignored, it returns an empty list.
+
+The `list` type resolves to `{ items, summary }`: `items` is the crawled object array in original order, and `summary` describes the sampling:
+
+- `option`: the listOption type used (`all` when no listOption is set).
+- `count`: how many elements were actually crawled.
+- `dropped`: how many indices were dropped (out of range or duplicated).
+- `truncated`: how many entries were cut off because the range/limit exceeded the list length.
 
 ### crawl
 
