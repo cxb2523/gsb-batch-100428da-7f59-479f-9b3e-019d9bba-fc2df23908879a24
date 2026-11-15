@@ -1,0 +1,95 @@
+# MangaFox Download Script
+
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
+[![CI](https://github.com/techwizrd/MangaFox-Download-Script/actions/workflows/ci.yml/badge.svg)](https://github.com/techwizrd/MangaFox-Download-Script/actions/workflows/ci.yml)
+
+This project downloads manga chapter images and can optionally package each
+chapter into a `.cbz` archive.
+
+This script is intended for archival/offline reading use cases (for example,
+downloading chapters before a flight). Users are responsible for complying
+with Fanfox [Terms of Service](https://fanfox.net/teams/).
+
+Downloaded manga should be written to `downloads/` with `--output-dir downloads`
+when working from a Git checkout. That directory is ignored by Git.
+
+If a chapter finishes with missing images, the script prints a final failed-image
+summary and exits non-zero instead of silently leaving an incomplete chapter.
+
+The script is now maintained as a Python 3.11+ project with linting, type
+checking, tests, and pre-commit hooks.
+
+## Runtime requirements
+
+- Python 3.11+
+- `beautifulsoup4`
+
+## Usage
+
+After installation, run the downloader with `mfdl`. From a source checkout,
+`uv run mfdl` also works.
+
+Mandatory argument:
+
+- `-m`, `--manga <Manga Name>`
+
+Optional arguments:
+
+- `-s`, `--start <chapter>` start chapter (float supported)
+- `-e`, `--end <chapter>` end chapter (float supported)
+- `-c`, `--cbz` create CBZ archive after download
+- `-r`, `--remove` remove image files after CBZ creation
+- `-f`, `--force` redownload chapters even when matching `.cbz` files already exist
+- `--output-dir <directory>` directory where manga downloads are written
+- `-l`, `--list` list chapter numbers and exit
+- `--latest <count>` download or list only the latest N selected chapters
+- `-d`, `--debug` show HTTP request debug output
+- `--profile <safe|balanced|aggressive>` performance profile (default: `safe`)
+- `--workers <count>` concurrent image downloads (overrides profile)
+- `--delay <seconds>` average delay between retry attempts (overrides profile)
+- `--max-retries <count>` max retries per image download (overrides profile)
+- `--timeout <seconds>` HTTP request timeout (default: `30`)
+
+Examples:
+
+```bash
+mfdl -m "The World God Only Knows"
+mfdl -m "The World God Only Knows" -s 222.5 -e 222.5
+mfdl -m "The World God Only Knows" -s 190 -e 205 -c -r
+mfdl -m "One Piece" -c -r --force
+mfdl -m "The World God Only Knows" --list
+mfdl -m "One Piece" --latest 5 -c -r
+mfdl -m "One Piece" --profile balanced -c -r
+mfdl -m "One Piece" --output-dir downloads -c -r
+mfdl -m "One Piece" --timeout 60 -c -r
+```
+
+## Development setup
+
+Install dev dependencies:
+
+```bash
+uv sync --extra dev
+```
+
+Run quality checks directly:
+
+```bash
+uv run ruff check .
+uv run ruff format .
+uv run prek run markdownlint --all-files
+uv run ty check mfdl.py tests
+uv run pytest -q
+```
+
+## Pre-commit (`prek`)
+
+This repository uses `.pre-commit-config.yaml` and is intended to be executed
+with `prek`.
+
+```bash
+uv run prek install
+uv run prek run --all-files
+```
+
+`pytest` is configured on the `pre-push` stage to keep normal commits fast.
