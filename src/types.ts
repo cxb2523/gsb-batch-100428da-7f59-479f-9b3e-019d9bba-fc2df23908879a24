@@ -52,6 +52,15 @@ export interface CrawlManifestSummary {
   durationMs: number;
 }
 
+export type SitemapDiscoveryStatus = 'success' | 'failed';
+
+export interface SitemapDiscoveryRecord {
+  url: string;
+  status: SitemapDiscoveryStatus;
+  error?: string;
+  urlCount: number;
+}
+
 export interface CrawlManifest {
   seedUrl: string;
   scope: CrawlScope;
@@ -59,4 +68,5 @@ export interface CrawlManifest {
   finishedAt: string;
   results: CrawlPageResult[];
   summary: CrawlManifestSummary;
+  sitemapRecords: SitemapDiscoveryRecord[];
 }

@@ -15,12 +15,19 @@ import {
 } from './output.js';
 import { CrawlQueue } from './queue.js';
 import { discoverSitemap } from './sitemap.js';
-import type { CrawlManifest, CrawlOptions, CrawlPageResult, CrawlScope } from './types.js';
+import type {
+  CrawlManifest,
+  CrawlOptions,
+  CrawlPageResult,
+  CrawlScope,
+  SitemapDiscoveryRecord,
+} from './types.js';
 import { deriveScope, normalizeUrl, resolveCollision, urlToOutputPath } from './urls.js';
 
 interface CrawlRuntime {
   queue: CrawlQueue;
   results: CrawlPageResult[];
+  sitemapRecords: SitemapDiscoveryRecord[];
   reservedPages: number;
   inFlight: number;
   interrupted: boolean;
@@ -55,6 +62,7 @@ export async function crawl(seedUrl: string, options: CrawlOptions): Promise<Cra
     runtime: {
       queue: new CrawlQueue(),
       results: [],
+      sitemapRecords: [],
       reservedPages: 0,
       inFlight: 0,
       interrupted: false,
@@ -86,6 +94,7 @@ export async function crawl(seedUrl: string, options: CrawlOptions): Promise<Cra
       startedAt,
       finishedAt: new Date().toISOString(),
       results: finalizedResults,
+      sitemapRecords: context.runtime.sitemapRecords,
       durationMs: Date.now() - startTime,
     });
 
@@ -126,18 +135,20 @@ async function seedQueueFromSitemap(context: CrawlContext): Promise<void> {
     return;
   }
 
-  const sitemapUrls = await discoverSitemap(context.seedUrl, context.scope, {
+  const discovery = await discoverSitemap(context.seedUrl, context.scope, {
     include: context.options.include,
     exclude: context.options.exclude,
     verbose: context.options.verbose,
     fetchDelayMs: context.options.delay,
   });
 
-  if (sitemapUrls === null) {
+  context.runtime.sitemapRecords.push(...discovery.records);
+
+  if (discovery.urls === null) {
     return;
   }
 
-  for (const sitemapUrl of sitemapUrls) {
+  for (const sitemapUrl of discovery.urls) {
     const sitemapDepth = inferDepthFromScope(sitemapUrl, context.scope);
     if (context.maxDepth !== undefined && sitemapDepth > context.maxDepth) {
       continue;
@@ -430,6 +441,7 @@ function buildManifest(input: {
   startedAt: string;
   finishedAt: string;
   results: CrawlPageResult[];
+  sitemapRecords: SitemapDiscoveryRecord[];
   durationMs: number;
 }): CrawlManifest {
   return {
@@ -439,6 +451,7 @@ function buildManifest(input: {
     finishedAt: input.finishedAt,
     results: input.results.map(stripPageContent),
     summary: buildSummary(input.results, input.durationMs),
+    sitemapRecords: input.sitemapRecords,
   };
 }
 
