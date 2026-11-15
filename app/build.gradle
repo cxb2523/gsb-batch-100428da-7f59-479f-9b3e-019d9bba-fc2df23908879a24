@@ -1,0 +1,121 @@
+plugins {
+    alias(libs.plugins.android.application)
+    id 'com.chaquo.python'
+}
+
+// 从 local.properties 读取签名凭据，避免明文写在版本控制的 build.gradle 中。
+// local.properties 已被 .gitignore 忽略，不会提交到仓库。
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file("local.properties")
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+// 凭据是否齐全：齐全才启用 release 签名；否则 release 构建回退到默认（未签名/调试签名），
+// 这样在未配置凭据的机器上 debug 构建（Run/Debug）也能直接跑，不被签名卡住。
+// 用非空白判定而非仅 != null：local.properties 里写了空值/空白（storePassword=）时，
+// 旧的 != null 会误判为"已配置"，导致 release 构建在签名阶段才失败；这里提前回退到默认签名。
+def hasValue = { v -> v != null && !v.toString().trim().isEmpty() }
+def hasReleaseSigning = hasValue(keystoreProperties['storePassword']) &&
+        hasValue(keystoreProperties['keyAlias']) &&
+        hasValue(keystoreProperties['keyPassword'])
+
+android {
+    namespace 'com.javdb_spider.app'
+    compileSdk {
+        version = release(36)
+    }
+
+    defaultConfig {
+        applicationId "com.javdb_spider.app"
+        minSdk 26
+        targetSdk 36
+        versionCode 29
+        versionName "2.4.0"
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        // === 新增：配置 NDK，指定手机 CPU 架构 ===
+        ndk {
+            abiFilters "arm64-v8a"
+        }
+    }
+    signingConfigs {
+        release {
+            // 仅在凭据齐全时填充，避免缺失时 Gradle 校验报 "missing required property"
+            if (hasReleaseSigning) {
+                storeFile file("javdb_spider.jks")
+                storePassword keystoreProperties['storePassword']
+                keyAlias keystoreProperties['keyAlias']
+                keyPassword keystoreProperties['keyPassword']
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            // debug 构建使用 Android 默认调试签名，无需任何凭据，Run/Debug 可直接运行
+        }
+
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            // 凭据齐全才用 release 签名；否则不指定签名（需自行在 local.properties 配置后再出正式包）
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+    sourceSets {
+        main {
+            // 告诉 Chaquopy，Python 代码不在默认的 src/main/python 里了，
+            // 而是在 app 文件夹上一级的 spider_core 文件夹里！
+            python {
+                srcDir "../spider_core"
+                // 排除运行时无关内容，防止被 Chaquopy 打进 APK（节省约 130M）。
+                // Chaquopy 默认会打包 srcDir 下所有文件（不止 .py），故需显式排除。
+                exclude "web/**"            // Vite 前端开发目录 + node_modules (~106M)
+                exclude ".venv-test/**"     // 测试虚拟环境 (~23M)
+                exclude "tests/**"          // 单元测试，运行时不需要
+                exclude "**/__pycache__/**" // Python 字节码缓存
+                exclude "data/**"           // 本机运行时数据库（设备上会在沙盒自动重建）
+                exclude "task_config.json"  // 本地任务配置（设备运行时自建）
+                exclude "status.json"       // 本地运行状态
+                exclude "checkpoint.json"   // 本地断点续传记录
+                exclude "*.db"              // 数据库文件兜底
+                exclude "*.sqlite"
+                exclude "*.sqlite3"
+                // 保留：所有 .py、routers/、services/、frontend_dist/（后端 serve 给浏览器的前端）
+            }
+        }
+    }
+}
+
+dependencies {
+    implementation libs.appcompat
+    implementation libs.material
+    implementation libs.activity
+    implementation libs.constraintlayout
+    testImplementation libs.junit
+    androidTestImplementation libs.ext.junit
+    androidTestImplementation libs.espresso.core
+}
+
+chaquopy {
+    defaultConfig {
+        // 指定 Python 版本
+        version = "3.12"
+        // 配置你的爬虫需要的 Python 库
+        pip {
+            install "fastapi>=0.95.2,<0.100.0"
+            install "pydantic>=1.10.24,<2.0.0"
+            install "uvicorn>=0.46.0,<1.0.0"
+            install "beautifulsoup4>=4.14.3,<5.0.0"
+            install "bencodepy>=0.9.5,<1.0.0"
+            // 注意：不安装 curl_cffi，因为我们要改用安卓原生 WebView
+        }
+    }
+}

@@ -1,0 +1,74 @@
+name: Docker Publish to GHCR (Manual)
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '请输入发布的版本号 (例如: v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/javdb_spider
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Run Python tests
+        run: |
+          pip install -r requirements.txt
+          python -m unittest discover -s spider_core/tests
+      - name: Guard Pydantic v1/v2 compatibility
+        run: |
+          if grep -rnE '(model_dump|model_validate|model_config|ConfigDict|field_validator|parse_obj|parse_raw)' spider_core --include='*.py'; then
+            echo "::error::Found Pydantic version-specific API; keep schemas in the v1/v2 common subset."
+            exit 1
+          fi
+          echo "Pydantic compatibility guard passed."
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ github.event.inputs.version }}
+            type=raw,value=latest
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build frontend (生成 frontend_dist 供镜像 COPY)
+        run: |
+          cd spider_core/web
+          npm ci
+          npm run build
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          build-args: |
+            JAVDB_SPIDER_VERSION=${{ github.event.inputs.version }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=spider
+          cache-to: type=gha,mode=max,scope=spider

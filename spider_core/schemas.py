@@ -1,0 +1,70 @@
+"""Pydantic request/response schemas."""
+
+from pydantic import BaseModel
+from ranking_utils import COLLECTION_TYPE_ACTOR
+
+
+class TaskConfig(BaseModel):
+    start_url: str
+    cookie: str = ""
+    user_agent: str = ""
+    filename: str = ""
+    proxies: str | None = None
+    crawl_mode: str = ""
+    collection_type: str = COLLECTION_TYPE_ACTOR
+    ranking_category: str = ""
+    ranking_period: str = ""
+    remember_cookie: bool = False
+
+class RuntimeConfig(BaseModel):
+    cookie: str = ""
+    remember_cookie: bool = False
+    user_agent: str = ""
+    proxies: str = ""
+    trackers: list[str] = []
+    magnet_score_100_condition: str | None = None
+    magnet_score_10_condition: str | None = None
+    magnet_score_1_condition: str | None = None
+
+class AuthSessionRequest(BaseModel):
+    session_id: str
+
+
+class AuthLoginRequest(BaseModel):
+    session_id: str
+    email: str
+    password: str
+    captcha: str = ""
+    remember_cookie: bool = True
+
+class CookieConfig(BaseModel):
+    cookie: str = ""
+
+class ModeConfig(BaseModel):
+    mode: str
+
+class TagConfigRequest(BaseModel):
+    url: str
+    cookie: str = ""
+    user_agent: str = ""
+    proxies: str | None = None
+
+class ActorRefreshRequest(BaseModel):
+    category: str = "all"
+
+class ActorTaskRequest(BaseModel):
+    actor_id: str
+    tags: list[dict] = []
+    crawl_mode: str = ""
+
+class DeleteRequest(BaseModel):
+    filenames: list[str]
+
+class SelectMagnetRequest(BaseModel):
+    magnet_id: int
+
+
+class AutoSelectRequest(BaseModel):
+    """Request body for automatic magnet selection."""
+
+    filenames: list[str]
