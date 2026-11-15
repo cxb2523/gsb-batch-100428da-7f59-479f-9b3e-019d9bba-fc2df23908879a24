@@ -249,6 +249,8 @@ circularCaptital(9), yearPE(10), nextYearPE(11)
 | data/main_plate_info_{date}.csv | **主板块汇总**（强度/成交额/主力/涨停封单/大单封单/换手率/上涨下跌/爆发原因，merge 4 组数据） |
 | data/sub_plate_info_{date}.csv | **子板块关联**（父代码/子代码/子板块名/子板块强度） |
 | data/stock_info_{date}.csv | **个股详情**（代码/名称/价格/涨幅/成交额/主力/换手率/量比/封单/市值/PE 等 63 字段） |
+| data/fetch_status_{date}.csv | **抓取结局明细**（每个板块 × 每个接口一行：结局/尝试次数/重试次数/原因） |
+| data/fetch_summary_{date}.csv | **抓取结局汇总**（每个板块一行：成功或失败、失败接口、成分股成功/失败/跳过数） |
 | captures/ | mitmproxy 抓包原始数据（用于 token 刷新） |
 
 ---
@@ -364,11 +366,50 @@ crawler_batch.py 按天循环:
 │   ├── 阶段1：串行分页 RealRankingInfo → 动态获取板块列表
 │   ├── 阶段2：并行抓取板块数据 (PlateInfo_QJ + PanKou + BoomReason + SonPlate)
 │   ├── 阶段3：并行抓取成分股 (ZhiShuStockList_W8)
-│   └── 阶段4：构建 DataFrame → 输出 3 个 CSV
-│       ├── data/main_plate_info_{date}.csv  (主板块汇总)
-│       ├── data/sub_plate_info_{date}.csv   (子板块关联)
-│       └── data/stock_info_{date}.csv       (个股详情)
+│   ├── 阶段4：构建 DataFrame → 输出 3 个 CSV
+│   │   ├── data/main_plate_info_{date}.csv  (主板块汇总)
+│   │   ├── data/sub_plate_info_{date}.csv   (子板块关联)
+│   │   └── data/stock_info_{date}.csv       (个股详情)
+│   └── 结局落盘（与当天数据一起产出，供事后核对）
+│       ├── data/fetch_status_{date}.csv     (板块 × 接口 明细结局)
+│       └── data/fetch_summary_{date}.csv    (每板块汇总结局)
 ```
+
+### 抓取容错与结局核对
+
+- **接口失败不影响其他数据**：单个板块的任一接口重试耗尽（默认 3 次）只让该接口
+  对应的字段留空，其余板块、其余接口照常抓取，三个业务 CSV 一定照常写出。
+- **结局文件**（随当天数据一起落盘，UTF-8-SIG 便于 Excel 打开）：
+  - `fetch_status_{date}.csv`：`日期, 板块代码, 板块名称, 子板块代码, 阶段, 接口,
+    结局, 尝试次数, 重试次数, 说明`。每个板块的 4 个板块接口各一行，每个子板块的
+    成分股接口各一行；成功、失败、跳过都有记录。
+  - `fetch_summary_{date}.csv`：`日期, 板块代码, 板块名称, 结局, 板块接口成功数,
+    板块接口失败数, 失败接口, 成分股成功数, 成分股失败数, 成分股跳过数, 重试总次数,
+    说明`。一行一个板块，成功板块同样有 `结局=成功` 的记录。
+- **子板块为空 ≠ 子板块请求失败**：
+  - 返回空 `List` → 正常回退，用排行数据补父板块自身，结局仍为成功，说明列注明“回退”。
+  - 请求失败 → 记为失败，不生成回退行，该板块成分股整体跳过并单独记一条 `结局=跳过`。
+- **板块列表本身失败**：首页失败时不生成三个业务 CSV，但结局文件仍会写出失败原因；
+  后续页失败时保留已拿到的板块继续抓取，并在明细里记录分页失败。
+- 接口返回结构异常（缺字段/字段数不足）记为失败并写入说明列，不会被当成“空数据”静默吞掉。
+
+### 验收自测
+
+`tests/` 下有基于本地桩请求的离线验收用例（不需要 token、不需要真实接口）：
+
+```bash
+python -m pytest tests -q
+```
+
+若本机装有会报错的第三方 pytest 插件（例如 `pycodemath` 入口缺失），可先禁用插件自动加载：
+
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest tests -q
+```
+
+覆盖：单个板块接口持续失败时其余板块完整、失败结局可定位到板块+接口+重试次数、
+空子板块回退与子板块失败区分、子板块失败时成分股跳过并记录、三个 CSV 列名/顺序/
+金额换算不变、板块列表分页失败、结构异常响应、多次运行输出稳定。
 
 ### Token 过期处理
 
@@ -398,6 +439,9 @@ crawler_batch.py 按天循环:
 - 板块数量、token 状态、每个板块的抓取结果
 - 并发线程执行情况
 - 失败重试记录
+- 当天结局文件路径与成功/失败板块统计
+
+落盘的结局文件见 8.4“抓取容错与结局核对”，可直接用于事后核对，不必翻控制台日志。
 
 ---
 
@@ -436,7 +480,12 @@ crawler_batch.py 按天循环:
 ├── data/                        # 输出数据
 │   ├── main_plate_info_{date}.csv   # 主板块汇总
 │   ├── sub_plate_info_{date}.csv    # 子板块关联
-│   └── stock_info_{date}.csv        # 个股详情
+│   ├── stock_info_{date}.csv        # 个股详情
+│   ├── fetch_status_{date}.csv      # 抓取结局明细（板块 × 接口）
+│   └── fetch_summary_{date}.csv     # 抓取结局汇总（每板块一行）
+├── tests/                       # 离线验收测试（本地桩请求）
+│   ├── conftest.py              # akshare 打桩 + FakeApi
+│   └── test_fetch_resilience.py # 容错与结局记录验收用例
 ├── captures/                    # mitmproxy 原始抓包（用于 token 刷新）
 └── .gitignore                   # 排除 .env / data / captures / __pycache__
 ```
