@@ -7,7 +7,12 @@ from typing import TYPE_CHECKING
 from mitmproxy.http import Request
 
 # Import the utility functions directly
-from .utils import is_in_scope, create_target_signature
+from .utils import (
+    is_in_scope,
+    create_target_signature,
+    TARGET_TYPE_LINK,
+    TARGET_TYPE_FORM,
+)
 
 if TYPE_CHECKING:
     from .addon import MainAddon
@@ -67,7 +72,9 @@ def discover_and_queue_targets(
                 mock_req = Request.make("GET", absolute_url)
                 mock_req.query = query_params  # Set query for signature function
 
-                target_signature = create_target_signature(mock_req, logger)
+                target_signature = create_target_signature(
+                    mock_req, logger, target_type=TARGET_TYPE_LINK
+                )
 
                 if (
                     target_signature
@@ -119,7 +126,9 @@ def discover_and_queue_targets(
         else:
             mock_req.urlencoded_form = form_params
 
-        target_signature = create_target_signature(mock_req, logger)
+        target_signature = create_target_signature(
+            mock_req, logger, target_type=TARGET_TYPE_FORM
+        )
 
         if target_signature and target_signature not in addon_instance.scanned_targets:
             addon_instance.scanned_targets.add(target_signature)
