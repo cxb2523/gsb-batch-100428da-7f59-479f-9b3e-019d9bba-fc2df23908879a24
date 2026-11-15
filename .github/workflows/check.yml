@@ -1,0 +1,54 @@
+# This workflow runs for every pull request to lint and test the proposed changes.
+
+name: Check
+
+on:
+    pull_request:
+
+jobs:
+    # NPM install is done in a separate job and cached to speed up the following jobs.
+    build_and_test:
+        name: Build & Test
+        if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+        runs-on: ${{ matrix.os }}
+
+        strategy:
+            matrix:
+                os: [ubuntu-latest, windows-latest]
+                node-version: [15, 16, 18]
+
+        steps:
+            -
+                uses: actions/checkout@v2
+            -
+                name: Use Node.js ${{ matrix.node-version }}
+                uses: actions/setup-node@v1
+                with:
+                    node-version: ${{ matrix.node-version }}
+            -
+                uses: microsoft/playwright-github-action@v1
+            -
+                name: Install Dependencies
+                run: npm install
+            -
+                name: Run Tests
+                run: npm test
+
+    lint:
+        name: Lint
+        needs: [build_and_test]
+        runs-on: ubuntu-latest
+
+        steps:
+            -
+                uses: actions/checkout@v2
+            -
+                name: Use Node.js 16
+                uses: actions/setup-node@v1
+                with:
+                    node-version: 16
+            -
+                name: Install Dependencies
+                run: npm install
+            -
+                run: npm run lint
