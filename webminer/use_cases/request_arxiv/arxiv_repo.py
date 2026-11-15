@@ -14,6 +14,16 @@ import feedparser
 from webminer.entities import arxiv_document as ad
 
 
+# feedparser 5 exposes _FeedParserMixin at package level; feedparser 6 moved
+# it into the feedparser.mixin module. Support both.
+try:
+    _FeedParserMixin = feedparser._FeedParserMixin  # pylint: disable=W0212
+except AttributeError:
+    from feedparser import mixin as _feedparser_mixin
+
+    _FeedParserMixin = _feedparser_mixin._FeedParserMixin  # pylint: disable=W0212
+
+
 class ArxivRepo:
     """
         The helper class to parse arxiv.org site.
@@ -30,10 +40,10 @@ class ArxivRepo:
     base_url = "http://export.arxiv.org/api/query?"
 
     # Expose both of the open source metadata namespaces in feedparser
-    feedparser._FeedParserMixin.namespaces[  # pylint: disable=W0212
+    _FeedParserMixin.namespaces[
         "http://a9.com/-/spec/opensearch/1.1/"
     ] = "opensearch"
-    feedparser._FeedParserMixin.namespaces[  # pylint: disable=W0212
+    _FeedParserMixin.namespaces[
         "http://arxiv.org/schemas/atom"
     ] = "arxiv"
 
@@ -41,6 +51,11 @@ class ArxivRepo:
         self._entries = []
         if entries:
             self._entries.extend(entries)
+        # Metadata about pages that could not be fetched/parsed during the
+        # last fetch_papers() run. Each item is a dict with the page start
+        # index ("start_index") and the error description ("error"). Empty
+        # when every page succeeded.
+        self.fetch_errors = []
 
     def _check(self, element, key, value):
         """Checks elements and formats them
@@ -80,15 +95,32 @@ class ArxivRepo:
         if not filters:
             return self._entries
 
-        self._entries = self.fetch_papers()
+        # Fetch fresh papers and keep the injected entries untouched. The
+        # filters are applied on every paper accumulated across all pages,
+        # not only the last fetched page.
+        entries = self.fetch_papers()
 
         result = []
-        result.extend(self._entries)
+        result.extend(entries)
 
         for key, value in filters.items():
             result = [e for e in result if self._check(e, key, value)]
 
-        return [ad.ArxivDocument.from_dict(r) for r in result]
+        return [self._to_document(r) for r in result]
+
+    @staticmethod
+    def _to_document(dict_entry):
+        """Build an ArxivDocument from a dict produced by extract_relevant_info"""
+
+        return ad.ArxivDocument(
+            doc_id=dict_entry["id"],
+            url=dict_entry["link"],
+            title=dict_entry["title"],
+            abstract=dict_entry["abstract"],
+            authors=dict_entry["authors"],
+            publish_date=dict_entry["publish_date"],
+            pdf_url=dict_entry.get("pdf", ""),
+        )
 
     # @classmethod
     # def encode_feedparser_dict(cls, fp_dict):
@@ -194,20 +226,57 @@ class ArxivRepo:
             break_on_no_added {bool} --
                 [break out early if all returned query papers are already in db]
                 (default: {True})
+
+        Returns:
+            list: dicts of all papers accumulated across the fetched pages.
+                Pages that fail (request error or no parseable entries) are
+                recorded in self.fetch_errors together with their start index
+                and do not abort the whole fetch.
+
+        Raises:
+            RuntimeError: if every requested page failed and no paper could
+                be fetched, instead of silently returning an empty list.
         """
 
-        for i in range(start_index, max_index, results_per_iteration):
-            parsed_response = self.run_query(search_query, i, results_per_iteration)
+        results = []
+        self.fetch_errors = []
+        page_starts = list(range(start_index, max_index, results_per_iteration))
 
-            results = []
+        for i in page_starts:
+            try:
+                parsed_response = self.run_query(search_query, i, results_per_iteration)
 
-            for entry in parsed_response.entries:
-                dict_entry = self.extract_relevant_info(entry)
+                page_entries = parsed_response.entries
+                if not page_entries:
+                    raise ValueError("no entries parsed from page response")
 
-                rawid, version = self.parse_arxiv_url(dict_entry["link"])
-                dict_entry["_rawid"] = rawid
-                dict_entry["_version"] = version
+                page_results = []
+                for entry in page_entries:
+                    dict_entry = self.extract_relevant_info(entry)
 
-                results.append(dict_entry)
+                    rawid, version = self.parse_arxiv_url(dict_entry["link"])
+                    dict_entry["_rawid"] = rawid
+                    dict_entry["_version"] = version
+
+                    page_results.append(dict_entry)
+            except Exception as exc:  # pylint: disable=W0703
+                # A single broken page must not discard the papers already
+                # fetched from the other pages: record it and keep going.
+                self.fetch_errors.append(
+                    {
+                        "start_index": i,
+                        "error": f"{exc.__class__.__name__}: {exc}",
+                    }
+                )
+                continue
+
+            results.extend(page_results)
+
+        if page_starts and not results and len(self.fetch_errors) == len(page_starts):
+            details = "; ".join(
+                f"start={failure['start_index']} {failure['error']}"
+                for failure in self.fetch_errors
+            )
+            raise RuntimeError("all arxiv pages failed to fetch papers: " + details)
 
         return results

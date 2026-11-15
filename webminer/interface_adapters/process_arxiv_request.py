@@ -14,4 +14,11 @@ class ProcessArxivDocuments(uc.RestInterface):
 
     def process_request(self, request_object):
         arxiv_documents = self.repo.list(filters=request_object.filters)
-        return res.ResponseSuccess(arxiv_documents)
+        response = res.ResponseSuccess(arxiv_documents)
+        # Make partially failed pages visible to the caller while keeping the
+        # successful papers in the response. Only present when something went
+        # wrong on at least one page.
+        fetch_errors = getattr(self.repo, "fetch_errors", None)
+        if isinstance(fetch_errors, list) and fetch_errors:
+            response.fetch_errors = fetch_errors
+        return response

@@ -1,6 +1,10 @@
 """Takes the valid request object and returns a filtered arxiv document"""
 
-import collections
+try:
+    from collections.abc import Mapping
+except ImportError:  # Python 3.6 keeps Mapping under collections
+    from collections import Mapping
+
 from webminer.interface_adapters.rest_adapters import request_object as req
 
 
@@ -30,7 +34,7 @@ class ArxivDocumentListRequestObject(req.ValidRequestObject):
 
         invalid_req = req.InvalidRequestObject()
 
-        if "filters" in adict and not isinstance(adict["filters"], collections.Mapping):
+        if "filters" in adict and not isinstance(adict["filters"], Mapping):
             invalid_req.add_error("filters", "Is not iterable")
 
         if invalid_req.has_errors():

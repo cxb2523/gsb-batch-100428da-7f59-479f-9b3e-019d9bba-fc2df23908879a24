@@ -43,8 +43,16 @@ def arxiv():
 
     response = use_case.execute(request_object)
 
-    return Response(
+    http_response = Response(
         json.dumps(response.value, cls=ser.ArxivDocEncoder),
         mimetype="application/json",
         status=STATUS_CODES[response.type],
     )
+
+    # Partially failed pages are reported alongside the successful papers.
+    # The status code and the JSON body semantics stay untouched.
+    fetch_errors = getattr(response, "fetch_errors", None)
+    if fetch_errors:
+        http_response.headers["X-Arxiv-Failed-Pages"] = json.dumps(fetch_errors)
+
+    return http_response
