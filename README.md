@@ -104,6 +104,13 @@ $ torcrawl -v -u http://www.github.com/ -c -d 2 -p 2
 | -vis         | --visualization     | Generate HTML visualization from SQLite database (requires -DB)                        |
 | -l           | --log               | Log file with visited URLs and their response code                                     |
 
+When `--database` is used, the SQLite file keeps the existing `nodes`, `edges` and
+`resources` tables and adds an `outcomes` table with one row per visited URL
+(`url` primary key, `outcome`, `error`). `outcome` is one of `success`,
+`request_failed` (HTTPError/URLError), `read_failed` or `parse_failed`; the
+`error` column carries a short failure summary and stays empty for successes.
+Re-exporting the same crawl overwrites outcome rows instead of duplicating them.
+
 ## Usage & Examples
 
 ### As Extractor:

@@ -21,6 +21,12 @@ DEFAULT_REGEX_FILE = os.path.abspath(
 )
 IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.gif', '.webp', '.svg', '.bmp')
 
+# Per-URL visit outcomes recorded by crawl().
+OUTCOME_SUCCESS = "success"
+OUTCOME_REQUEST_FAILED = "request_failed"
+OUTCOME_READ_FAILED = "read_failed"
+OUTCOME_PARSE_FAILED = "parse_failed"
+
 
 class Crawler:
     def __init__(self, website, c_depth, c_pause, out_path, logs, verbose,
@@ -66,6 +72,9 @@ class Crawler:
         }
         self.edges = set()
         self.titles = {}
+        # Final visit outcome per URL: {url: {"outcome": str, "error": str | None}}.
+        # One entry per URL; a later visit overwrites an earlier one.
+        self.outcomes = {}
 
     def _load_regex_patterns(self):
         """Load regex patterns from res/regex_patterns.txt plus default URL pattern."""
@@ -252,6 +261,7 @@ class Crawler:
 
             # For every element of list.
             for item in ord_lst:
+                visit_url = item if item else self.website
                 html_page = http.client.HTTPResponse
                 # Check if is the first element
                 if ord_lst_ind > 0:
@@ -261,6 +271,7 @@ class Crawler:
                     except (HTTPError, URLError) as error:
                         self.write_log(f"[INFO] ERROR: Domain or link seems to be unreachable: {str(item)} | "
                                        f"Message: {error}\n")
+                        self._record_outcome(visit_url, OUTCOME_REQUEST_FAILED, error)
                         continue
                 else:
                     try:
@@ -270,6 +281,7 @@ class Crawler:
                         self.write_log(f"[INFO] ERROR: Domain or link seems to be unreachable: {str(item)} | "
                                        f"Message: {error}\n")
                         ord_lst_ind += 1
+                        self._record_outcome(visit_url, OUTCOME_REQUEST_FAILED, error)
                         continue
 
                 try:
@@ -278,16 +290,24 @@ class Crawler:
                         html_content = raw_content.decode('utf-8', errors='ignore')
                     else:
                         html_content = str(raw_content)
-                except Exception:
+                except Exception as error:
                     self.write_log(f"[INFO] ERROR: Unable to read content from: {str(item)}\n")
+                    self._record_outcome(visit_url, OUTCOME_READ_FAILED, error)
                     continue
 
                 try:
                     soup = BeautifulSoup(html_content, features="html.parser")
-                except TypeError:
+                except Exception as error:
+                    failed_url = (ord_lst[ord_lst_ind]
+                                  if 0 <= ord_lst_ind < len(ord_lst) else visit_url)
                     print(f"## Soup Error Encountered:: couldn't parse "
-                          f"ord_list # {ord_lst_ind}::{ord_lst[ord_lst_ind]}")
+                          f"ord_list # {ord_lst_ind}::{failed_url}")
+                    self.write_log(f"[INFO] ERROR: Unable to parse content from: {str(item)}\n")
+                    self._record_outcome(visit_url, OUTCOME_PARSE_FAILED, error)
                     continue
+
+                # Content was fetched and parsed; keep any links found below.
+                self._record_outcome(visit_url, OUTCOME_SUCCESS, None)
 
                 source_url = item if item else self.website
                 page_title = None
@@ -373,6 +393,34 @@ class Crawler:
             "files": sorted(self.findings["files"]),
         }
 
+    def _record_outcome(self, url, outcome, error=None):
+        """Record the final visit outcome for a URL.
+
+        One entry per URL; a later visit replaces an earlier one so the last
+        visit wins. ``error`` is summarised into a short human-readable string
+        and left empty for successful visits.
+
+        :param url: String - URL that was visited.
+        :param outcome: String - One of the OUTCOME_* constants.
+        :param error: Exception/None - Failure cause for non-success outcomes.
+        :return: None
+        """
+        if url is None:
+            return
+        summary = None
+        if error is not None:
+            summary = f"{type(error).__name__}: {error}".strip()
+            if not summary:
+                summary = type(error).__name__
+        self.outcomes[str(url)] = {"outcome": outcome, "error": summary}
+
+    def visit_outcomes(self):
+        """Return the recorded per-URL outcomes as a plain dict."""
+        return {
+            url: {"outcome": info.get("outcome"), "error": info.get("error")}
+            for url, info in self.outcomes.items()
+        }
+
     def _normalize_for_dedupe(self, url):
         """Normalize URL for deduplication: lower-case host, strip leading www."""
         try:
@@ -423,4 +471,6 @@ class Crawler:
             "titles": dict(self.titles),
             "resources": {cat: {src: sorted(vals) for src, vals in sources.items()}
                           for cat, sources in self.resources.items()},
+            # Per-URL visit outcomes: {url: {"outcome": str, "error": str | None}}.
+            "outcomes": self.visit_outcomes(),
         }

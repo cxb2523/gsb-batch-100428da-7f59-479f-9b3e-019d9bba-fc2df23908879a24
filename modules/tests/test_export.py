@@ -84,16 +84,102 @@ class TestExportFunctions(unittest.TestCase):
         self.assertTrue(os.path.exists(db_path))
 
         conn = sqlite3.connect(db_path)
-        with conn:
-            cur = conn.cursor()
-            cur.execute("SELECT url, title FROM nodes ORDER BY url;")
-            rows = cur.fetchall()
-            self.assertIn(("https://torcrawl.com", "Home"), rows)
-            self.assertIn(("https://torcrawl.com/about", "About"), rows)
+        try:
+            with conn:
+                cur = conn.cursor()
+                cur.execute("SELECT url, title FROM nodes ORDER BY url;")
+                rows = cur.fetchall()
+                self.assertIn(("https://torcrawl.com", "Home"), rows)
+                self.assertIn(("https://torcrawl.com/about", "About"), rows)
 
-            cur.execute("SELECT from_url, to_url FROM edges;")
-            edges = cur.fetchall()
-            self.assertIn(("https://torcrawl.com", "https://torcrawl.com/about"), edges)
+                cur.execute("SELECT from_url, to_url FROM edges;")
+                edges = cur.fetchall()
+                self.assertIn(("https://torcrawl.com", "https://torcrawl.com/about"), edges)
+        finally:
+            conn.close()
+
+    def test_export_database_stores_outcomes_idempotently(self):
+        """Outcomes are stored once per URL and re-exporting does not duplicate rows."""
+        prefix = f"{self.crawler.timestamp}_results_test_outcomes"
+        self.crawler.outcomes = {
+            "https://torcrawl.com": {"outcome": "success", "error": None},
+            "https://torcrawl.com/missing": {"outcome": "request_failed", "error": "URLError: unreachable"},
+            "https://torcrawl.com/broken": {"outcome": "read_failed", "error": "OSError: reset"},
+        }
+        self.crawler.findings["links"].update(self.crawler.outcomes.keys())
+        payload = self.crawler.export_payload()
+
+        db_path = os.path.join(self.out_path, f"{prefix}.db")
+        export_database(self.out_path, prefix, payload["data"], payload["edges"],
+                        payload["titles"], payload["resources"], payload["outcomes"], verbose=False)
+        export_database(self.out_path, prefix, payload["data"], payload["edges"],
+                        payload["titles"], payload["resources"], payload["outcomes"], verbose=False)
+
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT url, outcome, error FROM outcomes ORDER BY url;")
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+
+        self.assertEqual(len(rows), 3)
+        self.assertIn(("https://torcrawl.com/missing", "request_failed", "URLError: unreachable"), rows)
+        self.assertIn(("https://torcrawl.com/broken", "read_failed", "OSError: reset"), rows)
+        self.assertIn(("https://torcrawl.com", "success", None), rows)
+
+        # A later export with an updated outcome overwrites the row in place.
+        updated = dict(payload["outcomes"])
+        updated["https://torcrawl.com/broken"] = {"outcome": "success", "error": None}
+        export_database(self.out_path, prefix, payload["data"], payload["edges"],
+                        payload["titles"], payload["resources"], updated, verbose=False)
+
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM outcomes;")
+            self.assertEqual(cur.fetchone()[0], 3)
+            cur.execute("SELECT outcome, error FROM outcomes WHERE url = ?;",
+                        ("https://torcrawl.com/broken",))
+            self.assertEqual(cur.fetchone(), ("success", None))
+        finally:
+            conn.close()
+
+    def test_export_database_outcomes_fall_back_to_data(self):
+        """Callers passing outcomes inside data still populate the outcomes table."""
+        prefix = f"{self.crawler.timestamp}_results_test_outcomes_data"
+        data = dict(self.crawler.export_payload()["data"])
+        data["outcomes"] = {"https://torcrawl.com": {"outcome": "success", "error": None}}
+
+        db_path = os.path.join(self.out_path, f"{prefix}.db")
+        export_database(self.out_path, prefix, data, set(), {}, verbose=False)
+
+        conn = sqlite3.connect(db_path)
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT url, outcome FROM outcomes;")
+            rows = cur.fetchall()
+        finally:
+            conn.close()
+
+        self.assertEqual(rows, [("https://torcrawl.com", "success")])
+
+    def test_json_and_xml_do_not_include_outcomes(self):
+        """JSON/XML exports keep their original field set."""
+        prefix = f"{self.crawler.timestamp}_results_test_no_outcomes"
+        self.crawler.outcomes = {"https://torcrawl.com": {"outcome": "success", "error": None}}
+        self.crawler.findings["links"].add("https://torcrawl.com")
+        payload = self.crawler.export_payload()
+
+        export_json(self.out_path, prefix, payload["data"], verbose=False)
+        export_xml(self.out_path, prefix, payload["data"], verbose=False)
+
+        with open(os.path.join(self.out_path, f"{prefix}.json"), "r", encoding="UTF-8") as json_file:
+            data = json.load(json_file)
+        self.assertNotIn("outcomes", data)
+
+        root = ET.parse(os.path.join(self.out_path, f"{prefix}.xml")).getroot()
+        self.assertIsNone(root.find("outcomes"))
 
 
 if __name__ == '__main__':

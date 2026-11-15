@@ -5,6 +5,7 @@ import unittest
 import datetime
 from unittest.mock import patch
 from unittest import mock
+import urllib.error
 import urllib.request
 import json
 import sqlite3
@@ -185,3 +186,100 @@ class TestCrawlerFunctions(unittest.TestCase):
 
             self.assertIn("https://example.com", result)
             self.assertIn("https://example.com/page1", result)
+
+    def test_crawl_records_outcomes_and_continues_after_failures(self):
+        """Failed pages are recorded and do not stop sibling/child crawling."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            start_url = "https://example.com"
+            ok_url = "https://example.com/ok"
+            ok_child = "https://example.com/ok/child"
+            url_error_url = "https://example.com/url-error"
+            read_error_url = "https://example.com/read-error"
+
+            crawler = Crawler(start_url, 2, 0, temp_dir, False, False)
+
+            class FakeResponse:
+                def __init__(self, body):
+                    self.body = body
+                    self.status = 200
+
+                def read(self):
+                    return self.body
+
+            class ReadErrorResponse:
+                status = 200
+
+                def read(self):
+                    raise OSError("connection reset while reading")
+
+            start_html = (
+                "<html><body>"
+                f"<a href='{ok_url}'>ok</a>"
+                f"<a href='{url_error_url}'>bad-request</a>"
+                f"<a href='{read_error_url}'>bad-read</a>"
+                "</body></html>"
+            ).encode("utf-8")
+            ok_html = (
+                "<html><body>"
+                f"<a href='{ok_child}'>child</a>"
+                "</body></html>"
+            ).encode("utf-8")
+
+            responses = {
+                start_url: FakeResponse(start_html),
+                ok_url: FakeResponse(ok_html),
+                read_error_url: ReadErrorResponse(),
+            }
+
+            def fake_request(url):
+                if url == url_error_url:
+                    raise urllib.error.URLError("name resolution failed")
+                return responses[url]
+
+            with mock.patch.object(crawler, "_make_request", side_effect=fake_request):
+                result = crawler.crawl()
+
+            # Successful page and its child survive failures on the same level.
+            self.assertIn(ok_url, result)
+            self.assertIn(ok_child, result)
+            self.assertIn(ok_url, crawler.findings["links"])
+            self.assertIn((start_url, ok_url), crawler.edges)
+
+            outcomes = crawler.export_payload()["outcomes"]
+            self.assertEqual(outcomes[start_url]["outcome"], "success")
+            self.assertEqual(outcomes[ok_url]["outcome"], "success")
+            self.assertEqual(outcomes[url_error_url]["outcome"], "request_failed")
+            self.assertEqual(outcomes[read_error_url]["outcome"], "read_failed")
+            self.assertTrue(outcomes[url_error_url]["error"])
+            self.assertTrue(outcomes[read_error_url]["error"])
+
+    @mock.patch("modules.crawler.BeautifulSoup", side_effect=TypeError("bad markup"))
+    def test_crawl_records_parse_failure(self, _mock_soup):
+        """A page whose markup cannot be parsed is recorded as parse_failed."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            crawler = Crawler("https://example.com", 1, 0, temp_dir, False, False)
+
+            class FakeResponse:
+                status = 200
+
+                def read(self):
+                    return b"<html><body>broken</body></html>"
+
+            with mock.patch.object(crawler, "_make_request", return_value=FakeResponse()):
+                crawler.crawl()
+
+            outcomes = crawler.export_payload()["outcomes"]
+            self.assertEqual(outcomes["https://example.com"]["outcome"], "parse_failed")
+            self.assertTrue(outcomes["https://example.com"]["error"])
+
+    def test_outcomes_keep_last_visit_per_url(self):
+        """Repeated visits to the same URL collapse to one final outcome."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            crawler = Crawler("https://example.com", 0, 0, temp_dir, False, False)
+            crawler._record_outcome("https://example.com/page", "read_failed", OSError("boom"))
+            crawler._record_outcome("https://example.com/page", "success", None)
+
+            outcomes = crawler.export_payload()["outcomes"]
+            self.assertEqual(len(outcomes), 1)
+            self.assertEqual(outcomes["https://example.com/page"]["outcome"], "success")
+            self.assertIsNone(outcomes["https://example.com/page"]["error"])

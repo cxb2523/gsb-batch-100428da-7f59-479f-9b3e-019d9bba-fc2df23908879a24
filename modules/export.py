@@ -43,7 +43,12 @@ def export_xml(export_path, prefix, data, verbose=False):
     return xml_path
 
 
-def export_database(export_path, prefix, data, edges, titles, resources=None, verbose=False):
+def export_database(export_path, prefix, data, edges, titles, resources=None, outcomes=None, verbose=False):
+    # Backwards compatibility: older callers may pass verbose positionally as
+    # the 7th argument (before outcomes existed).
+    if isinstance(outcomes, bool) and verbose is False:
+        verbose, outcomes = outcomes, None
+
     db_path = os.path.join(export_path, f"{prefix}.db")
 
     nodes = set(data.get("links", []))
@@ -74,6 +79,13 @@ def export_database(export_path, prefix, data, edges, titles, resources=None, ve
                 value TEXT
             );
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS outcomes (
+                url TEXT PRIMARY KEY,
+                outcome TEXT,
+                error TEXT
+            );
+        """)
 
         cur.executemany(
             "INSERT OR REPLACE INTO nodes(url, title) VALUES(?, ?);",
@@ -84,7 +96,7 @@ def export_database(export_path, prefix, data, edges, titles, resources=None, ve
             "INSERT OR IGNORE INTO edges(from_url, to_url) VALUES(?, ?);",
             list(edges)
         )
-        
+
         # Resources
         res_payload = resources if resources is not None else data.get("resources", {})
         res_rows = []
@@ -96,6 +108,24 @@ def export_database(export_path, prefix, data, edges, titles, resources=None, ve
             cur.executemany(
                 "INSERT OR IGNORE INTO resources(category, from_url, value) VALUES(?, ?, ?);",
                 res_rows
+            )
+
+        # Per-URL visit outcomes. URL is the primary key, so re-exporting the
+        # same payload overwrites each row instead of appending duplicates.
+        outcome_payload = outcomes if outcomes is not None else data.get("outcomes", {})
+        outcome_rows = []
+        for url, info in (outcome_payload or {}).items():
+            if isinstance(info, dict):
+                outcome = info.get("outcome")
+                error = info.get("error")
+            else:
+                outcome = info
+                error = None
+            outcome_rows.append((url, outcome, error))
+        if outcome_rows:
+            cur.executemany(
+                "INSERT OR REPLACE INTO outcomes(url, outcome, error) VALUES(?, ?, ?);",
+                outcome_rows
             )
         conn.commit()
         if verbose:
