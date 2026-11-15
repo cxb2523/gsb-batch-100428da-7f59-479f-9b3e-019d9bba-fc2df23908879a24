@@ -7,6 +7,8 @@ output.md
 screenshot.png
 batch_results.json
 batch_extracted.json
+batch_extracted.summary.json
+batch_extracted.pages/
 batch_markdown/
 generated_schema.json
 extracted_data.json

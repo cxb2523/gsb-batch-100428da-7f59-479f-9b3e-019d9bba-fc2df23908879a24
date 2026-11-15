@@ -243,7 +243,16 @@ Crawler config template: [`templates/crawler.yml`](templates/crawler.yml).
 ```
 
 The two scripts split on responsibility: `batch_crawl.py` returns markdown per URL; `batch_extract.py` returns
-schema-extracted JSON per URL. Python equivalent uses `arun_many()`:
+schema-extracted JSON per URL. Both keep going when some pages fail, and both write a per-URL outcome summary:
+
+- `batch_crawl.py` writes `<out>/_summary.json` with one entry per input URL: `success`, `fetch_failed`, or
+  `write_failed`, plus the markdown path and the failure reason.
+- `batch_extract.py` writes `<out-stem>.summary.json` with one entry per input URL: `success`, `fetch_failed`, or
+  `extract_failed` (crawled but the schema matched nothing, matched zero items, or produced invalid JSON). Per-page
+  data goes to `<out-stem>.pages/`; `--out` keeps the aggregate list of successful records.
+
+Both exit 0 when at least one page succeeded, non-zero only when every page failed — and the summary is written in
+either case. Python equivalent uses `arun_many()`:
 
 ```python
 urls = ["https://site1.com", "https://site2.com", "https://site3.com"]
@@ -333,8 +342,8 @@ recipe closest to the task at hand and adapt.
 | Script                                               | Responsibility                                       |
 | ---------------------------------------------------- | ---------------------------------------------------- |
 | `scripts/basic_crawler.py <url>`                     | One URL → markdown + screenshot                      |
-| `scripts/batch_crawl.py <urls.txt>`                  | Many URLs → markdown files                           |
-| `scripts/batch_extract.py <urls.txt> <schema.json>`  | Many URLs + schema → JSON                            |
+| `scripts/batch_crawl.py <urls.txt>`                  | Many URLs → markdown files + per-URL outcome summary |
+| `scripts/batch_extract.py <urls.txt> <schema.json>`  | Many URLs + schema → JSON + per-URL outcome summary  |
 | `scripts/generate_schema.py <url> "<instruction>"`   | Derive a reusable CSS schema (one-time LLM call)     |
 | `scripts/extract_with_schema.py <url> <schema.json>` | Apply a saved schema (no LLM)                        |
 | `scripts/extract_with_llm.py <url> "<instruction>"`  | Per-request LLM extraction (expensive; one-off only) |

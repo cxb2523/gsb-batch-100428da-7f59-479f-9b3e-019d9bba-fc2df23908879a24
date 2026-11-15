@@ -13,6 +13,7 @@ prose of any particular reference file.
 | `test_markdown_generation.py` | Default markdown, `BM25ContentFilter`, `PruningContentFilter`, generator options |
 | `test_data_extraction.py`     | `JsonCssExtractionStrategy` manual schema, `LLMExtractionStrategy` constructor   |
 | `test_advanced_patterns.py`   | `session_id` reuse, `proxy_config` shape, `arun_many` batch                      |
+| `test_batch_scripts.py`       | Per-URL outcomes of `batch_crawl.py` / `batch_extract.py` on mixed success/failure batches |
 | `test_fixtures.py`            | Deterministic schema extraction against the bundled `fixtures/` pair             |
 
 ## Running
@@ -29,7 +30,8 @@ Every script is a self-contained PEP 723 (`uv run --script`) invocation; depende
 
 - `crawl4ai>=0.8.9` (matches the floor pin in `VERSION` and the script shebangs).
 - The four integration tests reach `example.com` / `example.org`; network access required.
-- `test_fixtures.py` is fully offline — it uses the `raw:` URL form against the bundled HTML.
+- `test_batch_scripts.py` and `test_fixtures.py` are fully offline — the batch test uses `raw:` URLs plus a closed local
+  port, and the fixture test uses the `raw:` URL form against the bundled HTML.
 - LLM-extraction test only verifies constructor shape; no API key needed.
 
 ## What "pass" means
@@ -38,6 +40,8 @@ A green run confirms:
 
 - The documented API surface (class names, constructor kwargs, return shapes) still matches the installed library.
 - The deterministic fixture still extracts the expected three product records.
+- A mixed batch still records one outcome per input URL, keeps data from successful pages, separates `fetch_failed`
+  from `extract_failed`, and exits 0 when at least one page succeeded.
 
 A red run means one of the following — investigate in this order before bumping `VERSION`:
 

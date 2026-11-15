@@ -122,8 +122,8 @@ done
 | Script                                               | Purpose                                              |
 | ---------------------------------------------------- | ---------------------------------------------------- |
 | `scripts/basic_crawler.py <url>`                     | One URL → markdown + screenshot                      |
-| `scripts/batch_crawl.py <urls.txt>`                  | Many URLs → markdown files                           |
-| `scripts/batch_extract.py <urls.txt> <schema.json>`  | Many URLs + schema → JSON                            |
+| `scripts/batch_crawl.py <urls.txt>`                  | Many URLs → markdown files + per-URL outcome summary |
+| `scripts/batch_extract.py <urls.txt> <schema.json>`  | Many URLs + schema → JSON + per-URL outcome summary  |
 | `scripts/generate_schema.py <url> "<instruction>"`   | Derive a reusable CSS schema (one-time LLM call)     |
 | `scripts/extract_with_schema.py <url> <schema.json>` | Apply a saved schema (no LLM)                        |
 | `scripts/extract_with_llm.py <url> "<instruction>"`  | Per-request LLM extraction (expensive; one-off only) |

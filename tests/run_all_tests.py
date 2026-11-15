@@ -31,6 +31,7 @@ def main():
         "test_markdown_generation.py",
         "test_data_extraction.py",
         "test_advanced_patterns.py",
+        "test_batch_scripts.py",
         "test_fixtures.py",
     ]
 
