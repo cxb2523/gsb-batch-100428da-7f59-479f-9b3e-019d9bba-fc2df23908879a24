@@ -1,0 +1,2 @@
+# ByteDance / Toutiao Reverse Engineering & Data Engine
+# Python 3.8+ Standard Library Only (Zero third-party requirements)

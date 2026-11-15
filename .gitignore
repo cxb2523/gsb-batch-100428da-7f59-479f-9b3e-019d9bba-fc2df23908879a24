@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.vscode/
+.idea/
+*.log
+.DS_Store
+
+# ===== 运行产物：真实 Token / 设备指纹 / 抓包输出，运行后自动生成，禁止提交 =====
+mstoken_cache.json
+browser_fingerprint.json
+browser_env_snapshot.json
+live_canvas_dataurl.txt
+live_canvas_meta.json
+replay_bdms_offline_out.json

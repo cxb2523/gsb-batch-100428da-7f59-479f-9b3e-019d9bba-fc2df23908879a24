@@ -1,0 +1,23 @@
+{
+  "name": "toutiao-news-feed-crawl",
+  "version": "1.0.0",
+  "description": "ByteDance Toutiao Reverse Engineering & Protocol Reproduction Engine (2026-08)",
+  "main": "replay_bdms_offline.js",
+  "scripts": {
+    "test": "node replay_bdms_offline.js"
+  },
+  "keywords": [
+    "toutiao",
+    "bytedance",
+    "jsvmp",
+    "a_bogus",
+    "signature",
+    "crawler",
+    "reverse-engineering"
+  ],
+  "author": "ludapao675-debug",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
