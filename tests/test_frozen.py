@@ -102,6 +102,9 @@ def main():
 
         ok = bool(results and results[0].get("imageCount") and pdfs
                   and any(e.get("type") == "done" and e.get("text") == "全部完成"
+                          and (e.get("summary") or {}).get("total") == 1
+                          and (e.get("summary") or {}).get("success") == 1
+                          and len(e.get("items") or []) == 1
                           for e in events))
         print()
         print("FROZEN WEB APP:", "PASS" if ok else "FAIL")

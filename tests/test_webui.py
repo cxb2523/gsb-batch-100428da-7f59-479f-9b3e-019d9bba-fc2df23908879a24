@@ -146,8 +146,27 @@ def main():
             print(f"result             -> JM{it['id']} images={it.get('imageCount')} "
                   f"exports={len(it.get('exportFiles') or [])} "
                   f"duration={it.get('durationSec')}s")
-        done = [e["text"] for e in events if e.get("type") == "done"]
+        done_events = [e for e in events if e.get("type") == "done"]
+        done = [e["text"] for e in done_events]
         print(f"done               -> {done}")
+        if done_events:
+            term = done_events[-1]
+            print(f"done summary       -> {term.get('summary')} outcome={term.get('outcome')}")
+            for item in term.get("items") or []:
+                print(f"   row JM{item.get('id')} status={item.get('status')} "
+                      f"images={item.get('imageCount')} exports={len(item.get('exportFiles') or [])} "
+                      f"error={item.get('error')}")
+        summary_ok = False
+        if done_events:
+            term = done_events[-1]
+            summary = term.get("summary") or {}
+            rows = term.get("items") or []
+            # One book was submitted: the table must account for exactly that book and
+            # its verdict must agree with the summary counts.
+            summary_ok = (summary.get("total") == 1 and len(rows) == 1
+                          and summary.get("success", 0) + summary.get("failed", 0)
+                          + summary.get("cancelled", 0) + summary.get("pending", 0) == 1
+                          and rows[0].get("status") in ("success", "failed"))
 
         files = [p for p in Path(tmp).rglob("*") if p.is_file()]
         pdfs = [p.name for p in files if p.suffix.lower() == ".pdf"]
@@ -163,7 +182,7 @@ def main():
             print("server did NOT exit after shutdown !!!")
 
         ok = (results and results[0].get("imageCount") and pdfs
-              and done == ["全部完成"])
+              and done == ["全部完成"] and summary_ok)
         print()
         print("WEB UI TEST:", "PASS" if ok else "FAIL")
         return 0 if ok else 1

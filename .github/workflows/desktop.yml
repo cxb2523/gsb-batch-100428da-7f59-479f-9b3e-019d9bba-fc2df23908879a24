@@ -74,6 +74,22 @@ jobs:
           print('doctor JSON OK:', data['platform'], data['httpBackend'])
           PY
 
+      - name: Batch outcomes are reported per book
+        # Stubs the download engine: asserts that one failing book does not stop the
+        # batch, cancel marks the in-flight book "cancelled" (not success/failure),
+        # and the done event carries the summary + per-book rows. No network needed.
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tests/test_webui_batch.py
+
+      - name: Full batch flow against a local fake engine
+        # Starts the real server + real jmcore, with tests/fixtures/fake_jmcomic first
+        # on PYTHONPATH, so the whole path runs offline with a self-made id sample
+        # (good / unparseable / unavailable / cancel-mid-download).
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tests/test_webui_batch_e2e.py
+
       # These two encode Android build rules that cost several broken CI runs to
       # discover. Both are fast (no Android toolchain) and run on every push.
       - name: Android requirements must be resolvable by python-for-android

@@ -230,6 +230,11 @@ Android 的 recipe 与 `curl_cffi` 绕行方案，见 **[ANDROID.md](ANDROID.md)
 - 服务只监听回环地址，不会暴露到局域网。
 - ~~无法攻破的网站（雾）~~
 
+批量任务的约束：同一时刻只允许一个任务，重复提交返回 `409`。任务结束后页面会给出
+**逐本结局表**——每本书的车号、状态（成功 / 失败 / 取消 / 未开始）、成功时的图片数与
+导出文件、失败时的错误信息。单本失败不会中断后面的车号；只有点「取消」才停止剩余任务，
+且取消时仍在下载的那一本记为「取消」（不算成功也不算失败），其后未开始的书记为「未开始」。
+
 ---
 
 ## 项目结构
@@ -254,6 +259,9 @@ JMComic_downloader/
 │   └── build_android.py       # Android 打包辅助（暂存 + buildozer）
 ├── tests/
 │   ├── test_webui.py          # 源码级端到端测试
+│   ├── test_webui_batch.py    # 批量逐本结局（成功/失败/取消/未开始）契约
+│   ├── test_webui_batch_e2e.py# 真服务 + 假 jmcomic，离线跑完整批量流程
+│   ├── fixtures/fake_jmcomic/ # 供上一个测试使用的离线 jmcomic 替身
 │   └── test_frozen.py         # 打包产物端到端测试
 ├── assets/
 │   └── option.example.yml     # 带完整注释的配置模板
