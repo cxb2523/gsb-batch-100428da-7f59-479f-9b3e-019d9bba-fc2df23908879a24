@@ -63,7 +63,13 @@ export interface AuditReport {
      * directory; `skipped` were over the 200 MB run limit. Since schema 1.1.
      */
     artefacts?: { html: number; screenshots: number; bytes: number; skipped: number };
-    truncated: boolean; startUrl: string; robots: { url: string; state: string; status: number; sitemaps: string[] }; sitemaps: string[]; sitemapUrls: number; sitemapIssues: Array<{ sitemap: string; message: string }> };
+    truncated: boolean; startUrl: string; robots: { url: string; state: string; status: number; sitemaps: string[] }; sitemaps: string[]; sitemapUrls: number; sitemapIssues: Array<{ sitemap: string; message: string }>;
+    /**
+     * Per-sitemap outcome of the collection: `ok` sitemaps contributed `urlCount` URLs to the crawl queue,
+     * `fetch-failed`/`parse-failed` ones contributed none (`error` says why). Optional so reports written
+     * before this field existed still validate.
+     */
+    sitemapOutcomes?: Array<{ url: string; status: 'ok' | 'fetch-failed' | 'parse-failed'; urlCount: number; error?: string }> };
   inventory: SiteInventory;
   findings: Array<Finding & { count: number }>;
   geo: GeoReport;
@@ -283,6 +289,7 @@ function crawlSummary(result: CrawlResult, robotsAgent = DEFAULT_CRAWL.robotsAge
     sitemaps: result.sitemap.sitemaps,
     sitemapUrls: result.sitemap.urls.length,
     sitemapIssues: result.sitemap.issues.slice(0, 100),
+    ...(result.sitemap.outcomes.length ? { sitemapOutcomes: result.sitemap.outcomes.slice(0, 200) } : {}),
   };
 }
 

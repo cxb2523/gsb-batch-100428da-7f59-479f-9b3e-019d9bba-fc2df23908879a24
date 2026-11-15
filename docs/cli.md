@@ -135,9 +135,9 @@ With `--json`, the next stderr line is a JSON object:
 | `repository-report.html` / `.md` / `.json` | `run` only: the repository audit of the same run |
 | `pages.jsonl` | One crawled page record per line (since 1.4.0 without the page text: `data.mainTextRef` points into `texts.txt`) |
 | `texts.txt` | Main-content text of each crawled page (up to 20,000 characters), read back by the analysis and `--resume` |
-| `checkpoint.json` | Queue + seen set for `--resume` |
+| `checkpoint.json` | Queue + seen set for `--resume`, plus the sitemap state (succeeded sitemaps are not requested again; a failed one is retried at most once) |
 | `artefacts/html/*.html.txt`, `artefacts/screenshots/*.png` | `--save-html` / `--screenshots` evidence, named `<hash>-<path slug>` |
-| `crawl-summary.json` | Robots, sitemaps, stats |
+| `crawl-summary.json` | Robots, sitemaps (with per-sitemap outcomes: status, URL count, failure reason), stats |
 | `meta.json` | Run metadata |
 | `research.json` / `.md` | Research output |
 | `monitor.json` / `.md` | Run diff |

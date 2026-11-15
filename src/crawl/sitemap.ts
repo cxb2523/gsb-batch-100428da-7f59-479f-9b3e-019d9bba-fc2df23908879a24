@@ -13,10 +13,34 @@ export interface SitemapIssue {
   message: string;
 }
 
+/** How one sitemap (index child or urlset) ended up in this run's collection. */
+export type SitemapOutcomeStatus = 'ok' | 'fetch-failed' | 'parse-failed';
+
+export interface SitemapOutcome {
+  /** Sitemap URL (after origin mapping). */
+  url: string;
+  /** `ok`: downloaded and parsed; `fetch-failed`: network error or non-200; `parse-failed`: 200 but not a sitemap. */
+  status: SitemapOutcomeStatus;
+  /** Page URLs parsed from this sitemap (0 for indexes and failures). */
+  urlCount: number;
+  /** Why the download or parse failed (`status` != 'ok'). */
+  error?: string;
+}
+
 export interface SitemapResult {
   sitemaps: string[];
   urls: SitemapUrl[];
   issues: SitemapIssue[];
+  /** Per-sitemap outcome: which URLs were enqueued from it, or why none were. */
+  outcomes: SitemapOutcome[];
+}
+
+/** Sitemap collection state carried across an interrupted run (checkpoint.json). */
+export interface SitemapResume {
+  /** Sitemaps fetched and parsed successfully in earlier runs: never requested again. */
+  done?: readonly string[];
+  /** Requests made per sitemap URL so far; a failed sitemap is retried at most once. */
+  attempts?: Readonly<Record<string, number>>;
 }
 
 /** Protocol limits (sitemaps.org; Google documents the same): 50,000 URLs and 50 MB uncompressed per file. */
@@ -42,18 +66,20 @@ function text(v: unknown): string | undefined {
   return String(v).trim();
 }
 
-export function parseSitemapXml(xml: string, source: string): { urls: SitemapUrl[]; children: string[]; issues: SitemapIssue[] } {
+export function parseSitemapXml(xml: string, source: string): { urls: SitemapUrl[]; children: string[]; issues: SitemapIssue[]; error?: string } {
   const issues: SitemapIssue[] = [];
   let doc: Record<string, unknown>;
   try {
     doc = parser.parse(xml) as Record<string, unknown>;
   } catch (e) {
-    return { urls: [], children: [], issues: [{ sitemap: source, message: `Invalid XML: ${(e as Error).message}` }] };
+    const error = `Invalid XML: ${(e as Error).message}`;
+    return { urls: [], children: [], issues: [{ sitemap: source, message: error }], error };
   }
   const urlset = doc['urlset'] as Record<string, unknown> | undefined;
   const index = doc['sitemapindex'] as Record<string, unknown> | undefined;
   if (!urlset && !index) {
-    return { urls: [], children: [], issues: [{ sitemap: source, message: 'Not a sitemap: missing <urlset> or <sitemapindex> root element' }] };
+    const error = 'Not a sitemap: missing <urlset> or <sitemapindex> root element';
+    return { urls: [], children: [], issues: [{ sitemap: source, message: error }], error };
   }
   const children = asArray(index?.['sitemap'] as unknown[]).map((s) => text((s as Record<string, unknown>)['loc'])).filter((x): x is string => !!x);
   const urls: SitemapUrl[] = [];
@@ -78,18 +104,23 @@ export function parseSitemapXml(xml: string, source: string): { urls: SitemapUrl
 
 export async function collectSitemaps(
   seeds: string[],
-  opts: FetchOptions & { maxSitemaps?: number; maxUrls?: number; limiter?: HostRateLimiter; mapUrl?: (url: string) => string } = {},
+  opts: FetchOptions & { maxSitemaps?: number; maxUrls?: number; limiter?: HostRateLimiter; mapUrl?: (url: string) => string; resume?: SitemapResume } = {},
 ): Promise<SitemapResult> {
   const maxSitemaps = opts.maxSitemaps ?? 50;
   const maxUrls = opts.maxUrls ?? 100000;
   const map = opts.mapUrl ?? ((u: string) => u);
   const queue = [...new Set(seeds.map(map))];
   const seen = new Set<string>();
-  const result: SitemapResult = { sitemaps: [], urls: [], issues: [] };
+  // --resume: sitemaps parsed successfully in an earlier run are not requested again; a failed
+  // sitemap is retried at most once (one initial request + one retry across all runs).
+  const done = new Set(opts.resume?.done ?? []);
+  const attempts = opts.resume?.attempts ?? {};
+  const result: SitemapResult = { sitemaps: [], urls: [], issues: [], outcomes: [] };
   while (queue.length && seen.size < maxSitemaps && result.urls.length < maxUrls) {
     const sm = queue.shift()!;
     if (seen.has(sm)) continue;
     seen.add(sm);
+    if (done.has(sm) || (attempts[sm] ?? 0) >= 2) continue;
     try {
       await opts.limiter?.wait(new URL(sm).host);
     } catch {
@@ -97,7 +128,9 @@ export async function collectSitemaps(
     }
     const res = await safeFetch(sm, { ...opts, maxBytes: SITEMAP_MAX_BYTES });
     if (res.error || res.status !== 200) {
-      result.issues.push({ sitemap: sm, message: res.error ?? `HTTP ${res.status}` });
+      const message = res.error ?? `HTTP ${res.status}`;
+      result.issues.push({ sitemap: sm, message });
+      result.outcomes.push({ url: sm, status: 'fetch-failed', urlCount: 0, error: message });
       continue;
     }
     result.sitemaps.push(sm);
@@ -105,6 +138,12 @@ export async function collectSitemaps(
     if (res.truncated) result.issues.push({ sitemap: sm, message: 'Sitemap exceeds 50 MB uncompressed limit (truncated)' });
     const parsed = parseSitemapXml(body, sm);
     result.issues.push(...parsed.issues);
+    if (parsed.error) {
+      // Fetched but unusable: nothing is enqueued from it, and a resumed run may retry it once.
+      result.outcomes.push({ url: sm, status: 'parse-failed', urlCount: 0, error: parsed.error });
+      continue;
+    }
+    result.outcomes.push({ url: sm, status: 'ok', urlCount: parsed.urls.length });
     for (const c of parsed.children.map(map)) if (!seen.has(c)) queue.push(c);
     result.urls.push(...parsed.urls.slice(0, maxUrls - result.urls.length).map((u) => ({ ...u, loc: map(u.loc) })));
   }

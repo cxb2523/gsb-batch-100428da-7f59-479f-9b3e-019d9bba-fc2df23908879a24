@@ -5,7 +5,7 @@ import { extractPage, parseXRobotsTag, type PageData } from '../extract/html.js'
 import { DEFAULT_USER_AGENT, HostRateLimiter, safeFetch } from '../net/fetcher.js';
 import { DEFAULT_POLICY, type NetPolicy } from '../net/ssrf.js';
 import { proxySummary } from '../net/proxy.js';
-import { collectSitemaps, type SitemapResult } from './sitemap.js';
+import { collectSitemaps, type SitemapIssue, type SitemapOutcome, type SitemapResult, type SitemapUrl } from './sitemap.js';
 import { fetchRobots, type RobotsInfo } from './robots.js';
 import { RunStore, type TextRef } from './store.js';
 
@@ -159,6 +159,23 @@ interface QueueItem {
 interface Checkpoint {
   queue: QueueItem[];
   seen: string[];
+  /**
+   * Sitemap collection state for --resume. Absent in checkpoints written before this field
+   * existed: treated as "no sitemap has succeeded yet", so every sitemap is collected again.
+   */
+  sitemap?: {
+    /** Sitemaps fetched and parsed successfully: never requested again. */
+    done: string[];
+    /** Requests per sitemap URL across runs: a failed sitemap is retried at most once. */
+    attempts: Record<string, number>;
+    /** Sitemaps fetched with HTTP 200 (kept for the summary and the robots.sitemap-unreachable rule). */
+    fetched: string[];
+    /** Page URLs parsed from the successful sitemaps. */
+    urls: SitemapUrl[];
+    /** Per-sitemap outcome, merged across runs (fresh entries replace stored ones). */
+    outcomes: SitemapOutcome[];
+    issues: SitemapIssue[];
+  };
 }
 
 const KEPT_HEADERS = ['content-type', 'x-robots-tag', 'content-language', 'last-modified', 'cache-control', 'link', 'location', 'retry-after', 'strict-transport-security', 'vary', 'content-encoding'];
@@ -225,7 +242,7 @@ export async function crawl(startUrl: string, partial: Partial<CrawlOptions> = {
         startUrl: start,
         origin,
         robots,
-        sitemap: { sitemaps: [], urls: [], issues: [] },
+        sitemap: { sitemaps: [], urls: [], issues: [], outcomes: [] },
         pages: [],
         startedAt,
         finishedAt: new Date().toISOString(),
@@ -242,14 +259,43 @@ export async function crawl(startUrl: string, partial: Partial<CrawlOptions> = {
   const delay = robots.crawlDelay(opts.robotsAgent);
   if (delay && delay > 0) limiter.setDelay(new URL(origin).host, Math.min(delay, 30) * 1000);
 
-  const sitemapSeeds = robots.sitemaps.length ? robots.sitemaps : [new URL('/sitemap.xml', origin).toString()];
-  // Sitemap downloads share the per-host politeness limiter with page fetches.
-  const sitemap: SitemapResult = opts.useSitemaps ? await collectSitemaps(sitemapSeeds, { ...fetchOpts, limiter, mapUrl: (u) => mapOrigin(u, map) }) : { sitemaps: [], urls: [], issues: [] };
-  const sitemapSet = new Set(sitemap.urls.map((u) => normalizeUrl(u.loc)).filter((x): x is string => !!x));
-
-  // Resume support
+  // Resume support: read the stored pages and checkpoint before sitemap collection, so sitemaps that
+  // already succeeded are not requested again. Checkpoints written before the sitemap state existed
+  // have no `sitemap` field: every sitemap is then treated as not yet succeeded and collected again.
   const existing = store?.readLines<PageRecord>('pages.jsonl') ?? [];
   const checkpoint = store?.readJson<Checkpoint>('checkpoint.json');
+  const smPrev = checkpoint?.sitemap;
+
+  const sitemapSeeds = robots.sitemaps.length ? robots.sitemaps : [new URL('/sitemap.xml', origin).toString()];
+  // Sitemaps that failed in the previous run are seeded again (the index that led to them is skipped
+  // as done); each failed sitemap gets at most one retry across runs.
+  const smAttempts: Record<string, number> = { ...(smPrev?.attempts ?? {}) };
+  const retrySeeds = (smPrev?.outcomes ?? []).filter((o) => o.status !== 'ok' && (smAttempts[o.url] ?? 0) < 2).map((o) => o.url);
+  // Sitemap downloads share the per-host politeness limiter with page fetches.
+  const collected: SitemapResult = opts.useSitemaps
+    ? await collectSitemaps([...sitemapSeeds, ...retrySeeds], { ...fetchOpts, limiter, mapUrl: (u) => mapOrigin(u, map), resume: { done: smPrev?.done ?? [], attempts: smAttempts } })
+    : { sitemaps: [], urls: [], issues: [], outcomes: [] };
+  for (const o of collected.outcomes) smAttempts[o.url] = (smAttempts[o.url] ?? 0) + 1;
+  // Merge with the previous run's state: fresh outcomes and issues replace stored ones per sitemap.
+  const requestedSm = new Set(collected.outcomes.map((o) => o.url));
+  const outcomeMap = new Map<string, SitemapOutcome>();
+  for (const o of [...(smPrev?.outcomes ?? []), ...collected.outcomes]) outcomeMap.set(o.url, o);
+  const sitemap: SitemapResult = {
+    sitemaps: [...(smPrev?.fetched ?? []), ...collected.sitemaps],
+    urls: [...(smPrev?.urls ?? []), ...collected.urls],
+    issues: [...(smPrev?.issues ?? []).filter((i) => !requestedSm.has(i.sitemap)), ...collected.issues],
+    outcomes: [...outcomeMap.values()],
+  };
+  const sitemapState: NonNullable<Checkpoint['sitemap']> = {
+    done: sitemap.outcomes.filter((o) => o.status === 'ok').map((o) => o.url),
+    attempts: smAttempts,
+    fetched: sitemap.sitemaps,
+    urls: sitemap.urls,
+    outcomes: sitemap.outcomes,
+    issues: sitemap.issues,
+  };
+  const sitemapSet = new Set(sitemap.urls.map((u) => normalizeUrl(u.loc)).filter((x): x is string => !!x));
+
   const pages: PageRecord[] = [...existing];
   const seen = new Set<string>(checkpoint?.seen ?? []);
   for (const p of existing) seen.add(p.url);
@@ -304,7 +350,7 @@ export async function crawl(startUrl: string, partial: Partial<CrawlOptions> = {
   let lastPersist = Date.now();
   const persist = () => {
     lastPersist = Date.now();
-    store?.writeJson('checkpoint.json', { queue, seen: [...seen] } satisfies Checkpoint);
+    store?.writeJson('checkpoint.json', { queue, seen: [...seen], sitemap: sitemapState } satisfies Checkpoint);
   };
   // Links of pages stored after the last checkpoint were never queued: queue them again (seen dedupes).
   if (checkpoint) for (const p of existing) enqueueLinksOf(p, { url: p.url, depth: p.depth });

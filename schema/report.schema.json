@@ -234,6 +234,37 @@
               "message"
             ]
           }
+        },
+        "sitemapOutcomes": {
+          "description": "Per-sitemap outcome of the collection: `ok` sitemaps contributed `urlCount` URLs to the crawl queue, `fetch-failed`/`parse-failed` ones contributed none (`error` says why). Optional so reports written before this field existed still validate.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "url": {
+                "type": "string"
+              },
+              "status": {
+                "type": "string",
+                "enum": [
+                  "fetch-failed",
+                  "ok",
+                  "parse-failed"
+                ]
+              },
+              "urlCount": {
+                "type": "number"
+              },
+              "error": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "url",
+              "status",
+              "urlCount"
+            ]
+          }
         }
       },
       "required": [

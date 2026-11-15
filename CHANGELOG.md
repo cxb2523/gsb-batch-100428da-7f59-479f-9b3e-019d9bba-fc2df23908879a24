@@ -5,6 +5,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Per-sitemap outcomes in the crawl: every sitemap (index child or urlset) is recorded with its URL, a status
+  (`ok`, `fetch-failed`, `parse-failed`), the number of URLs parsed from it and, on failure, the reason. The
+  outcomes are part of the crawl result, `crawl-summary.json` and the optional `crawl.sitemapOutcomes` field of
+  `report.json`, so a report can tell "enqueued from this sitemap" apart from "never queued because the sitemap
+  failed". Checkpoints persist the sitemap state: on `--resume` a sitemap that already succeeded is not
+  requested again, a failed one is retried at most once, and checkpoints written by older versions (no sitemap
+  state) are treated as "nothing succeeded yet".
+
 ## [1.5.0] - 2026-11-12
 
 Searvex in other tools: community rule packs, an MCP server for AI clients and a GitHub Action. Release notes:
