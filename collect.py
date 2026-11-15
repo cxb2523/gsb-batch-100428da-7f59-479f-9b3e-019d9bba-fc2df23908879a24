@@ -28,8 +28,27 @@ from storage import Article, get_storage
 ROOT = Path(__file__).resolve().parent
 STATE_FILE = ROOT / "state" / "seen.json"
 MP_ACCOUNTS_FILE = ROOT / "state" / "mp_accounts.json"   # 缓存号名→fakeid
+MP_CHECKPOINT_FILE = ROOT / "state" / "mp_checkpoint.json"  # mp 逐号结局+断点（独立于 seen）
 MP_SESSION_FILE = ROOT / "mp_session.json"               # token + cookie
 _CST = dt.timezone(dt.timedelta(hours=8))                # 北京时间
+
+# mp 采集的逐号结局
+MP_DONE = "done"                       # 完成（本次配额页全部跑完 / 翻到空页）
+MP_SESSION_EXPIRED = "session_expired"  # 登录态失效（中断，留断点）
+MP_RATE_LIMITED = "rate_limited"       # 被限频（中断，留断点）
+MP_SEARCH_FAILED = "search_failed"     # 搜号失败（没搜到 / 搜号请求异常）
+MP_FETCH_ERROR = "fetch_error"         # 拉取异常（文章列表请求非登录态/限频类错误）
+MP_OUTCOME_LABELS = {
+    MP_DONE: "完成",
+    MP_SESSION_EXPIRED: "登录态失效",
+    MP_RATE_LIMITED: "被限频",
+    MP_SEARCH_FAILED: "搜号失败",
+    MP_FETCH_ERROR: "拉取异常",
+}
+# 属于「中断」、下次需要按断点续跑的结局
+MP_INTERRUPTED = (MP_SESSION_EXPIRED, MP_RATE_LIMITED)
+# 「存在中断/失败」的退出码（0=全部完成），供 launchd/cron 判断
+EXIT_MP_INCOMPLETE = 3
 
 
 def log(msg: str) -> None:
@@ -129,16 +148,58 @@ def collect_rss(cfg, storage, seen) -> tuple[int, int]:
 
 
 # ------------------------- 采集源 2：公众号后台 mp -------------------------
-def collect_mp(cfg, storage, seen) -> tuple[int, int]:
+def _now_cst_str() -> str:
+    return dt.datetime.now(_CST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def load_mp_checkpoint() -> dict:
+    """
+    读逐号结局/断点文件。文件缺失或损坏（非合法 JSON、结构不对）一律按
+    「没有断点、从头采集」处理，返回空结构，绝不抛错中断采集。
+    """
+    data = load_json(MP_CHECKPOINT_FILE, None)
+    if not isinstance(data, dict) or not isinstance(data.get("accounts"), dict):
+        return {"accounts": {}}
+    return data
+
+
+def record_mp_outcome(checkpoint: dict, name: str, outcome: str, *,
+                      fakeid: str = "", pages_done: int = 0, new_count: int = 0,
+                      begin: int = 0, detail: str = "") -> None:
+    """
+    登记一个号本次的结局并立即落盘（逐号留痕，中途崩溃也能核对）。
+    中断类结局（登录态失效/被限频）且拿到了 fakeid 时写入断点 {fakeid, begin}，
+    供下次续跑；终局（完成/搜号失败/拉取异常）或连号都没解析出来时不带断点，
+    下次从第 0 页重新增量。
+    """
+    if outcome in MP_INTERRUPTED and fakeid:
+        resume = {"fakeid": str(fakeid), "begin": int(begin)}
+    else:
+        resume = None
+    checkpoint["accounts"][name] = {
+        "outcome": outcome,
+        "pages_done": int(pages_done),
+        "new_count": int(new_count),
+        "resume": resume,
+        "detail": detail,
+        "updated_at": _now_cst_str(),
+    }
+    save_json(MP_CHECKPOINT_FILE, checkpoint)
+
+
+def collect_mp(cfg, storage, seen) -> tuple[int, int, int]:
+    """
+    逐号采集公众号文章。返回 (新增总数, 失败计数, 未完成号数)。
+    每个号的结局写入 state/mp_checkpoint.json：
+      - 登录态失效/被限频不再跳出整批，只把当前号标为中断并记断点，继续后面的号；
+      - 下次运行时，中断号从断点 begin 续翻，其余号仍从第 0 页增量；
+      - 已入库文章靠 seen 去重，续跑不会重复写素材库。
+    """
     from mp_client import (MPClient, MPFreqError, MPSessionError,
                            fetch_article_text)
 
     session = load_json(MP_SESSION_FILE, {})
     token, cookie = session.get("token", ""), session.get("cookie", "")
-    if not token or not cookie:
-        log(f"❌ 缺少登录态。请把 token 和 cookie 填进 {MP_SESSION_FILE.name}"
-            f"（参考 mp_session.example.json）")
-        return 0, 1
 
     mp_cfg = cfg.get("mp") or {}
     accounts = mp_cfg.get("accounts") or []
@@ -146,31 +207,53 @@ def collect_mp(cfg, storage, seen) -> tuple[int, int]:
     save_full = bool(cfg.get("save_full_content", True))
     page_size = 20
 
+    checkpoint = load_mp_checkpoint()
+    new_total = err_total = 0
+
+    if not token or not cookie:
+        log(f"❌ 缺少登录态。请把 token 和 cookie 填进 {MP_SESSION_FILE.name}"
+            f"（参考 mp_session.example.json）")
+        # 每个号都留一条「登录态失效」，便于核对本批哪些号没跑；不写断点，
+        # 下次补上登录态后从第 0 页正常增量。
+        for name in accounts:
+            record_mp_outcome(checkpoint, name, MP_SESSION_EXPIRED,
+                              detail="缺少 token/cookie，未发起请求")
+        return 0, 1, len(accounts)
+
     client = MPClient(token, cookie)
     fakeid_cache = load_json(MP_ACCOUNTS_FILE, {})   # {号名: {fakeid, nickname}}
-    new_total = err_total = 0
 
     for name in accounts:
         log(f"采集 [{name}] …")
+        new_here = 0
+        pages_done = 0
+
         # 1) 解析 fakeid（缓存优先，避免频繁搜号被限频）
         rec = fakeid_cache.get(name)
         if not rec or not rec.get("fakeid"):
             try:
                 hit = client.resolve_fakeid(name)
             except MPSessionError as e:
-                log(f"❌ {e}　→ 需要重新扫码登录、更新 mp_session.json，本次中止。")
+                # 不再 break 整批：当前号留痕，继续后面的号（可能还有缓存号可跑）
+                log(f"❌ {e}　→ 登录态失效，[{name}] 标记中断，继续后续账号。")
                 notify_session_expired(cfg, str(e))
-                break
+                record_mp_outcome(checkpoint, name, MP_SESSION_EXPIRED,
+                                  detail=str(e))
+                continue
             except MPFreqError as e:
-                log(f"⏳ {e}　→ 搜号被限频，今天先到这，明天再跑。")
-                break
+                log(f"⏳ {e}　→ 搜号被限频，[{name}] 标记中断，继续后续账号。")
+                record_mp_outcome(checkpoint, name, MP_RATE_LIMITED, detail=str(e))
+                continue
             except Exception as e:
                 log(f"   ❌ [{name}] 搜号失败：{e}")
                 err_total += 1
+                record_mp_outcome(checkpoint, name, MP_SEARCH_FAILED, detail=str(e))
                 continue
             if not hit:
                 log(f"   ⚠️ [{name}] 没搜到这个号，检查名字是否准确")
                 err_total += 1
+                record_mp_outcome(checkpoint, name, MP_SEARCH_FAILED,
+                                  detail="searchbiz 未返回候选")
                 continue
             rec = {"fakeid": hit["fakeid"], "nickname": hit.get("nickname", name)}
             fakeid_cache[name] = rec
@@ -178,14 +261,28 @@ def collect_mp(cfg, storage, seen) -> tuple[int, int]:
             log(f"   ✓ 命中「{rec['nickname']}」(fakeid={rec['fakeid']})")
             time.sleep(2)
 
-        # 2) 拉文章列表
-        new_here = 0
+        # 2) 决定起始页：只有上次中断（失效/限频）且 fakeid 对得上的号才续跑，
+        #    其余情况（完成/搜号失败/拉取异常/断点损坏）从第 0 页重新增量。
+        saved = checkpoint["accounts"].get(name) or {}
+        resume = saved.get("resume")
+        if (isinstance(resume, dict)
+                and saved.get("outcome") in MP_INTERRUPTED
+                and str(resume.get("fakeid", "")) == str(rec["fakeid"])):
+            start_begin = int(resume.get("begin") or 0)
+            if start_begin > 0:
+                log(f"   ↪ 上次中断于 begin={start_begin}，从该页继续翻页")
+        else:
+            start_begin = 0
+
+        # 3) 拉文章列表（本次仍只跑 pages 页配额；已入库的靠 seen 去重）
         try:
             for pg in range(pages):
-                arts = client.list_articles(rec["fakeid"], begin=pg * page_size,
+                begin = start_begin + pg * page_size
+                arts = client.list_articles(rec["fakeid"], begin=begin,
                                             count=page_size)
                 if not arts:
                     break
+                pages_done += 1
                 for a in arts:
                     link = a.get("link", "")
                     guid = guid_of(name, link or a.get("title", ""))
@@ -213,19 +310,61 @@ def collect_mp(cfg, storage, seen) -> tuple[int, int]:
                         err_total += 1
                 time.sleep(2)
         except MPSessionError as e:
-            log(f"❌ {e}　→ 需要重新扫码登录、更新 mp_session.json，本次中止。")
+            # 当前页没拉成：断点指向下次要重试的这一页（begin），已处理页数不增
+            log(f"❌ {e}　→ 登录态失效，[{name}] 中断于 begin={begin}，"
+                f"已处理 {pages_done} 页；继续后续账号。")
             notify_session_expired(cfg, str(e))
-            break
+            record_mp_outcome(checkpoint, name, MP_SESSION_EXPIRED,
+                              fakeid=rec["fakeid"], pages_done=pages_done,
+                              new_count=new_here, begin=begin, detail=str(e))
+            time.sleep(3)
+            continue
         except MPFreqError as e:
-            log(f"⏳ {e}　→ 被限频，今天先到这，明天再跑。")
-            break
+            log(f"⏳ {e}　→ 被限频，[{name}] 中断于 begin={begin}，"
+                f"已处理 {pages_done} 页；继续后续账号。")
+            record_mp_outcome(checkpoint, name, MP_RATE_LIMITED,
+                              fakeid=rec["fakeid"], pages_done=pages_done,
+                              new_count=new_here, begin=begin, detail=str(e))
+            time.sleep(3)
+            continue
         except Exception as e:
             log(f"   ❌ [{name}] 拉文章失败：{e}")
             err_total += 1
+            record_mp_outcome(checkpoint, name, MP_FETCH_ERROR,
+                              fakeid=rec["fakeid"], pages_done=pages_done,
+                              new_count=new_here, detail=str(e))
+            time.sleep(3)
+            continue
 
         log(f"   [{name}] 本次新增 {new_here} 篇")
+        record_mp_outcome(checkpoint, name, MP_DONE, fakeid=rec["fakeid"],
+                          pages_done=pages_done, new_count=new_here)
         time.sleep(3)   # 号与号之间慢一点，降低限频风险
-    return new_total, err_total
+
+    interrupted = log_mp_summary(checkpoint, accounts)
+    return new_total, err_total, interrupted
+
+
+def log_mp_summary(checkpoint: dict, accounts: list[str]) -> int:
+    """按号输出本次结局汇总。返回未完成（中断/失败）的号数。"""
+    log("— mp 逐号结局汇总 —")
+    incomplete = 0
+    for name in accounts:
+        rec = checkpoint["accounts"].get(name)
+        if not rec:
+            log(f"  · [{name}] 无结局记录")
+            incomplete += 1
+            continue
+        label = MP_OUTCOME_LABELS.get(rec.get("outcome"), rec.get("outcome", "?"))
+        resume = rec.get("resume")
+        tip = ""
+        if resume:
+            tip = f"，断点 fakeid={resume.get('fakeid', '')} begin={resume.get('begin', 0)}"
+        log(f"  · [{name}] {label}｜已处理 {rec.get('pages_done', 0)} 页"
+            f"｜本次新增 {rec.get('new_count', 0)} 篇{tip}")
+        if rec.get("outcome") != MP_DONE:
+            incomplete += 1
+    return incomplete
 
 
 # ----------------------------- 登录态探针 + 推送 -----------------------------
@@ -325,8 +464,9 @@ def main() -> int:
 
     if source == "rss":
         new_total, err_total = collect_rss(cfg, storage, seen)
+        incomplete = 0
     elif source == "mp":
-        new_total, err_total = collect_mp(cfg, storage, seen)
+        new_total, err_total, incomplete = collect_mp(cfg, storage, seen)
     else:
         log(f"❌ 未知 source：{source}（可选 rss / mp）")
         return 1
@@ -350,6 +490,13 @@ def main() -> int:
 
     # 有新推文就推手机提醒去 ima 导入（待导入数取自上面的链接清单）
     notify_new_articles(cfg, new_total, pending)
+
+    # mp 采集时：只要有号中断（登录态失效/限频）或失败，就用非 0 退出码区分，
+    # 方便 launchd/cron 判断本次是否需要关注（rss 路径行为不变，始终 0）。
+    if source == "mp" and incomplete:
+        log(f"⚠️ 本次有 {incomplete} 个号未完成（见上方逐号结局汇总，"
+            f"断点已写入 {MP_CHECKPOINT_FILE.name}，下次自动续跑）。退出码 {EXIT_MP_INCOMPLETE}。")
+        return EXIT_MP_INCOMPLETE
     return 0
 
 
