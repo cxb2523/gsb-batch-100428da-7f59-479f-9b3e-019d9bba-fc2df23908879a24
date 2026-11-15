@@ -63,7 +63,7 @@ class TestCreateJson(object):
         json.loads(raw)
 
     def test_has_the_documented_top_level_shape(self, payload):
-        assert sorted(payload.keys()) == ["dolarpy", "updated"]
+        assert sorted(payload.keys()) == ["dolarpy", "status", "updated"]
 
     def test_lists_every_active_source(self, payload):
         assert sorted(payload["dolarpy"].keys()) == sorted(SOURCE_TO_KEY.values())

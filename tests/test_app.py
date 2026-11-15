@@ -38,6 +38,30 @@ class TestApi(object):
         assert response.mimetype == "application/json"
         assert json.loads(response.data) == payload
 
+    def test_serves_the_status_field_without_any_change_to_the_app(self, client):
+        """The per-source outcome is just part of the file the API already serves."""
+        payload = {
+            "dolarpy": {
+                "maxicambios": {"compra": 7200.0, "venta": 7300.0},
+                "cambioschaco": {"compra": 0, "venta": 0},
+            },
+            "status": {
+                "maxicambios": {"status": "ok", "detail": "compra 7200 / venta 7300"},
+                "cambioschaco": {
+                    "status": "connection_error",
+                    "detail": "HTTPError: HTTP 403",
+                },
+            },
+            "updated": "2025-09-01 10:00:00",
+        }
+        (client.workdir / "dolar.json").write_text(json.dumps(payload))
+
+        body = json.loads(client.get("/api/1.0/").data)
+
+        assert body["dolarpy"] == payload["dolarpy"]
+        assert body["status"] == payload["status"]
+        assert body["updated"] == payload["updated"]
+
     def test_allows_cross_origin_requests(self, client):
         (client.workdir / "dolar.json").write_text("{}")
         response = client.get("/api/1.0/", headers={"Origin": "https://example.com"})

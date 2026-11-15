@@ -9,6 +9,49 @@ Checks USD/PYG exchange rate from several sites, with a calculator, RESTful API 
 
 http://dolar.melizeche.com/api/1.0/
 
+#### API response
+
+`dolar.json` keeps the same `dolarpy` object it always had: one key per source,
+each with `compra`/`venta` (and `referencial_diario` for `bcp`). A source that
+could not be collected is still published under its usual key with prices at
+`0`, so consumers never hit a `KeyError`.
+
+What is new is a top-level `status` object that records how each source's
+collection went on this run:
+
+```json
+{
+    "dolarpy": {"maxicambios": {"compra": 7200, "venta": 7300}, "...": {}},
+    "status": {
+        "maxicambios": {"status": "ok", "detail": "compra 7200 / venta 7300"},
+        "cambioschaco": {"status": "connection_error", "detail": "HTTPError: HTTP 403"},
+        "set": {"status": "structure_error", "detail": "IndexError: list index out of range"},
+        "bcp": {"status": "invalid_value", "detail": "compra 0 outside 3000-20000"}
+    },
+    "updated": "2026-11-15 08:30:00"
+}
+```
+
+`status` is one of:
+
+* `ok` -- prices were parsed and look plausible.
+* `connection_error` -- the request failed (timeout, refused connection, a
+  blocking 403/5xx, a Cloudflare challenge).
+* `structure_error` -- the page was fetched but no longer has the expected
+  shape (a redesigned page, an error page, a missing table/cell, an
+  unparseable number).
+* `invalid_value` -- a price was parsed but cannot be trusted: it falls outside
+  the plausible guaraní-per-dollar range (3000-20000), or the sell price is
+  below the buy price.
+
+BCP is special-cased for the spread check only: its `compra`/`venta` are hourly
+averages (`POR CORTE HORARIO`), not counter quotes, so the two may legitimately
+cross. Its values are still range-checked. Every other source is a counter
+quote, where `venta < compra` means the columns were swapped.
+
+The `detail` field is a short human-readable reason (the exception type and
+message, or the offending value), meant for debugging a source that broke.
+
 #### Twitter Bot
 
 https://twitter.com/DolarPy
@@ -101,8 +144,9 @@ There are two suites, split by the question they answer.
 
 **Offline** (default, no network) -- checks that `coti.py` keeps its own
 contract: every source is fetched from the right endpoint, a source that is
-down or redesigned degrades to zeros instead of breaking the others,
-`dolar.json` has the documented shape, and the API serves it.
+down or redesigned degrades to zeros instead of breaking the others and is
+labelled with the right `status` outcome, `dolar.json` has the documented
+shape, and the API serves it.
 
 ```
 pip install -r requirements-dev.txt
