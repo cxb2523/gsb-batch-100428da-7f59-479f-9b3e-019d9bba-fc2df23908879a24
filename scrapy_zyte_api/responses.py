@@ -1,0 +1,215 @@
+from __future__ import annotations
+
+import datetime as dt
+from base64 import b64decode
+from copy import copy
+from typing import TYPE_CHECKING, Any, TypeAlias, cast
+
+from scrapy.http import HtmlResponse, JsonResponse, Response, TextResponse, XmlResponse
+from scrapy.responsetypes import responsetypes
+
+if TYPE_CHECKING:
+    from scrapy import Request
+    from scrapy.http.cookies import CookieJar
+
+from scrapy_zyte_api._cookies import _process_cookies
+
+_DEFAULT_ENCODING = "utf-8"
+
+
+class ZyteAPIMixin:
+    attributes: tuple[str, ...]
+    url: str
+
+    REMOVE_HEADERS = {
+        # Zyte API already decompresses the HTTP Response Body. Scrapy's
+        # HttpCompressionMiddleware will error out when it attempts to
+        # decompress an already decompressed body based on this header.
+        "content-encoding",
+    }
+
+    def __init__(self, *args, raw_api_response: dict | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._raw_api_response = raw_api_response
+        self.attributes += ("raw_api_response",)
+
+    def replace(self, *args, **kwargs):
+        if kwargs.get("raw_api_response"):
+            raise ValueError("Replacing the value of 'raw_api_response' isn't allowed.")
+        for attribute in self.attributes:
+            kwargs.setdefault(attribute, getattr(self, attribute))
+        cls = kwargs.pop("cls", self.__class__)
+        return cls(*args, **kwargs)
+
+    @property
+    def raw_api_response(self) -> dict | None:
+        """Contains the raw API response from Zyte API.
+
+        For the full list of parameters, see :ref:`zapi-reference`.
+        """
+        return self._raw_api_response
+
+    @staticmethod
+    def _response_cookie_to_header_value(cookie):
+        result = f"{cookie['name']}={cookie['value']}"
+        domain = cookie.get("domain")
+        if domain:
+            result += f"; Domain={cookie['domain']}"
+        path = cookie.get("path")
+        if path is not None:
+            result += f"; Path={path}"
+        expires = cookie.get("expires")
+        if expires is not None:
+            expires_date = dt.datetime.fromtimestamp(expires, dt.UTC)
+            expires_date_string = expires_date.strftime("%a, %d %b %Y %H:%M:%S GMT")
+            result += f"; Expires={expires_date_string}"
+        if cookie.get("httpOnly"):
+            result += "; HttpOnly"
+        if cookie.get("secure"):
+            result += "; Secure"
+        same_site = cookie.get("sameSite")
+        if same_site is not None:
+            result += f"; SameSite={same_site}"
+        return result
+
+    @classmethod
+    def from_api_response(cls, api_response: dict, *, request: Request | None = None):
+        """Alternative constructor to instantiate the response from the raw
+        Zyte API response.
+        """
+        return cls(
+            url=api_response["url"],
+            status=api_response.get("statusCode") or 200,
+            body=b64decode(api_response.get("httpResponseBody") or ""),
+            request=request,
+            flags=["zyte-api"],
+            headers=cls._prepare_headers(api_response),
+            raw_api_response=api_response,
+        )
+
+    @classmethod
+    def _prepare_headers(cls, api_response: dict[str, Any]):
+        result: dict[str, list[str]] = {}
+        input_headers: list[dict[str, str]] | None = api_response.get(
+            "httpResponseHeaders"
+        )
+        response_cookies: list[dict[str, str]] | None = api_response.get(
+            "experimental", {}
+        ).get("responseCookies")
+        if input_headers:
+            headers_to_remove = copy(cls.REMOVE_HEADERS)
+            if response_cookies:
+                headers_to_remove.add("set-cookie")
+            result = {
+                h["name"]: [h["value"]]
+                for h in input_headers
+                if h["name"].lower() not in headers_to_remove
+            }
+        if response_cookies:
+            result["Set-Cookie"] = []
+            for cookie in response_cookies:
+                result["Set-Cookie"].append(
+                    cls._response_cookie_to_header_value(cookie)
+                )
+        return result
+
+
+class ZyteAPITextResponse(ZyteAPIMixin, HtmlResponse):
+    @classmethod
+    def from_api_response(cls, api_response: dict, *, request: Request | None = None):
+        """Alternative constructor to instantiate the response from the raw
+        Zyte API response.
+        """
+        body = None
+        encoding = None
+
+        if api_response.get("browserHtml"):
+            encoding = _DEFAULT_ENCODING  # Zyte API has "utf-8" by default
+            body = api_response["browserHtml"].encode(encoding)
+        elif api_response.get("httpResponseBody"):
+            body = b64decode(api_response["httpResponseBody"])
+
+        return cls(
+            url=api_response["url"],
+            status=api_response.get("statusCode") or 200,
+            body=body,
+            encoding=encoding,
+            request=request,
+            flags=["zyte-api"],
+            headers=cls._prepare_headers(api_response),
+            raw_api_response=api_response,
+        )
+
+    def replace(self, *args, **kwargs):
+        kwargs.setdefault("encoding", self.encoding)
+        return ZyteAPIMixin.replace(self, *args, **kwargs)
+
+
+class ZyteAPIXmlResponse(ZyteAPIMixin, XmlResponse):
+    pass
+
+
+class ZyteAPIJsonResponse(ZyteAPIMixin, JsonResponse):
+    pass
+
+
+class ZyteAPIResponse(ZyteAPIMixin, Response):
+    pass
+
+
+_IMMUTABLE_JSON: TypeAlias = str | int | float | bool | None
+_JSON: TypeAlias = (
+    str | int | float | bool | list["_JSON"] | dict[_IMMUTABLE_JSON, "_JSON"] | None
+)
+_API_RESPONSE: TypeAlias = dict[str, _JSON]
+
+_SCRAPY_TO_ZYTE_RESPONSE: dict[type[TextResponse], type[ZyteAPIMixin]] = {
+    JsonResponse: ZyteAPIJsonResponse,
+    XmlResponse: ZyteAPIXmlResponse,
+}
+
+
+def _process_response(
+    api_response: _API_RESPONSE,
+    request: Request,
+    cookie_jars: dict[Any, CookieJar] | None,
+) -> (
+    ZyteAPITextResponse
+    | ZyteAPIXmlResponse
+    | ZyteAPIJsonResponse
+    | ZyteAPIResponse
+    | None
+):
+    """Given a Zyte API Response and the ``scrapy.Request`` that asked for it,
+    this returns the most appropriate Zyte API response class based on the
+    response content type.
+    """
+
+    # NOTES: Currently, Zyte API does NOT only allow both 'browserHtml' and
+    # 'httpResponseBody' to be present at the same time. The support for both
+    # will be addressed in the future. Reference:
+    # - https://github.com/scrapy-plugins/scrapy-zyte-api/pull/10#issuecomment-1131406460
+    # For now, at least one of them should be present.
+
+    _process_cookies(api_response, request, cookie_jars)
+
+    if api_response.get("browserHtml"):
+        # Using TextResponse because browserHtml always returns a browser-rendered page
+        # even when requesting files (like images)
+        return ZyteAPITextResponse.from_api_response(api_response, request=request)
+
+    if api_response.get("httpResponseHeaders") and api_response.get("httpResponseBody"):
+        scrapy_headers: dict[bytes, bytes] = {}
+        for header in cast("list[dict[str, str]]", api_response["httpResponseHeaders"]):
+            scrapy_headers[header["name"].encode()] = header["value"].encode()
+        response_cls = responsetypes.from_args(
+            headers=scrapy_headers,
+            url=cast("str", api_response["url"]),
+            # FIXME: update this when python-zyte-api supports base64 decoding
+            body=b64decode(api_response["httpResponseBody"]),  # type: ignore[arg-type]
+        )
+        if issubclass(response_cls, TextResponse):
+            zyte_cls = _SCRAPY_TO_ZYTE_RESPONSE.get(response_cls, ZyteAPITextResponse)
+            return zyte_cls.from_api_response(api_response, request=request)
+
+    return ZyteAPIResponse.from_api_response(api_response, request=request)

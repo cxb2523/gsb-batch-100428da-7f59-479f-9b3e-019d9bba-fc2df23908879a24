@@ -1,0 +1,305 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "scrapy-zyte-api"
+version = "0.37.0"
+description = "Client library to process URLs through Zyte API"
+authors = [{name = "Zyte Group Ltd", email = "info@zyte.com"}]
+license = "BSD-3-Clause"
+readme = "README.rst"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Natural Language :: English",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+]
+requires-python = ">=3.11"
+# Sync with [min] @ tox.ini
+dependencies = [
+    "packaging>=20.0",
+    "scrapy>=2.13.3",
+    "zyte-api>=0.6.0",
+]
+
+[project.optional-dependencies]
+# Sync with [testenv:min-provider] @ tox.ini
+provider = [
+    "andi>=0.6.0",
+    "scrapy-poet>=0.28.0",
+    "web-poet>=0.25.0",
+    "zyte-common-items>=0.27.0",
+]
+x402 = [
+    "zyte-api[x402]>=0.8.0",
+    "x402<2.0.0",
+]
+
+[project.urls]
+source = "https://github.com/scrapy-plugins/scrapy-zyte-api"
+docs = "https://scrapy-zyte-api.readthedocs.io/en/latest/"
+
+[tool.bumpversion]
+current_version = "0.37.0"
+commit = true
+tag = true
+tag_name = "{new_version}"
+
+[[tool.bumpversion.files]]
+filename = 'CHANGES.rst'
+search = "\\(unreleased\\)$"
+replace = "({now:%Y-%m-%d})"
+regex = true
+
+[[tool.bumpversion.files]]
+filename = "docs/conf.py"
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+parse = "version\\s*=\\s*['\"](?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)"
+
+[[tool.bumpversion.files]]
+filename = "scrapy_zyte_api/__version__.py"
+
+[tool.coverage.run]
+branch = true
+include = [
+    "scrapy_zyte_api/*",
+]
+omit = [
+    "tests/*",
+]
+disable_warnings = [
+    "include-ignored",
+]
+
+[tool.coverage.report]
+exclude_also = [
+    # Type-checking-only branches.
+    "if not TYPE_CHECKING:",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/docs",
+    "/scrapy_zyte_api",
+    "/tests",
+    "/CHANGES.rst",
+    "/tox.ini",
+]
+
+[tool.mypy]
+check_untyped_defs = true
+implicit_reexport = false
+warn_no_return = false
+warn_unused_ignores = true
+files = [
+    "scrapy_zyte_api",
+    "tests"
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "pytest_twisted",
+    "scrapy_crawlera",
+    "scrapy_zyte_smartproxy",
+]
+ignore_missing_imports = true
+
+# to be fixed
+[[tool.mypy.overrides]]
+module = "scrapy_poet.*"
+implicit_reexport = true
+
+[tool.pytest.ini_options]
+junit_family = "xunit2"
+testpaths = [
+    "scrapy_zyte_api/",
+    "tests/"
+]
+minversion = "6.0"
+filterwarnings = [
+    # Envs with pinned old dependencies opt out of this, see tox.ini.
+    "error",
+    "ignore::DeprecationWarning:twisted\\.web\\.http",
+    "ignore::DeprecationWarning:scrapy\\.core\\.downloader\\.contextfactory",  # https://github.com/scrapy/scrapy/issues/3288
+
+    # scrapy-poet warnings for Scrapy 2.14. They match on the message, and not
+    # on ScrapyDeprecationWarning, because pytest imports the category that a
+    # filter names with the error filter already in place, and importing Scrapy
+    # emits warnings of its own on the oldest supported dependency versions.
+    "ignore:CollectorPipeline\\.",
+    "ignore:DownloaderStatsMiddleware\\.",
+    "ignore:.*?InjectionMiddleware\\.",
+    "ignore:RetryMiddleware\\.process_spider_exception\\(\\)",
+    "ignore:::scrapy_poet",
+
+    # The scrapy-poet mock server leaks the socket it uses to find a free port
+    # and the pipe it reads the server URL from. They are collected at an
+    # arbitrary point, sometimes while finalizing objects, hence the second
+    # pair of filters, and never from the same module, hence matching on the
+    # object repr rather than on the module.
+    "ignore:unclosed <socket\\.socket:ResourceWarning",
+    "ignore:unclosed file <_io\\.BufferedReader:ResourceWarning",
+    "ignore:.*<socket\\.socket fd=:pytest.PytestUnraisableExceptionWarning",
+    "ignore:.*<_io\\.FileIO name=:pytest.PytestUnraisableExceptionWarning",
+
+    # The scrapy-crawlera and scrapy-zyte-smartproxy middlewares still declare
+    # a spider parameter in their method signatures.
+    "ignore:(Crawlera|ZyteSmartProxy)Middleware\\.",
+
+    # CI runs without coverage pass --no-cov, which pytest-cov reports.
+    "ignore:Coverage disabled via --no-cov switch!",
+]
+
+[tool.ruff.lint]
+extend-select = [
+    # flake8-builtins
+    "A",
+    # flake8-async
+    "ASYNC",
+    # flake8-bugbear
+    "B",
+    # flake8-comprehensions
+    "C4",
+    # flake8-commas
+    "COM",
+    # pydocstyle
+    "D",
+    # flake8-future-annotations
+    "FA",
+    # flynt
+    "FLY",
+    # refurb
+    "FURB",
+    # isort
+    "I",
+    # flake8-implicit-str-concat
+    "ISC",
+    # flake8-logging
+    "LOG",
+    # Perflint
+    "PERF",
+    # pygrep-hooks
+    "PGH",
+    # flake8-pie
+    "PIE",
+    # pylint
+    "PL",
+    # flake8-pytest-style
+    "PT",
+    # flake8-use-pathlib
+    "PTH",
+    # flake8-pyi
+    "PYI",
+    # flake8-quotes
+    "Q",
+    # flake8-return
+    "RET",
+    # flake8-raise
+    "RSE",
+    # Ruff-specific rules
+    "RUF",
+    # flake8-bandit
+    "S",
+    # flake8-simplify
+    "SIM",
+    # flake8-slots
+    "SLOT",
+    # flake8-debugger
+    "T10",
+    # flake8-type-checking
+    "TC",
+    # pyupgrade
+    "UP",
+    # pycodestyle warnings
+    "W",
+    # flake8-2020
+    "YTT",
+]
+ignore = [
+    # Do not catch blind exception
+    "BLE001",
+    # Trailing comma missing
+    "COM812",
+    # Missing docstring in public module
+    "D100",
+    # Missing docstring in public class
+    "D101",
+    # Missing docstring in public method
+    "D102",
+    # Missing docstring in public function
+    "D103",
+    # Missing docstring in public package
+    "D104",
+    # Missing docstring in magic method
+    "D105",
+    # Missing docstring in public nested class
+    "D106",
+    # Missing docstring in __init__
+    "D107",
+    # One-line docstring should fit on one line with quotes
+    "D200",
+    # No blank lines allowed after function docstring
+    "D202",
+    # 1 blank line required between summary line and description
+    "D205",
+    # Multi-line docstring closing quotes should be on a separate line
+    "D209",
+    # First line should end with a period
+    "D400",
+    # First line should be in imperative mood; try rephrasing
+    "D401",
+    # First line should not be the function's "signature"
+    "D402",
+    # First word of the first line should be properly capitalized
+    "D403",
+    # No blank lines allowed between a section header and its content
+    "D412",
+    # `try`-`except` within a loop incurs performance overhead
+    "PERF203",
+    # Too many return statements
+    "PLR0911",
+    # Too many branches
+    "PLR0912",
+    # Too many arguments in function definition
+    "PLR0913",
+    # Too many statements
+    "PLR0915",
+    # Too many positional arguments
+    "PLR0917",
+    # Magic value used in comparison
+    "PLR2004",
+    # String contains ambiguous {}.
+    "RUF001",
+    # Docstring contains ambiguous {}.
+    "RUF002",
+    # Comment contains ambiguous {}.
+    "RUF003",
+    # Mutable class attributes should be annotated with `typing.ClassVar`
+    "RUF012",
+    # Use of `assert` detected
+    "S101",
+    # Prefer `TypeError` exception for invalid type
+    "TRY004",
+]
+
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S", "TRY002"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.sphinx-scrapy]
+python-version = "3.14"  # Keep in sync with .github/workflows/test.yml.
