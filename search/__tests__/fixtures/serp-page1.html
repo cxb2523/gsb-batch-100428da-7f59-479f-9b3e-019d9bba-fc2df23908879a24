@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>web scraping api - Google Search</title>
+</head>
+<body>
+  <!-- Local test fixture: mimics the parts of a Google SERP the scraper reads.
+       This is synthetic HTML, not a captured live response. -->
+  <div id="search">
+    <div data-attrid="wa:/description" role="region">
+      <span>Web scraping APIs fetch pages at scale and return structured data.</span>
+    </div>
+
+    <div id="rso">
+      <div class="g">
+        <div>
+          <h3>ScrapingBee - Web Scraping API</h3>
+          <a href="https://www.scrapingbee.com/">https://www.scrapingbee.com/</a>
+        </div>
+        <div data-sncf="1">
+          <span>ScrapingBee is a web scraping API that handles proxies and browsers.</span>
+        </div>
+      </div>
+
+      <div class="g">
+        <div>
+          <h3>ScraperAPI - Scalable Web Scraping</h3>
+          <a href="https://www.scraperapi.com/">https://www.scraperapi.com/</a>
+        </div>
+        <div style="display:-webkit-box;-webkit-line-clamp:2">
+          <span>ScraperAPI rotates proxies and renders JavaScript for you.</span>
+        </div>
+      </div>
+
+      <div class="g">
+        <div>
+          <h3>ZenRows - Web Scraping API</h3>
+          <a href="https://www.zenrows.com/">https://www.zenrows.com/</a>
+        </div>
+        <div data-sncf="1">
+          <span>ZenRows bypasses anti-bot protection from a single API call.</span>
+        </div>
+      </div>
+
+      <!-- Sponsored block: no h3/anchor pair usable by the scraper selectors. -->
+      <div class="g">
+        <div>
+          <span>Sponsored</span>
+          <a href="https://ads.example.com/promo">Ad</a>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

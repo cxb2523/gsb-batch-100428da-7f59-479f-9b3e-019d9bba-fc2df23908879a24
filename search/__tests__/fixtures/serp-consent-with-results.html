@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>web scraping api - Google Search</title>
+</head>
+<body>
+  <!-- Local test fixture: a consent banner sits above results that still rendered.
+       The banner must be reported but must not throw the results away. -->
+  <div id="consent-bump" role="dialog">
+    <h1>Before you continue to Google</h1>
+    <form action="https://consent.google.com/save" method="POST">
+      <button type="submit">Accept all</button>
+    </form>
+  </div>
+
+  <div id="search">
+    <div id="rso">
+      <div class="g">
+        <div>
+          <h3>Oxylabs - Web Scraping API</h3>
+          <a href="https://oxylabs.io/products/scraping-api">https://oxylabs.io/products/scraping-api</a>
+        </div>
+        <div data-sncf="1">
+          <span>Oxylabs provides a proxy-backed scraping API.</span>
+        </div>
+      </div>
+
+      <div class="g">
+        <div>
+          <h3>Scrapingdog - Web Scraping API</h3>
+          <a href="https://www.scrapingdog.com/">https://www.scrapingdog.com/</a>
+        </div>
+        <div data-sncf="1">
+          <span>Scrapingdog handles proxies and headless browsers for you.</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

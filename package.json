@@ -154,12 +154,15 @@
     "arxiv": "tsx science-research/arxiv-scraper.ts",
     "pubmed": "tsx science-research/pubmed-scraper.ts",
     "petfinder": "tsx pets/petfinder-scraper.ts",
-    "thumbtack": "tsx home-services/thumbtack-scraper.ts"
+    "thumbtack": "tsx home-services/thumbtack-scraper.ts",
+    "test:google-search": "tsx --test search/__tests__/google-search-scraper.test.ts"
   },
   "dependencies": {
     "spider-browser": "^0.2.0"
   },
   "devDependencies": {
+    "@types/node": "^26.6.6",
+    "linkedom": "^0.18.15",
     "tsx": "^4.0.0",
     "typescript": "^5.5.0"
   }

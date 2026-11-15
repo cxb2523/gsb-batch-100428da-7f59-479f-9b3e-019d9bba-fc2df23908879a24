@@ -11,6 +11,28 @@ SPIDER_API_KEY=sk-... npx tsx ecommerce/amazon-scraper.ts
 
 Get a free API key at [spider.cloud](https://spider.cloud).
 
+## Google search scraper: paging and outcomes
+
+`search/google-search-scraper.ts` accepts the query and page count as CLI args (defaults: `"web scraping api"`, 1 page):
+
+```bash
+SPIDER_API_KEY=sk-... npx tsx search/google-search-scraper.ts "rust web crawler" 3
+SPIDER_API_KEY=sk-... npx tsx search/google-search-scraper.ts --query "headless browser" --pages 2
+```
+
+It prints a JSON summary to stdout with `results` (merged across pages in page order, duplicate URLs dropped, `position` renumbered) and `pageOutcomes` (per page: `page`, `outcome` = `ok` | `empty` | `blocked` | `error`, `resultCount`, and a `reason` for failures). Per-page progress goes to stderr. Exit code `0` means at least one page gave a usable answer (including a genuine "no results" page); `1` means every page was blocked or errored; `2` means invalid arguments.
+
+Both the normal and blocked paths are reproducible offline with synthetic HTML fixtures (no API key, no Google requests):
+
+```bash
+npm run test:google-search                                  # 26 offline tests
+npx tsx search/__tests__/fixture-demo.ts normal             # multi-page merge
+npx tsx search/__tests__/fixture-demo.ts blocked            # captcha + consent, exits 1
+npx tsx search/__tests__/fixture-demo.ts mixed              # blocked + error + ok
+```
+
+Fixtures live in `search/__tests__/fixtures/`; they are test doubles, not live Google responses.
+
 ## Categories
 
 | Category | Scripts | Example Sites |
