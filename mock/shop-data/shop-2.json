@@ -1,0 +1,13 @@
+{
+  "shopId": "shop-2",
+  "shopName": "义乌小商品城店",
+  "capturedAt": "2026-11-15T09:00:00+08:00",
+  "metrics": {
+    "visits": 2860,
+    "exposure": 18420,
+    "views": 5210,
+    "paidOrders": 46,
+    "amount": 12860.5,
+    "refunds": 3
+  }
+}

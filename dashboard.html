@@ -1,0 +1,1021 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>数据总览采集 - 闲鱼辅助系统</title>
+<style>
+  :root {
+    --bg: #eef2f8;
+    --panel: #ffffff;
+    --text: #1b2433;
+    --muted: #6b778c;
+    --line: #e4e9f2;
+    --blue: #2563eb;
+    --blue-dark: #1d4ed8;
+    --green: #15803d;
+    --green-bg: #dcfce7;
+    --red: #b91c1c;
+    --red-bg: #fee2e2;
+    --amber: #b45309;
+    --amber-bg: #fef3c7;
+    --gray: #64748b;
+    --gray-bg: #f1f5f9;
+    --shadow: 0 12px 34px rgba(30, 51, 90, 0.10);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Roboto, sans-serif;
+    background: linear-gradient(160deg, #f6f8fc 0%, #dde6f4 55%, #d5e0f1 100%);
+    color: var(--text);
+    min-height: 100vh;
+  }
+  .page {
+    max-width: 1240px;
+    margin: 0 auto;
+    padding: 28px 20px 56px;
+  }
+  .hero {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 18px;
+    margin-bottom: 22px;
+  }
+  .hero h1 { font-size: 28px; margin: 0 0 6px; letter-spacing: -0.3px; }
+  .hero .sub { margin: 0; color: var(--muted); font-size: 14px; line-height: 1.7; }
+  .hero nav a {
+    color: var(--blue);
+    text-decoration: none;
+    background: rgba(255,255,255,0.7);
+    border: 1px solid var(--line);
+    padding: 9px 14px;
+    border-radius: 10px;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  .hero nav a:hover { background: #fff; }
+  .banner {
+    background: #fff7ed;
+    border: 1px solid #fed7aa;
+    color: #9a3412;
+    padding: 12px 16px;
+    border-radius: 12px;
+    font-size: 13px;
+    line-height: 1.65;
+    margin-bottom: 18px;
+  }
+  .banner code {
+    background: #ffedd5;
+    border-radius: 5px;
+    padding: 1px 5px;
+    font-family: Consolas, monospace;
+  }
+  .panel {
+    background: var(--panel);
+    border-radius: 18px;
+    box-shadow: var(--shadow);
+    padding: 20px;
+    margin-bottom: 22px;
+  }
+  .toolbar { position: sticky; top: 12px; z-index: 30; }
+  .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+  .btn {
+    border: none;
+    border-radius: 11px;
+    padding: 11px 18px;
+    font-size: 14px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: transform .15s, background .15s, box-shadow .15s, opacity .15s;
+    font-family: inherit;
+    line-height: 1.45;
+    max-width: 100%;
+  }
+  .btn:disabled { cursor: not-allowed; opacity: .62; transform: none !important; box-shadow: none !important; }
+  .btn-primary { background: var(--blue); color: #fff; box-shadow: 0 7px 18px rgba(37,99,235,.28); }
+  .btn-primary:hover:not(:disabled) { background: var(--blue-dark); transform: translateY(-1px); }
+  .btn-retry { background: #f59e0b; color: #422006; box-shadow: 0 7px 18px rgba(245,158,11,.24); }
+  .btn-retry:hover:not(:disabled) { background: #fbbf24; transform: translateY(-1px); }
+  .btn-ghost { background: var(--gray-bg); color: #475569; }
+  .btn-ghost:hover:not(:disabled) { background: #e2e8f0; }
+  .batch-status { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 14px; }
+  .status-line {
+    font-size: 14px;
+    font-weight: 600;
+    color: #334155;
+    line-height: 1.6;
+    word-break: break-word;
+  }
+  .status-line.is-running { color: var(--blue); }
+  .summary { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 700;
+    background: var(--gray-bg);
+    color: var(--gray);
+  }
+  .chip-success { background: var(--green-bg); color: var(--green); }
+  .chip-error { background: var(--red-bg); color: var(--red); }
+  .chip-timeout { background: var(--amber-bg); color: var(--amber); }
+  .chip-running { background: #dbeafe; color: var(--blue); }
+  .progress-track {
+    height: 7px;
+    background: #e8edf5;
+    border-radius: 999px;
+    overflow: hidden;
+    margin-top: 12px;
+  }
+  .progress-bar {
+    height: 100%;
+    width: 0%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #3b82f6, #22c55e);
+    transition: width .25s ease;
+  }
+  .section-title {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 10px;
+    margin: 0 0 14px;
+    font-size: 19px;
+  }
+  .section-title small { font-size: 12px; color: var(--muted); font-weight: 500; }
+  details.config-panel { padding: 0; overflow: hidden; }
+  details.config-panel > summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 18px 20px;
+    font-size: 15px;
+    font-weight: 700;
+    user-select: none;
+  }
+  details.config-panel > summary::-webkit-details-marker { display: none; }
+  details.config-panel > summary::after {
+    content: "展开";
+    float: right;
+    color: var(--blue);
+    font-size: 12px;
+    font-weight: 600;
+  }
+  details.config-panel[open] > summary::after { content: "收起"; }
+  .config-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(330px, 1fr));
+    gap: 12px;
+    padding: 0 20px 8px;
+  }
+  .config-item {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .config-item .config-name { font-size: 13px; color: var(--text); font-weight: 700; }
+  .config-item input {
+    width: 100%;
+    border: 1px solid #d5dce8;
+    border-radius: 9px;
+    padding: 9px 10px;
+    font-size: 12.5px;
+    font-family: Consolas, "SFMono-Regular", monospace;
+    color: #334155;
+    background: #fbfdff;
+    outline: none;
+  }
+  .config-item input:focus { border-color: #93c5fd; box-shadow: 0 0 0 3px rgba(37,99,235,.10); }
+  .config-item input:disabled { background: #f1f5f9; color: #94a3b8; }
+  .config-hint { padding: 4px 20px 20px; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+  .card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(285px, 1fr));
+    gap: 16px;
+  }
+  .shop-card {
+    background: #fff;
+    border: 1px solid var(--line);
+    border-left: 5px solid #cbd5e1;
+    border-radius: 16px;
+    padding: 16px;
+    box-shadow: 0 8px 24px rgba(30,51,90,.07);
+    transition: border-color .2s, box-shadow .2s, transform .2s;
+    min-width: 0;
+  }
+  .shop-card[data-status="running"] { border-left-color: #3b82f6; box-shadow: 0 10px 28px rgba(37,99,235,.18); }
+  .shop-card[data-status="success"] { border-left-color: #22c55e; }
+  .shop-card[data-status="error"] { border-left-color: #ef4444; }
+  .shop-card[data-status="timeout"] { border-left-color: #f59e0b; }
+  .card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; }
+  .shop-name { font-size: 16px; font-weight: 800; line-height: 1.35; }
+  .shop-id { color: var(--muted); font-size: 11.5px; margin-top: 2px; font-family: Consolas, monospace; }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    padding: 4px 9px;
+    border-radius: 999px;
+    font-size: 11.5px;
+    font-weight: 700;
+    white-space: nowrap;
+    background: var(--gray-bg);
+    color: var(--gray);
+  }
+  .badge[data-status="running"] { background: #dbeafe; color: var(--blue); }
+  .badge[data-status="success"] { background: var(--green-bg); color: var(--green); }
+  .badge[data-status="error"] { background: var(--red-bg); color: var(--red); }
+  .badge[data-status="timeout"] { background: var(--amber-bg); color: var(--amber); }
+  .badge[data-status="running"]::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; animation: pulse 1s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .2; } }
+  .metric-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: 11px;
+    overflow: hidden;
+    margin: 14px 0 12px;
+  }
+  .metric {
+    background: #fbfcfe;
+    padding: 9px 9px 10px;
+    min-width: 0;
+  }
+  .metric .m-label { display: block; color: var(--muted); font-size: 11px; margin-bottom: 3px; white-space: nowrap; }
+  .metric .m-value {
+    display: block;
+    font-size: 17px;
+    font-weight: 800;
+    color: #0f172a;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .shop-card[data-status="idle"] .m-value,
+  .shop-card[data-status="running"] .m-value,
+  .shop-card[data-status="error"] .m-value,
+  .shop-card[data-status="timeout"] .m-value { color: #a8b3c4; font-weight: 600; }
+  .shop-card[data-status="running"] .m-value::after {
+    content: "采集中";
+    font-size: 10px;
+    color: #93c5fd;
+    font-weight: 600;
+    margin-left: 4px;
+  }
+  .card-foot {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    font-size: 11.5px;
+    color: var(--muted);
+    line-height: 1.5;
+    min-height: 34px;
+  }
+  .card-foot .reason { flex: 1; min-width: 0; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .card-foot .duration { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+  table { width: 100%; border-collapse: collapse; min-width: 760px; }
+  thead th {
+    background: #f7f9fd;
+    text-align: left;
+    font-size: 12px;
+    color: #475569;
+    padding: 11px 12px;
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }
+  tbody td { padding: 11px 12px; border-bottom: 1px solid #eef2f8; font-size: 12.5px; vertical-align: top; line-height: 1.55; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr[data-status="running"] { background: #f5f9ff; }
+  tbody tr[data-status="error"] { background: #fffafa; }
+  tbody tr[data-status="timeout"] { background: #fffdf5; }
+  .outcome-status { font-weight: 700; white-space: nowrap; }
+  .outcome-status[data-status="success"] { color: var(--green); }
+  .outcome-status[data-status="error"] { color: var(--red); }
+  .outcome-status[data-status="timeout"] { color: var(--amber); }
+  .outcome-status[data-status="running"] { color: var(--blue); }
+  .outcome-status[data-status="idle"] { color: var(--gray); }
+  .outcome-source { font-family: Consolas, "SFMono-Regular", monospace; font-size: 11.5px; color: #64748b; word-break: break-all; }
+  .outcome-reason { color: #475569; word-break: break-word; }
+  .outcome-duration { white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .empty-tip { color: var(--muted); font-size: 13px; padding: 8px 0; }
+  @media (max-width: 720px) {
+    .page { padding: 20px 12px 40px; }
+    .hero { flex-direction: column; }
+    .hero h1 { font-size: 24px; }
+    .toolbar { position: static; }
+    .metric-grid { grid-template-columns: repeat(3, 1fr); }
+    .metric .m-value { font-size: 15px; }
+  }
+</style>
+</head>
+<body data-timeout-ms="8000">
+
+<div class="page">
+  <header class="hero">
+    <div>
+      <h1>📊 数据总览采集</h1>
+      <p class="sub">多网点独立采集访问、曝光、浏览、支付、金额、退款指标 · 单点失败不中断整批 · 单网点超时上限 <strong id="timeoutLabel">8</strong> 秒</p>
+    </div>
+    <nav><a href="./index.html">← 返回授权中心</a></nav>
+  </header>
+
+  <div id="fileWarning" class="banner" hidden>
+    ⚠️ 当前通过 <code>file://</code> 直接打开页面。默认数据源已自动指向本地 mock 服务 <code>http://127.0.0.1:8787</code>，请先运行 <code>node mock/server.mjs</code> 再开始采集；
+    也可以改用 <code>http://127.0.0.1:8787/dashboard.html</code> 访问。
+  </div>
+
+  <section class="panel toolbar">
+    <div class="actions">
+      <button id="startBtn" class="btn btn-primary" type="button">▶ 开始采集</button>
+      <button id="retryBtn" class="btn btn-retry" type="button" hidden>🔁 重试失败/超时网点</button>
+      <button id="resetConfigBtn" class="btn btn-ghost" type="button">恢复默认数据源</button>
+    </div>
+    <div class="batch-status">
+      <div id="batchStatus" class="status-line" role="status" aria-live="polite">尚未开始采集</div>
+      <div id="summary" class="summary"></div>
+      <div class="progress-track" aria-hidden="true"><div id="progressBar" class="progress-bar"></div></div>
+    </div>
+  </section>
+
+  <details class="panel config-panel">
+    <summary>⚙️ 数据源配置（每个网点独立地址，采集进行中不可修改）</summary>
+    <div id="configGrid" class="config-grid"></div>
+    <p class="config-hint">
+      默认地址指向本仓库 <code>mock/server.mjs</code> 提供的 mock 接口或 <code>mock/shop-data/</code> 下的静态 JSON，可直接改写为任意返回同类指标结构的数据源（跨域地址需服务端允许 CORS）。
+      默认 8 个网点分别演示：正常成功、静态 JSON、HTTP 503 后重试成功、HTTP 404、非 JSON 响应、网络连接失败、超过 8 秒超时、慢但成功。
+    </p>
+  </details>
+
+  <section class="panel">
+    <h2 class="section-title">网点指标卡片 <small>每个网点独立请求，成功后才渲染指标</small></h2>
+    <div id="cardGrid" class="card-grid"></div>
+  </section>
+
+  <section class="panel">
+    <h2 class="section-title">采集结局列表 <small>与上方卡片来自同一份采集状态，始终同步</small></h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>网点</th>
+            <th>结局</th>
+            <th>数据源地址</th>
+            <th>耗时</th>
+            <th>原因 / 说明</th>
+          </tr>
+        </thead>
+        <tbody id="outcomeBody"></tbody>
+      </table>
+    </div>
+  </section>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var TIMEOUT_MS = 8000;
+  var METRIC_DEFS = [
+    { key: "visits", label: "访问", kind: "int" },
+    { key: "exposure", label: "曝光", kind: "int" },
+    { key: "views", label: "浏览", kind: "int" },
+    { key: "paidOrders", label: "支付", kind: "int" },
+    { key: "amount", label: "金额", kind: "money" },
+    { key: "refunds", label: "退款", kind: "int" }
+  ];
+  var STATUS_META = {
+    idle:    { icon: "⚪", label: "待采集" },
+    running: { icon: "⏳", label: "采集中" },
+    success: { icon: "✅", label: "成功" },
+    error:   { icon: "❌", label: "失败" },
+    timeout: { icon: "⏰", label: "超时" }
+  };
+
+  // 每个网点都有独立、可编辑的数据源地址。
+  // shop-6 指向一个未监听的本地端口，用于演示网络层失败：
+  // 请求直接连接被拒绝，结局记为“失败”，但不中断其他网点。
+  var MOCK_ORIGIN = "http://127.0.0.1:8787";
+  var SHOPS = [
+    { id: "shop-1", name: "杭州总店",     url: "/api/metrics/shop-1" },
+    { id: "shop-2", name: "义乌小商品城店", url: "/mock/shop-data/shop-2.json" },
+    { id: "shop-3", name: "广州分店",     url: "/api/flaky/shop-3" },
+    { id: "shop-4", name: "成都分店",     url: "/api/notfound/shop-4" },
+    { id: "shop-5", name: "北京分店",     url: "/api/badjson/shop-5" },
+    { id: "shop-6", name: "深圳分店",     url: "http://127.0.0.1:8799/api/metrics/shop-6" },
+    { id: "shop-7", name: "上海分店",     url: "/api/slow/shop-7" },
+    { id: "shop-8", name: "武汉分店",     url: "/api/metrics/shop-8?delay=1200" }
+  ];
+
+  // 通过 file:// 直接双击打开时，相对地址会解析成 file: 协议而被浏览器拦截。
+  // 这里把默认相对地址补全为本地 mock 服务地址，让页面开箱可用。
+  var IS_FILE_PROTOCOL = location.protocol === "file:";
+  SHOPS.forEach(function (shop) {
+    shop.relativeUrl = shop.url;
+    if (IS_FILE_PROTOCOL && shop.url.charAt(0) === "/") {
+      shop.url = MOCK_ORIGIN + shop.url;
+    }
+    shop.defaultUrl = shop.url;
+  });
+
+  var state = {
+    batchRunning: false,
+    hasCompleted: false,
+    runId: 0,
+    run: null,
+    lastRun: null,
+    shops: new Map()
+  };
+  var inFlight = new Set();
+
+  SHOPS.forEach(function (shop) {
+    state.shops.set(shop.id, {
+      status: "idle",
+      metrics: null,
+      reason: "等待采集",
+      durationMs: null,
+      httpStatus: null
+    });
+  });
+
+  var els = {
+    startBtn: document.getElementById("startBtn"),
+    retryBtn: document.getElementById("retryBtn"),
+    resetConfigBtn: document.getElementById("resetConfigBtn"),
+    batchStatus: document.getElementById("batchStatus"),
+    summary: document.getElementById("summary"),
+    progressBar: document.getElementById("progressBar"),
+    configGrid: document.getElementById("configGrid"),
+    cardGrid: document.getElementById("cardGrid"),
+    outcomeBody: document.getElementById("outcomeBody"),
+    fileWarning: document.getElementById("fileWarning"),
+    timeoutLabel: document.getElementById("timeoutLabel")
+  };
+
+  document.body.dataset.timeoutMs = String(TIMEOUT_MS);
+  els.timeoutLabel.textContent = String(TIMEOUT_MS / 1000);
+  if (location.protocol === "file:") {
+    els.fileWarning.hidden = false;
+  }
+
+  function shopById(id) {
+    return SHOPS.find(function (shop) { return shop.id === id; });
+  }
+  function shopState(id) {
+    return state.shops.get(id);
+  }
+  function el(tag, className, text) {
+    var node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+  function formatInt(value) {
+    return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 }).format(value);
+  }
+  function formatMoney(value) {
+    return "¥" + new Intl.NumberFormat("zh-CN", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    }).format(value);
+  }
+  function formatMetric(def, value) {
+    return def.kind === "money" ? formatMoney(value) : formatInt(value);
+  }
+  function formatDuration(ms) {
+    if (ms === null || ms === undefined) return "—";
+    if (ms < 1000) return Math.round(ms) + " ms";
+    return (ms / 1000).toFixed(1) + " 秒";
+  }
+  function counts() {
+    var result = { idle: 0, running: 0, success: 0, error: 0, timeout: 0 };
+    SHOPS.forEach(function (shop) {
+      result[shopState(shop.id).status] += 1;
+    });
+    return result;
+  }
+  function runningShops() {
+    return SHOPS.filter(function (shop) {
+      return shopState(shop.id).status === "running";
+    });
+  }
+  function failedShops() {
+    return SHOPS.filter(function (shop) {
+      var st = shopState(shop.id);
+      return st.status === "error" || st.status === "timeout";
+    });
+  }
+  function statusLabel(status) {
+    var meta = STATUS_META[status] || STATUS_META.idle;
+    return meta.icon + " " + meta.label;
+  }
+
+  /* ---------- 一次性构建 DOM，后续只更新，不追加，避免重复卡片 ---------- */
+
+  function buildConfig() {
+    SHOPS.forEach(function (shop) {
+      var item = el("label", "config-item");
+      var name = el("span", "config-name", shop.name + "（" + shop.id + "）");
+      var input = document.createElement("input");
+      input.type = "url";
+      input.value = shop.url;
+      input.spellcheck = false;
+      input.autocomplete = "off";
+      input.dataset.shopId = shop.id;
+      input.setAttribute("aria-label", shop.name + " 数据源地址");
+      input.addEventListener("input", function () {
+        if (state.batchRunning) {
+          input.value = shop.url;
+          return;
+        }
+        shop.url = input.value.trim();
+        renderOutcomeRow(shop);
+      });
+      item.appendChild(name);
+      item.appendChild(input);
+      els.configGrid.appendChild(item);
+    });
+  }
+
+  function buildCards() {
+    SHOPS.forEach(function (shop) {
+      var card = el("article", "shop-card");
+      card.dataset.cardShop = shop.id;
+      card.dataset.status = "idle";
+
+      var head = el("div", "card-head");
+      var nameWrap = el("div");
+      nameWrap.appendChild(el("div", "shop-name", shop.name));
+      nameWrap.appendChild(el("div", "shop-id", shop.id));
+      var badge = el("span", "badge");
+      badge.dataset.role = "badge";
+      badge.dataset.status = "idle";
+      head.appendChild(nameWrap);
+      head.appendChild(badge);
+
+      var grid = el("div", "metric-grid");
+      METRIC_DEFS.forEach(function (def) {
+        var box = el("div", "metric");
+        var label = el("span", "m-label", def.label);
+        var value = el("span", "m-value", "—");
+        value.dataset.metric = def.key;
+        box.appendChild(label);
+        box.appendChild(value);
+        grid.appendChild(box);
+      });
+
+      var foot = el("div", "card-foot");
+      var reason = el("span", "reason", "等待采集");
+      reason.dataset.role = "card-reason";
+      var duration = el("span", "duration", "—");
+      duration.dataset.role = "card-duration";
+      foot.appendChild(reason);
+      foot.appendChild(duration);
+
+      card.appendChild(head);
+      card.appendChild(grid);
+      card.appendChild(foot);
+      els.cardGrid.appendChild(card);
+    });
+  }
+
+  function buildOutcomeRows() {
+    SHOPS.forEach(function (shop) {
+      var row = document.createElement("tr");
+      row.dataset.outcomeShop = shop.id;
+      row.dataset.status = "idle";
+
+      var nameCell = document.createElement("td");
+      nameCell.textContent = shop.name;
+      nameCell.style.fontWeight = "700";
+      nameCell.style.whiteSpace = "nowrap";
+
+      var statusCell = document.createElement("td");
+      var statusSpan = el("span", "outcome-status");
+      statusSpan.dataset.role = "outcome-status";
+      statusCell.appendChild(statusSpan);
+
+      var sourceCell = el("td", "outcome-source");
+      sourceCell.dataset.role = "outcome-source";
+      sourceCell.textContent = shop.url;
+
+      var durationCell = el("td", "outcome-duration");
+      durationCell.dataset.role = "outcome-duration";
+      durationCell.textContent = "—";
+
+      var reasonCell = el("td", "outcome-reason");
+      reasonCell.dataset.role = "outcome-reason";
+      reasonCell.textContent = "等待采集";
+
+      row.appendChild(nameCell);
+      row.appendChild(statusCell);
+      row.appendChild(sourceCell);
+      row.appendChild(durationCell);
+      row.appendChild(reasonCell);
+      els.outcomeBody.appendChild(row);
+    });
+  }
+
+  /* ---------- 渲染：卡片与结局列表共用同一份状态 ---------- */
+
+  function renderCard(shop) {
+    var st = shopState(shop.id);
+    var card = els.cardGrid.querySelector('[data-card-shop="' + shop.id + '"]');
+    if (!card) return;
+    card.dataset.status = st.status;
+    var badge = card.querySelector('[data-role="badge"]');
+    badge.dataset.status = st.status;
+    badge.textContent = statusLabel(st.status);
+    METRIC_DEFS.forEach(function (def) {
+      var node = card.querySelector('[data-metric="' + def.key + '"]');
+      if (st.status === "success" && st.metrics) {
+        node.textContent = formatMetric(def, st.metrics[def.key]);
+      } else {
+        node.textContent = "—";
+      }
+    });
+    var reason = card.querySelector('[data-role="card-reason"]');
+    reason.textContent = st.reason;
+    var duration = card.querySelector('[data-role="card-duration"]');
+    duration.textContent = formatDuration(st.durationMs);
+  }
+
+  function renderOutcomeRow(shop) {
+    var st = shopState(shop.id);
+    var row = els.outcomeBody.querySelector('[data-outcome-shop="' + shop.id + '"]');
+    if (!row) return;
+    row.dataset.status = st.status;
+    var status = row.querySelector('[data-role="outcome-status"]');
+    status.dataset.status = st.status;
+    status.textContent = statusLabel(st.status);
+    var source = row.querySelector('[data-role="outcome-source"]');
+    source.textContent = shop.url || "（未配置）";
+    var duration = row.querySelector('[data-role="outcome-duration"]');
+    duration.textContent = formatDuration(st.durationMs);
+    var reason = row.querySelector('[data-role="outcome-reason"]');
+    reason.textContent = st.reason;
+  }
+
+  function renderSummary() {
+    var c = counts();
+    var frag = document.createDocumentFragment();
+    [
+      ["success", "✅ 成功", c.success],
+      ["error", "❌ 失败", c.error],
+      ["timeout", "⏰ 超时", c.timeout],
+      ["running", "⏳ 进行中", c.running],
+      ["idle", "⚪ 待采集", c.idle]
+    ].forEach(function (item) {
+      if (item[2] === 0 && (item[0] === "running" || item[0] === "idle")) return;
+      var chip = el("span", "chip chip-" + item[0], item[1] + " " + item[2]);
+      frag.appendChild(chip);
+    });
+    els.summary.replaceChildren(frag);
+  }
+
+  function renderStatus() {
+    var text = "";
+    var running = runningShops();
+    if (state.batchRunning && state.run) {
+      var scope = (state.run.targetNames || []).join("、");
+      var runningNames = running.map(function (shop) { return shop.name; }).join("、");
+      if (state.run.mode === "retry") {
+        text = "正在重试 " + state.run.total + " 个网点（" + scope + "）· 已成功网点跳过" +
+          " · 进行中：" + runningNames +
+          " · 已完成 " + state.run.settled + "/" + state.run.total;
+      } else {
+        text = "正在采集 " + state.run.total + " 个网点 · 进行中：" + runningNames +
+          " · 已完成 " + state.run.settled + "/" + state.run.total;
+      }
+      els.batchStatus.classList.add("is-running");
+    } else if (state.hasCompleted && state.lastRun) {
+      var c = counts();
+      var run = state.lastRun;
+      var prefix = run.mode === "retry"
+        ? "重试完成 · 本次重试 " + run.total + " 个网点（成功网点未重复请求）"
+        : "采集完成 · 共 " + SHOPS.length + " 个网点";
+      text = prefix + " · 成功 " + c.success + " · 失败 " + c.error +
+        " · 超时 " + c.timeout + " · 用时 " + formatDuration(run.durationMs);
+      els.batchStatus.classList.remove("is-running");
+    } else {
+      text = "尚未开始采集";
+      els.batchStatus.classList.remove("is-running");
+    }
+    els.batchStatus.textContent = text;
+
+    var percent = 0;
+    if (state.run) {
+      percent = state.batchRunning
+        ? Math.round((state.run.settled / Math.max(1, state.run.total)) * 100)
+        : 100;
+    }
+    els.progressBar.style.width = percent + "%";
+  }
+
+  function renderControls() {
+    var running = state.batchRunning;
+    var runningList = runningShops();
+    var failed = failedShops();
+
+    els.startBtn.disabled = running;
+    els.retryBtn.disabled = running;
+    els.resetConfigBtn.disabled = running;
+    Array.prototype.forEach.call(els.configGrid.querySelectorAll("input"), function (input) {
+      input.disabled = running;
+    });
+
+    if (running && state.run && state.run.mode === "retry") {
+      els.startBtn.textContent = "⏳ 重试进行中…";
+      els.retryBtn.hidden = false;
+      els.retryBtn.textContent = "⏳ 重试范围：" + (state.run.targetNames || []).join("、") +
+        "（" + state.run.total + " 个网点，进行中 " + runningList.length + "）";
+    } else if (running) {
+      els.startBtn.textContent = "⏳ 采集中（" + runningList.length + " 个网点进行中）…";
+      els.retryBtn.hidden = true;
+    } else {
+      els.startBtn.textContent = state.hasCompleted ? "🔄 重新采集全部网点" : "▶ 开始采集";
+      if (failed.length) {
+        els.retryBtn.hidden = false;
+        els.retryBtn.textContent = "🔁 重试失败/超时网点（" + failed.length + "）";
+      } else {
+        els.retryBtn.hidden = true;
+      }
+    }
+  }
+
+  function renderAll() {
+    document.body.dataset.batchRunning = state.batchRunning ? "1" : "0";
+    document.body.dataset.hasCompleted = state.hasCompleted ? "1" : "0";
+    SHOPS.forEach(function (shop) {
+      renderCard(shop);
+      renderOutcomeRow(shop);
+    });
+    renderSummary();
+    renderStatus();
+    renderControls();
+  }
+
+  /* ---------- 采集逻辑 ---------- */
+
+  function ScenarioError(message, httpStatus) {
+    this.name = "ScenarioError";
+    this.message = message;
+    this.httpStatus = httpStatus || null;
+    if (Error.captureStackTrace) Error.captureStackTrace(this, ScenarioError);
+  }
+  ScenarioError.prototype = Object.create(Error.prototype);
+  ScenarioError.prototype.constructor = ScenarioError;
+
+  function resolveDataSource(rawUrl) {
+    if (!rawUrl) {
+      throw new ScenarioError("数据源地址为空，请在数据源配置中填写地址");
+    }
+    var url;
+    try {
+      url = new URL(rawUrl, location.href);
+    } catch (err) {
+      throw new ScenarioError("数据源地址无效：无法解析 URL");
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      throw new ScenarioError("数据源地址协议不支持（仅支持 http/https）：" + url.protocol);
+    }
+    return url.href;
+  }
+
+  function readErrorMessage(text) {
+    if (!text) return "";
+    try {
+      var body = JSON.parse(text);
+      if (body && typeof body === "object") {
+        var message = body.error || body.message || "";
+        if (message) return String(message).slice(0, 100);
+      }
+    } catch (err) { /* 非 JSON 错误体，继续截取文本 */ }
+    return String(text).trim().replace(/\s+/g, " ").slice(0, 80);
+  }
+
+  function validateMetrics(payload) {
+    var raw = payload && typeof payload === "object" ? payload.metrics : null;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new ScenarioError("数据格式无效：响应缺少 metrics 对象");
+    }
+    var bad = [];
+    METRIC_DEFS.forEach(function (def) {
+      var value = raw[def.key];
+      if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+        bad.push(def.label + "(" + def.key + ")");
+      }
+    });
+    if (bad.length) {
+      throw new ScenarioError("数据格式无效：字段 " + bad.join("、") + " 缺失或不是非负数字");
+    }
+    var metrics = {};
+    METRIC_DEFS.forEach(function (def) { metrics[def.key] = raw[def.key]; });
+    return metrics;
+  }
+
+  function humanNetworkError(err) {
+    if (err && err.name === "TypeError") {
+      return "无法连接数据源，请检查地址是否正确、mock 服务是否已启动";
+    }
+    return (err && err.message ? err.message : "未知网络异常");
+  }
+
+  async function collectShop(shop, token) {
+    if (inFlight.has(shop.id)) return;
+    inFlight.add(shop.id);
+
+    var st = shopState(shop.id);
+    st.status = "running";
+    st.metrics = null;
+    st.reason = "正在请求数据源…";
+    st.durationMs = null;
+    st.httpStatus = null;
+    renderAll();
+
+    var startedAt = performance.now();
+    var timedOut = false;
+    var controller = new AbortController();
+    var timer = setTimeout(function () {
+      timedOut = true;
+      controller.abort();
+    }, TIMEOUT_MS);
+
+    try {
+      var target = resolveDataSource(shop.url);
+      var response = await fetch(target, {
+        signal: controller.signal,
+        cache: "no-store",
+        headers: { "Accept": "application/json" }
+      });
+
+      if (!response.ok) {
+        var detailText = "";
+        try {
+          detailText = readErrorMessage(await response.text());
+        } catch (readErr) {
+          if (!timedOut) throw readErr;
+        }
+        throw new ScenarioError(
+          "HTTP " + response.status + (detailText ? "：" + detailText : "（数据源返回错误状态）"),
+          response.status
+        );
+      }
+
+      var payload;
+      try {
+        payload = await response.json();
+      } catch (parseErr) {
+        if (timedOut) throw parseErr;
+        throw new ScenarioError("数据格式无效：响应不是合法的 JSON");
+      }
+
+      var metrics = validateMetrics(payload);
+      if (token !== state.runId) return;
+
+      st.status = "success";
+      st.metrics = metrics;
+      st.httpStatus = response.status;
+      st.reason = "HTTP " + response.status + "，6 项指标校验通过";
+      st.durationMs = performance.now() - startedAt;
+    } catch (err) {
+      if (token !== state.runId) return;
+      var elapsed = performance.now() - startedAt;
+      st.metrics = null;
+      st.durationMs = elapsed;
+      if (timedOut || (err && err.name === "AbortError")) {
+        st.status = "timeout";
+        st.reason = "请求超时：超过 " + (TIMEOUT_MS / 1000) + " 秒未响应（单网点超时上限）";
+      } else if (err instanceof ScenarioError) {
+        st.status = "error";
+        st.reason = err.message;
+        st.httpStatus = err.httpStatus;
+      } else {
+        st.status = "error";
+        st.reason = "网络请求失败：" + humanNetworkError(err);
+      }
+    } finally {
+      clearTimeout(timer);
+      inFlight.delete(shop.id);
+      if (token === state.runId) {
+        if (state.run) state.run.settled += 1;
+        renderAll();
+      }
+    }
+  }
+
+  async function runBatch(targetIds, mode) {
+    // 同步守卫：重复点击在发起任何请求前就被丢弃，不会产生重复请求/卡片。
+    if (state.batchRunning || inFlight.size > 0) return;
+
+    var targets = targetIds.map(shopById).filter(Boolean);
+    if (!targets.length) return;
+
+    state.runId += 1;
+    var token = state.runId;
+    state.batchRunning = true;
+    state.run = {
+      token: token,
+      mode: mode,
+      total: targets.length,
+      targetNames: targets.map(function (shop) { return shop.name; }),
+      settled: 0,
+      startedAt: performance.now(),
+      finishedAt: null,
+      durationMs: null
+    };
+
+    targets.forEach(function (shop) {
+      var st = shopState(shop.id);
+      st.status = "running";
+      st.metrics = null;
+      st.reason = "正在请求数据源…";
+      st.durationMs = null;
+      st.httpStatus = null;
+    });
+    renderAll();
+
+    // 每个网点自行捕获错误；allSettled 保证单个失败永远不会中断整批。
+    await Promise.allSettled(targets.map(function (shop) {
+      return collectShop(shop, token);
+    }));
+
+    if (token !== state.runId) return;
+
+    state.batchRunning = false;
+    state.hasCompleted = true;
+    state.run.finishedAt = performance.now();
+    state.run.durationMs = state.run.finishedAt - state.run.startedAt;
+    state.lastRun = {
+      mode: state.run.mode,
+      total: state.run.total,
+      durationMs: state.run.durationMs
+    };
+    renderAll();
+  }
+
+  /* ---------- 事件绑定 ---------- */
+
+  els.startBtn.addEventListener("click", function () {
+    if (state.batchRunning) return;
+    runBatch(SHOPS.map(function (shop) { return shop.id; }), "full");
+  });
+
+  els.retryBtn.addEventListener("click", function () {
+    if (state.batchRunning) return;
+    var ids = failedShops().map(function (shop) { return shop.id; });
+    if (!ids.length) return;
+    runBatch(ids, "retry");
+  });
+
+  els.resetConfigBtn.addEventListener("click", function () {
+    if (state.batchRunning) return;
+    SHOPS.forEach(function (shop) {
+      shop.url = shop.defaultUrl;
+      var input = els.configGrid.querySelector('[data-shop-id="' + shop.id + '"]');
+      if (input) input.value = shop.url;
+    });
+    renderAll();
+  });
+
+  /* ---------- 初始化 ---------- */
+
+  buildConfig();
+  buildCards();
+  buildOutcomeRows();
+  renderAll();
+
+  // 只读状态快照，便于自动化检查页面内部结局（不参与业务逻辑）。
+  window.__dashboardState = function () {
+    return {
+      batchRunning: state.batchRunning,
+      hasCompleted: state.hasCompleted,
+      lastRun: state.lastRun,
+      shops: SHOPS.map(function (shop) {
+        var st = shopState(shop.id);
+        return {
+          id: shop.id,
+          name: shop.name,
+          url: shop.url,
+          status: st.status,
+          reason: st.reason,
+          durationMs: st.durationMs,
+          metrics: st.metrics ? Object.assign({}, st.metrics) : null
+        };
+      })
+    };
+  };
+})();
+</script>
+
+</body>
+</html>
