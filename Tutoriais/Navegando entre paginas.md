@@ -94,3 +94,40 @@ class QuotesSpider(scrapy.Spider):
         proxima_pag = response.urljoin(response.css('li.next > a::attr(href)').extract_first())
         yield scrapy.Request( url = proxima_pag, callback = self.parse)
 ```
+
+## Bônus: deixando a paginação auditável
+
+O `QuotesSpider` do projeto `Cloud` (`Cloud/Cloud/spiders/__init__.py`) evoluiu
+esse exemplo: além de seguir o link `next`, ele informa **o desfecho de cada
+página** e **o motivo do término** da paginação.
+
+* Cada requisição leva o número da página em `meta['page']`, começando em 1 e
+  avançando de 1 em 1 (`page + 1`).
+* Página bem-sucedida registra quantas citações foram coletadas.
+* Sem link `next` → término normal, motivo `last_page`.
+* Página com status diferente de 200 ou com exceção → a página é registrada
+  como falha (`page_failed`), nenhuma página posterior é requisitada e as
+  citações já coletadas permanecem na saída.
+* A mesma página, mesmo após retentativa, entra **uma única vez** no resumo.
+
+O resumo é produzido pelo `PageOutcomesPipeline`, habilitado em
+`Cloud/Cloud/settings.py` (`ITEM_PIPELINES` e `PAGE_OUTCOMES_FILE`), e vai para:
+
+1. o arquivo JSON indicado por `PAGE_OUTCOMES_FILE` (`page_outcomes.json` por
+   padrão; use `-s PAGE_OUTCOMES_FILE=` para desabilitar o arquivo);
+2. os logs (`Resumo da paginação` e uma linha por página);
+3. as estatísticas do Scrapy (`page_outcomes/...`).
+
+Exemplo de execução apontando para um site local de teste:
+
+```BASH
+scrapy crawl quotes -a start_url=http://127.0.0.1:8080/page/1/
+```
+
+Os testes de aceitação ficam em `Cloud/tests/test_pagination_outcomes.py` e
+cobrem paginação até a última página, falha no meio do caminho, falha logo na
+primeira página, falha de conexão e retentativa sem duplicar a página:
+
+```BASH
+python -m pytest tests   # executado de dentro de Cloud/
+```

@@ -67,6 +67,16 @@ ROBOTSTXT_OBEY = True
 #ITEM_PIPELINES = {
 #    'Cloud.pipelines.CloudPipeline': 300,
 #}
+ITEM_PIPELINES = {
+    'Cloud.pipelines.CloudPipeline': 300,
+    # Resume o desfecho de cada página e o motivo do término da paginação.
+    'Cloud.pipelines.PageOutcomesPipeline': 800,
+}
+
+# Resumo verificável da paginação (um desfecho por página + motivo do
+# término). Deixe vazio para não gravar arquivo; o resumo continua nos logs
+# e nas estatísticas (page_outcomes/*).
+PAGE_OUTCOMES_FILE = 'page_outcomes.json'
 
 # Enable and configure the AutoThrottle extension (disabled by default)
 # See https://doc.scrapy.org/en/latest/topics/autothrottle.html

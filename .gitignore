@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+# Resumo de paginação gerado pelas execuções do spider
+page_outcomes.json
+*.jsonl
