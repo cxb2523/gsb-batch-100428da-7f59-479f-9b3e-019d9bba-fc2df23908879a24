@@ -1,0 +1,104 @@
+<div class="study-block">
+  <div class="results-row study-row">
+    <div class="results-check">
+      <input type="checkbox" class="results-checkbox" name="select-all-accession-number"
+        data-patient-id="{{ doc['groupValue'] }}"
+        data-accession-number="{{ study['AccessionNumber'] }}"
+        aria-label="Select study {{ study['AccessionNumber'] }}">
+    </div>
+    <div class="results-body study-row-main">
+      <span class="study-accession-group">
+        <span class="study-accession">{{ study['AccessionNumber'] }}</span>
+        <button type="button" class="copy-accession-btn" data-accession-number="{{ study['AccessionNumber'] }}"
+          aria-label="Copy accession number {{ study['AccessionNumber'] }}" title="Copy accession number">
+          <span class="bi bi-clipboard-plus copy-accession-icon" aria-hidden="true"></span>
+        </button>
+      </span>
+      {% if study.get('StudyDescription') %}
+      <span class="study-row-description" title="{{ study['StudyDescription'] | fix_mojibake }}">{{ study['StudyDescription'] | fix_mojibake }}</span>
+      {% endif %}
+      <span class="study-inline-meta">
+        <span class="study-meta-item">
+          <span class="study-meta-label">Date</span>
+          <span class="study-meta-value">{{ study['StudyDate'] | to_date }}</span>
+        </span>
+        <span class="study-meta-item">
+          <span class="study-meta-label">Age</span>
+          <span class="study-meta-value">{{ study['PatientAge'] }}</span>
+        </span>
+      </span>
+    </div>
+    <div class="results-meta study-row-actions">
+      <a class="view-images-link" target="_blank" rel="noopener"
+        href="{{ sectra_uniview_url(study['PatientID'], study['AccessionNumber']) }}">
+        View images <span class="oi oi-external-link small" aria-hidden="true"></span>
+      </a>
+      <button type="button" class="results-icon-btn exam-toggle"
+        data-toggle="collapse" data-target="#study-{{ study['AccessionNumber'] }}"
+        aria-label="Expand study" aria-expanded="false">
+        <span class="bi bi-chevron-down exam-chevron" aria-hidden="true"></span>
+      </button>
+    </div>
+  </div>
+  <div class="study-details collapse" id="study-{{ study['AccessionNumber'] }}">
+    {# Series tables and reports can be very large. Template contents are parsed
+       but stay outside the active document until this study is expanded. #}
+    <template class="deferred-collapse-content">
+    <div class="study-panels">
+      <div class="study-series-panel">
+        <div class="study-panel-heading">Series</div>
+        <div class="study-series-table-wrap">
+          <table class="series-table" data-patient-id="{{ doc['groupValue'] }}"
+            data-accession-number="{{ study['AccessionNumber'] }}">
+            <thead>
+              <tr>
+                <th class="col-check" scope="col"></th>
+                <th class="col-mod" scope="col">Mod.</th>
+                <th class="col-num" scope="col">#</th>
+                <th class="col-desc" scope="col">Description</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for series in study['_childDocuments_'] %}
+              {% set d = series.update({
+                'series_int': series.get('SeriesNumber') | int,
+                'instance_int': series.get('InstanceNumber', 0) | int
+              }) %}
+              {% endfor %}
+              {% for child in study['_childDocuments_'] | sort(attribute='instance_int') | sort(attribute='series_int') %}
+              <tr>
+                <td class="col-check">
+                  <input type="checkbox" class="results-checkbox series-checkbox" name="series"
+                    data-patient-id="{{ doc['groupValue'] }}"
+                    data-patient-birthdate="{{ doc.doclist.docs[0]['PatientBirthDate'] }}"
+                    {% if child.StudyInstanceUID %}
+                    data-study-id="{{ child['StudyInstanceUID'].strip(' \t\r\0') }}"
+                    {% else %}
+                    data-study-id="{{ study['StudyInstanceUID'].strip(' \t\r\0') }}"
+                    {% endif %}
+                    data-series-id="{{ child['SeriesInstanceUID'].strip(' \t\r\0') }}"
+                    data-sop-instance-uid="{{ child.get('SOPInstanceUID', '') }}"
+                    data-instance-number="{{ child.get('InstanceNumber', '') }}"
+                    data-accession-number="{{ study['AccessionNumber'] }}"
+                    data-series-number="{{ child['SeriesNumber'] }}"
+                    data-study-description="{{ study['StudyDescription'] | fix_mojibake }}"
+                    data-study-date="{{ study['StudyDate'] }}"
+                    data-series-description="{{ child['SeriesDescription'] | fix_mojibake }}">
+                </td>
+                <td class="col-mod">{{ child['Modality'] }}</td>
+                <td class="col-num" title="Series {{ child['SeriesNumber'] }}{% if child.get('InstanceNumber') %}, Instance {{ child['InstanceNumber'] }}{% endif %}">{% if child.get('InstanceNumber') %}{{ child['SeriesNumber'] | series_num_short }}.{{ child['InstanceNumber'] }}{% else %}{{ child['SeriesNumber'] | series_num_short }}{% endif %}</td>
+                <td class="col-desc" title="{{ child['SeriesDescription'] | fix_mojibake }}">{{ child['SeriesDescription'] | fix_mojibake }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="study-report-panel">
+        <div class="study-panel-heading">Report</div>
+        <div id="{{ study['AccessionNumber'] }}-report" class="study-report-body">{{ study['RisReport'] | fix_mojibake }}</div>
+      </div>
+    </div>
+    </template>
+  </div>
+</div>

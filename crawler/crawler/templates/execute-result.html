@@ -1,0 +1,13 @@
+{% if stdout %}
+<h4 class="crawler-output-heading">Standard output</h4>
+<div class="crawler-output-panel">
+  <pre class="crawler-output-pre mb-0">{{ stdout }}</pre>
+</div>
+{% endif %}
+
+{% if stderr %}
+<h4 class="crawler-output-heading mt-3">Standard error</h4>
+<div class="crawler-output-panel">
+  <pre class="crawler-output-pre mb-0">{{ stderr }}</pre>
+</div>
+{% endif %}

@@ -1,0 +1,33 @@
+{
+    "description": "A unified search application to link PACS exams with the RIS reports.",
+    "license": "GPL-3.0",
+    "title": "PACS-RIS Crawler v1.0.2",
+    "version": "v1.0.0",
+    "upload_type": "software",
+    "publication_date": "2019-12-16",
+    "creators": [
+        {
+            "affiliation": "Universit\u00e4tsspital Basel",
+            "name": "Joshy Cyriac"
+        },
+        {
+            "name": "Ivan Nesic",
+            "affiliation": "Universit\u00e4tsspital Basel"
+        },
+        {
+            "name": "Manuela Moor",
+            "affiliation": "Universit\u00e4tsspital Basel"
+        }
+    ],
+    "access_right": "open",
+    "related_identifiers": [
+        {
+            "identifier": "https://doi.org/10.1007/s10278-026-02130-8",
+            "relation": "isDocumentedBy",
+            "resource_type": "publication-article"
+        }
+    ],
+    "references": [
+        "Cyriac, J., Indrakanti, A.K., Wasserthal, J. et al. Technical Developments in Radiology: Enhancing Research Workflows with PACScrawler. J Digit Imaging. Inform. med. (2026). https://doi.org/10.1007/s10278-026-02130-8"
+    ]
+}

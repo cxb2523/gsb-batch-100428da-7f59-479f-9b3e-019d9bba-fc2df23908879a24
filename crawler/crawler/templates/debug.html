@@ -1,0 +1,13 @@
+{% extends "page.html" %}
+
+{% block title %}Crawler Debug{% endblock %}
+
+{% block body_content %}
+<div class="container-fluid px-4 pb-4">
+  <div class="pacs-main mx-auto">
+    {% include 'partials/navbar.html' %}
+    {% include 'partials/execute.html' %}
+    <div id="result-target" class="pacs-card p-3 mt-3"></div>
+  </div>
+</div>
+{% endblock %}

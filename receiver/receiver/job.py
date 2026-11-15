@@ -1,0 +1,223 @@
+import logging
+import os
+import shlex
+
+from redis import Redis
+from rq import Queue
+
+from receiver.config import dcmtk_config, new_pacs, transfer_pacs
+from receiver.executor import run, run_many
+
+logger = logging.getLogger("job")
+
+
+def transfer_new_pacs_command(dcmtk_config, target, study_uid, series_uid, sop_uid=None):
+    """Constructs the first part of the transfer command to a PACS node."""
+    level = "IMAGE" if sop_uid else "SERIES"
+    return (
+        dcmtk_config.dcmtk_bin
+        + f"/movescu -v -S -pdu 131072 -k QueryRetrieveLevel={level} "
+        + transfer_pacs()
+        + _transfer_new(target, study_uid, series_uid, sop_uid)
+    )
+
+
+def _transfer_new(target, study_uid, series_uid, sop_uid=None):
+    cmd = " -aem {} -k StudyInstanceUID={} -k SeriesInstanceUID={}".format(
+        target, study_uid, series_uid
+    )
+    if sop_uid:
+        cmd += f" -k SOPInstanceUID={sop_uid}"
+    return cmd
+
+
+def image_subdir(entry):
+    """Folder name under accession: series, or series_instance for echo clips."""
+    series_number = str(entry.get("series_number") or "0")
+    instance_number = str(entry.get("instance_number") or "").strip()
+    sop = str(entry.get("sop_instance_uid") or "").strip()
+    if instance_number:
+        return f"{series_number}_{instance_number}"
+    if sop:
+        return f"{series_number}_{sop.split('.')[-1]}"
+    return series_number
+
+
+def transfer_series(config, target, series_list):
+    dcmtk = dcmtk_config(config)
+    for entry in series_list:
+        study_uid = entry["study_uid"]
+        series_uid = entry["series_uid"]
+        sop_uid = entry.get("sop_instance_uid") or None
+        command = transfer_new_pacs_command(dcmtk, target, study_uid, series_uid, sop_uid)
+        args = shlex.split(command)
+        queue_transfer(args)
+        logger.debug("Running transfer command %s", args)
+    return len(series_list), command
+
+
+def base_command(dcmtk_config, pacs_config):
+    """Constructs the first part of a dcmtk command."""
+    return (
+        dcmtk_config.dcmtk_bin
+        + "/movescu -S -pdu 131072 -k QueryRetrieveLevel=SERIES "
+        + "-aet {} -aec {} {} {} +P {}".format(
+            pacs_config.ae_title,
+            pacs_config.ae_called,
+            pacs_config.peer_address,
+            pacs_config.peer_port,
+            pacs_config.incoming_port,
+        )
+    )
+
+
+def base_command_new_pacs(dcmtk_config):
+    """Constructs the first part of a dcmtk command."""
+    return (
+        dcmtk_config.dcmtk_bin
+        + "/movescu -S -pdu 131072 +xv -k QueryRetrieveLevel=SERIES "
+        + new_pacs()
+    )
+
+def download_series_debug(config, study_uid, series_uid,  dir_name):
+    output_dir = config["IMAGE_FOLDER"]
+    dcmtk = dcmtk_config(config)
+    image_folder = os.path.join(output_dir, dir_name)
+    if not os.path.exists(image_folder):
+        os.makedirs(image_folder, exist_ok=True)
+    command = (
+            base_command_new_pacs(dcmtk)
+            + " --output-directory "
+            + image_folder
+            + " -k StudyInstanceUID="
+            + study_uid
+            + " -k SeriesInstanceUID="
+            + series_uid
+        )
+    args = shlex.split(command)
+    return args
+
+
+def download_series(config, series_list, dir_name, image_type, queue_prio):
+    """Download the series. The folder structure is as follows:
+    MAIN_DOWNLOAD_DIR / USER_DEFINED / PATIENTID / ACCESSION_NUMBER / SERIES_NUMER
+    """
+    output_dir = config["IMAGE_FOLDER"]
+    dcmtk = dcmtk_config(config)
+    for entry in series_list:
+        image_folder = _create_image_dir(output_dir, entry, dir_name)
+        study_uid = entry["study_uid"]
+        accession_number = entry["accession_number"]
+        series_uid = entry["series_uid"]
+        sop_uid = (entry.get("sop_instance_uid") or "").strip()
+        if not all([study_uid, series_uid, accession_number]):
+            print("Error missing either study_uid, series_uid or accession number")
+            print("study_uid:", study_uid)
+            print("series_uid:", series_uid)
+            print("accession number:", accession_number)
+            continue
+        command = (
+            base_command_new_pacs(dcmtk)
+            + " --output-directory "
+            + image_folder
+            + " -k StudyInstanceUID="
+            + study_uid
+            + " -k SeriesInstanceUID="
+            + series_uid
+        )
+        if sop_uid:
+            command = command.replace(
+                "QueryRetrieveLevel=SERIES", "QueryRetrieveLevel=IMAGE"
+            )
+            command += " -k SOPInstanceUID=" + sop_uid
+        args = shlex.split(command)
+        queue(
+            args,
+            config,
+            image_folder,
+            image_type,
+            queue_prio,
+            accession_number,
+            series_uid,
+        )
+        logger.debug("Running download command %s", args)
+        print("Running download command %s", args)
+    return len(series_list)
+
+
+def create_nifti_cmd(image_folder):
+    nifti_output_dir = os.path.join(image_folder, "nifti")
+    os.makedirs(nifti_output_dir, exist_ok=True)
+    print(
+        "/usr/local/bin/dcm2niix/dcm2niix -f %i_%g_%s -z y -o "
+        + nifti_output_dir
+        + " "
+        + image_folder
+    )
+    return shlex.split(
+        "/usr/local/bin/dcm2niix -f %i_%g_%s_%z -z y -o "
+        + nifti_output_dir
+        + " "
+        + image_folder
+    )
+
+
+def delete_dicom_cmd(image_folder):
+    for f in os.scandir(image_folder):
+        if f.is_file():
+            os.remove(f)
+
+
+def _command_meta(cmd):
+    if isinstance(cmd, (list, tuple)):
+        return {"command": shlex.join(str(x) for x in cmd)}
+    return {"command": str(cmd)}
+
+
+def queue_transfer(cmd):
+    redis_conn = Redis()
+    q = Queue(name="transfer", connection=redis_conn)
+    q.enqueue(run, cmd, job_timeout="12m", meta=_command_meta(cmd))
+    return
+
+
+def queue(
+    cmd, config, image_folder, image_type, queue_prio, accession_number, series_uid
+):
+    redis_conn = Redis()
+    if queue_prio == "queue-high":
+        q = Queue(name="high", connection=redis_conn)
+    else:
+        q = Queue(name="medium", connection=redis_conn)
+    download_job = q.enqueue(
+        run,
+        args=(cmd,),
+        description=f"AccessionNr: {accession_number} / SeriesInstanceUID: {series_uid}",
+        meta=_command_meta(cmd),
+    )
+    if image_type == "nifti":
+        nifti_job = q.enqueue(
+            run, create_nifti_cmd(image_folder), depends_on=download_job
+        )
+        delete_dicom_job = q.enqueue(
+            delete_dicom_cmd, image_folder, depends_on=nifti_job
+        )
+        return delete_dicom_job
+    if image_type == "anon-dicom":
+        dicom_anonymize_job = q.enqueue(
+            run_many, config, image_folder, depends_on=download_job
+        )
+        return dicom_anonymize_job
+    return download_job
+
+
+def _create_image_dir(output_dir, entry, dir_name):
+    patient_id = entry["patient_id"]
+    accession_number = str(entry["accession_number"])
+    series_number = image_subdir(entry)
+    image_folder = os.path.join(
+        output_dir, dir_name, patient_id, accession_number, series_number
+    )
+    if not os.path.exists(image_folder):
+        os.makedirs(image_folder, exist_ok=True)
+    return image_folder

@@ -1,0 +1,24 @@
+<nav class="navbar navbar-expand-lg app-navbar shadow-sm mb-3">
+  <div class="container-fluid d-flex justify-content-between align-items-center">
+    <div class="d-flex align-items-center flex-wrap">
+      <a class="navbar-brand blog-header-logo mb-0" href="/">PACS / RIS Crawler</a>
+      {% if version %}
+      <small class="text-muted-brand ml-3 d-none d-md-inline">{{ version }}</small>
+      {% endif %}
+      {% if indexed_start_date %}
+      <small class="text-muted-brand ml-3 d-none d-lg-inline">
+        Indexed: {{ indexed_start_date | int | to_date }} – {{ indexed_end_date | int | to_date }}
+      </small>
+      {% endif %}
+    </div>
+    <div class="d-flex align-items-center">
+      <button type="button" class="btn btn-sm theme-toggle-btn mr-2" data-toggle="modal" data-target="#citeModal">
+        Cite
+      </button>
+      <button type="button" class="btn btn-sm theme-toggle-btn mr-3" data-theme-toggle aria-label="Switch theme">
+        <i class="bi bi-moon-stars theme-toggle-icon" aria-hidden="true"></i>
+      </button>
+      <img class="navbar-logo" src="{{ url_for('static', filename='images/logo.svg') }}" alt="Universitätsspital Basel">
+    </div>
+  </div>
+</nav>

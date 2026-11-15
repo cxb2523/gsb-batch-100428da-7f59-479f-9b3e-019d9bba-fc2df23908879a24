@@ -1,0 +1,638 @@
+$(function () {
+  console.log("ready!");
+
+  $('[data-toggle="tooltip"]').tooltip();
+
+  var $moreSearchDetails = $('#more-search-details');
+  var $moreSearchDetailsToggle = $('#more-search-details-toggle');
+  var $moreSearchDetailsToggleText = $('#more-search-details-toggle-text');
+  var $moreSearchDetailsToggleIcon = $('#more-search-details-toggle-icon');
+  function updateMoreSearchDetailsToggle(expanded) {
+    $moreSearchDetailsToggleText.text(
+      expanded ? 'Hide filter options' : 'Show more filter options'
+    );
+    $moreSearchDetailsToggleIcon
+      .toggleClass('bi-chevron-down', !expanded)
+      .toggleClass('bi-chevron-up', expanded);
+    $moreSearchDetailsToggle.attr('aria-expanded', expanded ? 'true' : 'false');
+  }
+  $moreSearchDetails.on('show.bs.collapse', function () {
+    updateMoreSearchDetailsToggle(true);
+  });
+  $moreSearchDetails.on('hide.bs.collapse', function () {
+    updateMoreSearchDetailsToggle(false);
+  });
+
+  var startDatePicker = $('#start-date-picker').pikaday({
+    format: 'DD.MM.YYYY',
+    firstDay: 1,
+    minDate: new Date(2005, 0, 1),
+    maxDate: new Date(),
+    yearRange: [2005, 2019]
+  });
+
+  var endDatePicker = $('#end-date-picker').pikaday({
+    format: 'DD.MM.YYYY',
+    firstDay: 1,
+    minDate: new Date(2005, 0, 1),
+    maxDate: new Date(),
+    yearRange: [2005, 2019]
+  });
+
+  $('#llmSubmit').on('click', function () {
+    const userText = $('#modalTextField').val().trim();
+    if (!userText) { $('#modalTextField').focus(); return; }
+  
+    $('#loading').removeClass('d-none');
+    $(this).prop('disabled', true);
+  
+    $.ajax({
+      method: 'POST',
+      url:  '/llm_query',
+      data: JSON.stringify({ query: userText }),
+      contentType: 'application/json',
+      dataType: 'json',         // expect JSON back
+      headers: {                // CSRF if you use Flask-WTF
+        'X-CSRFToken': $('meta[name=csrf-token]').attr('content')
+      }
+    }).done(res => {
+        if (res.studyDescriptionQuery) $('#studydescription-input').val(res.studyDescriptionQuery);
+        if (res.regexQuery)      $('#search-input').val(res.regexQuery);
+        $('#textInputModal').modal('hide');
+    }).fail(() => {
+        noty({ text:'LLM processing failed',
+               type:'error', layout:'centerRight', timeout:3000 });
+    }).always(() => {
+        $('#loading').addClass('d-none');
+        $('#llmSubmit').prop('disabled', false);
+    });
+  });
+  
+
+  var getCheckedData = function () {
+    return $('input:checked[name=series]')
+      .map(function () {
+        var patient_id = $(this).attr('data-patient-id');
+        var patient_birth_date = $(this).attr('data-patient-birthdate');
+        var study_uid = $(this).attr('data-study-id');
+        var study_description = $(this).attr('data-study-description')
+        var study_date = $(this).attr('data-study-date');
+        var series_uid = $(this).attr('data-series-id');
+        var sop_instance_uid = $(this).attr('data-sop-instance-uid');
+        var accession_number = $(this).attr('data-accession-number');
+        var series_number = $(this).attr('data-series-number');
+        var instance_number = $(this).attr('data-instance-number');
+        var series_description = $(this).attr('data-series-description');
+        result = {
+          "patient_id": patient_id,
+          "patient_birth_date": patient_birth_date,
+          "study_uid": study_uid,
+          "study_description": study_description,
+          "study_date": study_date,
+          "series_uid": series_uid,
+          "sop_instance_uid": sop_instance_uid,
+          "accession_number": accession_number,
+          "series_number": series_number,
+          "instance_number": instance_number,
+          "series_description": series_description
+        };
+        return result;
+      })
+      .get();
+  };
+
+  var getUniqueAccessionNumbers = function (data) {
+    var set = new Set();
+    for (i = 0; i < data.length; ++i) {
+      set.add(data[i].accession_number);
+    };
+    return set;
+  };
+
+  $(document).on('click', '#expand-all', function (e) {
+    e.preventDefault();
+    // Showing patients hydrates their studies synchronously; query for study
+    // details afterwards so Expand all retains its previous behaviour.
+    $('.patient-studies').collapse('show');
+    $('.study-details').collapse('show');
+  });
+
+  $(document).on('click', '#collapse-all', function (e) {
+    e.preventDefault();
+    $('.study-details').collapse('hide');
+    $('.patient-studies').collapse('hide');
+  });
+
+
+  $(document).on('click', '.page-link', function (e) {
+    e.preventDefault();
+    if (window.kev && window.kev.isOpen()) { window.kev.page(this); return; }
+    page = $(this).data('page');
+    offset = $(this).data('offset');
+    $('input[name="offset"]').val(offset);
+    $('input[name="page"]').val(page);
+    $('#search-form').submit();
+  });
+
+
+  function studiesResultCount() {
+    var count = $('#studies_result').data('count');
+    if (count !== undefined) {
+      return parseInt(count, 10);
+    }
+    return parseInt($('#studies_result').text().replace(/'/g, ''), 10);
+  }
+
+  $("#export").on('click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (studiesResultCount() > 10000) {
+      noty({
+        text: 'Too many results to export (Studies > 10000)',
+        layout: 'centerRight',
+        timeout: '3000',
+        closeWith: ['click', 'hover'],
+        type: 'error'
+      });
+      return
+    }
+    $('#loading').removeClass('d-none');
+    q = $('#search-form').serialize();
+    var xhr = new XMLHttpRequest();
+    var kevExport = window.kev && window.kev.exportData();
+    xhr.open('POST', '/export', true);
+    xhr.setRequestHeader("Content-type", kevExport ? "application/json" : "application/x-www-form-urlencoded");
+    if (kevExport) q = JSON.stringify(kevExport);
+    xhr.responseType = 'blob';
+    xhr.onload = function (e) {
+      if (this.status == 200) {
+        $('#loading').addClass('d-none');
+        var blob = this.response;
+        saveAs(blob, 'download.xlsx');
+      } else if (this.status == 204) {
+        $('#loading').addClass('d-none');
+        console.log(" got empty response")
+        noty({
+          text: 'No results to export',
+          layout: 'center',
+          timeout: '3000',
+          closeWith: ['click', 'hover'],
+          type: 'error'
+        });
+      } else if (this.status >= 400 || this.status == 500) {
+        $('#loading').addClass('d-none');
+      }
+    };
+    xhr.send(q);
+
+    return false;
+  });
+  
+  
+  $("#export_anon").on('click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (studiesResultCount() > 10000) {
+      noty({
+        text: 'Too many results to export (Studies > 10000)',
+        layout: 'centerRight',
+        timeout: '3000',
+        closeWith: ['click', 'hover'],
+        type: 'error'
+      });
+      return
+    }
+    $('#loading').removeClass('d-none');
+    q = $('#search-form').serialize();
+    var xhr = new XMLHttpRequest();
+    var kevExport = window.kev && window.kev.exportData();
+    xhr.open('POST', '/export_anon', true);
+    xhr.setRequestHeader("Content-type", kevExport ? "application/json" : "application/x-www-form-urlencoded");
+    if (kevExport) q = JSON.stringify(kevExport);
+    xhr.responseType = 'blob';
+    xhr.onload = function (e) {
+      if (this.status == 200) {
+        $('#loading').addClass('d-none');
+        var blob = this.response;
+        saveAs(blob, 'download.xlsx');
+      } else if (this.status == 204) {
+        $('#loading').addClass('d-none');
+        console.log(" got empty response")
+        noty({
+          text: 'No results to export',
+          layout: 'center',
+          timeout: '3000',
+          closeWith: ['click', 'hover'],
+          type: 'error'
+        });
+      } else if (this.status >= 400 || this.status == 500) {
+        $('#loading').addClass('d-none');
+      }
+    };
+    xhr.send(q);
+
+    return false;
+  });
+  
+
+  $("#download-ris-reports").on('click', function (e) {
+    e.preventDefault();
+    var data = getCheckedData();
+    var aNum_set = getUniqueAccessionNumbers(data);
+    var zip = new JSZip();
+    for (var it = aNum_set.values(), item = null; item = it.next().value;) {
+      name = item + '-report';
+      text = document.getElementById(name).innerText;
+      zip.file(name + '.txt', text);
+    }
+    zip.generateAsync({ type: "blob" })
+      .then(function (content) {
+        saveAs(content, "reports.zip");
+      });
+  });
+
+  $('#transfer-button').on('click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    var target = $("input[type='radio'][name='target']:checked").val();
+    var selection = $("input[name='transfer-selection']:checked", "#transfer-form").val();
+    console.log(selection);
+    if ("all" === selection) {
+      $('#loading').removeClass('d-none');
+      q = $('#search-form').serialize() + "&target=" + target + "&selection=" + selection;
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', '/transfer-all', true);
+      xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
+      xhr.responseType = 'json';
+      xhr.onload = function (e) {
+        if (this.status == 200) {
+          $('#loading').addClass('d-none');
+          var data = this.response;
+          console.log(data)
+          noty({
+            text: 'Successfully added ' + data.series_length + ' series',
+            layout: 'centerRight',
+            timeout: '3000',
+            closeWith: ['click', 'hover'],
+            type: 'success'
+          });
+        } else if (this.status >= 400 || this.status == 500) {
+          $('#loading').addClass('d-none');
+          noty({
+            text: 'Can\'t get connection to RECEIVER. Download failed!',
+            layout: 'centerRight',
+            timeout: '3000',
+            closeWith: ['click', 'hover'],
+            type: 'error'
+          });
+        }
+      };
+      xhr.send(q);
+    } else {
+      var checkedData = getCheckedData();
+      var data = {
+        'data': checkedData,
+        'target': target
+      }
+      $.ajax({
+        type: 'POST',
+        url: 'transfer',
+        data: JSON.stringify(data),
+        dataType: 'json'
+      }).done(function (data) {
+        noty({
+          text: 'Successfully added ' + data.series_length + ' studies to transfer',
+          layout: 'centerRight',
+          timeout: '3000',
+          closeWith: ['click', 'hover'],
+          type: 'success'
+        });
+      }).fail(function (error) {
+        console.log(error);
+        console.error("Post failed");
+        noty({
+          text: 'Can\'t get connection to RECEIVER',
+          layout: 'centerRight',
+          timeout: '3000',
+          closeWith: ['click', 'hover'],
+          type: 'error'
+        });
+      });
+    }
+  });
+
+  $('#download-button').on('click', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    var dirName = $('#download-dir').val();
+    var regex = /^[a-zA-Z0-9_-]+$/
+    var selection = $("input[name='download-selection']:checked", "#download-form").val();
+    var imageType = $("input[name='download-type']:checked", "#download-form").val();
+    var queue_prio = $("input[name='queue']:checked", "#download-form").val();
+    if (!dirName) {
+      setError('Please put in folder name, allowed characters are: a-Z, 0-9,_,-');
+      return
+    } else if (dirName.indexOf(' ') >= 0) {
+      setError('No spaces are allowed');
+      return
+    } else if (!regex.test(dirName)) {
+      setError('Allowed characters are: a-Z,0-9,_,-');
+      return
+    } else {
+      clearError();
+    }
+
+    if ("all" === selection) {
+      $('#loading').removeClass('d-none');
+      q = $('#search-form').serialize() + "&download-dir=" + dirName + "&selection=" + selection + "&imageType=" + imageType + "&queue_prio=" + queue_prio;
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', '/download-all', true);
+      xhr.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
+      xhr.responseType = 'json';
+      xhr.onload = function (e) {
+        if (this.status == 200) {
+          $('#loading').addClass('d-none');
+          var data = this.response;
+          noty({
+            text: 'Successfully added ' + data.series_length + ' series',
+            layout: 'centerRight',
+            timeout: '3000',
+            closeWith: ['click', 'hover'],
+            type: 'success'
+          });
+        } else if (this.status >= 400 || this.status == 500) {
+          $('#loading').addClass('d-none');
+          noty({
+            text: 'Can\'t get connection to RECEIVER. Download failed!',
+            layout: 'centerRight',
+            timeout: '3000',
+            closeWith: ['click', 'hover'],
+            type: 'error'
+          });
+        }
+      };
+      xhr.send(q);
+    } else { // selected series only
+      var checkedData = getCheckedData();
+      var data = {
+        'data': checkedData,
+        'dir': dirName,
+        'queue_prio': queue_prio,
+        'image_type': imageType
+      }
+      $.ajax({
+        type: 'POST',
+        url: 'download',
+        data: JSON.stringify(data),
+        dataType: 'json'
+      }).done(function (data) {
+        noty({
+          text: 'Successfully added ' + data.series_length + ' series',
+          layout: 'centerRight',
+          timeout: '3000',
+          closeWith: ['click', 'hover'],
+          type: 'success'
+        });
+      }).fail(function (error) {
+        console.log(error);
+        console.error("Post failed");
+        noty({
+          text: 'Can\'t get connection to RECEIVER. Download failed!',
+          layout: 'centerRight',
+          timeout: '3000',
+          closeWith: ['click', 'hover'],
+          type: 'error'
+        });
+      });
+    }
+  });
+
+
+  if ('download-status' == $('body').data('page')) {
+    $.get('/tasks/data',
+      function (data) {
+        $('#container').html(data);
+        $(document).on('click', 'input[name=select-all-resend]', function (e) {
+          var value = $(this).prop("checked")
+          $("input:checkbox").prop('checked', value);
+        });
+        $(document).on('click', '#resend', function (e) {
+          var checkedData = getCheckedData();
+          var dir_name_element = $('input:checked[name=series]')
+          var dir_name = $(dir_name_element[0]).data('dir');
+          var data = {
+            'data': checkedData,
+            'dir': dir_name
+          }
+          $.ajax({
+            type: 'POST',
+            url: 'download',
+            data: JSON.stringify(data),
+            dataType: 'json'
+          }).done(function (data) {
+            noty({
+              text: 'Successfully added ' + data.series_length + ' series',
+              layout: 'centerRight',
+              timeout: '3000',
+              closeWith: ['click', 'hover'],
+              type: 'success'
+            });
+          }).fail(function (error) {
+            console.log(error);
+            console.error("Post failed");
+          });
+        });
+      });
+  }
+
+  setError = function (text) {
+    $('#download-dir').addClass('is-invalid');
+    $('#download-error-text').text(text);
+    $('input[name=download-dir]').addClass("invalid");
+  }
+
+  clearError = function () {
+    $('#download-dir').removeClass('is-invalid');
+    $('#download-error-text').text('');
+    $('input[name=download-dir]').removeClass("form-control-danger");
+  }
+
+  var $resultsPanel = $('#table-view');
+
+  $resultsPanel.on('click', 'input[name="select-all-accession-number"]', function (e) {
+    var value = $(this).prop("checked")
+    $(this).closest('.study-block').find('td input:checkbox').prop('checked', value);
+  });
+
+  $resultsPanel.on('click', 'input[name="select-all-patient"]', function (e) {
+    var value = $(this).prop("checked")
+    $(this).closest('.patient-entry').find('input:checkbox').prop('checked', value);
+  });
+
+  $resultsPanel.on('click', 'input[name="select-all-page"]', function (e) {
+    var value = $(this).prop("checked")
+    $("input:checkbox").not('.modality').prop('checked', value);
+  });
+
+  $resultsPanel.on('click', '.patient-row', function (e) {
+    if ($(e.target).closest('input, a, button').length) return;
+    $(this).closest('.patient-entry').find('.patient-studies').collapse('toggle');
+  });
+
+  function hydrateCollapse(element) {
+    var template = $(element).children('template.deferred-collapse-content')[0];
+    if (!template) return;
+
+    element.appendChild(template.content);
+    template.remove();
+  }
+
+  function updatePatientToggle($patient, expanded) {
+    $patient.find('.patient-row-toggle, .patient-row .results-icon-btn')
+      .attr('aria-expanded', expanded ? 'true' : 'false');
+    $patient.find('.patient-row .results-icon-btn')
+      .attr('aria-label', expanded ? 'Collapse patient' : 'Expand patient');
+    $patient.find('.patient-row-chevron')
+      .toggleClass('bi-chevron-down', !expanded)
+      .toggleClass('bi-chevron-up', expanded);
+  }
+
+  function updateStudyToggle($study, expanded) {
+    $study.find('.study-row')
+      .toggleClass('is-expanded', expanded);
+    $study.find('.exam-toggle')
+      .attr('aria-label', expanded ? 'Collapse study' : 'Expand study')
+      .attr('aria-expanded', expanded ? 'true' : 'false');
+    $study.find('.exam-chevron')
+      .toggleClass('bi-chevron-down', !expanded)
+      .toggleClass('bi-chevron-up', expanded);
+  }
+
+  $resultsPanel.on('click', '.study-row', function (e) {
+    // Checkboxes, the image viewer, the copy action and the explicit toggle are independent controls.
+    if ($(e.target).closest('input, a, button').length) return;
+    $(this).closest('.study-block').find('.study-details').collapse('toggle');
+  });
+
+  $resultsPanel.on('click', '.copy-accession-btn', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    var $button = $(this);
+    var accessionNumber = $button.attr('data-accession-number');
+    var showCopied = function () {
+      var $icon = $button.find('.copy-accession-icon');
+      $icon.removeClass('bi-clipboard-plus').addClass('bi-check2');
+      $button.attr('aria-label', 'Accession number copied');
+      window.setTimeout(function () {
+        $icon.removeClass('bi-check2').addClass('bi-clipboard-plus');
+        $button.attr('aria-label', 'Copy accession number ' + accessionNumber);
+      }, 1400);
+    };
+    var copyFallback = function () {
+      var $temporaryInput = $('<textarea>').val(accessionNumber).appendTo('body');
+      $temporaryInput[0].select();
+      var copied = false;
+      try {
+        copied = document.execCommand('copy');
+      } catch (error) {
+        copied = false;
+      }
+      $temporaryInput.remove();
+      return copied;
+    };
+
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(accessionNumber).then(showCopied).catch(function () {
+        if (copyFallback()) showCopied();
+      });
+    } else if (copyFallback()) {
+      showCopied();
+    }
+  });
+
+  $resultsPanel.on('show.bs.collapse', '.patient-studies', function (e) {
+    if (e.target !== this) return;
+    hydrateCollapse(this);
+    var $patient = $(this).closest('.patient-entry');
+    updatePatientToggle($patient, true);
+
+    // Preserve selections made while the patient's deferred content was inert.
+    if ($('#select-all-page').prop('checked') ||
+        $patient.find('input[name="select-all-patient"]').prop('checked')) {
+      $patient.find('input:checkbox').prop('checked', true);
+    }
+  });
+
+  $resultsPanel.on('hide.bs.collapse', '.patient-studies', function (e) {
+    if (e.target !== this) return;
+    updatePatientToggle($(this).closest('.patient-entry'), false);
+  });
+
+  $resultsPanel.on('show.bs.collapse', '.study-details', function (e) {
+    if (e.target !== this) return;
+    hydrateCollapse(this);
+    var $study = $(this).closest('.study-block');
+    updateStudyToggle($study, true);
+
+    // A study can be selected before its deferred series table is hydrated.
+    if ($('#select-all-page').prop('checked') ||
+        $study.find('input[name="select-all-accession-number"]').prop('checked') ||
+        $study.closest('.patient-entry').find('input[name="select-all-patient"]').prop('checked')) {
+      $study.find('input:checkbox').prop('checked', true);
+    }
+  });
+
+  $resultsPanel.on('hide.bs.collapse', '.study-details', function (e) {
+    if (e.target !== this) return;
+    updateStudyToggle($(this).closest('.study-block'), false);
+  });
+
+  /**
+   * Pasting the names will escape them automatically. This means that a
+   * name like Jon Doe will be become "John\^Doe". In the PACS the whitespace
+   * is replace by a '^'. The usecase is that people are coming with lists of
+   * names and they don't need to remember how to escape it properly.
+   */
+  $('#patientname-input').on('paste', function (e) {
+    // cancel paste
+    e.preventDefault();
+    var data = e.originalEvent.clipboardData.getData('Text');
+    var names = data.split(/(?:\r\n|\r|\n)/g);
+    names = names.map(function (x) { return x.trim(); });
+    names = names.filter(function (x) { return x !== '' });
+    names = names.map(function (x) { return x.replace(/\s/g, "\^"); });
+    names = names.map(function (x) { return '"' + x.toUpperCase() + '"' });
+    value = names.join(',');
+    $('#patientname-input').val(value);
+  });
+
+  if ('statistics' == $('body').data('page')) {
+    
+    
+   
+  
+  
+  }
+
+  $('#copy-citation-btn').on('click', function () {
+    var text = $('#citation-text').text().trim();
+    var $btn = $(this);
+    function showCopied() {
+      var original = $btn.text();
+      $btn.text('Copied');
+      setTimeout(function () {
+        $btn.text(original);
+      }, 1500);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(showCopied);
+    } else {
+      var $tmp = $('<textarea>').val(text).appendTo('body').select();
+      document.execCommand('copy');
+      $tmp.remove();
+      showCopied();
+    }
+  });
+  
+});

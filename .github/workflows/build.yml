@@ -1,0 +1,24 @@
+name: PACS/RIS Crawler CI
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12"]
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install uv
+      uses: astral-sh/setup-uv@v6
+      with:
+        version: "latest"
+    - name: Set up Python ${{ matrix.python-version }}
+      run: uv python install ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: uv sync
+    - name: crawler tests
+      working-directory: crawler
+      run: uv run python -m pytest  
+    - name: web tests
+      working-directory: web
+      run: uv run python -m pytest

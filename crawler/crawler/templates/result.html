@@ -1,0 +1,25 @@
+{% extends "index.html" %}
+
+{% block crawler_main %}
+<div class="results-panel mt-1">
+  <div class="results-toolbar-row results-row">
+    <div class="results-body">
+      <span class="results-summary-label mb-0">Accession {{ accession_number }}</span>
+    </div>
+    <div class="results-actions">
+      <button type="button" id="upload-button" class="btn btn-primary btn-sm">Upload result</button>
+    </div>
+  </div>
+  {% if command %}
+  <div class="crawler-command-panel px-3 py-2">
+    <div class="crawler-command-label">Command</div>
+    <pre class="crawler-command-pre mb-0">{{ command }}</pre>
+  </div>
+  {% endif %}
+  <div class="crawler-results-body px-2 py-2">
+    {% for study in results %}
+    {% include 'partials/study_result.html' %}
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

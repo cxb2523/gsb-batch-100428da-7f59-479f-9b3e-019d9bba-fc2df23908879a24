@@ -1,0 +1,62 @@
+<div class="results-panel">
+  <div class="results-row results-toolbar-row">
+    <div class="results-check">
+      <input type="checkbox" class="results-checkbox" name="select-all-page" id="select-all-page">
+    </div>
+    <div class="results-body">
+      <label class="results-summary-label mb-0" for="select-all-page">
+        <span class="results-label-part">Patients found:</span>
+        <span class="badge badge-count">{{ results | swiss_number }}</span>
+        <span class="results-label-part ml-3">Studies found:</span>
+        <span class="badge badge-count" id="studies_result" data-count="{{ studies_result }}">{{ studies_result | swiss_number }}</span>
+      </label>
+    </div>
+    <div class="results-actions">
+      {% include 'paging.html' %}
+      <a href="#" id="collapse-all" class="results-tool-link ml-2" title="Collapse all">
+        <span class="bi bi-chevron-up"></span>
+      </a>
+      <a href="#" id="expand-all" class="results-tool-link ml-1" title="Expand all">
+        <span class="bi bi-chevron-down"></span>
+      </a>
+    </div>
+  </div>
+  <ul class="list-group result mb-0">
+    {% for doc in docs['groups'] %}
+    <li class="list-group-item patient-entry">
+      <div class="results-row patient-row">
+        <div class="results-check">
+          <input type="checkbox" class="results-checkbox" name="select-all-patient"
+            data-patient-id="{{ doc['groupValue'] }}">
+        </div>
+        <div class="results-body">
+          <button type="button" class="results-text-btn patient-row-toggle"
+            data-toggle="collapse" data-target="#{{ doc['groupValue'] }}">
+            {{ doc.doclist.docs[0]['PatientID'] }}, {{ doc.doclist.docs[0]['PatientSex'] }}
+          </button>
+        </div>
+        <div class="results-meta">
+          <span class="patient-row-studies">
+            <span class="results-label-part">Studies</span>
+            <span class="badge badge-count">{{ doc.doclist.numFound }}</span>
+          </span>
+          <button type="button" class="results-icon-btn ml-2"
+            data-toggle="collapse" data-target="#{{ doc['groupValue'] }}"
+            aria-label="Expand patient">
+            <span class="bi bi-chevron-down patient-row-chevron" aria-hidden="true"></span>
+          </button>
+        </div>
+      </div>
+      <div class="patient-studies collapse" id="{{ doc['groupValue'] }}">
+        {# Keep large result trees inert until a patient is opened. This avoids
+           style calculation and event setup for every hidden study. #}
+        <template class="deferred-collapse-content">
+          {% for study in doc.doclist.docs %}
+          {% include 'study.html' %}
+          {% endfor %}
+        </template>
+      </div>
+    </li>
+    {% endfor %}
+  </ul>
+</div>

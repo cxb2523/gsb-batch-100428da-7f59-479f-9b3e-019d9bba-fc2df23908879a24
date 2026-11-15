@@ -1,0 +1,71 @@
+<div class="study-block">
+  <div class="results-row study-row">
+    <div class="results-body study-row-main">
+      <span class="study-patient">{{ study['PatientID'] }}</span>
+      <span class="study-accession-group">
+        <span class="study-accession">{{ study['AccessionNumber'] }}</span>
+        <button type="button" class="copy-accession-btn" data-accession-number="{{ study['AccessionNumber'] }}"
+          aria-label="Copy accession number {{ study['AccessionNumber'] }}" title="Copy accession number">
+          <span class="bi bi-clipboard-plus copy-accession-icon" aria-hidden="true"></span>
+        </button>
+      </span>
+      {% if study.get('StudyDescription') %}
+      <span class="study-row-description" title="{{ study['StudyDescription'] | fix_mojibake }}">{{ study['StudyDescription'] | fix_mojibake }}</span>
+      {% endif %}
+      <span class="study-inline-meta">
+        <span class="study-meta-item">
+          <span class="study-meta-label">Date</span>
+          <span class="study-meta-value">{{ study['StudyDate'] | to_date }}</span>
+        </span>
+        <span class="study-meta-item">
+          <span class="study-meta-label">Age</span>
+          <span class="study-meta-value">{{ study['PatientAge'] }}</span>
+        </span>
+      </span>
+    </div>
+    <div class="results-meta study-row-actions">
+      <button type="button" class="results-icon-btn exam-toggle"
+        data-toggle="collapse" data-target="#study-{{ study['AccessionNumber'] }}"
+        aria-label="Collapse study" aria-expanded="true">
+        <span class="bi bi-chevron-up exam-chevron" aria-hidden="true"></span>
+      </button>
+    </div>
+  </div>
+  <div class="study-details collapse show" id="study-{{ study['AccessionNumber'] }}">
+    <div class="study-panels">
+      <div class="study-series-panel">
+        <div class="study-panel-heading">Series</div>
+        <div class="study-series-table-wrap">
+          <table class="series-table" data-accession-number="{{ study['AccessionNumber'] }}">
+            <thead>
+              <tr>
+                <th class="col-mod" scope="col">Mod.</th>
+                <th class="col-num" scope="col">#</th>
+                <th class="col-desc" scope="col">Description</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for series in study['_childDocuments_'] %}
+              {% set d = series.update({
+                'series_int': series.get('SeriesNumber', 0)|int,
+                'instance_int': series.get('InstanceNumber', 0)|int
+              }) %}
+              {% endfor %}
+              {% for child in study['_childDocuments_'] | sort(attribute='instance_int') | sort(attribute='series_int') %}
+              <tr>
+                <td class="col-mod">{{ child['Modality'] }}</td>
+                <td class="col-num" title="Series {{ child['SeriesNumber'] }}{% if child.get('InstanceNumber') %}, Instance {{ child['InstanceNumber'] }}{% endif %}">{% if child.get('InstanceNumber') %}{{ child['SeriesNumber'] | series_num_short }}.{{ child['InstanceNumber'] }}{% else %}{{ child['SeriesNumber'] | series_num_short }}{% endif %}</td>
+                <td class="col-desc" title="{{ child['SeriesDescription'] | fix_mojibake }}">{{ child['SeriesDescription'] | fix_mojibake }}</td>
+              </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="study-report-panel">
+        <div class="study-panel-heading">Report</div>
+        <div id="{{ study['AccessionNumber'] }}-report" class="study-report-body">{{ study['RisReport'] | fix_mojibake }}</div>
+      </div>
+    </div>
+  </div>
+</div>
