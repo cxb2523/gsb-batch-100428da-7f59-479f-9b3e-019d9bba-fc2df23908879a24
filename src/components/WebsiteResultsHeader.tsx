@@ -1,4 +1,5 @@
 import type { WorkerSuccessResponse } from '../api/worker-client'
+import { ContentSourceBadge } from './ContentSourceBadge'
 
 interface WebsiteResultsHeaderProps {
   websiteData: WorkerSuccessResponse
@@ -58,6 +59,17 @@ export function WebsiteResultsHeader({ websiteData }: WebsiteResultsHeaderProps)
           </div>
         ))}
       </div>
+
+      {/* Content source annotation — website mode only;
+          absent on legacy worker responses that predate the field */}
+      {websiteData.contentSource && (
+        <ContentSourceBadge
+          source={{
+            contentSource: websiteData.contentSource,
+            fallbackReason: websiteData.fallbackReason ?? null,
+          }}
+        />
+      )}
 
       {/* Headings */}
       {websiteData.headings.length > 0 && (

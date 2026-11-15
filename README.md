@@ -170,9 +170,30 @@ Calibrated using an 8-sample audit dataset. See [Methodology](https://mianhassam
 - Redirect destination re-validated
 - HTML content-type enforcement
 - URL length limit: 2048 characters
+- Extracted content capped at 10,000 characters; minimum 20 words or `INSUFFICIENT_CONTENT`
 - `Cache-Control: no-store` on all responses
 - No raw server error messages exposed in responses
 - CORS locked to production origin
+
+### Content extraction provenance
+
+The worker extracts body text from qualifying `<p>` elements inside an
+`<article>`/`<main>` container first. When that yields too little text it
+falls back to the page's cleaned visible text, and every success response
+declares which path was used via two additive fields:
+
+| Field | Values | Meaning |
+|---|---|---|
+| `contentSource` | `paragraphs` \| `full-text-fallback` | Whether `content` came from paragraph extraction or the visible-text fallback |
+| `fallbackReason` | `null` \| `no_article_main_container` \| `too_few_qualifying_paragraphs` | Why the fallback was taken (`null` on the paragraph path) |
+
+Both fields are optional and additive — legacy clients ignore them and all
+pre-existing fields keep their original semantics. The fallback still obeys
+the 10,000-character cap, the 20-word minimum, and every HTTPS/SSRF/size/
+content-type guard. If the fallback also produces fewer than 20 words the
+worker still returns `INSUFFICIENT_CONTENT`. The website analysis UI surfaces
+this provenance as a content-source badge (with the fallback reason); text
+analysis mode never displays it.
 
 ---
 

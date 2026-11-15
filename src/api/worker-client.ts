@@ -9,6 +9,19 @@ import { getUserError, errorFromException } from './errors'
 const WORKER_URL = (import.meta.env.VITE_WORKER_URL as string | undefined)
   ?? 'https://miantrace.mianhassam96.workers.dev'
 
+/**
+ * Extraction path reported by the worker.
+ * - 'paragraphs'         : content comes from qualifying <p> elements
+ * - 'full-text-fallback' : paragraph extraction was insufficient; the worker
+ *                          used cleaned visible page text instead
+ */
+export type ContentSource = 'paragraphs' | 'full-text-fallback'
+
+/** Machine-readable fallback reason; null/absent outside fallback responses. */
+export type FallbackReason =
+  | 'no_article_main_container'
+  | 'too_few_qualifying_paragraphs'
+
 export interface WorkerSuccessResponse {
   url: string
   title: string
@@ -18,6 +31,13 @@ export interface WorkerSuccessResponse {
   headings: string[]
   headingHierarchy: { level: number; text: string }[]
   paragraphCount: number
+  /**
+   * Additive worker fields (older worker responses may omit them).
+   * Default to 'paragraphs' when absent so legacy responses keep their
+   * original semantics.
+   */
+  contentSource?: ContentSource
+  fallbackReason?: FallbackReason | null
 }
 
 export interface WorkerErrorResponse {

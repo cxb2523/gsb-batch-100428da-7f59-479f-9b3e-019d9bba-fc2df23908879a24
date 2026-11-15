@@ -17,6 +17,25 @@
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+/**
+ * How the returned `content` was produced.
+ * - 'paragraphs'          : preferred path — joined qualifying <p> text
+ * - 'full-text-fallback'  : paragraph extraction was insufficient, so the
+ *                           cleaned visible text of the page was used instead
+ */
+export type ContentSource = 'paragraphs' | 'full-text-fallback'
+
+/**
+ * Machine-readable reason for a full-text fallback. `null` when
+ * `contentSource === 'paragraphs'`.
+ * - 'no_article_main_container'       : page has no <article>/<main> container
+ * - 'too_few_qualifying_paragraphs'   : a container exists but the joined
+ *                                       qualifying paragraphs are too short
+ */
+export type FallbackReason =
+  | 'no_article_main_container'
+  | 'too_few_qualifying_paragraphs'
+
 interface WorkerResponse {
   url: string
   title: string
@@ -26,6 +45,13 @@ interface WorkerResponse {
   headings: string[]
   headingHierarchy: { level: number; text: string }[]
   paragraphCount: number
+  /**
+   * Extraction path used for `content`. Additive field — clients built
+   * against the older contract simply ignore it.
+   */
+  contentSource: ContentSource
+  /** Reason for the fallback; `null` when paragraph extraction succeeded. */
+  fallbackReason: FallbackReason | null
 }
 
 interface ErrorResponse {
@@ -135,6 +161,7 @@ async function extractContent(html: string, baseUrl: string): Promise<WorkerResp
 
   // Prefer article/main content
   const articleMatch = cleaned.match(/<(?:article|main)[^>]*>([\s\S]*?)<\/(?:article|main)>/i)
+  const hasArticleMain = articleMatch !== null
   if (articleMatch) cleaned = articleMatch[1]
 
   // Extract paragraphs
@@ -147,14 +174,22 @@ async function extractContent(html: string, baseUrl: string): Promise<WorkerResp
 
   // Fallback to full text if not enough paragraphs
   let content = contentParts.join('\n\n')
+  let contentSource: ContentSource = 'paragraphs'
+  let fallbackReason: FallbackReason | null = null
   if (content.length < 200) {
+    // Same cleaned-visible-text fallback as before, now annotated with the
+    // extraction path and the reason the preferred path was insufficient.
+    contentSource = 'full-text-fallback'
+    fallbackReason = hasArticleMain
+      ? 'too_few_qualifying_paragraphs'
+      : 'no_article_main_container'
     content = stripTags(cleaned)
       .replace(/\s{3,}/g, '\n\n')
       .replace(/[ \t]+/g, ' ')
       .trim()
   }
 
-  // Hard cap at 10,000 chars for analysis
+  // Hard cap at 10,000 chars for analysis — applies to both extraction paths
   content = content.slice(0, 10000)
 
   const wordCount = content.trim().split(/\s+/).filter(w => w.length > 0).length
@@ -168,6 +203,8 @@ async function extractContent(html: string, baseUrl: string): Promise<WorkerResp
     headings,
     headingHierarchy,
     paragraphCount: contentParts.length,
+    contentSource,
+    fallbackReason,
   }
 }
 

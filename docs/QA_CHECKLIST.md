@@ -39,6 +39,14 @@ Mark each item ✅ Pass, ❌ Fail, or ⚠️ Partial.
 | 2.9 | Progress steps visible | 5-step progress shown while fetching | |
 | 2.10 | Website header in results | Shows URL, title, word count, headings | |
 | 2.11 | Same analysis engine as text | 8 signals, sentence analysis, improvements shown | |
+| 2.12 | Page with ample `<p>` text in an article/main container | Neutral "Content source: paragraph extraction" badge shown | |
+| 2.13 | Page without article/main container | Amber "full-text fallback" badge, reason "No article/main container found" | |
+| 2.14 | Article container with only short paragraphs | Amber fallback badge, reason "Too few qualifying paragraphs" | |
+| 2.15 | Fallback page with < 20 words of visible text | `INSUFFICIENT_CONTENT` error (422), human-readable message, retry not offered | |
+| 2.16 | Text analysis mode | No content-source badge anywhere in the results | |
+| 2.17 | Copy Report / PDF for a fallback website analysis | Report includes the content-source line and fallback reason | |
+| 2.18 | Fallback response over 10,000 chars | `content` still truncated to 10,000 characters | |
+| 2.19 | Fallback attempt on a private/non-HTTPS/oversized/non-HTML target | Same security rejection as before — fallback never bypasses a guard | |
 
 ---
 

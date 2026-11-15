@@ -9,6 +9,31 @@ import type { AnalysisResult, CombinedResult, Signal, VisibilityDimension } from
 const LEVEL_LABEL: Record<string, string> = { high: 'High', medium: 'Medium', low: 'Low' }
 const CONF_LABEL: Record<string, string>  = { high: 'High', moderate: 'Moderate', low: 'Low' }
 
+const FALLBACK_REASON_TEXT: Record<string, string> = {
+  no_article_main_container:
+    'No article/main container found — analysis uses all visible page text.',
+  too_few_qualifying_paragraphs:
+    'Too few qualifying paragraphs — analysis uses all visible page text.',
+}
+
+/** Human-readable content-source lines for report output (website mode only). */
+function contentSourceLines(source?: {
+  contentSource: string
+  fallbackReason: string | null
+}): string[] {
+  if (!source) return []
+  if (source.contentSource === 'full-text-fallback') {
+    const reason = source.fallbackReason
+      ? (FALLBACK_REASON_TEXT[source.fallbackReason] ?? 'Analysis uses all visible page text.')
+      : 'Analysis uses all visible page text.'
+    return [
+      `Content:  full-text fallback`,
+      `Reason:   ${reason}`,
+    ]
+  }
+  return ['Content:  paragraph extraction']
+}
+
 function divider(char = '─', len = 44): string { return char.repeat(len) }
 
 function signalLine(signal: Signal): string {
@@ -36,6 +61,7 @@ export function generateCombinedReport(combined: CombinedResult): string {
   if (combined.sourceMode === 'website' && combined.websiteData) {
     lines.push(`Source:    ${combined.websiteData.url}`)
     if (combined.websiteData.title) lines.push(`Page:      ${combined.websiteData.title}`)
+    lines.push(...contentSourceLines(combined.websiteData.source))
   }
 
   lines.push('')
@@ -127,6 +153,7 @@ export function generateReport(result: AnalysisResult): string {
   if (result.sourceMode === 'website' && result.websiteData) {
     lines.push(`Source: ${result.websiteData.url}`)
     if (result.websiteData.title) lines.push(`Page: ${result.websiteData.title}`)
+    lines.push(...contentSourceLines(result.websiteData.source))
   }
   lines.push('')
   lines.push('AI-LIKELIHOOD ESTIMATE')

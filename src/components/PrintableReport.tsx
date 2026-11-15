@@ -157,6 +157,25 @@ export function PrintableReport({ result }: PrintableReportProps) {
               {result.websiteData.description}
             </div>
           )}
+          {result.websiteData.source && (
+            <div style={{
+              fontSize: '8.5pt', marginTop: '6px',
+              color: result.websiteData.source.contentSource === 'full-text-fallback' ? '#b45309' : '#475569',
+              background: result.websiteData.source.contentSource === 'full-text-fallback' ? '#fffbeb' : '#f1f5f9',
+              border: `1px solid ${result.websiteData.source.contentSource === 'full-text-fallback' ? '#fde68a' : '#e2e8f0'}`,
+              borderRadius: '6px', padding: '5px 8px',
+            }}>
+              {result.websiteData.source.contentSource === 'full-text-fallback'
+                ? `Content source: full-text fallback — ${
+                    result.websiteData.source.fallbackReason === 'no_article_main_container'
+                      ? 'no article/main container found'
+                      : result.websiteData.source.fallbackReason === 'too_few_qualifying_paragraphs'
+                        ? 'too few qualifying paragraphs'
+                        : 'paragraph extraction insufficient'
+                  }`
+                : 'Content source: paragraph extraction'}
+            </div>
+          )}
         </div>
       )}
 

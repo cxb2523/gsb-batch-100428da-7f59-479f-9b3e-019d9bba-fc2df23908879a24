@@ -5,6 +5,28 @@ export type ConfidenceLevel = 'low' | 'moderate' | 'high';
 export type SignalLevel = 'low' | 'medium' | 'high';
 export type AnalyzerTab = 'text' | 'website';
 
+/**
+ * Where the analyzed website body text came from.
+ * - 'paragraphs'         : extracted from qualifying paragraph elements
+ * - 'full-text-fallback' : paragraph extraction was insufficient, so the
+ *                          worker fell back to cleaned visible page text
+ */
+export type ContentSource = 'paragraphs' | 'full-text-fallback';
+
+/** Why the worker fell back to full visible text. Null outside fallback. */
+export type FallbackReason =
+  | 'no_article_main_container'
+  | 'too_few_qualifying_paragraphs';
+
+/**
+ * Provenance of website content, transparently relayed from the worker.
+ * Optional so older worker responses and text-mode results stay valid.
+ */
+export interface ContentSourceInfo {
+  contentSource: ContentSource;
+  fallbackReason: FallbackReason | null;
+}
+
 export interface ContentStatistics {
   words: number;
   characters: number;
@@ -64,6 +86,8 @@ export interface AnalysisResult {
     headings: string[];
     paragraphCount: number;
     wordCount: number;
+    /** How the worker produced `content`; absent on legacy worker responses */
+    source?: ContentSourceInfo;
   };
 }
 
@@ -105,6 +129,8 @@ export interface CombinedResult {
     headings: string[]
     paragraphCount: number
     wordCount: number
+    /** How the worker produced `content`; absent on legacy worker responses */
+    source?: ContentSourceInfo
   }
   analyzedAt: string
 }

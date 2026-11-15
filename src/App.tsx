@@ -105,13 +105,27 @@ export default function App() {
         const { data } = workerResult
         await new Promise<void>(r => setTimeout(r, 50))
         const stats = computeStatistics(data.content)
-        const writingResult2 = { ...runSignalEngine(stats), sourceMode: 'website' as const, websiteData: { url: data.url, title: data.title, description: data.description, headings: data.headings, paragraphCount: data.paragraphCount, wordCount: data.wordCount } }
+        const websiteMeta = {
+          url: data.url,
+          title: data.title,
+          description: data.description,
+          headings: data.headings,
+          paragraphCount: data.paragraphCount,
+          wordCount: data.wordCount,
+          // Legacy worker responses omit the provenance fields — treat them
+          // as the original paragraph-extraction path.
+          source: {
+            contentSource: data.contentSource ?? 'paragraphs',
+            fallbackReason: data.fallbackReason ?? null,
+          },
+        }
+        const writingResult2 = { ...runSignalEngine(stats), sourceMode: 'website' as const, websiteData: websiteMeta }
         const visibilityResult2 = runVisibilityEngine(stats, data.content, data.headings)
         setResult({
           writing: writingResult2,
           visibility: visibilityResult2,
           sourceMode: 'website',
-          websiteData: { url: data.url, title: data.title, description: data.description, headings: data.headings, paragraphCount: data.paragraphCount, wordCount: data.wordCount },
+          websiteData: websiteMeta,
           analyzedAt: new Date().toISOString(),
         })
         setStatus('success')
