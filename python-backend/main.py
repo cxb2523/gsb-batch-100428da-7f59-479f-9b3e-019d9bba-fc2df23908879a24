@@ -152,6 +152,13 @@ class ScanResponse(BaseModel):
     has_screenshot: bool = False
     has_html_copy: bool = False
     wayback_files: List[str] = []
+    wayback_status: Optional[str] = None
+    wayback_summary: Optional[str] = None
+    wayback_downloaded_count: int = 0
+    wayback_failed_count: int = 0
+    wayback_duplicate_count: int = 0
+    wayback_total_candidates: int = 0
+    wayback_failed: List[dict] = []
 
 
 @app.post("/scan", response_model=ScanResponse)
@@ -251,6 +258,8 @@ def run_scan(request: ScanRequest):
         if wb_dir.exists():
             wayback_files = sorted([f.name for f in wb_dir.iterdir() if f.is_file()])
 
+        wayback_result = data_array[53] if len(data_array) > 53 and isinstance(data_array[53], dict) else {}
+
         return ScanResponse(
             status="success",
             domain=short_domain,
@@ -263,6 +272,22 @@ def run_scan(request: ScanRequest):
             has_screenshot=has_screenshot,
             has_html_copy=has_html_copy,
             wayback_files=wayback_files,
+            wayback_status=wayback_result.get('status'),
+            wayback_summary=wayback_result.get('summary'),
+            wayback_downloaded_count=int(wayback_result.get('downloaded_count') or 0),
+            wayback_failed_count=int(wayback_result.get('failed_count') or 0),
+            wayback_duplicate_count=int(wayback_result.get('duplicate_count') or 0),
+            wayback_total_candidates=int(wayback_result.get('total_candidates') or 0),
+            wayback_failed=[
+                {
+                    'timestamp': entry.get('timestamp'),
+                    'original_url': entry.get('original_url') or entry.get('url'),
+                    'reason_type': entry.get('reason_type'),
+                    'reason': entry.get('reason'),
+                }
+                for entry in (wayback_result.get('failed') or [])
+                if isinstance(entry, dict)
+            ],
         )
 
     except Exception as e:

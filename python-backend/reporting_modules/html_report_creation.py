@@ -154,6 +154,90 @@ def generate_report(data, output_file, template_path):
     return True
 
 
+def build_wayback_context(snapshot_result):
+    """Normalize the snapshot result for the report template.
+
+    Distinguishes "snapshotting not requested", "no snapshots available",
+    "all downloads failed", "partial" and "success" outcomes.
+    """
+    result = snapshot_result if isinstance(snapshot_result, dict) else {}
+    status = result.get('status') or 'not_requested'
+    downloaded_files = [f for f in (result.get('downloaded_files') or []) if isinstance(f, str)]
+    failed = [f for f in (result.get('failed') or []) if isinstance(f, dict)]
+    duplicates = [d for d in (result.get('duplicates') or []) if isinstance(d, dict)]
+
+    status_labels = {
+        'not_requested': 'Not requested',
+        'no_snapshots': 'No snapshots found',
+        'all_failed': 'All downloads failed',
+        'partial_success': 'Partially completed',
+        'success': 'Completed',
+        'cdx_error': 'CDX query failed',
+        'error': 'Snapshotting error',
+    }
+
+    if status == 'no_snapshots':
+        headline = 'No HTML snapshots were found for this domain in the selected date range.'
+    elif status == 'all_failed':
+        headline = (
+            f"{len(failed)} snapshot(s) were found but every download failed. "
+            "See the failure details below."
+        )
+    elif status == 'partial_success':
+        headline = (
+            f"{len(downloaded_files)} of {result.get('unique_candidates', 0)} snapshot(s) were "
+            f"downloaded; {len(failed)} failed."
+        )
+    elif status == 'success':
+        headline = f"All {len(downloaded_files)} snapshot(s) were downloaded successfully."
+    elif status in ('cdx_error', 'error'):
+        headline = result.get('summary') or 'Wayback snapshotting could not be completed.'
+    elif status == 'not_requested':
+        headline = 'Wayback snapshotting was not requested for this scan.'
+    else:
+        headline = result.get('summary') or 'Wayback snapshotting outcome is unknown.'
+
+    if duplicates:
+        headline += f" {len(duplicates)} duplicate timestamp(s) were skipped."
+
+    failed_rows = []
+    for entry in failed:
+        failed_rows.append({
+            'timestamp': entry.get('timestamp') or '',
+            'original_url': entry.get('original_url') or entry.get('url') or '',
+            'archive_url': entry.get('archive_url') or '',
+            'reason_type': entry.get('reason_type') or 'unknown',
+            'reason': entry.get('reason') or '',
+        })
+
+    duplicate_rows = []
+    for entry in duplicates:
+        duplicate_rows.append({
+            'timestamp': entry.get('timestamp') or '',
+            'original_url': entry.get('original_url') or '',
+        })
+
+    return {
+        'wayback_status': status,
+        'wayback_status_label': status_labels.get(status, status),
+        'wayback_enabled': status != 'not_requested',
+        'wayback_headline': headline,
+        'wayback_summary': result.get('summary') or headline,
+        'wayback_error': result.get('error') or '',
+        'wayback_downloaded_files': downloaded_files,
+        'wayback_failed': failed_rows,
+        'wayback_duplicates': duplicate_rows,
+        'wayback_total_candidates': int(result.get('total_candidates') or 0),
+        'wayback_unique_candidates': int(result.get('unique_candidates') or 0),
+        'wayback_downloaded_count': int(result.get('downloaded_count') or len(downloaded_files)),
+        'wayback_failed_count': int(result.get('failed_count') or len(failed)),
+        'wayback_duplicate_count': int(result.get('duplicate_count') or len(duplicates)),
+        'wayback_no_snapshots': status == 'no_snapshots',
+        'wayback_all_failed': status == 'all_failed',
+        'wayback_partial': status == 'partial_success',
+    }
+
+
 def report_assembling(short_domain, url, case_comment, data_array, report_info_array, pagesearch_ui_mark, end, snapshotting_ui_mark):
     try:
         ip = data_array[0]
@@ -208,6 +292,7 @@ def report_assembling(short_domain, url, case_comment, data_array, report_info_a
         total_ips = data_array[50]
         total_vulns = data_array[51]
         lunarcyber_intel = data_array[52]
+        wayback_snapshot_result = data_array[53] if len(data_array) > 53 else None
         casename = report_info_array[0]
         db_casename = report_info_array[1]
         db_creation_date = report_info_array[2]
@@ -264,6 +349,8 @@ def report_assembling(short_domain, url, case_comment, data_array, report_info_a
         )
 
         social_counts = compute_social_counts(common_socials)
+
+        wayback_context = build_wayback_context(wayback_snapshot_result)
 
         dorking_enabled = dorking_status != 'Google Dorking mode was not selected for this scan'
         pagesearch_enabled = isinstance(pagesearch_ui_mark, str) and pagesearch_ui_mark.strip().lower().startswith('yes')
@@ -356,6 +443,7 @@ def report_assembling(short_domain, url, case_comment, data_array, report_info_a
             'social_table_rows': social_table_rows,
             'hudsonrock_intel': hudsonrock_intel,
             'lunarcyber_intel': lunarcyber_intel,
+            **wayback_context,
         }
 
         html_report_name = report_folder + '//' + casename

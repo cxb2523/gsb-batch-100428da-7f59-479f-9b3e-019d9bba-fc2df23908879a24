@@ -89,6 +89,87 @@ snapshotModeSelect.addEventListener("change", () => {
 const snapshotPanel = document.getElementById("snapshot-panel");
 const snapshotContent = document.getElementById("snapshot-content");
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderWaybackResult(data, encodedFolder) {
+  const files = Array.isArray(data.wayback_files) ? data.wayback_files : [];
+  const failed = Array.isArray(data.wayback_failed) ? data.wayback_failed : [];
+  const failedCount = data.wayback_failed_count || failed.length;
+  const duplicateCount = data.wayback_duplicate_count || 0;
+  const totalCandidates = data.wayback_total_candidates || 0;
+
+  if (files.length === 0) {
+    let message;
+    if (failedCount > 0) {
+      message = `All ${failedCount} archived snapshot download(s) failed in the selected date range.`;
+    } else {
+      message = "No archived snapshots were found for this domain in the selected date range.";
+    }
+    const failedRows = failed
+      .map(
+        (entry) => `
+          <li>
+            <span>${escapeHtml(entry.timestamp)} — ${escapeHtml(entry.original_url)}</span>
+            <span class="hint error-text">${escapeHtml(entry.reason_type || "error")}</span>
+          </li>`
+      )
+      .join("");
+    snapshotContent.innerHTML = `
+      <p class="hint error-text">${escapeHtml(message)}</p>
+      ${failedRows ? `<ul class="wayback-list">${failedRows}</ul>` : ""}
+      <button class="secondary-btn small-btn" id="open-live-wayback-btn">🌐 Browse live Wayback Machine</button>
+    `;
+    document.getElementById("open-live-wayback-btn").addEventListener("click", () => {
+      const liveUrl = `https://web.archive.org/web/*/http://${data.domain}`;
+      openMiniBrowser(liveUrl, "Wayback Machine — Live");
+    });
+    return;
+  }
+
+  const listHtml = files
+    .map((f) => {
+      const fileUrl = `${API_BASE}/snapshot/wayback/file?folder=${encodedFolder}&filename=${encodeURIComponent(f)}`;
+      return `<li>${escapeHtml(f)} <button class="secondary-btn small-btn open-wayback-file" data-url="${escapeHtml(fileUrl)}">Open</button></li>`;
+    })
+    .join("");
+
+  const failedRows = failed
+    .map(
+      (entry) => `
+        <li>
+          <span>${escapeHtml(entry.timestamp)} — ${escapeHtml(entry.original_url)}</span>
+          <span class="hint error-text">${escapeHtml(entry.reason_type || "error")}: ${escapeHtml(entry.reason || "")}</span>
+        </li>`
+    )
+    .join("");
+
+  const summaryParts = [`${files.length} archived snapshot(s) downloaded`];
+  if (failedCount > 0) summaryParts.push(`${failedCount} failed`);
+  if (duplicateCount > 0) summaryParts.push(`${duplicateCount} duplicate timestamp(s) skipped`);
+  if (totalCandidates > files.length + failedCount) summaryParts.push(`${totalCandidates} candidate entries`);
+
+  snapshotContent.innerHTML = `
+    <p class="hint">${escapeHtml(summaryParts.join(" · "))}.</p>
+    <ul class="wayback-list">${listHtml}</ul>
+    ${failedRows ? `<ul class="wayback-list">${failedRows}</ul>` : ""}
+    <button class="secondary-btn small-btn" id="open-live-wayback-btn">🌐 Browse live Wayback Machine</button>
+  `;
+  snapshotContent.querySelectorAll(".open-wayback-file").forEach((btn) => {
+    btn.addEventListener("click", () => openMiniBrowser(btn.dataset.url, "DPULSE Wayback Snapshot"));
+  });
+  document.getElementById("open-live-wayback-btn").addEventListener("click", () => {
+    const liveUrl = `https://web.archive.org/web/*/http://${data.domain}`;
+    openMiniBrowser(liveUrl, "Wayback Machine — Live");
+  });
+}
+
 function renderSnapshotPanel(data, reportFolder) {
   snapshotContent.innerHTML = "";
 
@@ -129,28 +210,7 @@ function renderSnapshotPanel(data, reportFolder) {
       snapshotContent.innerHTML = `<p class="hint error-text">HTML copy could not be captured.</p>`;
     }
   } else if (data.snapshot_type === "w") {
-    if (data.wayback_files && data.wayback_files.length > 0) {
-      const listHtml = data.wayback_files
-        .map((f) => {
-          const fileUrl = `${API_BASE}/snapshot/wayback/file?folder=${encodedFolder}&filename=${encodeURIComponent(f)}`;
-          return `<li>${f} <button class="secondary-btn small-btn open-wayback-file" data-url="${fileUrl}">Open</button></li>`;
-        })
-        .join("");
-      snapshotContent.innerHTML = `
-        <p class="hint">${data.wayback_files.length} archived snapshot(s) downloaded.</p>
-        <ul class="wayback-list">${listHtml}</ul>
-        <button class="secondary-btn small-btn" id="open-live-wayback-btn">🌐 Browse live Wayback Machine</button>
-      `;
-      snapshotContent.querySelectorAll(".open-wayback-file").forEach((btn) => {
-        btn.addEventListener("click", () => openMiniBrowser(btn.dataset.url, "DPULSE Wayback Snapshot"));
-      });
-      document.getElementById("open-live-wayback-btn").addEventListener("click", () => {
-        const liveUrl = `https://web.archive.org/web/*/http://${data.domain}`;
-        openMiniBrowser(liveUrl, "Wayback Machine — Live");
-      });
-    } else {
-      snapshotContent.innerHTML = `<p class="hint error-text">No archived snapshots were found for this domain in the selected date range.</p>`;
-    }
+    renderWaybackResult(data, encodedFolder);
   }
 }
 

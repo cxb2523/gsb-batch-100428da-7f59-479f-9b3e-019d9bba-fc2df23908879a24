@@ -137,6 +137,8 @@ pre.code-block {
 @keyframes slideIn { from { transform: translateX(30px); opacity:0; } to { transform: translateX(0); opacity:1; } }
 .checkbox-cell { width: 30px; }
 .hint-note { font-size: 11px; color: var(--text-dim); font-style: italic; margin-bottom: 10px; padding: 8px 12px; background: var(--input-bg); border-radius: 6px; border-left: 3px solid var(--accent); }
+.wayback-file-list { list-style: none; margin: 6px 0 14px; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.wayback-file-list li { background: var(--input-bg); border: 1px solid var(--border); border-radius: 6px; padding: 5px 10px; font-size: 12px; }
 .geo-cell.loaded { color: var(--accent); }
 ::-webkit-scrollbar { width: 8px; height: 8px; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
@@ -292,6 +294,56 @@ pre.code-block {
         <div class="info-item"><div class="label">Report Created</div><div class="value">{{ ctime }}</div></div>
       </div>
     </div>
+
+    {% if wayback_enabled %}
+    <div class="panel">
+      <h2>🗄️ Wayback Snapshots</h2>
+      <div class="info-grid">
+        <div class="info-item"><div class="label">Outcome</div><div class="value {{ 'status-yes' if wayback_downloaded_count else 'status-no' }}">{{ wayback_status_label }}</div></div>
+        <div class="info-item"><div class="label">Candidate Entries</div><div class="value">{{ wayback_total_candidates }}</div></div>
+        <div class="info-item"><div class="label">Downloaded</div><div class="value">{{ wayback_downloaded_count }}</div></div>
+        <div class="info-item"><div class="label">Failed</div><div class="value">{{ wayback_failed_count }}</div></div>
+        <div class="info-item"><div class="label">Duplicate Timestamps Skipped</div><div class="value">{{ wayback_duplicate_count }}</div></div>
+      </div>
+      <div class="hint-note">{{ wayback_headline }}</div>
+
+      {% if wayback_downloaded_files %}
+      <h3>Downloaded Files</h3>
+      <ul class="wayback-file-list">
+        {% for fname in wayback_downloaded_files %}<li>{{ fname }}</li>{% endfor %}
+      </ul>
+      {% endif %}
+
+      {% if wayback_failed %}
+      <h3>Failed Downloads</h3>
+      <table id="wayback-failed-table">
+        <thead><tr><th>Timestamp</th><th>Original URL</th><th>Reason Type</th><th>Reason</th></tr></thead>
+        <tbody>
+          {% for row in wayback_failed %}
+          <tr>
+            <td>{{ row.timestamp }}</td>
+            <td style="word-break:break-all;">{{ row.original_url }}</td>
+            <td><span class="badge badge-unknown">{{ row.reason_type }}</span></td>
+            <td>{{ row.reason }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+
+      {% if wayback_duplicates %}
+      <h3>Duplicate Timestamps (skipped)</h3>
+      <table id="wayback-duplicate-table">
+        <thead><tr><th>Timestamp</th><th>Original URL</th></tr></thead>
+        <tbody>
+          {% for row in wayback_duplicates %}
+          <tr><td>{{ row.timestamp }}</td><td style="word-break:break-all;">{{ row.original_url }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+    </div>
+    {% endif %}
   </section>
 
   <section class="view-section" id="section-stats">

@@ -19,7 +19,11 @@ import api_hudsonrock
 import api_lunarcyber
 from screen_snapshotting import take_screenshot
 from html_snapshotting import save_page_as_html
-from archive_snapshotting import download_snapshot
+from archive_snapshotting import (
+    download_snapshot,
+    snapshot_error_result,
+    snapshot_not_requested_result,
+)
 
 
 SOCIAL_KEYS = [
@@ -88,6 +92,26 @@ def establishing_dork_db_connection(dorking_flag):
     return dorking_db_path, table
 
 
+def run_wayback_snapshotting(short_domain, from_date, end_date, report_folder):
+    """Run the Wayback snapshot batch and never let a failure abort the scan.
+
+    Returns a structured snapshot result whose ``status`` distinguishes
+    "no snapshots available" from "all downloads failed".
+    """
+    try:
+        return download_snapshot(short_domain, from_date, end_date, report_folder)
+    except Exception as e:
+        logging.exception("Wayback snapshotting failed")
+        print(Fore.RED + f"Wayback snapshotting failed: {e}" + Style.RESET_ALL)
+        return snapshot_error_result(
+            f"{type(e).__name__}: {e}",
+            domain=short_domain,
+            from_date=from_date,
+            to_date=end_date,
+            snapshot_folder=os.path.join(report_folder, 'wayback_snapshots'),
+        )
+
+
 class DataProcessing():
     def report_preprocessing(self, short_domain, report_file_type):
         report_ctime = datetime.now().strftime('%d-%m-%Y, %H:%M:%S')
@@ -116,6 +140,7 @@ class DataProcessing():
          report_folder, ctime, report_ctime) = self.report_preprocessing(short_domain, report_file_type)
 
         logging.info(f'### THIS LOG PART FOR {casename} CASE, TIME: {ctime} STARTS HERE')
+        wayback_snapshot_result = None
         print(Fore.LIGHTMAGENTA_EX + "\n[STARTED BASIC DOMAIN SCAN]" + Style.RESET_ALL)
         print(Fore.GREEN + "[1/11] Getting domain IP address" + Style.RESET_ALL)
         ip = cp.ip_gather(short_domain)
@@ -337,8 +362,31 @@ class DataProcessing():
                 elif snapshotting_flag.lower() == 'p':
                     save_page_as_html(url, report_folder + '//domain_html_copy.html')
                 elif snapshotting_flag.lower() == 'w':
-                    download_snapshot(short_domain, from_date, end_date, report_folder)
+                    wayback_snapshot_result = run_wayback_snapshotting(
+                        short_domain, from_date, end_date, report_folder
+                    )
+                    if not isinstance(wayback_snapshot_result, dict):
+                        wayback_snapshot_result = snapshot_error_result(
+                            'snapshot module returned no result',
+                            domain=short_domain,
+                            from_date=from_date,
+                            to_date=end_date,
+                            snapshot_folder=os.path.join(
+                                report_folder, 'wayback_snapshots'
+                            ),
+                        )
+                    print(
+                        Fore.GREEN
+                        + f"Wayback snapshot outcome: {wayback_snapshot_result['status']} "
+                        + f"({wayback_snapshot_result['downloaded_count']} downloaded, "
+                        + f"{wayback_snapshot_result['failed_count']} failed, "
+                        + f"{wayback_snapshot_result['duplicate_count']} duplicate timestamp(s))"
+                        + Style.RESET_ALL
+                    )
                 print(Fore.LIGHTMAGENTA_EX + f"[ENDED DOMAIN SNAPSHOTTING]\n" + Style.RESET_ALL)
+
+            if wayback_snapshot_result is None:
+                wayback_snapshot_result = snapshot_not_requested_result(short_domain)
 
             data_array = [
                 ip, res, mails, subdomains, subdomains_amount, social_medias,
@@ -354,7 +402,7 @@ class DataProcessing():
                 accessed_links_counter, keywords_messages_list, dorking_status,
                 dorking_file_path, virustotal_output, securitytrails_output,
                 hudsonrock_intel, ps_string, total_ports, total_ips, total_vulns,
-                lunarcyber_intel
+                lunarcyber_intel, wayback_snapshot_result
             ]
 
         report_info_array = [
