@@ -153,6 +153,23 @@ class DistributedQueueScheduler(Scheduler):
                 self.stats.inc_value("scheduler/dequeued/distributed-queue", spider=self.spider)
             return request
         else:
+            # Distinguish "no message available right now" from "a polled
+            # message could not be restored into a Request and was redelivered
+            # or skipped". Only the former is an empty-queue condition.
+            # RabbitQueue does not expose this flag, so its behaviour is
+            # unchanged.
+            if getattr(self.queue, "last_pop_failed", False):
+                self.waiting = False
+                if self.stats:
+                    self.stats.inc_value(
+                        "scheduler/dequeued/failed", spider=self.spider
+                    )
+                logger.warning(
+                    "Distributed queue %s returned no request because a message "
+                    "failed to parse; it will be retried or has been skipped.",
+                    self.queue.name,
+                )
+                return None
             if not self.waiting:
                 msg = "Queue {} is empty. Waiting for messages..."
                 self.waiting = True

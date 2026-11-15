@@ -67,6 +67,7 @@ class TestKafkaQueueConfig:
         assert cfg.num_partitions == 10
         assert cfg.replication_factor == 3
         assert cfg.arguments is None
+        assert cfg.max_retries == 3
 
     def test_custom_values(self):
         cfg = KafkaQueueConfig(
@@ -74,11 +75,13 @@ class TestKafkaQueueConfig:
             num_partitions=4,
             replication_factor=1,
             arguments={"compression.type": "gzip"},
+            max_retries=5,
         )
         assert cfg.topic == "crawl"
         assert cfg.num_partitions == 4
         assert cfg.replication_factor == 1
         assert cfg.arguments == {"compression.type": "gzip"}
+        assert cfg.max_retries == 5
 
 
 class TestRocketMQQueueConfig:

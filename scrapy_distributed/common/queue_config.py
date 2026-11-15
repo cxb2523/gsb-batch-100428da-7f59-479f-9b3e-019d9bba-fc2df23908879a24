@@ -35,11 +35,16 @@ class KafkaQueueConfig(object):
         num_partitions=10,
         replication_factor=3,
         arguments=None,
+        max_retries=3,
     ):
         self.topic = topic
         self.num_partitions = num_partitions
         self.replication_factor = replication_factor
         self.arguments = arguments
+        # Maximum number of times a message whose body cannot be restored into a
+        # Scrapy Request is re-delivered before it is skipped (its offset committed)
+        # so that one poison message cannot block the whole partition forever.
+        self.max_retries = max_retries
 
 
 class RocketMQQueueConfig(object):
