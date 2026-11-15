@@ -14,6 +14,8 @@ from pathlib import Path
 import requests
 from redis import Redis
 from rq import Queue
+from rq.exceptions import NoSuchJobError
+from rq.job import Job
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from common.rq_dashboard_custom import format_dicomweb_job_command
@@ -419,27 +421,155 @@ def _queue_dicomweb_download(config, entry, dir_name, image_type, queue_prio):
     return download_job
 
 
+def _series_outcome(entry, status, reason=None, job_id=None):
+    """One per-series outcome record for the download_series_dicomweb result."""
+    return {
+        "series_uid": entry.get("series_uid"),
+        "study_uid": entry.get("study_uid"),
+        "accession_number": entry.get("accession_number"),
+        "status": status,
+        "reason": reason,
+        "job_id": job_id,
+    }
+
+
 def download_series_dicomweb(config, series_list, dir_name, image_type, queue_prio):
     """Download series via DICOMweb WADO-RS.
 
     Drop-in replacement for job.download_series: enqueues one RQ job per series.
+
+    Returns a dict describing the outcome of every requested series::
+
+        {
+            "total": <number of series requested>,
+            "queued": <series successfully enqueued>,
+            "failed": <series rejected before enqueue>,
+            "config_error": None or <str>,  # set when the DICOMweb config is
+                                            # invalid; then every series failed
+            "series": [
+                {
+                    "series_uid": ...,
+                    "study_uid": ...,
+                    "accession_number": ...,
+                    "status": "queued" | "failed",
+                    "reason": None or <str>,
+                    "job_id": <RQ job id of the download job> or None,
+                },
+                ...
+            ],
+        }
+
+    A series that was enqueued may still fail later inside the RQ worker;
+    call refresh_download_outcomes() with this result to pick up the final
+    state of each download job.
     """
-    _validate_dicomweb_config(config)
+    series_list = list(series_list)
+    result = {
+        "total": len(series_list),
+        "queued": 0,
+        "failed": 0,
+        "config_error": None,
+        "series": [],
+    }
+    try:
+        _validate_dicomweb_config(config)
+    except ValueError as exc:
+        # Invalid config makes the whole batch unusable. Record it on the
+        # result (and on every series) instead of raising, so callers can
+        # see exactly which series were affected; also logged, not swallowed.
+        logger.error(
+            "DICOMweb configuration invalid, no series enqueued: %s", exc,
+        )
+        result["config_error"] = str(exc)
+        for entry in series_list:
+            result["series"].append(
+                _series_outcome(entry, "failed", f"configuration invalid: {exc}"),
+            )
+        result["failed"] = len(result["series"])
+        return result
+
     for entry in series_list:
-        study_uid = entry.get("study_uid")
-        series_uid = entry.get("series_uid")
-        accession_number = entry.get("accession_number")
-        if not all([study_uid, series_uid, accession_number]):
+        missing = [
+            key
+            for key in ("study_uid", "series_uid", "accession_number")
+            if not entry.get(key)
+        ]
+        if missing:
+            reason = f"missing required field(s): {', '.join(missing)}"
             logger.error(
-                "Missing study_uid, series_uid, or accession_number: %s", entry,
+                "Cannot queue DICOMweb download for %s: %s", entry, reason,
+            )
+            result["series"].append(_series_outcome(entry, "failed", reason))
+            continue
+        try:
+            download_job = _queue_dicomweb_download(
+                config, entry, dir_name, image_type, queue_prio,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Failed to queue DICOMweb download for series %s",
+                entry.get("series_uid"),
+            )
+            result["series"].append(
+                _series_outcome(entry, "failed", f"enqueue failed: {exc}"),
             )
             continue
-        _queue_dicomweb_download(config, entry, dir_name, image_type, queue_prio)
         logger.debug(
             "Queued DICOMweb download for series %s (accession %s)",
-            series_uid, accession_number,
+            entry["series_uid"], entry.get("accession_number"),
         )
-    return len(series_list)
+        result["series"].append(
+            _series_outcome(
+                entry, "queued", job_id=getattr(download_job, "id", None),
+            ),
+        )
+
+    result["queued"] = sum(
+        1 for s in result["series"] if s["status"] == "queued"
+    )
+    result["failed"] = result["total"] - result["queued"]
+    return result
+
+
+def refresh_download_outcomes(result, connection=None):
+    """Update a download_series_dicomweb result with the current RQ job states.
+
+    For every series that was enqueued (has a job_id), the status is refreshed
+    from the RQ job: "queued"/"started"/"finished" mirror the job state, and a
+    failed download job marks the series as "failed" with the job's error as
+    the reason. Series that already failed before enqueue are left untouched.
+    The queued/failed counters are recomputed. Returns the updated result.
+    """
+    if connection is None:
+        connection = Redis()
+    for series in result.get("series", []):
+        job_id = series.get("job_id")
+        if not job_id or series.get("status") == "failed":
+            continue
+        try:
+            job = Job.fetch(job_id, connection=connection)
+        except NoSuchJobError:
+            series["status"] = "unknown"
+            series["reason"] = f"download job {job_id} no longer exists"
+            continue
+        job_status = job.get_status()
+        if job_status == "failed":
+            series["status"] = "failed"
+            exc_lines = (job.exc_info or "").strip().splitlines()
+            series["reason"] = (
+                f"download job failed: {exc_lines[-1]}"
+                if exc_lines else "download job failed"
+            )
+        elif job_status in ("finished", "started"):
+            series["status"] = job_status
+        else:
+            series["status"] = "queued"
+    if "series" in result:
+        result["failed"] = sum(
+            1 for s in result["series"] if s["status"] == "failed"
+        )
+        result["queued"] = result.get("total", len(result["series"])) - result["failed"]
+    return result
 
 
 def download_series_debug_dicomweb(config, study_uid, series_uid, dir_name):

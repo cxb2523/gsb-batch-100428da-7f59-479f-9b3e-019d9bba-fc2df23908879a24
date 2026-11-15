@@ -89,9 +89,25 @@ def download():
     method = app.config.get("RETRIEVE_METHOD", "movescu")
     try:
         if method == "dicomweb":
-            length = download_series_dicomweb(
+            result = download_series_dicomweb(
                 app.config, series_list, dir_name, image_type, queue_prio,
             )
+            if result.get("config_error"):
+                app.logger.error(
+                    "Download configuration error: %s", result["config_error"],
+                )
+                return json.dumps({
+                    "status": "error",
+                    "message": result["config_error"],
+                    "result": result,
+                }), 400
+            return json.dumps({
+                "status": "OK",
+                "series_length": result["total"],
+                "queued": result["queued"],
+                "failed": result["failed"],
+                "series": result["series"],
+            })
         else:
             length = download_series(
                 app.config, series_list, dir_name, image_type, queue_prio,
