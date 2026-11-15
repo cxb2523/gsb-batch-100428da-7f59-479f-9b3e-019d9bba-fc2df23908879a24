@@ -23,7 +23,34 @@ import {
 import type { Task, TaskAssignee } from "./helpers/types";
 
 interface PollStaticData extends IDataObject {
+	/**
+	 * Timestamp of the last emitted task. Kept as its own key for backwards
+	 * compatibility with workflows whose static data predates the composite
+	 * watermark.
+	 */
 	lastCreatedTime?: string;
+	/** Id of the last emitted task, used to disambiguate equal timestamps. */
+	lastCreatedTaskId?: string;
+}
+
+/**
+ * Watermark identifying the last emitted task.
+ *
+ * `createdTime` alone is not enough: several tasks can share the same
+ * millisecond, and a strict `>` comparison on the timestamp would drop all but
+ * one of them forever. The task id breaks that tie deterministically.
+ */
+interface TaskWatermark {
+	createdTime: string;
+	/**
+	 * Id of the last emitted task.
+	 *
+	 * - a string (possibly empty when the task carried no id) means composite
+	 *   watermark, so only same-millisecond tasks sorting after it are pending;
+	 * - `undefined` means the state predates composite watermarks and only
+	 *   carries a timestamp.
+	 */
+	taskId: string | undefined;
 }
 
 interface ProjectListItem {
@@ -65,6 +92,76 @@ function extractAssigneeId(assignee: Task["assignee"]): string | undefined {
 }
 
 const MAX_EMITTED_PER_POLL = 500;
+
+function createdTimeToMs(createdTime: string): number {
+	return Date.parse(createdTime);
+}
+
+function compareCreatedTime(a: string, b: string): number {
+	const aMs = createdTimeToMs(a);
+	const bMs = createdTimeToMs(b);
+	if (!Number.isNaN(aMs) && !Number.isNaN(bMs)) return aMs - bMs;
+	return a.localeCompare(b);
+}
+
+function taskIdOf(task: Task): string {
+	return task.id === undefined || task.id === null ? "" : String(task.id);
+}
+
+/**
+ * Ordering used both for sorting the fetched tasks and for advancing the
+ * watermark, so that a task can never sort before the watermark and still be
+ * considered newer than it.
+ */
+function compareTasks(a: Task, b: Task): number {
+	const byTime = compareCreatedTime(
+		a.createdTime as string,
+		b.createdTime as string,
+	);
+	if (byTime !== 0) return byTime;
+	return taskIdOf(a).localeCompare(taskIdOf(b));
+}
+
+function readWatermark(staticData: PollStaticData): TaskWatermark | undefined {
+	const createdTime = staticData.lastCreatedTime;
+	if (typeof createdTime !== "string" || createdTime.length === 0) {
+		return undefined;
+	}
+	// Key presence, not emptiness, separates "no id recorded because the task
+	// had none" from legacy timestamp-only state.
+	const hasTaskId = Object.prototype.hasOwnProperty.call(
+		staticData,
+		"lastCreatedTaskId",
+	);
+	const rawTaskId = staticData.lastCreatedTaskId;
+	return {
+		createdTime,
+		taskId: hasTaskId
+			? typeof rawTaskId === "string"
+				? rawTaskId
+				: ""
+			: undefined,
+	};
+}
+
+function writeWatermark(staticData: PollStaticData, task: Task): void {
+	staticData.lastCreatedTime = task.createdTime as string;
+	staticData.lastCreatedTaskId = taskIdOf(task);
+}
+
+function isAfterWatermark(task: Task, watermark: TaskWatermark): boolean {
+	const byTime = compareCreatedTime(
+		task.createdTime as string,
+		watermark.createdTime,
+	);
+	if (byTime !== 0) return byTime > 0;
+	// Static data written before the composite watermark only stored a
+	// timestamp. Its same-millisecond tasks may still be unemitted (the old
+	// comparison dropped them), so treat that whole millisecond as pending.
+	// At worst this re-emits tasks from a single millisecond once.
+	if (watermark.taskId === undefined) return true;
+	return taskIdOf(task).localeCompare(watermark.taskId) > 0;
+}
 
 async function fetchTasksV1(
 	context: IPollFunctions,
@@ -342,9 +439,10 @@ export class TickTickTrigger implements INodeType {
 
 		tasks = tasks.filter((t) => typeof t.createdTime === "string");
 
-		tasks.sort((a, b) =>
-			(a.createdTime as string).localeCompare(b.createdTime as string)
-		);
+		// Project/assignee filters above run before any watermark movement, so a
+		// filtered-out task can never advance the watermark past tasks that are
+		// still owed to the caller. Ordering is createdTime, then task id.
+		tasks.sort(compareTasks);
 
 		if (isManual) {
 			return tasks.length > 0
@@ -353,22 +451,22 @@ export class TickTickTrigger implements INodeType {
 		}
 
 		const staticData = this.getWorkflowStaticData("node") as PollStaticData;
-		const lastCreatedTime = staticData.lastCreatedTime;
+		const watermark = readWatermark(staticData);
 
-		if (!lastCreatedTime) {
+		if (!watermark) {
 			if (tasks.length > 0) {
-				staticData.lastCreatedTime = tasks[tasks.length - 1].createdTime as string;
+				writeWatermark(staticData, tasks[tasks.length - 1]);
 			}
 			return null;
 		}
 
-		const emitted = tasks
-			.filter((t) => (t.createdTime as string) > lastCreatedTime)
-			.slice(0, MAX_EMITTED_PER_POLL);
+		const pending = tasks.filter((t) => isAfterWatermark(t, watermark));
+		if (pending.length === 0) return null;
 
-		if (emitted.length === 0) return null;
-
-		staticData.lastCreatedTime = emitted[emitted.length - 1].createdTime as string;
+		// The remaining backlog stays after the watermark and is picked up by
+		// the following polls.
+		const emitted = pending.slice(0, MAX_EMITTED_PER_POLL);
+		writeWatermark(staticData, emitted[emitted.length - 1]);
 		return [this.helpers.returnJsonArray(emitted)];
 	}
 }
