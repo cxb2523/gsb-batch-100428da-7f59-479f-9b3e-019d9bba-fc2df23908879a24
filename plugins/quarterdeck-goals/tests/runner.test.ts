@@ -98,6 +98,77 @@ test('a due tool watch is called from the tick with nobody asked, and something 
   expect(spawned).toMatchObject([{ prompt: 'Run Mail' }])
 })
 
+test('a tool watch answer larger than the send limit is reported as truncated', async ($, on) => {
+  const { clock } = engine(on)
+  settle = () => clock.settle()
+  const SEARCH = 'mcp__mail__search'
+  on('tool.call', { tool: SEARCH as never }, () => ({ result: `x${'y'.repeat(70_000)}` }) as never)
+  const fake = fakeQuarterdeck(on, [goal({ id: 'g1', name: 'Mail' })], {
+    toolWatches: [{ watch_id: 'w-g1', goal_id: 'g1', name: 'mail', tool: SEARCH, input: {} }],
+  })
+  await $.session.start(START)
+  await settle()
+  const report = fake.of('watch_report')[0]!.input as { text?: string; truncated?: boolean }
+  expect(report.truncated).toBe(true)
+  expect((report.text ?? '').length).toBeLessThanOrEqual(60_000)
+})
+
+test('the four tool-watch failures are reported with distinct kinds, each keeping its own ending', async ($, on) => {
+  const { spawned, clock } = engine(on)
+  settle = () => clock.settle()
+  // A fake connector whose answer depends on which tool is called
+  on('tool.call', { tool: 'mcp__mail__timeout' as never }, () => new Promise(() => { /* never answers: the 30 s limit fires */ }) as never)
+  on('tool.call', { tool: 'mcp__mail__denied' as never }, () => ({ deny: 'denied by a permission rule' }) as never)
+  on('tool.call', { tool: 'mcp__mail__error' as never }, () => ({ result: 'Not signed in', isError: true }) as never)
+  on('tool.call', { tool: 'mcp__mail__threw' as never }, () => { throw new Error('the connector process is gone') })
+  const fake = fakeQuarterdeck(on, [goal({ id: 'g1', name: 'Mail' })], {
+    toolWatches: [
+      { watch_id: 'w-1', goal_id: 'g1', name: 'timeout', tool: 'mcp__mail__timeout', input: {} },
+      { watch_id: 'w-2', goal_id: 'g1', name: 'denied', tool: 'mcp__mail__denied', input: {} },
+      { watch_id: 'w-3', goal_id: 'g1', name: 'error', tool: 'mcp__mail__error', input: {} },
+      { watch_id: 'w-4', goal_id: 'g1', name: 'threw', tool: 'mcp__mail__threw', input: {} },
+    ],
+  })
+  await $.session.start(START)
+  // The timeout check waits for the 30 s call limit
+  await clock.advance(30_000)
+  await settle()
+
+  const reports = fake.of('watch_report').map((c) => c.input)
+  expect(reports).toEqual([
+    { watch_id: 'w-2', error_kind: 'denied', error: 'Claude Code refused the call: denied by a permission rule' },
+    { watch_id: 'w-3', error_kind: 'tool_error', error: 'Not signed in' },
+    { watch_id: 'w-4', error_kind: 'exception', error: 'the connector process is gone' },
+    { watch_id: 'w-1', error_kind: 'timeout', error: expect.stringContaining("didn't answer within 30 s") },
+  ])
+  // No run starts from failures, and nothing in the round threw the pass over
+  expect(spawned).toEqual([])
+})
+
+test('one failed tool-watch check does not block a successful watch in the same round from starting a run', async ($, on) => {
+  const { spawned, clock } = engine(on)
+  settle = () => clock.settle()
+  const SEARCH = 'mcp__mail__search'
+  on('tool.call', { tool: 'mcp__mail__broken' as never }, () => ({ deny: 'denied by a rule' }) as never)
+  on('tool.call', { tool: SEARCH as never }, () => ({ result: '{"threads":[{"id":"1a"}]}' }) as never)
+  const fake = fakeQuarterdeck(on, [goal({ id: 'g1', name: 'Mail' })], {
+    toolWatches: [
+      { watch_id: 'w-1', goal_id: 'g1', name: 'broken', tool: 'mcp__mail__broken', input: {} },
+      { watch_id: 'w-g1', goal_id: 'g1', name: 'working', tool: SEARCH, input: {} },
+    ],
+  })
+  await $.session.start(START)
+  await settle()
+
+  // Both checks are reported: the denial as its own failure, the success as text
+  const reports = fake.of('watch_report').map((c) => c.input)
+  expect(reports).toContainEqual({ watch_id: 'w-1', error_kind: 'denied', error: 'Claude Code refused the call: denied by a rule' })
+  expect(reports).toContainEqual({ watch_id: 'w-g1', text: '{"threads":[{"id":"1a"}]}' })
+  // The successful watch queued a run and the second pass claimed it despite the other failure
+  expect(fake.of('goals_tick')).toHaveLength(2)
+  expect(spawned).toMatchObject([{ prompt: 'Run Mail' }])
+})
+
 test('a tool watch whose call is refused or fails is reported as a failed check', async ($, on) => {
   const { spawned, clock } = engine(on)
   settle = () => clock.settle()
@@ -112,8 +183,8 @@ test('a tool watch whose call is refused or fails is reported as a failed check'
   await $.session.start(START)
   await settle()
   expect(fake.of('watch_report').map((c) => c.input)).toEqual([
-    { watch_id: 'w-1', error: 'Claude Code refused the call: denied by a permission rule' },
-    { watch_id: 'w-2', error: 'Not signed in' },
+    { watch_id: 'w-1', error_kind: 'denied', error: 'Claude Code refused the call: denied by a permission rule' },
+    { watch_id: 'w-2', error_kind: 'tool_error', error: 'Not signed in' },
   ])
   expect(fake.of('goals_tick')).toHaveLength(1)
   expect(spawned).toEqual([])

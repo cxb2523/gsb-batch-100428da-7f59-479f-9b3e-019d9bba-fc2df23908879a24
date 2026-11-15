@@ -7,8 +7,9 @@ import {
   openDatabase, createGoal, updateGoal, getGoal, getOpenRun, listRuns, buildBrief, claimRun, endRun, failRun, schedulerPass,
   setWatch, removeWatch, listWatches, getWatch, watchDue, watchFailing, toLines, recordWatchLines, checkCommandWatch, listWatchEvents,
   takeWatchEvents, checkWatches, queueForWatchEvents, applyGoalChanges, reportRunEnd, buildOverview, deleteGoal,
-  WATCH_MAX_LINES, WATCH_SEEN_MAX, WATCH_LINE_CHARS, WATCH_BRIEF_LINES, WATCH_REPORT_GRACE_MS,
+  WATCH_MAX_LINES, WATCH_SEEN_MAX, WATCH_LINE_CHARS, WATCH_BRIEF_LINES, WATCH_REPORT_GRACE_MS, WATCH_CHECK_HISTORY,
   matchLines, describeWatch, reportToolWatch, markRunUntrusted, getRun, WATCH_EVENTS_SOURCE,
+  recordWatchCheck, listWatchChecks, listGoalWatchChecks, watchFailureKind,
 } from './index.js'
 
 let db: Database
@@ -409,6 +410,114 @@ describe('tool watches', () => {
     expect(() => reportToolWatch(db, c.id, { text: 'x' })).toThrow(/not found/)
     expect(applyGoalChanges(db, 'g1', { watches: { mail: { tool: SEARCH, input: { query: 'x' }, every_minutes: 2 } } }))
       .toEqual([`watch "mail" changed: every 2 min, calls ${SEARCH} {"query":"x"}`])
+  })
+})
+
+describe('tool watch check outcomes', () => {
+  const SEARCH = 'mcp__claude_ai_Gmail__search_threads'
+  const answer = (...ids: string[]) => JSON.stringify({ resultCountEstimate: '201', threads: ids.map((id) => ({ id })) })
+
+  it('a successful check records the item count, and truncation when the answer was cut', () => {
+    const w = setWatch(db, 'g1', 'mail', { tool: SEARCH })
+    expect(reportToolWatch(db, w.id, { text: answer('1a', '2b', '3c') })).not.toHaveProperty('truncated')
+    const [first] = listWatchChecks(db, w.id)
+    expect(first).toMatchObject({ outcome: 'ok', item_count: 3, truncated: false, error: null })
+
+    const truncated = reportToolWatch(db, w.id, { text: answer('4d'), truncated: true })
+    expect(truncated).toMatchObject({ truncated: true })
+    const checks = listWatchChecks(db, w.id)
+    expect(checks[0]).toMatchObject({ outcome: 'ok', item_count: 1, truncated: true })
+    expect(checks[1]).toMatchObject({ outcome: 'ok', truncated: false })
+  })
+
+  it('keeps the four failure kinds apart, each with its original error, and they do not overwrite each other', () => {
+    const w = setWatch(db, 'g1', 'mail', { tool: SEARCH })
+    reportToolWatch(db, w.id, { text: answer('1a') }) // a working baseline first
+    const failures = [
+      { kind: 'timeout', error: "mcp__mail didn't answer within 30 s" },
+      { kind: 'denied', error: 'Claude Code refused the call: denied by a rule' },
+      { kind: 'tool_error', error: 'Not signed in' },
+      { kind: 'exception', error: 'Cannot read properties of undefined' },
+    ] as const
+    for (const f of failures) {
+      expect(reportToolWatch(db, w.id, { error: f.error, error_kind: f.kind })).toMatchObject({ error: f.error, error_kind: f.kind })
+    }
+    const checks = listWatchChecks(db, w.id)
+    // Newest first: the four distinct failures, then the successful baseline, each keeping its own ending
+    expect(checks.map((c) => c.outcome)).toEqual(['exception', 'tool_error', 'denied', 'timeout', 'ok'])
+    expect(checks.slice(0, 4).every((c) => c.item_count === 0 && c.truncated === false && c.error !== null)).toBe(true)
+    expect(checks.find((c) => c.outcome === 'denied')!.error).toContain('refused')
+    expect(checks.find((c) => c.outcome === 'timeout')!.error).toContain('30 s')
+    // A failure leaves the seen lines alone but raises the fail count
+    expect(getWatch(db, w.id)).toMatchObject({ seen: ['1a'], fail_count: 4 })
+  })
+
+  it('an unrecognised or missing failure kind is an exception, so an old plugin still records something', () => {
+    const w = setWatch(db, 'g1', 'mail', { tool: SEARCH })
+    expect(watchFailureKind(undefined)).toBe('exception')
+    expect(watchFailureKind('boom' as never)).toBe('exception')
+    expect(watchFailureKind('denied')).toBe('denied')
+    // The old shape ({ error } with no kind): stored as an exception, not dropped
+    expect(reportToolWatch(db, w.id, { error: 'something threw' } as never)).toMatchObject({ error_kind: 'exception' })
+    expect(listWatchChecks(db, w.id)[0]).toMatchObject({ outcome: 'exception', error: 'something threw' })
+  })
+
+  it('keeps only the newest WATCH_CHECK_HISTORY endings per watch', () => {
+    const w = setWatch(db, 'g1', 'mail', { tool: SEARCH })
+    for (let i = 0; i < WATCH_CHECK_HISTORY + 4; i++) {
+      recordWatchCheck(db, w.id, i % 2 ? { outcome: 'ok', itemCount: i } : { outcome: 'timeout', error: `late ${i}` })
+    }
+    const checks = listWatchChecks(db, w.id)
+    expect(checks).toHaveLength(WATCH_CHECK_HISTORY)
+    expect(checks[0]).toMatchObject({ outcome: 'ok', item_count: WATCH_CHECK_HISTORY + 3 })
+    expect(listGoalWatchChecks(db, 'g1')).toHaveLength(WATCH_CHECK_HISTORY)
+  })
+
+  it('records no check endings for a command watch, whose behaviour is unchanged', async () => {
+    const w = setWatch(db, 'g1', 'cmd', { command: 'node -e "console.log(1)"' })
+    await checkCommandWatch(db, w.id)
+    expect(listWatchChecks(db, w.id)).toEqual([])
+    const [full] = buildOverview(db, 'all').goals
+    expect(full!.watches.find((x) => x.name === 'cmd')).not.toHaveProperty('checks')
+  })
+
+  it('a failed check on one watch does not stop another watch in the same round from queuing a run', async () => {
+    const broken = setWatch(db, 'g1', 'broken', { tool: SEARCH, every_minutes: 1 })
+    const working = setWatch(db, 'g1', 'working', { tool: SEARCH, every_minutes: 1 })
+    // First round: baselines for both
+    let pass = await schedulerPass(db, { holder: 'A', toolWatches: true })
+    expect(pass.tool_watches).toHaveLength(2)
+    for (const call of pass.tool_watches!) reportToolWatch(db, call.watch_id, { text: answer('1a') })
+    // Next round, a minute later: one check fails (timeout), the other sees a new item
+    pass = await schedulerPass(db, { holder: 'A', toolWatches: true, now: later(1) })
+    const calls = pass.tool_watches!
+    const bad = calls.find((c) => c.watch_id === broken.id)!
+    const good = calls.find((c) => c.watch_id === working.id)!
+    reportToolWatch(db, bad.watch_id, { error: 'timed out', error_kind: 'timeout' })
+    reportToolWatch(db, good.watch_id, { text: answer('2b', '1a') })
+    // The failure is recorded as its own ending...
+    expect(listWatchChecks(db, broken.id)[0]).toMatchObject({ outcome: 'timeout' })
+    // ...and the successful watch still queued a run that the pass claims
+    const claimed = (await schedulerPass(db, { holder: 'A', toolWatches: true, now: later(1) })).claimed
+    expect(claimed).toHaveLength(1)
+    expect(claimed[0]).toMatchObject({ trigger: 'watch' })
+    expect(buildBrief(db, 'g1', claimed[0]!.run_id).watch_events).toEqual([{ watch: 'working', new: ['2b'], omitted: 0 }])
+  })
+
+  it('surfaces the recent endings in full detail but not on a card, and removes them with the goal', () => {
+    const w = setWatch(db, 'g1', 'mail', { tool: SEARCH })
+    reportToolWatch(db, w.id, { text: answer('1a') })
+    reportToolWatch(db, w.id, { error: 'refused', error_kind: 'denied' })
+    const [full] = buildOverview(db, 'all').goals
+    const view = full!.watches[0]!
+    expect(view.checks).toEqual([
+      { at: expect.any(String), outcome: 'denied', error: 'refused' },
+      { at: expect.any(String), outcome: 'ok', item_count: 1, truncated: false },
+    ])
+    const [card] = buildOverview(db, []).goals
+    expect(card!.watches).toEqual([])
+    deleteGoal(db, 'g1')
+    expect(db.prepare('SELECT COUNT(*) n FROM goal_watch_checks').get()).toEqual({ n: 0 })
   })
 })
 

@@ -101,7 +101,7 @@ Mail, calendars and cloud files have no command to run: only a Claude Code sessi
 - `match` (optional): a regular expression over the answer's text; each match's first group is one item. Left out, every `"id": "…"` in a JSON answer is an item, which suits most searches.
 - Call the tool yourself first with the same input and look at the answer: check the ids are there and are stable.
 - The first call is made within a minute by the session running goals. `goal_detail` shows the watch as failing, with the reason, if the connector isn't signed in there or the call is refused.
-- A call that takes over 30 seconds, is refused by a permission rule, or answers an error is a failed check: nothing starts.
+- Every check leaves a checkable ending, and the last ten are shown on the goal (the Goals pane when the goal is expanded, and `goal_detail`). A successful check says how many items it retrieved and whether the answer was too large and truncated. A failed check names one of four causes — it **timed out** (over 30 s), Claude Code **refused** it (a permission rule), the **tool returned an error**, or the **call threw** — and keeps the original error. Nothing starts on a failure, and one watch failing never blocks another watch's run.
 
 New mail in the inbox (Gmail connector):
 
@@ -127,5 +127,5 @@ A goal can have both a schedule and watches. The watch brings the run forward; t
 
 - Giving an existing name changes that watch. A new command starts over with a new first check.
 - `null` removes a watch: `{ "watches": { "new issues": null } }`.
-- `goal_detail` lists a goal's watches and says when one is failing and why.
+- `goal_detail` lists a goal's watches with their recent check endings and says when one is failing and why.
 - Tell the goal what to do with the news: add a line to its instructions such as "watch_events lists new issue numbers: read each with `gh issue view` and propose a label".

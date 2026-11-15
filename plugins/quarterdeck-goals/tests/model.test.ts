@@ -4,7 +4,7 @@ import { phoneText } from '../hooks/alerts'
 
 import {
   ago, choiceFromAnswer, choiceOptions, clip, diffAlerts, EMPTY, findGoal, nextRunText, parseSchedule, parseSuggestion, scheduleLabel, spark,
-  statusText, suggestByKeywords, offersWatch, watchSetupPrompt, toCard, cleanTitle, fallbackTitle, splitGoalArgs, runCost, planModeBlocked, soundsEventDriven, isQuiet, allowRules, allowRulesPrompt, describe, describeGoalChanges, modelName, newGoalModelText, readModelAnswer } from '../hooks/model'
+  statusText, suggestByKeywords, offersWatch, watchSetupPrompt, toCard, cleanTitle, fallbackTitle, splitGoalArgs, runCost, planModeBlocked, soundsEventDriven, isQuiet, allowRules, allowRulesPrompt, describe, describeWatchCheck, describeGoalChanges, modelName, newGoalModelText, readModelAnswer } from '../hooks/model'
 import { TEMPLATES, CI_FIX, ISSUE_FIX, ISSUE_FIX_OTHERS_WATCH } from '../hooks/templates'
 import { goal, NOW, proposal } from './fixtures'
 
@@ -270,6 +270,33 @@ test('a run that read untrusted content says so, and so does a tool rule marking
   expect(g.runs[0]!.untrusted).toBe('WebFetch')
   expect(describe(g, NOW)).toContain('[read outside content (WebFetch): auto actions needed approval]')
   expect(describeGoalChanges(g, { tool_map: { 'mcp__issues__get_issue': 'untrusted' } })[0]).toMatch(/untrusted \(reads outside content/)
+})
+
+test('describeWatchCheck words each ending, with item count, truncation and the original error', () => {
+  const at = new Date(NOW - 5 * 60_000).toISOString()
+  expect(describeWatchCheck({ at, outcome: 'ok', itemCount: 3, truncated: false }, NOW)).toMatch(/^5m ago: ok, 3 items$/)
+  expect(describeWatchCheck({ at, outcome: 'ok', itemCount: 1, truncated: true }, NOW)).toContain('ok, 1 item (answer too large: truncated)')
+  expect(describeWatchCheck({ at, outcome: 'timeout', error: "didn't answer within 30 s" }, NOW)).toContain('timed out')
+  expect(describeWatchCheck({ at, outcome: 'denied', error: 'Claude Code refused the call: denied by a rule' }, NOW)).toContain('refused by Claude Code: Claude Code refused')
+  expect(describeWatchCheck({ at, outcome: 'tool_error', error: 'Not signed in' }, NOW)).toContain('the tool returned an error: Not signed in')
+  expect(describeWatchCheck({ at, outcome: 'exception', error: 'it threw' }, NOW)).toContain('the call threw: it threw')
+})
+
+test('goal_detail describes a tool watch with its recent check endings', () => {
+  const g = card({
+    id: 'g1', name: 'Inbox',
+    watches: [{
+      name: 'new mail', every_minutes: 5, runs: 'mcp__mail__search', last_fired_at: null, failing: false, error: null,
+      checks: [
+        { at: new Date(NOW).toISOString(), outcome: 'denied', error: 'Claude Code refused the call: denied by a rule' },
+        { at: new Date(NOW - 5 * 60_000).toISOString(), outcome: 'ok', item_count: 2, truncated: false },
+      ],
+    }],
+  })
+  const text = describe(g, NOW)
+  expect(text).toContain('recent checks (newest first)')
+  expect(text).toContain('refused by Claude Code')
+  expect(text).toContain('ok, 2 items')
 })
 
 test('a goal about something arriving is offered a watch first, its timer next', () => {

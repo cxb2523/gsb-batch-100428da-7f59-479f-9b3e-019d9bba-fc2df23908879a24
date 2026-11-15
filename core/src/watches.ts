@@ -18,7 +18,7 @@ import { runVerifyCommand } from './gates.js'
 import { getGoal, newId } from './goals.js'
 import { canonicalToolName, matchToolCategory, QUARTERDECK_TOOL_PREFIX } from './guard.js'
 import { getPlan } from './queries.js'
-import type { Watch, WatchEvent, WatchSpec } from './types.js'
+import type { Watch, WatchCheck, WatchCheckFailure, WatchCheckOutcome, WatchEvent, WatchSpec } from './types.js'
 
 export const WATCH_TIMEOUT_S = 30
 /** Lines read from one check; more are ignored. */
@@ -32,6 +32,10 @@ export const WATCH_OUTPUT_CHARS = 64 * 1024
 export const WATCH_FAILING_AFTER = 3
 /** New lines per watch a brief lists; the rest are counted. */
 export const WATCH_BRIEF_LINES = 50
+/** Tool-watch check endings kept per watch, the newest first. */
+export const WATCH_CHECK_HISTORY = 10
+/** How much of a failed call's original error is kept. */
+export const WATCH_ERROR_CHARS = 500
 export const WATCH_MIN_MINUTES = 1
 export const WATCH_DEFAULT_MINUTES = 5
 /** A tool watch's lines when it has no `match` of its own: every "id" in a JSON answer. */
@@ -141,6 +145,87 @@ export function removeWatch(db: Database, planId: string, name: string): boolean
   return true
 }
 
+// ── Tool-watch check outcomes ─────────────────────────────────────────────────
+
+/** The four ways a tool-watch call can fail, as the plugin reports them. */
+export const WATCH_FAILURE_KINDS: readonly WatchCheckFailure[] = ['timeout', 'denied', 'tool_error', 'exception']
+
+function isFailureKind(kind: string): kind is WatchCheckFailure {
+  return (WATCH_FAILURE_KINDS as readonly string[]).includes(kind)
+}
+
+/** What the plugin reports about one tool-watch check. */
+export type ToolWatchReport =
+  | { text: string; /** The plugin cut the answer to its send limit before matching. */ truncated?: boolean }
+  | { error: string; /** How the call failed; an older plugin leaves it out and 'exception' stands in. */ error_kind?: WatchCheckFailure }
+
+/**
+ * Keeps one check's ending: an answer with how many items it held and whether
+ * it was truncated, or a named failure with the original error. Only the
+ * newest WATCH_CHECK_HISTORY stay. The row is written separately from the
+ * watch itself, so a routine check bumps no plan revision.
+ */
+export function recordWatchCheck(
+  db: Database, watchId: string, result: { outcome: WatchCheckOutcome; itemCount?: number; truncated?: boolean; error?: string | null },
+  now: Date = new Date(),
+): WatchCheck {
+  const watch = getWatch(db, watchId)
+  if (!watch) throw new Error(`Watch ${watchId} not found`)
+  const at = now.toISOString()
+  const failed = result.outcome !== 'ok'
+  const error = failed ? (result.error ?? '').trim().slice(-WATCH_ERROR_CHARS) || 'The check failed.' : null
+  const row: WatchCheck = {
+    id: newId('wck'),
+    watch_id: watchId,
+    plan_id: watch.plan_id,
+    outcome: result.outcome,
+    item_count: failed ? 0 : result.itemCount ?? 0,
+    truncated: failed ? false : result.truncated === true,
+    error,
+    created_at: at,
+  }
+  db.transaction(() => {
+    db.prepare('INSERT INTO goal_watch_checks (id, watch_id, plan_id, outcome, item_count, truncated, error, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(row.id, row.watch_id, row.plan_id, row.outcome, row.item_count, row.truncated ? 1 : 0, row.error, row.created_at)
+    pruneWatchChecks(db, watchId)
+  })()
+  return row
+}
+
+/** Drops check endings beyond the newest WATCH_CHECK_HISTORY of one watch. */
+function pruneWatchChecks(db: Database, watchId: string): void {
+  db.prepare(`
+    DELETE FROM goal_watch_checks WHERE watch_id = ? AND id NOT IN (
+      SELECT id FROM goal_watch_checks WHERE watch_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?
+    )
+  `).run(watchId, watchId, WATCH_CHECK_HISTORY)
+}
+
+/** A watch's recent check endings, newest first (at most WATCH_CHECK_HISTORY). */
+export function listWatchChecks(db: Database, watchId: string, limit = WATCH_CHECK_HISTORY): WatchCheck[] {
+  const rows = db.prepare('SELECT * FROM goal_watch_checks WHERE watch_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?').all(watchId, limit) as Row[]
+  return rows.map(deserializeCheck)
+}
+
+/** A goal's recent check endings across its tool watches, newest first. */
+export function listGoalWatchChecks(db: Database, planId: string, limit = WATCH_CHECK_HISTORY): WatchCheck[] {
+  const rows = db.prepare('SELECT * FROM goal_watch_checks WHERE plan_id = ? ORDER BY created_at DESC, rowid DESC LIMIT ?').all(planId, limit) as Row[]
+  return rows.map(deserializeCheck)
+}
+
+function deserializeCheck(r: Row): WatchCheck {
+  return {
+    id: r.id as string, watch_id: r.watch_id as string, plan_id: r.plan_id as string,
+    outcome: r.outcome as WatchCheckOutcome, item_count: Number(r.item_count), truncated: r.truncated === 1,
+    error: (r.error as string | null) ?? null, created_at: r.created_at as string,
+  }
+}
+
+/** A reported failure kind, with anything unrecognised (or missing) treated as an exception. */
+export function watchFailureKind(kind: string | undefined): WatchCheckFailure {
+  return kind && isFailureKind(kind) ? kind : 'exception'
+}
+
 export function watchDue(watch: Watch, now: Date = new Date()): boolean {
   if (!watch.last_checked_at) return true
   return now.getTime() - new Date(watch.last_checked_at).getTime() >= watch.every_minutes * 60_000
@@ -163,7 +248,7 @@ export function toLines(output: string): string[] {
   return [...lines]
 }
 
-export interface WatchCheck {
+export interface WatchCheckResult {
   /** True for the first check that worked: it recorded what is there and started nothing. */
   baseline: boolean
   /** How many lines the check gave. */
@@ -171,13 +256,17 @@ export interface WatchCheck {
   /** The lines not seen before (none on the baseline). */
   fresh: string[]
   error?: string
+  /** Tool watches only: which of the four failure kinds a failed check was. */
+  error_kind?: WatchCheckFailure
+  /** Tool watches only: the answer was cut before the whole of it was checked. */
+  truncated?: boolean
 }
 
 /**
  * Records one check's result: the lines it gave, or why it failed. New lines
  * become events. A failed check leaves what was seen alone and fires nothing.
  */
-export function recordWatchLines(db: Database, watchId: string, result: { lines: string[] } | { error: string }, now: Date = new Date()): WatchCheck {
+export function recordWatchLines(db: Database, watchId: string, result: { lines: string[] } | { error: string }, now: Date = new Date()): WatchCheckResult {
   const watch = getWatch(db, watchId)
   if (!watch) throw new Error(`Watch ${watchId} not found`)
   const at = now.toISOString()
@@ -217,7 +306,7 @@ export function recordWatchLines(db: Database, watchId: string, result: { lines:
 }
 
 /** Runs a command watch in its goal's working directory and records the result. */
-export async function checkCommandWatch(db: Database, watchId: string, now: Date = new Date()): Promise<WatchCheck> {
+export async function checkCommandWatch(db: Database, watchId: string, now: Date = new Date()): Promise<WatchCheckResult> {
   const watch = getWatch(db, watchId)
   if (!watch) throw new Error(`Watch ${watchId} not found`)
   const plan = getPlan(db, watch.plan_id)
@@ -271,13 +360,27 @@ export function takeDueToolWatches(db: Database, planIds: string[], now: Date = 
   return calls
 }
 
-/** Records what a tool watch's call answered: its text, read into lines, or why it failed. */
-export function reportToolWatch(db: Database, watchId: string, result: { text: string } | { error: string }, now: Date = new Date()): WatchCheck {
+/**
+ * Records what a tool watch's call answered: its text, read into lines, or why
+ * it failed. Either way the check leaves a verifiable ending in
+ * goal_watch_checks (an answer's item count and whether it was truncated, or a
+ * named failure with the original error), keeping the watch's seen lines and
+ * fail count exactly as before.
+ */
+export function reportToolWatch(db: Database, watchId: string, result: ToolWatchReport, now: Date = new Date()): WatchCheckResult {
   const watch = getWatch(db, watchId)
   if (!watch || watch.kind !== 'tool') throw new Error(`Tool watch ${watchId} not found`)
   db.prepare('UPDATE goal_watches SET asked_at = NULL WHERE id = ?').run(watchId)
-  if ('error' in result) return recordWatchLines(db, watchId, { error: result.error }, now)
-  return recordWatchLines(db, watchId, { lines: matchLines(result.text, watch.match) }, now)
+  if ('error' in result) {
+    const kind = watchFailureKind(result.error_kind)
+    const check = recordWatchCheck(db, watchId, { outcome: kind, error: result.error }, now)
+    const lines = recordWatchLines(db, watchId, { error: check.error! }, now)
+    return { ...lines, error_kind: kind }
+  }
+  const lines = matchLines(result.text, watch.match)
+  const check = recordWatchCheck(db, watchId, { outcome: 'ok', itemCount: lines.length, truncated: result.truncated === true }, now)
+  const recorded = recordWatchLines(db, watchId, { lines }, now)
+  return check.truncated ? { ...recorded, truncated: true } : recorded
 }
 
 // ── Events ────────────────────────────────────────────────────────────────────

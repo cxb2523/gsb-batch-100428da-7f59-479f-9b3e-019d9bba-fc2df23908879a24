@@ -2,8 +2,7 @@
  * Pure functions: the web app's overview turned into cards, goal-name
  * matching, alert diffing and the small formatters the pane uses.
  */
-import type { GoalCard, Item, Schedule, Snapshot, Update } from '../types'
-
+import type { GoalCard, Item, Schedule, Snapshot, Update, WatchCheck } from '../types'
 /** One goal as GET /api/goals/overview returns it (the fields used here). */
 export type OverviewGoal = {
   id: string
@@ -34,9 +33,29 @@ export type OverviewGoal = {
   memory: { id: string; kind: string; text: string; pinned: boolean; untrusted?: string | null }[]
   suggestions: { category: string; approved_in_a_row: number }[]
   /** Missing from a server older than watches. */
-  watches?: { name: string; every_minutes: number; fires?: 'new' | 'change'; runs: string; last_fired_at: string | null; failing: boolean; error: string | null }[]
+  watches?: {
+    name: string; every_minutes: number; fires?: 'new' | 'change'; runs: string; last_fired_at: string | null; failing: boolean; error: string | null
+    /** Tool watches only (a server new enough): the recent check endings, newest first. */
+    checks?: OverviewWatchCheck[]
+  }[]
   watch_count?: number
   watch_failing?: boolean
+}
+
+/** One tool-watch check ending as the overview carries it. */
+export type OverviewWatchCheck = {
+  at: string
+  outcome: 'ok' | 'timeout' | 'denied' | 'tool_error' | 'exception'
+  item_count?: number
+  truncated?: boolean
+  error?: string | null
+}
+
+/** Narrows an overview check into the discriminated union the pane and goal_detail use. */
+function toWatchCheck(c: OverviewWatchCheck): WatchCheck {
+  return c.outcome === 'ok'
+    ? { at: c.at, outcome: 'ok', itemCount: c.item_count ?? 0, truncated: c.truncated === true }
+    : { at: c.at, outcome: c.outcome, error: c.error ?? null }
 }
 
 type OverviewItem = { id: string; goal: string; action?: { category?: string; summary?: string } | null; asks_person?: boolean; notes?: string | null; clipped?: boolean }
@@ -88,7 +107,10 @@ export function toCard(g: OverviewGoal): GoalCard {
     trend: g.health.map((check) => check.value).filter((v): v is number => v !== null).reverse(),
     memory: g.memory.map((m) => ({ id: m.id, kind: m.kind, text: m.text, pinned: m.pinned, ...(m.untrusted && { untrusted: m.untrusted }) })),
     suggestions: g.suggestions.map((s) => ({ category: s.category, approvedInARow: s.approved_in_a_row })),
-    watches: (g.watches ?? []).map((w) => ({ name: w.name, everyMinutes: w.every_minutes, onChange: w.fires === 'change', runs: w.runs, lastFiredAt: w.last_fired_at, failing: w.failing, error: w.error })),
+    watches: (g.watches ?? []).map((w) => ({
+      name: w.name, everyMinutes: w.every_minutes, onChange: w.fires === 'change', runs: w.runs, lastFiredAt: w.last_fired_at, failing: w.failing, error: w.error,
+      checks: (w.checks ?? []).map(toWatchCheck),
+    })),
     watchCount: g.watch_count ?? g.watches?.length ?? 0,
     watchFailing: g.watch_failing ?? (g.watches ?? []).some((w) => w.failing),
   }
@@ -245,13 +267,35 @@ export function describe(g: GoalCard, now: number): string {
     `Schedule: ${g.oneOff ? 'one-off' : scheduleLabel(g.schedule)}`,
     `Model: ${goalModelLabel(g.model)}`,
     g.watches.length > 0
-      ? `Watches (a run starts when one sees a new line):\n${g.watches.map((w) => `- ${w.name}: every ${w.everyMinutes} min${w.onChange ? ' (on change)' : ''}, runs ${w.runs}${w.failing ? ` [failing: ${w.error ?? 'no message'}]` : ''}${w.lastFiredAt ? `, last ${w.onChange ? 'changed' : 'saw something new'} ${ago(w.lastFiredAt, now)}` : ''}`).join('\n')}`
+      ? `Watches (a run starts when one sees a new line):\n${g.watches.map((w) => `- ${w.name}: every ${w.everyMinutes} min${w.onChange ? ' (on change)' : ''}, runs ${w.runs}${w.failing ? ` [failing: ${w.error ?? 'no message'}]` : ''}${w.lastFiredAt ? `, last ${w.onChange ? 'changed' : 'saw something new'} ${ago(w.lastFiredAt, now)}` : ''}${w.checks.length ? `\n  recent checks (newest first):\n${w.checks.map((c) => `    - ${describeWatchCheck(c, now)}`).join('\n')}` : ''}`).join('\n')}`
       : null,
     `Autonomy (unlisted categories: propose): ${Object.entries(g.autonomy).map(([c, m]) => `${c}=${m}`).join(', ') || 'none set'}`,
     Object.keys(g.toolMap).length ? `Tool rules: ${Object.entries(g.toolMap).map(([p, c]) => `${p} → ${c}`).join(', ')}` : null,
     allowRulesText(g),
     g.memory.length > 0 ? `Memory:\n${g.memory.map((m) => `- ${m.id} [${m.kind}${m.pinned ? ', pinned' : ''}${m.untrusted ? `, untrusted: written after ${m.untrusted}` : ''}] ${m.text}`).join('\n')}` : null,
   ].filter(Boolean).join('\n\n')
+}
+
+/** What a failed tool-watch check is called in plain words (the four failure kinds). */
+export function watchFailureLabel(outcome: WatchCheck['outcome']): string {
+  switch (outcome) {
+    case 'timeout': return 'timed out'
+    case 'denied': return 'refused by Claude Code'
+    case 'tool_error': return 'the tool returned an error'
+    case 'exception': return 'the call threw'
+    default: return 'failed'
+  }
+}
+
+/** One tool-watch check ending in one line, for the pane and goal_detail. */
+export function describeWatchCheck(c: WatchCheck, now: number): string {
+  const when = ago(c.at, now)
+  if (c.outcome === 'ok') {
+    const items = `${c.itemCount} ${c.itemCount === 1 ? 'item' : 'items'}`
+    return `${when}: ok, ${items}${c.truncated ? ' (answer too large: truncated)' : ''}`
+  }
+  const detail = c.error ? `: ${c.error}` : ''
+  return `${when}: ${watchFailureLabel(c.outcome)}${detail}`
 }
 
 /** `text` cut to `columns` characters, ending in … when cut. */

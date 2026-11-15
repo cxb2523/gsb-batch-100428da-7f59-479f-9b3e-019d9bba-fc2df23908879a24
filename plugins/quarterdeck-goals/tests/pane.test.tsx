@@ -391,6 +391,27 @@ test('a goal with a watch and no schedule says it runs on its watch, not that it
   }
 })
 
+test('an expanded tool watch lists its recent check endings, with item count, truncation and the failure kind', async ($, on) => {
+  engine(on)
+  const watch = {
+    name: 'new mail', every_minutes: 5, runs: 'mcp__mail__search', last_fired_at: null, failing: false, error: null,
+    checks: [
+      { at: '2026-11-07T07:59:00Z', outcome: 'denied' as const, error: 'Claude Code refused the call: denied by a rule' },
+      { at: '2026-11-07T07:54:00Z', outcome: 'ok' as const, item_count: 3, truncated: true },
+      { at: '2026-11-07T07:49:00Z', outcome: 'ok' as const, item_count: 2, truncated: false },
+    ],
+  }
+  fakeQuarterdeck(on, [goal({ id: 'g1', name: 'Inbox', watches: [watch] })])
+  await $.session.start(START)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'toggle-g1' })
+  // Newest first; each ending says what happened in plain words
+  expect(await ui.find({ type: 'Text', text: /refused by Claude Code: Claude Code refused the call/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /ok, 3 items \(answer too large: truncated\)/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /ok, 2 items/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('Set schedule asks with the suggestion first and sets the choice', async ($, on) => {
   const { asked } = engine(on, { answer: 'Weekly' })
   const fake = fakeQuarterdeck(on, [goal({ id: 'g1', name: 'Status', objective: 'a weekly report', next_run_at: null, schedule: null })])

@@ -36,7 +36,7 @@ export const REVISION_TRIGGERS = [
  * a session still running older code then sees it is outdated (`schemaOutdated`)
  * and leaves scheduling to the newer one.
  */
-export const SCHEMA_VERSION = 9
+export const SCHEMA_VERSION = 10
 
 /** The schema version recorded in the database (0 before versions existed). */
 export function dbSchemaVersion(db: Database): number {
@@ -459,6 +459,28 @@ export function runMigrations(db: Database): void {
     BEGIN UPDATE plans SET revision = revision + 1 WHERE id = NEW.plan_id; END;
     CREATE TRIGGER IF NOT EXISTS trg_goal_watches_delete_revision AFTER DELETE ON goal_watches
     BEGIN UPDATE plans SET revision = revision + 1 WHERE id = OLD.plan_id; END;
+  `)
+
+  // ── Tool watch check outcomes (schema version 10): every check leaves a verifiable ending ──
+  // One row per tool-watch check; the latest WATCH_CHECK_HISTORY per watch are kept. No revision
+  // trigger: a check every few minutes must not redraw the pane's cards, and the table is never
+  // updated in place, so the watch triggers above don't fire because of it either.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS goal_watch_checks (
+      id          TEXT PRIMARY KEY,
+      watch_id    TEXT NOT NULL REFERENCES goal_watches(id) ON DELETE CASCADE,
+      plan_id     TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+      -- 'ok': the tool answered; the rest name how the call failed
+      outcome     TEXT NOT NULL CHECK (outcome IN ('ok', 'timeout', 'denied', 'tool_error', 'exception')),
+      -- How many item lines the answer gave (0 for a failure)
+      item_count  INTEGER NOT NULL DEFAULT 0,
+      -- The answer was larger than the plugin sends on, so only part of it was checked
+      truncated   INTEGER NOT NULL DEFAULT 0,
+      -- A failure's original error, clipped (null on success)
+      error       TEXT,
+      created_at  TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_goal_watch_checks_watch ON goal_watch_checks(watch_id, created_at);
   `)
 
   // ── Agent transcripts ───────────────────────────────────────────────────────

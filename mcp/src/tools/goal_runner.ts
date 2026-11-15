@@ -247,16 +247,28 @@ async function firstChecks(goalId: string): Promise<{ name: string; result: stri
 
 /**
  * What a tool watch's call answered (the plugin made the call). Something new
- * queues a run at once, for the caller's next pass to start.
+ * queues a run at once, for the caller's next pass to start. Every check also
+ * leaves a verifiable ending: an answer's item count and truncation, or a named
+ * failure (timeout / denied / tool_error / exception) with its original error.
  */
 export async function watch_report(args: unknown) {
   const input = WatchReportSchema.parse(args)
   const watch = getWatch(input.watch_id)
   if (!watch) throw new Error(`Watch ${input.watch_id} not found.`)
-  const r = reportToolWatch(watch.id, input.error !== undefined ? { error: input.error } : { text: input.text ?? '' })
+  const r = reportToolWatch(
+    watch.id,
+    input.error !== undefined
+      ? { error: input.error, ...(input.error_kind && { error_kind: input.error_kind }) }
+      : { text: input.text ?? '', ...(input.truncated && { truncated: true }) },
+  )
   const goal = getGoal(watch.plan_id)
   const queued = r.fresh.length && goal?.status === 'active' ? queueForWatchEvents(watch.plan_id) : null
-  return { watch_id: watch.id, baseline: r.baseline, lines: r.lines, new: r.fresh.length, ...(r.error && { error: r.error }), queued_run: queued ? queued.id : null }
+  return {
+    watch_id: watch.id, baseline: r.baseline, lines: r.lines, new: r.fresh.length,
+    ...(r.truncated && { truncated: true }),
+    ...(r.error && { error: r.error, error_kind: r.error_kind ?? 'exception' }),
+    queued_run: queued ? queued.id : null,
+  }
 }
 
 /** A run's agent finished a turn (reported by the guard plugin): skips a run that hit the usage limit and holds goal runs. */

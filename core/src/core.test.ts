@@ -3,7 +3,7 @@ import { Database } from './sqlite.js'
 import {
   openDatabase, runMigrations, insertPlan, insertTask, updateTask, updatePlan, touchPlan,
   deleteTaskTree, getPlanRevision, getTask, getChildren, getSiblings, nextChildId,
-  insertVerification, getVerifications, getLatestVerification, REVISION_TRIGGERS,
+  insertVerification, getVerifications, getLatestVerification, REVISION_TRIGGERS, SCHEMA_VERSION,
   createGoal, getGoal, envVar, defaultDbPath, type NewTask,
 } from './index.js'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'fs'
@@ -60,6 +60,17 @@ describe('runMigrations', () => {
     runMigrations(db)
     runMigrations(db)
     expect(getGoal(db, 'g1')!.tool_map).toEqual({ mcp__quarterdeck__unsubscribe_one_click: 'email.unsubscribe', 'mcp__claude_ai_Gmail__*': 'email.delete' })
+  })
+
+  it('creates the tool-watch check history table and raises the schema version', () => {
+    expect(Number(db.pragma('user_version', { simple: true }))).toBe(SCHEMA_VERSION)
+    const cols = (db.prepare('PRAGMA table_info(goal_watch_checks)').all() as { name: string }[]).map((c) => c.name)
+    expect(cols).toEqual(['id', 'watch_id', 'plan_id', 'outcome', 'item_count', 'truncated', 'error', 'created_at'])
+    // The CHECK constraint rejects an outcome that isn't one of the five endings
+    expect(() => db.exec("INSERT INTO goal_watch_checks (id, watch_id, plan_id, outcome, created_at) VALUES ('x', 'w', 'g', 'bogus', 't')"))
+      .toThrow()
+    runMigrations(db) // idempotent: running it again keeps the table and version
+    expect(db.prepare('SELECT COUNT(*) n FROM goal_watch_checks').get()).toEqual({ n: 0 })
   })
 })
 

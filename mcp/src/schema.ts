@@ -133,7 +133,11 @@ export const GoalsTickSchema = z.object({
 export const WatchReportSchema = z.object({
   watch_id: z.string(),
   text: z.string().optional().describe("The tool's answer as text"),
-  error: z.string().optional().describe('Why the call failed, when it did'),
+  /** The answer was larger than what is sent, so only part of it was checked. */
+  truncated: z.boolean().optional().describe('The answer was cut before the whole of it was checked'),
+  error: z.string().optional().describe('Why the call failed, when it did (the original error, clipped)'),
+  error_kind: z.enum(['timeout', 'denied', 'tool_error', 'exception']).optional()
+    .describe('How the call failed: the call timed out, Claude Code refused it, the tool returned an error, or the call threw'),
 }).refine((v) => v.text !== undefined || v.error !== undefined, { message: 'Give the text the tool answered, or the error.' })
 
 export const GoalsOverviewSchema = z.object({

@@ -87,6 +87,17 @@ export type GoalCard = {
   watchFailing: boolean
 }
 
+export type WatchCheckOutcome = 'ok' | 'timeout' | 'denied' | 'tool_error' | 'exception'
+
+/** One tool-watch check's verifiable ending, newest first in a watch's list. */
+export type WatchCheck = {
+  at: string
+  outcome: WatchCheckOutcome
+} & (
+  | { outcome: 'ok'; itemCount: number; truncated: boolean; error?: null }
+  | { outcome: Exclude<WatchCheckOutcome, 'ok'>; error: string | null; itemCount?: never; truncated?: never }
+)
+
 export type Watch = {
   name: string
   everyMinutes: number
@@ -97,6 +108,8 @@ export type Watch = {
   lastFiredAt: string | null
   failing: boolean
   error: string | null
+  /** Tool watches only: the recent check endings (an answer's item count and truncation, or a named failure). */
+  checks: WatchCheck[]
 }
 
 /** The latest read of the Quarterdeck web app. */

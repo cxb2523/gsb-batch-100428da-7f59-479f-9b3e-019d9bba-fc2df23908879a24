@@ -51,7 +51,7 @@ type FakeGoal = {
   memory: { id: string; kind: string; text: string; pinned: boolean; untrusted?: string | null }[]
   suggestions: { category: string; approved_in_a_row: number }[]
   status_note?: { text: string; at: string | null; stale: boolean; untrusted: string | null; tone?: 'ok' | 'attention' | 'problem' | null } | null
-  watches?: { name: string; every_minutes: number; runs: string; last_fired_at: string | null; failing: boolean; error: string | null }[]
+  watches?: { name: string; every_minutes: number; fires?: 'new' | 'change'; runs: string; last_fired_at: string | null; failing: boolean; error: string | null; checks?: { at: string; outcome: 'ok' | 'timeout' | 'denied' | 'tool_error' | 'exception'; item_count?: number; truncated?: boolean; error?: string | null }[] }[]
 }
 
 export function goal(over: Partial<FakeGoal> & { id: string; name: string }): FakeGoal {
@@ -195,6 +195,17 @@ export function fakeQuarterdeck(on: On, goals: FakeGoal[], opts: { fail?: boolea
           if (fresh) {
             watched!.open_run = { id: `r${++runs}`, status: 'queued' }
             version++
+          }
+          // Keep the check ending on the watch, newest first, like the server's goal_watch_checks
+          if (watched) {
+            const name = (opts.toolWatches ?? []).find((w) => w.watch_id === input.watch_id)?.name
+            const watch = watched.watches?.find((x) => x.name === name)
+            if (watch) {
+              const check = typeof input.text === 'string'
+                ? { at: new Date(NOW).toISOString(), outcome: 'ok' as const, item_count: 1, ...(input.truncated === true && { truncated: true }) }
+                : { at: new Date(NOW).toISOString(), outcome: (input.error_kind ?? 'exception') as 'timeout' | 'denied' | 'tool_error' | 'exception', error: String(input.error ?? 'failed') }
+              watch.checks = [check, ...(watch.checks ?? [])].slice(0, 10)
+            }
           }
           return ok({ watch_id: input.watch_id, queued_run: fresh ? watched!.open_run!.id : null }) as never
         }

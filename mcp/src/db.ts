@@ -80,7 +80,7 @@ export const reportRunProgress = (runId: string, progress: core.RunProgress) => 
 export const listWatches = (planId: string) => core.listWatches(db, planId)
 export const checkCommandWatch = (watchId: string) => core.checkCommandWatch(db, watchId)
 export const getWatch = (watchId: string) => core.getWatch(db, watchId)
-export const reportToolWatch = (watchId: string, result: { text: string } | { error: string }) => core.reportToolWatch(db, watchId, result)
+export const reportToolWatch = (watchId: string, result: core.ToolWatchReport) => core.reportToolWatch(db, watchId, result)
 export const queueForWatchEvents = (planId: string) => core.queueForWatchEvents(db, planId)
 export const todoLists =(workingDir: string) => core.todoLists(db, workingDir)
 export const addTodo = (input: Parameters<typeof core.addTodo>[1]) => core.addTodo(db, input)

@@ -201,6 +201,29 @@ export interface Watch {
 
 export type WatchFires = 'new' | 'change'
 
+/** How a tool-watch check ended: an answer, or one of the four ways the call can fail. */
+export type WatchCheckOutcome = 'ok' | 'timeout' | 'denied' | 'tool_error' | 'exception'
+
+/** The four ways a tool-watch call can fail (everything but a successful answer). */
+export type WatchCheckFailure = Exclude<WatchCheckOutcome, 'ok'>
+
+/**
+ * One tool-watch check's verifiable ending. `outcome 'ok'` means the tool
+ * answered: `item_count` says how many items the answer held and `truncated`
+ * says whether the answer was cut before the whole of it was checked. The
+ * other outcomes name how the call failed, with its original error in `error`.
+ */
+export interface WatchCheck {
+  id: string
+  watch_id: string
+  plan_id: string
+  outcome: WatchCheckOutcome
+  item_count: number
+  truncated: boolean
+  error: string | null
+  created_at: string
+}
+
 /** What the person sets on a watch. */
 export type WatchSpec =
   | { command: string; every_minutes?: number; fires?: WatchFires }

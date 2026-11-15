@@ -14,7 +14,7 @@ import type { Confirm, GoalCard, TodoItem, Todos, Update } from '../types'
 import { answerItem, approve, baseUrl, deleteGoal, deleteMemory, getItem, NOT_LOADED, reject, runNow, setGoalStatus, trustMemory, updateGoal } from './api'
 import { cancelRun } from './runner'
 import { chooseSchedule, rescheduleGoal } from './schedule'
-import { ago, allowRules, allowRulesPrompt, clip, discussPrompt, goalModelLabel, holdUntilText, isFailed, isQuiet, isWorking, lastRun, MODEL_CHOICES, modelName, nextRunText, permissionWhere, planModeBlocked, readModelAnswer, runCost, runsText, runTokens, spark, SPINNER_FRAMES, SPINNER_MS, updatePrompt } from './model'
+import { ago, allowRules, allowRulesPrompt, clip, describeWatchCheck, discussPrompt, goalModelLabel, holdUntilText, isFailed, isQuiet, isWorking, lastRun, MODEL_CHOICES, modelName, nextRunText, permissionWhere, planModeBlocked, readModelAnswer, runCost, runsText, runTokens, spark, SPINNER_FRAMES, SPINNER_MS, updatePrompt } from './model'
 import { connectRemote, markActive } from './alerts'
 import { sendToChat } from './chat'
 import { advanceSpinner, getAddingTo, getAskingAbout, getBusy, getDiscussing, getEditingTodo, getHeldTodos, getConfirm, getExpanded, getFullItems, getGuardMissing, getNotice, getPhone, getPlanMode, getRejecting, getRuns, getSnapshot, getSpinnerFrame, getTodos, setAddingTo, setAskingAbout, setConfirm, setDiscussing, setEditingTodo, setFullItem, setRejecting, toggleExpanded } from './state'
@@ -640,10 +640,19 @@ function details($: Engine, e: E, view: View, g: GoalCard) {
       <Text dimColor>{runsText(g)}</Text>
       {modelLine($, e, view, g)}
       {g.watches.map((w) => (
-        <Text key={`watch-${g.id}/${w.name}`} dimColor>
-          Also runs when "{w.name}" {w.onChange ? 'changes' : 'sees something new'} (checked every {w.everyMinutes} min{w.lastFiredAt ? `, last ${ago(w.lastFiredAt, view.now)}` : ''})
-          {w.failing && <Text color="red"> · can't check: {w.error ?? 'the command fails'}</Text>}
-        </Text>
+        <Box key={`watch-${g.id}/${w.name}`} flexDirection="column">
+          <Text dimColor>
+            Also runs when "{w.name}" {w.onChange ? 'changes' : 'sees something new'} (checked every {w.everyMinutes} min{w.lastFiredAt ? `, last ${ago(w.lastFiredAt, view.now)}` : ''})
+            {w.failing && <Text color="red"> · can't check: {w.error ?? 'the command fails'}</Text>}
+          </Text>
+          {w.checks.map((c, i) => (
+            <Text key={`check-${g.id}/${w.name}/${i}-${c.at}`} dimColor>
+              {'    '}
+              <Text color={c.outcome === 'ok' ? 'green' : 'red'}>{c.outcome === 'ok' ? '✓' : '✗'}</Text>
+              {` ${describeWatchCheck(c, view.now)}`}
+            </Text>
+          ))}
+        </Box>
       ))}
       {allowSection($, e, view, g)}
 

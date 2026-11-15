@@ -12,8 +12,8 @@ import { getOpenRun, getGoal, listGoals, listMemory, listRuns } from './goals.js
 import { autonomyFor } from './goal-engine.js'
 import { getSchedule } from './schedule.js'
 import { listHealth } from './health.js'
-import { describeWatch, listWatches, watchFailing } from './watches.js'
-import type { Event, Goal, GoalRun, Task } from './types.js'
+import { describeWatch, listWatchChecks, listWatches, watchFailing } from './watches.js'
+import type { Event, Goal, GoalRun, Task, WatchCheck } from './types.js'
 import { getRunHold } from './goal-changes.js'
 import { schemaOutdated } from './migrate.js'
 import { leaseHolder } from './goal-tick.js'
@@ -35,6 +35,14 @@ const CLIP = { summary: 300, memory: 240, title: 200, notes: 200, result: 200, a
 function clip(text: string | null, max: number): string | null {
   if (text === null || text.length <= max) return text
   return `${text.slice(0, max - 1).trimEnd()}…`
+}
+
+/** One tool-watch check ending as the overview carries it: the raw error is clipped like other notes. */
+function checkView(c: WatchCheck) {
+  return {
+    at: c.created_at, outcome: c.outcome,
+    ...(c.outcome === 'ok' ? { item_count: c.item_count, truncated: c.truncated } : { error: clip(c.error, CLIP.notes) }),
+  }
 }
 /**
  * The goal's status (set by a run through end_run), or null. It is stale when
@@ -296,6 +304,8 @@ export function buildOverview(db: Database, detail: OverviewDetail = 'all', stan
         watches: watches.map((w) => ({
           name: w.name, kind: w.kind, every_minutes: w.every_minutes, fires: w.fires, runs: clip(describeWatch(w), CLIP.watch)!,
           last_fired_at: w.last_fired_at, failing: watchFailing(w), error: watchFailing(w) ? clip(w.last_error, CLIP.notes) : null,
+          // Tool watches only, and only in full detail: the recent check endings, newest first
+          ...(w.kind === 'tool' ? { checks: listWatchChecks(db, w.id).map(checkView) } : {}),
         })),
         watch_count: watches.length,
         watch_failing: watches.some(watchFailing),

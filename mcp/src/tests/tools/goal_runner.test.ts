@@ -342,9 +342,26 @@ describe('tool watches', () => {
     const brief = await withScope({ planId: id, runId: run.run_id }, () => get_goal_brief({ goal_id: id, run_id: run.run_id })) as { watch_events: unknown[] }
     expect(brief.watch_events).toEqual([{ watch: 'mail', new: ['2b'], omitted: 0 }])
 
-    expect(await watch_report({ watch_id: watchId, error: 'refused' })).toMatchObject({ new: 0, error: 'refused', queued_run: null })
+    expect(await watch_report({ watch_id: watchId, error: 'refused', error_kind: 'denied' })).toMatchObject({ new: 0, error: 'refused', error_kind: 'denied', queued_run: null })
+    // An old plugin sends no kind: the server stands in 'exception' rather than dropping it
+    expect(await watch_report({ watch_id: watchId, error: 'boom' })).toMatchObject({ error_kind: 'exception' })
+    // A truncated answer says so
+    expect(await watch_report({ watch_id: watchId, text: answer('3c'), truncated: true })).toMatchObject({ truncated: true })
     await expect(watch_report({ watch_id: watchId })).rejects.toThrow()
     await expect(watch_report({ watch_id: 'nope', text: '' })).rejects.toThrow(/not found/)
+  })
+
+  it('watch_report records each of the four failure kinds as its own ending', async () => {
+    const { id } = await create_goal({ name: 'Mail', objective: 'Answer new mail', working_dir: tmpdir() })
+    await update_goal({ goal_id: id, watches: { mail: { tool: SEARCH } } })
+    const watchId = (await goals_tick({ holder: 'session-A', tool_watches: true }) as PassResult).tool_watches![0]!.watch_id
+    for (const [kind, error] of [['timeout', '30 s'], ['denied', 'refused'], ['tool_error', 'Not signed in'], ['exception', 'threw']] as const) {
+      expect(await watch_report({ watch_id: watchId, error, error_kind: kind })).toMatchObject({ error, error_kind: kind })
+    }
+    const overview = await goals_overview({ detail: [id] }) as unknown as { goals: { id: string; watches: { checks: { outcome: string; error?: string }[] }[] }[] }
+    const checks = overview.goals.find((g) => g.id === id)!.watches[0]!.checks
+    expect(checks.map((c) => c.outcome)).toEqual(['exception', 'tool_error', 'denied', 'timeout'])
+    expect(checks.every((c) => c.outcome === 'timeout' || typeof c.error === 'string')).toBe(true)
   })
 
   it('a watch is a command or a tool, and not a tool the goal would have to ask for', async () => {
