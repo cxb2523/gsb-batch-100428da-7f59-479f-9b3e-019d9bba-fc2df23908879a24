@@ -8,6 +8,7 @@
     "build": "vite build && node indexSearch.js && node build-site.js",
     "preview": "vite preview",
     "test": "node --check update.js",
+    "test:collector": "node --test tests/collector.test.js",
     "deploy": "wrangler deploy"
   },
   "keywords": [],
