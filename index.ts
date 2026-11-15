@@ -72,6 +72,58 @@ const BROWSER_COMMANDS_DESCRIPTION =
   '- JavaScript: {"javascript": "console.log(\'test\')"} - Execute custom JS\n' +
   'Example: [{"click": "#accept-cookies"}, {"wait": 2000}, {"input": {"input[name=\'search\']": "query"}}]';
 
+const KNOWN_BROWSER_COMMAND_ACTIONS = ["click", "input", "select", "scroll", "wait", "waitfor", "javascript"] as const;
+const MAX_WAIT_COMMAND_MS = 15000;
+const UPSTREAM_RESPONSE_SNIPPET_LENGTH = 500;
+const SCRAPI_REQUEST_TIMEOUT_MS = 300000;
+
+// Validate parsed browser commands locally so callers get a precise,
+// actionable error instead of an opaque upstream failure.
+// Returns an error message, or null when every command is valid.
+export function validateBrowserCommands(commands: unknown[]): string | null {
+  const knownActions = KNOWN_BROWSER_COMMAND_ACTIONS.join(", ");
+
+  for (let index = 0; index < commands.length; index++) {
+    const position = `Browser command #${index + 1}`;
+    const command = commands[index];
+
+    if (command === null || typeof command !== "object" || Array.isArray(command)) {
+      return `${position} must be an object containing one of the known action keys (${knownActions}).`;
+    }
+
+    const record = command as Record<string, unknown>;
+    const hasKnownAction = KNOWN_BROWSER_COMMAND_ACTIONS.some((action) => action in record);
+    if (!hasKnownAction) {
+      return `${position} has no known action key. Expected one of: ${knownActions}.`;
+    }
+
+    if ("wait" in record) {
+      const wait = record["wait"];
+      if (typeof wait !== "number" || !Number.isFinite(wait)) {
+        return `${position}: the "wait" field must be a number (milliseconds).`;
+      }
+      if (wait > MAX_WAIT_COMMAND_MS) {
+        return `${position}: the "wait" field must not exceed ${MAX_WAIT_COMMAND_MS} ms (got ${wait}).`;
+      }
+    }
+
+    if ("scroll" in record) {
+      const scroll = record["scroll"];
+      if (typeof scroll !== "number" || !Number.isFinite(scroll)) {
+        return `${position}: the "scroll" field must be a number (pixels).`;
+      }
+    }
+  }
+
+  return null;
+}
+
+function truncateForError(text: string): string {
+  return text.length > UPSTREAM_RESPONSE_SNIPPET_LENGTH
+    ? `${text.slice(0, UPSTREAM_RESPONSE_SNIPPET_LENGTH)}…`
+    : text;
+}
+
 interface ScrapeRequestBody {
   url: string;
   useBrowser: boolean;
@@ -161,6 +213,18 @@ export async function scrapeUrl(url: string, format: "HTML" | "Markdown", apiKey
     try {
       const commands = JSON.parse(browserCommands) as unknown;
       if (Array.isArray(commands)) {
+        const validationError = validateBrowserCommands(commands);
+        if (validationError !== null) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: `Error: Invalid browser commands. ${validationError}`,
+              },
+            ],
+            isError: true,
+          };
+        }
         body.browserCommands = commands;
       } else {
         return {
@@ -199,7 +263,7 @@ export async function scrapeUrl(url: string, format: "HTML" | "Markdown", apiKey
       },
       body: JSON.stringify(body),
       // ScrAPI can take up to 5 minutes to solve captchas and load dynamic pages
-      signal: AbortSignal.timeout(300000),
+      signal: AbortSignal.timeout(SCRAPI_REQUEST_TIMEOUT_MS),
     });
 
     const data = await response.text();
@@ -218,11 +282,23 @@ export async function scrapeUrl(url: string, format: "HTML" | "Markdown", apiKey
       };
     }
 
+    const snippet = truncateForError(data);
+    let category: string;
+    if (response.status === 401 || response.status === 403) {
+      category = "authentication failed (check your ScrAPI API key)";
+    } else if (response.status >= 400 && response.status < 500) {
+      category = "request rejected by ScrAPI (invalid parameters)";
+    } else if (response.status >= 500) {
+      category = "ScrAPI server error";
+    } else {
+      category = "unexpected response from ScrAPI";
+    }
+
     return {
       content: [
         {
           type: "text" as const,
-          text: data,
+          text: `Error: ScrAPI ${category} (HTTP ${response.status}). Response: ${snippet}`,
         },
       ],
       isError: true,
@@ -230,12 +306,17 @@ export async function scrapeUrl(url: string, format: "HTML" | "Markdown", apiKey
   } catch (error) {
     console.error("Error calling API:", error);
     const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+    const isTimeout =
+      error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
+    const text = isTimeout
+      ? `Error: ScrAPI request timed out after ${SCRAPI_REQUEST_TIMEOUT_MS} ms. ${errorMessage}`
+      : `Error: Network error while contacting ScrAPI. ${errorMessage}`;
 
     return {
       content: [
         {
           type: "text" as const,
-          text: `Error: Failed to scrape URL. ${errorMessage}`,
+          text,
         },
       ],
       isError: true,
