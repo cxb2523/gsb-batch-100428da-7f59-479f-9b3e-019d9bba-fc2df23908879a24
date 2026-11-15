@@ -1,0 +1,253 @@
+% LaTeX Textbook Template - Chinese Version
+% Save this as main.tex or include in your project
+
+\documentclass[12pt,a4paper,openany]{book}
+% ctex package auto-detects and configures Chinese fonts (Windows/macOS/Linux)
+\usepackage{ctex}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{geometry}
+\usepackage{xcolor}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{bookmark}
+\usepackage[most]{tcolorbox}
+\tcbuselibrary{theorems}
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,calc,matrix,fit,backgrounds}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{biblatex}
+
+% Page setup
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+
+% Disable subsection numbering
+\setcounter{secnumdepth}{1}
+
+% Custom colors
+\definecolor{titleblue}{RGB}{0,51,102}       % Chapter/section titles - blue
+\definecolor{defgreen}{RGB}{34,139,34}        % Definition/notation - green
+\definecolor{thmorange}{RGB}{230,126,0}       % Theorem/proposition/lemma/proof - orange
+\definecolor{exblue}{RGB}{70,130,180}         % Example - blue
+\definecolor{remgray}{RGB}{80,80,80}           % Remark - dark gray
+\definecolor{linkblue}{RGB}{0,70,140}
+\definecolor{exercisehead}{RGB}{139,69,19}    % Exercise - brown
+
+% Hyperlink setup
+\hypersetup{
+    colorlinks=true,
+    linkcolor=linkblue,
+    filecolor=magenta,
+    urlcolor=cyan,
+    citecolor=thmorange,
+    pdftitle={数学教材},
+    pdfauthor={教材作者},
+}
+
+% Section title formatting (sans-serif + bold titles; serif body text)
+\titleformat{\chapter}[display]
+{\sffamily\huge\bfseries\color{titleblue}}
+{\chaptertitlename\ \thechapter}{20pt}{\Huge\bfseries}
+\titleformat{\section}
+{\sffamily\Large\bfseries\color{titleblue}}
+{\color{titleblue}\thesection}{0.8em}{}
+[\color{titleblue!40}\titlerule]
+\titleformat{\subsection}
+{\sffamily\large\bfseries\color{titleblue}}
+{}{0em}{}
+
+% Header/footer
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\leftmark}
+\fancyhead[R]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\setlength{\headheight}{28pt}
+
+% --- Core theorem environment style ---
+\tcbset{
+    my_thm_base/.style={
+        enhanced,
+        breakable,
+        arc=6pt,
+        outer arc=6pt,
+        boxrule=1pt,
+        width=\textwidth,
+        center,
+        left=10pt, right=10pt, top=15pt, bottom=8pt,
+        before skip=22pt, after skip=20pt,
+        fontupper=\rmfamily,          % Body text uses serif font (Song)
+        fonttitle=\bfseries\sffamily, % Titles use sans-serif + bold (DengXian)
+        coltitle=white,
+        separator sign none,
+        titlerule=0pt,
+        toptitle=1mm, bottomtitle=1mm,
+    }
+}
+
+% Definition environment (green)
+\newtcbtheorem[number within=section]{definition}{定义}{%
+    my_thm_base, colframe=defgreen, colback=defgreen!5,
+    separator sign={：},
+    title={\thesection.\arabic{tcbcounter}\quad\tcbtitle}
+}{def}
+
+% Notation environment (green)
+\newtcbtheorem[number within=section, use counter from=definition]{notation}{记号}{%
+    my_thm_base, colframe=defgreen, colback=defgreen!5,
+    separator sign={：},
+    title={\thesection.\arabic{tcbcounter}\quad\tcbtitle}
+}{not}
+
+% Theorem environment (orange)
+\newtcbtheorem[number within=section]{theorem}{定理}{%
+    my_thm_base, colframe=thmorange, colback=thmorange!5,
+    separator sign={：},
+    title={\thesection.\arabic{tcbcounter}\quad\tcbtitle}
+}{thm}
+
+% Lemma environment (orange)
+\newtcbtheorem[number within=section, use counter from=theorem]{lemma}{引理}{%
+    my_thm_base, colframe=thmorange, colback=thmorange!5,
+    separator sign={：},
+    title={\thesection.\arabic{tcbcounter}\quad\tcbtitle}
+}{lem}
+
+% Proposition environment (orange)
+\newtcbtheorem[number within=section, use counter from=theorem]{proposition}{命题}{%
+    my_thm_base, colframe=thmorange, colback=thmorange!5,
+    separator sign={：},
+    title={\thesection.\arabic{tcbcounter}\quad\tcbtitle}
+}{prop}
+
+% Example environment (horizontal lines style)
+\newtcbtheorem[number within=section]{example}{}{%
+    enhanced,
+    breakable,
+    frame hidden,             % Hide outer frame
+    interior hidden,          % Hide background color
+    sharp corners,            % Sharp corners
+    boxrule=0pt,              % Base border thickness
+    left=15pt, right=15pt,    % Left/right padding
+    top=12pt, bottom=12pt,    % Internal vertical spacing
+    toptitle=2pt,            % Spacing between title and top line
+    before skip=12pt,        % Spacing before box
+    after skip=12pt,         % Spacing after box
+    % Top and bottom horizontal lines (gray start, black end)
+    borderline north={1pt}{0pt}{black!50},
+    borderline south={1pt}{0pt}{black},
+    coltitle=black,               % Title color
+    fonttitle=\bfseries\sffamily, % Sans-serif bold title
+    fontupper=\rmfamily,          % Body text uses serif
+    attach title to upper,
+    after title={\par\smallskip},
+    separator sign none,
+    title={\thesection.\arabic{tcbcounter}\quad 例：\tcbtitle},
+}{ex}
+
+% Exercise environment (brown)
+\newtcbtheorem[number within=section]{exercise}{练习}{%
+    my_thm_base, colframe=exercisehead, colback=exercisehead!5,
+    separator sign={：},
+    title={\thesection.\arabic{tcbcounter}\quad\tcbtitle}
+}{exer}
+
+% Remark environment (dark gray)
+\newtcbtheorem[number within=section]{remark}{注}{%
+    my_thm_base, colframe=remgray, colback=remgray!5,
+    separator sign={：},
+    title={\thesection.\arabic{tcbcounter}\quad\tcbtitle}
+}{rem}
+
+% Proof (bold label, serif text)
+\renewenvironment{proof}[1][\proofname]{%
+    \par\medskip\noindent{\sffamily\color{thmorange}\textbf{#1}\quad}{\small}
+}{%
+    \hfill\qed\par\medskip
+}
+
+% First-line indent 2 characters, moderate paragraph spacing
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0pt plus 0.1em}
+
+% Paragraph indentation in enumerate environments (for answers.tex appendix)
+\setlist[enumerate]{%
+  listparindent=\parindent,  % First-line indent for paragraphs within list items
+  parsep=0pt plus 0.1em      % Paragraph spacing
+}
+
+% Allow ragged bottom (prevents line spacing from being stretched)
+\raggedbottom
+
+\begin{document}
+
+% Your content goes here
+% Example:
+% \chapter{向量空间}
+%
+% 本章介绍向量空间的基本概念...
+%
+% \section{定义和基本性质}
+%
+% 让我们从最基本的概念开始...
+%
+% \begin{definition}{向量空间}{def:vector_space}
+% 域 $\mathbb{F}$ 上的向量空间 $V$ 是...
+% \end{definition}
+%
+% 这个定义刻画了...
+%
+% \begin{theorem}{基定理}{thm:basis}
+% 每个向量空间都有基。
+% \end{theorem}
+%
+% \begin{proof}
+% 证明由佐恩引理可得...
+% \end{proof}
+
+% === Answer Appendix Format (optional) ===
+% If you have an answers.tex appendix, use this format:
+%
+% \chapter{参考答案}
+%
+% \section{作业一参考答案}
+%
+% \begin{enumerate}
+%     \item \textbf{解：} 第一题的解答...
+%
+%     多段解答自动缩进：
+%
+%     这是第二段，会自动缩进。
+%
+%     \begin{enumerate}
+%         \item \textbf{解：} 子问题 的解答...
+%         \item \textbf{解：} 子问题 的解答...
+%     \end{enumerate}
+%
+%     \item \textbf{解：} 第二题的解答...
+% \end{enumerate}
+%
+% Note: Paragraphs within \item automatically indent due to
+% \setlist[enumerate]{listparindent=\parindent} in preamble.
+
+% [Important] Chinese quotation marks in LaTeX — use the following format:
+% 在 LaTeX 中使用中文引号时，请使用以下格式：
+% - 左双引号：按两次 ` 键（Tab 键上方）→  ``
+% - 右双引号：按两次 ' 键（分号右侧）→  ''
+% - 左单引号：按一次 ` 键 →  `
+% - 右单引号：按一次 ' 键 →  '
+%
+% 示例：
+% 我们关于``接近''和``连续''的概念...    % 正确：使用 `` 和 ''
+% 这是一个``简单''的定义。               % 正确：使用 `` 和 ''
+%
+% 不要使用：
+% 我们关于"接近"和"连续"的概念...      % 错误：ASCII 直引号
+% 我们关于「接近」和「连续」的概念...   % 错误：角引号
+
+\end{document}
