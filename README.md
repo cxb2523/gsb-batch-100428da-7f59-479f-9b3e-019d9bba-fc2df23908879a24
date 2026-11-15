@@ -66,6 +66,14 @@ interface Options<L, R, P> {
    */
   shouldQueue(props: { location: L; origin: L; response: R; parsed: P }): ValueOrPromise<boolean>;
   /**
+   * This function is called once for every visited location, with the outcome of the visit.
+   *
+   * Errors thrown by this function are logged and do not interrupt the crawl.
+   *
+   * @default undefined
+   */
+  onVisit?: OnVisit<L, R, P>;
+  /**
    * The logger can be set to `console` to output debug information to the `console`.
    *
    * @default undefined
@@ -82,8 +90,36 @@ interface PostParseProps<L, R, P> extends PreParseProps<L, R> {
   parsed: P;
 }
 
+/**
+ * The outcome of visiting a single location.
+ */
+type VisitOutcome = 'yielded' | 'skipped' | 'unparsed' | 'failed';
+
+interface VisitProps<L, R, P> {
+  location: L;
+  /**
+   * The location this location was followed from, or `undefined` for the start location.
+   */
+  origin: L | undefined;
+  outcome: VisitOutcome;
+  response?: R;
+  parsed?: P;
+  error?: unknown;
+}
+
+type OnVisit<L, R, P> = (props: VisitProps<L, R, P>) => ValueOrPromise<void>;
+
 type ValueOrPromise<T> = T | Promise<T>;
 ```
+
+The `outcome` of a visit is one of:
+
+- `yielded`: the location was parsed and yielded a result.
+- `skipped`: the location did not pass `shouldParse` (or the requester returned no response) or did not pass `shouldYield`.
+- `unparsed`: the `parser` returned an empty result.
+- `failed`: the `requester`, `shouldParse` or `parser` threw an error. The error is available as `error`.
+
+A failing location does not stop the crawler from continuing with the other locations that were followed from its parent.
 
 There are built-in modules available that implement some of these configuration values. See [Modules](.#modules) section.
 
