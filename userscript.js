@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TikTok User Region
 // @namespace    https://github.com/haithamaouati/BlackCat/
-// @version      1.5
+// @version      1.6
 // @description  Shows the video creator's region and the viewer's region in an alert
 // @author       Haitham Aouati         
 // @run-at       document-end
@@ -23,8 +23,11 @@
     const RETRY_MS = 1000;
 
     let initialId = getVideoId();
-    let lastHandledUrl = '';
-    let runToken = 0;
+    let lastCheckedUrl = location.href;
+    // Videos with a collection currently running, and videos already
+    // collected successfully: re-triggers for either are ignored.
+    const inFlightIds = new Set();
+    const doneIds = new Set();
     let pageLoaded = document.readyState === 'complete';
 
     function say(msg) {
@@ -132,33 +135,43 @@
     async function run() {
         if (!pageLoaded && document.readyState !== 'complete') return;
 
+        // Bind this collection to the video that triggered it.
         const url = location.href;
         const videoId = getVideoId();
-        if (!videoId || url === lastHandledUrl) return;
-        lastHandledUrl = url;
+        if (!videoId) return;
+        if (inFlightIds.has(videoId) || doneIds.has(videoId)) return; // same video: don't collect twice
+        inFlightIds.add(videoId);
+        lastCheckedUrl = url;
 
-        const token = ++runToken;
+        // The collection is stale once the page shows a different video/URL.
+        const isStale = () => location.href !== url || getVideoId() !== videoId;
         const allowRegex = videoId === initialId;
 
         try {
             let data = null;
-            for (let i = 0; i < MAX_TRIES && token === runToken; i++) {
+            for (let i = 0; i < MAX_TRIES && !isStale(); i++) {
                 data = fromDocument(document, videoId, allowRegex);
                 if (data) break;
-                await new Promise(r => setTimeout(r, RETRY_MS));
+                if (i < MAX_TRIES - 1) {
+                    console.log(LOG, 'video ' + videoId + ': attempt ' + (i + 1) + '/' + MAX_TRIES +
+                        ' found no region data, retrying in ' + RETRY_MS + 'ms');
+                    await new Promise(r => setTimeout(r, RETRY_MS));
+                }
             }
+            if (isStale()) return; // page moved to another video: discard silently
 
             let fetchError = null;
-            if (!data && token === runToken) {
+            if (!data) {
                 try {
                     data = await fromFetch(videoId);
                 } catch (e) {
                     fetchError = e;
                 }
             }
-            if (token !== runToken) return;
+            if (isStale()) return; // page moved to another video: discard silently
 
             if (data) {
+                doneIds.add(videoId);
                 console.log(LOG, data);
                 say(
                     'TikTok User Region 🌐\n\n' +
@@ -166,12 +179,15 @@
                     'Viewer region: ' + block(data.viewer)
                 );
             } else if (fetchError) {
-                fail('Region not found.\nFallback request failed:', fetchError);
+                fail('Region not found: the fallback request to re-fetch the page failed.', fetchError);
             } else {
-                fail('Region not found.\n"locationCreated" is missing from the page data (login wall, captcha or app prompt?).');
+                fail('Region not found: "locationCreated" is missing from the page data (login wall, captcha or app prompt?).');
             }
         } catch (e) {
+            if (isStale()) return;
             fail('Unexpected error in script:', e);
+        } finally {
+            inFlightIds.delete(videoId);
         }
     }
 
@@ -192,7 +208,7 @@
             };
         });
         window.addEventListener('popstate', onNav);
-        setInterval(() => { if (location.href !== lastHandledUrl) onNav(); }, 1500);
+        setInterval(() => { if (location.href !== lastCheckedUrl) onNav(); }, 1500);
     } catch (e) {
         fail('Failed to set up navigation hooks:', e);
     }
