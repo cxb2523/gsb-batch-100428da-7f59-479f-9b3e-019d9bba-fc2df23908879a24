@@ -111,7 +111,7 @@ Present the results to the user:
 ```
 Proxy Optimization Report for <TARGET_URL>
 
-Success rate: X% (N/M proxies working)
+Success rate: X% (N/M tested proxies working)
 
 Problem areas:
 - Countries: <list countries with failure rates>
@@ -119,11 +119,19 @@ Problem areas:
 - Subnets: <list /24 subnets with failure rates>
 
 Failed proxies: <count>
+Unprobed proxies: <count> — <one line per proxy: address/id + reason>
 Replacement credits available: <count>
 ```
 
-If success rate is 100%, report that all proxies are working and no action is
-needed. Stop here.
+Success rate and the problem areas cover only proxies that were actually
+probed. Proxies listed in `unprobed_proxies` were never tested (for example
+missing address, port or credentials) and are deliberately excluded from the
+denominator — report them separately from failures, with their `reason`, so
+the user knows they still need attention.
+
+If success rate is 100% and there are no unprobed proxies, report that all
+proxies are working and no action is needed. Stop here. If every proxy is
+unprobed, say so and list the reasons instead of claiming everything works.
 
 ### Step 4: Ask if the user wants details
 
@@ -198,11 +206,16 @@ After:  Y% success rate (M failures)
    and are irreversible.
 3. **If replacement credits are 0**, report the findings but explain that
    replacements require credits (available on paid plans).
-4. **If all proxies pass**, say so and stop. Don't suggest unnecessary
-   replacements.
+4. **If all probed proxies pass**, say so and stop. Don't suggest unnecessary
+   replacements. If some proxies were unprobed, mention them but don't count
+   them as failures.
 5. **Limit replacements to available credits.** If 20 proxies failed but only
    10 credits are available, prioritize replacing proxies in the
    worst-performing ASNs/subnets first.
+6. **Don't hide unprobed proxies.** They are in `unprobed_proxies` with a
+   `reason`; the summary's `unprobed` count must be reported to the user.
+   Incomplete proxy records cannot be replaced by IP — the user has to fix or
+   re-provision them.
 
 ## Troubleshooting
 
