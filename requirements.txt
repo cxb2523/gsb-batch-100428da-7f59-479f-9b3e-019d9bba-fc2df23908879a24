@@ -1,0 +1,7 @@
+playwright
+requests
+lxml
+tqdm
+fastapi
+uvicorn
+pydantic
