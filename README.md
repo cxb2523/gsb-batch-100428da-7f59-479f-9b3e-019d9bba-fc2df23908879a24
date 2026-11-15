@@ -94,6 +94,43 @@ python main.py
 
 ---
 
+## 🔁 Estados de envio e reprocessamento
+
+O banco `vagas_gupy.db` guarda dois estados por vaga na coluna `status`:
+
+* `pending` — a vaga já foi registrada, mas o Telegram ainda não confirmou o envio.
+* `sent` — o Telegram respondeu HTTP 200; a vaga está concluída.
+
+O fluxo de cada execução é:
+
+1. Tenta reenviar todas as vagas `pending` (falhas individuais não interrompem as demais nem a busca).
+2. Varre a Gupy e grava cada vaga nova como `pending` **antes** de enviar.
+3. Só marca como `sent` após confirmação do Telegram; caso contrário permanece `pending` para a próxima execução.
+4. Ao encontrar `GUPY_LIMITE_VELHAS` vagas antigas consecutivas, encerra **todas** as páginas daquele filtro.
+
+Bancos criados pela versão anterior (tabela sem `status`) são migrados automaticamente: os registros existentes recebem `status = 'sent'`, portanto nunca são reenviados, e nada é apagado.
+
+Opções de configuração (todas opcionais, via variáveis de ambiente):
+
+| Variável | Padrão | Descrição |
+|---|---|---|
+| `GUPY_DB_PATH` | `vagas_gupy.db` na pasta do script | Caminho do banco SQLite |
+| `GUPY_API_URL` | API pública da Gupy | Endpoint de busca |
+| `TELEGRAM_API_BASE` | `https://api.telegram.org` | Base da API do Telegram |
+| `GUPY_LIMITE_VELHAS` | `20` | Vagas antigas consecutivas que encerram o filtro |
+| `GUPY_PAGINA_MAXIMA` | `35` | Máximo de páginas por filtro |
+| `INTERVALO_ENVIO` | `2` | Segundos entre envios |
+
+### Teste de aceitação local
+
+`tests/acceptance_check.py` sobe um servidor HTTP local que simula a Gupy e o Telegram (sem credenciais reais) e valida: falha de envio seguida de reenvio único, migração de banco antigo sem reenvio, encerramento de todas as páginas ao atingir o limite de vagas antigas e ausência de duplicatas:
+
+```bash
+python tests/acceptance_check.py
+```
+
+---
+
 ## 📅 Agendamento Automático (Windows)
 Se você utiliza Windows, o repositório inclui um arquivo `rodar_gupy.bat`. Você pode usar o **Agendador de Tarefas do Windows** para rodar esse arquivo de hora em hora. O `.bat` já está configurado para forçar o encoding UTF-8 (evitando crash com emojis) e gerar um arquivo `erro_log.txt` para monitoramento.
 
