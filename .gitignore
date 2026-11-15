@@ -1,0 +1,10 @@
+.ipynb_checkpoints
+__pycache__
+.vscode
+.idea
+*.ipynb
+env3.9
+data
+build
+dist
+reddit_multimodal_crawler.egg-info
