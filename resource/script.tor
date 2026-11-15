@@ -1,0 +1,15 @@
+Click (chrome_icon)
+Press (enter)
+Wait (1)
+Type (hello)
+Wait (1)
+Press (enter)
+# Comment
+Wait(1)
+Press (alt_space)
+Wait (1)
+Press (x)
+# Comment bye
+Press (alt_space)
+Wait (1)
+Press (c)
