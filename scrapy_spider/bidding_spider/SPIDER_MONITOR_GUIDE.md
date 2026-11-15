@@ -288,8 +288,32 @@ WHERE stat_date = CURDATE();
 需要改造的其他爬虫：
 
 - [ ] `sd_post_spider.py` - 山东省政府采购
-- [ ] `jinan_post.py` - 济南公共资源
+- [x] `jinan_post.py` - 济南公共资源（含分页失败容错与采集完整性标记）
 - [ ] `taian_post.py` - 泰安公共资源
 - [ ] `zibo_post.py` - 淄博公共资源
 
 建议按以上步骤逐个改造。
+
+## 附：多配置项采集链的完整性标记
+
+`jinan_post` 按七个配置项分别请求接口并各自分页，单页失败不再静默结束：
+
+- 失败页会记录“配置项 + 页偏移 + 失败原因”（`self.page_failures`），并写入
+  `spider_timeout_logs`（`warning_type` 为 `json_error` / `http_error` / `api_error` /
+  `dns_error` / `connection_error` / `request_error` / `parse_error`，`error_message` 形如
+  `配置项:政府采购公告 页:2 JSON解析失败: ...`）；
+- 该配置项停止翻页（不额外重试），已抓到的条目继续交给管道入库，其他配置项照常采集；
+- `closed()` 中若存在未抓全的配置项，仍写 `status=success`，但 `close_reason` 变为
+  `finished [采集不完整] 未抓全N/7项: ...`，且 `warning_count` 计入失败页数；
+- 监控页据此把该爬虫标记为“采集不完整”（黄色告警），而全部完整跑完时与原有行为一致。
+
+本地验证（构造假响应，不访问真实站点）：
+
+```bash
+cd scrapy_spider/bidding_spider
+python tests/jinan_post_e2e.py ok /tmp/jinan_ok.json            # 全部成功
+python tests/jinan_post_e2e.py bad /tmp/jinan_bad.json          # 某页坏 JSON
+python tests/jinan_post_e2e.py timeout /tmp/jinan_timeout.json  # 某页超时
+python -m pytest tests/ -q
+```
+

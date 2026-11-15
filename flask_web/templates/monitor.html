@@ -89,6 +89,20 @@
         .failed-item:last-child {
             margin-bottom: 0;
         }
+
+        /* 运行成功但有配置项未抓全：黄色告警样式 */
+        .failed-item.incomplete {
+            border-left-color: #f59e0b;
+        }
+
+        .failed-item.incomplete .failed-item-title .badge {
+            background: #f59e0b !important;
+        }
+
+        .failed-item.incomplete .failed-item-error {
+            color: #92400e;
+            background: #fffbeb;
+        }
         
         .failed-item-title {
             font-weight: 600;
@@ -294,6 +308,10 @@
         .spider-card.failed {
             border-left: 4px solid var(--danger-color);
         }
+
+        .spider-card.warning {
+            border-left: 4px solid var(--warning-color);
+        }
         
         .spider-header {
             display: flex;
@@ -326,6 +344,11 @@
         .spider-status.failed {
             background: #fee2e2;
             color: #9b1c1c;
+        }
+
+        .spider-status.warning {
+            background: #fef3c7;
+            color: #92400e;
         }
         
         .spider-desc {
@@ -580,7 +603,7 @@
             <div class="failed-alert">
                 <div class="failed-alert-header">
                     <i class="fas fa-exclamation-triangle fa-lg"></i>
-                    <span>以下爬虫运行异常或今日未运行</span>
+                    <span>以下爬虫运行异常、采集不完整或今日未运行</span>
                 </div>
                 <div id="failed-spiders-list"></div>
             </div>
@@ -926,6 +949,7 @@
                             'json_error': '<span class="badge bg-danger">JSON解析失败</span>',
                             'http_error': '<span class="badge bg-warning">HTTP错误</span>',
                             'api_error': '<span class="badge bg-info">API业务错误</span>',
+                            'parse_error': '<span class="badge bg-danger">页面解析异常</span>',
                             'dns_error': '<span class="badge bg-warning">DNS解析失败</span>',
                             'connection_error': '<span class="badge bg-warning">连接被拒绝</span>'
                         };
@@ -975,6 +999,7 @@
                             'json_error': '<span class="badge bg-danger">JSON解析失败</span>',
                             'http_error': '<span class="badge bg-warning">HTTP错误</span>',
                             'api_error': '<span class="badge bg-info">API业务错误</span>',
+                            'parse_error': '<span class="badge bg-danger">页面解析异常</span>',
                             'dns_error': '<span class="badge bg-warning">DNS解析失败</span>',
                             'connection_error': '<span class="badge bg-warning">连接被拒绝</span>'
                         };
@@ -1174,7 +1199,7 @@
                                 if (s.status === 'not_run') statusLabel = '未运行';
                                 if (s.status === 'warning') statusLabel = '告警';
 
-                                const errorHtml = s.error_msg ? `<div class="text-danger small mt-2">错误: ${escapeHtml(s.error_msg)}</div>` : '';
+                                const errorHtml = s.error_msg ? `<div class="${s.incomplete ? 'text-warning' : 'text-danger'} small mt-2">${s.incomplete ? '' : '错误: '}${escapeHtml(s.error_msg)}</div>` : '';
 
                                 const actionHtml = s.status !== 'running' ? `
                                         <button class="btn btn-sm btn-danger" onclick="showStartModal('${s.name}')">
@@ -1312,8 +1337,13 @@
                         failedEl.classList.toggle('text-danger', failedCount > 0);
                         failedEl.classList.toggle('text-success', failedCount === 0);
                     }
-                    // 显示失败爬虫
-                    renderFailedSpiders(data.stats.failed_spiders || []);
+                    // 显示失败爬虫 + 采集不完整的爬虫
+                    renderFailedSpiders([
+                        ...(data.stats.failed_spiders || []),
+                        ...(data.stats.incomplete_spiders || []).filter(
+                            s => !(data.stats.failed_spiders || []).some(f => f.spider === s.spider)
+                        )
+                    ]);
 
                     // 更新图表：同时显示爬取数量和入库数量
                     try {
@@ -1381,28 +1411,36 @@
             
             if (failedSpiders && failedSpiders.length > 0) {
                 listDiv.innerHTML = failedSpiders.map(s => {
-                    const statusIcon = s.status === 'not_run' ? 'fa-clock' : 'fa-times-circle';
-                    const statusText = s.status === 'not_run' ? '未运行' : '运行失败';
+                    const incomplete = s.status !== 'not_run' && s.status !== 'failed' && s.incomplete;
+                    const statusIcon = s.status === 'not_run' ? 'fa-clock'
+                        : incomplete ? 'fa-exclamation-triangle' : 'fa-times-circle';
+                    const statusText = s.status === 'not_run' ? '未运行'
+                        : incomplete ? '采集不完整' : '运行失败';
+                    const iconClass = incomplete ? 'text-warning' : 'text-danger';
+                    const badgeClass = incomplete ? 'badge bg-warning text-dark' : 'badge bg-danger';
+                    const itemClass = incomplete ? 'failed-item incomplete' : 'failed-item';
                     const timeText = s.time ? `<span class="text-muted"> | 最后运行: ${s.time}</span>` : '';
-                    
+
                     let errorHtml = '';
-                    if (s.error_msg) {
-                        errorHtml = `<div class="failed-item-error"><i class="fas fa-bug me-1"></i>${escapeHtml(s.error_msg)}</div>`;
+                    const msg = s.error_msg || s.warning_msg;
+                    if (msg) {
+                        const icon = incomplete ? 'fa-exclamation-triangle' : 'fa-bug';
+                        errorHtml = `<div class="failed-item-error"><i class="fas ${icon} me-1"></i>${escapeHtml(msg)}</div>`;
                     }
-                    
+
                     let actionHtml = '';
                     if (s.status !== 'running') {
-                        actionHtml = `<button class="btn btn-sm btn-danger mt-2" onclick="showStartModal('${s.spider}')">
+                        actionHtml = `<button class="btn btn-sm ${incomplete ? 'btn-warning' : 'btn-danger'} mt-2" onclick="showStartModal('${s.spider}')">
                             <i class="fas fa-play me-1"></i>立即启动
                         </button>`;
                     }
-                    
+
                     return `
-                        <div class="failed-item">
+                        <div class="${itemClass}">
                             <div class="failed-item-title">
-                                <i class="fas ${statusIcon} text-danger"></i>
+                                <i class="fas ${statusIcon} ${iconClass}"></i>
                                 ${s.name}
-                                <span class="badge bg-danger ms-2">${statusText}</span>
+                                <span class="${badgeClass} ms-2">${statusText}</span>
                                 ${timeText}
                             </div>
                             <div class="failed-item-desc">${s.desc || ''}</div>

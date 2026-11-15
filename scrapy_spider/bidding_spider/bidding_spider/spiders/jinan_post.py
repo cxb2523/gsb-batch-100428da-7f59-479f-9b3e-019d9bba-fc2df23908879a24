@@ -10,6 +10,22 @@ from urllib.parse import quote
 from bidding_spider.items import BiddingItem
 from twisted.internet.error import TimeoutError, TCPTimedOutError, DNSLookupError, ConnectionRefusedError
 
+try:
+    # HTTP 非 2xx 且重试耗尽后由 HttpErrorMiddleware 交给 errback
+    from scrapy.spidermiddlewares.httperror import HttpError
+except ImportError:  # pragma: no cover - 兼容旧版 Scrapy 命名
+    HttpError = None
+
+try:
+    # Scrapy>=2.13 将下载层的超时/连接/域名解析异常换了新类型，这里一并兼容
+    from scrapy.exceptions import (
+        DownloadTimeoutError,
+        DownloadConnectionRefusedError,
+        CannotResolveHostError,
+    )
+except ImportError:  # pragma: no cover - Scrapy 2.11 无这些类型
+    DownloadTimeoutError = DownloadConnectionRefusedError = CannotResolveHostError = None
+
 # 导入监控数据库模块
 try:
     from bidding_spider.monitor_db import get_monitor
@@ -41,7 +57,14 @@ class JinanPostSpider(scrapy.Spider):
         self.total_requests = 0
         self.successful_requests = 0
         self.items_crawled = 0
-        
+
+        # 采集完整性跟踪（7 个配置项各自独立分页，单页失败不影响其他配置项）
+        # 失败页明细：[{'config': 配置项名称, 'page': 页偏移, 'type': 失败类型, 'reason': 失败原因}]
+        self.page_failures = []
+        # 配置项状态：配置项名称 -> pending/completed/incomplete
+        # 在构造时初始化，确保未开始/未跑完的配置项也会被识别为“未抓全”
+        self.config_states = {config['name']: 'pending' for config in self._get_configs()}
+
         # 初始化监控数据库
         self.monitor = None
         self.monitor_run_id = None
@@ -51,6 +74,11 @@ class JinanPostSpider(scrapy.Spider):
                 self.logger.info(f"[Monitor] 监控数据库模块已加载")
             except Exception as e:
                 self.logger.warning(f"[Monitor] 监控数据库初始化失败: {e}")
+
+    async def start(self):
+        """Scrapy>=2.13 的起始请求入口，复用 start_requests() 的逻辑"""
+        for request in self.start_requests():
+            yield request
 
     def start_requests(self):
         """生成POST请求 - 只抓取系统当天的数据"""
@@ -71,7 +99,48 @@ class JinanPostSpider(scrapy.Spider):
 
         self.logger.info(f"抓取济南公共资源当天数据: {today_date}")
 
-        configs = [
+        configs = self._get_configs()
+
+        # 初始化各配置项的采集状态，运行结束时可据此判断是否抓全
+        for config in configs:
+            self.config_states.setdefault(config['name'], 'pending')
+
+        self.logger.info(f"共有 {len(configs)} 个配置项")
+
+        for i, config in enumerate(configs):
+            self.logger.info(f"处理配置 {i + 1}: {config['name']}")
+            yield scrapy.FormRequest(
+                url=config['url'],
+                formdata=config['payload'],
+                headers={
+                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                    'Accept': 'application/json, text/javascript, */*; q=0.01',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'User-Agent': random.choice([
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+                        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+                    ]),
+                    'Origin': 'https://jnggzy.jinan.gov.cn',
+                    'Referer': 'https://jnggzy.jinan.gov.cn/jnggzyztb/front/'
+                },
+                callback=self.parse_api_response,
+                meta={
+                    'config': config,
+                    'today_date': today_date,
+                    'page_num': 1,
+                    'item_index': 0
+                },
+                errback=self.handle_error,
+                dont_filter=True
+            )
+
+    def _get_configs(self):
+        """返回七个配置项定义（每个配置项独立分页采集）"""
+        return [
             # 1. 政府采购公告
             {
                 'name': '政府采购公告',
@@ -180,41 +249,28 @@ class JinanPostSpider(scrapy.Spider):
             }
         ]
 
-        self.logger.info(f"共有 {len(configs)} 个配置项")
+    def parse_api_response(self, response):
+        """解析API响应 - 只处理当天的数据
 
-        for i, config in enumerate(configs):
-            self.logger.info(f"处理配置 {i + 1}: {config['name']}")
-            yield scrapy.FormRequest(
-                url=config['url'],
-                formdata=config['payload'],
-                headers={
-                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-                    'Accept': 'application/json, text/javascript, */*; q=0.01',
-                    'X-Requested-With': 'XMLHttpRequest',
-                    'User-Agent': random.choice([
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-                        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
-                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
-                    ]),
-                    'Origin': 'https://jnggzy.jinan.gov.cn',
-                    'Referer': 'https://jnggzy.jinan.gov.cn/jnggzyztb/front/'
-                },
-                callback=self.parse_api_response,
-                meta={
-                    'config': config,
-                    'today_date': today_date,
-                    'page_num': 1,
-                    'item_index': 0
-                },
-                errback=self.handle_error,
-                dont_filter=True
+        单页失败（请求超时/HTTP错误/JSON无法解析/接口返回异常/解析异常）时：
+        - 记录所属配置项、页偏移和失败原因；
+        - 该配置项停止翻页（不做无限重试），但已解析出的条目照常 yield 给管道入库；
+        - 其他配置项的分页请求不受影响，继续采集。
+        """
+        config = response.meta.get('config')
+        page_num = response.meta.get('page_num', 1)
+        try:
+            yield from self._parse_page(response)
+        except Exception as e:
+            # 兜底：任何未预期的解析异常都不能让该配置链静默结束
+            self.logger.exception(f"解析响应异常: {e}, URL: {response.url}")
+            self._record_page_failure(config, page_num, 'parse_error', f"解析响应异常: {e}")
+            self._log_page_warning(
+                response.url, 'parse_error', response.status, config, page_num, f"解析响应异常: {e}"
             )
 
-    def parse_api_response(self, response):
-        """解析API响应 - 只处理当天的数据"""
+    def _parse_page(self, response):
+        """解析单页响应，产出当天条目或下一页请求"""
         self.logger.info(f"解析API响应，URL: {response.url}")
 
         today_date = response.meta['today_date']
@@ -225,40 +281,39 @@ class JinanPostSpider(scrapy.Spider):
         try:
             data = json.loads(response.text)
         except Exception as e:
-            self.logger.error(f"❌ JSON解析失败: {e}, URL: {response.url}")
-            if get_monitor and hasattr(self, 'monitor') and self.monitor:
-                self.monitor.log_interface_warning(
-                    self.name, response.url, 'json_error',
-                    response_status=response.status,
-                    error_message=f"JSON解析失败: {e}"
-                )
+            self._record_page_failure(config, page_num, 'json_error', f"JSON解析失败: {e}")
+            self._log_page_warning(response.url, 'json_error', response.status, config, page_num, f"JSON解析失败: {e}")
             return
 
         # 检查响应状态
         if not data.get('success', False) and data.get('code') is not None:
             error_msg = data.get('message', '未知错误')
-            self.logger.error(f"API返回错误: {error_msg}")
-            if get_monitor and hasattr(self, 'monitor') and self.monitor:
-                self.monitor.log_interface_warning(
-                    self.name, response.url, 'api_error',
-                    response_status=response.status,
-                    error_message=f"API返回错误: {error_msg}"
-                )
+            self._record_page_failure(config, page_num, 'api_error', f"API返回错误: {error_msg}")
+            self._log_page_warning(response.url, 'api_error', response.status, config, page_num, f"API返回错误: {error_msg}")
             return
 
         params = data.get('params', {})
         if not params:
-            self.logger.error("API返回数据格式异常: 缺少params字段")
+            self._record_page_failure(config, page_num, 'api_error', "API返回数据格式异常: 缺少params字段")
+            self._log_page_warning(response.url, 'api_error', response.status, config, page_num,
+                                    "API返回数据格式异常: 缺少params字段")
             return
 
         # 获取HTML内容和分页信息
-        html_str = params.get('str', '')
-        pagesum = int(params.get('pagesum', 0))
+        try:
+            html_str = params.get('str', '')
+            pagesum = int(params.get('pagesum', 0) or 0)
+        except (TypeError, ValueError) as e:
+            self._record_page_failure(config, page_num, 'json_error', f"分页信息字段异常: {e}")
+            self._log_page_warning(response.url, 'json_error', response.status, config, page_num,
+                                    f"分页信息字段异常: {e}")
+            return
 
         self.logger.info(f"第{page_num}页: 共{pagesum}页数据")
 
         if not html_str:
             self.logger.info("本页没有数据，停止翻页")
+            self._mark_config_complete(config)
             return
 
         # 解析HTML提取项目信息
@@ -359,6 +414,55 @@ class JinanPostSpider(scrapy.Spider):
                 self.logger.info(f"当前页没有当天数据，停止翻页")
             elif page_num >= pagesum:
                 self.logger.info(f"已达到最后一页")
+            # 正常走到链尾（无当天数据或已到最后一页）才算该配置项抓全
+            self._mark_config_complete(config)
+
+    @staticmethod
+    def _config_name(config):
+        """获取配置项名称（防御式，errback 中 meta 可能不完整）"""
+        if isinstance(config, dict):
+            return config.get('name') or config.get('category') or '未知配置项'
+        return str(config) if config else '未知配置项'
+
+    def _record_page_failure(self, config, page_num, failure_type, reason):
+        """记录单页采集失败：所属配置项、页偏移、失败原因
+
+        失败只影响当前配置项的后续翻页，不终止整次运行，也不影响已 yield 的条目入库。
+        """
+        config_name = self._config_name(config)
+        failure = {
+            'config': config_name,
+            'page': page_num,
+            'type': failure_type,
+            'reason': reason,
+        }
+        self.page_failures.append(failure)
+        if self.config_states.get(config_name) != 'completed':
+            self.config_states[config_name] = 'incomplete'
+        self.logger.error(
+            f"❌ 配置项[{config_name}] 第{page_num}页采集失败({failure_type}): {reason}；"
+            f"该配置项停止翻页，已抓取条目继续入库"
+        )
+
+    def _log_page_warning(self, url, warning_type, response_status, config, page_num, error_message):
+        """把带配置项/页偏移上下文的失败信息写入监控库"""
+        if not (get_monitor and getattr(self, 'monitor', None)):
+            return
+        try:
+            config_name = self._config_name(config)
+            self.monitor.log_interface_warning(
+                self.name, url, warning_type,
+                response_status=response_status,
+                error_message=f"配置项:{config_name} 页:{page_num} {error_message}"
+            )
+        except Exception as e:
+            self.logger.warning(f"[Monitor] 记录接口警告失败: {e}")
+
+    def _mark_config_complete(self, config):
+        """标记配置项已完整跑到链尾"""
+        config_name = self._config_name(config)
+        if self.config_states.get(config_name) != 'incomplete':
+            self.config_states[config_name] = 'completed'
 
     def parse_html_items(self, html_str, api_type, detail_type):
         """
@@ -484,23 +588,60 @@ class JinanPostSpider(scrapy.Spider):
         return items
 
     def handle_error(self, failure):
-        """处理请求错误"""
+        """处理请求错误
+
+        分页请求最终失败（超时/连接/DNS/重试耗尽）时，记录所属配置项与页偏移，
+        该配置项的采集中断但不影响其他配置项，也不影响已入库数据。
+        """
         self.logger.error(f"请求失败: {failure.value}")
-        
+
         request = failure.request
         url = request.url
         retry_count = request.meta.get('retry_count', 0)
-        
+        config = request.meta.get('config')
+        page_num = request.meta.get('page_num')
+
+        # 分页请求失败：标记该配置项未抓全（失败页不做额外重试）
+        if config is not None and page_num is not None:
+            if HttpError is not None and failure.check(HttpError):
+                failure_type = 'http_error'
+            elif self._is_timeout_failure(failure):
+                failure_type = 'timeout'
+            elif self._is_dns_failure(failure):
+                failure_type = 'dns_error'
+            elif self._is_connection_failure(failure):
+                failure_type = 'connection_error'
+            else:
+                failure_type = 'request_error'
+            self._record_page_failure(
+                config, page_num, failure_type, f"请求失败: {str(failure.value)[:300]}"
+            )
+
+        # 处理 HTTP 错误（重试耗尽）
+        if HttpError is not None and failure.check(HttpError):
+            response = failure.value.response
+            self.logger.error(f"HTTP错误 {getattr(response, 'status', '?')} | URL: {url}")
+            if self.monitor:
+                try:
+                    self.monitor.log_interface_warning(
+                        self.name, url, 'http_error',
+                        response_status=getattr(response, 'status', 0),
+                        error_message=self._with_page_context(
+                            config, page_num, f"HTTP错误: {getattr(response, 'status', '?')}")
+                    )
+                except Exception as e:
+                    self.logger.warning(f"[Monitor] 记录HTTP错误日志失败: {e}")
+
         # 处理超时错误
-        if failure.check(TimeoutError, TCPTimedOutError):
+        if self._is_timeout_failure(failure):
             self.timeout_errors += 1
             self.logger.error(f"⏰ 超时错误 #{self.timeout_errors} | URL: {url}")
-            
+
             # 记录到监控数据库
             if self.monitor:
                 try:
                     timeout_seconds = int(request.meta.get('response_time', 0) / 1000) if request.meta.get('response_time') else 60
-                    error_message = str(failure.value)[:500]
+                    error_message = self._with_page_context(config, page_num, str(failure.value)[:500])
                     self.monitor.log_timeout(
                         spider_name=self.name,
                         url=url,
@@ -511,7 +652,7 @@ class JinanPostSpider(scrapy.Spider):
                     )
                 except Exception as e:
                     self.logger.warning(f"[Monitor] 记录超时日志失败: {e}")
-        elif failure.check(DNSLookupError):
+        elif self._is_dns_failure(failure):
             self.dns_errors += 1
             self.logger.error(f"DNS解析失败 | URL: {url}")
 
@@ -520,12 +661,12 @@ class JinanPostSpider(scrapy.Spider):
                     self.monitor.log_interface_warning(
                         self.name, url, 'dns_error',
                         response_status=0,
-                        error_message=f"DNS解析失败: {failure.value}"
+                        error_message=self._with_page_context(config, page_num, f"DNS解析失败: {failure.value}")
                     )
                 except Exception as e:
                     self.logger.warning(f"[Monitor] 记录DNS错误日志失败: {e}")
 
-        elif failure.check(ConnectionRefusedError):
+        elif self._is_connection_failure(failure):
             self.logger.error(f"连接被拒绝 | URL: {url}")
 
             if self.monitor:
@@ -533,13 +674,70 @@ class JinanPostSpider(scrapy.Spider):
                     self.monitor.log_interface_warning(
                         self.name, url, 'connection_error',
                         response_status=0,
-                        error_message=f"连接被拒绝: {failure.value}"
+                        error_message=self._with_page_context(config, page_num, f"连接被拒绝: {failure.value}")
                     )
                 except Exception as e:
                     self.logger.warning(f"[Monitor] 记录连接错误日志失败: {e}")
+
+    @staticmethod
+    def _is_timeout_failure(failure):
+        """判断是否为超时失败（兼容 Scrapy 2.11 与 2.13+ 的异常类型）"""
+        if failure.check(TimeoutError, TCPTimedOutError):
+            return True
+        return DownloadTimeoutError is not None and failure.check(DownloadTimeoutError)
+
+    @staticmethod
+    def _is_dns_failure(failure):
+        """判断是否为域名解析失败"""
+        if failure.check(DNSLookupError):
+            return True
+        return CannotResolveHostError is not None and failure.check(CannotResolveHostError)
+
+    @staticmethod
+    def _is_connection_failure(failure):
+        """判断是否为连接被拒绝"""
+        if failure.check(ConnectionRefusedError):
+            return True
+        return (
+            DownloadConnectionRefusedError is not None
+            and failure.check(DownloadConnectionRefusedError)
+        )
+
+    def _with_page_context(self, config, page_num, message):
+        """给监控日志补充“配置项 + 页偏移”上下文"""
+        if config is None or page_num is None:
+            return message
+        return f"配置项:{self._config_name(config)} 页:{page_num} {message}"
     
     def closed(self, reason):
-        """爬虫关闭时的处理"""
+        """爬虫关闭时的处理
+
+        区分两种收尾：
+        - 全部配置项完整跑完：status=success，close_reason 保持原有关闭原因（如 finished），行为与改造前一致；
+        - 有配置项未抓全：仍记为 success（不因单页失败把整次运行判为失败、不丢弃已入库数据），
+          但 close_reason 写入“不完整”摘要，warning_count 计入失败页数，供监控页核对。
+        """
+        incomplete_configs = self.get_incomplete_configs()
+        close_reason = reason
+
+        if incomplete_configs:
+            # close_reason 字段为 VARCHAR(100)，只放可快速核对的摘要；
+            # 具体失败页（配置项/页偏移/原因）在日志与接口警告中可查。
+            close_reason = (
+                f"{reason} [采集不完整] 未抓全{len(incomplete_configs)}/{len(self.config_states)}项: "
+                f"{','.join(incomplete_configs)}"
+            )[:100]
+            detail = "；".join(
+                f"{f['config']}(第{f['page']}页 {f['type']}: {f['reason']})"
+                for f in self.page_failures
+            )
+            self.logger.warning(
+                f"⚠️ 本次采集不完整：未抓全配置项 {len(incomplete_configs)}/{len(self.config_states)} "
+                f"({','.join(incomplete_configs)})，失败页数 {len(self.page_failures)}；失败明细: {detail}"
+            )
+        else:
+            self.logger.info("✅ 全部配置项完整采集完成")
+
         if self.monitor and self.monitor_run_id:
             try:
                 status = 'success' if reason == 'finished' else 'failed'
@@ -549,10 +747,20 @@ class JinanPostSpider(scrapy.Spider):
                     items_crawled=self.items_crawled,
                     # items_stored 不传，让数据库保持 Pipeline 累积的值
                     error_count=self.timeout_errors + self.dns_errors,
-                    warning_count=self.slow_requests,
+                    # 警告数 = 原有慢请求数 + 失败页数，便于监控页看出本次采集不完整
+                    warning_count=self.slow_requests + len(self.page_failures),
                     timeout_count=self.timeout_errors,
-                    close_reason=reason
+                    close_reason=close_reason
                 )
                 self.logger.info(f"[Monitor] 运行记录已更新，ID: {self.monitor_run_id}")
             except Exception as e:
                 self.logger.warning(f"[Monitor] 记录运行结束失败: {e}")
+
+    def get_incomplete_configs(self):
+        """返回未完整采集的配置项名称列表
+
+        未跑到链尾（pending）或中途出现失败页（incomplete）的配置项都视为未抓全。
+        """
+        return sorted(
+            name for name, state in self.config_states.items() if state != 'completed'
+        )

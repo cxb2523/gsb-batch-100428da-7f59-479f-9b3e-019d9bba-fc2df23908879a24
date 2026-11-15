@@ -149,6 +149,18 @@ class MonitorService:
             hours = int(seconds / 3600)
             minutes = int((seconds % 3600) / 60)
             return f"{hours}小时{minutes}分"
+
+    @staticmethod
+    def _is_incomplete_run(run):
+        """判断一次运行是否“成功但采集不完整”
+
+        采集链在单页失败后仍会正常收尾（status=success 且已入库数据保留），
+        此时 close_reason 中带有 “[采集不完整]” 标记，用于区分“全部配置项完整跑完”。
+        """
+        if run.get('status') != 'success':
+            return False
+        close_reason = run.get('close_reason') or ''
+        return '[采集不完整]' in close_reason
     
     @classmethod
     def get_log_files(cls, spider_name=None, lines=50, date_filter='today'):
@@ -496,7 +508,8 @@ class MonitorService:
                 'total_warnings': stats_result['total_warnings'] or 0,
                 'total_timeouts': timeout_result['timeout_count'] or 0,
                 'last_runs': {},
-                'failed_spiders': []
+                'failed_spiders': [],
+                'incomplete_spiders': []
             }
             
             # 处理每个爬虫的最新运行记录
@@ -530,14 +543,19 @@ class MonitorService:
                     'errors': run['error_count'],
                     'warnings': run['warning_count'],
                     'timeouts': run['timeout_count'],
-                    'close_reason': run['close_reason']
+                    'close_reason': run['close_reason'],
+                    # 运行成功但存在未抓全的配置项时，标记为不完整，便于监控页核对
+                    'incomplete': cls._is_incomplete_run(run)
                 }
-                
+
                 stats['last_runs'][spider_name] = run_info
-                
+
                 if status == 'failed':
                     run_info['error_msg'] = run['close_reason'] or '运行失败'
                     stats['failed_spiders'].append(run_info)
+                elif run_info['incomplete']:
+                    run_info['warning_msg'] = run['close_reason'] or '采集不完整'
+                    stats['incomplete_spiders'].append(run_info)
             
             # 获取正在运行的进程
             running_processes = []
@@ -587,7 +605,8 @@ class MonitorService:
                 'total_warnings': 0,
                 'total_timeouts': 0,
                 'last_runs': {},
-                'failed_spiders': []
+                'failed_spiders': [],
+                'incomplete_spiders': []
             }
             
             if not logs_dir.exists():
@@ -909,7 +928,7 @@ class MonitorService:
                     FROM spider_timeout_logs
                     WHERE spider_name = %s
                     AND occurred_at >= %s
-                    AND warning_type IN ('json_error', 'http_error', 'api_error', 'dns_error', 'connection_error')
+                    AND warning_type IN ('json_error', 'http_error', 'api_error', 'dns_error', 'connection_error', 'parse_error', 'request_error')
                     ORDER BY occurred_at DESC
                     LIMIT %s
                 """, (spider_name, start_date, limit))
@@ -926,7 +945,7 @@ class MonitorService:
                         resolved
                     FROM spider_timeout_logs
                     WHERE occurred_at >= %s
-                    AND warning_type IN ('json_error', 'http_error', 'api_error', 'dns_error', 'connection_error')
+                    AND warning_type IN ('json_error', 'http_error', 'api_error', 'dns_error', 'connection_error', 'parse_error', 'request_error')
                     ORDER BY occurred_at DESC
                     LIMIT %s
                 """, (start_date, limit))

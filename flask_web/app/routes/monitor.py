@@ -113,6 +113,9 @@ def api_spiders():
                     spider['status'] = 'failed'
                 elif rstatus == 'warning':
                     spider['status'] = 'warning'
+                elif rstatus == 'success' and run_info.get('incomplete'):
+                    # 运行成功但有配置项未抓全：用告警状态提示数据可能不完整
+                    spider['status'] = 'warning'
                 elif rstatus == 'success':
                     spider['status'] = 'stopped'
                 else:
@@ -121,6 +124,10 @@ def api_spiders():
                 # 附加错误信息与最后运行时间，便于前端展示
                 if run_info.get('error_msg'):
                     spider['error_msg'] = run_info.get('error_msg')
+                if run_info.get('warning_msg'):
+                    spider['error_msg'] = run_info.get('warning_msg')
+                if run_info.get('incomplete'):
+                    spider['incomplete'] = True
                 if run_info.get('time'):
                     spider['last_time'] = run_info.get('time')
             else:
