@@ -1,9 +1,35 @@
 var host='http://127.0.0.1:5000/';
 
 
+function renderSiteStatus(siteStatus){
+  var container = $('#site-status-div');
+  container.empty();
+  if(!siteStatus || !siteStatus.length){
+    return;
+  }
+  for(var i=0; i<siteStatus.length; i++){
+    var s = siteStatus[i];
+    var cls, msg;
+    if(s.status === 'failed'){
+      cls = 'site-status-failed';
+      msg = s.site + ': could not be scraped' + (s.reason ? ' (' + s.reason + ')' : '');
+    }
+    else if(s.status === 'zero_results'){
+      cls = 'site-status-zero';
+      msg = s.site + ': no products found for this search';
+    }
+    else{
+      cls = 'site-status-success';
+      msg = s.site + ': ' + s.count + ' product(s) found';
+    }
+    container.append($('<div/>').addClass('site-status ' + cls).text(msg));
+  }
+}
+
 function DataIsReady(response){
   var prof = $('.product-info').clone();
   $("#products-div").empty();
+  renderSiteStatus(response['site_status']);
   len=response['product_name'].length;
   for(var i=0; i<len;i++){
      var prof_card = prof.clone();

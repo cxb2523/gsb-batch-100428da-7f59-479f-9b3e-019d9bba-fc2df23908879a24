@@ -34,6 +34,17 @@ Product-Info-Crawler is a python web crawler developed using scrapy framework. I
 5. Enter the search keyword and click search button
 6. The products found are displayed with images, price and source info
 
+## Per-site crawl status
+Each demo search writes `demo/search_status.json` next to `results.csv`. It
+records, for every site (amazon, ebay, shopclues, olx), whether the site was
+scraped successfully (`success`, with the number of items), was reachable but
+had nothing for the keyword (`zero_results`), or could not be scraped
+(`failed`, with a short reason). The results page shows a notice for sites
+that failed or returned nothing, so an empty section is never ambiguous.
+The merge + manifest logic lives in `crawl_summary.py` and can also be run
+standalone (`python crawl_summary.py <keyword>`) to rebuild `results.csv`
+and the manifest from existing per-site CSVs in `demo/tmp/`.
+
  ## Thanks
 Feel free to post issues if you find any problem or contact me [Aishwarya Mittal](https://www.facebook.com/aishhmittal)<br>
 ©[MIT License](https://github.com/aishmittal/Product-Info-Crawler/blob/master/LICENSE)

@@ -126,3 +126,26 @@ a:hover{color: inherit; text-decoration:none;}
 			  padding: 3px 5px;
 			  border: 1px solid black;
 			  text-align: center;}
+
+/* Per-site crawl outcome notices */
+.site-status {
+  padding: 8px 12px;
+  margin: 4px 0;
+  border-radius: 4px;
+  font-size: 13px;
+}
+.site-status-success {
+  background-color: #e8f5e9;
+  border: 1px solid #a5d6a7;
+  color: #2e7d32;
+}
+.site-status-zero {
+  background-color: #fff8e1;
+  border: 1px solid #ffe082;
+  color: #f57f17;
+}
+.site-status-failed {
+  background-color: #ffebee;
+  border: 1px solid #ef9a9a;
+  color: #c62828;
+}
