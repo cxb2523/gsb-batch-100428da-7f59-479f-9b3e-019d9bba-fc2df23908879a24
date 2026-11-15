@@ -101,6 +101,23 @@ def export_browser(
             storage_state_path=str(storage_state) if storage_state else None,
             executable_path=str(executable_path) if executable_path else None,
         )
+        failures = list(getattr(output_path, "failures", []) or [])
+        if failures:
+            console.print(
+                Panel(
+                    "\n".join(
+                        [
+                            f"⚠️ 以下 {len(failures)} 个资源下载失败，已在 Markdown 中保留原始占位符：",
+                            *(
+                                f"- [{failure.asset_type}] {failure.block_id}: {failure.reason}"
+                                for failure in failures
+                            ),
+                        ]
+                    ),
+                    title="资源下载失败",
+                    border_style="yellow",
+                )
+            )
         console.print(
             Panel(
                 f"✅ 浏览器回退导出完成: [green]{output_path}[/green]",

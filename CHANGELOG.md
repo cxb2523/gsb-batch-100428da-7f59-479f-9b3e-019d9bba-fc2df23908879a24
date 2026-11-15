@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `README.md` 增加中英文切换入口，并更新为当前项目仓库链接
 
+### Fixed
+- Browser-based 导出的资源下载改为逐个隔离失败：单个图片/附件/白板/图表下载抛错不再中断整次导出，失败资源在 Markdown 中保留 `browser-asset://` 占位符，其余资源照常落盘并回写相对路径
+- `BrowserMarkdownExporter.export` 返回值（仍兼容 `Path`）新增 `failures` 属性，列出每个失败资源的类型、`block_id` 与失败原因；`export-browser` 命令会打印同样的失败清单
+
 ## [0.2.5] - 2026-04-11
 
 ### Fixed

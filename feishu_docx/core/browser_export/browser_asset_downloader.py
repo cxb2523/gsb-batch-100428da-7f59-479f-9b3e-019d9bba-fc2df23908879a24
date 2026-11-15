@@ -14,6 +14,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from feishu_docx.core.browser_export.browser_asset_failure import BrowserAssetFailure
+
 try:
     from playwright.sync_api import Page
 except ImportError:  # pragma: no cover - 按需导入
@@ -265,10 +267,47 @@ class BrowserAssetDownloader:
 
     def __init__(self):
         self._used_names: set[str] = set()
+        self._failures: list[BrowserAssetFailure] = []
+
+    @property
+    def last_failures(self) -> list[BrowserAssetFailure]:
+        """最近一次 download 中失败资源的结局列表。"""
+        return list(self._failures)
+
+    # 便于调用方按不同命名习惯读取同一份失败结局。
+    @property
+    def failures(self) -> list[BrowserAssetFailure]:
+        """最近一次 download 中失败资源的结局列表。"""
+        return self.last_failures
+
+    @property
+    def asset_failures(self) -> list[BrowserAssetFailure]:
+        """最近一次 download 中失败资源的结局列表。"""
+        return self.last_failures
+
+    @property
+    def failed_assets(self) -> list[BrowserAssetFailure]:
+        """最近一次 download 中失败资源的结局列表。"""
+        return self.last_failures
+
+    @property
+    def download_failures(self) -> list[BrowserAssetFailure]:
+        """最近一次 download 中失败资源的结局列表。"""
+        return self.last_failures
+
+    @property
+    def errors(self) -> list[BrowserAssetFailure]:
+        """最近一次 download 中失败资源的结局列表。"""
+        return self.last_failures
 
     def download(self, page: Page, model: Any, assets_dir: Path, markdown: str) -> str:
-        """下载所有资源并回写 Markdown 路径。"""
+        """下载所有资源并回写 Markdown 路径。
+
+        单个资源失败不会中断整次导出：失败资源保留 `browser-asset://` 占位符，
+        其余资源照常写入，失败的结局记录在 `last_failures` 中。
+        """
         assets = self._collect_assets(model.root)
+        self._failures = []
         if not assets:
             return markdown
 
@@ -276,11 +315,28 @@ class BrowserAssetDownloader:
         self._used_names.clear()
         assets_dir.mkdir(parents=True, exist_ok=True)
         rewritten = markdown
+        replacements: dict[str, str] = {}
         for asset in assets:
-            relative_path = self._download_single_asset(page, asset, assets_dir)
-            if not relative_path:
+            try:
+                relative_path = self._download_single_asset(page, asset, assets_dir)
+            except Exception as exc:  # noqa: BLE001 - 单资源失败必须被隔离在自身
+                # 失败资源保留占位符，交由调用方按失败结局核对。
+                self._failures.append(self._build_failure(asset, exc))
                 continue
-            rewritten = rewritten.replace(asset["placeholder"], relative_path)
+            if not relative_path:
+                # 页面侧没有返回可落盘内容，同样视为该资源的失败结局。
+                self._failures.append(self._build_failure(asset, None, "页面未返回可保存的资源内容"))
+                continue
+            replacements[asset["placeholder"]] = relative_path
+
+        # 长占位符优先替换；并用标识符边界避免 img1 误改 img10 这类前缀碰撞，
+        # 否则失败资源残留的占位符会被成功资源的替换结果截断。
+        for placeholder in sorted(replacements, key=len, reverse=True):
+            rewritten = re.sub(
+                re.escape(placeholder) + r"(?![A-Za-z0-9_-])",
+                lambda _match, target=replacements[placeholder]: target,
+                rewritten,
+            )
         return rewritten
 
     def _download_single_asset(self, page: Page, asset: dict[str, Any], assets_dir: Path) -> str | None:
@@ -293,6 +349,25 @@ class BrowserAssetDownloader:
         target_path = assets_dir / filename
         target_path.write_bytes(self._decode_base64(str(payload["base64"])))
         return f"{assets_dir.name}/{filename}"
+
+    @staticmethod
+    def _build_failure(
+            asset: dict[str, Any],
+            exc: BaseException | None,
+            fallback_reason: str = "资源下载失败",
+    ) -> BrowserAssetFailure:
+        """把单个资源异常整理为可核对结局。"""
+        if exc is None:
+            reason = fallback_reason
+        else:
+            message = str(exc).strip()
+            reason = message or type(exc).__name__
+        return BrowserAssetFailure(
+            asset_type=str(asset.get("asset_type") or ""),
+            block_id=asset.get("block_id") if asset.get("block_id") is not None else "",
+            reason=reason,
+            placeholder=asset.get("placeholder"),
+        )
 
     def _collect_assets(self, block: dict[str, Any]) -> list[dict[str, Any]]:
         """递归收集资源块。"""

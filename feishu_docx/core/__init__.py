@@ -9,13 +9,19 @@
 # =====================================================
 """
 [INPUT]: None
-[OUTPUT]: 对外提供 FeishuSDK, FeishuExporter, BrowserMarkdownExporter
+[OUTPUT]: 对外提供 FeishuSDK, FeishuExporter, BrowserMarkdownExporter, BrowserAssetFailure, BrowserExportResult
 [POS]: core 模块入口
 [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
 """
 
-from feishu_docx.core.browser_export import BrowserMarkdownExporter
+from feishu_docx.core.browser_export import BrowserAssetFailure, BrowserExportResult, BrowserMarkdownExporter
 from feishu_docx.core.exporter import FeishuExporter
 from feishu_docx.core.sdk import FeishuSDK
 
-__all__ = ["FeishuSDK", "FeishuExporter", "BrowserMarkdownExporter"]
+__all__ = [
+    "FeishuSDK",
+    "FeishuExporter",
+    "BrowserAssetFailure",
+    "BrowserExportResult",
+    "BrowserMarkdownExporter",
+]

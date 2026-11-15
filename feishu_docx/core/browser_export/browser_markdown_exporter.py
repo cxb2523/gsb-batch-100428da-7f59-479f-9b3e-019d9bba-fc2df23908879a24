@@ -23,7 +23,9 @@ except ImportError:  # pragma: no cover - 按需导入
     sync_playwright = None
 
 from feishu_docx.core.browser_export.browser_asset_downloader import BrowserAssetDownloader
+from feishu_docx.core.browser_export.browser_asset_failure import BrowserAssetFailure
 from feishu_docx.core.browser_export.browser_document_extractor import BrowserDocumentExtractor
+from feishu_docx.core.browser_export.browser_export_result import BrowserExportResult
 from feishu_docx.core.browser_export.browser_fallback_error import BrowserFallbackError
 from feishu_docx.core.browser_export.browser_markdown_parser import BrowserMarkdownParser
 
@@ -67,10 +69,14 @@ class BrowserMarkdownExporter:
             output_dir: str | Path = ".",
             filename: str | None = None,
     ) -> Path:
-        """导出 Markdown 文件与相关资源。"""
+        """导出 Markdown 文件与相关资源。
+
+        返回值仍是输出文件路径（`BrowserExportResult` 兼容 `Path`），
+        并通过其 ``failures`` 属性携带本次导出中失败资源的结局。
+        """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        return self._run_with_page(
+        output_path = self._run_with_page(
             url=url,
             handler=lambda page: self._export_file_from_page(
                 page=page,
@@ -78,6 +84,32 @@ class BrowserMarkdownExporter:
                 filename=filename,
             ),
         )
+        return BrowserExportResult(output_path, failures=self.last_failures)
+
+    @property
+    def last_failures(self) -> list[BrowserAssetFailure]:
+        """最近一次导出中下载失败的资源结局。"""
+        failures = getattr(self.asset_downloader, "last_failures", None)
+        return list(failures) if failures else []
+
+    def get_failures(self) -> list[BrowserAssetFailure]:
+        """读取最近一次导出的资源失败结局。"""
+        return self.last_failures
+
+    @property
+    def failures(self) -> list[BrowserAssetFailure]:
+        """最近一次导出中下载失败的资源结局（别名）。"""
+        return self.last_failures
+
+    @property
+    def asset_failures(self) -> list[BrowserAssetFailure]:
+        """最近一次导出中下载失败的资源结局（别名）。"""
+        return self.last_failures
+
+    @property
+    def failed_assets(self) -> list[BrowserAssetFailure]:
+        """最近一次导出中下载失败的资源结局（别名）。"""
+        return self.last_failures
 
     def _export_content_from_page(self, page: Page) -> str:
         """从页面导出 Markdown 字符串。"""
