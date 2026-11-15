@@ -10,6 +10,17 @@ Stresses:
 - batch stages downstream of a much slower stage (backpressure)
 - JSONL output produced by a single-worker batch sink
 
+Every article ends the run with an explicit outcome, so a consumer of the
+JSONL can tell a page without usable content apart from one the upstream
+rate limiter dropped:
+
+- :data:`OUTCOME_SUCCESS`: a summary was fetched, cleaned and embedded
+- :data:`OUTCOME_NO_CONTENT`: a permanent soft failure (HTTP 404 or an
+  empty summary): no words, terms or vector are fabricated for it
+- :data:`OUTCOME_RETRY_EXHAUSTED`: a transient failure (HTTP 429/5xx, or a
+  network error) kept failing through the whole retry strategy: the item is
+  not treated as a summary and its vector stays empty
+
 Run from the repository root::
 
     python examples/news_crawler.py --items 120 --workers 8
@@ -29,13 +40,14 @@ import threading
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, TypedDict
+from typing import Any, Dict, List, Optional, Protocol, Sequence, TypedDict
 from urllib.parse import quote
 
 import requests
 from _common import RunMetrics, add_scale_args, configure_logging, consume
 
 from smartpipeline import BatchStage, Item, Pipeline, SoftError, Source, Stage
+from smartpipeline.error.exceptions import RetryError
 
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 WIKI_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/summary/"
@@ -46,6 +58,15 @@ TOKEN_RE = re.compile(r"[a-z][a-z'-]{2,}")
 TERM_WORDS = frozenset({"the", "and", "for", "that", "with", "from", "this", "are"})
 VECTOR_DIM = 128
 
+# Explicit item outcomes written to every JSONL row.
+OUTCOME_SUCCESS = "success"
+OUTCOME_NO_CONTENT = "no_content"
+OUTCOME_RETRY_EXHAUSTED = "retry_exhausted"
+OUTCOMES = (OUTCOME_SUCCESS, OUTCOME_NO_CONTENT, OUTCOME_RETRY_EXHAUSTED)
+
+# HTTP status codes worth retrying instead of failing the item immediately.
+TRANSIENT_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
 
 class ArticleData(TypedDict):
     title: str
@@ -54,20 +75,39 @@ class ArticleData(TypedDict):
     word_count: int
     top_terms: list[tuple[str, int]]
     vector: list[float]
+    outcome: str
 
 
 class TransientHTTPError(Exception):
     """A response worth retrying (429 or 5xx)."""
 
 
+class HttpGet(Protocol):
+    """Shape of the HTTP call used by :class:`PageFetcher`.
+
+    ``requests.Session.get`` satisfies it, and so do the in-process test stubs:
+    this keeps the stage testable without touching the network or the global
+    ``requests`` module.
+    """
+
+    def __call__(self, url: str, timeout: float = ...) -> requests.Response: ...
+
+
+def is_retry_exhausted(item: Item[ArticleData]) -> bool:
+    """True when the item's fetch stage gave up after exhausting its retries."""
+    return any(isinstance(error, RetryError) for error in item.soft_errors())
+
+
 class RandomWikipediaSource(Source[ArticleData]):
     """Pull random article titles from the MediaWiki API."""
 
-    def __init__(self, pages: int, timeout: float = 15.0):
+    def __init__(self, pages: int, timeout: float = 15.0, titles: Optional[Sequence[str]] = None):
         self._pages = pages
         self._timeout = timeout
-        self._titles: List[str] = []
-        self._seen: set[str] = set()
+        # An explicit title list skips the random-title API entirely: tests use
+        # it to drive the pipeline with fully stubbed HTTP responses.
+        self._titles: List[str] = list(titles) if titles is not None else []
+        self._seen: set[str] = set(self._titles)
         self._emitted = 0
 
     def _fetch_titles(self) -> None:
@@ -120,6 +160,7 @@ class RandomWikipediaSource(Source[ArticleData]):
                 "word_count": 0,
                 "top_terms": [],
                 "vector": [],
+                "outcome": OUTCOME_SUCCESS,
             }
         )
 
@@ -127,8 +168,9 @@ class RandomWikipediaSource(Source[ArticleData]):
 class PageFetcher(Stage[ArticleData]):
     """Fetch the REST summary of a page, one HTTP call per item."""
 
-    def __init__(self, timeout: float = 10.0):
+    def __init__(self, timeout: float = 10.0, transport: Optional[HttpGet] = None):
         self._timeout = timeout
+        self._transport = transport
         self._local = threading.local()
         self._sessions: list[requests.Session] = []
         self._sessions_lock = threading.Lock()
@@ -148,13 +190,19 @@ class PageFetcher(Stage[ArticleData]):
                 self._sessions.append(session)
         return session
 
+    def _get(self, url: str) -> requests.Response:
+        # The injected transport replaces the per-thread session, which keeps
+        # tests free of real sockets while production uses real sessions.
+        if self._transport is not None:
+            return self._transport(url, timeout=self._timeout)
+        return self._session().get(url, timeout=self._timeout)
+
     def process(self, item: Item[ArticleData]) -> Item[ArticleData]:
         title = item.data["title"]
-        response = self._session().get(
-            WIKI_SUMMARY + quote(title.replace(" ", "_"), safe=""),
-            timeout=self._timeout,
+        response = self._get(
+            WIKI_SUMMARY + quote(title.replace(" ", "_"), safe="")
         )
-        if response.status_code in (429, 500, 502, 503, 504):
+        if response.status_code in TRANSIENT_STATUS_CODES:
             raise TransientHTTPError(f"HTTP {response.status_code} for {title}")
         if response.status_code == 404:
             raise SoftError(f"no Wikipedia summary for {title}")
@@ -177,6 +225,25 @@ class PageFetcher(Stage[ArticleData]):
             self._sessions.clear()
 
 
+class OutcomeClassifier(Stage[ArticleData]):
+    """Give every item an explicit outcome based on its fetch-stage errors.
+
+    It runs right after the fetch stage: a :class:`~smartpipeline.error.exceptions.RetryError`
+    means the retry strategy was exhausted, any other soft error means the page
+    has no usable content, and an item without errors is a successful summary.
+    Downstream stages only read the outcome and never invent data for failures.
+    """
+
+    def process(self, item: Item[ArticleData]) -> Item[ArticleData]:
+        if is_retry_exhausted(item):
+            item.data["outcome"] = OUTCOME_RETRY_EXHAUSTED
+        elif item.has_soft_errors():
+            item.data["outcome"] = OUTCOME_NO_CONTENT
+        else:
+            item.data["outcome"] = OUTCOME_SUCCESS
+        return item
+
+
 class CleanText(Stage[ArticleData]):
     """Normalize the extract and keep a few readable statistics."""
 
@@ -184,6 +251,10 @@ class CleanText(Stage[ArticleData]):
     _brackets = re.compile(r"\[\d+\]")
 
     def process(self, item: Item[ArticleData]) -> Item[ArticleData]:
+        if item.data["outcome"] != OUTCOME_SUCCESS:
+            # The fetch failed or the page had no content: leave the placeholder
+            # values untouched instead of fabricating statistics.
+            return item
         text = self._brackets.sub("", item.data["extract"])
         text = self._spaces.sub(" ", text).strip()
         item.data["extract"] = text
@@ -205,7 +276,9 @@ class HashEmbedding(BatchStage[ArticleData]):
         self, items: Sequence[Item[ArticleData]]
     ) -> Sequence[Item[ArticleData]]:
         for item in items:
-            if not item.data["extract"]:
+            if item.data["outcome"] != OUTCOME_SUCCESS:
+                # Failed items must never carry a vector, even when a batch
+                # mixes successful and failed articles.
                 item.data["vector"] = []
                 continue
             vector = [0.0] * VECTOR_DIM
@@ -229,7 +302,13 @@ class DigestWriter(BatchStage[ArticleData]):
         self._rows = 0
         self._words = 0
         self._with_vector = 0
+        self._outcome_counts: Dict[str, int] = {outcome: 0 for outcome in OUTCOMES}
         self._longest: List[tuple[int, str]] = []
+
+    @property
+    def outcome_counts(self) -> Dict[str, int]:
+        """Number of rows written for each of the three outcomes."""
+        return dict(self._outcome_counts)
 
     def on_start(self) -> None:
         self._file = self._path.open("w", encoding="utf-8")
@@ -240,16 +319,19 @@ class DigestWriter(BatchStage[ArticleData]):
         assert self._file is not None
         for item in items:
             data = item.data
+            outcome = data["outcome"]
             row: Dict[str, Any] = {
                 "title": data["title"],
                 "url": data["url"],
                 "words": data["word_count"],
                 "top_terms": data["top_terms"],
                 "vector": data["vector"],
+                "outcome": outcome,
                 "errors": [str(error) for error in item.soft_errors()],
             }
             self._file.write(json.dumps(row) + "\n")
             self._rows += 1
+            self._outcome_counts[outcome] = self._outcome_counts.get(outcome, 0) + 1
             self._words += data["word_count"]
             if data["vector"]:
                 self._with_vector += 1
@@ -265,21 +347,31 @@ class DigestWriter(BatchStage[ArticleData]):
             self._file = None
 
 
-def build_pipeline(args: argparse.Namespace, output: Path) -> Pipeline[ArticleData]:
+def build_pipeline(
+    args: argparse.Namespace,
+    output: Path,
+    *,
+    source: Optional[RandomWikipediaSource] = None,
+    fetcher: Optional[PageFetcher] = None,
+    writer: Optional[DigestWriter] = None,
+    max_retries: int = 2,
+    backoff: float = 0.3,
+) -> Pipeline[ArticleData]:
     return (
         Pipeline[ArticleData](max_queues_size=args.queue_size)
-        .set_source(RandomWikipediaSource(args.items))
+        .set_source(source or RandomWikipediaSource(args.items))
         .append(
             "fetch",
-            PageFetcher(),
+            fetcher or PageFetcher(),
             concurrency=max(1, args.workers),
             retryable_errors=(TransientHTTPError, requests.RequestException),
-            max_retries=2,
-            backoff=0.3,
+            max_retries=max_retries,
+            backoff=backoff,
         )
+        .append("classify", OutcomeClassifier())
         .append("clean", CleanText())
         .append("embed", HashEmbedding(size=16), concurrency=2)
-        .append("digest", DigestWriter(output))
+        .append("digest", writer or DigestWriter(output))
         .build()
     )
 
@@ -301,12 +393,17 @@ def main() -> None:
         writer = pipeline.get_stage("digest")
         assert isinstance(writer, DigestWriter)
         longest = ", ".join(title for _, title in writer._longest[:3])
+        outcome_counts = writer.outcome_counts
         metrics.report(
             "Wikipedia digest",
             elapsed,
             extra=[
                 f"jsonl_rows={writer._rows} total_words={writer._words} "
                 f"with_vector={writer._with_vector}",
+                "outcomes: "
+                + " ".join(
+                    f"{outcome}={outcome_counts[outcome]}" for outcome in OUTCOMES
+                ),
                 f"output_bytes={output.stat().st_size if output.exists() else 0}",
                 f"longest_pages={longest}",
                 f"run_plus_setup={setup_and_run:.2f}s",
