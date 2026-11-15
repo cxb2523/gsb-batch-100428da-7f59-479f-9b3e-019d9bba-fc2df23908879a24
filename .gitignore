@@ -1,0 +1,16 @@
+node_modules/
+website/node_modules/
+website/build/
+website/.docusaurus/
+dist/
+.webext/
+.wxt/
+extension/.output/
+extension/output/
+coverage/
+*.log
+test_results.txt
+.otto-relay/
+.env
+.DS_Store
+.vscode/

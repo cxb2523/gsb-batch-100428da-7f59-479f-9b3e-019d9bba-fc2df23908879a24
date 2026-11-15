@@ -1,0 +1,33 @@
+{
+  "name": "otto-docs",
+  "description": "Ottomate Everything - Efficient Automation For Your Browser",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/telepat-io/otto.git",
+    "directory": "website"
+  },
+  "bugs": {
+    "url": "https://github.com/telepat-io/otto/issues"
+  },
+  "homepage": "https://docs.telepat.io/otto/",
+  "scripts": {
+    "start": "docusaurus start --host 0.0.0.0",
+    "build": "docusaurus build",
+    "serve": "docusaurus serve build --host 0.0.0.0",
+    "deploy": "docusaurus deploy"
+  },
+  "dependencies": {
+    "@docusaurus/core": "3.9.2",
+    "@docusaurus/preset-classic": "3.9.2",
+    "@docusaurus/theme-mermaid": "3.9.2",
+    "@mdx-js/react": "3.1.1",
+    "clsx": "2.1.1",
+    "prism-react-renderer": "2.4.1",
+    "react": "19.2.4",
+    "react-dom": "19.2.4"
+  },
+  "overrides": {
+    "webpack": "5.105.4"
+  }
+}

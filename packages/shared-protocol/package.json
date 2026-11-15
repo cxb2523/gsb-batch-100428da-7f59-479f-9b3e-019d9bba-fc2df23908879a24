@@ -1,0 +1,33 @@
+{
+  "name": "@telepat/otto-protocol",
+  "version": "0.21.0",
+  "description": "Ottomate Everything - Efficient Automation For Your Browser",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/telepat-io/otto.git",
+    "directory": "packages/shared-protocol"
+  },
+  "bugs": {
+    "url": "https://github.com/telepat-io/otto/issues"
+  },
+  "homepage": "https://docs.telepat.io/otto/",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test test/**/*.test.ts",
+    "test:coverage": "c8 --reporter=lcov --reporter=text-summary --report-dir coverage --check-coverage --lines 90 --branches 90 tsx --test test/**/*.test.ts",
+    "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\" --max-warnings 0"
+  }
+}

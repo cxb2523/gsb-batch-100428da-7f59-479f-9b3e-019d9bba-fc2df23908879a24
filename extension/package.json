@@ -1,0 +1,35 @@
+{
+  "name": "@telepat/otto-extension",
+  "version": "0.21.0",
+  "description": "Ottomate Everything - Efficient Automation For Your Browser",
+  "private": true,
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/telepat-io/otto.git",
+    "directory": "extension"
+  },
+  "bugs": {
+    "url": "https://github.com/telepat-io/otto/issues"
+  },
+  "homepage": "https://docs.telepat.io/otto/",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "zip": "wxt zip",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test test/**/*.test.ts",
+    "test:coverage": "c8 --reporter=lcov --reporter=text-summary --report-dir coverage --check-coverage --lines 80 --branches 80 tsx --test test/**/*.test.ts",
+    "lint": "eslint \"entrypoints/**/*.ts\" \"src/**/*.ts\" \"test/**/*.ts\" \"wxt.config.ts\" --max-warnings 0"
+  },
+  "dependencies": {
+    "@telepat/otto-protocol": "0.21.0",
+    "nanoid": "^5.1.6"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.1.24",
+    "tsx": "^4.20.6",
+    "typescript": "^5.8.3",
+    "wxt": "^0.20.6"
+  }
+}

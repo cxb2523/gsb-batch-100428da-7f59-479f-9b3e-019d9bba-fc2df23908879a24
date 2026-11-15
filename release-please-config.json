@@ -1,0 +1,28 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "separate-pull-requests": false,
+  "packages": {
+    ".": {
+      "release-type": "node",
+      "include-component-in-tag": false,
+      "include-v-in-tag": true,
+      "extra-files": [
+        {"type": "json", "path": "packages/cli/package.json", "jsonpath": "$.version"},
+        {"type": "json", "path": "packages/cli/package.json", "jsonpath": "$.dependencies['@telepat/otto-protocol']"},
+        {"type": "json", "path": "packages/cli/package.json", "jsonpath": "$.dependencies['@telepat/otto-relay']"},
+        {"type": "json", "path": "packages/relay/package.json", "jsonpath": "$.version"},
+        {"type": "json", "path": "packages/relay/package.json", "jsonpath": "$.dependencies['@telepat/otto-protocol']"},
+        {"type": "json", "path": "packages/shared-protocol/package.json", "jsonpath": "$.version"},
+        {"type": "json", "path": "packages/sdk/package.json", "jsonpath": "$.version"},
+        {"type": "json", "path": "packages/sdk/package.json", "jsonpath": "$.dependencies['@telepat/otto-protocol']"},
+        {"type": "json", "path": "extension/package.json", "jsonpath": "$.version"},
+        {"type": "json", "path": "extension/package.json", "jsonpath": "$.dependencies['@telepat/otto-protocol']"},
+        "packages/cli/.version",
+        "packages/relay/.version",
+        "packages/shared-protocol/.version",
+        "packages/sdk/.version",
+        "extension/.version"
+      ]
+    }
+  }
+}

@@ -1,0 +1,84 @@
+import type {
+  NetworkInterceptListenerOptions,
+  CommandAuthMode,
+  CommandDescriptor,
+  CommandTestStream,
+} from '@telepat/otto-protocol';
+
+type ChromeLike = typeof chrome;
+
+export const SERIALIZED_COMMAND_ERROR_MARKER = '__ottoSerializedCommandError';
+
+export type CommandNetworkInterceptionOptions = Omit<NetworkInterceptListenerOptions, 'tabSessionId' | 'site'>;
+
+export type CommandNetworkInterceptionEvent = {
+  updateType: string;
+  emittedAt: string;
+  data: unknown;
+};
+
+export type CommandNetworkInterceptionHandle = {
+  requestId: string;
+  takeUpdates: () => CommandNetworkInterceptionEvent[];
+  stop: () => Promise<void>;
+};
+
+export type CommandDebugContext = {
+  enabled: boolean;
+  log: (event: string, data?: Record<string, unknown>) => Promise<void>;
+};
+
+export type SerializedCommandError = {
+  [SERIALIZED_COMMAND_ERROR_MARKER]: true;
+  code: string;
+  message: string;
+  diagnostics?: Record<string, unknown>;
+  retryable?: boolean;
+};
+
+export type CommandExecutionContext = {
+  chromeApi: ChromeLike;
+  tabId: number;
+  tabSessionId: string;
+  debug: CommandDebugContext;
+  isSerializedScriptError: (value: unknown) => value is SerializedCommandError;
+  getTabUrl: () => Promise<string | null>;
+  navigateTab: (url: string) => Promise<void>;
+  executeScript: <TArgs extends unknown[], TResult>(
+    func: (...args: TArgs) => TResult,
+    args: TArgs,
+  ) => Promise<TResult>;
+  executeScriptWithDomHelpers: <TArgs extends unknown[], TResult>(
+    func: (...args: TArgs) => TResult,
+    args: TArgs,
+  ) => Promise<TResult>;
+  startNetworkInterception: (options?: CommandNetworkInterceptionOptions) => Promise<CommandNetworkInterceptionHandle>;
+};
+
+export type CommandExecuteFn = (
+  ctx: CommandExecutionContext,
+  input: Record<string, unknown>,
+  authMode: CommandAuthMode,
+) => Promise<unknown>;
+
+export type CommandTestFn = (
+  ctx: CommandExecutionContext,
+  input: Record<string, unknown>,
+  helpers: {
+    authMode: CommandAuthMode;
+    execute: (inputOverride?: Record<string, unknown>) => Promise<unknown>;
+  },
+) => Promise<unknown | { stream?: CommandTestStream }>;
+
+export type SiteCommand = {
+  metadata: CommandDescriptor;
+  execute: CommandExecuteFn;
+  test?: CommandTestFn;
+};
+
+export type SiteCommandBundle = {
+  site: string;
+  checkLogin: SiteCommand;
+  gotoLogin: SiteCommand;
+  commands: SiteCommand[];
+};

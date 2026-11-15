@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality-gates:
+    name: ${{ matrix.label }} quality
+    runs-on: ubuntu-latest
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: cli
+            workspace: '@telepat/otto'
+            hasTests: true
+            coverageFlag: otto-cli
+            coverageFile: packages/cli/coverage/lcov.info
+          - label: relay
+            workspace: '@telepat/otto-relay'
+            hasTests: true
+            coverageFlag: otto-relay
+            coverageFile: packages/relay/coverage/lcov.info
+          - label: shared-protocol
+            workspace: '@telepat/otto-protocol'
+            hasTests: false
+          - label: extension
+            workspace: '@telepat/otto-extension'
+            hasTests: true
+            coverageFlag: otto-extension
+            coverageFile: extension/coverage/lcov.info
+          - label: sdk
+            workspace: '@telepat/otto-sdk'
+            hasTests: true
+            coverageFlag: otto-sdk
+            coverageFile: packages/sdk/coverage/lcov.info
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.0.0
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build protocol dependency
+        if: matrix.workspace != '@telepat/otto-protocol'
+        run: npm run --workspace @telepat/otto-protocol build
+
+      - name: Check types
+        run: npm run --workspace "${{ matrix.workspace }}" check
+
+      - name: Lint
+        run: npm run --workspace "${{ matrix.workspace }}" lint
+
+      - name: Build
+        run: npm run --workspace "${{ matrix.workspace }}" build
+
+      - name: Test with coverage
+        if: matrix.hasTests
+        run: npm run --workspace "${{ matrix.workspace }}" test:coverage
+
+      - name: Upload coverage to Codecov
+        if: ${{ matrix.hasTests && env.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ env.CODECOV_TOKEN }}
+          files: ${{ matrix.coverageFile }}
+          flags: ${{ matrix.coverageFlag }}
+          fail_ci_if_error: false
+          disable_search: true
+          verbose: true
