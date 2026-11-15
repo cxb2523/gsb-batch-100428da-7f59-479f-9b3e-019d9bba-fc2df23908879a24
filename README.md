@@ -37,7 +37,7 @@ flowchart LR
 
 | Component | Lines | What it guarantees |
 |---|---:|---|
-| `references/search.py` | ~400 | A query always gets answered by the first engine that works. With `--fan`, all engines run in parallel and URLs are merged after canonicalisation (scheme, `www.`, trailing slash, tracking parameters); hits found by several engines rank first. Domain filters are re-applied locally because not every engine honours them. |
+| `references/search.py` | ~400 | A query always gets answered by the first engine that works. With `--fan`, all engines run in parallel and URLs are merged after canonicalisation (scheme, `www.`, trailing slash, tracking parameters); hits found by several engines rank first. Domain filters are re-applied locally because not every engine honours them. Every `--fan` run ends with a per-engine summary — hits, `empty` (answered, zero results) or `error` (and why, keys scrubbed) — as one line per engine in text mode and as an `engines` list with `--json`, so "nothing found" is distinguishable from "that engine never answered". |
 | `--seen <file>` | | An `flock`-guarded list shared by one agent wave. Each hit is tagged `[new]` or `[known]`, so agent 4 sees what agents 1 to 3 already found. |
 | `references/sources.py` | ~170 | Numbered ledger `[sNN]`. `quote` only stores a quote if it appears verbatim in the fetched page (whitespace and typographic quotes normalised). `verify` exits non-zero until every citation in the draft is backed; `--check-urls` re-fetches and re-checks the quote live. |
 | `references/fetch_hard.py` | ~80 | Last-resort reader for Cloudflare-protected pages. Resolves the host first and refuses loopback, private, link-local and metadata addresses, and passes only a fixed set of flags to the browser. |
@@ -83,7 +83,7 @@ Threat model and mitigations are in [SECURITY.md](SECURITY.md): fetched pages ar
 python -m unittest discover -s tests -v
 ```
 
-19 tests, no network, no keys, about one second. CI runs them on Linux and macOS with Python 3.10, 3.12 and 3.13. Covered: URL canonicalisation, merge ranking, fallback order and error logging, parallel fan-out surviving dead engines, `.env` parsing, eight concurrent writers on one `seen.txt` producing zero duplicates, the full `add / quote / verify` CLI flow including a fabricated quote being rejected, and the SSRF guard against loopback, RFC 1918, IPv6 loopback, cloud metadata and non-HTTP schemes.
+25 tests, no network, no keys, about one second. CI runs them on Linux and macOS with Python 3.10, 3.12 and 3.13. Covered: URL canonicalisation, merge ranking, fallback order and error logging, parallel fan-out surviving dead engines with a per-engine summary that separates "engine errored" from "engine answered with zero hits" and never leaks keys, `.env` parsing, eight concurrent writers on one `seen.txt` producing zero duplicates, the full `add / quote / verify` CLI flow including a fabricated quote being rejected, and the SSRF guard against loopback, RFC 1918, IPv6 loopback, cloud metadata and non-HTTP schemes.
 
 The concurrency test earned its place on day one: on Linux it caught `seen.txt` being unlocked before the buffered write reached the file, so parallel agents recorded the same URL twice. macOS never showed it.
 

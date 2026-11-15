@@ -22,7 +22,9 @@ Optionen:
   --lang de|en|...  Sprache/Land der Ergebnisse, wo die Suchmaschine es kann
   --news            Nachrichten statt allgemeiner Web-Suche (Tavily, Serper)
   --engine NAME     nur diese: tavily, exa, exa-api, serper, donsetch, hound, jina
-  --fan             alle verfügbaren parallel statt Fallback-Kette
+  --fan             alle verfügbaren parallel statt Fallback-Kette; danach eine
+                    Zusammenfassung pro Maschine (Treffer / 0 Treffer / Fehler),
+                    mit --json als "engines"-Liste
   --seen DATEI      gemeinsame Fundliste einer Agent-Welle: markiert [neu] oder
                     [bekannt] und hängt neue URLs an (dateigesperrt, parallel sicher)
   --json            maschinenlesbar statt Text
@@ -272,6 +274,14 @@ def _missing(name):
     raise EngineDown(f"kein {name}")
 
 
+def scrub(msg, keys):
+    """Fehlermeldungen dürfen nie Key-Werte enthalten."""
+    for v in keys.values():
+        if v and len(v) >= 4:
+            msg = msg.replace(v, "***")
+    return msg
+
+
 ENGINES = {"tavily": s_tavily, "exa-api": s_exa_api, "serper": s_serper,
            "exa": s_exa_mcp, "donsetch": s_donsetch, "hound": s_hound,
            "jina": s_jina}
@@ -287,17 +297,27 @@ def norm_url(u):
     return urllib.parse.urlunsplit(("https", host, p.path.rstrip("/"), query, ""))
 
 
-def run_query(q, o, keys, log):
+def run_query(q, o, keys, log, outcomes=None):
     names = [o.engine] if o.engine else CHAIN
     if o.fan:
         def one(name):
             try:
-                return ENGINES[name](q, o, keys)
+                return name, ENGINES[name](q, o, keys), None
             except EngineDown as e:
-                log.append(f"{name}: {e}")
-                return []
+                return name, [], scrub(str(e), keys)
         with ThreadPoolExecutor(len(names)) as ex:
-            return [h for part in ex.map(one, names) for h in part]
+            results = list(ex.map(one, names))
+        hits = []
+        for name, part, err in results:
+            if err is not None:
+                log.append(f"{name}: {err}")
+            if outcomes is not None:
+                rec = outcomes.setdefault(name, {"engine": name, "hits": 0, "errors": []})
+                rec["hits"] += len(part)
+                if err is not None:
+                    rec["errors"].append(err)
+            hits += part
+        return hits
     for name in names:
         try:
             hits = ENGINES[name](q, o, keys)
@@ -305,8 +325,25 @@ def run_query(q, o, keys, log):
                 return hits
             log.append(f"{name}: 0 Treffer")
         except EngineDown as e:
-            log.append(f"{name}: {e}")
+            log.append(f"{name}: {scrub(str(e), keys)}")
     return []
+
+
+def summarize(outcomes, names):
+    """Pro Maschine ein Eintrag: ok (Treffer), error (ausgefallen) oder
+    empty (gelaufen, aber 0 Treffer). Mehrere Queries sind schon summiert."""
+    summary = []
+    for name in names:
+        rec = outcomes.get(name)
+        if rec is None:
+            continue
+        entry = {"engine": name, "hits": rec["hits"],
+                 "status": "ok" if rec["hits"] else
+                           ("error" if rec["errors"] else "empty")}
+        if rec["errors"]:
+            entry["error"] = "; ".join(dict.fromkeys(rec["errors"]))
+        summary.append(entry)
+    return summary
 
 
 def host_ok(h, o):
@@ -381,16 +418,20 @@ def main():
         ap.error("mindestens eine Query")
     o.since_d = since_date(o.since)
 
-    log, hits = [], []
+    log, hits, outcomes = [], [], {}
     for q in o.queries:
-        hits += run_query(q, o, keys, log)
+        hits += run_query(q, o, keys, log, outcomes if o.fan else None)
     hits = merge([h for h in hits if h.get("url") and host_ok(h, o)])
     log = list(dict.fromkeys(log))
     if o.seen:
         mark_seen(hits, o.seen)
+    summary = summarize(outcomes, [o.engine] if o.engine else CHAIN) if o.fan else []
 
     if o.json:
-        print(json.dumps({"hits": hits, "log": log}, ensure_ascii=False, indent=1))
+        out = {"hits": hits, "log": log}
+        if o.fan:
+            out["engines"] = summary
+        print(json.dumps(out, ensure_ascii=False, indent=1))
     else:
         for i, h in enumerate(hits, 1):
             tag = "" if "new" not in h else ("[neu] " if h["new"] else "[bekannt] ")
@@ -398,7 +439,16 @@ def main():
             print(f"{i}. {tag}{h['title']}{date_s} | {h['engine']}\n   {h['url']}")
             if h["snippet"]:
                 print(f"   {h['snippet'][:220]}")
-        if log:
+        if o.fan:
+            for e in summary:
+                if e["status"] == "ok":
+                    line = f"{e['engine']}: {e['hits']} Treffer"
+                elif e["status"] == "empty":
+                    line = f"{e['engine']}: 0 Treffer"
+                else:
+                    line = f"{e['engine']}: Fehler ({e['error']})"
+                print(f"# {line}", file=sys.stderr)
+        elif log:
             print("\n# ausgefallen: " + "; ".join(log), file=sys.stderr)
     if not hits:
         sys.exit(1)
