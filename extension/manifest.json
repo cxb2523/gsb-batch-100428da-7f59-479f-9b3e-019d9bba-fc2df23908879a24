@@ -1,0 +1,37 @@
+{
+  "manifest_version": 3,
+  "name": "Lightpanda Session Bridge",
+  "version": "0.7.41",
+  "description": "Explicitly transfer the current site session to a local Lightpanda browser.",
+  "update_url": "https://raknaos.github.io/lightpanda-session-bridge/updates.xml",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "cookies",
+    "activeTab",
+    "scripting",
+    "storage",
+    "alarms"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
+  "action": {
+    "default_title": "Transfer session to Lightpanda",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  }
+}

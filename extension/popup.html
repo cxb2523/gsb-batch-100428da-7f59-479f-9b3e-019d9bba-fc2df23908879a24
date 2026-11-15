@@ -1,0 +1,704 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lightpanda Bridge</title>
+  <link rel="stylesheet" href="fonts/fonts.css">
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #071019;
+      --ink-secondary: #243342;
+      --soft: #546573;
+      --muted: #8295a5;
+      --blue: #3579ff;
+      --violet: #6b52ff;
+      --violet-blue: #5468ff;
+      --lilac: #e2d9ff;
+      --ice: #c8f7ff;
+      --lime: #16a34a;
+      --danger: #e11d48;
+      --glass-alpha: 0.85;
+      --glass-surface: rgba(255, 255, 255, 0.72);
+      --glass-card: rgba(255, 255, 255, 0.86);
+      --edge: rgba(255, 255, 255, 0.9);
+      --edge-subtle: rgba(255, 255, 255, 0.6);
+      --shadow-sm: 0 2px 8px rgba(15, 25, 65, 0.04);
+      --shadow-md: 0 12px 32px rgba(15, 25, 65, 0.08);
+      --shadow-glow: 0 12px 28px rgba(84, 104, 255, 0.32);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html {
+      background: linear-gradient(140deg, rgba(235, 246, 255, var(--glass-alpha)) 0%, rgba(243, 236, 255, var(--glass-alpha)) 55%, rgba(230, 244, 255, var(--glass-alpha)) 100%);
+    }
+
+    html, body {
+      width: 430px;
+      max-width: 430px;
+      min-width: 430px;
+      min-height: 400px;
+      /* Chrome caps a popup at 600px: scrolling is the safety net, but the
+         layout is trimmed to fit well under it. The old hard 580px + overflow
+         hidden CLIPPED the update buttons - a control you cannot click is
+         worse than one that requires a scroll. */
+      max-height: 600px;
+      margin: 0;
+      color: var(--ink);
+      font: 13.5px/1.5 'DM Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: linear-gradient(140deg, rgba(235, 246, 255, var(--glass-alpha)) 0%, rgba(243, 236, 255, var(--glass-alpha)) 55%, rgba(230, 244, 255, var(--glass-alpha)) 100%);
+      position: relative;
+      isolation: isolate;
+      overflow-x: hidden;
+      overflow-y: auto;
+      user-select: none;
+    }
+
+    /* Quota Glass Ambient Halos */
+    body::before {
+      content: '';
+      position: fixed;
+      z-index: -1;
+      width: 480px;
+      height: 480px;
+      left: -160px;
+      top: -170px;
+      border-radius: 50%;
+      background: radial-gradient(circle, #ffffff 0%, #c8f7ff 50%, transparent 75%);
+      opacity: 0.6;
+      filter: blur(16px);
+      pointer-events: none;
+    }
+    body::after {
+      content: '';
+      position: fixed;
+      z-index: -1;
+      width: 440px;
+      height: 440px;
+      right: -180px;
+      bottom: -180px;
+      border-radius: 50%;
+      background: radial-gradient(circle, #e2d9ff 0%, #a8c6ff 50%, transparent 75%);
+      opacity: 0.65;
+      filter: blur(16px);
+      pointer-events: none;
+    }
+
+    .app-shell {
+      padding: 14px 18px;
+      min-height: 400px;
+      display: flex;
+      flex-direction: column;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.95), inset 0 0 28px rgba(190, 175, 255, 0.2);
+      backdrop-filter: blur(32px) saturate(140%);
+      -webkit-backdrop-filter: blur(32px) saturate(140%);
+    }
+
+    /* Header Layout */
+    .app-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+    .brand-wrap {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+    .brand-mark-img {
+      width: 34px;
+      height: 34px;
+      border-radius: 11px;
+      box-shadow: 0 4px 14px rgba(15, 25, 65, 0.15), 0 0 0 1px rgba(255, 255, 255, 0.8);
+      object-fit: cover;
+    }
+    .brand-title {
+      font-family: 'Space Grotesk', sans-serif;
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      color: var(--ink);
+      line-height: 1.1;
+      white-space: nowrap;
+    }
+    .brand-dot {
+      background: linear-gradient(135deg, var(--blue), var(--violet));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+
+    /* Language Switcher Pill */
+    .lang-select-wrap {
+      position: relative;
+    }
+    .lang-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 5px 10px;
+      border-radius: 99px;
+      border: 1px solid var(--edge);
+      background: rgba(255, 255, 255, 0.75);
+      font-family: 'Space Grotesk', sans-serif;
+      font-size: 11.5px;
+      font-weight: 700;
+      color: var(--ink-secondary);
+      cursor: pointer;
+      box-shadow: var(--shadow-sm);
+      transition: all 0.15s ease;
+      white-space: nowrap;
+    }
+    .lang-btn:hover {
+      background: #ffffff;
+      color: var(--ink);
+      box-shadow: 0 2px 10px rgba(84, 104, 255, 0.15);
+    }
+    .lang-dropdown {
+      position: absolute;
+      top: 100%;
+      right: 0;
+      margin-top: 6px;
+      width: 145px;
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border: 1px solid var(--edge);
+      border-radius: 12px;
+      box-shadow: var(--shadow-md);
+      padding: 5px;
+      display: none;
+      flex-direction: column;
+      gap: 2px;
+      z-index: 100;
+    }
+    .lang-dropdown.open {
+      display: flex;
+    }
+    .lang-item {
+      padding: 6px 10px;
+      border-radius: 8px;
+      font-size: 11.5px;
+      font-weight: 600;
+      color: var(--ink-secondary);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border: none;
+      background: transparent;
+      text-align: left;
+      width: 100%;
+      transition: background 0.1s ease;
+    }
+    .lang-item:hover {
+      background: rgba(84, 104, 255, 0.1);
+      color: var(--violet);
+    }
+    .lang-item.active {
+      background: rgba(84, 104, 255, 0.15);
+      color: var(--violet);
+    }
+
+    /* Relay Badge - Single line guaranteed, spacious */
+    .badge {
+      font-size: 11px;
+      font-weight: 600;
+      padding: 5px 11px;
+      border-radius: 99px;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid var(--edge);
+      background: rgba(255, 255, 255, 0.75);
+      box-shadow: var(--shadow-sm);
+      white-space: nowrap;
+    }
+    .badge.online {
+      color: #0d7a36;
+      background: rgba(214, 255, 225, 0.8);
+      border-color: rgba(46, 160, 67, 0.35);
+    }
+    .badge.offline {
+      color: #c51834;
+      background: rgba(255, 225, 230, 0.8);
+      border-color: rgba(225, 29, 72, 0.35);
+    }
+    /* Third state, added in v0.6.1: the relay answers but is not attached to
+       Lightpanda. Neither green (it is up) nor red (it is up too) - amber says
+       "reachable, not ready yet", which is exactly what it is. */
+    .badge.idle {
+      color: #9a6200;
+      background: rgba(255, 243, 205, 0.85);
+      border-color: rgba(217, 119, 6, 0.35);
+    }
+    .badge .dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: currentColor;
+      box-shadow: 0 0 8px currentColor;
+      flex-shrink: 0;
+    }
+
+    /* Target Origin Glass Card */
+    .glass-card {
+      background: var(--glass-card);
+      border: 1px solid var(--edge);
+      border-radius: 16px;
+      padding: 11px 13px;
+      margin-bottom: 9px;
+      box-shadow: var(--shadow-sm);
+      position: relative;
+    }
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 5px;
+    }
+    .card-label {
+      font-size: 10.5px;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: var(--soft);
+      font-weight: 700;
+    }
+    .security-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 10.5px;
+      font-weight: 600;
+      color: #0d7a36;
+      background: rgba(46, 160, 67, 0.1);
+      padding: 2px 8px;
+      border-radius: 99px;
+    }
+    .card-val {
+      font-family: 'Space Grotesk', monospace;
+      font-size: 13.5px;
+      font-weight: 700;
+      color: var(--ink);
+      word-break: break-all;
+    }
+
+    .desc {
+      font-size: 12px;
+      color: var(--soft);
+      line-height: 1.45;
+      margin-bottom: 10px;
+      padding: 0 2px;
+    }
+
+    /* Consent Box */
+    .consent-box {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      background: var(--glass-surface);
+      border: 1px solid var(--edge);
+      border-radius: 13px;
+      padding: 10px 12px;
+      margin-bottom: 11px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      box-shadow: var(--shadow-sm);
+    }
+    .consent-box:hover {
+      background: rgba(255, 255, 255, 0.92);
+      border-color: #ffffff;
+      transform: translateY(-0.5px);
+    }
+    .consent-box input[type="checkbox"] {
+      margin-top: 2px;
+      accent-color: var(--violet);
+      cursor: pointer;
+      width: 16px;
+      height: 16px;
+      flex-shrink: 0;
+    }
+    .consent-box span {
+      font-size: 12px;
+      color: var(--ink);
+      font-weight: 500;
+      line-height: 1.35;
+    }
+
+    /* Primary CTA Button */
+    .btn-primary {
+      width: 100%;
+      padding: 13px 18px;
+      border-radius: 14px;
+      border: 1px solid rgba(255, 255, 255, 0.75);
+      background: linear-gradient(135deg, var(--blue) 0%, var(--violet) 100%);
+      color: #ffffff;
+      font-family: 'Space Grotesk', sans-serif;
+      font-weight: 700;
+      font-size: 14px;
+      letter-spacing: -0.2px;
+      cursor: pointer;
+      box-shadow: var(--shadow-glow), inset 0 1px 0 rgba(255, 255, 255, 0.5);
+      transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+    .btn-primary:hover:not(:disabled) {
+      transform: translateY(-1.5px);
+      box-shadow: 0 16px 34px rgba(84, 104, 255, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.65);
+      filter: brightness(1.04);
+    }
+    .btn-primary:active:not(:disabled) {
+      transform: translateY(0);
+    }
+    .btn-primary:disabled {
+      background: rgba(0, 0, 0, 0.08);
+      border-color: rgba(255, 255, 255, 0.4);
+      color: rgba(0, 0, 0, 0.28);
+      box-shadow: none;
+      cursor: not-allowed;
+    }
+
+    /* Status Notification Box */
+    #status {
+      margin-top: 9px;
+      font-size: 12px;
+      font-weight: 600;
+      min-height: 15px;
+      line-height: 1.4;
+      word-break: break-word;
+      transition: all 0.15s ease;
+    }
+
+    /* Footer */
+    .app-footer {
+      margin-top: auto;
+      padding-top: 11px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-top: 1px solid rgba(0, 0, 0, 0.06);
+      font-size: 11.5px;
+      color: var(--soft);
+      font-weight: 500;
+    }
+    .footer-badge {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      background: rgba(255, 255, 255, 0.55);
+      padding: 4px 9px;
+      border-radius: 99px;
+      border: 1px solid var(--edge);
+    }
+
+    /* ---- Update card (the relay pulls it from GitHub) ---- */
+    .update-card {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .update-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .update-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 10.5px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      padding: 3px 9px;
+      border-radius: 99px;
+      border: 1px solid var(--edge);
+      background: rgba(255, 255, 255, 0.6);
+      color: var(--soft);
+      white-space: nowrap;
+    }
+    .update-chip.ok { color: #12855a; border-color: rgba(18, 133, 90, 0.28); background: rgba(18, 133, 90, 0.08); }
+    .update-chip.new { color: #ffffff; border-color: rgba(255,255,255,0.6); background: linear-gradient(135deg, var(--blue) 0%, var(--violet) 100%); }
+    .update-chip.off { color: #a2560f; border-color: rgba(162, 86, 15, 0.28); background: rgba(162, 86, 15, 0.08); }
+    .update-line {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+      font-size: 12px;
+      color: var(--soft);
+      min-height: 16px;
+    }
+    .update-version { font-family: 'Space Grotesk', sans-serif; font-weight: 700; color: var(--ink); font-size: 12.5px; }
+    .update-meta { text-align: right; font-size: 11px; line-height: 1.3; word-break: break-word; }
+    .update-actions { display: flex; gap: 8px; }
+    .update-actions:empty { display: none; }
+    .btn-update {
+      flex: 1;
+      padding: 9px 14px;
+      white-space: nowrap;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.75);
+      background: linear-gradient(135deg, var(--blue) 0%, var(--violet) 100%);
+      color: #ffffff;
+      font-family: 'Space Grotesk', sans-serif;
+      font-weight: 700;
+      font-size: 12.5px;
+      cursor: pointer;
+      box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.45);
+      transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .btn-update:hover:not(:disabled) { transform: translateY(-1px); }
+    .btn-update:disabled { opacity: 0.6; cursor: progress; }
+    /* Icone seule : deux libelles longs ne tiennent pas cote a cote sur 430px. */
+    .btn-rollback {
+      width: 38px;
+      height: 38px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      border-radius: 12px;
+      border: 1px solid var(--edge);
+      background: rgba(255, 255, 255, 0.6);
+      color: var(--soft);
+      font-family: 'Space Grotesk', sans-serif;
+      font-weight: 600;
+      font-size: 12px;
+      cursor: pointer;
+      transition: all 0.18s ease;
+    }
+    .btn-rollback:hover:not(:disabled) { color: var(--ink); background: rgba(255, 255, 255, 0.95); }
+    .btn-rollback:disabled { opacity: 0.6; cursor: progress; }
+
+    /* ---- Active sessions (Lightpanda side) ---- */
+    .sessions-head {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    }
+    .sessions-head-right { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+    .sessions-toggle {
+      display: flex; align-items: center; gap: 6px;
+      min-width: 0; border: none; background: transparent; cursor: pointer;
+      padding: 0; font: inherit; text-align: left;
+    }
+    .sessions-toggle .card-label { white-space: nowrap; }
+    .sessions-toggle:hover .card-label { color: var(--violet); }
+    .sessions-caret {
+      flex-shrink: 0; color: var(--muted);
+      transition: transform 0.18s ease;
+    }
+    .sessions-card.open .sessions-caret { transform: rotate(180deg); }
+    .sessions-count {
+      font-size: 10.5px; font-weight: 700; color: var(--ink-secondary);
+      background: rgba(84, 104, 255, 0.12); border-radius: 99px; padding: 3px 8px;
+      min-width: 22px; text-align: center;
+    }
+    .sessions-list { margin-top: 9px; max-height: 132px; overflow-y: auto; display: none; flex-direction: column; gap: 6px; }
+    .sessions-card.open .sessions-list { display: flex; }
+    .session-row {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      background: var(--glass-surface); border: 1px solid var(--edge-subtle);
+      border-radius: 10px; padding: 7px 10px;
+    }
+    .session-host {
+      font-family: 'Space Grotesk', monospace; font-size: 12px; font-weight: 700;
+      color: var(--ink); word-break: break-all;
+    }
+    .session-meta { font-size: 10.5px; color: var(--muted); font-weight: 600; }
+    .session-remove {
+      border: none; background: rgba(225, 29, 72, 0.1); color: var(--danger);
+      border-radius: 8px; padding: 5px 8px; cursor: pointer; flex-shrink: 0;
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 10.5px; font-weight: 700;
+      transition: background 0.12s ease;
+    }
+    .session-remove:hover { background: rgba(225, 29, 72, 0.2); }
+    .sessions-clear {
+      display: inline-flex; align-items: center; gap: 5px;
+      border: 1px solid rgba(225, 29, 72, 0.3); background: rgba(225, 29, 72, 0.06);
+      color: var(--danger); border-radius: 99px; padding: 4px 10px;
+      font-family: 'Space Grotesk', sans-serif; font-size: 10.5px; font-weight: 700;
+      cursor: pointer; transition: background 0.12s ease, color 0.12s ease;
+      white-space: nowrap;
+    }
+    .sessions-clear:hover { background: rgba(225, 29, 72, 0.14); }
+    .sessions-clear[data-armed] {
+      background: var(--danger); border-color: var(--danger); color: #ffffff;
+    }
+    .sessions-empty { font-size: 11.5px; color: var(--muted); font-weight: 600; padding: 2px 0; }
+
+    /* Toast */
+    .toast {
+      position: fixed;
+      bottom: 14px;
+      left: 50%;
+      transform: translateX(-50%) translateY(8px);
+      background: rgba(20, 24, 34, 0.92);
+      color: #e8ecf5;
+      padding: 8px 14px;
+      border-radius: 10px;
+      font-size: 12px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity .25s ease, transform .25s ease;
+      border: 1px solid rgba(120, 140, 180, .25);
+      z-index: 50;
+    }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+      /* Tertiary action: tinted with the product's lilac so it reads as
+         clickable without competing with the primary sync button. Two review
+         passes said the same thing - readable, but it looked like a passive
+         label, not something you can press. */
+      .diag-btn {
+        background: var(--lilac);
+        border: 1px solid rgba(107, 82, 255, .35);
+        color: var(--ink);
+        font: inherit;
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: .02em;
+        padding: 3px 9px;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: background .15s, border-color .15s, color .15s;
+      }
+      .diag-btn:hover {
+        background: #d3c6ff;
+        border-color: var(--violet);
+        color: var(--ink);
+      }
+      .diag-btn:focus-visible {
+        outline: 2px solid var(--blue);
+        outline-offset: 1px;
+      }
+  </style>
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="brand-wrap">
+        <img class="brand-mark-img" src="icons/icon48.png" width="34" height="34" alt="Panda Logo">
+        <div class="brand-title">Lightpanda<span class="brand-dot">.Bridge</span></div>
+      </div>
+      <div class="header-actions">
+        <div class="lang-select-wrap">
+          <button id="lang-btn" class="lang-btn" title="Change language">
+            <span id="current-lang-code">EN</span>
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"></polyline></svg>
+          </button>
+          <div id="lang-dropdown" class="lang-dropdown">
+            <button class="lang-item" data-lang="en"><span>English</span> <span>🇺🇸</span></button>
+            <button class="lang-item" data-lang="fr"><span>Français</span> <span>🇫🇷</span></button>
+            <button class="lang-item" data-lang="es"><span>Español</span> <span>🇪🇸</span></button>
+            <button class="lang-item" data-lang="de"><span>Deutsch</span> <span>🇩🇪</span></button>
+            <button class="lang-item" data-lang="zh"><span>中文</span> <span>🇨🇳</span></button>
+            <button class="lang-item" data-lang="ja"><span>日本語</span> <span>🇯🇵</span></button>
+            <button class="lang-item" data-lang="it"><span>Italiano</span> <span>🇮🇹</span></button>
+            <button class="lang-item" data-lang="pt"><span>Português</span> <span>🇧🇷</span></button>
+            <button class="lang-item" data-lang="ar"><span>العربية</span> <span>🇦🇪</span></button>
+            <button class="lang-item" data-lang="ru"><span>Русский</span> <span>🇷🇺</span></button>
+          </div>
+        </div>
+        <div id="relay-badge" class="badge">
+          <span class="dot"></span>
+          <span id="relay-text">Checking…</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="glass-card">
+      <div class="card-header">
+        <div class="card-label" id="label-target-origin">Target Origin</div>
+        <div class="security-chip">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+          <span>HTTPS</span>
+        </div>
+      </div>
+      <div class="card-val" id="origin">Reading tab…</div>
+    </div>
+
+    <p class="desc" id="desc-text">
+      Seamlessly transfers cookies and local session state to your isolated background Lightpanda runtime.
+    </p>
+
+    <label class="consent-box">
+      <input id="confirm" type="checkbox">
+      <span id="consent-text">I authorize the explicit transfer of this tab's authenticated session to Lightpanda.</span>
+    </label>
+
+    <button id="transfer" class="btn-primary" disabled>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"></path><path d="M3 12a9 9 0 0 1 15-6.7L21 8"></path><path d="M3 22v-6h6"></path><path d="M21 12a9 9 0 0 1-15 6.7L3 16"></path></svg>
+      <span id="btn-text">Sync to Lightpanda</span>
+    </button>
+
+    <div id="status"></div>
+
+    <!-- Bridge update: the relay does the download, this is only the button/state -->
+    <div id="update-card" class="glass-card update-card">
+      <div class="update-head">
+        <div class="card-label" id="label-update">Bridge update</div>
+        <div class="update-chip" id="update-chip">…</div>
+      </div>
+      <div class="update-line">
+        <span class="update-version" id="update-version">v0.5.0</span>
+        <span class="update-meta" id="update-meta"></span>
+      </div>
+      <div class="update-actions">
+        <button id="update-btn" class="btn-update" type="button" style="display:none"></button>
+        <button id="rollback-btn" class="btn-rollback" type="button" style="display:none">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7v6h6"></path><path d="M3.5 13a9 9 0 1 0 2.6-8.1L3 8"></path></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Active sessions inside Lightpanda (collapsible: last, so opening it only grows the tail) -->
+    <div id="sessions-card" class="glass-card sessions-card">
+      <div class="sessions-head">
+        <button id="sessions-toggle" class="sessions-toggle" type="button" aria-expanded="false">
+          <span class="card-label" id="label-sessions">Active sessions in Lightpanda</span>
+          <svg class="sessions-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="6 9 12 15 18 9"></polyline></svg>
+        </button>
+        <div class="sessions-head-right">
+          <div class="sessions-count" id="sessions-count">…</div>
+          <button id="sessions-clear" class="sessions-clear" type="button" style="display:none">
+            <span id="clear-text">Clear all</span>
+          </button>
+        </div>
+      </div>
+      <div id="sessions-list" class="sessions-list"></div>
+    </div>
+
+
+    <footer class="app-footer">
+      <div class="footer-badge">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
+        <span id="footer-secure-tag">Isolated Profile · Localhost CDP</span>
+      </div>
+      <button id="diag-btn" class="diag-btn" type="button">
+        <!-- English, not French: this is the default language, and the literal is
+             painted before popup.js can translate it. A French flash in an
+             English panel is a wrong-language frame, not a cosmetic detail. -->
+        <span id="diag-text">Copy diagnostic</span>
+      </button>
+      <span id="app-version">v0.5.0</span>
+    </footer>
+  </div>
+
+  <script src="popup.js"></script>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

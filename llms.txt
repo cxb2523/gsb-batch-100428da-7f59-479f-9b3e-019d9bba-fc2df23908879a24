@@ -1,0 +1,33 @@
+# Lightpanda Session Bridge
+
+> An open-source bridge to explicitly transfer authenticated browser sessions (Google OAuth, Passkeys, SSO, 2FA cookies) into an isolated local [Lightpanda](https://lightpanda.io) headless browser runtime via Chrome DevTools Protocol (CDP).
+
+## Key Metadata
+- **Repository:** https://github.com/Raknaos/lightpanda-session-bridge
+- **Live Demo & Docs:** https://raknaos.github.io/lightpanda-session-bridge/
+- **Deep-Dive Article:** https://dev.to/raknaos/handing-real-logins-to-headless-ai-agents-building-the-lightpanda-session-bridge-17je
+- **License:** MIT License
+- **Target Runtime:** Lightpanda CDP (WebSocket on 127.0.0.1:9222)
+- **Local Relay Port:** 127.0.0.1:8765 (Loopback only)
+
+## Core Capabilities
+- **Zero Credential Sharing:** AI agents and LLMs never receive plain text passwords or long-lived API keys.
+- **Human-in-the-Loop Authentication:** The human user authenticates normally inside any Chromium-based desktop browser (Chrome, Edge, Brave, Opera, Vivaldi, Arc, Comet). The extension securely captures scoped cookies for the active origin upon explicit user interaction.
+- **Strict SSRF Firewall:** The local relay blocks identity providers (Google accounts, Microsoft, Apple, GitHub, Auth0), rejects private IPv4/IPv6 ranges (`127.0.0.0/8`, `10.0.0.0/8`, `192.168.0.0/16`), and resolves DNS with 60-second pinning to prevent TOCTOU / DNS rebinding.
+- **Automatic Token Pairing:** First-run handshake via `/v1/bootstrap` ensures only callers carrying a verified `chrome-extension://` Origin receive the shared authorization secret (`X-Bridge-Token`).
+- **Python Client SDK:** `bridge_agent.AuthenticatedSession` (3-line authenticated automation; legacy `lightpanda_client.py` is a compatibility shim routed through the same proxy). Agents MUST go through the relay's `/v1/cdp` proxy: Lightpanda scopes its cookie jar per CDP connection, so raw sockets never see synced sessions.
+- **Zero-Config Daemon (`bridge.py`):** `python bridge.py setup` installs WSL2/Lightpanda/deps; `start` boots Lightpanda + relay (idempotent); `status` / `doctor` diagnose.
+
+## Installation & Usage
+```bash
+git clone https://github.com/Raknaos/lightpanda-session-bridge.git
+cd lightpanda-session-bridge
+pip install -r requirements.txt
+
+# Start Lightpanda (WSL2)
+./scripts/start-lightpanda.ps1
+
+# Start Local Relay
+./scripts/start-relay.ps1
+```
+Load the `extension/` directory unpacked in `chrome://extensions` (Developer Mode). Open popup to auto-pair. Click "Sync Session" on any logged-in site.

@@ -1,0 +1,1250 @@
+# -*- coding: utf-8 -*-
+"""Tests for the update path: GitHub -> relay -> live unpacked extension.
+
+Nothing here touches the network: the GitHub calls are stubbed, so the tests
+exercise the real download/verify/extract/backup/mirror/rollback code against a
+synthetic release archive.
+"""
+import hashlib
+import io
+import json
+import os
+import pathlib
+import re
+import shutil
+import sys
+import tarfile
+import tempfile
+import unittest
+import unittest.mock
+import urllib.error
+import zipfile
+
+HERE = pathlib.Path(__file__).resolve().parent
+REPO_ROOT = HERE.parent
+sys.path.insert(0, str(REPO_ROOT / "relay"))
+
+import updater  # noqa: E402
+
+VERSION = "9.9.9"
+
+
+def extension_tree(root, version=VERSION, popup_marker="new-popup"):
+    """A minimal but valid unpacked-extension tree on disk."""
+    os.makedirs(os.path.join(root, "icons"), exist_ok=True)
+    with open(os.path.join(root, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump({
+            "manifest_version": 3,
+            "name": "Lightpanda Session Bridge",
+            "version": version,
+            "permissions": ["cookies", "alarms"],
+        }, fh)
+    with open(os.path.join(root, "popup.html"), "w", encoding="utf-8") as fh:
+        fh.write(popup_marker)
+    with open(os.path.join(root, "popup.js"), "w", encoding="utf-8") as fh:
+        fh.write("// " + popup_marker + "\n")
+    with open(os.path.join(root, "icons", "icon.png"), "wb") as fh:
+        fh.write(b"\x89PNG")
+    return root
+
+
+def release_zip(version=VERSION, prefix="", popup_marker="new-popup"):
+    """In-memory zip laid out exactly like `scripts/build_release_zip.py`."""
+    buffer = io.BytesIO()
+    staging = tempfile.mkdtemp(prefix="lp-bridge-test-zip-")
+    try:
+        extension_tree(os.path.join(staging, "extension"), version, popup_marker)
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(pathlib.Path(staging).rglob("*")):
+                if path.is_file():
+                    rel = path.relative_to(staging).as_posix()
+                    archive.write(path, prefix + rel)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return buffer.getvalue()
+
+
+def release_tarball(version=VERSION, popup_marker="new-popup"):
+    """GitHub's own source archive shape: <repo>-<sha>/extension/..."""
+    buffer = io.BytesIO()
+    staging = tempfile.mkdtemp(prefix="lp-bridge-test-tar-")
+    try:
+        top = os.path.join(staging, "lightpanda-session-bridge-deadbeef")
+        extension_tree(os.path.join(top, "extension"), version, popup_marker)
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            archive.add(top, arcname=os.path.basename(top))
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return buffer.getvalue()
+
+
+class UpdateTestCase(unittest.TestCase):
+    """Gives every test its own extension dir and its own config dir."""
+
+    def setUp(self):
+        self.ext = tempfile.mkdtemp(prefix="lp-bridge-ext-")
+        self.config = tempfile.mkdtemp(prefix="lp-bridge-cfg-")
+        self._env = {key: os.environ.get(key) for key in
+                     ("LP_BRIDGE_EXTENSION_DIR", "LP_BRIDGE_CONFIG_DIR")}
+        os.environ["LP_BRIDGE_EXTENSION_DIR"] = self.ext
+        os.environ["LP_BRIDGE_CONFIG_DIR"] = self.config
+        updater.clear_cache()
+
+    def tearDown(self):
+        for key, value in self._env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        shutil.rmtree(self.ext, ignore_errors=True)
+        shutil.rmtree(self.config, ignore_errors=True)
+        updater.clear_cache()
+
+
+class TestVersionOrdering(unittest.TestCase):
+    def test_parses_and_rejects(self):
+        self.assertEqual(updater.parse_version("v0.4.3"), (0, 4, 3, ""))
+        self.assertEqual(updater.parse_version(" 1.2.10 "), (1, 2, 10, ""))
+        self.assertEqual(updater.parse_version("0.5.0-rc1"), (0, 5, 0, "rc1"))
+        self.assertIsNone(updater.parse_version("main"))
+        self.assertIsNone(updater.parse_version(""))
+        self.assertIsNone(updater.parse_version(None))
+
+    def test_ordering(self):
+        self.assertTrue(updater.is_newer("0.5.0", "0.4.3"))
+        self.assertTrue(updater.is_newer("0.4.10", "0.4.9"))
+        self.assertFalse(updater.is_newer("0.4.3", "0.4.3"))
+        self.assertFalse(updater.is_newer("0.4.2", "0.4.3"))
+        self.assertTrue(updater.is_newer("0.5.0", "0.5.0-rc1"))
+        self.assertTrue(updater.is_newer("0.5.0-rc2", "0.5.0-rc1"))
+        self.assertFalse(updater.is_newer("0.5.0-rc1", "0.5.0"))
+        # An unparsable side must never win an update.
+        self.assertFalse(updater.is_newer("nonsense", "0.4.3"))
+        self.assertFalse(updater.is_newer("0.9.9", "nonsense"))
+
+
+class TestArchiveSafety(UpdateTestCase):
+    def test_zip_traversal_refused(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("../../evil.txt", "x")
+        path = os.path.join(self.ext, "bad.zip")
+        with open(path, "wb") as fh:
+            fh.write(buffer.getvalue())
+        with self.assertRaises(RuntimeError):
+            updater.extract_archive(path, os.path.join(self.ext, "out"))
+
+    def test_zip_absolute_path_refused(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("/abs/evil.txt", "x")
+        path = os.path.join(self.ext, "bad.zip")
+        with open(path, "wb") as fh:
+            fh.write(buffer.getvalue())
+        with self.assertRaises(RuntimeError):
+            updater.extract_archive(path, os.path.join(self.ext, "out"))
+
+    def test_tar_traversal_refused(self):
+        path = os.path.join(self.ext, "bad.tar.gz")
+        with tarfile.open(path, "w:gz") as archive:
+            info = tarfile.TarInfo("../evil.txt")
+            info.size = 1
+            archive.addfile(info, io.BytesIO(b"x"))
+        with self.assertRaises(RuntimeError):
+            updater.extract_archive(path, os.path.join(self.ext, "out"))
+
+    def test_good_archives_accepted(self):
+        for name, payload in (("release.zip", release_zip()),
+                              ("source.tar.gz", release_tarball())):
+            path = os.path.join(self.ext, name)
+            with open(path, "wb") as fh:
+                fh.write(payload)
+            out = os.path.join(self.ext, "out-" + name)
+            updater.extract_archive(path, out)
+            root = updater.locate_extension_root(out)
+            self.assertEqual(updater.validate_extension_tree(root)["version"], VERSION)
+
+
+class TestLayout(UpdateTestCase):
+    def test_release_zip_layout(self):
+        out = os.path.join(self.ext, "out")
+        updater.extract_archive(self._write("a.zip", release_zip()), out)
+        self.assertTrue(os.path.isfile(os.path.join(updater.locate_extension_root(out), "manifest.json")))
+
+    def test_github_tarball_layout(self):
+        out = os.path.join(self.ext, "out")
+        updater.extract_archive(self._write("a.tar.gz", release_tarball()), out)
+        root = updater.locate_extension_root(out)
+        self.assertEqual(os.path.basename(os.path.dirname(root)), "lightpanda-session-bridge-deadbeef")
+
+    def test_tree_without_manifest_refused(self):
+        bare = os.path.join(self.ext, "bare")
+        os.makedirs(bare)
+        with open(os.path.join(bare, "readme.txt"), "w") as fh:
+            fh.write("hi")
+        with self.assertRaises(RuntimeError):
+            updater.locate_extension_root(bare)
+
+    def test_wrong_manifest_refused(self):
+        tree = os.path.join(self.ext, "other")
+        extension_tree(tree)
+        with open(os.path.join(tree, "manifest.json"), "w", encoding="utf-8") as fh:
+            json.dump({"manifest_version": 3, "name": "Some Other Extension", "version": "1.0.0"}, fh)
+        with self.assertRaises(RuntimeError):
+            updater.validate_extension_tree(tree)
+
+    def _write(self, name, payload):
+        path = os.path.join(self.ext, name)
+        with open(path, "wb") as fh:
+            fh.write(payload)
+        return path
+
+
+class TestMirror(UpdateTestCase):
+    def test_copy_prune_and_keep_build_info(self):
+        src = extension_tree(os.path.join(self.ext, "src"), popup_marker="fresh")
+        dst = extension_tree(os.path.join(self.ext, "dst"), version="0.0.1", popup_marker="stale")
+        with open(os.path.join(dst, "obsolete.js"), "w") as fh:
+            fh.write("gone")
+        with open(os.path.join(dst, updater.BUILD_INFO), "w") as fh:
+            fh.write('{"commit": "keep-me"}')
+        copied, removed = updater._mirror(src, dst)
+        self.assertNotIn("obsolete.js", os.listdir(dst))
+        self.assertIn("obsolete.js", removed)
+        self.assertIn("manifest.json", copied)
+        with open(os.path.join(dst, updater.BUILD_INFO), encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["commit"], "keep-me")
+        with open(os.path.join(dst, "popup.html"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "fresh")
+
+    def test_unchanged_files_are_not_rewritten(self):
+        tree = extension_tree(os.path.join(self.ext, "same"))
+        before = os.path.getmtime(os.path.join(tree, "manifest.json"))
+        copied, _ = updater._mirror(tree, tree)
+        self.assertEqual(copied, [])
+        self.assertEqual(before, os.path.getmtime(os.path.join(tree, "manifest.json")))
+
+
+class TestApplyAndRollback(UpdateTestCase):
+    """End-to-end through apply_update(), with only the network stubbed."""
+
+    def setUp(self):
+        super().setUp()
+        extension_tree(self.ext, version="0.4.3", popup_marker="deployed-old")
+        os.makedirs(os.path.join(self.ext, "locales"), exist_ok=True)
+        with open(os.path.join(self.ext, "locales", "stale.json"), "w") as fh:
+            fh.write("{}")
+
+    def _stub(self, payload, asset_name="lightpanda-session-bridge-9.9.9.zip",
+              tag="v9.9.9", commit="a" * 40, commit_message="release 9.9.9",
+              extra_assets=(), fetch_error=None):
+        digest = hashlib.sha256(payload).hexdigest()
+        assets = [{"name": asset_name, "url": "https://api.github.com/stub/asset"}] + list(extra_assets)
+        release = {
+            "tag": tag, "version_text": tag.lstrip("v"), "assets": assets,
+            "html_url": "https://github.com/stub/release", "published_at": "2026-01-01T00:00:00Z",
+            "notes": "notes", "commit": commit,
+        }
+        head = {"sha": commit, "short": commit[:7], "message": commit_message,
+                "date": "2026-01-01T00:00:00Z", "html_url": "https://github.com/stub/commit"}
+        served = {}
+
+        def fake_fetch(url, limit=updater.MAX_ARCHIVE_BYTES, accept="application/vnd.github+json"):
+            if fetch_error:
+                raise fetch_error
+            value = served.get(url)
+            if value is None:
+                if url.endswith(".sha256") or "SHA256SUMS" in url:
+                    value = (digest + "  " + asset_name + "\n").encode()
+                else:
+                    value = payload
+            return value
+
+        saved = (updater.latest_release, updater.latest_commit, updater._fetch)
+        updater.latest_release = lambda repo=updater.REPO: release
+        updater.latest_commit = lambda repo=updater.REPO, branch=updater.BRANCH, tag=None: head
+        # Unless a test says otherwise, the shipped tip is the commit itself:
+        # these tests are about the channel, not about the subtree filter.
+        updater.shipped_commit = lambda repo=updater.REPO, branch=updater.BRANCH: head
+        updater._fetch = fake_fetch
+        self.addCleanup(lambda: (setattr(updater, "latest_release", saved[0]),
+                                 setattr(updater, "latest_commit", saved[1]),
+                                 setattr(updater, "_fetch", saved[2])))
+        return release, head, digest
+
+    def test_every_install_leaves_one_audit_line_without_secrets(self):
+        self._stub(release_zip())
+        updater.apply_update()
+        log = pathlib.Path(self.config) / updater.AUDIT_FILE
+        lines = [json.loads(row) for row in log.read_text(encoding="utf-8").splitlines() if row.strip()]
+        self.assertEqual(len(lines), 1)
+        entry = lines[0]
+        self.assertEqual(entry["event"], "install")
+        self.assertEqual(entry["version"], VERSION)
+        self.assertEqual(entry["source"], "release")
+        self.assertTrue(entry["commit"])
+        self.assertTrue(entry["artifact"])
+        self.assertTrue(entry["at"])
+        # the line says what changed, never anything about a session
+        for forbidden in ("cookie", "token", "secret", "url", "origin", "headers"):
+            self.assertNotIn(forbidden, entry)
+
+    def test_release_install_writes_files_and_provenance(self):
+        release, head, digest = self._stub(release_zip())
+        result = updater.apply_update()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["source"], "release")
+        self.assertEqual(result["version"], VERSION)
+        self.assertEqual(result["commit"], head["sha"])
+        self.assertFalse(result["checksum_verified"])  # no sidecar published
+        with open(os.path.join(self.ext, "popup.html"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "new-popup")
+        self.assertFalse(os.path.exists(os.path.join(self.ext, "locales", "stale.json")))
+        with open(os.path.join(self.ext, updater.BUILD_INFO), encoding="utf-8") as fh:
+            build = json.load(fh)
+        self.assertEqual(build["commit"], "a" * 40)
+        self.assertEqual(build["tag"], "v9.9.9")
+        self.assertEqual(build["sha256"], digest)
+        self.assertEqual(build["previous"]["version"], "0.4.3")
+
+    def test_checksum_sidecar_is_enforced(self):
+        sidecar = {"name": "SHA256SUMS", "url": "https://api.github.com/stub/SHA256SUMS"}
+        self._stub(release_zip(), extra_assets=(sidecar,))
+        result = updater.apply_update()
+        self.assertTrue(result["checksum_verified"])
+
+    def test_wrong_checksum_refuses_the_artifact(self):
+        sidecar = {"name": "SHA256SUMS", "url": "https://api.github.com/stub/SHA256SUMS"}
+
+        def fake_fetch(url, limit=updater.MAX_ARCHIVE_BYTES, accept="application/vnd.github+json"):
+            if "SHA256SUMS" in url:
+                return ("b" * 64 + "  lightpanda-session-bridge-9.9.9.zip\n").encode()
+            return release_zip()
+
+        self._stub(release_zip(), extra_assets=(sidecar,))
+        updater._fetch = fake_fetch
+        with self.assertRaises(RuntimeError) as caught:
+            updater.apply_update()
+        self.assertIn("checksum", str(caught.exception))
+        # The deployed tree must be untouched.
+        with open(os.path.join(self.ext, "popup.html"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "deployed-old")
+
+    def test_rollback_restores_the_previous_tree(self):
+        self._stub(release_zip())
+        updater.apply_update()
+        with open(os.path.join(self.ext, "popup.html"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "new-popup")
+        result = updater.rollback_update()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["version"], "0.4.3")
+        with open(os.path.join(self.ext, "popup.html"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "deployed-old")
+
+    def test_rollback_without_backup_is_an_error(self):
+        with self.assertRaises(RuntimeError):
+            updater.rollback_update()
+
+    def test_main_source_installs_the_commit_tarball(self):
+        release, head, _ = self._stub(release_zip())
+        # Same version as deployed, but main has moved on -> main channel.
+        release["version_text"] = "0.4.3"
+        release["tag"] = "v0.4.3"
+        head["sha"] = "c" * 40
+        head["short"] = "c" * 7
+        payload = release_tarball(version="0.4.4", popup_marker="main-popup")
+
+        def fake_fetch(url, limit=updater.MAX_ARCHIVE_BYTES, accept="application/vnd.github+json"):
+            return payload
+
+        updater._fetch = fake_fetch
+        # Provenance says the deployed copy came from a, main is now c: that is
+        # what makes this the main channel and not the equal-version release.
+        with open(os.path.join(self.ext, updater.BUILD_INFO), "w", encoding="utf-8") as fh:
+            json.dump({"commit": "a" * 40, "tag": "v0.4.3"}, fh)
+        updater.clear_cache()
+        result = updater.apply_update()
+        self.assertEqual(result["source"], "main")
+        self.assertIsNone(result["tag"])  # never claim a tag the code is not from
+        self.assertEqual(result["commit"], "c" * 40)
+        with open(os.path.join(self.ext, "popup.html"), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "main-popup")
+
+
+class TestDownloadGuards(unittest.TestCase):
+    """_fetch: what the download path accepts, and what it must refuse.
+
+    v0.5.1 shipped with the real GitHub CDN host missing from the allow-list, so
+    every install died with "update redirect refused" (seen from the popup).
+    These tests pin the behaviour against a fake HTTP layer instead of the
+    network, so the guard can be changed without flying blind.
+    """
+
+    class _Response:
+        def __init__(self, url, body=b"zip-bytes", content_length=None):
+            self._url = url
+            self._body = body
+            self.headers = {}
+            if content_length is not None:
+                self.headers["Content-Length"] = str(content_length)
+
+        def geturl(self):
+            return self._url
+
+        def read(self, size=-1):
+            return self._body if size is None or size < 0 else self._body[:size]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _serve(self, response):
+        return unittest.mock.patch.object(updater.urllib.request, "urlopen",
+                                          lambda request, timeout=None: response)
+
+    def test_current_cdn_host_is_accepted(self):
+        url = ("https://release-assets.githubusercontent.com/github-production-release-asset/"
+               "1/2?sp=r&sig=whatever")
+        with self._serve(self._Response(url)):
+            self.assertEqual(updater._fetch("https://api.github.com/stub/asset"), b"zip-bytes")
+
+    def test_historical_cdn_hosts_are_accepted(self):
+        for host in ("objects.githubusercontent.com", "github-releases.githubusercontent.com"):
+            with self._serve(self._Response("https://%s/x" % host)):
+                self.assertEqual(updater._fetch("https://api.github.com/stub/asset"), b"zip-bytes")
+
+    def test_redirect_off_github_is_refused(self):
+        with self._serve(self._Response("https://evil.example/asset.zip")):
+            with self.assertRaises(RuntimeError) as caught:
+                updater._fetch("https://api.github.com/stub/asset")
+        self.assertIn("redirect refused", str(caught.exception))
+
+    def test_redirect_to_plain_http_is_refused(self):
+        with self._serve(self._Response("http://release-assets.githubusercontent.com/x")):
+            with self.assertRaises(RuntimeError) as caught:
+                updater._fetch("https://api.github.com/stub/asset")
+        self.assertIn("redirect refused", str(caught.exception))
+
+    def test_lookalike_host_is_refused(self):
+        with self._serve(self._Response("https://release-assets.githubusercontent.com.evil.example/x")):
+            with self.assertRaises(RuntimeError) as caught:
+                updater._fetch("https://api.github.com/stub/asset")
+        self.assertIn("redirect refused", str(caught.exception))
+
+    def test_source_url_must_be_github_over_https(self):
+        for url in ("http://api.github.com/x", "https://evil.example/x", "file:///etc/passwd"):
+            with self.assertRaises(RuntimeError) as caught:
+                updater._fetch(url)
+            self.assertIn("source refused", str(caught.exception))
+
+    def test_oversized_download_is_refused(self):
+        url = "https://release-assets.githubusercontent.com/x"
+        # Declared by the header ...
+        with self._serve(self._Response(url, content_length=99)):
+            with self.assertRaises(RuntimeError) as caught:
+                updater._fetch("https://api.github.com/stub/asset", limit=10)
+        self.assertIn("too large", str(caught.exception))
+        # ... and when the header lies.
+        with self._serve(self._Response(url, body=b"x" * 50)):
+            with self.assertRaises(RuntimeError) as caught:
+                updater._fetch("https://api.github.com/stub/asset", limit=10)
+        self.assertIn("too large", str(caught.exception))
+
+    def test_the_real_asset_host_is_in_the_allow_list(self):
+        # Regression guard for the v0.5.1 bug, expressible without the network.
+        self.assertIn("release-assets.githubusercontent.com", updater.ALLOWED_HOSTS)
+        for host in updater.ALLOWED_HOSTS:
+            self.assertFalse(host.startswith("*"), "no wildcard hosts: %s" % host)
+
+
+class TestCheckUpdate(UpdateTestCase):
+    def setUp(self):
+        super().setUp()
+        extension_tree(self.ext, version="0.4.3", popup_marker="deployed")
+        # Point 25: save the real callables in setUp, not in `_stub` - a test
+        # that never calls `_stub` had no `_real_local` to restore, and a
+        # measurement test read a leftover stub constant instead of the files.
+        self._real_local = updater.local_tree_sha
+        self._real_shipped = updater.shipped_tree_sha
+
+    def _stub(self, release_version, commit, installed_commit=None):
+        if installed_commit:
+            with open(os.path.join(self.ext, updater.BUILD_INFO), "w", encoding="utf-8") as fh:
+                json.dump({"commit": installed_commit, "tag": "v" + release_version}, fh)
+        release = None
+        if release_version:
+            release = {"tag": "v" + release_version, "version_text": release_version,
+                       "assets": [], "html_url": "u", "published_at": "d", "notes": "", "commit": commit}
+        head = {"sha": commit, "short": commit[:7], "message": "m", "date": "d", "html_url": "u"}
+        updater.latest_release = lambda repo=updater.REPO: release
+        updater.latest_commit = lambda repo=updater.REPO, branch=updater.BRANCH, tag=None: head
+        # Unless a test says otherwise, the shipped tip is the commit itself:
+        # these tests are about the channel, not about the subtree filter.
+        updater.shipped_commit = lambda repo=updater.REPO, branch=updater.BRANCH: head
+        # Default: the deployed bytes match the remote tree. These tests are
+        # about the CHANNEL, not about the content comparison - a test that left
+        # the lookup unmocked would hit the real GitHub and pass or fail for
+        # reasons unrelated to what it asserts.
+        same = "d" * 64
+        # Point 25: save and restore EVERY global you replace, the callables
+        # included. Leaving a stub installed made the tests that exercise the
+        # REAL local_tree_sha read a constant instead of the files on disk -
+        # four failures that pointed at the product instead of the harness.
+        def restore_trees():
+            updater.local_tree_sha = self._real_local
+            updater.shipped_tree_sha = self._real_shipped
+        self.addCleanup(restore_trees)
+        updater.local_tree_sha = lambda ext_dir="": same
+        updater.shipped_tree_sha = lambda repo=updater.REPO, ref="main": same
+        self.addCleanup(updater.clear_cache)
+
+    def test_newer_release_wins(self):
+        self._stub("9.9.9", "a" * 40)
+        status = updater.check_update(force=True)
+        self.assertTrue(status["update_available"])
+        self.assertEqual(status["source"], "release")
+        self.assertEqual(status["latest_version"], "9.9.9")
+        self.assertTrue(status["writable"])
+
+    def test_nothing_to_do_when_release_matches_and_commit_is_known(self):
+        self._stub("0.4.3", "a" * 40, installed_commit="a" * 40)
+        status = updater.check_update(force=True)
+        self.assertFalse(status["update_available"])
+        self.assertIsNone(status["source"])
+        self.assertFalse(status["baseline_unknown"])
+
+    def test_new_commit_on_main_is_offered(self):
+        self._stub("0.4.3", "b" * 40, installed_commit="a" * 40)
+        # An update is only honest if the CONTENT differs. This test used to
+        # pass with identical trees, which is the very bug the next test covers.
+        updater.local_tree_sha = lambda ext_dir="": "e" * 64
+        updater.shipped_tree_sha = lambda repo=updater.REPO, ref="main": "f" * 64
+        status = updater.check_update(force=True)
+        self.assertTrue(status["update_available"])
+        self.assertEqual(status["source"], "main")
+        self.assertEqual(status.get("shipped_tree"), "differs",
+                         "without a recorded commit the tree comparison is the "
+                         "only evidence available")
+
+    def test_a_commit_that_ships_identical_bytes_is_not_offered(self):
+        """The wolf-crying chip. Measured on 0.7.18: installed commit 045eac3,
+        newest commit touching extension/ 37e958d, and BOTH have the tree
+        c1090d37 - so the commit comparison reported an update forever, and no
+        install could clear it because the next fetch records a non-shipped
+        commit again. The invariant is the deployed BYTES."""
+        self._stub("0.4.3", "b" * 40, installed_commit="a" * 40)
+        same = "d" * 64
+        updater.local_tree_sha = lambda ext_dir="": same
+        updater.shipped_tree_sha = lambda repo=updater.REPO, ref="main": same
+        status = updater.check_update(force=True)
+        self.assertFalse(
+            status["update_available"],
+            "le popup propose d'installer des octets identiques: "
+            "shipped_tree=%s note=%s" % (status.get("shipped_tree"),
+                                         status.get("note")))
+        self.assertEqual(status["shipped_tree"], "same")
+        self.assertIn("byte-identical", status.get("note") or "")
+
+    def _different_trees(self):
+        """Declare the deployed bytes DIFFER from the remote tree.
+
+        The default in `_stub` is "identical", because that is the common case
+        and the one the wolf-crying bug was about. A test that asserts an update
+        is offered must therefore say the content changed - otherwise it passes
+        for the wrong reason (it was asserting the channel, not the content).
+        """
+        updater.local_tree_sha = lambda ext_dir="": "1" * 64
+        updater.shipped_tree_sha = lambda repo=updater.REPO, ref="main": "2" * 64
+
+    def _use_real_trees(self):
+        """Put the REAL hashing back, for tests that measure it on disk."""
+        updater.local_tree_sha = self._real_local
+        updater.shipped_tree_sha = self._real_shipped
+
+    def test_the_build_info_file_never_enters_the_tree_hash(self):
+        """`.build-info.json` is written by the installer, is untracked, and
+        differs on every machine. Hashing it would make every tree unique and
+        every comparison meaningless - the update would be offered forever for
+        the same reason this check exists."""
+        self._use_real_trees()
+        extension_tree(self.ext, version="0.4.3")
+        with open(os.path.join(self.ext, updater.BUILD_INFO), "w", encoding="utf-8") as fh:
+            json.dump({"commit": "a" * 40, "tag": "v0.4.3"}, fh)
+        first = updater.local_tree_sha()
+        with open(os.path.join(self.ext, updater.BUILD_INFO), "w", encoding="utf-8") as fh:
+            json.dump({"commit": "b" * 40, "tag": "v0.4.3", "installed_at": "later"}, fh)
+        # The message must NAME the file: unittest truncates the failing pair of
+        # hex digests to the width of the window, so "which file?" is otherwise
+        # unanswerable from the output.
+        self.assertEqual(
+            first, updater.local_tree_sha(),
+            "build-info.json change: le hash du tree a bouge alors que seul "
+            ".build-info.json a change - toute machine aura un tree unique")
+
+    def test_local_tree_hash_uses_the_git_blob_scheme(self):
+        """It must agree with the remote side, which hands back git blob shas.
+        Hashing the raw bytes with another digest compares two alphabets and
+        reports a difference on files that are byte-identical (measured on all
+        14 shipped files before this was fixed)."""
+        import hashlib
+        self._use_real_trees()
+        extension_tree(self.ext, version="0.4.3")
+        got = updater.local_tree_sha()
+        h = hashlib.sha256()
+        pairs = []
+        for base, _dirs, files in os.walk(self.ext):
+            for name in files:
+                full = os.path.join(base, name)
+                rel = "extension/" + os.path.relpath(full, self.ext).replace(os.sep, "/")
+                if rel.endswith(updater.BUILD_INFO):
+                    continue
+                with open(full, "rb") as fh:
+                    blob = fh.read()
+                pairs.append((rel, hashlib.sha1(b"blob %d\0" % len(blob) + blob).hexdigest()))
+        for path, digest in sorted(pairs):
+            h.update((path + ":" + digest + "\n").encode("utf-8"))
+        self.assertEqual(got, h.hexdigest(),
+                         "local_tree_sha n'utilise pas le schema de blob git")
+
+    def test_unknown_baseline_is_flagged(self):
+        # Nothing published yet: the only honest thing to offer is the commit.
+        self._stub(None, "b" * 40)
+        status = updater.check_update(force=True)
+        self.assertTrue(status["update_available"])
+        self.assertTrue(status["baseline_unknown"])
+        self.assertEqual(status["source"], "main")
+        self.assertEqual(status["to"], "bbbbbbb")
+
+    def test_unknown_baseline_prefers_the_verified_release(self):
+        # Deployed 0.5.0 with no provenance, and the release is also 0.5.0:
+        # offer the tagged zip (checksum-verifiable), not the main tarball.
+        # The DEPLOYED BYTES DIFFER from the shipped tree, so this is a real
+        # install: an equal version is not on its own a reason to skip it.
+        extension_tree(self.ext, version="0.5.0", popup_marker="deployed")
+        self._stub("0.5.0", "b" * 40)
+        self._use_real_trees()
+        updater.shipped_tree_sha = lambda repo=None, ref=None: "r" * 40
+        status = updater.check_update(force=True)
+        self.assertTrue(status["update_available"])
+        self.assertEqual(status["source"], "release")
+        self.assertTrue(status["baseline_unknown"])
+        self.assertEqual(status.get("shipped_tree"), "differs",
+                         "without a recorded commit the tree comparison is the "
+                         "only evidence available")
+
+    def test_unknown_baseline_never_offers_a_downgrade(self):
+        # A dev checkout ahead of the last release: main channel, not the older
+        # tagged artifact.
+        extension_tree(self.ext, version="9.0.0", popup_marker="deployed")
+        self._stub("0.5.0", "b" * 40)
+        status = updater.check_update(force=True)
+        self.assertTrue(status["update_available"])
+        self.assertEqual(status["source"], "main")
+
+    def _shipped(self, sha):
+        return {"sha": sha, "short": sha[:7], "message": "m", "date": "d", "html_url": "u"}
+
+    def test_a_commit_that_shipped_nothing_is_not_offered(self):
+        """v0.5.6 shipped scripts and tests only: the installed extension/ tree
+        was identical, and the chip still asked for an update."""
+        self._stub("0.4.3", "b" * 40, installed_commit="a" * 40)
+        updater.shipped_commit = lambda repo=updater.REPO, branch=updater.BRANCH: \
+            self._shipped("a" * 40)
+        status = updater.check_update(force=True)
+        self.assertFalse(status["update_available"])
+        self.assertIsNone(status["source"])
+        # Fast path: the installed commit IS the last one to touch extension/,
+        # so nothing is hashed and nothing may claim it was. The note used to
+        # read "byte-identical" here, which the popup then had to trust (0.7.20).
+        self.assertEqual(status.get("shipped_tree"), "unknown")
+        self.assertIsNone(status.get("shipped_tree_sha"))
+        self.assertNotIn("byte-identical", status.get("note") or "",
+                         "la note affirme une comparaison que ce chemin n'a pas "
+                         "faite: %r" % (status.get("note"),))
+        self.assertIn("latest that touched extension/", status.get("note") or "",
+                      "la note doit dire POURQUOI il n'y a rien a installer")
+
+    def test_a_commit_that_shipped_something_is_offered_at_that_commit(self):
+        self._stub("0.4.3", "c" * 40, installed_commit="a" * 40)
+        self._different_trees()
+        updater.shipped_commit = lambda repo=updater.REPO, branch=updater.BRANCH: \
+            self._shipped("b" * 40)
+        status = updater.check_update(force=True)
+        self.assertTrue(status["update_available"])
+        self.assertEqual(status["source"], "main")
+        self.assertEqual(status["to"], "b" * 7)
+
+    def test_an_unanswerable_shipped_lookup_still_offers_the_commit(self):
+        # Fail-open: a needless update beats a missed one.
+        self._stub("0.4.3", "b" * 40, installed_commit="a" * 40)
+
+        def boom(repo=updater.REPO, branch=updater.BRANCH):
+            raise RuntimeError("rate limit reached")
+
+        updater.shipped_commit = boom
+        # The shipped lookup failed, so the content lookup cannot be trusted
+        # either: fail OPEN and offer the tip, because a needless update beats
+        # a missed one.
+        self._different_trees()
+        status = updater.check_update(force=True)
+        self.assertTrue(status["update_available"])
+        self.assertEqual(status["source"], "main")
+        self.assertEqual(status["to"], "b" * 7)
+
+    def test_github_unreachable_is_not_reported_as_up_to_date(self):
+        def boom(repo=updater.REPO):
+            raise OSError("network down")
+        updater.latest_release = boom
+        status = updater.check_update(force=True)
+        self.assertFalse(status["ok"])
+        self.assertFalse(status["update_available"])
+        # the cause is carried through, whatever it says - a class name in the
+        # popup told the user nothing ("GitHub unreachable (RuntimeError)")
+        self.assertIn("network down", status["error"])
+        self.assertEqual(status.get("error_kind"), "unreachable")
+
+    def _rate_limited_urlopen(self, url, timeout=None):
+        # Real headers, as GitHub sends them on the error itself. With empty
+        # headers the honest message carries no figure, and asserting a number
+        # there would assert a memory, not a measurement.
+        raise urllib.error.HTTPError(
+            url, 403, "Forbidden",
+            {"X-RateLimit-Limit": "5000", "X-RateLimit-Remaining": "0"},
+            io.BytesIO(b'{"message": "API rate limit exceeded for 203.0.113.7."}'))
+
+    def test_a_rate_limited_api_is_named_as_such(self):
+        """GitHub writes the quota message in the BODY, so a check on the reason
+        phrase alone misses it and the user only sees a generic failure."""
+        with unittest.mock.patch.object(updater.urllib.request, "urlopen", self._rate_limited_urlopen):
+            with self.assertRaises(RuntimeError) as caught:
+                updater._fetch_json("https://api.github.com/repos/x/y/releases/latest")
+        # The quota must be named WITH ITS REAL FIGURE, read from the error's
+        # headers. Pinning "60/hour" asserted a number that is only true for an
+        # anonymous caller - and this fixture authenticates, so the honest
+        # answer is 5000/hour. Asserting "60/hour" here was asserting the bug.
+        msg = str(caught.exception)
+        self.assertIn("rate limit", msg.lower())
+        self.assertIn("5000/hour", msg)
+        self.assertNotIn("anonymous", msg)
+
+    def test_a_rate_limited_check_says_what_to_do(self):
+        err = urllib.error.HTTPError(
+            "https://api.github.com/repos/x/y", 403, "Forbidden",
+            {"X-RateLimit-Limit": "5000", "X-RateLimit-Remaining": "0"},
+            io.BytesIO(b'{"message": "API rate limit exceeded"}'))
+
+        def limited(repo=updater.REPO):
+            raise RuntimeError(updater._rate_hint(err))
+        updater.latest_release = limited
+        status = updater.check_update(force=True)
+        self.assertFalse(status["ok"])
+        self.assertFalse(status["update_available"])
+        self.assertEqual(status.get("error_kind"), "rate_limit")
+        # Same reason as above: the figure is the real one, not a remembered one.
+        self.assertIn("5000/hour", status["error"])
+        self.assertNotIn("anonymous", status["error"])
+
+    def test_missing_extension_dir_is_reported(self):
+        os.environ["LP_BRIDGE_EXTENSION_DIR"] = os.path.join(self.ext, "nope")
+        # Neutralise the checkout fallback: this test is about "nowhere found".
+        self.addCleanup(setattr, updater, "extension_dir", updater.extension_dir)
+        updater.extension_dir = lambda: ""
+        updater.latest_release = lambda repo=updater.REPO: None
+        updater.latest_commit = lambda repo=updater.REPO, branch=updater.BRANCH, tag=None: None
+        status = updater.check_update(force=True)
+        self.assertFalse(status["ok"])
+        self.assertIn("not found", status["error"])
+
+
+class TestWiring(unittest.TestCase):
+    """The button only exists if the three files agree."""
+
+    def test_popup_card_and_handler_exist(self):
+        html = (REPO_ROOT / "extension" / "popup.html").read_text(encoding="utf-8")
+        js = (REPO_ROOT / "extension" / "popup.js").read_text(encoding="utf-8")
+        for element in ("update-card", "update-chip", "update-version", "update-meta",
+                        "update-btn", "rollback-btn", "app-version"):
+            self.assertIn('id="%s"' % element, html)
+        for token in ("/v1/update/check", "/v1/update/apply", "/v1/update/rollback",
+                      "chrome.runtime.reload()", "bridgeHeaders()"):
+            self.assertIn(token, js)
+        # The footer version is filled from the manifest at runtime, so a bump
+        # never needs a second hand-edit of the HTML placeholder.
+        self.assertIn("appVersion.textContent = 'v' + chrome.runtime.getManifest().version", js)
+
+    def test_every_language_has_the_update_strings(self):
+        js = (REPO_ROOT / "extension" / "popup.js").read_text(encoding="utf-8")
+        keys = ["updateLabel", "updateChecking", "updateUpToDate", "updateAvailable",
+                "updateMainAvailable", "updateBtn", "updateBtnMain", "updateApplying",
+                "updateApplied", "updateFailed", "updateRollback", "updateRolledBack",
+                "updateBaseline", "updateChipNew", "updateChipOk", "sessionsClearShort",
+                "clearConfirmShort"]
+        for key in keys:
+            self.assertEqual(js.count("\n    %s: " % key), 10, "%s is not in all 10 languages" % key)
+
+
+class TestPopupLayout(unittest.TestCase):
+    """Chrome caps a popup at 600px tall.
+
+    The previous layout used `max-height: 580px` + `overflow: hidden` on the
+    body, so the update card at the bottom was sliced in half and its buttons
+    were unreachable. These tests pin the shape of the fix: a regression here
+    is invisible in unit output and only shows up as an unusable button.
+    """
+
+    def setUp(self):
+        self.html = (REPO_ROOT / "extension" / "popup.html").read_text(encoding="utf-8")
+        self.js = (REPO_ROOT / "extension" / "popup.js").read_text(encoding="utf-8")
+
+    def test_body_never_hides_overflow_behind_a_fixed_cap(self):
+        block = re.search(r"html, body \{(.*?)\}",
+                          self.html, re.S).group(1)
+        self.assertNotIn("overflow: hidden", block,
+                         "a hidden body plus a max-height is what clipped the buttons")
+        self.assertIn("overflow-y: auto", block, "the body must be able to scroll")
+
+    def test_collapsible_card_is_last(self):
+        """Opening the session list must only grow the tail of the popup."""
+        body = self.html[self.html.index('<div class="app-shell"'):]
+        self.assertLess(body.index('id="update-card"'), body.index('id="sessions-card"'))
+
+    def test_session_list_is_its_own_scroll_area(self):
+        block = re.search(r"\.sessions-list \{(.*?)\}", self.html, re.S).group(1)
+        self.assertIn("max-height", block)
+        self.assertIn("overflow-y: auto", block)
+
+    def test_clear_button_is_a_compact_pill_in_the_header(self):
+        head = re.search(r'<div class="sessions-head">(.*?)</div>\n      </div>',
+                         self.html, re.S).group(1)
+        self.assertIn('id="sessions-clear"', head, "the clear button belongs in the header row")
+        block = re.search(r"\.sessions-clear \{(.*?)\}", self.html, re.S).group(1)
+        self.assertNotIn("width: 100%", block, "a full-width red bar on its own row was the ugly part")
+
+    def test_clear_button_keeps_its_inner_span(self):
+        """Writing textContent on the button replaced its <span> and detached it."""
+        self.assertNotIn("sessionsClear.textContent =", self.js)
+        self.assertIn("clearText.textContent = labelClear()", self.js)
+
+    def test_update_card_shows_state_and_target_once(self):
+        """The chip used to show the hash and the meta line repeated it."""
+        card = self.js[self.js.index("function renderUpdateCard"):self.js.index("async function refreshUpdateStatus")]
+        self.assertIn("updateChip.textContent = t('updateChipNew')", card)
+        self.assertIn("updateChip.textContent = t('updateChipOk')", card)
+        self.assertNotIn("t('updateUpToDate', deployed)", card,
+                         "the chip must not repeat the version shown on the line below")
+
+    def test_manifest_has_alarms_and_matching_versions(self):
+        manifest = json.loads((REPO_ROOT / "extension" / "manifest.json").read_text(encoding="utf-8"))
+        self.assertIn("alarms", manifest["permissions"])
+        version = manifest["version"]
+        self.assertIn('version = "%s"' % version, (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        xml = (REPO_ROOT / "updates.xml").read_text(encoding="utf-8")
+        self.assertIn("version='%s'" % version, xml)
+        self.assertIn("lightpanda-session-bridge-%s.zip" % version, xml)
+
+    def test_relay_exposes_the_three_routes(self):
+        server = (REPO_ROOT / "relay" / "server.py").read_text(encoding="utf-8")
+        for route in ("/v1/update/check", "/v1/update/apply", "/v1/update/rollback"):
+            self.assertIn(route, server)
+        self.assertIn("--check-update", server)
+        self.assertIn("--rollback-update", server)
+
+    def test_background_raises_the_badge(self):
+        worker = (REPO_ROOT / "extension" / "background.js").read_text(encoding="utf-8")
+        self.assertIn("setBadgeText", worker)
+        self.assertIn("/v1/update/check", worker)
+        self.assertIn("chrome.alarms", worker)
+
+
+
+class TestPopupTranslations(unittest.TestCase):
+    """zh, ja and ar were each missing `clearConfirm` and `clearedToast`, so the
+    confirm tooltip and the toast after clearing rendered the string
+    "undefined" in three languages. Nothing checked parity, only the presence of
+    a hand-picked key list - so the check is now the whole key set."""
+
+    LANGS = ["en", "fr", "es", "de", "zh", "ja", "it", "pt", "ar", "ru"]
+
+    def _blocks(self):
+        js = (REPO_ROOT / "extension" / "popup.js").read_text(encoding="utf-8")
+        block = js[js.index("const I18N"):js.index("function t(")]
+        found = {}
+        for lang in self.LANGS:
+            m = re.search(r"\n  %s: \{(.*?)\n  \},?\n" % lang, block, re.S)
+            self.assertIsNotNone(m, "langue %s absente" % lang)
+            found[lang] = (m.group(1), set(re.findall(r"^\s{4}(\w+):", m.group(1), re.M)))
+        return js, found
+
+    def test_every_language_defines_exactly_the_same_keys(self):
+        _, blocks = self._blocks()
+        base = blocks["en"][1]
+        for lang, (_, keys) in blocks.items():
+            self.assertEqual(sorted(base - keys), [], "%s: cles manquantes" % lang)
+            self.assertEqual(sorted(keys - base), [], "%s: cles en trop" % lang)
+
+    def test_every_t_call_resolves_in_every_language(self):
+        js, blocks = self._blocks()
+        used = set(re.findall(r"\bt\(['\"]([A-Za-z0-9_]+)['\"]", js))
+        self.assertTrue(used, "aucun appel t('...') trouve")
+        for lang, (_, keys) in blocks.items():
+            self.assertEqual(sorted(used - keys), [], "%s: t() sans traduction" % lang)
+
+
+class TestGitHubAcceptHeader(unittest.TestCase):
+    """v0.5.4 shipped a real bug: the main channel asked api.github.com for
+    `application/octet-stream` and GitHub answered `415 Unsupported Media Type`
+    before sending a single byte. Measured on 2026-09-10, for
+    /repos/.../tarball/<sha>: octet-stream -> 415, vnd.github+json -> 200,
+    no Accept header at all -> 200. The CDN that serves release assets does
+    serve octet-stream, so the fix belongs in the choke point, not in a caller.
+    """
+
+    class _FakeResponse:
+        status = 200
+        headers = {"Content-Length": "2"}
+
+        def __init__(self, url):
+            self._url = url
+
+        def geturl(self):
+            return self._url
+
+        def read(self, size=-1):
+            return b"ok"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _capture(self, url, accept):
+        seen = {}
+
+        def fake_urlopen(request, timeout=None):
+            seen["url"] = request.full_url
+            seen["accept"] = request.get_header("Accept")
+            return self._FakeResponse(request.full_url)
+
+        with unittest.mock.patch.object(updater.urllib.request, "urlopen", fake_urlopen):
+            updater._fetch(url, accept=accept)
+        return seen
+
+    def test_the_api_host_never_receives_a_binary_accept(self):
+        api = "https://api.github.com/repos/Raknaos/lightpanda-session-bridge/tarball/main"
+        seen = self._capture(api, "application/octet-stream")
+        self.assertEqual(seen["accept"], updater.API_MEDIA_TYPE)
+
+    def test_a_download_host_keeps_the_accept_the_caller_asked_for(self):
+        cdn = "https://release-assets.githubusercontent.com/github-production-release-asset/x.zip"
+        seen = self._capture(cdn, "application/octet-stream")
+        self.assertEqual(seen["accept"], "application/octet-stream")
+
+    def test_the_guard_lives_in_the_single_choke_point(self):
+        src = (REPO_ROOT / "relay" / "updater.py").read_text(encoding="utf-8")
+        body = src[src.index("def _fetch("):src.index("def _fetch_json(")]
+        self.assertIn("if parsed.hostname in API_HOSTS:", body)
+        self.assertIn("accept = API_MEDIA_TYPE", body)
+        # and the main channel still asks for bytes: the guard upgrades it, so
+        # no caller has to know which host an archive will come from.
+        apply_body = src[src.index("def apply_update("):src.index("def rollback_update(")]
+        self.assertIn('archive_name, archive_url, accept, checksum, tag, commit', apply_body)
+        self.assertIn('"application/octet-stream"', apply_body)
+        self.assertIn("_fetch(archive_url, accept=accept)", apply_body)
+
+
+class TestNoProvenanceChannel(unittest.TestCase):
+    """No-provenance installs still get the CONTENT test, not just versions.
+
+    Measured on 0.7.19: a hand-installed extension reporting version 0.7.19 with
+    no recorded commit answered `update_available: True, source: release,
+    from 0.7.19 -> to 0.7.19` - a chip reinstalling identical bytes on every
+    check. The commit comparison cannot run without provenance, but the tree
+    comparison is the same question and does not need it.
+    """
+
+    def setUp(self):
+        self._real = (updater.installed_info, updater.local_tree_sha,
+                      updater.shipped_tree_sha, updater.latest_release)
+        self._release = updater.latest_release()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        (updater.installed_info, updater.local_tree_sha,
+         updater.shipped_tree_sha, updater.latest_release) = self._real
+        updater.clear_cache()
+
+    def _install(self, version, commit=None):
+        updater.installed_info = lambda ext_dir=None: {
+            "version": version, "commit": commit, "tag": None}
+
+    def test_equal_version_identical_tree_is_not_an_update(self):
+        self._install(self._release["version_text"])
+        updater.local_tree_sha = lambda ext_dir=None: "same-tree"
+        updater.shipped_tree_sha = lambda repo=None, ref=None: "same-tree"
+        result = updater.check_update(force=True)
+        self.assertFalse(
+            result["update_available"],
+            "equal version + identical bytes must not offer an update, "
+            "otherwise the chip reinstalls the same files forever")
+        self.assertEqual(result.get("shipped_tree"), "same",
+                         "the update check must report that it compared the "
+                         "deployed tree against the shipped one")
+        self.assertIn("byte-identical", result["note"],
+                      "when nothing is offered, the check must say why - an "
+                      "update chip that vanishes silently looks like a bug")
+
+    def test_equal_version_different_tree_is_still_an_update(self):
+        """The inverse must hold too, or the fix hides a real update."""
+        self._install(self._release["version_text"])
+        updater.local_tree_sha = lambda ext_dir=None: "local-tree"
+        updater.shipped_tree_sha = lambda repo=None, ref=None: "shipped-tree"
+        result = updater.check_update(force=True)
+        self.assertTrue(
+            result["update_available"],
+            "same version but different bytes IS an install worth making; "
+            "treating it as up-to-date would ship stale code forever")
+        self.assertEqual(result["source"], "release")
+        self.assertEqual(result.get("shipped_tree"), "differs",
+                         "the deployed bytes differ from the shipped tree, so the "
+                         "check must have measured the tree rather than skipped it")
+
+    def test_older_version_still_offered_from_the_release(self):
+        self._install("0.0.1")
+        result = updater.check_update(force=True)
+        self.assertTrue(result["update_available"])
+        self.assertEqual(result["source"], "release")
+
+    def test_newer_version_is_never_downgraded_to_the_release(self):
+        self._install("99.0.0")
+        result = updater.check_update(force=True)
+        self.assertNotEqual(
+            result["source"], "release",
+            "a version newer than the release must not be pulled back to it")
+
+
+class TestTheCommonCaseIsAlsoMeasured(unittest.TestCase):
+    """Deployed tree IS the tip of main - the outcome almost every up-to-date
+    user hits - fell through every branch of check_update and published neither
+    `shipped_tree` nor `note`. Measured live on 0.7.21: the diagnostic report
+    showed `update_state = None` and `update_note = None`, i.e. two empty
+    fields, on a relay with nothing at all wrong with it.
+
+    The branch must say WHY nothing is offered, and it must not claim the tree
+    was hashed: it was not compared, because comparing was unnecessary.
+    """
+
+    def _run(self, *, release_version, head_sha, installed_commit):
+        import updater as U
+        saved = (U.latest_release, U.latest_commit, U.installed_info)
+        self.addCleanup(lambda: setattr(U, "latest_release", saved[0]))
+        self.addCleanup(lambda: setattr(U, "latest_commit", saved[1]))
+        self.addCleanup(lambda: setattr(U, "installed_info", saved[2]))
+        if release_version is None:
+            U.latest_release = lambda repo=None: None
+        else:
+            parts = tuple(int(x) for x in release_version.split("."))
+            U.latest_release = lambda repo=None: {
+                "tag": "v" + release_version, "version": parts,
+                "version_text": release_version, "commit": None,
+                "published_at": "2026-01-01", "html_url": "u",
+                "assets": [], "notes": "n"}
+        U.latest_commit = (lambda repo=None: {"sha": head_sha, "short": head_sha[:8],
+                                              "message": "m", "date": "2026-01-01"}
+                           if head_sha else (lambda repo=None: None))
+        U.installed_info = lambda ext_dir=None: {
+            "version": "0.7.21", "commit": installed_commit,
+            "tag": "v0.7.21" if installed_commit else None}
+        return U.check_update(force=True)
+
+    def test_tip_of_main_publishes_the_state_and_the_reason(self):
+        sha = "a" * 40
+        r = self._run(release_version="0.7.21", head_sha=sha, installed_commit=sha)
+        self.assertFalse(r["update_available"])
+        self.assertEqual(
+            r.get("shipped_tree"), "same",
+            "the most common outcome published no state at all, so the report "
+            "showed an empty field and the popup had nothing to translate")
+        self.assertTrue(r.get("note"), "no reason given for a quiet chip")
+        self.assertIn(sha[:8], r["note"])
+
+    def test_it_never_claims_the_tree_was_hashed(self):
+        """Same commit means same bytes by construction - no hash ran. Saying
+        "byte-identical" here would be the unmeasured claim that 0.7.20 already
+        had to retract once (point 59 in the skill)."""
+        sha = "b" * 40
+        r = self._run(release_version="0.7.21", head_sha=sha, installed_commit=sha)
+        self.assertNotIn(
+            "byte-identical", r.get("note") or "",
+            "nothing was hashed on this path, so nothing may claim a comparison")
+
+    def test_a_newer_release_still_offers_the_update(self):
+        """The regression this branch must not cause: a genuinely different
+        tree still reports update_available True."""
+        r = self._run(release_version="0.7.22", head_sha="c" * 40,
+                      installed_commit="a" * 40)
+        self.assertTrue(
+            r["update_available"],
+            "adding a branch for the up-to-date case must not swallow the "
+            "case where there IS something to install")
+
+
+class TestAnUnreadableBranchIsNotSilence(unittest.TestCase):
+    """GitHub did not answer for the BRANCH. Measured 0.7.22: `head` came back
+    None, `check_update` fell through every arm, and the relay answered
+    `update_available: False` with `shipped_tree: "unknown"` and no note.
+
+    That reads as "up to date" in the popup, and it is the exact unmeasured
+    claim 0.7.20 had to retract - reintroduced through a different door. The
+    release lookup DID succeed (we got past it), so the strongest honest
+    statement is "no published release supersedes what you have", NOT "nothing
+    changed": a main-branch commit may be waiting and unread.
+    """
+
+    # The release version defaults to the INSTALLED one on purpose. With a newer
+    # release the `release_is_newer` arm answers first and every test below would
+    # pass while exercising a different path than the one its name claims -
+    # three green tests that measured nothing (points 24 / 54).
+    def _run(self, *, release_version="0.7.21", head_sha=None,
+             installed_commit="a" * 40):
+        import updater as U
+        saved = (U.latest_release, U.latest_commit, U.installed_info)
+        self.addCleanup(lambda: setattr(U, "latest_release", saved[0]))
+        self.addCleanup(lambda: setattr(U, "latest_commit", saved[1]))
+        self.addCleanup(lambda: setattr(U, "installed_info", saved[2]))
+        parts = tuple(int(x) for x in release_version.split("."))
+        U.latest_release = lambda repo=None: {
+            "tag": "v" + release_version, "version": parts,
+            "version_text": release_version, "commit": None,
+            "published_at": "2026-01-01", "html_url": "u",
+            "assets": [], "notes": "n"}
+        U.latest_commit = (lambda repo=None: {"sha": head_sha, "short": head_sha[:8],
+                                              "message": "m", "date": "2026-01-01"}
+                           if head_sha else (lambda repo=None: None))
+        U.installed_info = lambda ext_dir=None: {
+            "version": "0.7.21", "commit": installed_commit,
+            "tag": "v0.7.21" if installed_commit else None}
+        return U.check_update(force=True)
+
+    def test_it_says_the_branch_could_not_be_read(self):
+        r = self._run()
+        self.assertTrue(
+            r.get("unreachable_branch"),
+            "with head=None nothing marked the state as unread, so False read "
+            "as 'up to date' - the popup then printed reassurance nobody measured")
+        self.assertTrue(r.get("note"),
+                        "an unread branch must still carry a reason")
+
+    def test_the_key_always_exists_even_when_the_branch_was_read(self):
+        """A state that is only set on failure is indistinguishable from a relay
+        that never learned to report it (point 64): seed it in the initial dict.
+
+        The release version must EQUAL the installed one here, or the release arm
+        wins first and this never reaches the branch under test - a fixture that
+        quietly exercises a different path than the one it names.
+        """
+        sha = "a" * 40
+        r = self._run(release_version="0.7.21", head_sha=sha)
+        self.assertIn("unreachable_branch", r)
+        self.assertFalse(r["unreachable_branch"])
+        # and the common up-to-date case must not have been swallowed
+        self.assertEqual(r.get("shipped_tree"), "same")
+        self.assertTrue(r.get("note"))
+
+    def test_it_never_claims_nothing_changed(self):
+        r = self._run()
+        note = r.get("note") or ""
+        self.assertNotIn("nothing newer", note)
+        self.assertNotIn("byte-identical", note)
+        self.assertFalse(
+            r.get("update_available"),
+            "the release lookup succeeded and superseded nothing, so no update "
+            "is offered - but that is not the same as saying nothing changed")
+
+    def test_a_newer_release_still_wins_over_the_unreadable_branch(self):
+        """An unread branch must not mask a real published update."""
+        r = self._run(release_version="0.7.30")
+        self.assertTrue(r["update_available"])
+        self.assertEqual(r.get("source"), "release")
+        self.assertFalse(r.get("unreachable_branch"),
+                         "the release arm answers, so the branch was not needed "
+                         "and must not be reported as unread")
+
+
+class TestNoteOnlyClaimsWhatWasMeasured(unittest.TestCase):
+    """A note must not assert a measurement that was skipped.
+
+    Measured live on 0.7.20: main had moved to a docs-only commit, the installed
+    commit WAS the last one to touch extension/, so the fast path returned
+    `shipped_tree: None`, `shipped_tree_sha: None`, `local_tree_sha: None` - and
+    a note reading "the deployed tree is byte-identical". Nothing had been
+    hashed. The popup keys its explanation off `shipped_tree`, so a False there
+    is the difference between an honest panel and a misleading one.
+    """
+
+    def setUp(self):
+        self._real = (updater.installed_info, updater.shipped_commit,
+                      updater.shipped_tree_sha, updater.local_tree_sha,
+                      updater.latest_commit, updater.latest_release)
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        (updater.installed_info, updater.shipped_commit, updater.shipped_tree_sha,
+         updater.local_tree_sha, updater.latest_commit,
+         updater.latest_release) = self._real
+        updater.clear_cache()
+
+    def test_fast_path_never_claims_bytes_were_compared(self):
+        # main moved on (head != installed), but the installed commit IS the last
+        # one that touched extension/. Head differs, so the branch is entered;
+        # shipped == installed, so nothing is hashed. That combination is the
+        # live 0.7.20 case, and it used to report "byte-identical".
+        # Fast path = head moved on, but the installed commit IS the last one
+        # that touched extension/. Both hashes are UNREACHABLE here, so if the
+        # note says "byte-identical" it is claiming a comparison it skipped.
+        # head != installed (so the branch IS entered) AND shipped == installed
+        # (so nothing is hashed). Both hash readers must also be unreachable,
+        # so any "byte-identical" wording is provably unearned.
+        head = {"sha": "b" * 40, "short": "bbbbbbb", "message": "docs",
+                "date": "2026-01-01T00:00:00Z", "html_url": "u"}
+        updater.latest_commit = lambda repo=None, branch=None, tag=None: head
+        updater.shipped_commit = lambda repo=None, branch=None: {
+            "sha": "a" * 40, "short": "aaaaaaa", "message": "extension",
+            "date": "2026-01-01T00:00:00Z", "html_url": "u"}
+        updater.latest_release = lambda repo=None: None
+        updater.installed_info = lambda ext_dir=None: {
+            "version": "0.7.20", "commit": "a" * 40, "tag": None}
+        result = updater.check_update(force=True)
+        self.assertFalse(result["update_available"])
+        self.assertEqual(
+            result.get("shipped_tree"), "unknown",
+            "nothing was hashed on the fast path, so the state must say so "
+            "instead of claiming the trees are identical")
+        self.assertIsNone(result.get("shipped_tree_sha"))
+        self.assertNotIn(
+            "byte-identical", result.get("note") or "",
+            "the note claimed a comparison that was never performed: %r"
+            % (result.get("note"),))
+
+    def test_slow_path_reports_the_hashes_it_measured(self):
+        head = {"sha": "b" * 40, "short": "bbbbbbb", "message": "docs",
+                "date": "2026-01-01T00:00:00Z", "html_url": "u"}
+        updater.latest_commit = lambda repo=None, branch=None, tag=None: head
+        updater.shipped_commit = lambda repo=None, branch=None: {
+            "sha": "c" * 40, "short": "ccccccc", "message": "ext",
+            "date": "2026-01-01T00:00:00Z", "html_url": "u"}
+        updater.latest_release = lambda repo=None: None
+        updater.shipped_tree_sha = lambda repo=None, ref=None: "same"
+        updater.local_tree_sha = lambda ext_dir=None: "same"
+        updater.installed_info = lambda ext_dir=None: {
+            "version": "0.7.20", "commit": "a" * 40, "tag": None}
+        result = updater.check_update(force=True)
+        self.assertEqual(result.get("shipped_tree"), "same")
+        self.assertEqual(result.get("shipped_tree_sha"), "same")
+        self.assertIn("byte-identical", result.get("note") or "")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

@@ -1,0 +1,1088 @@
+"""Self-update for the unpacked extension, driven by the local relay.
+
+Why the relay does it and not the extension: the extension is loaded
+*unpacked* from a directory on disk, so Chrome will never update it by itself
+(no Web Store, and the update_url manifest key only serves CRX builds). The
+popup can only ask; a process with filesystem access must do the work. The
+relay already runs on the user's machine, so it is that process.
+
+Safety rules, in order of importance:
+  * the download origin is compiled in (REPO) - never taken from the caller;
+  * https only, GitHub hosts only, checked again after every redirect;
+  * hard size cap, and the archive layout is validated before a byte is
+    written into the live extension directory;
+  * archive members are extracted one by one with zip-slip / traversal refused;
+  * the current tree is copied to a backup outside the repo first, so any
+    update can be undone with rollback();
+  * nothing secret is ever read, logged or returned (versions and hashes only).
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import tarfile
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+
+REPO = os.environ.get("LP_BRIDGE_UPDATE_REPO", "Raknaos/lightpanda-session-bridge")
+BRANCH = os.environ.get("LP_BRIDGE_UPDATE_BRANCH", "main")
+API = "https://api.github.com"
+# Every host the download is allowed to end up on. GitHub answers a release
+# asset request with a 302 to a signed CDN URL, and the CDN hostname has changed
+# over the years, so all known ones are listed rather than trusting a wildcard:
+# `release-assets.githubusercontent.com` is what it redirects to today
+# (v0.5.2 fix - v0.5.1 failed here with "update redirect refused"), the other two
+# are the historical targets. The check runs on the *final* URL, so a redirect
+# can never walk the download off GitHub.
+ALLOWED_HOSTS = {
+    "api.github.com",
+    "github.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+}
+MAX_ARCHIVE_BYTES = 25 * 1024 * 1024
+BUILD_INFO = ".build-info.json"
+# Written by _backup() INTO the backup directory. rollback_update() mirrors
+# that directory into the live extension, so without an exemption the live
+# unpacked tree ends up carrying a stray config file - and the next update's
+# prune pass then deletes it as "not in the source tree".
+BACKUP_META = "meta.json"
+# Files that live in a managed directory but are never part of the shipped
+# source tree. Kept during a prune so the relay's own bookkeeping survives.
+MIRROR_KEEP = (BUILD_INFO, BACKUP_META)
+
+# One writer at a time. The relay is a ThreadingHTTPServer and three different
+# callers reach this module concurrently: the popup (/v1/update/apply,
+# /v1/update/rollback), an agent holding the token, and
+# `python relay/server.py --apply-update`. Without this, one thread's rmtree can
+# delete the directory another thread is mirroring from, and rollback_update can
+# pull the backup out from under an install in flight.
+#
+# RLock, not Lock: apply_update calls check_update, so a plain Lock deadlocks the
+# request thread against itself (the suite hung for 7 minutes before this). The
+# reentrancy is per-thread, which is exactly the semantics wanted here - a nested
+# check_update from inside apply_update must NOT block, but a second THREAD still
+# must.
+_UPDATE_LOCK = threading.RLock()
+BACKUP_DIRNAME = "extension-backup"
+AUDIT_FILE = "update.log"
+# 5 minutes, not 60 seconds: every check is up to three anonymous API calls and
+# the quota is 60/hour for the whole IP. A run of popup opens could exhaust it
+# and the relay would then answer "rate limit" for everything.
+CACHE_TTL = 300.0
+USER_AGENT = "lightpanda-session-bridge-updater"
+# api.github.com refuses a media type it cannot *produce*: asking for
+# `application/octet-stream` on /repos/.../tarball or /commits/main is answered
+# with `415 Unsupported Media Type`. That is how "install the latest commit"
+# failed on 2026-09-10 (v0.5.4): the main channel reused the octet-stream
+# Accept meant for the CDN and the API rejected it before a single byte of the
+# archive was sent. Measured: the same tarball URL returns 200 with
+# `application/vnd.github+json` and 200 with no Accept header at all.
+# The guard sits in _fetch, the one place every update request goes through,
+# so no caller can reintroduce it by asking for bytes from the API host.
+API_MEDIA_TYPE = "application/vnd.github+json"
+API_HOSTS = {"api.github.com"}
+# Anonymous GitHub is 60 requests/hour per IP and the badge, the popup and the
+# acceptance gate all call the API: a run of checks is enough to exhaust it and
+# the relay then reports "rate limit exceeded" for everything. A token raises it
+# to 5000/h. Read from the environment or a file next to the config, never
+# logged, never sent anywhere but github.com (every download host is
+# allow-listed above).
+TOKEN_ENV = "LP_BRIDGE_GITHUB_TOKEN"
+TOKEN_FILE = "github_token"
+# Not a constant any more: this message used to claim "anonymous is 60/hour"
+# on EVERY quota failure, including authenticated ones - while a token gets
+# 5000/h. A user with a valid token was told to add a token. The real limit and
+# remaining count are read from the response headers, which GitHub sends on the
+# error itself.
+def _rate_hint(err):
+    h = getattr(err, "headers", None) or {}
+    limit = h.get("X-RateLimit-Limit")
+    remaining = h.get("X-RateLimit-Remaining")
+    # GitHub's OWN header is the authority, not whether this process happens to
+    # hold a token: it reports 60 for an anonymous call and 5000 for an
+    # authenticated one. Reading identity from the local token file produced
+    # "anonymous: 5000/hour" - two contradicting facts in one sentence.
+    if limit:
+        who = "authenticated token" if limit != "60" else "anonymous"
+        return ("GitHub API rate limit reached (%s: %s/hour, %s left)"
+                % (who, limit, remaining if remaining is not None else "?"))
+    who = "authenticated token" if github_token() else "anonymous"
+    return "GitHub API rate limit reached (%s, quota not reported)" % who
+
+_CACHE: dict = {"at": 0.0, "data": None}
+_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+]([0-9A-Za-z.\-]+))?$")
+
+
+# --------------------------------------------------------------------------
+# versions
+# --------------------------------------------------------------------------
+
+def parse_version(text: str):
+    """'v0.4.3' -> (0, 4, 3, ''); '0.5.0-beta.1' -> (0, 5, 0, 'beta.1')."""
+    match = _VERSION_RE.match((text or "").strip())
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)),
+            match.group(4) or "")
+
+
+def is_newer(candidate: str, current: str) -> bool:
+    """True when `candidate` is strictly newer than `current`.
+
+    A final release beats a pre-release of the same numbers (0.5.0 > 0.5.0-rc1),
+    which is the ordering users expect from a release channel.
+    """
+    new, old = parse_version(candidate), parse_version(current)
+    if new is None or old is None:
+        return False
+    if new[:3] != old[:3]:
+        return new[:3] > old[:3]
+    if bool(new[3]) != bool(old[3]):
+        return not new[3]
+    return new[3] > old[3]
+
+
+# --------------------------------------------------------------------------
+# local layout
+# --------------------------------------------------------------------------
+
+def config_dir() -> str:
+    return os.environ.get("LP_BRIDGE_CONFIG_DIR") or os.path.join(
+        os.path.expanduser("~"), ".config", "lightpanda-bridge"
+    )
+
+
+def repo_root() -> str:
+    """The checkout this file ships in (relay/../)."""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def extension_dir() -> str:
+    """Where the live unpacked extension lives.
+
+    LP_BRIDGE_EXTENSION_DIR wins, then <config>/config.json {"extension_dir"},
+    then the sibling ./extension of the checkout this relay was started from.
+    Returns "" when none of them holds a manifest.json.
+    """
+    candidates = []
+    env = os.environ.get("LP_BRIDGE_EXTENSION_DIR")
+    if env:
+        candidates.append(env)
+    try:
+        with open(os.path.join(config_dir(), "config.json"), "r", encoding="utf-8") as fh:
+            configured = (json.load(fh) or {}).get("extension_dir")
+            if configured:
+                candidates.append(configured)
+    except (OSError, ValueError):
+        pass
+    candidates.append(os.path.join(repo_root(), "extension"))
+    for path in candidates:
+        if os.path.isfile(os.path.join(path, "manifest.json")):
+            return os.path.abspath(path)
+    return ""
+
+
+def read_manifest(ext_dir: str) -> dict:
+    with open(os.path.join(ext_dir, "manifest.json"), "r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def installed_info(ext_dir: str = "") -> dict:
+    """What is deployed right now: version from the manifest, provenance from
+    the .build-info.json the updater writes on every install."""
+    ext_dir = ext_dir or extension_dir()
+    info = {"version": None, "manifest_version": None, "commit": None,
+            "commit_short": None, "tag": None, "installed_at": None,
+            "source": None, "directory": ext_dir}
+    if not ext_dir:
+        return info
+    try:
+        manifest = read_manifest(ext_dir)
+    except (OSError, ValueError):
+        return info
+    info["version"] = manifest.get("version")
+    info["manifest_version"] = manifest.get("manifest_version")
+    try:
+        with open(os.path.join(ext_dir, BUILD_INFO), "r", encoding="utf-8") as fh:
+            build = json.load(fh) or {}
+        for key in ("commit", "tag", "installed_at", "source"):
+            if build.get(key):
+                info[key] = build[key]
+        info["commit_short"] = (info["commit"] or "")[:8] or None
+    except (OSError, ValueError):
+        pass
+    return info
+
+
+def audit_path() -> str:
+    return os.path.join(config_dir(), AUDIT_FILE)
+
+
+def audit(record: dict) -> None:
+    """Append one JSON line per install to update.log.
+
+    On 2026-09-10 a new copy appeared in the live extension directory and the
+    only way to date it was to diff two timestamps by hand; the run itself left
+    no trace of what it installed or what it replaced. One append-only line per
+    install (no cookie, no token, no page URL - version, commit shas, artifact
+    name, file counts, timestamp) answers that without archaeology.
+    """
+    line = dict(record)
+    line["at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        os.makedirs(config_dir(), exist_ok=True)
+        with open(audit_path(), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(line, ensure_ascii=True, sort_keys=True) + "\n")
+    except OSError:
+        pass  # never let bookkeeping break an install that already succeeded
+
+
+def backup_meta_path() -> str:
+    return os.path.join(config_dir(), BACKUP_DIRNAME, BACKUP_META)
+
+
+def read_backup_meta() -> dict:
+    try:
+        with open(backup_meta_path(), "r", encoding="utf-8") as fh:
+            return json.load(fh) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+# --------------------------------------------------------------------------
+# GitHub
+# --------------------------------------------------------------------------
+
+def github_token() -> str:
+    token = (os.environ.get(TOKEN_ENV) or "").strip()
+    if token:
+        return token
+    try:
+        with open(os.path.join(config_dir(), TOKEN_FILE), "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _fetch(url: str, limit: int = MAX_ARCHIVE_BYTES, accept: str = API_MEDIA_TYPE):
+    """GET over https, from an allow-listed host only, capped in size.
+
+    The allow-list is re-checked on the *final* URL so a redirect cannot walk
+    the download onto an arbitrary origin. The API host always gets the GitHub
+    media type: it answers 415 to an Accept it cannot produce, whatever the
+    caller asked for (see API_HOSTS).
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in ALLOWED_HOSTS:
+        raise RuntimeError("update source refused")
+    if parsed.hostname in API_HOSTS:
+        accept = API_MEDIA_TYPE
+    headers = {"User-Agent": USER_AGENT}
+    if accept:
+        headers["Accept"] = accept
+    token = github_token()
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=30) as response:
+        final = urllib.parse.urlparse(response.geturl())
+        if final.scheme != "https" or final.hostname not in ALLOWED_HOSTS:
+            raise RuntimeError("update redirect refused")
+        declared = int(response.headers.get("Content-Length") or 0)
+        if declared > limit:
+            raise RuntimeError("update artifact too large")
+        data = response.read(limit + 1)
+        if len(data) > limit:
+            raise RuntimeError("update artifact too large")
+    return data
+
+
+def _fetch_json(url: str):
+    try:
+        return json.loads(_fetch(url, limit=1_000_000).decode("utf-8"))
+    except urllib.error.HTTPError as err:
+        if err.code == 404:
+            return None
+        # GitHub writes the quota message in the BODY ("API rate limit
+        # exceeded for ..."), not in the reason phrase, so read it before
+        # deciding. 403 and 429 are both used.
+        body = ""
+        try:
+            body = err.read().decode("utf-8", "replace")[:400]
+        except Exception:
+            pass
+        haystack = " ".join([str(getattr(err, "reason", "")),
+                             str(getattr(err, "headers", "") or ""), body]).lower()
+        if err.code in (403, 429) and "rate limit" in haystack:
+            raise RuntimeError(_rate_hint(err)) from err
+        raise
+
+
+def latest_release(repo: str = REPO):
+    data = _fetch_json(f"{API}/repos/{repo}/releases/latest")
+    if not data or not data.get("tag_name"):
+        return None
+    assets = []
+    for asset in data.get("assets") or []:
+        url = asset.get("browser_download_url") or ""
+        host = urllib.parse.urlparse(url).hostname
+        if not url or host not in ALLOWED_HOSTS:
+            continue
+        assets.append({"name": asset.get("name") or "", "url": url,
+                       "size": int(asset.get("size") or 0)})
+    return {
+        "tag": data["tag_name"],
+        "version": (parse_version(data["tag_name"]) or (0, 0, 0, ""))[:3],
+        "version_text": data["tag_name"].lstrip("vV"),
+        "commit": data.get("target_commitish") or None,
+        "published_at": data.get("published_at"),
+        "html_url": data.get("html_url"),
+        "assets": assets,
+        "notes": (data.get("body") or "").strip()[:400],
+    }
+
+
+def latest_commit(repo: str = REPO, branch: str = BRANCH, tag: str | None = None):
+    ref = tag or branch
+    data = _fetch_json(f"{API}/repos/{repo}/commits/{urllib.parse.quote(ref)}")
+    if not data or not data.get("sha"):
+        return None
+    commit = data.get("commit") or {}
+    return {
+        "sha": data["sha"],
+        "short": data["sha"][:8],
+        "date": ((commit.get("committer") or {}).get("date")),
+        "message": (commit.get("message") or "").splitlines()[0][:120],
+        "html_url": data.get("html_url"),
+    }
+
+
+def shipped_commit(repo: str = REPO, branch: str = BRANCH):
+    """The newest commit that changed the shipped subtree (extension/).
+
+    The commit channel installs `extension/` and nothing else - the mirror only
+    ever writes that subtree - so a commit touching scripts/, tests/ or docs
+    has nothing to deliver. Offering it asked the user to install an identical
+    tree: the update chip that cried wolf. GitHub answers the question directly
+    (one request, only ever made when the tip already differs).
+    """
+    query = ("%s/repos/%s/commits?path=extension&sha=%s&per_page=1"
+             % (API, repo, urllib.parse.quote(branch)))
+    data = _fetch_json(query)
+    if not isinstance(data, list) or not data:
+        return None
+    sha = (data[0] or {}).get("sha")
+    if not sha:
+        return None
+    commit = (data[0].get("commit") or {})
+    return {
+        "sha": sha,
+        "short": sha[:8],
+        "date": (commit.get("committer") or {}).get("date"),
+        "message": (commit.get("message") or "").splitlines()[0][:120],
+        "html_url": data[0].get("html_url"),
+    }
+
+
+def shipped_tree_sha(repo: str = REPO, ref: str = "main") -> str | None:
+    """One sha256 over the CONTENT of extension/ at `ref`.
+
+    Comparing COMMITS is not enough and, here, is the wrong test. The commit
+    channel installs `extension/`; two commits that leave that subtree byte
+    identical - a harness fix, a release note, a test - have different shas and
+    the same product. Measured: 045eac3 and 37e958d share the tree
+    `c1090d37...`, yet the shipped subtree commit (37e958d) is not the installed
+    one, so a `sha == sha` test reports an update that would install identical
+    bytes - and the user can never clear it, because the install records the
+    tip it fetched, which is again a non-shipped commit.
+
+    GitHub's tree API answers this in one request: `/git/trees/<sha>?recursive=1`
+    lists every blob under `extension/` with its own sha. Hash the (path, blob)
+    pairs so the result does not depend on ordering or on the commit message.
+    Return None when the lookup fails - the caller then falls back to comparing
+    commits, because a needless update beats a missed one.
+    """
+    query = ("%s/repos/%s/git/trees/%s?recursive=1"
+             % (API, repo, urllib.parse.quote(ref)))
+    try:
+        data = _fetch_json(query)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    entries = []
+    for node in (data.get("tree") or []):
+        if node.get("type") != "blob":
+            continue
+        path = node.get("path") or ""
+        if not path.startswith("extension/") or path == "extension/.build-info.json":
+            # The provenance file is written by the installer, not tracked, and
+            # differs on every machine: including it would make every tree
+            # unique and the comparison meaningless.
+            continue
+        entries.append((path, node.get("sha") or ""))
+    if not entries:
+        return None
+    h = hashlib.sha256()
+    for path, blob in sorted(entries):
+        h.update((path + ":" + blob + "\n").encode("utf-8"))
+    return h.hexdigest()
+
+
+def local_tree_sha(ext_dir: str = "") -> str | None:
+    """The same hash over the deployed tree on disk, for a like-for-like compare.
+
+    Hash the files, not the git tree: the relay runs from the checkout, and the
+    checkout may carry edits that were never committed. If the deployed bytes
+    match the remote tree, there is nothing to install - whatever commit is
+    recorded in .build-info.json.
+    """
+    ext_dir = ext_dir or extension_dir()
+    if not ext_dir or not os.path.isdir(ext_dir):
+        return None
+    entries = []
+    for base, _dirs, files in os.walk(ext_dir):
+        for name in files:
+            full = os.path.join(base, name)
+            # Key the hash by the REPO-relative path, not the path relative to
+            # the extension dir: the remote side lists `extension/popup.js`, and
+            # hashing the two alphabets differently reported a difference on 14
+            # files that were byte-identical.
+            rel = "extension/" + os.path.relpath(full, ext_dir).replace(os.sep, "/")
+            if rel == "extension/" + BUILD_INFO or rel.endswith("/.DS_Store"):
+                continue
+            try:
+                with open(full, "rb") as fh:
+                    blob = fh.read()
+            except OSError:
+                return None
+            # git's BLOB HASH, not a bare sha256 of the bytes: the remote side
+            # hands us git blob shas, so hashing anything else here compares two
+            # different alphabets and reports a difference that is not there
+            # (measured: every one of the 14 files matched byte for byte while
+            # the tree hashes disagreed).
+            entries.append((rel, hashlib.sha1(
+                b"blob %d\0" % len(blob) + blob).hexdigest()))
+    if not entries:
+        return None
+    h = hashlib.sha256()
+    for rel, digest in sorted(entries):
+        h.update((rel + ":" + digest + "\n").encode("utf-8"))
+    return h.hexdigest()
+
+
+# --------------------------------------------------------------------------
+# check
+# --------------------------------------------------------------------------
+
+def check_update(force: bool = False, repo: str = REPO) -> dict:
+    """Compare what is deployed with GitHub. Read-only, cacheable."""
+    """Serialized: only one update operation runs at a time."""
+    with _UPDATE_LOCK:
+        now = time.time()
+        if not force and _CACHE["data"] is not None and (now - _CACHE["at"]) < CACHE_TTL:
+            return _CACHE["data"]
+
+        ext_dir = extension_dir()
+        result = {
+            "ok": True,
+            "repo": repo,
+            "extension_dir": ext_dir or None,
+            "writable": bool(ext_dir) and os.access(ext_dir, os.W_OK),
+            "update_available": False,
+            "source": None,
+            "current_version": None,
+            "current_commit": None,
+            "current_tag": None,
+            "latest_version": None,
+            "latest_tag": None,
+            "latest_commit": None,
+            "baseline_unknown": False,
+            "backup_available": bool(read_backup_meta().get("version")),
+            "published_at": None,
+            "url": None,
+            "notes": "",
+            # Seeded here, refined by the branches below. Measured on 0.7.21:
+            # `shipped_tree` and `note` existed ONLY inside the conditional arms,
+            # so the common up-to-date outcome (`head == current`, which falls
+            # through every arm) published neither and the report showed empty
+            # fields on a healthy relay. A key that is absent and a key that
+            # says "not measured" must never look the same (skill point 64).
+            "shipped_tree": "unknown",
+            "note": None,
+            # Seeded for the same reason as `shipped_tree`: `True` must be a
+            # deliberate statement, never a key that only exists when a branch
+            # set it. The popup reads its ABSENCE as "the branch was read and
+            # there is nothing to report".
+            "unreachable_branch": False,
+        }
+        current = installed_info(ext_dir)
+        result.update({
+            "current_version": current["version"],
+            "current_commit": current["commit"],
+            "current_tag": current["tag"],
+        })
+        if not ext_dir:
+            result.update({"ok": False, "error": "extension directory not found"})
+            _CACHE.update({"at": now, "data": result})
+            return result
+
+        try:
+            release = latest_release(repo)
+        except Exception as err:  # network down, rate limited, ...
+            # An actionable message beats a class name: "GitHub API rate limit
+            # reached (anonymous is 60/hour per IP)" tells the user what to do,
+            # "GitHub unreachable (RuntimeError)" does not.
+            detail = str(err) if str(err) else ""
+            result.update({
+                "ok": False,
+                "error": detail or f"GitHub unreachable ({type(err).__name__})",
+                "error_kind": "rate_limit" if "rate limit" in detail.lower() else "unreachable",
+            })
+            _CACHE.update({"at": now, "data": result})
+            return result
+
+        head = None
+        try:
+            head = latest_commit(repo)
+        except Exception:
+            head = None
+        # `latest_commit` is external data too: if a stub, a proxy or a future
+        # refactor hands back something that is not a commit mapping, the truthy
+        # value used to reach `head["sha"]` and raise TypeError INSIDE the check -
+        # a 500 on the popup's update path. Measured 0.7.22: a non-dict `head`
+        # crashed the whole comparison. Treat anything that is not a mapping as
+        # "could not be read", which is what it is.
+        if not isinstance(head, dict) or not head.get("sha"):
+            head = None
+
+        if release:
+            result["latest_version"] = release["version_text"]
+            result["latest_tag"] = release["tag"]
+            result["published_at"] = release["published_at"]
+            result["url"] = release["html_url"]
+            result["notes"] = release["notes"]
+
+        release_is_newer = bool(
+            release and release["version_text"]
+            and is_newer(release["version_text"], current["version"] or "0.0.0")
+        )
+
+        if release_is_newer:
+            result.update({"update_available": True, "source": "release",
+                           "from": current["version"], "to": release["version_text"]})
+        elif head and current["commit"] and head["sha"] != current["commit"]:
+            # Same release, main moved on - but only a commit that changed the
+            # shipped subtree is worth installing. Fail-open: if GitHub will not
+            # say, offer the tip, because a needless update beats a missed one.
+            try:
+                shipped = shipped_commit(repo)
+            except Exception:
+                shipped = None
+            target = shipped or head
+            # Compare CONTENT, not commits. The installed commit is whatever tip
+            # the last fetch recorded, which is routinely a commit that touched
+            # only scripts/ or docs - so `shipped["sha"] != current["commit"]`
+            # was true while the deployed bytes were identical, and the chip
+            # offered an update the user could never clear (measured: installed
+            # 045eac3, shipped 37e958d, both tree c1090d37, update_available True).
+            same_shipped_commit = bool(shipped and shipped["sha"] == current["commit"])
+            identical_tree = False
+            tree_state = "unknown"
+            if not same_shipped_commit:
+                local_sha = local_tree_sha()
+                remote_sha = shipped_tree_sha(repo)
+                if local_sha and remote_sha:
+                    identical_tree = local_sha == remote_sha
+                    tree_state = "same" if identical_tree else "differs"
+                result["shipped_tree_sha"] = remote_sha
+                result["local_tree_sha"] = local_sha
+            # Reported on BOTH paths: the popup reads it to decide whether it can
+            # claim the bytes are identical, so "unknown" has to be visible, not
+            # a missing key.
+            result["shipped_tree"] = tree_state
+            if same_shipped_commit or identical_tree:
+                # The NOTE must say what was MEASURED. Reusing the slow path's
+                # wording on the fast path claimed "byte-identical" while
+                # shipped_tree / shipped_tree_sha / local_tree_sha were all None -
+                # nothing had been hashed at all. Measured live on 0.7.20.
+                # An unmeasured fact gets an unmeasured sentence, and the popup
+                # keys its explanation off `shipped_tree`, so a False here would
+                # send the user back to a bare commit sha.
+                result.update({
+                    "update_available": False,
+                    "shipped_tree": tree_state,
+                    "note": ("main moved to %s, but the deployed tree is "
+                             "byte-identical" % head["short"]) if identical_tree
+                            else ("deployed commit %s is the latest that touched "
+                                  "extension/" % head["short"]),
+                })
+            else:
+                result.update({
+                    "update_available": True, "source": "main",
+                    "from": current["commit"][:8], "to": target["short"],
+                })
+        elif not current["commit"] and release:
+            # No provenance (hand-installed, or an installer older than 0.5.0), so
+            # the deployed tree *is* the release only by assumption. Offer the
+            # tagged artifact - the immutable, checksum-verified one - never a
+            # downgrade, and never a silent guess about what is on disk.
+            installed = parse_version(current["version"] or "")
+            published = parse_version(release["version_text"])
+            # An equal version is NOT an update. Measured: hand-installed
+            # 0.7.19 against release 0.7.19 answered `update_available: True,
+            # from 0.7.19 -> to 0.7.19`, a chip reinstalling the identical bytes
+            # on every check, because this branch compared versions only and
+            # never looked at the deployed tree. With no provenance the commit
+            # test cannot run - but the CONTENT test can, and it is the same
+            # question.
+            identical = False
+            tree_state = "unknown"
+            tag = release.get("tag_name") or release.get("tag") or ""
+            if installed and published and installed == published:
+                local_sha = local_tree_sha(ext_dir)
+                remote_sha = shipped_tree_sha(repo, tag) if tag else None
+                if local_sha and remote_sha:
+                    identical = local_sha == remote_sha
+                    tree_state = "same" if identical else "differs"
+                result["shipped_tree_sha"] = remote_sha
+                result["local_tree_sha"] = local_sha
+                # The popup reads this to explain WHY nothing is offered. It is
+                # a measured flag, not a message: the note below carries a git sha
+                # and English prose, which is right for a log and wrong for a
+                # ten-language panel - so the popup translates the STATE.
+                result["shipped_tree"] = tree_state
+                if identical:
+                    result.update({
+                        "update_available": False,
+                        "note": "release %s is byte-identical to the deployed "
+                                "tree" % release["version_text"],
+                    })
+            if not identical:
+                if installed and published and installed[:3] <= published[:3]:
+                    result.update({
+                        "update_available": True, "source": "release",
+                        "baseline_unknown": True,
+                        "from": current["version"], "to": release["version_text"],
+                    })
+                else:
+                    result.update({"update_available": True, "source": "main",
+                                   "baseline_unknown": True, "from": None,
+                                   "to": (head or {}).get("short")})
+        elif head and not current["commit"]:
+            # No release to fall back on: install main and record the commit so the
+            # next check is exact.
+            result.update({"update_available": True, "source": "main",
+                           "baseline_unknown": True, "from": None, "to": head["short"]})
+        elif head and current["commit"] == head["sha"]:
+            # The most COMMON outcome - deployed tree IS the tip of main - fell
+            # through every branch above and published no `shipped_tree` and no
+            # `note`. Measured live on 0.7.21: `update_available: False` with
+            # both facts absent, so the diagnostic report showed two empty
+            # fields and the popup had no state to translate. The bytes are
+            # identical BY CONSTRUCTION here (same commit), so `same` is a
+            # measurement, not a guess - but say so, and never claim the tree
+            # was hashed: it was not compared, it was never needed.
+            result.update({
+                "update_available": False,
+                "shipped_tree": "same",
+                "note": ("deployed commit %s is the tip of main; "
+                         "no update was fetched because there is "
+                         "nothing newer to fetch"
+                         % (current["commit"][:8] if current["commit"] else "?")),
+            })
+
+        elif head is None:
+            # GitHub did not answer for the branch (measured 0.7.22: the commit
+            # lookup raised and `head` came back None). This also fell through
+            # every arm - but here it is NOT "up to date", it is "we could not
+            # look". `update_available: False` with no note made the popup print
+            # "À jour": the unmeasured claim 0.7.20 had to retract, reintroduced
+            # by a different route. The release lookup DID succeed (we got here),
+            # so the strongest honest claim is that no PUBLISHED release
+            # supersedes what is deployed - not that nothing changed. A state
+            # the popup can translate beats silence read as reassurance.
+            result.update({
+                "update_available": False,
+                "unreachable_branch": True,
+                "note": ("the branch state could not be read from GitHub; only "
+                         "the published release was compared, so a main-branch "
+                         "commit may be waiting"),
+            })
+
+        if head:
+            result["latest_commit"] = head["sha"]
+            result["latest_commit_short"] = head["short"]
+            result["latest_commit_message"] = head["message"]
+            result["latest_commit_date"] = head["date"]
+
+        _CACHE.update({"at": now, "data": result})
+        return result
+
+
+def clear_cache() -> None:
+    _CACHE.update({"at": 0.0, "data": None})
+
+
+# --------------------------------------------------------------------------
+# archives
+# --------------------------------------------------------------------------
+
+def _safe_members(archive) -> list:
+    """Reject absolute paths, drive letters and any traversal component."""
+    names = []
+    for member in archive:
+        # zipfile.ZipInfo exposes .filename, tarfile.TarInfo exposes .name
+        name = getattr(member, "name", None) or getattr(member, "filename", "") or ""
+        name = name.replace("\\", "/")
+        if not name or name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+            raise RuntimeError("archive refused: absolute path")
+        parts = [part for part in name.split("/") if part not in ("", ".")]
+        if any(part == ".." for part in parts):
+            raise RuntimeError("archive refused: path traversal")
+        names.append((member, "/".join(parts)))
+    return names
+
+
+def extract_archive(archive_path: str, dest: str) -> str:
+    """Extract a .zip or .tar.gz into dest, refusing traversal. Returns dest."""
+    if archive_path.lower().endswith(".zip"):
+        with zipfile.ZipFile(archive_path) as archive:
+            for member, safe in _safe_members(archive.infolist()):
+                if member.is_dir():
+                    continue
+                target = os.path.join(dest, *safe.split("/"))
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with archive.open(member) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+        return dest
+    with tarfile.open(archive_path, "r:*") as archive:
+        for member, safe in _safe_members(archive.getmembers()):
+            if not member.isfile():
+                continue
+            source = archive.extractfile(member)
+            if source is None:
+                continue
+            target = os.path.join(dest, *safe.split("/"))
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with source, open(target, "wb") as out:
+                shutil.copyfileobj(source, out)
+    return dest
+
+
+def locate_extension_root(root: str) -> str:
+    """Find the directory that holds manifest.json in an extracted archive.
+
+    Accepts the release layout (extension/ at the archive root) and the GitHub
+    source archive layout (<repo>-<sha>/extension/), so both channels work.
+    """
+    if os.path.isfile(os.path.join(root, "manifest.json")):
+        return root
+    candidate = os.path.join(root, "extension")
+    if os.path.isfile(os.path.join(candidate, "manifest.json")):
+        return candidate
+    children = [os.path.join(root, name) for name in sorted(os.listdir(root))]
+    children = [path for path in children if os.path.isdir(path)]
+    for child in children:
+        candidate = os.path.join(child, "extension")
+        if os.path.isfile(os.path.join(candidate, "manifest.json")):
+            return candidate
+    if len(children) == 1 and os.path.isfile(os.path.join(children[0], "manifest.json")):
+        return children[0]
+    raise RuntimeError("archive refused: no extension/manifest.json inside")
+
+
+def validate_extension_tree(root: str) -> dict:
+    """Refuse anything that is not this extension before touching the live dir."""
+    manifest_path = os.path.join(root, "manifest.json")
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as fh:
+            manifest = json.load(fh)
+    except (OSError, ValueError):
+        raise RuntimeError("archive refused: unreadable manifest.json")
+    if int(manifest.get("manifest_version") or 0) != 3:
+        raise RuntimeError("archive refused: not a Manifest V3 extension")
+    if "lightpanda" not in (manifest.get("name") or "").lower():
+        raise RuntimeError("archive refused: unexpected extension name")
+    if not parse_version(manifest.get("version") or ""):
+        raise RuntimeError("archive refused: unparsable version")
+    if not os.path.isfile(os.path.join(root, "popup.js")):
+        raise RuntimeError("archive refused: incomplete tree")
+    return manifest
+
+
+def _same_file(left: str, right: str) -> bool:
+    """Byte comparison that never holds two file handles beyond the loop."""
+    try:
+        if os.path.getsize(left) != os.path.getsize(right):
+            return False
+        with open(left, "rb") as a, open(right, "rb") as b:
+            while True:
+                chunk_a, chunk_b = a.read(65536), b.read(65536)
+                if chunk_a != chunk_b:
+                    return False
+                if not chunk_a:
+                    return True
+    except OSError:
+        return False
+
+
+def _mirror(src_root: str, dst_root: str) -> tuple:
+    """Make dst_root hold exactly the files of src_root (plus kept local files)."""
+    copy, remove = [], []
+    src_files = {}
+    for folder, _dirs, files in os.walk(src_root):
+        for name in files:
+            absolute = os.path.join(folder, name)
+            rel = os.path.relpath(absolute, src_root).replace(os.sep, "/")
+            if rel in MIRROR_KEEP or rel.startswith("__pycache__/"):
+                continue
+            src_files[rel] = absolute
+
+    for rel, absolute in sorted(src_files.items()):
+        target = os.path.join(dst_root, *rel.split("/"))
+        if os.path.commonpath([os.path.abspath(target), os.path.abspath(dst_root)]) != os.path.abspath(dst_root):
+            raise RuntimeError("refused: write outside the extension directory")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        if not os.path.isfile(target) or not _same_file(target, absolute):
+            shutil.copy2(absolute, target)
+            copy.append(rel)
+
+    for folder, _dirs, files in os.walk(dst_root):
+        for name in files:
+            absolute = os.path.join(folder, name)
+            rel = os.path.relpath(absolute, dst_root).replace(os.sep, "/")
+            if rel in src_files or rel in MIRROR_KEEP or rel.startswith("__pycache__/"):
+                continue
+            os.unlink(absolute)
+            remove.append(rel)
+    return copy, remove
+
+
+def _backup(ext_dir: str) -> str:
+    """Snapshot the live tree so `rollback_update` has an undo point.
+
+    Build it BESIDE the current backup and swap at the end. The old version did
+    `rmtree(backup_root)` first, so a failure during the copy - ENOSPC, EPERM, a
+    file lock, which is the NORMAL case on Windows when Chrome holds popup.js
+    open - left the install with no undo point at all, before the live tree had
+    been touched by anything. The old generation is only discarded once the new
+    one is complete.
+    """
+    backup_root = os.path.join(config_dir(), BACKUP_DIRNAME)
+    # Snapshot the info BEFORE mirroring: the live tree is replaced right after
+    # this call, so anything read afterwards describes the NEW install rather
+    # than the one this backup can restore.
+    info = installed_info(ext_dir)
+    staging = backup_root + ".new"
+    retired = backup_root + ".old"
+    try:
+        shutil.rmtree(staging, ignore_errors=True)
+        os.makedirs(staging, exist_ok=True)
+        _mirror(ext_dir, staging)
+        # _mirror deliberately SKIPS BUILD_INFO (it belongs to the tree being
+        # replaced, not to the source), so the backup never carried it and a
+        # rollback restored a tree whose provenance was blank. Carry it over.
+        live_build = os.path.join(ext_dir, BUILD_INFO)
+        if os.path.isfile(live_build):
+            shutil.copy2(live_build, os.path.join(staging, BUILD_INFO))
+        meta = {key: info.get(key)
+                for key in ("version", "commit", "tag", "source")}
+        meta["saved_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        with open(os.path.join(staging, BACKUP_META), "w", encoding="utf-8") as fh:
+            json.dump(meta, fh, indent=2)
+        # Swap only now: the new generation is complete and readable.
+        shutil.rmtree(retired, ignore_errors=True)
+        if os.path.isdir(backup_root):
+            os.replace(backup_root, retired)
+        os.replace(staging, backup_root)
+        return backup_root
+    finally:
+        # No half-written staging dir: the next backup would mirror from it, and
+        # read_backup_meta() would report the version of an install that never
+        # completed. The OLD generation is untouched by this cleanup.
+        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(retired, ignore_errors=True)
+
+
+def _write_build_info(ext_dir: str, payload: dict) -> None:
+    payload = dict(payload)
+    payload["installed_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    payload["repo"] = REPO
+    # newline="\n": the shipped tree is LF everywhere (.gitattributes), and a
+    # CRLF provenance file made the acceptance check fail on a fresh install.
+    with open(os.path.join(ext_dir, BUILD_INFO), "w", encoding="utf-8", newline="\n") as fh:
+        json.dump(payload, fh, indent=2)
+
+
+def _checksum_from_assets(assets: list, zip_name: str):
+    """Fetch the published sha256 sidecar for a release asset, if there is one."""
+    sidecar = None
+    for asset in assets:
+        if asset["name"] in (zip_name + ".sha256", "SHA256SUMS", "SHA256SUMS.txt"):
+            sidecar = asset
+            break
+    if not sidecar:
+        return None
+    try:
+        text = _fetch(sidecar["url"], limit=64_000, accept="text/plain").decode("utf-8", "replace")
+    except Exception:
+        return None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1].lstrip("*") == zip_name:
+            return parts[0].lower()
+        if len(parts) == 1 and re.fullmatch(r"[0-9a-fA-F]{64}", parts[0]):
+            return parts[0].lower()
+    return None
+
+
+def apply_update(source: str = "auto", repo: str = REPO) -> dict:
+    """Download and install the newest release (or main commit) from GitHub."""
+    """Serialized: only one update operation runs at a time."""
+    with _UPDATE_LOCK:
+        ext_dir = extension_dir()
+        if not ext_dir:
+            raise RuntimeError("extension directory not found")
+        if not os.access(ext_dir, os.W_OK):
+            raise RuntimeError("extension directory is not writable")
+
+        status = check_update(force=True, repo=repo)
+        if not status.get("ok"):
+            raise RuntimeError(status.get("error") or "update check failed")
+        source = status.get("source") if source in ("auto", None) else source
+        if source not in ("release", "main"):
+            raise RuntimeError("nothing to install: already up to date")
+
+        release = latest_release(repo) if source == "release" else None
+        archive_name, archive_url, accept, checksum, tag, commit = "", "", "application/octet-stream", None, None, None
+
+        if source == "release":
+            if not release:
+                raise RuntimeError("release not found")
+            zip_name = ""
+            for asset in release["assets"]:
+                if asset["name"].lower().endswith(".zip"):
+                    zip_name = asset["name"]
+                    archive_name, archive_url = asset["name"], asset["url"]
+                    checksum = _checksum_from_assets(release["assets"], zip_name)
+                    break
+            if not archive_url:
+                # No release asset: fall back to the source archive of the tag.
+                tag = release["tag"]
+                archive_name = f"source-{tag}.tar.gz"
+                archive_url = f"{API}/repos/{repo}/tarball/{urllib.parse.quote(tag)}"
+            tag = tag or release["tag"]
+            commit = (latest_commit(repo, tag=tag) or {}).get("sha") or release.get("commit")
+        else:
+            head = latest_commit(repo)
+            if not head:
+                raise RuntimeError("main branch not found")
+            try:
+                target = shipped_commit(repo) or head
+            except Exception:
+                target = head
+            commit = target["sha"]
+            tag = None  # main-channel install: no tag to claim
+            archive_name = f"source-{target['short']}.tar.gz"
+            archive_url = f"{API}/repos/{repo}/tarball/{target['sha']}"
+
+        raw = _fetch(archive_url, accept=accept)
+        digest = hashlib.sha256(raw).hexdigest()
+        if checksum and digest != checksum:
+            raise RuntimeError("checksum mismatch: artifact refused")
+
+        workdir = tempfile.mkdtemp(prefix="lp-bridge-update-")
+        try:
+            suffix = ".zip" if archive_name.lower().endswith(".zip") else ".tar.gz"
+            archive_path = os.path.join(workdir, "artifact" + suffix)
+            with open(archive_path, "wb") as fh:
+                fh.write(raw)
+            extract_dir = os.path.join(workdir, "extract")
+            os.makedirs(extract_dir)
+            extract_archive(archive_path, extract_dir)
+            root = locate_extension_root(extract_dir)
+            manifest = validate_extension_tree(root)
+
+            previous = installed_info(ext_dir)
+            backup_root = _backup(ext_dir)
+            copy, remove = _mirror(root, ext_dir)
+            _write_build_info(ext_dir, {
+                "version": manifest.get("version"),
+                "manifest_version": manifest.get("manifest_version"),
+                "tag": tag,
+                "commit": commit,
+                "source": source,
+                "artifact": archive_name,
+                "sha256": digest,
+                "release_url": (release or {}).get("html_url"),
+                "previous": {key: previous.get(key) for key in ("version", "commit", "tag")},
+            })
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+        audit({"event": "install", "source": source, "version": manifest.get("version"),
+               "previous_version": previous.get("version"), "previous_commit": (previous.get("commit") or "")[:8],
+               "commit": (commit or "")[:8], "tag": tag, "artifact": archive_name,
+               "sha256": digest, "files_written": len(copy), "files_removed": len(remove)})
+        clear_cache()
+        return {
+            "ok": True,
+            "source": source,
+            "version": manifest.get("version"),
+            "tag": tag,
+            "commit": commit,
+            "commit_short": (commit or "")[:8] or None,
+            "artifact": archive_name,
+            "sha256": digest,
+            "checksum_verified": bool(checksum),
+            "files_written": len(copy),
+            "files_removed": len(remove),
+            "previous": {key: previous.get(key) for key in ("version", "commit", "tag")},
+            "backup": backup_root,
+            "reload_required": True,
+        }
+
+
+def rollback_update() -> dict:
+    """Restore the tree saved by the previous update (undo)."""
+    """Serialized: only one update operation runs at a time."""
+    with _UPDATE_LOCK:
+        ext_dir = extension_dir()
+        if not ext_dir:
+            raise RuntimeError("extension directory not found")
+        backup_root = os.path.join(config_dir(), BACKUP_DIRNAME)
+        meta = read_backup_meta()
+        if not meta.get("version") or not os.path.isfile(os.path.join(backup_root, "manifest.json")):
+            raise RuntimeError("no backup to restore")
+        manifest = validate_extension_tree(backup_root)
+        current = installed_info(ext_dir)
+        copy, remove = _mirror(backup_root, ext_dir)
+        _write_build_info(ext_dir, {
+            "version": manifest.get("version"),
+            "manifest_version": manifest.get("manifest_version"),
+            "tag": meta.get("tag"),
+            "commit": meta.get("commit"),
+            "source": "rollback",
+            "previous": {key: current.get(key) for key in ("version", "commit", "tag")},
+        })
+        shutil.rmtree(backup_root, ignore_errors=True)
+        clear_cache()
+        return {"ok": True, "version": manifest.get("version"), "tag": meta.get("tag"),
+                "commit": meta.get("commit"), "files_written": len(copy),
+                "files_removed": len(remove), "reload_required": True}
