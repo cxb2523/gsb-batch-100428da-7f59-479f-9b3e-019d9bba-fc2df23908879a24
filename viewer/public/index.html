@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Job feed</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="feed.css" />
+</head>
+<body>
+<div class="app" id="app-root">
+
+  <!-- Header -->
+  <header class="app-header">
+    <div>
+      <h1>Job feed</h1>
+      <div class="sub" id="header-sub">Loading…</div>
+    </div>
+    <div class="meta" id="header-meta"></div>
+    <div class="queue-btn-wrap">
+      <button class="queue-btn" id="queue-btn" aria-label="Queue" title="Analysis queue">
+        <span class="queue-btn-label">Queue</span>
+        <span class="queue-btn-badge" id="queue-badge"></span>
+      </button>
+      <span class="queue-processed-stat" id="queue-processed-stat" style="display:none">
+        <span class="qps-icon">✓</span>
+        <span id="queue-processed-count">0</span> processed
+        <span class="qps-sep">·</span>
+        <span class="qps-apply-icon">📋</span>
+        <span id="queue-apply-count">0</span> to apply
+      </span>
+    </div>
+  </header>
+
+  <!-- Queue drawer -->
+  <div class="queue-overlay" id="queue-overlay"></div>
+  <aside class="queue-drawer" id="queue-drawer" aria-label="Analysis queue">
+    <div class="queue-drawer-header">
+      <span class="queue-drawer-title">Analysis queue</span>
+      <div style="display:flex;align-items:center;gap:8px">
+        <button class="qi-autoanalyze-btn" id="qi-autoanalyze-btn" title="Toggle auto-analyze" style="display:none"></button>
+        <button class="queue-drawer-close" id="queue-drawer-close" aria-label="Close">✕</button>
+      </div>
+    </div>
+    <div class="queue-drawer-body" id="queue-drawer-body">
+      <p class="queue-empty-msg">No items in queue.</p>
+    </div>
+  </aside>
+
+  <!-- Filters -->
+  <section class="filters-panel">
+    <div class="filters-top">
+      <div class="filters-heading">
+        <div class="filters-heading-row">
+          <h2>Refine the job stream</h2>
+        </div>
+        <div class="result-count" id="result-count"></div>
+      </div>
+      <div class="filters-stats" id="stats"></div>
+      <div class="crawl-indicator" id="crawl-indicator" aria-label="Crawl status">
+        <div class="crawl-bar-wrap">
+          <div class="crawl-bar-fill" id="crawl-bar-fill"></div>
+        </div>
+        <span class="crawl-bar-pct" id="crawl-bar-pct"></span>
+        <div class="crawl-popover" id="crawl-popover"></div>
+      </div>
+    </div>
+    <div class="filters-grid">
+      <div class="filter-group filter-group--title">
+        <label class="filter-label" for="filter-title">Job title</label>
+        <input id="filter-title" class="filter-input" type="text" placeholder="product (owner,manager,builder)" autocomplete="off" />
+      </div>
+      <div class="filter-group filter-group--include">
+        <label class="filter-label" for="filter-include">Must include</label>
+        <div class="keyword-input-wrap">
+          <input id="filter-include" class="filter-input" type="text" placeholder="TPM, program manager" autocomplete="off" />
+          <button type="button" class="keyword-clear" id="filter-include-clear" aria-label="Clear">×</button>
+        </div>
+      </div>
+      <div class="filter-group filter-group--exclude">
+        <label class="filter-label" for="filter-exclude">Exclude</label>
+        <div class="keyword-input-wrap">
+          <input id="filter-exclude" class="filter-input" type="text" placeholder="data science, ML, intern" autocomplete="off" />
+          <button type="button" class="keyword-clear" id="filter-exclude-clear" aria-label="Clear">×</button>
+        </div>
+      </div>
+      <div class="filter-group">
+        <div class="filter-label-row">
+          <label class="filter-label" for="filter-mylocation">My location</label>
+          <label class="remote-toggle">
+            <input type="checkbox" id="filter-remote" checked />
+            <span>Include remote</span>
+          </label>
+        </div>
+        <input id="filter-mylocation" class="filter-input" type="text" placeholder="Miami, FL" autocomplete="off" />
+      </div>
+      <div class="filter-group">
+        <label class="filter-label" for="filter-company">Company</label>
+        <input id="filter-company" class="filter-input" type="text" placeholder="Apple, Google" autocomplete="off" />
+      </div>
+      <div class="filter-group">
+        <label class="filter-label">Providers</label>
+        <div class="provider-dropdown" id="provider-dropdown">
+          <button type="button" class="provider-btn" id="provider-btn">All providers</button>
+          <div class="provider-menu" id="provider-menu"></div>
+        </div>
+      </div>
+      <div class="filter-group">
+        <label class="filter-label" for="filter-days">Max age</label>
+        <input id="filter-days" class="filter-input" type="number" min="1" placeholder="7" />
+      </div>
+      <div class="filter-group">
+        <label class="filter-label" for="filter-score">Score</label>
+        <select id="filter-score" class="filter-input">
+          <option value="">All</option>
+          <option value="none">No score yet</option>
+          <option value="4plus">Score ≥ 4</option>
+        </select>
+      </div>
+      <div class="filter-group filter-group--tiers">
+        <label class="filter-label">Level</label>
+        <div class="provider-dropdown" id="tier-dropdown">
+          <button type="button" class="provider-btn" id="tier-btn">Mid, Senior</button>
+          <div class="provider-menu" id="tier-menu">
+            <label class="provider-item"><input type="checkbox" name="tier" value="intern" /><span>Intern</span></label>
+            <label class="provider-item"><input type="checkbox" name="tier" value="entry" /><span>Entry</span></label>
+            <label class="provider-item"><input type="checkbox" name="tier" value="mid" checked /><span>Mid</span></label>
+            <label class="provider-item"><input type="checkbox" name="tier" value="senior" checked /><span>Senior</span></label>
+          </div>
+        </div>
+      </div>
+      <div class="filter-group filter-group--types">
+        <label class="filter-label">Type</label>
+        <div class="provider-dropdown" id="type-dropdown">
+          <button type="button" class="provider-btn" id="type-btn">Full-time, Contract</button>
+          <div class="provider-menu" id="type-menu">
+            <label class="provider-item"><input type="checkbox" name="emptype" value="Full-time" checked /><span>Full-time</span></label>
+            <label class="provider-item"><input type="checkbox" name="emptype" value="Contract" checked /><span>Contract</span></label>
+            <label class="provider-item"><input type="checkbox" name="emptype" value="Part-time" /><span>Part-time</span></label>
+            <label class="provider-item"><input type="checkbox" name="emptype" value="Temporary" /><span>Temp</span></label>
+            <label class="provider-item"><input type="checkbox" name="emptype" value="Internship" /><span>Internship</span></label>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Saved searches + favorites strip -->
+  <div class="strip-panel">
+    <div class="strip-left" id="saved-searches-strip">
+      <span class="strip-label">Saved</span>
+    </div>
+    <div class="strip-right">
+      <label class="fav-only-wrap">
+        <input type="checkbox" id="fav-only-toggle" />
+        Favorites only
+      </label>
+      <label class="fav-only-wrap">
+        <input type="checkbox" id="evaluated-only-toggle" />
+        Evaluated only
+      </label>
+      <button class="btn-manage" type="button" id="open-fav-modal">Manage favorites</button>
+    </div>
+  </div>
+
+  <!-- Job list -->
+  <div id="loading-state" class="loading-state">
+    <div class="spinner"></div>
+    <div>Loading jobs…</div>
+  </div>
+
+  <div id="empty-state" class="empty-state" style="display:none">
+    <h3>No results</h3>
+    <p id="empty-msg">No jobs match your filters.</p>
+  </div>
+
+  <div id="jobs-list" class="job-list" style="display:none"></div>
+
+  <div id="pagination" class="pagination-wrap" style="display:none">
+    <button id="btn-prev" class="btn" type="button">← Prev</button>
+    <span id="page-info" class="page-info"></span>
+    <button id="btn-next" class="btn" type="button">Next →</button>
+  </div>
+
+  <footer style="margin-top:24px; text-align:center; font-size:12px; color:var(--muted);">
+    <a href="https://logo.dev" target="_blank" rel="noopener" style="color:inherit;">Logos by Logo.dev</a>
+  </footer>
+</div>
+
+<!-- Side panel overlay -->
+<div class="panel-overlay" id="panel-overlay"></div>
+<div class="side-panel" id="side-panel" role="dialog" aria-modal="true" aria-label="Fit analysis">
+  <header class="panel-header">
+    <div>
+      <div class="p-label">Fit analysis</div>
+      <h2 id="panel-title"></h2>
+      <div class="pcompany" id="panel-company"></div>
+      <div class="panel-pills" id="panel-pills"></div>
+    </div>
+    <button class="panel-close" id="panel-close">✕</button>
+  </header>
+  <div class="panel-body" id="panel-body"></div>
+  <footer class="panel-footer" id="panel-footer"></footer>
+</div>
+
+<!-- Notification stack -->
+<div id="notif-stack" class="notif-stack"></div>
+
+
+<!-- Favorites modal -->
+<div class="modal-overlay" id="fav-modal" style="display:none">
+  <div class="modal-box">
+    <div class="modal-header">
+      <h3>Favorite companies</h3>
+      <button class="modal-close" id="close-fav-modal">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="fav-add-row">
+        <input id="fav-input" type="text" placeholder="Add favorite company" autocomplete="off" />
+        <button class="btn" id="fav-add-btn" type="button">Add</button>
+      </div>
+      <div id="fav-chips-wrap" style="display:none">
+        <div class="strip-label" style="margin-bottom:8px;">Saved companies</div>
+        <div class="fav-chips" id="fav-chips"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="feed.js"></script>
+</body>
+</html>
