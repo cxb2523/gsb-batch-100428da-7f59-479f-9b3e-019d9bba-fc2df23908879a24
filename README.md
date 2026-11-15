@@ -403,13 +403,14 @@ Annual billing and extra credit top-ups are available on paid plans. See [pricin
 | Variable | Default | Purpose |
 |---|---|---|
 | `MONOCRAWL_API_KEY` | Empty | Your key. Optional for free discovery; needed for data, account and monitor tools |
-| `MONOCRAWL_TIMEOUT_MS` | `75000` | Time allowed for each request, from 100 to 120000 milliseconds |
+| `MONOCRAWL_TIMEOUT_MS` | `75000` | Time allowed for each request, measured from when it enters the bridge (queue wait included), from 100 to 120000 milliseconds |
 | `MONOCRAWL_MCP_URL` | `https://www.monocrawl.com/mcp` | Service address. Only the official address and local `127.0.0.1` or `[::1]` addresses for development are accepted |
 
 ## How the bridge handles your key and your credits
 
 - **Your key goes to Monocrawl and nowhere else.** Redirects and unofficial addresses are refused.
 - **A paid request is sent once.** The bridge never retries on its own, even after a timeout, so a slow call is never charged twice. To retry on purpose, reuse the same `idempotency_key`.
+- **Bursts queue instead of failing.** At most 32 requests are forwarded at once; up to 128 more wait in a local FIFO queue. A request past that limit is rejected with `max_inflight` and `max_queued` in the error data. The `MONOCRAWL_TIMEOUT_MS` budget starts when a request enters the bridge, so a request that times out while queued returns an "outcome unknown, not retried" error without ever opening an upstream connection; cancelling a queued request removes it immediately.
 - **The same rules as the hosted service.** Prices, account limits, key permissions and confirmation steps are all enforced by Monocrawl, so running locally costs exactly the same.
 - **Clean output.** Standard output carries only MCP messages; diagnostics go to standard error.
 

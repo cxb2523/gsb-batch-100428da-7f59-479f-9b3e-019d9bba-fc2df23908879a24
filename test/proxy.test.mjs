@@ -3,9 +3,18 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { readConfig, DEFAULT_URL } from '../lib/proxy.mjs';
-import { fixture, sdkClient, rawClient, serverPath, tool } from './helpers.mjs';
+import { fixture, connectionLimitedFixture, sdkClient, rawClient, serverPath, tool } from './helpers.mjs';
 
 const rpc = (id, method = 'tools/call', params = { name: 'call_endpoint', arguments: {} }) => ({ jsonrpc: '2.0', id, method, params });
+
+const waitFor = async (predicate, { timeout = 4000, interval = 10, label = 'condition' } = {}) => {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, interval));
+  }
+  throw new Error('Timed out waiting for ' + label);
+};
 
 test('SDK client negotiates with hosted server and receives current schemas, annotations and results', async t => {
   const upstream = await fixture(t);
@@ -114,14 +123,96 @@ test('configuration defaults to official host and rejects unsafe URLs', () => {
 });
 
 
-test('32-call local concurrency cap preserves every admitted response ID', async t => {
-  const upstream = await fixture(t, async () => { await new Promise(resolve => setTimeout(resolve, 300)); });
+test('40 concurrent calls queue behind the 32-slot cap and every response keeps its ID', async t => {
+  let concurrent = 0;
+  let peak = 0;
+  const upstream = await fixture(t, async () => {
+    concurrent++;
+    peak = Math.max(peak, concurrent);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    concurrent--;
+  });
   const { request } = await rawClient(t, upstream.url);
   const results = await Promise.all(Array.from({ length: 40 }, (_, i) => request(rpc('burst-' + i))));
-  assert.equal(upstream.calls.length, 32);
-  assert.equal(results.filter(x => x.result).length, 32);
-  assert.equal(results.filter(x => x.error?.data?.max_inflight === 32).length, 8);
+  assert.equal(upstream.calls.length, 40);
+  assert.equal(peak, 32);
+  assert.equal(results.filter(x => x.result).length, 40);
+  assert.equal(results.filter(x => x.error).length, 0);
   results.forEach((result, i) => assert.equal(result.id, 'burst-' + i));
+});
+
+test('a request cancelled while queued leaves the queue and never reaches the upstream', async t => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const upstream = await fixture(t, async message => {
+    if (message.method === 'tools/call') await gate;
+  });
+  const { request, transport } = await rawClient(t, upstream.url);
+  const workers = Array.from({ length: 32 }, (_, i) => request(rpc('worker-' + i)));
+  await waitFor(() => upstream.calls.filter(x => x.message.method === 'tools/call').length === 32,
+    { label: 'all upstream slots to fill' });
+  const cancelled = request(rpc('queued-cancel'));
+  // Give the bridge a turn to enqueue the 33rd request before cancelling it.
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.equal(upstream.calls.filter(x => x.message.id === 'queued-cancel').length, 0);
+  await transport.send({ jsonrpc: '2.0', method: 'notifications/cancelled', params: { requestId: 'queued-cancel' } });
+  const response = await cancelled;
+  assert.equal(response.id, 'queued-cancel');
+  assert.match(response.error.message, /cancelled/);
+  assert.equal(response.error.data.automatically_retried, false);
+  assert.equal(upstream.calls.filter(x => x.message.id === 'queued-cancel').length, 0);
+  release();
+  await Promise.all(workers);
+  // The freed slot is reusable for another queued request.
+  const replacement = await request(rpc('replacement'));
+  assert.ok(replacement.result);
+  assert.equal(upstream.calls.length, 33);
+});
+
+test('the bounded queue rejects only beyond 32 in flight plus 128 waiting, with checkable limits', async t => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const upstream = await fixture(t, async () => { await gate; });
+  const { request } = await rawClient(t, upstream.url);
+  const calls = Array.from({ length: 32 + 128 }, (_, i) => request(rpc('backlog-' + i)));
+  await waitFor(() => upstream.calls.length === 32, { label: '32 calls to reach the upstream' });
+  const overflow = await request(rpc('overflow'));
+  assert.equal(overflow.id, 'overflow');
+  assert.equal(overflow.error.code, -32000);
+  assert.deepEqual(overflow.error.data, { max_inflight: 32, max_queued: 128 });
+  assert.ok(JSON.stringify(overflow).length < 400);
+  assert.equal(upstream.calls.filter(x => x.message.id === 'overflow').length, 0);
+  release();
+  const results = await Promise.all(calls);
+  assert.equal(results.length, 32 + 128);
+  assert.equal(results.filter(x => x.result).length, 32 + 128);
+  assert.equal(upstream.calls.length, 32 + 128);
+});
+
+test('a request that exhausts MONOCRAWL_TIMEOUT_MS while queued never opens a POST', async t => {
+  // The raw upstream caps total sockets at 32 and never answers held requests
+  // until releaseAll(). A long-budget holder bridge occupies all 32 sockets,
+  // so the short-budget test bridge cannot open even one connection: its
+  // request sits in the local queue until MONOCRAWL_TIMEOUT_MS (measured from
+  // bridge entry, queue wait included) and times out without any POST.
+  const upstream = await connectionLimitedFixture(t, 32);
+  const holder = await rawClient(t, upstream.url, { env: { MONOCRAWL_TIMEOUT_MS: '10000' } });
+  const { request } = await rawClient(t, upstream.url, { env: { MONOCRAWL_TIMEOUT_MS: '1000' } });
+  const workers = Array.from({ length: 32 }, (_, i) => holder.request(rpc('held-' + i)).catch(() => {}));
+  await waitFor(() => upstream.calls.length === 32, { label: '32 calls to reach the upstream' });
+  const start = Date.now();
+  const response = await request(rpc('waiting-1'));
+  assert.ok(Date.now() - start >= 800, 'should wait for the timeout, got ' + (Date.now() - start) + 'ms');
+  assert.equal(response.id, 'waiting-1');
+  assert.equal(response.error.code, -32000);
+  assert.match(response.error.message, /timed out or was cancelled/);
+  assert.equal(response.error.data.automatically_retried, false);
+  assert.equal(response.error.data.http_status, undefined);
+  // The upstream has exactly the 32 holder requests; the target never connected.
+  assert.equal(upstream.calls.filter(x => x.message.id === 'waiting-1').length, 0);
+  assert.equal(upstream.calls.length, 32);
+  upstream.releaseAll();
+  await Promise.allSettled(workers);
 });
 
 test('duplicate in-flight ID cannot execute the paid request twice', async t => {

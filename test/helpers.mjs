@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { createServer as createNetServer } from 'node:net';
 import { once } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/client';
@@ -37,6 +38,61 @@ export async function fixture(t, handler = () => undefined) {
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
   return { calls, url: 'http://127.0.0.1:' + server.address().port + '/mcp' };
+}
+
+// Minimal HTTP/1.1 server that holds at most `maxConnections` sockets at once:
+// further TCP connections are accepted but left unread, so requests on them
+// never reach the request log until a held socket closes. An admitted request
+// only gets its response once release() is called, keeping the socket occupied
+// for the lifetime of the hold. This models a hard upstream connection ceiling
+// that the bridge cannot bypass with pipelining or socket reuse.
+export async function connectionLimitedFixture(t, maxConnections) {
+  const calls = [];
+  const open = new Set();
+  const queue = [];
+  const releaseWaiters = [];
+  const server = createNetServer(socket => {
+    if (open.size >= maxConnections) { queue.push(socket); return; }
+    admit(socket);
+  });
+  function admit(socket) {
+    open.add(socket);
+    let buffer = '';
+    const process = () => {
+      const end = buffer.indexOf('\r\n\r\n');
+      if (end === -1) return;
+      const head = buffer.slice(0, end);
+      const length = Number(head.split('\r\n').find(line => line.toLowerCase().startsWith('content-length:'))?.split(':')[1] || 0);
+      if (buffer.length < end + 4 + length) return;
+      const body = buffer.slice(end + 4, end + 4 + length);
+      buffer = buffer.slice(end + 4 + length);
+      let message;
+      try { message = JSON.parse(body); } catch { socket.destroy(); return; }
+      calls.push({ message, headers: {} });
+      const payload = message.id === undefined ? '' : JSON.stringify({ jsonrpc: '2.0', id: message.id, result: normalReply(message) });
+      const write = () => {
+        socket.write(
+          'HTTP/1.1 ' + (message.id === undefined ? '202' : '200') + ' Accepted\r\n' +
+          'content-type: application/json\r\ncontent-length: ' + Buffer.byteLength(payload) + '\r\nconnection: keep-alive\r\n\r\n' + payload);
+        setImmediate(process);
+      };
+      if (message.id === undefined) write();
+      else releaseWaiters.push(write);
+    };
+    socket.on('data', chunk => { buffer += chunk.toString('utf8'); process(); });
+    socket.on('close', () => {
+      open.delete(socket);
+      const next = queue.shift();
+      if (next && !next.destroyed) admit(next);
+    });
+    socket.on('error', () => { socket.destroy(); });
+  }
+  const releaseAll = () => { while (releaseWaiters.length) releaseWaiters.shift()(); };
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  t.after(() => { for (const socket of open) socket.destroy(); for (const socket of queue) socket.destroy();
+    return new Promise(resolve => server.close(resolve)); });
+  return { calls, url: 'http://127.0.0.1:' + server.address().port + '/mcp', releaseAll };
 }
 export function transportFor(url, { entry = serverPath, env = {}, command = process.execPath, args = [entry], cwd } = {}) {
   const transport = new StdioClientTransport({ command, args, cwd, env: {
