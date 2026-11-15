@@ -1062,6 +1062,10 @@ function storagePartitioningOtherOrigin() {
   return null
 }
 
+// run token for testStoragePartitioning: only the latest run may report, and its value carries the token so a
+// late answer echoing an older run's value is recognized as stale instead of being read as a different value
+let storagePartitioningRunId = 0
+
 // detects disabled third-party storage partitioning: a frame of this site nested in a frame of another site
 // (aba/mid -> aba/leaf) can read this page's localStorage
 async function testStoragePartitioning() {
@@ -1081,12 +1085,15 @@ async function testStoragePartitioning() {
     return
   }
 
+  const runId = ++storagePartitioningRunId
+  const isCurrentRun = () => runId === storagePartitioningRunId
+
   const key = 'rebrowserStoragePartitioning'
-  const value = Math.random().toString(36).slice(2)
+  const value = `rebrowser-sp-${runId}-${Math.random().toString(36).slice(2)}`
   try {
     localStorage.setItem(key, value)
   } catch (error) {
-    inconclusive('localStorage isn\'t available.')
+    inconclusive('localStorage isn\'t available on this page, so the test couldn\'t be set up.')
     return
   }
 
@@ -1094,16 +1101,35 @@ async function testStoragePartitioning() {
   iframe.style.cssText = 'position:absolute;width:1px;height:1px;border:0;opacity:0'
   let onMessage
   let timer
-  let data
+  let outcome
   try {
-    data = await new Promise(resolve => {
+    outcome = await new Promise(resolve => {
+      const mismatched = []
       onMessage = event => {
-        if (event.origin === location.origin && event.data?.type === 'storagePartitioningLeaf') {
-          resolve(event.data)
+        if (!isCurrentRun()) {
+          // a newer run is in flight; it owns the verdict and its own listener
+          return
+        }
+        const type = event.data?.type
+        if (event.origin === location.origin && type === 'storagePartitioningLeaf') {
+          const data = event.data
+          if (typeof data.value === 'string' && data.value.startsWith('rebrowser-sp-') && data.value !== value) {
+            // an echo of another run's value arriving late: not this run's answer
+            return
+          }
+          if (!('value' in data) && !('error' in data)) {
+            mismatched.push({ origin: event.origin, type, reason: 'unexpected payload shape' })
+            return
+          }
+          resolve({ kind: 'reply', data })
+          return
+        }
+        if (type === 'storagePartitioningLeaf' || (event.origin === location.origin && typeof type === 'string' && type.startsWith('storagePartitioning'))) {
+          mismatched.push({ origin: event.origin, type, reason: event.origin === location.origin ? 'unexpected type' : 'unexpected origin' })
         }
       }
       window.addEventListener('message', onMessage)
-      timer = setTimeout(() => resolve(null), 10000)
+      timer = setTimeout(() => resolve(mismatched.length ? { kind: 'mismatch', mismatched } : { kind: 'timeout' }), 10000)
       iframe.src = `${otherOrigin}/aba/mid/?top=${encodeURIComponent(location.origin)}`
       document.body.appendChild(iframe)
     })
@@ -1111,14 +1137,28 @@ async function testStoragePartitioning() {
     clearTimeout(timer)
     window.removeEventListener('message', onMessage)
     iframe.remove()
-    localStorage.removeItem(key)
+    try {
+      // a newer run may have already written its own value under the same key; only remove ours
+      if (localStorage.getItem(key) === value) {
+        localStorage.removeItem(key)
+      }
+    } catch (error) {
+      // localStorage went away mid-test, nothing to clean up
+    }
   }
 
-  if (!data) {
-    inconclusive('No answer from the test frames within 10 seconds.')
-  } else if (data.error) {
-    inconclusive('The test frame couldn\'t read storage.', { error: data.error })
-  } else if (data.value === value) {
+  if (!isCurrentRun()) {
+    // a newer run started while this one was waiting; its result supersedes this one
+    return
+  }
+
+  if (outcome.kind === 'timeout') {
+    inconclusive('No answer from the test frames within 10 seconds (the leaf frame may not have loaded).')
+  } else if (outcome.kind === 'mismatch') {
+    inconclusive('Messages arrived within 10 seconds, but none was a valid answer from the leaf frame (unexpected origin, type, or payload).', { mismatched: outcome.mismatched })
+  } else if (outcome.data.error) {
+    inconclusive('The leaf frame loaded but couldn\'t read localStorage.', { error: outcome.data.error })
+  } else if (outcome.data.value === value) {
     addDetection({
       type: 'storagePartitioning',
       rating: 1,
@@ -1133,7 +1173,7 @@ async function testStoragePartitioning() {
       type: 'storagePartitioning',
       rating: -1,
       note: 'Third-party storage is partitioned, as in a normal Chrome.',
-      debug: { otherOrigin },
+      debug: { otherOrigin, leafValue: outcome.data.value },
     })
   }
 }
