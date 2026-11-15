@@ -1,0 +1,729 @@
+openapi: 3.0.3
+info:
+  title: Twitter OpenAPI
+  version: 0.0.1
+
+paths:
+  /graphql/{pathQueryId}/HomeTimeline:
+    get:
+      operationId: getHomeTimeline
+      description: get tweet list of timeline
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TimelineResponse"
+      tags:
+        - "tweet"
+
+  /graphql/{pathQueryId}/HomeLatestTimeline:
+    get:
+      operationId: getHomeLatestTimeline
+      description: get tweet list of timeline
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TimelineResponse"
+      tags:
+        - "tweet"
+
+  /graphql/{pathQueryId}/ListLatestTweetsTimeline:
+    get:
+      operationId: getListLatestTweetsTimeline
+      description: get tweet list of timeline
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListLatestTweetsTimelineResponse"
+      tags:
+        - "tweet"
+
+  /graphql/{pathQueryId}/SearchTimeline:
+    get:
+      operationId: getSearchTimeline
+      description: search tweet list. product:[Top, Latest, People, Photos, Videos]
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchTimelineResponse"
+      tags:
+        - "tweet"
+
+  /graphql/{pathQueryId}/CommunityTweetsTimeline:
+    get:
+      operationId: getCommunityTweetsTimeline
+      description: get tweet list of community. rankingMode:[Recency, Relevance]
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommunityTweetsTimelineResponse"
+      tags:
+        - "tweet"
+
+  /graphql/{pathQueryId}/CommunityMediaTimeline:
+    get:
+      operationId: getCommunityMediaTimeline
+      description: get media list of community
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommunityMediaTimelineResponse"
+      tags:
+        - "tweet"
+
+  /graphql/{pathQueryId}/CommunityAboutTimeline:
+    get:
+      operationId: getCommunityAboutTimeline
+      description: get about of community
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommunityAboutTimelineResponse"
+      tags:
+        - "tweet"
+
+  /graphql/{pathQueryId}/NotificationsTimeline:
+    get:
+      operationId: getNotificationsTimeline
+      description: get notification list. timeline_type:[All, Verified, Mentions]
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NotificationsTimelineResponse"
+      tags:
+        - "tweet"
+
+  /graphql/{pathQueryId}/ConnectTabTimeline:
+    get:
+      operationId: getConnectTabTimeline
+      description: get the Connect tab (who to follow) timeline
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConnectTabTimelineResponse"
+      tags:
+        - "tweet"
+
+  /graphql/{pathQueryId}/CommunityDiscoveryTimeline:
+    get:
+      operationId: getCommunityDiscoveryTimeline
+      description: get the communities discovery timeline
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommunityDiscoveryTimelineResponse"
+      tags:
+        - "tweet"
+
+  /graphql/{pathQueryId}/GenericTimelineById:
+    get:
+      operationId: getGenericTimelineById
+      description: get a generic timeline by its id (explore tabs)
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GenericTimelineByIdResponse"
+      tags:
+        - "tweet"
+
+  /graphql/{pathQueryId}/ExplorePage:
+    get:
+      operationId: getExplorePage
+      description: get the explore page (segmented timelines)
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExplorePageResponse"
+      tags:
+        - "tweet"
+  /graphql/{pathQueryId}/BookmarkSearchTimeline:
+    get:
+      operationId: getBookmarkSearchTimeline
+      description: search the account's bookmarks
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BookmarkSearchTimelineResponse"
+      tags:
+        - "tweet"
+
+  /graphql/{pathQueryId}/ExploreSidebar:
+    get:
+      operationId: getExploreSidebar
+      description: the explore sidebar (trends)
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ExploreSidebarResponse"
+      tags:
+        - "tweet"
+
+  /graphql/{pathQueryId}/useStoryTopicQuery:
+    get:
+      operationId: getUseStoryTopicQuery
+      description: "AI-written stories of an explore topic (rest_id: For You)"
+      responses:
+        "200":
+          description: Successful operation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StoryTopicResponse"
+      tags:
+        - "default"
+
+components:
+  schemas:
+    TimelineResponse:
+      required:
+        - "data"
+      properties:
+        data:
+          $ref: "#/components/schemas/HomeTimelineResponseData"
+        errors:
+          type: array
+          items:
+            $ref: "./../response/error.yaml#/components/schemas/ErrorResponse"
+
+    HomeTimelineResponseData:
+      required:
+        - "home"
+      properties:
+        home:
+          $ref: "#/components/schemas/HomeTimelineHome"
+
+    HomeTimelineHome:
+      required:
+        - "home_timeline_urt"
+      properties:
+        home_timeline_urt:
+          $ref: "./../schemas/timeline.yaml#/components/schemas/Timeline"
+
+    ListLatestTweetsTimelineResponse:
+      required:
+        - "data"
+      properties:
+        data:
+          $ref: "#/components/schemas/ListTweetsTimelineData"
+        errors:
+          type: array
+          items:
+            $ref: "./../response/error.yaml#/components/schemas/ErrorResponse"
+
+    ListTweetsTimelineData:
+      required:
+        - "list"
+      properties:
+        list:
+          $ref: "#/components/schemas/ListTweetsTimelineList"
+
+    ListTweetsTimelineList:
+      required:
+        - "tweets_timeline"
+      properties:
+        tweets_timeline:
+          $ref: "#/components/schemas/TimelineResult"
+
+    SearchTimelineResponse:
+      required:
+        - "data"
+      properties:
+        data:
+          $ref: "#/components/schemas/SearchTimelineData"
+        errors:
+          type: array
+          items:
+            $ref: "./../response/error.yaml#/components/schemas/ErrorResponse"
+
+    SearchTimelineData:
+      required:
+        - "search_by_raw_query"
+      properties:
+        search_by_raw_query:
+          $ref: "#/components/schemas/SearchByRawQuery"
+
+    SearchByRawQuery:
+      required:
+        - "search_timeline"
+      properties:
+        search_timeline:
+          $ref: "#/components/schemas/SearchTimeline"
+
+    SearchTimeline:
+      properties:
+        timeline:
+          $ref: "./../schemas/timeline.yaml#/components/schemas/Timeline" # absent when the query fails (search_timeline is {} and errors is set)
+
+    CommunityTweetsTimelineResponse:
+      required:
+        - "data"
+      properties:
+        data:
+          $ref: "#/components/schemas/RankedCommunityTweetData"
+        errors:
+          type: array
+          items:
+            $ref: "./../response/error.yaml#/components/schemas/ErrorResponse"
+
+    RankedCommunityTweetData:
+      required:
+        - "communityResults"
+      properties:
+        communityResults:
+          $ref: "#/components/schemas/RankedCommunityResults"
+
+    RankedCommunityResults:
+      required:
+        - "result"
+      properties:
+        result:
+          $ref: "#/components/schemas/RankedCommunityResult"
+
+    RankedCommunityResult:
+      required:
+        - "__typename"
+        - "ranked_community_timeline"
+      properties:
+        __typename:
+          $ref: "./../schemas/typename.yaml#/components/schemas/TypeName" # Community
+        ranked_community_timeline:
+          $ref: "./../schemas/timeline.yaml#/components/schemas/TimelineResult"
+
+    CommunityMediaTimelineResponse:
+      required:
+        - "data"
+      properties:
+        data:
+          $ref: "#/components/schemas/MediaCommunityTweetData"
+        errors:
+          type: array
+          items:
+            $ref: "./../response/error.yaml#/components/schemas/ErrorResponse"
+
+    MediaCommunityTweetData:
+      required:
+        - "__typename"
+        - "communityResults"
+      properties:
+        communityResults:
+          $ref: "#/components/schemas/MediaCommunityResults"
+
+    MediaCommunityResults:
+      required:
+        - "result"
+      properties:
+        result:
+          $ref: "#/components/schemas/MediaCommunityResult"
+
+    MediaCommunityResult:
+      required:
+        - "__typename"
+        - "community_media_timeline"
+      properties:
+        __typename:
+          $ref: "./../schemas/typename.yaml#/components/schemas/TypeName" # Community
+        community_media_timeline:
+          $ref: "./../schemas/timeline.yaml#/components/schemas/TimelineResult"
+
+    CommunityAboutTimelineResponse:
+      required:
+        - "data"
+      properties:
+        data:
+          $ref: "#/components/schemas/AboutCommunityTweetData"
+        errors:
+          type: array
+          items:
+            $ref: "./../response/error.yaml#/components/schemas/ErrorResponse"
+
+    AboutCommunityTweetData:
+      required:
+        - "communityResults"
+      properties:
+        communityResults:
+          $ref: "#/components/schemas/AboutCommunityResults"
+
+    AboutCommunityResults:
+      required:
+        - "result"
+      properties:
+        result:
+          $ref: "#/components/schemas/AboutCommunityResult"
+
+    AboutCommunityResult:
+      required:
+        - "__typename"
+        - "about_timeline"
+      properties:
+        __typename:
+          $ref: "./../schemas/typename.yaml#/components/schemas/TypeName" # Community
+        about_timeline:
+          $ref: "./../schemas/timeline.yaml#/components/schemas/TimelineResult"
+
+    NotificationsTimelineResponse:
+      required:
+        - "data"
+      properties:
+        data:
+          $ref: "#/components/schemas/NotificationsTimelineData"
+        errors:
+          type: array
+          items:
+            $ref: "./../response/error.yaml#/components/schemas/ErrorResponse"
+
+    NotificationsTimelineData:
+      required:
+        - "viewer_v2"
+      properties:
+        viewer_v2:
+          $ref: "#/components/schemas/NotificationsViewerV2"
+
+    NotificationsViewerV2:
+      required:
+        - "user_results"
+      properties:
+        user_results:
+          $ref: "#/components/schemas/NotificationsUserResults"
+
+    NotificationsUserResults:
+      required:
+        - "result"
+      properties:
+        result:
+          $ref: "#/components/schemas/NotificationsResult"
+
+    NotificationsResult:
+      required:
+        - "__typename"
+        - "rest_id"
+        - "notification_timeline"
+      properties:
+        __typename:
+          $ref: "./../schemas/typename.yaml#/components/schemas/TypeName" # User
+        rest_id:
+          type: string
+          pattern: "^[0-9]+$"
+        notification_timeline:
+          $ref: "./../schemas/timeline.yaml#/components/schemas/TimelineResult"
+
+    ConnectTabTimelineResponse:
+      required:
+        - "data"
+      properties:
+        data:
+          $ref: "#/components/schemas/ConnectTabTimelineResponseData"
+        errors:
+          type: array
+          items:
+            $ref: "./../response/error.yaml#/components/schemas/ErrorResponse"
+
+    ConnectTabTimelineResponseData:
+      required:
+        - "connect_tab_timeline"
+      properties:
+        connect_tab_timeline:
+          $ref: "./../schemas/timeline.yaml#/components/schemas/TimelineResult"
+
+    CommunityDiscoveryTimelineResponse:
+      required:
+        - "data"
+      properties:
+        data:
+          $ref: "#/components/schemas/CommunityDiscoveryTimelineResponseData"
+        errors:
+          type: array
+          items:
+            $ref: "./../response/error.yaml#/components/schemas/ErrorResponse"
+
+    CommunityDiscoveryTimelineResponseData:
+      required:
+        - "viewer"
+      properties:
+        viewer:
+          $ref: "#/components/schemas/CommunityDiscoveryTimelineViewer"
+
+    CommunityDiscoveryTimelineViewer:
+      required:
+        - "community_discovery_timeline"
+      properties:
+        community_discovery_timeline:
+          $ref: "./../schemas/timeline.yaml#/components/schemas/TimelineResult"
+
+    GenericTimelineByIdResponse:
+      required:
+        - "data"
+      properties:
+        data:
+          $ref: "#/components/schemas/GenericTimelineByIdResponseData"
+        errors:
+          type: array
+          items:
+            $ref: "./../response/error.yaml#/components/schemas/ErrorResponse"
+
+    GenericTimelineByIdResponseData:
+      required:
+        - "timeline"
+      properties:
+        timeline:
+          $ref: "./../schemas/timeline.yaml#/components/schemas/TimelineResult"
+
+    ExplorePageResponse:
+      required:
+        - "data"
+      properties:
+        data:
+          $ref: "#/components/schemas/ExplorePageResponseData"
+        errors:
+          type: array
+          items:
+            $ref: "./../response/error.yaml#/components/schemas/ErrorResponse"
+
+    ExplorePageResponseData:
+      required:
+        - "explore_page"
+      properties:
+        explore_page:
+          $ref: "#/components/schemas/ExplorePage"
+
+    ExplorePage:
+      required:
+        - "body"
+        - "id"
+      properties:
+        body:
+          $ref: "#/components/schemas/ExplorePageBody"
+        id:
+          type: string
+
+    ExplorePageBody:
+      required:
+        - "__typename"
+        - "initialTimeline"
+        - "timelines"
+      properties:
+        __typename:
+          $ref: "./../schemas/typename.yaml#/components/schemas/TypeName" # SegmentedTimelines
+        initialTimeline:
+          $ref: "#/components/schemas/ExploreTimeline"
+        timelines:
+          type: array
+          items:
+            $ref: "#/components/schemas/ExploreTimeline"
+
+    ExploreTimeline:
+      required:
+        - "id"
+        - "labelText"
+        - "refreshIntervalSec"
+        - "scribeConfig"
+        - "timeline"
+      properties:
+        id:
+          type: string
+        labelText:
+          type: string
+        refreshIntervalSec:
+          type: integer
+        scribeConfig:
+          $ref: "#/components/schemas/ExploreTimelineScribeConfig"
+        timeline:
+          $ref: "./../schemas/timeline.yaml#/components/schemas/TimelineResult"
+
+    ExploreTimelineScribeConfig:
+      required:
+        - "page"
+        - "section"
+      properties:
+        page:
+          type: string
+        section:
+          type: string
+
+    BookmarkSearchTimelineResponse:
+      required:
+        - "data"
+      properties:
+        data:
+          $ref: "#/components/schemas/BookmarkSearchTimelineResponseData"
+        errors:
+          type: array
+          items:
+            $ref: "./../response/error.yaml#/components/schemas/ErrorResponse"
+
+    BookmarkSearchTimelineResponseData:
+      required:
+        - "search_by_raw_query"
+      properties:
+        search_by_raw_query:
+          $ref: "#/components/schemas/BookmarkSearch"
+
+    BookmarkSearch:
+      required:
+        - "bookmarks_search_timeline"
+      properties:
+        bookmarks_search_timeline:
+          $ref: "./../schemas/timeline.yaml#/components/schemas/TimelineResult"
+
+    ExploreSidebarResponse:
+      required:
+        - "data"
+      properties:
+        data:
+          $ref: "#/components/schemas/ExploreSidebarResponseData"
+        errors:
+          type: array
+          items:
+            $ref: "./../response/error.yaml#/components/schemas/ErrorResponse"
+
+    ExploreSidebarResponseData:
+      required:
+        - "explore_sidebar"
+      properties:
+        explore_sidebar:
+          $ref: "./../schemas/timeline.yaml#/components/schemas/TimelineResult"
+
+    StoryTopicResponse:
+      required:
+        - "data"
+      properties:
+        data:
+          $ref: "#/components/schemas/StoryTopicData"
+        errors:
+          type: array
+          items:
+            $ref: "./../response/error.yaml#/components/schemas/ErrorResponse"
+
+
+    StoryTopicData:
+      required:
+        - "story_topic"
+      properties:
+        story_topic:
+          $ref: "#/components/schemas/StoryTopic"
+
+    StoryTopic:
+      required:
+        - "id"
+        - "stories"
+      properties:
+        id:
+          type: string
+        stories:
+          $ref: "#/components/schemas/StoryTopicStories"
+
+    StoryTopicStories:
+      required:
+        - "items"
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/StoryTopicItem"
+
+    StoryTopicItem:
+      required:
+        - "trend_results"
+      properties:
+        trend_results:
+          $ref: "#/components/schemas/AiTrendResults"
+
+    AiTrendResults:
+      required:
+        - "id"
+        - "result"
+      properties:
+        id:
+          type: string
+        result:
+          $ref: "#/components/schemas/AiTrend"
+
+    AiTrend:
+      required:
+        - "__typename"
+        - "id"
+        - "rest_id"
+        - "core"
+        - "post_count"
+        - "social_proof"
+      properties:
+        __typename:
+          $ref: "./../schemas/typename.yaml#/components/schemas/TypeName" # AiTrend
+        id:
+          type: string
+        rest_id:
+          type: string
+          pattern: "^[0-9]+$"
+        core:
+          $ref: "#/components/schemas/AiTrendCore"
+        post_count:
+          type: string
+          pattern: "^[0-9]+$"
+        social_proof:
+          type: array
+          items:
+            $ref: "#/components/schemas/AiTrendSocialProof"
+
+    AiTrendCore:
+      required:
+        - "category"
+        - "created_at_ms"
+        - "hook"
+        - "name"
+      properties:
+        category:
+          type: string # News, Sports, Entertainment, Other, ...
+        created_at_ms:
+          type: integer
+        hook:
+          type: string
+        name:
+          type: string
+
+    AiTrendSocialProof:
+      required:
+        - "img_url"
+      properties:
+        img_url:
+          type: string
+          format: uri

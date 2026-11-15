@@ -1,0 +1,56 @@
+openapi: 3.0.3
+info:
+  title: Twitter OpenAPI
+  version: 0.0.1
+paths: {}
+components:
+  schemas:
+    TypeName:
+      type: string
+      enum:
+        [
+          TimelineTweet,
+          SegmentedTimelines,
+          TimelineFrame,
+          TimelineTwitterList,
+          TimelineLabel,
+          TimelineEventSummary,
+          AiTrend,
+          TimelineRichText,
+          TimelineTimelineItem,
+          TimelineUser,
+          TimelineTimelineCursor,
+          TweetWithVisibilityResults,
+          ContextualTweetInterstitial,
+          TimelineTimelineModule,
+          TweetTombstone,
+          TimelinePrompt,
+          TimelineMessagePrompt,
+          TimelineCommunity,
+          TimelineTombstone,
+          TimelineTrend,
+          TimelineNotification,
+          TimelineNotificationAggregateUserActions,
+          TweetUnavailable,
+          TweetPreviewDisplay,
+          Tweet,
+          User,
+          UserUnavailable,
+          Community,
+          CommunityDeleteActionUnavailable,
+          CommunityJoinAction,
+          CommunityJoinActionUnavailable,
+          CommunityLeaveActionUnavailable,
+          CommunityTweetPinActionUnavailable,
+          CommunityTweetUnpinActionUnavailable,
+          CommunityInvitesUnavailable,
+          CommunityJoinRequestsUnavailable,
+          CommunityUnavailable,
+          ApiImage,
+          ApiMedia,
+          CommunityUserDefaultModerationState,
+          CommunityHashtagSlice,
+          CommunityListMembersAction,
+          CtaLimitedActionPrompt,
+          TimelineRichTextUser,
+        ]

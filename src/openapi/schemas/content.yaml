@@ -1,0 +1,1251 @@
+openapi: 3.0.3
+info:
+  title: Twitter OpenAPI
+  version: 0.0.1
+
+paths: {}
+components:
+  schemas:
+    ContentUnion:
+      oneOf:
+        - $ref: "#/components/schemas/TimelineTimelineItem"
+        - $ref: "#/components/schemas/TimelineTimelineModule"
+        - $ref: "#/components/schemas/TimelineTimelineCursor"
+      discriminator:
+        propertyName: entryType
+        mapping": # deprecated
+          TimelineTimelineItem: "#/components/schemas/TimelineTimelineItem"
+          TimelineTimelineModule: "#/components/schemas/TimelineTimelineModule"
+          TimelineTimelineCursor: "#/components/schemas/TimelineTimelineCursor"
+
+    ContentEntryType:
+      type: string
+      enum:
+        [TimelineTimelineItem, TimelineTimelineCursor, TimelineTimelineModule]
+
+    CursorType:
+      type: string
+      enum: [Top, Bottom, ShowMore, ShowMoreThreads, Gap, ShowMoreThreadsPrompt] # Gap???
+
+    TimelineTimelineItem:
+      required:
+        - "__typename"
+        - "entryType"
+        - "itemContent"
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineTimelineItem
+        entryType:
+          $ref: "#/components/schemas/ContentEntryType" # TimelineTimelineItem
+        itemContent:
+          $ref: "#/components/schemas/ItemContentUnion"
+        clientEventInfo:
+          $ref: "#/components/schemas/ClientEventInfo"
+        feedbackInfo:
+          $ref: "#/components/schemas/FeedbackInfo"
+
+    TimelineTimelineModule:
+      required:
+        - "__typename"
+        - "entryType"
+        - "displayType"
+        # - "items"
+        # - "clientEventInfo"
+      properties:
+        __typename:
+          type: string
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineTimelineModule
+        entryType:
+          $ref: "#/components/schemas/ContentEntryType" # TimelineTimelineCursor
+        displayType:
+          $ref: "#/components/schemas/DisplayType"
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModuleItem"
+        footer:
+          $ref: "#/components/schemas/ModuleFooter"
+        header:
+          $ref: "#/components/schemas/ModuleHeader"
+        clientEventInfo:
+          $ref: "#/components/schemas/ClientEventInfo"
+        metadata:
+          $ref: "#/components/schemas/ModuleMetadata"
+        feedbackInfo:
+          $ref: "#/components/schemas/FeedbackInfo"
+
+    ModuleFooter:
+      required:
+        - "displayType"
+        - "landingUrl"
+        - "text"
+      properties:
+        displayType:
+          type: string # Classic, or an empty string (HomeLatestTimeline, 2026-10-16)
+        landingUrl:
+          $ref: "#/components/schemas/LandingUrl"
+        text:
+          type: string
+
+    ModuleHeader:
+      required:
+        - "displayType"
+        - "text"
+      properties:
+        displayType:
+          type: string # Classic, ... (UI value, X keeps adding)
+        socialContext:
+          $ref: "#/components/schemas/SocialContextUnion" # "Sourced from across X" on TweetDetail modules
+        sticky:
+          type: boolean
+        text:
+          type: string
+
+    ModuleMetadata:
+      required:
+        - "conversationMetadata"
+      properties:
+        conversationMetadata:
+          $ref: "#/components/schemas/ConversationMetadata"
+
+    ConversationMetadata:
+      required:
+        - "allTweetIds"
+        - "enableDeduplication"
+      properties:
+        allTweetIds:
+          type: array
+          items:
+            type: string
+            pattern: "^[0-9]+$"
+        enableDeduplication:
+          type: boolean
+
+    LandingUrl:
+      required:
+        - "url"
+        - "urlType"
+      properties:
+        url:
+          type: string
+        urlType:
+          type: string
+          enum: [DeepLink, ExternalUrl]
+
+    TimelineTimelineCursor:
+      required:
+        - "__typename"
+        - "cursorType"
+        - "value"
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineTimelineCursor
+        entryType:
+          $ref: "#/components/schemas/ContentEntryType" # null | TimelineTimelineCursor
+        itemType:
+          $ref: "#/components/schemas/ContentEntryType" # null | TimelineTimelineCursor
+        cursorType:
+          $ref: "#/components/schemas/CursorType"
+        value:
+          type: string
+        stopOnEmptyResponse:
+          type: boolean
+        displayTreatment:
+          $ref: "#/components/schemas/DisplayTreatment"
+
+    DisplayTreatment:
+      type: object
+      required:
+        - "actionText"
+      properties:
+        actionText:
+          type: string
+        labelText:
+          type: string
+
+    # ================= Module =================
+
+    DisplayType:
+      type: string
+      enum:
+        - Vertical
+        - VerticalConversation
+        - VerticalGrid
+        - Carousel
+
+    ModuleItem:
+      required:
+        - "entryId"
+        - "item"
+      properties:
+        entryId:
+          type: string
+          pattern: "^(([a-zA-Z]+|[0-9]+|[0-9a-f]+)(-|$))+"
+        item:
+          $ref: "#/components/schemas/ModuleEntry"
+        dispensable:
+          type: boolean
+
+    ModuleEntry:
+      required:
+        - "itemContent"
+      properties:
+        clientEventInfo:
+          $ref: "#/components/schemas/ClientEventInfo"
+        itemContent:
+          $ref: "#/components/schemas/ItemContentUnion"
+        feedbackInfo:
+          $ref: "#/components/schemas/FeedbackInfo"
+
+    FeedbackInfo:
+      required:
+        - "feedbackKeys"
+      properties:
+        clientEventInfo:
+          $ref: "#/components/schemas/FeedbackClientEventInfo"
+        feedbackKeys:
+          type: array
+          items:
+            type: string
+        feedbackMetadata:
+          type: string
+
+    # ================= ContentItem =================
+
+    ItemContentUnion:
+      oneOf:
+        - $ref: "#/components/schemas/TimelineTweet"
+        - $ref: "#/components/schemas/TimelineTimelineCursor"
+        - $ref: "#/components/schemas/TimelineUser"
+        - $ref: "#/components/schemas/TimelinePrompt"
+        - $ref: "#/components/schemas/TimelineMessagePrompt"
+        - $ref: "#/components/schemas/TimelineCommunity"
+        - $ref: "#/components/schemas/TimelineTombstone"
+        - $ref: "#/components/schemas/TimelineTrend"
+        - $ref: "#/components/schemas/TimelineNotification"
+        - $ref: "#/components/schemas/TimelineFrame"
+        - $ref: "#/components/schemas/TimelineTwitterList"
+        - $ref: "#/components/schemas/TimelineLabel"
+        - $ref: "#/components/schemas/TimelineEventSummary"
+
+      discriminator:
+        propertyName: __typename
+        mapping": # deprecated
+          TimelineTweet: "#/components/schemas/TimelineTweet"
+          TimelineTimelineCursor: "#/components/schemas/TimelineTimelineCursor"
+          TimelineUser: "#/components/schemas/TimelineUser"
+          TimelinePrompt: "#/components/schemas/TimelinePrompt"
+          TimelineMessagePrompt: "#/components/schemas/TimelineMessagePrompt"
+          TimelineCommunity: "#/components/schemas/TimelineCommunity"
+          TimelineTombstone: "#/components/schemas/TimelineTombstone"
+          TimelineTrend: "#/components/schemas/TimelineTrend"
+          TimelineNotification: "#/components/schemas/TimelineNotification"
+          TimelineFrame: "#/components/schemas/TimelineFrame"
+          TimelineTwitterList: "#/components/schemas/TimelineTwitterList"
+          TimelineLabel: "#/components/schemas/TimelineLabel"
+
+    ContentItemType:
+      type: string
+      enum:
+        [
+          TimelineTweet,
+          TimelineTimelineCursor,
+          TimelineUser,
+          TimelinePrompt,
+          TimelineMessagePrompt,
+          TimelineCommunity,
+          TimelineTombstone,
+          TimelineTrend,
+          TimelineNotification,
+          TimelineFrame,
+          TimelineTwitterList,
+          TimelineLabel,
+          TimelineEventSummary,
+        ]
+
+    TimelineTweet:
+      required:
+        - "__typename"
+        - "itemType"
+        - "tweetDisplayType"
+        - "tweet_results"
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineTweet
+        itemType:
+          $ref: "#/components/schemas/ContentItemType" # TimelineTweet
+        tweetDisplayType:
+          type: string
+          enum: [Tweet, SelfThread, MediaGrid, CondensedTweet]
+        tweet_results:
+          $ref: "#/components/schemas/ItemResult"
+        socialContext:
+          $ref: "#/components/schemas/SocialContextUnion"
+        promotedMetadata:
+          $ref: "#/components/schemas/PromotedMetadata"
+        prerollMetadata:
+          $ref: "#/components/schemas/PrerollMetadata" # a video ad played before the post's video (HomeTimeline, 2026-10-26)
+        highlights:
+          $ref: "#/components/schemas/Highlight"
+        hasModeratedReplies:
+          type: boolean
+
+    PrerollMetadata:
+      required:
+        - "preroll"
+      properties:
+        preroll:
+          $ref: "#/components/schemas/Preroll"
+
+    Preroll:
+      required:
+        - "dynamicPrerollType"
+        - "mediaInfo"
+        - "prerollId"
+      properties:
+        dynamicPrerollType:
+          type: string # Amplify
+        mediaInfo:
+          $ref: "#/components/schemas/PrerollMediaInfo"
+        prerollId:
+          type: string # <media type>_<media id>, e.g. 13_2105104720855781377
+
+    PrerollMediaInfo:
+      required:
+        - "advertiserName"
+        - "advertiserProfileImageUrl"
+        - "callToAction"
+        - "durationMillis"
+        - "publisherResults"
+        - "renderAdByAdvertiserName"
+        - "uuid"
+        - "videoVariants"
+      properties:
+        advertiserName:
+          type: string
+        advertiserProfileImageUrl:
+          type: string
+          format: uri
+        callToAction:
+          $ref: "#/components/schemas/PrerollCallToAction"
+        durationMillis:
+          type: integer
+        publisherResults:
+          $ref: "./user.yaml#/components/schemas/UserResults"
+        renderAdByAdvertiserName:
+          type: boolean
+        uuid:
+          type: string
+        videoVariants:
+          type: array
+          items:
+            $ref: "#/components/schemas/PrerollVideoVariant"
+
+    PrerollCallToAction:
+      required:
+        - "callToActionType"
+        - "url"
+      properties:
+        callToActionType:
+          type: string # SEE_MORE
+        url:
+          type: string
+          format: uri
+
+    PrerollVideoVariant:
+      required:
+        - "bitrate"
+        - "contentType"
+        - "url"
+      properties:
+        bitrate:
+          type: integer
+        contentType:
+          type: string # video/mp4
+        url:
+          type: string
+          format: uri
+
+    TimelineUser:
+      required:
+        - "__typename"
+        - "itemType"
+        - "userDisplayType"
+        - "user_results"
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineUser
+        itemType:
+          $ref: "#/components/schemas/ContentItemType" # TimelineUser
+        socialContext:
+          $ref: "#/components/schemas/SocialContextUnion"
+        userDisplayType:
+          type: string
+          enum: [User, UserDetailed, SubscribableUser, UserConcise]
+        user_results:
+          $ref: "./user.yaml#/components/schemas/UserResults"
+
+    ItemResult:
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # null | TimelineTweet | TweetUnavailable
+        result:
+          $ref: "./tweet.yaml#/components/schemas/TweetUnion"
+
+    SocialContextUnion:
+      oneOf:
+        - $ref: "#/components/schemas/TimelineGeneralContext"
+        - $ref: "#/components/schemas/TimelineTopicContext"
+      discriminator:
+        propertyName: type
+        mapping": # deprecated
+          TimelineGeneralContext: "#/components/schemas/TimelineGeneralContext"
+          TimelineTopicContext: "#/components/schemas/TimelineTopicContext"
+
+    SocialContextUnionType:
+      type: string
+      enum:
+        - TimelineGeneralContext
+        - TimelineTopicContext
+
+    TimelineGeneralContext:
+      type: object
+      properties:
+        type:
+          $ref: "#/components/schemas/SocialContextUnionType"
+        contextType:
+          type: string # enum
+          enum:
+            - "Follow"
+            - "Pin"
+            - "Like"
+            - "Location"
+            - "Sparkle"
+            - "Conversation"
+            - "List"
+            - "TextOnly"
+            - "Community"
+            - "Facepile"
+        text:
+          type: string
+        landingUrl:
+          $ref: "#/components/schemas/SocialContextLandingUrl"
+        contextImageUrls:
+          type: array
+          items:
+            type: string
+            format: uri
+
+    TimelineTopicContext:
+      type: object
+      properties:
+        type:
+          $ref: "#/components/schemas/SocialContextUnionType"
+        topic:
+          $ref: "#/components/schemas/TopicContext"
+        functionalityType:
+          type: string # Basic, ... (UI value, X keeps adding)
+
+    TopicContext:
+      type: object
+      properties:
+        id:
+          type: string
+        topic_id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        icon_url:
+          type: string
+          format: uri
+        following:
+          type: boolean
+        not_interested:
+          type: boolean
+
+    SocialContextLandingUrl:
+      type: object
+      properties:
+        urlType:
+          type: string # enum
+          enum: ["DeepLink", "UrtEndpoint", "ExternalUrl"]
+        url:
+          type: string # twitter://user?id=900282258736545792
+          format: uri
+        urtEndpointOptions:
+          $ref: "#/components/schemas/UrtEndpointOptions"
+
+    UrtEndpointOptions:
+      type: object
+      required:
+        - "requestParams"
+      properties:
+        title:
+          type: string
+        requestParams:
+          type: array
+          items:
+            $ref: "#/components/schemas/UrtEndpointRequestParams"
+
+    UrtEndpointRequestParams:
+      type: object
+      required:
+        - "key"
+        - "value"
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+
+    Highlight:
+      type: object
+      required:
+        - "textHighlights"
+      properties:
+        textHighlights:
+          type: array
+          items:
+            $ref: "#/components/schemas/TextHighlight"
+
+    TextHighlight:
+      type: object
+      required:
+        - "startIndex"
+        - "endIndex"
+      properties:
+        startIndex:
+          type: integer
+        endIndex:
+          type: integer
+
+    TimelinePrompt: # "Is this post relevant to your search?" in SearchTimeline
+      required:
+        - "__typename"
+        - "clientEventInfo"
+        - "content"
+        - "itemType"
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelinePrompt
+        clientEventInfo:
+          $ref: "#/components/schemas/ClientEventInfo"
+        content:
+          $ref: "#/components/schemas/TimelinePromptContent"
+        itemType:
+          $ref: "#/components/schemas/ContentItemType" # TimelinePrompt
+
+    TimelinePromptContent:
+      required:
+        - "confirmation"
+        - "contentType"
+        - "displayType"
+        - "isRelevantCallback"
+        - "isRelevantText"
+        - "notRelevantCallback"
+        - "notRelevantText"
+        - "title"
+      properties:
+        confirmation:
+          type: string
+        contentType:
+          type: string # TimelineRelevancePrompt, ... (UI value, X keeps adding)
+        displayType:
+          type: string # Compact, ... (UI value, X keeps adding)
+        isRelevantCallback:
+          $ref: "#/components/schemas/TimelinePromptCallback"
+        isRelevantText:
+          type: string
+        notRelevantCallback:
+          $ref: "#/components/schemas/TimelinePromptCallback"
+        notRelevantText:
+          type: string
+        title:
+          type: string
+
+    TimelinePromptCallback:
+      required:
+        - "endpoint"
+      properties:
+        endpoint:
+          type: string # /2/timeline/feedback.json?feedback_type=...
+
+    TimelineMessagePrompt: # subscription upsell on UserSuperFollowTweets, Community Notes explainers
+      required:
+        - "__typename"
+        - "content"
+        - "itemType"
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineMessagePrompt
+        content:
+          $ref: "#/components/schemas/TimelineMessagePromptContent"
+        itemType:
+          $ref: "#/components/schemas/ContentItemType" # TimelineMessagePrompt
+
+    TimelineMessagePromptContent:
+      required:
+        - "contentType"
+        - "headerText"
+      properties:
+        bodyRichText:
+          $ref: "#/components/schemas/TimelineMessagePromptRichText"
+        bodyText:
+          type: string
+        contentType:
+          type: string # TimelineInlinePrompt, TimelineCompactPrompt, ... (UI value, X keeps adding)
+        headerText:
+          type: string
+        primaryButtonAction:
+          $ref: "#/components/schemas/TimelineMessagePromptButton"
+
+    TimelineMessagePromptRichText:
+      required:
+        - "entities"
+        - "text"
+      properties:
+        entities:
+          type: array
+          items:
+            $ref: "#/components/schemas/TimelineMessagePromptRichTextEntity"
+        text:
+          type: string
+
+    TimelineMessagePromptRichTextEntity:
+      required:
+        - "fromIndex"
+        - "ref"
+        - "toIndex"
+      properties:
+        fromIndex:
+          type: integer
+        ref:
+          $ref: "#/components/schemas/TimelineMessagePromptRichTextEntityRef"
+        toIndex:
+          type: integer
+
+    TimelineMessagePromptRichTextEntityRef:
+      required:
+        - "type"
+        - "url"
+        - "urlType"
+      properties:
+        type:
+          type: string
+          enum: [TimelineUrl]
+        url:
+          type: string
+          format: uri
+        urlType:
+          type: string
+          enum: [ExternalUrl]
+
+    TimelineMessagePromptButton:
+      required:
+        - "action"
+        - "text"
+      properties:
+        action:
+          $ref: "#/components/schemas/TimelineMessagePromptButtonAction"
+        text:
+          type: string
+
+    TimelineMessagePromptButtonAction:
+      required:
+        - "dismissOnClick"
+        - "url"
+      properties:
+        dismissOnClick:
+          type: boolean
+        url:
+          type: string
+          format: uri
+
+    TimelineCommunity:
+      required:
+        - "__typename"
+        - "community_results"
+        - "itemType"
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineCommunity
+        community_results:
+          $ref: "./tweet.yaml#/components/schemas/CommunityResult"
+        itemType:
+          $ref: "#/components/schemas/ContentItemType" # TimelineCommunity
+
+    FeedbackClientEventInfo: # feedbackInfo and responseObjects.feedbackActions; any subset of the keys (notifications send {action} or {element} alone)
+      properties:
+        action:
+          type: string # click, see_less_often
+        component:
+          type: string
+        element:
+          type: string
+
+    ClientEventInfo:
+      properties:
+        component:
+          # enum half_cover
+          type: string
+        element:
+          type: string
+          # august-2023-privacy-prompt-candidate
+          # pattern: "^(([a-zA-Z]+|[0-9]+|[0-9a-f]+)(-|$))+"
+          # pattern: "^(january|february|march|april|may|june|july|august|september|october|november|december)-[0-9]{4}-([a-z]-)+[a-z]+$"
+        details:
+          $ref: "#/components/schemas/ClientEventInfoDetails"
+
+    ClientEventInfoDetails:
+      properties:
+        conversationDetails:
+          $ref: "#/components/schemas/ConversationDetails"
+        notificationDetails:
+          $ref: "#/components/schemas/NotificationDetails" # NotificationsTimeline items carry this instead of timelinesDetails
+        timelinesDetails:
+          $ref: "#/components/schemas/TimelinesDetails"
+
+    NotificationDetails:
+      required:
+        - "impressionId"
+        - "metadata"
+      properties:
+        impressionId:
+          type: string
+        metadata:
+          type: string
+
+    ConversationDetails:
+      required:
+        - "conversationSection"
+      properties:
+        conversationSection:
+          type: string # HighQuality, RelatedTweet, ... (X keeps adding)
+
+    TimelinesDetails:
+      properties:
+        controllerData:
+          type: string
+        injectionType:
+          type: string
+        sourceData:
+          type: string
+
+    PromotedMetadata:
+      required:
+        - "adMetadataContainer"
+        - "advertiser_results"
+        - "clickTrackingInfo"
+        - "impressionId"
+        - "impressionString"
+      properties:
+        adMetadataContainer:
+          $ref: "#/components/schemas/AdMetadataContainer"
+        advertiser_results:
+          $ref: "./user.yaml#/components/schemas/UserResults"
+        clickTrackingInfo:
+          $ref: "#/components/schemas/ClickTrackingInfo"
+        impressionId:
+          type: string
+        impressionString:
+          type: string
+
+    AdMetadataContainer:
+      required:
+        - "isQuickPromote"
+        - "renderLegacyWebsiteCard"
+        - "renderSalesCtaWebsiteCard"
+      properties:
+        destinationUrlParams:
+          type: array
+          items:
+            $ref: "#/components/schemas/KeyValue"
+        isQuickPromote:
+          type: boolean
+        unifiedCardOverride:
+          type: string # JSON of a unified card (image_multi_dest_carousel_website seen on an ad)
+        remove_promoted_attribution_for_preroll:
+          type: boolean # video ads (HomeTimeline, 2026-10-21)
+        renderLegacyWebsiteCard:
+          type: boolean
+        renderSalesCtaWebsiteCard:
+          type: boolean
+        showOverlayOnFirstCard:
+          type: boolean
+
+    ClickTrackingInfo:
+      required:
+        - "urlParams"
+      properties:
+        urlParams:
+          type: array
+          items:
+            $ref: "#/components/schemas/KeyValue"
+        urlOverride:
+          type: string # a third-party click tracker (HomeTimeline ads, 2026-10-29)
+          format: uri
+        urlOverrideType:
+          type: string # Dcm
+
+    KeyValue:
+      required:
+        - "key"
+        - "value"
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+
+    TimelineTombstone:
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineTombstone
+        itemType:
+          $ref: "#/components/schemas/ContentItemType" # TimelineTombstone
+        tombstoneDisplayType:
+          type: string # Inline, ... (UI value, X keeps adding)
+        tombstoneInfo:
+          $ref: "#/components/schemas/TombstoneInfo"
+
+    TombstoneInfo:
+      type: object
+      properties:
+        text:
+          type: string
+        richText:
+          $ref: "#/components/schemas/TombstoneRichText"
+
+    TombstoneRichText:
+      type: object
+      properties:
+        rtl:
+          type: boolean
+        text:
+          type: string
+        entities:
+          type: array
+          items:
+            $ref: "#/components/schemas/TombstoneEntity"
+
+    TombstoneEntity:
+      type: object
+      properties:
+        fromIndex:
+          type: integer
+        toIndex:
+          type: integer
+        ref:
+          $ref: "#/components/schemas/TombstoneRef"
+
+    TombstoneRef:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [TimelineUrl]
+        url:
+          type: string
+          format: uri
+        urlType:
+          type: string
+          enum: [ExternalUrl]
+
+    TimelineTrend:
+      required:
+        - "__typename"
+        - "name"
+        - "trend_url"
+        - "trend_metadata"
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineTrend
+        itemType:
+          $ref: "#/components/schemas/ContentItemType" # TimelineTrend
+        social_context:
+          $ref: "#/components/schemas/SocialContextUnion"
+        is_ai_trend:
+          type: boolean
+        promoted_metadata:
+          $ref: "#/components/schemas/TrendPromotedMetadata" # promoted trends
+        rank:
+          type: string # "1", "2", ... position in the trends timeline (GenericTimelineById)
+          pattern: "^[0-9]+$"
+        name:
+          type: string
+        trend_url:
+          $ref: "#/components/schemas/SocialContextLandingUrl"
+        trend_metadata:
+          $ref: "#/components/schemas/TrendMetadata"
+        thumbnail_image:
+          $ref: "#/components/schemas/ThumbnailImage"
+        grouped_trends:
+          type: array
+          items:
+            $ref: "#/components/schemas/GroupedTrend" # related trends shown under a trend (ExplorePage, 2026-10-16)
+        description:
+          type: string # promoted trends
+        images:
+          type: array
+          items:
+            $ref: "#/components/schemas/TrendImage"
+
+    GroupedTrend:
+      required:
+        - "name"
+        - "url"
+      properties:
+        name:
+          type: string
+        url:
+          $ref: "#/components/schemas/SocialContextLandingUrl"
+
+    TrendMetadata:
+      type: object
+      properties:
+        url:
+          $ref: "#/components/schemas/SocialContextLandingUrl"
+        meta_description:
+          type: string # promoted trends
+        domain_context:
+          type: string # "Trending in Japan", "Music · Trending"
+
+    ThumbnailImage:
+      type: object
+      properties:
+        original_img_url:
+          type: string
+          format: uri
+        original_img_width:
+          type: integer
+        original_img_height:
+          type: integer
+
+    TrendPromotedMetadata: # promoted trends (TimelineTrend.promoted_metadata)
+      required:
+        - "advertiser_results"
+        - "disclosureType"
+        - "impressionId"
+        - "impressionString"
+        - "promotedTrend"
+        - "promotedTrendDescription"
+        - "promotedTrendName"
+        - "promotedTrendQueryTerm"
+      properties:
+        advertiser_results:
+          $ref: "./user.yaml#/components/schemas/UserResults"
+        disclosureType:
+          type: string # NoDisclosure
+        impressionId:
+          type: string
+        impressionString:
+          type: string
+        promotedTrend:
+          $ref: "#/components/schemas/PromotedTrend"
+        promotedTrendDescription:
+          type: string
+          nullable: true # null on some promoted trends (nightly 2026-11-07)
+        promotedTrendName:
+          type: string
+        promotedTrendQueryTerm:
+          type: string
+
+    PromotedTrend:
+      required:
+        - "rest_id"
+      properties:
+        rest_id:
+          type: string
+          pattern: "^[0-9]+$"
+
+    TimelineEventSummary: # promoted event card on ExplorePage
+      required:
+        - "__typename"
+        - "event"
+        - "eventSummaryDisplayType"
+        - "eventSummaryUrl"
+        - "itemType"
+        - "media"
+        - "promotedMetadata"
+        - "title"
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineEventSummary
+        event:
+          $ref: "#/components/schemas/EventSummaryEvent"
+        eventSummaryDisplayType:
+          type: string # Hero
+        eventSummaryUrl:
+          $ref: "#/components/schemas/SocialContextLandingUrl"
+        itemType:
+          $ref: "#/components/schemas/ContentItemType" # TimelineEventSummary
+        media:
+          $ref: "#/components/schemas/EventSummaryMedia"
+        promotedMetadata:
+          $ref: "#/components/schemas/EventSummaryPromotedMetadata"
+        title:
+          type: string
+
+    EventSummaryEvent:
+      required:
+        - "rest_id"
+      properties:
+        rest_id:
+          type: string
+          pattern: "^[0-9]+$"
+
+    EventSummaryMedia:
+      required:
+        - "mediaEntity"
+        - "mediaKey"
+      properties:
+        mediaEntity:
+          $ref: "#/components/schemas/EventSummaryMediaEntity"
+        mediaKey:
+          $ref: "#/components/schemas/EventSummaryMediaKey"
+
+    EventSummaryMediaEntity:
+      required:
+        - "tweet_results"
+        - "type"
+      properties:
+        tweet_results:
+          $ref: "./tweet.yaml#/components/schemas/ItemResult"
+        type:
+          type: string
+
+    EventSummaryMediaKey:
+      required:
+        - "category"
+        - "id"
+      properties:
+        category:
+          type: integer
+        id:
+          type: string
+
+    EventSummaryPromotedMetadata: # TrendPromotedMetadata plus a reduced ad metadata container
+      required:
+        - "adMetadataContainer"
+        - "advertiser_results"
+        - "disclosureType"
+        - "impressionId"
+        - "impressionString"
+        - "promotedTrend"
+        - "promotedTrendDescription"
+        - "promotedTrendName"
+        - "promotedTrendQueryTerm"
+      properties:
+        adMetadataContainer:
+          $ref: "#/components/schemas/EventSummaryAdMetadataContainer"
+        advertiser_results:
+          $ref: "./user.yaml#/components/schemas/UserResults"
+        disclosureType:
+          type: string
+        impressionId:
+          type: string
+        impressionString:
+          type: string
+        promotedTrend:
+          $ref: "#/components/schemas/PromotedTrend"
+        promotedTrendDescription:
+          type: string
+          nullable: true # null on some promoted trends (nightly 2026-11-07)
+        promotedTrendName:
+          type: string
+        promotedTrendQueryTerm:
+          type: string
+
+    EventSummaryAdMetadataContainer:
+      required:
+        - "isQuickPromote"
+        - "renderSalesCtaWebsiteCard"
+      properties:
+        isQuickPromote:
+          type: boolean
+        renderSalesCtaWebsiteCard:
+          type: boolean
+
+    TrendImage:
+      type: object
+      properties:
+        url:
+          type: string
+          format: uri
+
+    TimelineNotification:
+      required:
+        - "__typename"
+        - "itemType"
+        - "id"
+        - "notification_icon"
+        - "rich_message"
+        - "notification_url"
+        - "template"
+        - "timestamp_ms"
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineNotification
+        itemType:
+          $ref: "#/components/schemas/ContentItemType" # TimelineNotification
+        id:
+          type: string
+        notification_icon:
+          type: string # enum milestone_icon
+        rich_message:
+          $ref: "#/components/schemas/RichMessage"
+        notification_url:
+          $ref: "#/components/schemas/NotificationUrl"
+        template:
+          $ref: "#/components/schemas/NotificationTemplate"
+        timestamp_ms:
+          type: string # 2025-05-05T01:18:21.657Z
+
+    RichMessage:
+      type: object
+      properties:
+        entities:
+          type: array
+          items:
+            $ref: "#/components/schemas/RichMessageEntity"
+        rtl:
+          type: boolean
+        text:
+          type: string
+
+    RichMessageEntity: # a user or a list mentioned in a notification message, or a styled range
+      required:
+        - "fromIndex"
+        - "toIndex"
+      properties:
+        fromIndex:
+          type: integer
+        ref:
+          $ref: "#/components/schemas/RichMessageEntityRef"
+        format:
+          type: string # Strong (a styled range without ref, 2026-10-23)
+        toIndex:
+          type: integer
+
+    RichMessageEntityRef:
+      required:
+        - "type"
+      properties:
+        type:
+          type: string
+          enum: [TimelineRichTextUser, TimelineRichTextList]
+        user_results:
+          $ref: "./user.yaml#/components/schemas/UserResults" # TimelineRichTextUser
+        id:
+          type: string
+          pattern: "^[0-9]+$" # TimelineRichTextList
+        url:
+          type: string # TimelineRichTextList, a relative path such as i/lists/<id>
+
+    NotificationAdditionalContext: # TimelineRichText under a notification template; only seen with empty text (2026-10-23)
+      required:
+        - "__typename"
+        - "entities"
+        - "text"
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineRichText
+        entities:
+          type: array
+          items:
+            type: object # only seen empty
+        text:
+          type: string
+
+    NotificationUrl: # ExternalUrl, or an UrtEndpoint for the notification details (/2/notifications/view/{id}.json)
+      required:
+        - "url"
+        - "urlType"
+      properties:
+        url:
+          type: string
+        urlType:
+          type: string
+          enum: [ExternalUrl, UrtEndpoint]
+        urtEndpointOptions:
+          $ref: "#/components/schemas/NotificationUrtEndpointOptions"
+
+    NotificationUrtEndpointOptions:
+      required:
+        - "cacheId"
+        - "subtitle"
+        - "title"
+      properties:
+        cacheId:
+          type: string
+        subtitle:
+          type: string
+        title:
+          type: string
+
+    NotificationTemplate:
+      type: object
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # NotificationTemplate
+        show_all_link_text:
+          type: string # "Show all"
+        additional_context:
+          $ref: "#/components/schemas/NotificationAdditionalContext"
+        target_objects:
+          type: array
+          items:
+            type: object
+        from_users:
+          type: array
+          items:
+            type: object
+
+    TimelineFrame:
+      required:
+        - "__typename"
+        - "itemType"
+        - "height"
+        - "payload"
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineFrame
+        itemType:
+          $ref: "#/components/schemas/ContentItemType" # TimelineFrame
+        height:
+          type: integer
+        payload:
+          type: string
+
+    TimelineTwitterList:
+      required:
+        - "__typename"
+        - "itemType"
+        - "list"
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineTwitterList
+        itemType:
+          $ref: "#/components/schemas/ContentItemType" # TimelineTwitterList
+        displayType:
+          type: string # ListWithSubscribe, ListWithPin, ... (UI value)
+        list:
+          $ref: "./list.yaml#/components/schemas/TwitterList"
+
+    TimelineLabel:
+      required:
+        - "__typename"
+        - "itemType"
+        - "text"
+        - "url"
+      properties:
+        __typename:
+          $ref: "./typename.yaml#/components/schemas/TypeName" # TimelineLabel
+        itemType:
+          $ref: "#/components/schemas/ContentItemType" # TimelineLabel
+        text:
+          type: string
+        url:
+          $ref: "#/components/schemas/SocialContextLandingUrl"

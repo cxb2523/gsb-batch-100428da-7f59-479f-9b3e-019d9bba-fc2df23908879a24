@@ -1,0 +1,25 @@
+name: update-placeholder
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+      - name: Apply twitter_api_safe_relay's request catalog
+        run: uv run tools/update_placeholder.py https://raw.githubusercontent.com/fa0311/twitter_api_safe_relay/main/packages/server/requests.ndjson
+      - uses: peter-evans/create-pull-request@v8
+        with:
+          branch: update-placeholder
+          commit-message: "placeholder: apply twitter_api_safe_relay's request catalog"
+          title: "placeholder: apply twitter_api_safe_relay's request catalog"
+          body: queryId / method / features / fieldToggles taken from the X web client's own requests (`packages/server/requests.ndjson` in fa0311/twitter_api_safe_relay, recorded with twitter-api-safe-dump). Only operations present in the catalog are touched; the job log lists the operations that are not in the catalog, the catalog operations missing from placeholder.json and the `variables` drift.
