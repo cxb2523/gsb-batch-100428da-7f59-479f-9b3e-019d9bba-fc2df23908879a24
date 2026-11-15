@@ -20,6 +20,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 SUITES = [
     ("generator_snapshots",        "test_generator_snapshots.py",        True,  False),
     ("generator_lint_integration", "test_generator_lint_integration.py", True,  False),
+    ("nextractdata_summary",       "test_nextractdata_summary.py",       False, False),
     ("cross_plugin",               "test_cross_plugin.py",               True,  False),
     ("lint_tests",                 "run_lint_tests.py",                  False, False),
     ("auto_fix",                   "test_auto_fix.py",                   False, False),

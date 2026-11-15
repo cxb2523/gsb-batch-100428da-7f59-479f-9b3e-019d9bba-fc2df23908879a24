@@ -50,7 +50,8 @@ The JSON spec format:
 Supported generators (gen field) — 93 core (plus plugin extensions):
   UI: ntypeinto, nclick, ncheck, nhover, ndoubleclick, nrightclick, ngettext,
       ncheckstate, nselectitem, nkeyboardshortcuts, nmousescroll,
-      ngotourl, ngeturl, nextractdata, pick_login_validation,
+      ngotourl, ngeturl, nextractdata, nextractdata_with_summary,
+      pick_login_validation,
       napplicationcard_open, napplicationcard_attach, napplicationcard_close,
       napplicationcard_desktop_open
   Control flow: if, if_else_if, switch, foreach, foreach_row, foreach_file,
@@ -105,7 +106,8 @@ from generate_activities import (
     # UI activities
     gen_ntypeinto, gen_nclick, gen_ncheck, gen_nhover, gen_ndoubleclick, gen_nrightclick,
     gen_ngettext, gen_ncheckstate, gen_nselectitem, gen_nkeyboardshortcuts,
-    gen_nmousescroll, gen_ngotourl, gen_nextractdata, gen_ngeturl,
+    gen_nmousescroll, gen_ngotourl, gen_nextractdata, gen_nextractdata_with_summary,
+    gen_ngeturl,
     gen_napplicationcard_open, gen_napplicationcard_attach,
     gen_napplicationcard_close, gen_napplicationcard_desktop_open,
     gen_pick_login_validation,
@@ -184,7 +186,7 @@ _VAR_TYPE_LOOKUP = {}    # {var_name: xaml_type} — set by generate_workflow() 
 _SELECTOR_BASED_GENS = {
     "ntypeinto", "nclick", "ncheck", "nselectitem", "nhover",
     "ndoubleclick", "nrightclick", "nkeyboardshortcuts", "nmousescroll",
-    "ncheckstate", "ngettext",
+    "ncheckstate", "ngettext", "nextractdata_with_summary",
 }
 
 
@@ -602,6 +604,7 @@ _REGISTRY: dict[str, _GenEntry] = {
     "nkeyboardshortcuts":  _e(gen_nkeyboardshortcuts, "NKeyboardShortcuts", ("display_name", "shortcuts")),
     "nmousescroll":        _e(gen_nmousescroll, "NMouseScroll", ("display_name", "selector")),
     "nextractdata":        _e(gen_nextractdata, "NExtractDataGeneric", ("display_name", "output_variable")),
+    "nextractdata_with_summary": _e(gen_nextractdata_with_summary, "NExtractDataGeneric", ("display_name", "selector", "output_variable", "summary_variable")),
     "ngeturl":             _e(gen_ngeturl, "NGetUrl", ("output_variable",)),
 
     # --- Orchestrator / credentials ---
@@ -903,7 +906,7 @@ def generate_workflow(spec: dict) -> str:
 
     ui_gens = set(_CORE_UI_GENERATORS) | get_ui_generators()
     # Generators that emit sd:DataRow or sd2:DataTable (need sd=Data namespace)
-    datatable_gens = {"foreach_row", "nextractdata"}
+    datatable_gens = {"foreach_row", "nextractdata", "nextractdata_with_summary"}
 
     # Generators that require uwah: (UiPath.Web.Activities.Http) namespace
     http_gens = {"net_http_request"}

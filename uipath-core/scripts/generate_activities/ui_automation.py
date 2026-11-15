@@ -1,4 +1,6 @@
 """UI automation activity generators."""
+import re
+
 from ._helpers import _hs, _escape_xml_attr, _escape_vb_expr, _normalize_selector_quotes
 from ._xml_utils import _selector_xml, _viewstate_block
 
@@ -373,3 +375,110 @@ def gen_nmousescroll(display_name, selector, id_ref, scope_id,
 {i3}</uix:SearchedElement>
 {i2}</uix:NMouseScroll.SearchedElement>
 {i}</uix:NMouseScroll>"""
+
+
+# ---------------------------------------------------------------------------
+# NExtractDataGeneric + extraction summary
+# ---------------------------------------------------------------------------
+
+# Counts only real data columns in ExtractDataSettings — the trailing
+# <Column xsi:type='DataNextLink' /> pagination placeholder is excluded.
+_RE_DATA_COLUMN = re.compile(r"xsi:type=['\"]DataColumn['\"]")
+
+
+def gen_nextractdata_with_summary(display_name, selector, output_variable, summary_variable,
+                                  id_ref, scope_id,
+                                  extract_data_settings="", extract_metadata="",
+                                  next_link_selector="",
+                                  max_results=0, limit_extraction_to="None",
+                                  summary_id_ref="",
+                                  obj_repo=None, indent="            "):
+    """Generate NExtractDataGeneric (Extract Table Data) + a summary Assign.
+
+    Emits two activities:
+      1. uix:NExtractDataGeneric bound to ``output_variable`` (DataTable).
+      2. An Assign that writes a generation-time extraction summary into
+         ``summary_variable`` so callers can inspect the run configuration
+         without manually reading XAML. Summary format:
+         ``Pagination=...; MaximumResults=...; DeclaredColumns=...``
+         - no next_link_selector  → ``Pagination=Disabled (single-page)``
+         - max_results == 0       → ``MaximumResults=0 (unlimited)``
+         - DeclaredColumns        → DataColumn count from extract_data_settings
+
+    Args:
+        display_name: DisplayName for the extract activity
+        selector: UiPath selector for the table/list container element
+        output_variable: DataTable variable receiving the extracted data
+        summary_variable: String variable receiving the extraction summary
+        id_ref: Unique suffix, e.g. "1" → IdRef "NExtractDataGeneric`1_1"
+        scope_id: ScopeIdentifier GUID from parent NApplicationCard
+        extract_data_settings: <Table> XML column schema (REQUIRED)
+        extract_metadata: <extract> XML row/column selectors (REQUIRED)
+        next_link_selector: selector for the "next page" link — empty means
+            single-page extraction (no NextLink child emitted)
+        max_results: row cap; 0 = unlimited
+        limit_extraction_to: "None" (all pages) or "CurrentPage" only
+        summary_id_ref: IdRef for the summary Assign (default: "Assign_{id_ref}")
+        obj_repo: optional Object Repository reference for the table target
+        indent: base indentation
+    """
+    # Lazy import — same cross-module reuse pattern as gen_pick_login_validation.
+    from .data_operations import gen_assign
+
+    if not (limit_extraction_to in ("None", "CurrentPage")):
+        raise ValueError(f"Invalid LimitExtractionTo: {limit_extraction_to}. Must be one of: None, CurrentPage")
+    if not extract_metadata:
+        raise ValueError("extract_metadata is REQUIRED — UiPath throws 'Value for a required activity argument "
+                         "'Extract metadata' was not supplied' without it. Must contain <extract> XML with "
+                         "<row> and <column> definitions.")
+    if not extract_data_settings:
+        raise ValueError("extract_data_settings is REQUIRED — must contain <Table> XML with <Column> "
+                         "definitions matching the column names in extract_metadata.")
+
+    max_results = int(max_results)
+    column_count = len(_RE_DATA_COLUMN.findall(extract_data_settings))
+    pagination_enabled = bool(next_link_selector)
+
+    if pagination_enabled:
+        pagination_part = "Pagination=Enabled"
+    else:
+        pagination_part = "Pagination=Disabled (single-page)"
+    if max_results == 0:
+        max_part = "MaximumResults=0 (unlimited)"
+    else:
+        max_part = f"MaximumResults={max_results}"
+    summary_text = f"{pagination_part}; {max_part}; DeclaredColumns={column_count}"
+
+    dn = _escape_xml_attr(display_name)
+    hs = _hs("NExtractDataGeneric")
+    i, i2, i3 = indent, indent+"  ", indent+"    "
+
+    # Backtick IdRef notation for generic types
+    idref = f"NExtractDataGeneric`1_{id_ref}"
+
+    settings_attr = f' ExtractDataSettings="{_escape_xml_attr(extract_data_settings)}"'
+    meta_attr = f' ExtractMetadata="{_escape_xml_attr(extract_metadata)}"'
+
+    # Child elements — order matters: NextLink first, then Target.
+    children = []
+    if pagination_enabled:
+        children.append(f"""{i2}<uix:NExtractDataGeneric.NextLink>
+{i3}{_selector_xml(next_link_selector)}
+{i2}</uix:NExtractDataGeneric.NextLink>""")
+    children.append(f"""{i2}<uix:NExtractDataGeneric.Target>
+{i3}{_selector_xml(selector, obj_repo=obj_repo)}
+{i2}</uix:NExtractDataGeneric.Target>""")
+    children_xml = "\n".join(children)
+
+    extract_xaml = f"""{i}<uix:NExtractDataGeneric x:TypeArguments="sd2:DataTable" ContinueOnError="True" DisplayName="{dn}"{settings_attr} ExtractedData="[{_escape_vb_expr(output_variable)}]"{meta_attr} HealingAgentBehavior="SameAsCard" {hs} sap2010:WorkflowViewState.IdRef="{idref}" LimitExtractionTo="{limit_extraction_to}" MaximumResults="{max_results}" ScopeIdentifier="{scope_id}" Version="V5">
+{children_xml}
+{i}</uix:NExtractDataGeneric>"""
+
+    # Summary Assign — VB string literal (double quotes are VB-escaped).
+    vb_literal = '"' + summary_text.replace('"', '""') + '"'
+    assign_idref = summary_id_ref or f"Assign_{id_ref}"
+    summary_xaml = gen_assign(summary_variable, vb_literal, assign_idref,
+                              display_name=f"Assign - {summary_variable} (extraction summary)",
+                              value_type="x:String", indent=indent)
+
+    return extract_xaml + "\n" + summary_xaml

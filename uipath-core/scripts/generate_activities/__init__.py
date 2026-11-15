@@ -1,4 +1,4 @@
-"""generate_activities package -- re-exports all 94 gen_* functions.
+"""generate_activities package -- re-exports all 95 gen_* functions.
 
 Preserves the import contract: from generate_activities import gen_ntypeinto
 """
@@ -127,6 +127,7 @@ from .ui_automation import (  # noqa: F401
     gen_ncheckstate,
     gen_nclick,
     gen_ndoubleclick,
+    gen_nextractdata_with_summary,
     gen_ngettext,
     gen_nhover,
     gen_nkeyboardshortcuts,
@@ -192,6 +193,7 @@ __all__ = [
     "gen_ndoubleclick",
     "gen_net_http_request",
     "gen_nextractdata",
+    "gen_nextractdata_with_summary",
     "gen_ngettext",
     "gen_ngeturl",
     "gen_ngotourl",
@@ -239,7 +241,8 @@ __all__ = [
 UI_GENERATORS = frozenset({
     "ntypeinto", "nclick", "ncheck", "nhover", "ndoubleclick", "nrightclick",
     "ngettext", "ncheckstate", "nselectitem", "nkeyboardshortcuts",
-    "nmousescroll", "ngotourl", "nextractdata", "ngeturl",
+    "nmousescroll", "ngotourl", "nextractdata", "nextractdata_with_summary",
+    "ngeturl",
     "napplicationcard_open", "napplicationcard_attach",
     "napplicationcard_close", "napplicationcard_desktop_open",
     "pick_login_validation",
