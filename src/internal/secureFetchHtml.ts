@@ -24,60 +24,97 @@ export async function secureFetchHtml(
         redirectCount <= maxRedirections;
         redirectCount += 1
     ) {
-        const resolution = await resolvePublicHttpUrl(currentUrl);
-        const dispatcher = createPinnedDnsAgent(resolution);
-
         try {
-            const response = await fetch(currentUrl, {
-                dispatcher,
-                headers: {
-                    'User-Agent': options.userAgent ?? DEFAULT_USER_AGENT,
-                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.5',
-                    DNT: '1',
-                    Connection: 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1',
-                    ...(options.cookieHeaderForUrl?.(currentUrl)
-                        ? { Cookie: options.cookieHeaderForUrl(currentUrl) }
-                        : {}),
-                },
-                redirect: 'manual',
-                signal: AbortSignal.timeout(options.timeout ?? 30000),
-            });
+            const resolution = await resolvePublicHttpUrl(currentUrl);
+            const dispatcher = createPinnedDnsAgent(resolution);
 
-            if (response.status >= 300 && response.status < 400) {
-                const location = response.headers.get('location');
-                await response.body?.cancel();
-                if (!location) {
+            try {
+                const response = await fetch(currentUrl, {
+                    dispatcher,
+                    headers: {
+                        'User-Agent': options.userAgent ?? DEFAULT_USER_AGENT,
+                        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5',
+                        DNT: '1',
+                        Connection: 'keep-alive',
+                        'Upgrade-Insecure-Requests': '1',
+                        ...(options.cookieHeaderForUrl?.(currentUrl)
+                            ? { Cookie: options.cookieHeaderForUrl(currentUrl) }
+                            : {}),
+                    },
+                    redirect: 'manual',
+                    signal: AbortSignal.timeout(options.timeout ?? 30000),
+                });
+
+                if (response.status >= 300 && response.status < 400) {
+                    const location = response.headers.get('location');
+                    await response.body?.cancel();
+                    if (!location) {
+                        throw new Error(
+                            `Redirect without Location header for ${currentUrl}`
+                        );
+                    }
+
+                    currentUrl = new URL(location, currentUrl).href;
+                    continue;
+                }
+
+                if (!response.ok) {
                     throw new Error(
-                        `Redirect without Location header for ${currentUrl}`
+                        `HTTP ${response.status} for ${currentUrl}`
                     );
                 }
 
-                currentUrl = new URL(location, currentUrl).href;
-                continue;
-            }
+                const contentType = response.headers.get('content-type');
+                if (
+                    contentType &&
+                    !contentType.includes('text/html') &&
+                    !contentType.includes('application/xhtml+xml')
+                ) {
+                    throw new Error(
+                        `Non-HTML content type: ${contentType} for ${currentUrl}`
+                    );
+                }
 
-            if (!response.ok) {
-                throw new Error(`HTTP ${response.status} for ${currentUrl}`);
+                return {
+                    html: await response.text(),
+                    finalUrl: currentUrl,
+                };
+            } finally {
+                await dispatcher.close();
             }
-
-            const contentType = response.headers.get('content-type');
-            if (
-                contentType &&
-                !contentType.includes('text/html') &&
-                !contentType.includes('application/xhtml+xml')
-            ) {
-                throw new Error(
-                    `Non-HTML content type: ${contentType} for ${currentUrl}`
-                );
-            }
-
-            return { html: await response.text(), finalUrl: currentUrl };
-        } finally {
-            await dispatcher.close();
+        } catch (error) {
+            throw attachFinalUrl(error, currentUrl);
         }
     }
 
-    throw new Error(`Too many redirects for ${url}`);
+    throw attachFinalUrl(
+        new Error(`Too many redirects for ${url}`),
+        currentUrl
+    );
+}
+
+/**
+ * Attach the URL the fetch ended up at to an error so callers can report a
+ * page's final URL even when the page failed after a redirect.
+ */
+function attachFinalUrl(error: unknown, finalUrl: string): Error {
+    const wrapped = error instanceof Error ? error : new Error(String(error));
+    if (!(wrapped as Error & { finalUrl?: string }).finalUrl) {
+        (wrapped as Error & { finalUrl?: string }).finalUrl = finalUrl;
+    }
+    return wrapped;
+}
+
+/** Read the final URL recorded on an error thrown by `secureFetchHtml`. */
+export function getErrorFinalUrl(error: unknown): string | undefined {
+    if (
+        error &&
+        typeof error === 'object' &&
+        typeof (error as { finalUrl?: unknown }).finalUrl === 'string'
+    ) {
+        return (error as { finalUrl: string }).finalUrl;
+    }
+
+    return undefined;
 }

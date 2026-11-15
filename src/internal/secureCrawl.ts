@@ -1,5 +1,4 @@
 import pLimit from 'p-limit';
-import type { CrawlResult } from '@just-every/crawl';
 import type { CookieEntry } from '@just-every/crawl/dist/crawler/cookies.js';
 import { DiskCache } from '@just-every/crawl/dist/cache/disk.js';
 import {
@@ -18,13 +17,14 @@ import { htmlToDom, extractLinks } from '@just-every/crawl/dist/parser/dom.js';
 import { extractArticle } from '@just-every/crawl/dist/parser/article.js';
 import { formatArticleMarkdown } from '@just-every/crawl/dist/parser/markdown.js';
 import { assertPublicHttpUrl } from '../utils/urlPolicy.js';
-import { secureFetchHtml } from './secureFetchHtml.js';
+import { secureFetchHtml, getErrorFinalUrl } from './secureFetchHtml.js';
 import type { FetchMarkdownOptions } from './fetchMarkdown.js';
+import type { CategorizedCrawlResult } from './pageOutcome.js';
 
 export async function secureCrawl(
     startUrl: string,
     options: FetchMarkdownOptions = {}
-): Promise<CrawlResult[]> {
+): Promise<CategorizedCrawlResult[]> {
     const crawler = new SecureCrawler(options);
     await crawler.init();
     return crawler.crawl(startUrl);
@@ -47,7 +47,7 @@ class SecureCrawler {
         >
     > &
         Pick<FetchMarkdownOptions, 'userAgent' | 'cookiesFile'>;
-    private readonly results: CrawlResult[] = [];
+    private readonly results: CategorizedCrawlResult[] = [];
     private cookieJar: CookieEntry[] | undefined;
 
     constructor(options: FetchMarkdownOptions = {}) {
@@ -73,7 +73,7 @@ class SecureCrawler {
         await this.cache.init();
     }
 
-    async crawl(startUrl: string): Promise<CrawlResult[]> {
+    async crawl(startUrl: string): Promise<CategorizedCrawlResult[]> {
         const normalizedUrl = normalizeUrl(startUrl);
         await assertPublicHttpUrl(normalizedUrl);
         this.queue.push(normalizedUrl);
@@ -128,6 +128,7 @@ class SecureCrawler {
                         url: normalizedUrl,
                         markdown: '',
                         error: 'Blocked by robots.txt',
+                        failureCategory: 'blocked-by-robots',
                     });
                     return;
                 }
@@ -157,6 +158,7 @@ class SecureCrawler {
                     url: finalUrl,
                     markdown: '',
                     error: 'Empty response from server',
+                    failureCategory: 'content-unavailable',
                 });
                 return;
             }
@@ -168,6 +170,7 @@ class SecureCrawler {
                     url: finalUrl,
                     markdown: '',
                     error: 'Failed to extract article content',
+                    failureCategory: 'content-unavailable',
                 });
                 return;
             }
@@ -183,6 +186,7 @@ class SecureCrawler {
                             : 'No text content available'),
                     title: article.title || finalUrl,
                     error: 'Limited content extracted (JavaScript-rendered page)',
+                    failureCategory: 'content-unavailable',
                 });
                 return;
             }
@@ -214,9 +218,11 @@ class SecureCrawler {
             });
         } catch (error) {
             this.results.push({
-                url: normalizedUrl,
+                url: getErrorFinalUrl(error) ?? normalizedUrl,
                 markdown: '',
                 error: error instanceof Error ? error.message : 'Unknown error',
+                failureCategory: 'fetch-error',
+                requestedUrl: normalizedUrl,
             });
         }
     }

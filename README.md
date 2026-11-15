@@ -144,6 +144,30 @@ npm run dev fetch https://example.com --output both
 - `-t, --timeout <ms>` - Request timeout in milliseconds (default: 30000)
 - `-o, --output <format>` - Output format: json, markdown, or both (default: markdown)
 
+### Multi-page outcomes
+
+When crawling more than one page (`--pages` / `pages` > 1), each attempted page
+gets exactly one outcome, exposed as `pages` on the `fetchMarkdown` result:
+
+| Category              | Meaning                                                            |
+| --------------------- | ------------------------------------------------------------------ |
+| `success`             | Page content was fetched and extracted                             |
+| `blocked-by-robots`   | robots.txt disallowed the page                                     |
+| `fetch-error`         | Timeout, non-HTML response, HTTP error, network or redirect failure |
+| `content-unavailable` | Fetched, but no usable article body could be extracted             |
+
+Each entry carries the page's final URL (`url`, plus `requestedUrl` when a
+redirect changed it). A failing page never aborts the rest of the queue: the
+crawler keeps dequeuing links until `maxPages` pages are attempted or the queue
+is exhausted, and successful pages keep their content and separators. In the
+combined markdown, a failed page renders as a labelled note
+(`<!-- Failed page: fetch failed (fetch-error) - ... -->`) in its original slot,
+and the top-level `error` summarizes the failure count and categories instead of
+listing URLs. When every page succeeds, `error` is left unset.
+
+Single-page fetches (`maxPages` = 1) keep the previous result shape and
+behaviour; `pages` is the only addition.
+
 ### Clear cache
 ```bash
 npm run dev clear-cache
