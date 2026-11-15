@@ -1,0 +1,12 @@
+node_modules/
+outputs/screenshots/*.png
+outputs/videos/*.webm
+outputs/videos/*.mp4
+outputs/.video-tmp/
+outputs/flow.md
+outputs/logs.txt
+outputs/report.json
+.env
+*.log
+.DS_Store
+promo/
