@@ -1,0 +1,32 @@
+; 雨课堂视频自动播放器 配置模板
+; 用法：把本文件复制一份，改名成 config.ini，然后填下面三项。
+; （直接运行 main.py 也会自动生成 config.ini，效果一样）
+
+[Settings]
+; 是否后台无窗口运行。推荐 false（能看见浏览器，出问题好排查）。
+; 扫码登录时必须 false。
+headless = false
+
+; 浏览器：auto / chrome / edge。你这台电脑没装 Chrome，auto 会自动用 Edge。
+browser = auto
+
+; 课程「学习内容」页面的地址。必须 https:// 开头。
+; 例：https://stu.yuketang.cn/pro/lms/Af9yJcU8ayj/17176973/studycontent
+course_url = https://在此填写你的课程URL
+
+; sessionid 的值；把整串 cookie 粘进来也可以。
+; 留空 = 每次运行都弹窗扫码登录。
+cookie =
+
+; 播放倍速，2 = 2 倍速
+playback_rate = 2
+
+; true = 没看完的视频从 0 开始播（不接着上次的位置续播）
+; false = 从上次停的位置接着播
+restart_from_start = true
+
+; 等页面元素的最长秒数
+implicitly_wait = 20
+
+; 单个视频最多等多少分钟，超时就跳过
+max_minutes_per_video = 180
