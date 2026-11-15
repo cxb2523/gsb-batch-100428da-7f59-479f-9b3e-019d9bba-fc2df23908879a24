@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Per-URL Crawl Outcomes (`CrawlSummary.url_outcomes`)**: Every discovered URL now leaves exactly one verifiable final outcome. The six outcome types are `success`, `redirect_success` (with final landing URL and hop count), `redirect_limit_exceeded`, `robots_disallowed`, `rate_limited_abandoned`, and `connection_failed`. Outcomes are serialized in JSON reports and rendered in both the Markdown and HTML reports.
+- **Landing-page retrievability by original URL**: Pages reached through redirects are now stored under the originally requested URL while retaining the full `redirect_chain`, the new `redirect_hops` count, and a `final_url` field, so lookups by the requested URL no longer miss.
+- **Shared backoff controller (`BackoffController`)**: A single polite-delay object is re-read by every worker before each request, so a 429/503 raises the delay for all not-yet-sent requests in the same batch rather than only mutating a per-task field; the delay relaxes back toward the configured base delay on success.
+- **Bounded 429/503 retries**: Rate-limited/unavailable responses are retried with backoff (per redirect hop) before being recorded as `rate_limited_abandoned`; the final response is still stored to preserve the existing `total_crawled` / `broken_links_count` semantics.
+- **Redirect hard limit**: Chains longer than 6 hops now produce an explicit `redirect_limit_exceeded` outcome instead of being silently dropped.
+- **Local HTTP service integration tests** (`tests/test_crawl_outcomes.py`) covering a 302→302→200 chain, a 429 path, a robots.txt-forbidden path, a closed-port connection failure, a >6-hop redirect loop, and cross-request backoff propagation.
+
+### Changed
+- Added an opt-in `CrawlConfig.trust_env` flag (default `True`, matching httpx's original behavior) so ambient OS proxy / `.netrc` support is preserved; set it to `False` for deterministic loopback testing where a system proxy could otherwise mask connection failures.
+
 ## [0.2.0] - 2026-10-09
 
 ### Added

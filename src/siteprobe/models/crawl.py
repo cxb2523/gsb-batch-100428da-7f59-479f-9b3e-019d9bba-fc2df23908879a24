@@ -1,10 +1,35 @@
+from enum import Enum
 from typing import Any, Dict, List, Optional
+
 from pydantic import BaseModel, Field
 
 
 class RedirectHop(BaseModel):
     url: str
     status_code: int
+
+
+class UrlOutcomeType(str, Enum):
+    """Final, verifiable disposition of every URL the crawler discovered."""
+
+    SUCCESS = "success"
+    REDIRECT_SUCCESS = "redirect_success"
+    REDIRECT_LIMIT_EXCEEDED = "redirect_limit_exceeded"
+    ROBOTS_DISALLOWED = "robots_disallowed"
+    RATE_LIMITED_ABANDONED = "rate_limited_abandoned"
+    CONNECTION_FAILED = "connection_failed"
+
+
+class UrlOutcome(BaseModel):
+    """One final outcome per discovered URL (keyed by the originally requested URL)."""
+
+    url: str
+    outcome: UrlOutcomeType
+    status_code: Optional[int] = None
+    final_url: Optional[str] = None
+    redirect_hops: int = 0
+    redirect_chain: List[RedirectHop] = Field(default_factory=list)
+    detail: Optional[str] = None
 
 
 class ImageItem(BaseModel):
@@ -42,6 +67,8 @@ class CrawlPage(BaseModel):
     depth: int = 0
     is_indexable: bool = True
     redirect_chain: List[RedirectHop] = Field(default_factory=list)
+    redirect_hops: int = 0
+    final_url: Optional[str] = None
 
 
 class CrawlSummary(BaseModel):
@@ -52,3 +79,5 @@ class CrawlSummary(BaseModel):
     broken_links_count: int = 0
     crawl_duration_seconds: float = 0.0
     status_codes_distribution: Dict[str, int] = Field(default_factory=dict)
+    # Exactly one final outcome per discovered URL, keyed by the originally requested URL.
+    url_outcomes: List[UrlOutcome] = Field(default_factory=list)

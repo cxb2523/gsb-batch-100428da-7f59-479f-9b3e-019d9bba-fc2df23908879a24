@@ -15,6 +15,9 @@ class CrawlConfig(BaseModel):
     respect_robots: bool = True
     timeout_seconds: float = 15.0
     user_agent: str = "SiteProbe/0.2.0 (+https://github.com/tmolavi/siteprobe)"
+    # Honor ambient HTTP(S)_PROXY / .netrc / CA bundle environment (httpx default).
+    # Set False for deterministic loopback testing where an OS proxy could mask failures.
+    trust_env: bool = True
 
 
 class ChecksConfig(BaseModel):

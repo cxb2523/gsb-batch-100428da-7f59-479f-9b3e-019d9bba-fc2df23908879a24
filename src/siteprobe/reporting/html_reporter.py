@@ -1,9 +1,7 @@
-import json
 from pathlib import Path
 from typing import Union
-from siteprobe.core.engine import AuditResult
-from siteprobe.models.finding import Severity
 
+from siteprobe.core.engine import AuditResult
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="{{ language }}">
@@ -171,6 +169,36 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div style="font-size: 0.8rem; color: var(--accent);">How to enable: {{ cap.how_to_enable }}</div>
       </div>
       {% endfor %}
+    </div>
+    {% endif %}
+
+    {% if crawl_summary.url_outcomes %}
+    <div class="section-title">Per-URL Crawl Outcomes ({{ crawl_summary.url_outcomes|length }})</div>
+    <div class="stat-box" style="padding: 0; overflow-x: auto;">
+      <table style="width: 100%; border-collapse: collapse; font-size: 0.85rem;">
+        <thead>
+          <tr style="text-align: left; color: var(--text-dim); border-bottom: 1px solid var(--border);">
+            <th style="padding: 0.75rem;">URL</th>
+            <th style="padding: 0.75rem;">Outcome</th>
+            <th style="padding: 0.75rem;">HTTP</th>
+            <th style="padding: 0.75rem;">Final URL</th>
+            <th style="padding: 0.75rem;">Hops</th>
+            <th style="padding: 0.75rem;">Detail</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for o in crawl_summary.url_outcomes %}
+          <tr style="border-bottom: 1px solid var(--border);">
+            <td style="padding: 0.6rem 0.75rem; font-family: monospace;">{{ o.url }}</td>
+            <td style="padding: 0.6rem 0.75rem;"><span class="badge" style="background: rgba(88,166,255,0.15); color: var(--accent);">{{ o.outcome.value }}</span></td>
+            <td style="padding: 0.6rem 0.75rem;">{{ o.status_code if o.status_code is not none else '-' }}</td>
+            <td style="padding: 0.6rem 0.75rem; font-family: monospace;">{{ o.final_url or '-' }}</td>
+            <td style="padding: 0.6rem 0.75rem;">{{ o.redirect_hops }}</td>
+            <td style="padding: 0.6rem 0.75rem; color: var(--text-dim);">{{ o.detail or '' }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
     </div>
     {% endif %}
 

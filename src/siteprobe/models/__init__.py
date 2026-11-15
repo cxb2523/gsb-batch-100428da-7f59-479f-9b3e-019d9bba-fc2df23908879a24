@@ -1,8 +1,21 @@
+from siteprobe.models.config import (
+    ChecksConfig,
+    CrawlConfig,
+    IntegrationsConfig,
+    SiteConfig,
+    SiteProbeConfig,
+)
+from siteprobe.models.crawl import (
+    CrawlPage,
+    CrawlSummary,
+    ImageItem,
+    RedirectHop,
+    UrlOutcome,
+    UrlOutcomeType,
+)
 from siteprobe.models.finding import Finding, FindingCategory, RiskClass, Severity
-from siteprobe.models.crawl import CrawlPage, CrawlSummary, RedirectHop, ImageItem
-from siteprobe.models.remediation import RemediationAction, RemediationPlan, RemediationActionType
+from siteprobe.models.remediation import RemediationAction, RemediationActionType, RemediationPlan
 from siteprobe.models.verification import VerificationResult, VerificationStatus
-from siteprobe.models.config import SiteProbeConfig, SiteConfig, CrawlConfig, ChecksConfig, IntegrationsConfig
 
 __all__ = [
     "Finding",
@@ -13,6 +26,8 @@ __all__ = [
     "CrawlSummary",
     "RedirectHop",
     "ImageItem",
+    "UrlOutcome",
+    "UrlOutcomeType",
     "RemediationAction",
     "RemediationPlan",
     "RemediationActionType",

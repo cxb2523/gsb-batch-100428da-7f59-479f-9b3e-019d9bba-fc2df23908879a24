@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Union
+
 from siteprobe.core.engine import AuditResult
 from siteprobe.models.finding import Severity
 
@@ -80,6 +81,21 @@ class MarkdownReporter:
                     f"- **How to Enable**: {cap.how_to_enable}",
                     "",
                 ])
+
+        if res.crawl_summary.url_outcomes:
+            lines.extend([
+                "---",
+                "## 🔎 Per-URL Crawl Outcomes",
+                "",
+                "| URL | Outcome | HTTP | Final URL | Hops | Detail |",
+                "| :--- | :--- | :---: | :--- | :---: | :--- |",
+            ])
+            for o in res.crawl_summary.url_outcomes:
+                lines.append(
+                    f"| `{o.url}` | `{o.outcome.value}` | {o.status_code if o.status_code is not None else '-'} "
+                    f"| {o.final_url or '-'} | {o.redirect_hops} | {o.detail or ''} |"
+                )
+            lines.append("")
 
         lines.extend([
             "---",
