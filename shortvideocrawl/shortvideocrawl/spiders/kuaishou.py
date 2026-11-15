@@ -3,6 +3,12 @@ import json
 import scrapy
 
 from ..items import ShortvideocrawlItem
+from ..pagination import (
+    CURSOR_NUMERIC,
+    MISSING,
+    decide_next_page,
+    log_pagination_stop,
+)
 
 headers = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/109.0.0.0 Safari/537.36",
@@ -45,22 +51,72 @@ class KuaishouSpider(scrapy.Spider):
             cookies=cookies,
             headers=headers,
             body=json.dumps(body),
+            meta={"page": page},
         )
 
     def parse(self, response):
-        resp = json.loads(response.body)
-        # print(resp)
-        data = resp["data"]["visionSearchPhoto"]
-        for feed in data["feeds"]:
-            yield ShortvideocrawlItem(
-                id=feed["photo"]["id"],
-                file_urls=[feed["photo"]["photoUrl"]],
-            )
+        current_page = response.meta.get("page", 0)
+        data = self.search_data(response, current_page)
+        if data is None:
+            # The payload itself was unusable, so nothing on this page could
+            # be parsed and no pagination marker is available.
+            log_pagination_stop(self.logger, self.name, "empty_page", current_page)
+            return
 
-        # next
-        # print(data)
-        if data["pcursor"] != "no_more" and data["pcursor"] is not None:
-            next_page = int(data["pcursor"])
-            # not enough, theoretically 20 per page
-            if next_page * 20 < int(self.count):
-                yield self.request(next_page)
+        entries_found = False
+        feeds = data.get("feeds")
+        if isinstance(feeds, list):
+            for feed in feeds:
+                item = self.parse_feed(feed)
+                if item is not None:
+                    entries_found = True
+                    yield item
+
+        raw_cursor = data.get("pcursor", MISSING)
+        decision = decide_next_page(
+            raw_cursor,
+            current_page=current_page,
+            entries_found=entries_found,
+            previous_cursor=current_page,
+            cursor_kind=CURSOR_NUMERIC,
+            count_allows_next=lambda next_page: next_page * 20 < int(self.count),
+        )
+        if decision.should_continue:
+            yield self.request(decision.next_page)
+        else:
+            log_pagination_stop(self.logger, self.name, decision.reason, current_page)
+
+    def search_data(self, response, current_page):
+        """Return the ``visionSearchPhoto`` payload, or None if unusable."""
+        try:
+            resp = json.loads(response.body)
+        except (TypeError, ValueError):
+            self.logger.warning(
+                "search response is not valid JSON: site=%s page=%s",
+                self.name,
+                current_page,
+            )
+            return None
+        data = resp.get("data") if isinstance(resp, dict) else None
+        data = data.get("visionSearchPhoto") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            self.logger.warning(
+                "search response has no visionSearchPhoto payload: site=%s page=%s",
+                self.name,
+                current_page,
+            )
+            return None
+        return data
+
+    @staticmethod
+    def parse_feed(feed):
+        photo = feed.get("photo") if isinstance(feed, dict) else None
+        if not isinstance(photo, dict):
+            return None
+        video_id = photo.get("id")
+        photo_url = photo.get("photoUrl")
+        if not isinstance(video_id, (str, int)) or isinstance(video_id, bool):
+            return None
+        if not isinstance(photo_url, str) or not photo_url:
+            return None
+        return ShortvideocrawlItem(id=video_id, file_urls=[photo_url])

@@ -5,6 +5,12 @@ from urllib.parse import quote, urlencode
 import scrapy
 
 from ..items import ShortvideocrawlItem
+from ..pagination import (
+    CURSOR_HAS_MORE,
+    MISSING,
+    decide_next_page,
+    log_pagination_stop,
+)
 
 SEARCH_API = "https://haokan.baidu.com/haokan/ui-search/pc/search/video"
 headers = {
@@ -77,21 +83,67 @@ class HaokanSpider(scrapy.Spider):
         )
 
     def parse_search(self, response):
-        resp = json.loads(response.body)
-        # print(resp)
-        data = resp["data"]
+        current_page = response.meta.get("page", 1)
+        data = self.search_data(response, current_page)
+        if data is None:
+            # The payload itself was unusable, so nothing on this page could
+            # be parsed and no pagination marker is available.
+            log_pagination_stop(self.logger, self.name, "empty_page", current_page)
+            return
 
-        if "list" in data:
-            for l in data["list"]:
-                # print(l)
-                yield self.detail_request(l["vid"])
+        entries_found = False
+        videos = data.get("list")
+        if isinstance(videos, list):
+            for video in videos:
+                vid = self.parse_listing_vid(video)
+                if vid is None:
+                    continue
+                entries_found = True
+                yield self.detail_request(vid)
 
-            if data["has_more"] != 0:
-                # not enough, theoretically 10 per page
-                if response.meta["page"] * 10 < int(self.count):
-                    yield self.search_request(response.meta["page"] + 1)
-        # else:
-        #     print(data)
+        raw_cursor = data.get("has_more", MISSING)
+        # not enough, theoretically 10 per page
+        decision = decide_next_page(
+            raw_cursor,
+            current_page=current_page,
+            entries_found=entries_found,
+            cursor_kind=CURSOR_HAS_MORE,
+            count_allows_next=lambda next_page: (next_page - 1) * 10 < int(self.count),
+        )
+        if decision.should_continue:
+            yield self.search_request(decision.next_page)
+        else:
+            log_pagination_stop(self.logger, self.name, decision.reason, current_page)
+
+    def search_data(self, response, current_page):
+        """Return the ``data`` payload, or None if unusable."""
+        try:
+            resp = json.loads(response.body)
+        except (TypeError, ValueError):
+            self.logger.warning(
+                "search response is not valid JSON: site=%s page=%s",
+                self.name,
+                current_page,
+            )
+            return None
+        data = resp.get("data") if isinstance(resp, dict) else None
+        if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+            self.logger.warning(
+                "search response has no data.list payload: site=%s page=%s",
+                self.name,
+                current_page,
+            )
+            return None
+        return data
+
+    @staticmethod
+    def parse_listing_vid(video):
+        if not isinstance(video, dict):
+            return None
+        vid = video.get("vid")
+        if not isinstance(vid, (str, int)) or isinstance(vid, bool) or vid == "":
+            return None
+        return vid
 
     def parse_detail(self, response):
         pattern = re.compile("window.__PRELOADED_STATE__ = (.*?);")
