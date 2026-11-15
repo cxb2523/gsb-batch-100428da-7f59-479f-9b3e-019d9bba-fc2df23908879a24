@@ -52,6 +52,21 @@ def output_to_json(filename, data):
 
 # 使用 Table 樣式顯示
 def print_to_table(title, datas):
+    # 相容 LotteryResult 結局物件：先印狀態與記錄數，再取其記錄列表
+    if hasattr(datas, 'status') and hasattr(datas, 'records'):
+        print('狀態: {}，記錄數: {}'.format(datas.status, len(datas.records)))
+        if getattr(datas, 'error_message', ''):
+            print('失敗原因: {}'.format(datas.error_message))
+        datas = datas.records
+
+    # 記錄為空時只顯示表頭，避免 datas[0] 越界
+    if len(datas) == 0:
+        table = AsciiTable([['期別', '開獎日期', '獎號']])
+        table.title = title
+        print(table.table)
+        print('\n')
+        return
+
     table_datas = []
     if ('第一區' in datas[0] and '第二區' in datas[0]):
         table_datas.append(['期別', '開獎日期', '第一區', '第二區'])

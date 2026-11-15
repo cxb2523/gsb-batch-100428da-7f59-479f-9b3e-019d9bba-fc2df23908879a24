@@ -216,6 +216,34 @@ result = lottery.lotto49m6(['2023', '08'])
 print(result)
 ```
 
+## 回傳結構
+
+九個抓取方法不再直接拋出例外，而是回傳統一的 `LotteryResult` 結局物件，讓介面逾時、非 2xx、非 JSON 或結構缺欄位時都能被核對，並保留已成功解析的記錄。
+
+```python
+from TaiwanLottery import TaiwanLotteryCrawler, CrawlStatus
+
+lottery = TaiwanLotteryCrawler()
+result = lottery.super_lotto(['2023', '06'])
+
+print(result.lottery_name)       # 彩券名稱，例如「威力彩」
+print(result.request_year_month)  # 請求年月，例如 ['2023', '06']
+print(result.status)             # 狀態，參考下方說明
+print(result.records)            # 已成功解析的記錄列表
+print(result.error_message)      # 失敗原因簡述；成功或無資料時為空字串
+```
+
+`status` 共有四種：
+
+| 狀態 | 說明 |
+| --- | --- |
+| `CrawlStatus.SUCCESS`（成功） | 正常解析且有資料，記錄位於 `records` |
+| `CrawlStatus.NO_DATA`（無資料） | 該月 `totalSize` 為 0，`records` 為空列表 |
+| `CrawlStatus.REQUEST_FAILED`（請求失敗） | 網路異常、HTTP 非 2xx 或回應內容不是合法 JSON，細節見 `error_message` |
+| `CrawlStatus.STRUCTURE_ERROR`（結構異常） | JSON 可解析但缺少 `content` / 結果鍵，或 `totalSize` 與實際陣列長度不一致；出事前已解析的記錄仍保留在 `records` |
+
+`utils.print_to_table` 可直接接收 `LotteryResult`，會先印出狀態與記錄數；記錄為空時也不會發生索引越界。
+
 ## 資料來源
 
 - [https://www.taiwanlottery.com/lotto/history/history_result/](https://www.taiwanlottery.com/lotto/history/history_result/)
