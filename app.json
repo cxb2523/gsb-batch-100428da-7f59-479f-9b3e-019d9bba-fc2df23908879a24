@@ -1,0 +1,17 @@
+{
+  "name": "Keep Current - Web Miner and Document finder",
+  "description":
+    "It opens an API for cron to trigger a search or update the query",
+  "image": "heroku/python",
+  "repository": "https://github.com/Keep-Current/Web-Miner",
+  "keywords": ["python", "crawler", "miner", "flask"],
+  "stack": "heroku-16",
+  "environments": {
+    "test": {
+      "scripts": {
+        "test-setup": "python app.py collectstatic --noinput",
+        "test": "python app.py test"
+      }
+    }
+  }
+}
