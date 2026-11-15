@@ -1,0 +1,172 @@
+# dolarPy
+Checks USD/PYG exchange rate from several sites, with a calculator, RESTful API and a twitter bot
+
+* [Scraper: ](coti.py) Checks USD/PYG exchange rate from several sites every 10 minutes, saves the info in a json file
+* [Webservice: ](cotiapp.py) Flask app to serve the API and display the main website with the calculator
+* [TwitterBot: ](single_tweet_bot.py) Reads the webservice output and tweet it(in a human readable format)
+
+#### DEMO/Webservice
+
+http://dolar.melizeche.com/api/1.0/
+
+#### Twitter Bot
+
+https://twitter.com/DolarPy
+
+#### Mobile
+
+* For Android  https://github.com/ivankoop/DolarPy-Android
+* For Android-Kotlin https://github.com/LucasGinard/DolarPy-Android-Kotlin
+* For iOS https://github.com/LucasGinard/DolarPy-iOS
+
+#### API wrappers
+
+* For Java https://github.com/melizeche/dolarpy-wrapper-java
+* For Python https://github.com/melizeche/dolarpy-wrapper-python
+
+## Documentation in progress
+
+## Requirements
+
+* Python 3.9+
+* BeautifulSoup4
+* Flask
+* Tweepy
+
+## Install
+
+```
+git clone git@github.com:melizeche/dolarPy.git
+cd dolarPy
+python3 -m venv env
+# if venv module is not installed install with `sudo apt install python3-venv`
+source env/bin/activate
+pip install -r requirements.txt
+crontab -e (add coti.py) // See example below
+python cotiapp.py
+```
+### On macOS High Sierra with python3 (also most linux distros)
+
+```
+# pip3 is installed with Python3
+pip3 install virtualenv
+# creating the virtualenv
+virtualenv -p python3 env
+# activate the virtualenv:
+source env/bin/activate
+pip3 install -r requirements.txt
+# and the run
+# if you need to deactivate the virtualenv:
+deactivate
+```
+
+### Crontab format and example
+
+MIN 	HOUR 	DAYofMONTH 	MONTH 	DAYofWEEK 	PYTHONPATH SCRIPT
+
+So for check/update the exchange rate every 10 minutes between 6am and 8pm on weekdays
+
+```*/10    6-20            * * 1-5 /apps/dolarPy/env/bin/python /apps/dolarPy/coti.py```
+
+And for tweet the exchange rate at 8am, 12pm and 6pm on weekdays
+
+```0      8,12,18    * * 1-5 /apps/dolarPy/env/bin/python /apps/dolarPy/single_tweet_bot.py```
+
+### Proxy (optional)
+
+Some sources sit behind Cloudflare or firewalls that block datacenter IPs (the scraper then logs an error or a 403 and reports `0` for that source). To fetch them through another machine, open a SOCKS tunnel to it:
+
+```
+autossh -M 0 -f -N -D 1080 -o ServerAliveInterval=30 -o ServerAliveCountMax=3 user@other-server
+```
+
+`requests` honors the standard proxy variables (SOCKS support comes from `PySocks`, already in `requirements.txt`), so this routes every source through the tunnel:
+
+```*/10    6-20            * * 1-5 ALL_PROXY=socks5h://localhost:1080 /apps/dolarPy/env/bin/python /apps/dolarPy/coti.py```
+
+To proxy only the source that needs it, pass `proxies=` to that scraper's request and read the address from its own variable, e.g. `FOO_PROXY`:
+
+```python
+proxy = os.environ.get("FOO_PROXY")
+requests.get(url, timeout=10, proxies={"http": proxy, "https": proxy} if proxy else None)
+```
+
+To start the tunnel on boot, add the same `autossh` command to your crontab with `@reboot`.
+
+This was first set up for Ueno, which was removed after the bank collapsed in November 2026 ([Al Jazeera](https://www.aljazeera.com/news/2026/11/6/how-paraguays-ueno-collapse-is-only-its-latest-banking-crisis)).
+
+## Tests
+
+There are two suites, split by the question they answer.
+
+**Offline** (default, no network) -- checks that `coti.py` keeps its own
+contract: every source is fetched from the right endpoint, a source that is
+down or redesigned degrades to zeros instead of breaking the others,
+`dolar.json` has the documented shape, and the API serves it.
+
+```
+pip install -r requirements-dev.txt
+pytest
+```
+
+**Live** (opt-in) -- asks the real sites whether the scrapers still scrape.
+This is what catches a redesign, and it is what to run while fixing one:
+
+```
+pytest -m live              # every source
+pytest -m live -k maxi      # just one, while tuning its selector
+```
+
+A live failure means the site changed its markup and the selector in `coti.py`
+needs updating (or the site is down/blocking). There is no saved copy of any
+page to keep in sync -- fixing a scraper is a one-file change.
+
+The live suite also runs nightly in GitHub Actions, which opens an issue when a
+check fails on two consecutive runs.
+
+## Contributing
+
+If it is a new feature, before contributing, open an issue and ask if your functionality is needed by the project.
+
+1. Fork it!
+2. Create your feature branch: `git checkout -b my-new-feature`
+3. Commit your changes: `git commit -am 'Add some feature'`
+4. Push to the branch: `git push origin my-new-feature`
+5. Submit a pull request :D
+
+## Author
+
+* Marcelo Elizeche Landó https://github.com/melizeche
+
+## Contributors / Thanks
+
+* Alejo Carballude https://github.com/AlejoAsd
+* Carlos Carvallo https://github.com/carloscarvallo
+* Carlos Laspina https://github.com/claspina
+* Carlos Vallejos  https://github.com/cabupy
+* Christian Zelaya https://github.com/eduzetapy
+* Diego Díaz https://github.com/berithpy
+* Diego Zacarías https://github.com/zv3
+* Ivan Koop https://github.com/ivankoop
+* Matías Sánchez https://github.com/MatiSanchez25
+* Mauricio Medina https://github.com/mauri-medina
+* Taras Samoilenko https://github.com/cos1715
+* Alcides Rivarola https://github.com/alcides29
+* Lucas Ginard https://github.com/LucasGinard
+* Padaleiana https://github.com/padaleiana
+* nestorcde https://github.com/nestorcde
+* Ever Leiva https://github.com/EverML
+* Enrique Zárate https://github.com/enrique-zarate
+* Jorge Cáceres https://github.com/jacaceresf
+
+## TODO(APIv2)
+
+* ~Better~ Documentation
+* Add more currencies
+* Databases support
+* Historical data API endpoint
+
+## License
+
+This project is licensed under the Apache 2.0 License - see the [LICENSE.txt](LICENSE.txt) file for details
+
