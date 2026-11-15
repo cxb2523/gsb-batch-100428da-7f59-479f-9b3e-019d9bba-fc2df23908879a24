@@ -86,6 +86,48 @@ const scraper = new ProductsScraper({
 scraper.startScraping().then(console.log, console.error);
 ```
 
+`startScraping()` still resolves to an array of products, so existing code that iterates over
+or serialises the result keeps working. On top of that the array carries non-enumerable run
+metadata:
+
+```javascript
+const products = await scraper.startScraping();
+
+products.summary.detailSuccessCount // products whose detail page was fetched successfully
+products.summary.detailFailedCount  // products whose detail retries were exhausted
+products.summary.failedAmazonIds    // Amazon IDs that need a detail retry
+products.summary.searchPageEmpty    // true when the search page returned nothing at all
+products.summary.searchPageFailed   // true when the search requests kept erroring
+products.summary.searchPageFailureReason // why scraping stopped early
+products.summary.stopReason         // 'product-limit-reached' | 'search-page-no-results' | 'search-page-failed' | 'search-results-exhausted'
+```
+
+Each product also carries two extra fields:
+
+-   `detail-status`: `success` or `failed` (products still being enriched use `pending`).
+-   `detail-failure-reason`: empty on success, the latest failure reason otherwise.
+
+Failed products keep every field obtained from the search page and are never reported as
+"success with an empty description".
+
+To retry detail pages only for failed products:
+
+```javascript
+// Right after a run, on the same scraper instance:
+const retried = await scraper.retryFailedProducts();
+
+// Or later, from a previously saved result:
+const retriedAgain = await scraper.retryFailedProducts(savedResult);
+```
+
+A successful retry clears the failure marker; another failure replaces the marker and reason
+with the latest attempt (no duplicate product rows). Retry counts are fixed by
+`limit.retry` in `constants.js` and can not be changed through options.
+
+CSV and XLS files keep their previous columns and order: `detail-status` and
+`detail-failure-reason` are appended as the last two columns. File names are unchanged
+(`<keyword>_product_<timestamp>.<csv|xls>`).
+
 Example output:
 
 ```
@@ -107,7 +149,9 @@ Total scraped products count: 10
     score: '4329.60',
     savings: 6.009999999999998,
     'short-description': 'This fits your . Make sure this fitsby entering your model number.✔️ FOOD GRADE SILICONE: GREENRANIN Pastry Mat is made of premium silicone and glass fiber. It is safe, soft, durable and will not wrinkle or fade✔️ DOUBLE THICKNESS: The thickness of the Mat is 0.6MM, which is almost twice that of other mats (0.3MM). Thicker mats will not slip and wrinkle when used✔️ NON-STICKY SURFACE: Even if grease or dough sticks to the surface, pastry mat can be easily cleaned to keep the countertop clean and sanitary✔️ ANTI-SLIP BOTTOM: It is strongly adhesive to the countertop or other surfaces, it does not slip and slide on the countertop and can realize complete adhesion✔️ 100% SATISFACTION GUARANTEED: We believe in our products, so every purchase comes with our 100% money back guarantee. If you experience an issue with your GREENRAIN product, get in touch with us for a replacement or refund. We will provide friendly, easy-to-reach support',
-    'full-description': ''
+    'full-description': '',
+    'detail-status': 'success',
+    'detail-failure-reason': ''
   },
   {
     'amazon-id': 'B07MZ5LTWQ',
@@ -125,7 +169,9 @@ Total scraped products count: 10
     score: '2385.00',
     savings: 18,
     'short-description': '',
-    'full-description': ''
+    'full-description': '',
+    'detail-status': 'failed',
+    'detail-failure-reason': 'Detail page request for product B07MZ5LTWQ failed: Request failed with status code 503'
   },
 .........
   {
@@ -144,7 +190,9 @@ Total scraped products count: 10
     score: '12892.10',
     savings: 2.039999999999999,
     'short-description': 'This fits your . Make sure this fitsby entering your model number.Turn ANY pan into a non-stick surface and save time cleaning up! Use Silpat instead for any baking recipe (sweet or savory) that calls for parchment paper; Silpat replaces the need for butter, grease, oils, and spraysMade of fiberglass mesh and the highest quality food grade silicone, which provides consistent heat distribution and promotes even baking and browningSilpat is the original non-stick baking mat and has stood the test of time with use by the most demanding chefs in the world; Silpat products conform to US regulations on food grade silicone, and are FDA, NSF, and Kosher certifiedMat measures 11-5/8" x 16-1/2"; Made for a 13" x 18” panTemperature safe for use in the oven and freezer (-40° F to 482° F)',
-    'full-description': "Size:Half Sheet | Style Name:Baking MatProduct DescriptionThis 11.6 x 16.5-inch half-sheet size baking mat will turn your pan into a non-stick surface. Silpat is especially great for working with sticky materials such as gooey dough, taffy, caramel, or anything your imagination allows. Nothing sticks to Silpat, so it will save you a lot of time cleaning as there is no more sticky mess on your pans! Silpat never needs greasing, which saves both time and money. Use Silpat instead for any baking recipe that calls for parchment paper. Utilizing Silpat products saves time, money and creates less waste for our environment. It is ideal for use when creating Danish pastries, baking biscuits, working with sugar and all sugary and salted preparations. Silpat Non-Stick..."
+    'full-description': "Size:Half Sheet | Style Name:Baking MatProduct DescriptionThis 11.6 x 16.5-inch half-sheet size baking mat will turn your pan into a non-stick surface. Silpat is especially great for working with sticky materials such as gooey dough, taffy, caramel, or anything your imagination allows. Nothing sticks to Silpat, so it will save you a lot of time cleaning as there is no more sticky mess on your pans! Silpat never needs greasing, which saves both time and money. Use Silpat instead for any baking recipe that calls for parchment paper. Utilizing Silpat products saves time, money and creates less waste for our environment. It is ideal for use when creating Danish pastries, baking biscuits, working with sugar and all sugary and salted preparations. Silpat Non-Stick...",
+    'detail-status': 'success',
+    'detail-failure-reason': ''
   },
   {
     'amazon-id': 'B085PX3DYH',
@@ -162,7 +210,9 @@ Total scraped products count: 10
     score: '122.50',
     savings: 0,
     'short-description': '',
-    'full-description': ''
+    'full-description': '',
+    'detail-status': 'failed',
+    'detail-failure-reason': 'Detail page for product B085PX3DYH returned no short or full description (attempt 3 of 3)'
   }
 ]
 ```
@@ -187,6 +237,16 @@ const options = {
 
     showProgress: true //Optional. Show progress bar to CLI. False by default.
 }
+```
+
+The CLI can also retry only the failed products of a run:
+
+```sh
+# Retry failed detail pages right after scraping
+$ amazon-proxy-scraper -k 'baking mat' -a '<apiKey>' --retryFailed --saveState ./baking_mat.json
+
+# Later: retry only the products marked as failed in the saved state
+$ amazon-proxy-scraper -a '<apiKey>' --retryFailedFrom ./baking_mat.json
 ```
 
 ## License
