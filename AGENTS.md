@@ -35,8 +35,10 @@ When the user is at the keyboard, let them answer the prompts; use `--yes` only 
 - `Already on IA: N` / `To upload: M` — the resume decision. Skipping is by **size**; real verification comes at the end.
 - `[2/11] Uploading 'x.zip'` then `Upload successful` — an S3 HTTP 200. **Not** proof the file is stored yet.
 - `Waiting for IA to index N uploaded file(s)` — normal: archive.org indexes asynchronously. The script waits up to 15 minutes.
-- `✅ OK` / `❌ MISMATCH` / `❌ MISSING` per file, then a summary.
-- Exit code `0` only when every local file verified; `1` when anything failed.
+- `✅ OK` / `❌ MISMATCH` / `❌ MISSING` / `⚠️ UNCONFIRMED` per file, then a summary with confirmed-match, confirmed-mismatch and unconfirmed counts.
+- Exit code `0` only when no file was confirmed wrong; `1` when any file mismatched or was missing from a readable remote list. A run with only `UNCONFIRMED` files exits `0` but says loudly that they could not be verified.
+- **`UNCONFIRMED`** — the file list could not be read from archive.org, so the script could not compare (it is *not* "missing"). State on IA is unknown; re-run when IA is reachable.
+- **`Could not fetch files from IA ... Remote file list unavailable`** — the resume step fell back to the local SQLite log: files logged as uploaded with the same size are skipped (reported as unconfirmed), files without a log entry are still uploaded.
 
 ## Failure modes and what to do
 
@@ -88,4 +90,10 @@ That way the only item that exists is the one the user wanted, and it holds exac
 - `bulk-upload.py` is the only source file; `vendor/` is generated — never edit it by hand.
 - A PUT returns 200 before the file is listed, so anything that reads the item back must poll (`wait_for_ia_index`).
 - Keep these: force upload skips the IA sync; verification decides the exit code; `--yes` stays prompt-free; the launcher stays a `runpy` wrapper.
-- Check a change with `python3 -m py_compile bulk-upload.py` plus an offline harness that stubs `questionary` and `fetch_ia_files` (no credentials, no network).
+- Check a change with `python3 -m py_compile bulk-upload.py` plus the offline
+  suite: `python3 -m unittest discover -s tests -v`. It stubs `questionary`,
+  `fetch_ia_files`, `get_item` and redirects all state into a temp directory —
+  no credentials, no network, never archive.org.
+- Remote reads must distinguish "unavailable" (`RemoteFileList.available is
+  False`) from "the item has no files". An unavailable read must never turn
+  every local file into an upload or a verification failure.

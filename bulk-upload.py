@@ -19,6 +19,7 @@ import sys
 import signal
 import time
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -79,6 +80,99 @@ def signal_handler(sig, frame):
 
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Result Types
+# ─────────────────────────────────────────────────────────────────────────────
+class RemoteFileList(dict):
+    """File list read from Internet Archive, keyed by relative path.
+
+    It behaves like the plain dict the rest of the code (and older callers)
+    expect, and adds ``available``: False means the list could not be read at
+    all, which must not be confused with "the item has no files".
+    """
+    def __init__(self, files: Optional[Dict[str, Dict[str, Any]]] = None,
+                 available: bool = True, error: Optional[str] = None):
+        super().__init__(files or {})
+        self.available = available
+        self.error = error
+
+    @property
+    def files(self) -> "RemoteFileList":
+        return self
+
+
+class SyncResult(dict):
+    """Upload log after a sync, carrying how the remote read went.
+
+    Dict-compatible so ``sync_upload_log()`` keeps returning something usable
+    as the upload log; ``remote`` says whether IA was actually consulted.
+    """
+    def __init__(self, upload_log: Dict[str, Dict[str, Any]],
+                 remote: RemoteFileList):
+        super().__init__(upload_log)
+        self.remote = remote
+
+    @property
+    def upload_log(self) -> "SyncResult":
+        return self
+
+
+@dataclass
+class UploadPlan:
+    """Which local files to upload and which to skip.
+
+    ``unconfirmed_skips`` is a subset of ``skipped``: files skipped purely
+    because the local upload log says they were uploaded, while the remote
+    file list could not be read in this run.
+    """
+    to_upload: List[Dict[str, Any]]
+    skipped: List[str]
+    unconfirmed_skips: List[str]
+
+
+@dataclass
+class VerificationResult:
+    """Per-file verification outcome.
+
+    Only ``mismatched`` (a remote file was read and differs) is a failure.
+    ``unconfirmed`` files could not be compared because the remote list was
+    unreadable; they are reported separately rather than as missing.
+    """
+    matched: List[str]
+    mismatched: List[str]
+    unconfirmed: List[str]
+    remote_available: bool
+    remote_error: Optional[str] = None
+
+    @property
+    def ok(self) -> bool:
+        """True when no file was confirmed to be wrong."""
+        return not self.mismatched
+
+    def __bool__(self) -> bool:
+        return self.ok
+
+
+@dataclass
+class ProcessOutcome:
+    """Result of one upload run, used for the process exit code."""
+    exit_ok: bool
+    unconfirmed: int = 0
+
+    def __bool__(self) -> bool:
+        return self.exit_ok
+
+
+def as_process_outcome(result: VerificationResult) -> ProcessOutcome:
+    """Map a verification outcome onto the exit-code decision.
+
+    Confirmed problems fail the run; unconfirmed files do not (they are
+    reported loudly, and the process still exits 0).
+    """
+    return ProcessOutcome(result.ok, unconfirmed=len(result.unconfirmed))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Configuration Directory & Identifiers
@@ -451,14 +545,22 @@ def get_local_files(directory: Path) -> Dict[str, Dict[str, Any]]:
     return local_files
 
 
-def sync_upload_log(identifier: str, upload_log: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Import the item's current file list from IA into the local upload log."""
+def sync_upload_log(identifier: str, upload_log: Dict[str, Dict[str, Any]]) -> SyncResult:
+    """Import the item's current file list from IA into the local upload log.
+
+    Returns a SyncResult carrying both the (possibly stale) log and whether the
+    remote list could actually be read. Callers must not treat an unreadable
+    remote list as "the remote has no files".
+    """
     try:
         ia_files = fetch_ia_files(identifier)
     except Exception as e:
         print(f"⚠️  Could not fetch files from IA: {e}")
-        print("   Continuing with local database only...")
-        return load_upload_log(identifier)
+        print("   ⚠️  Remote file list unavailable - relying on the local upload log.")
+        print("   Files recorded as uploaded locally will be skipped, but their")
+        print("   remote state cannot be confirmed in this run.")
+        return SyncResult(load_upload_log(identifier),
+                          RemoteFileList({}, False, str(e) or type(e).__name__))
 
     entries = [{
         'relative_path': name,
@@ -469,11 +571,11 @@ def sync_upload_log(identifier: str, upload_log: Dict[str, Dict[str, Any]]) -> D
 
     if not entries:
         print("ℹ️  No files found on IA for this identifier (new upload)")
-        return load_upload_log(identifier)
+        return SyncResult(load_upload_log(identifier), RemoteFileList(ia_files, True))
 
     update_upload_log(identifier, entries)
     print(f"✅ Synced {len(entries)} files from IA")
-    return load_upload_log(identifier)
+    return SyncResult(load_upload_log(identifier), RemoteFileList(ia_files, True))
 
 
 def fetch_ia_files(identifier: str) -> Dict[str, Dict[str, Any]]:
@@ -847,80 +949,19 @@ class TqdmFileWithCounter:
 # ─────────────────────────────────────────────────────────────────────────────
 # Main Upload Logic
 # ─────────────────────────────────────────────────────────────────────────────
-def process_upload(identifier: str, local_directory: str, force_upload: bool = False, metadata: Optional[Dict[str, Any]] = None):
-    """Main upload and verification process."""
-    global quit_flag
+def plan_upload(local_files: Dict[str, Dict[str, Any]],
+                upload_log: Dict[str, Dict[str, Any]],
+                remote_available: bool) -> UploadPlan:
+    """Decide which local files to upload, using size as the resume key.
 
-    # Validate directory path
-    is_valid, error_msg, local_dir = validate_path(local_directory)
-    if not is_valid:
-        print(f"❌ {error_msg}")
-        return False
-    
-    # Additional readability check
-    if not os.access(local_dir, os.R_OK):
-        print(f"❌ Directory is not readable: {local_dir}")
-        return False
-
-    if quit_flag:
-        print("⚠️  Exiting due to user request.")
-        return False
-
-    # Initialize database
-    create_upload_log_db()
-
-    # Load any existing log up-front; the sync block below may overwrite it
-    upload_log = load_upload_log(identifier)
-
-    # Handle force upload - clear existing log for this identifier
-    if force_upload:
-        print("\n🔄 Force upload mode - clearing existing upload log...")
-        conn = sqlite3.connect(UPLOAD_LOG_DB)
-        c = conn.cursor()
-        c.execute('DELETE FROM upload_log WHERE identifier = ?', (identifier,))
-        conn.commit()
-        conn.close()
-        upload_log = {}
-        print("✅ Upload log cleared. All files will be re-uploaded.")
-    
-    # Sync with IA to get accurate file list (default: Yes)
-    if force_upload:
-        # Skip the sync entirely: it would re-import every remote file as
-        # "already uploaded" and silently cancel the forced re-upload.
-        print("🔄 Force upload: skipping IA sync so every file is uploaded.")
-    elif ASSUME_YES:
-        # Non-interactive (-y / --yes): sync without asking
-        upload_log = sync_upload_log(identifier, upload_log)
-    elif not quit_flag:
-        sync_with_ia = questionary.confirm(
-            "📡 Sync with Internet Archive to check existing files?",
-            default=True,  # Always default to Yes
-            qmark="🔄"
-        ).ask()
-
-        if sync_with_ia and not quit_flag:
-            upload_log = sync_upload_log(identifier, upload_log)
-        else:
-            # User skipped sync
-            upload_log = load_upload_log(identifier)
-            if not upload_log:
-                print("\n⚠️  No upload history found. Files will be compared by size only.")
-
-    # Scan local files
-    print("\n📂 Scanning local files...")
-    local_files = get_local_files(local_dir)
-
-    if not local_files:
-        print(f"❌ No files found in '{local_dir}'.")
-        return False
-
-    # Calculate total size
-    total_size = sum(f['size'] for f in local_files.values())
-    print(f"   Found {len(local_files)} files ({format_size(total_size)})")
-
-    # Determine which files need uploading
-    files_to_upload = []
-    already_uploaded = []
+    When the remote list is unreadable, a local log entry that says "uploaded"
+    with the same size is still trusted for this run (re-uploading would be
+    destructive and redundant), but every such skip is recorded separately as
+    unconfirmed. Files with no local record are always uploaded.
+    """
+    to_upload: List[Dict[str, Any]] = []
+    skipped: List[str] = []
+    unconfirmed_skips: List[str] = []
 
     for relative_path, file_info in local_files.items():
         if quit_flag:
@@ -941,14 +982,17 @@ def process_upload(identifier: str, local_directory: str, force_upload: bool = F
                 needs_upload = True
                 reason = f"size changed ({log_entry['size']} → {size})"
             else:
-                already_uploaded.append(relative_path)
+                skipped.append(relative_path)
+                if not remote_available:
+                    # Trusted only because of the local log; IA was not read.
+                    unconfirmed_skips.append(relative_path)
                 continue
         else:
             needs_upload = True
             reason = "not yet uploaded"
 
         if needs_upload:
-            files_to_upload.append({
+            to_upload.append({
                 'relative_path': relative_path,
                 'path': filepath,
                 'size': size,
@@ -956,28 +1000,129 @@ def process_upload(identifier: str, local_directory: str, force_upload: bool = F
                 'reason': reason
             })
 
+    return UploadPlan(to_upload, skipped, unconfirmed_skips)
+
+
+def process_upload(identifier: str, local_directory: str, force_upload: bool = False,
+                   metadata: Optional[Dict[str, Any]] = None) -> ProcessOutcome:
+    """Main upload and verification process."""
+    global quit_flag
+
+    # Validate directory path
+    is_valid, error_msg, local_dir = validate_path(local_directory)
+    if not is_valid:
+        print(f"❌ {error_msg}")
+        return ProcessOutcome(False)
+
+    # Additional readability check
+    if not os.access(local_dir, os.R_OK):
+        print(f"❌ Directory is not readable: {local_dir}")
+        return ProcessOutcome(False)
+
     if quit_flag:
         print("⚠️  Exiting due to user request.")
-        return False
+        return ProcessOutcome(False)
+
+    # Initialize database
+    create_upload_log_db()
+
+    # Load any existing log up-front; the sync block below may overwrite it
+    upload_log = load_upload_log(identifier)
+    remote = RemoteFileList({}, False, "IA sync not performed")
+
+    # Handle force upload - clear existing log for this identifier
+    if force_upload:
+        print("\n🔄 Force upload mode - clearing existing upload log...")
+        conn = sqlite3.connect(UPLOAD_LOG_DB)
+        c = conn.cursor()
+        c.execute('DELETE FROM upload_log WHERE identifier = ?', (identifier,))
+        conn.commit()
+        conn.close()
+        upload_log = {}
+        print("✅ Upload log cleared. All files will be re-uploaded.")
+
+    # Sync with IA to get accurate file list (default: Yes)
+    if force_upload:
+        # Skip the sync entirely: it would re-import every remote file as
+        # "already uploaded" and silently cancel the forced re-upload.
+        print("🔄 Force upload: skipping IA sync so every file is uploaded.")
+    elif ASSUME_YES:
+        # Non-interactive (-y / --yes): sync without asking
+        sync_result = sync_upload_log(identifier, upload_log)
+        upload_log, remote = dict(sync_result), sync_result.remote
+    elif not quit_flag:
+        sync_with_ia = questionary.confirm(
+            "📡 Sync with Internet Archive to check existing files?",
+            default=True,  # Always default to Yes
+            qmark="🔄"
+        ).ask()
+
+        if sync_with_ia and not quit_flag:
+            sync_result = sync_upload_log(identifier, upload_log)
+            upload_log, remote = dict(sync_result), sync_result.remote
+        else:
+            # User skipped sync
+            upload_log = load_upload_log(identifier)
+            remote = RemoteFileList({}, False, "IA sync skipped by user")
+            if not upload_log:
+                print("\n⚠️  No upload history found. Files will be compared by size only.")
+
+    # Scan local files
+    print("\n📂 Scanning local files...")
+    local_files = get_local_files(local_dir)
+
+    if not local_files:
+        print(f"❌ No files found in '{local_dir}'.")
+        return ProcessOutcome(False)
+
+    # Calculate total size
+    total_size = sum(f['size'] for f in local_files.values())
+    print(f"   Found {len(local_files)} files ({format_size(total_size)})")
+
+    # Determine which files need uploading
+    plan = plan_upload(local_files, upload_log, remote.available)
+    files_to_upload = plan.to_upload
+    already_uploaded = plan.skipped
+    unconfirmed_skips = plan.unconfirmed_skips
+
+    if quit_flag:
+        print("⚠️  Exiting due to user request.")
+        return ProcessOutcome(False)
 
     # Show summary
     print("\n" + "=" * 60)
     print(f"📊 Upload Summary")
     print("=" * 60)
     print(f"   📁 Local files:     {len(local_files)}")
-    print(f"   ✅ Already on IA:   {len(already_uploaded)}")
+    if remote.available:
+        print(f"   ✅ Already on IA:   {len(already_uploaded)}")
+    elif unconfirmed_skips:
+        print(f"   ✅ Skipped (local log, IA unconfirmed): {len(already_uploaded)}")
+    else:
+        print(f"   ✅ Already on IA:   {len(already_uploaded)}")
     print(f"   📤 To upload:       {len(files_to_upload)}")
-    
-    if already_uploaded and len(files_to_upload) > 0:
-        print(f"\n   Files already on IA (skipping):")
-        for f in already_uploaded[:5]:
+    if unconfirmed_skips:
+        print(f"\n   ⚠️  Remote file list unavailable: {len(unconfirmed_skips)} file(s)")
+        print(f"      are skipped based on the local upload log only and their")
+        print(f"      state on Internet Archive is unconfirmed:")
+        for f in unconfirmed_skips[:5]:
             print(f"      • {f}")
-        if len(already_uploaded) > 5:
-            print(f"      ... and {len(already_uploaded) - 5} more")
+        if len(unconfirmed_skips) > 5:
+            print(f"      ... and {len(unconfirmed_skips) - 5} more")
+        print(f"      Verification below will re-check them and list any file")
+        print(f"      that still cannot be confirmed.")
+
+    confirmed_skips = [f for f in already_uploaded if f not in set(unconfirmed_skips)]
+    if remote.available and confirmed_skips and len(files_to_upload) > 0:
+        print(f"\n   Files already on IA (skipping):")
+        for f in confirmed_skips[:5]:
+            print(f"      • {f}")
+        if len(confirmed_skips) > 5:
+            print(f"      ... and {len(confirmed_skips) - 5} more")
 
     if not files_to_upload:
         print("\n✅ All files are already uploaded.")
-        return verify_upload(identifier, local_files, upload_log)
+        return as_process_outcome(verify_upload(identifier, local_files, upload_log))
 
     print(f"\n📤 {len(files_to_upload)} files to upload")
 
@@ -1093,42 +1238,132 @@ def process_upload(identifier: str, local_directory: str, force_upload: bool = F
 
     if quit_flag:
         print("\n⚠️  Exiting due to user request.")
-        return False
+        return ProcessOutcome(False)
 
     # Verification
-    return verify_upload(identifier, local_files, upload_log)
+    return as_process_outcome(verify_upload(identifier, local_files, upload_log))
 
 
 def wait_for_ia_index(identifier: str, expected: List[str],
-                      timeout: int = 900, interval: int = 20) -> Dict[str, Dict[str, Any]]:
-    """Wait until IA lists every expected file (its ingest is asynchronous)."""
+                      timeout: int = 900,
+                      interval: int = 20) -> RemoteFileList:
+    """Wait until IA lists every expected file (its ingest is asynchronous).
+
+    Returns the last successfully read file list, or an unavailable result if
+    every read failed. A failed read is retried until the deadline; it is not
+    treated as "no files on IA".
+    """
     deadline = time.time() + timeout
     announced = False
+    last_error: Optional[str] = None
+    last_good: Optional[Dict[str, Dict[str, Any]]] = None
     while True:
         try:
             ia_files = fetch_ia_files(identifier)
-        except Exception:
-            ia_files = {}
-        missing = [name for name in expected if name not in ia_files]
-        if not missing or quit_flag:
-            return ia_files
+            last_good = ia_files
+            last_error = None
+        except Exception as e:
+            ia_files = None
+            last_error = str(e) or type(e).__name__
+
+        if ia_files is not None:
+            missing = [name for name in expected if name not in ia_files]
+            if not missing:
+                return RemoteFileList(ia_files, True)
+        else:
+            missing = list(expected)
+
+        if quit_flag:
+            if last_good is not None:
+                return RemoteFileList(last_good, True)
+            return RemoteFileList({}, False, last_error)
+
         remaining = deadline - time.time()
         if remaining <= 0:
-            print(f"\n⚠️  {len(missing)} file(s) still not indexed after {timeout}s")
-            return ia_files
+            if last_good is not None:
+                print(f"\n⚠️  {len(missing)} file(s) still not indexed after {timeout}s")
+                return RemoteFileList(last_good, True)
+            print(f"\n⚠️  Could not read the file list from IA after {timeout}s: {last_error}")
+            return RemoteFileList({}, False, last_error)
         if not announced:
-            print(f"\n⏳ Waiting for IA to index {len(missing)} uploaded file(s) (up to {timeout}s)...")
+            if ia_files is None:
+                print(f"\n⏳ Waiting for IA file list (unreadable so far, up to {timeout}s)...")
+            else:
+                print(f"\n⏳ Waiting for IA to index {len(missing)} uploaded file(s) (up to {timeout}s)...")
             announced = True
         time.sleep(min(interval, remaining))
 
 
 def verify_upload(identifier: str, local_files: Dict[str, Dict[str, Any]],
-                  upload_log: Dict[str, Dict[str, Any]], wait_timeout: int = 900) -> bool:
-    """Verify every local file is on IA with matching size and MD5."""
-    print("\n🔍 Verifying files on IA...")
-    ia_files = wait_for_ia_index(identifier, list(local_files), timeout=wait_timeout)
+                  upload_log: Dict[str, Dict[str, Any]],
+                  wait_timeout: int = 900,
+                  interval: int = 20) -> VerificationResult:
+    """Verify every local file is on IA with matching size and MD5.
 
-    mismatched = []
+    Returns a VerificationResult that separates confirmed matches, confirmed
+    problems, and files whose remote counterpart could not be read because the
+    whole remote list was unavailable. Only confirmed problems make the run
+    fail (``result.ok``).
+    """
+    print("\n🔍 Verifying files on IA...")
+    # Re-read the log: files uploaded during this run were recorded after the
+    # caller's copy was loaded. Using the stale copy would reset their
+    # "uploaded" flag to False, which a later offline run would misread as
+    # "never uploaded" and re-send. The caller's entries remain as fallback
+    # for files that are not in the database (direct/in-memory callers).
+    fresh_log = load_upload_log(identifier)
+    for name, entry in upload_log.items():
+        fresh_log.setdefault(name, entry)
+    upload_log = fresh_log
+    remote = wait_for_ia_index(identifier, list(local_files),
+                               timeout=wait_timeout, interval=interval)
+    result = compare_files_with_remote(local_files, upload_log, remote,
+                                       identifier=identifier)
+
+    # Summary
+    print("\n" + "=" * 60)
+    print(f"🔍 Verification complete - {len(result.matched)} confirmed match, "
+          f"{len(result.mismatched)} confirmed mismatch, "
+          f"{len(result.unconfirmed)} unconfirmed")
+
+    if result.mismatched:
+        print(f"\n⚠️  {len(result.mismatched)} file(s) confirmed as missing or different on IA:")
+        for f in result.mismatched[:10]:
+            print(f"   • {f}")
+        if len(result.mismatched) > 10:
+            print(f"   ... and {len(result.mismatched) - 10} more")
+
+    if result.unconfirmed:
+        print(f"\n⚠️  {len(result.unconfirmed)} file(s) could NOT be verified because the")
+        print(f"   remote file list was unreadable"
+              + (f" ({result.remote_error})" if result.remote_error else "") + ":")
+        for f in result.unconfirmed[:10]:
+            print(f"   • {f}")
+        if len(result.unconfirmed) > 10:
+            print(f"   ... and {len(result.unconfirmed) - 10} more")
+        print("   Their state on archive.org is unknown - re-run when IA is reachable.")
+        if not result.mismatched:
+            print("   No confirmed problems; exiting successfully with unverified files.")
+
+    if not result.mismatched and not result.unconfirmed:
+        print("✅ Verification complete - all files match!")
+
+    return result
+
+
+def compare_files_with_remote(local_files: Dict[str, Dict[str, Any]],
+                              upload_log: Dict[str, Dict[str, Any]],
+                              remote: RemoteFileList,
+                              identifier: Optional[str] = None) -> VerificationResult:
+    """Classify each local file against a (possibly unavailable) remote list.
+
+    * remote available + file present + size/MD5 equal -> matched
+    * remote available + file present but different, or absent -> mismatched
+    * remote unavailable -> unconfirmed (there is nothing to compare against)
+    """
+    matched: List[str] = []
+    mismatched: List[str] = []
+    unconfirmed: List[str] = []
     total_files = len(local_files)
 
     for index, (relative_path, file_info) in enumerate(local_files.items(), start=1):
@@ -1145,7 +1380,7 @@ def verify_upload(identifier: str, local_files: Dict[str, Dict[str, Any]],
         log_entry = upload_log.get(relative_path, {})
         local_md5 = calc_md5(filepath)
 
-        if local_md5:
+        if local_md5 and identifier is not None:
             update_upload_log(identifier, [{
                 'relative_path': relative_path,
                 'size': local_size,
@@ -1154,12 +1389,16 @@ def verify_upload(identifier: str, local_files: Dict[str, Dict[str, Any]],
             }])
 
         # Compare with IA
-        if relative_path in ia_files:
-            ia_size = ia_files[relative_path]['size']
-            ia_md5 = ia_files[relative_path]['md5']
+        if not remote.available:
+            print("⚠️  UNCONFIRMED (remote file list unreadable)")
+            unconfirmed.append(relative_path)
+        elif relative_path in remote.files:
+            ia_size = remote.files[relative_path]['size']
+            ia_md5 = remote.files[relative_path]['md5']
 
             if ia_size == local_size and local_md5 == ia_md5:
                 print("✅ OK")
+                matched.append(relative_path)
             else:
                 print("❌ MISMATCH")
                 mismatched.append(relative_path)
@@ -1167,18 +1406,13 @@ def verify_upload(identifier: str, local_files: Dict[str, Dict[str, Any]],
             print("❌ MISSING")
             mismatched.append(relative_path)
 
-    # Summary
-    print("\n" + "=" * 60)
-    if mismatched:
-        print(f"⚠️  Verification complete - {len(mismatched)} file(s) have issues:")
-        for f in mismatched[:10]:
-            print(f"   • {f}")
-        if len(mismatched) > 10:
-            print(f"   ... and {len(mismatched) - 10} more")
-    else:
-        print("✅ Verification complete - all files match!")
-
-    return not mismatched
+    return VerificationResult(
+        matched=matched,
+        mismatched=mismatched,
+        unconfirmed=unconfirmed,
+        remote_available=remote.available,
+        remote_error=remote.error,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1313,16 +1547,21 @@ def main():
                 return
 
         # Run the upload process
+        outcome = ProcessOutcome(False)
         if not quit_flag:
-            success = process_upload(identifier, local_directory, force_upload=force_upload, metadata=metadata)
+            outcome = process_upload(identifier, local_directory,
+                                     force_upload=force_upload, metadata=metadata)
 
-            if success:
-                print("\n🎉 Upload process completed successfully!")
+            if outcome.exit_ok:
+                if outcome.unconfirmed:
+                    print("\n🎉 Upload process completed, but some files could not be verified.")
+                else:
+                    print("\n🎉 Upload process completed successfully!")
             else:
                 print("\n⚠️  Upload process completed with issues.")
 
         print("\n👋 Goodbye!\n")
-        sys.exit(0 if success else 1)
+        sys.exit(0 if outcome.exit_ok else 1)
     
     except KeyboardInterrupt:
         print("\n\n⚠️  Force exit...")

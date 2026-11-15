@@ -26,11 +26,20 @@ State lives next to the `ia` CLI config in `~/.config/internetarchive/`: `identi
 ## Behaviour
 
 - **Resumable** — re-running skips files already on the item.
-- **Verification** — size + MD5 per file, after archive.org finishes indexing (waits up to 15 min).
+- **Verification** — size + MD5 per file, after archive.org finishes indexing (waits up to 15 min). Results are split into confirmed match, confirmed mismatch, and unconfirmed (remote list unreadable).
 - **Metadata** — title, description, creator, date, subject, language.
 - **Pre-configured launcher** — optionally writes `<identifier>.py`, which runs that identifier/directory with `--yes`.
 - **Force upload** — interactive option; clears the local log and skips the IA sync so everything is really re-uploaded.
-- **Exit codes** — non-zero when upload or verification fails.
+- **Exit codes** — non-zero when upload or verification fails; a run where nothing could be confirmed but nothing was confirmed wrong exits `0` with a warning.
+
+## Tests
+
+Offline, no credentials and no network:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
 
 ## Notes
 
