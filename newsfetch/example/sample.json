@@ -1,0 +1,23 @@
+{
+  "url": "https://www.example.com/news/transit-plan",
+  "canonical_url": "https://www.example.com/news/transit-plan",
+  "title": "City Council Approves Transit Plan",
+  "description": "Local leaders voted to expand the metro line.",
+  "authors": ["Jane Reporter"],
+  "published_at": "2024-06-15T10:30:00+00:00",
+  "modified_at": "2024-06-15T12:00:00+00:00",
+  "publisher": "Example News",
+  "language": "en",
+  "image": "https://cdn.example.com/transit.jpg",
+  "section": "Local",
+  "word_count": 78,
+  "reading_time_minutes": 1,
+  "sources": {
+    "title": "json-ld",
+    "text": "json-ld.articleBody",
+    "published_at": "json-ld.datePublished",
+    "image": "json-ld",
+    "authors": "json-ld"
+  },
+  "text": "The city council approved a multi-year transit expansion on Tuesday after a lengthy debate. Officials said the plan will add three new stations and improve bus connections in the east side neighborhoods. Residents who attended the hearing largely supported the measure, though some raised concerns about construction noise. Funding will come from a mix of state grants and local bonds. Work is expected to begin next spring."
+}
