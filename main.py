@@ -3,6 +3,8 @@ import logging
 import os
 import re
 import sys
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from mimetypes import guess_extension
 
 from dotenv import load_dotenv
@@ -79,6 +81,91 @@ FILE_CATEGORIES = {
 }
 
 
+@dataclass(frozen=True)
+class DownloadedFile:
+    """A file that was downloaded during this run."""
+
+    message_id: int | None
+    file_path: str
+    size: int
+
+
+@dataclass(frozen=True)
+class SkippedFile:
+    """A target that already existed and was therefore left untouched."""
+
+    message_id: int | None
+    file_path: str
+    size: int
+
+
+@dataclass(frozen=True)
+class FailedFile:
+    """A message whose media could not be downloaded, with a readable reason."""
+
+    message_id: int | None
+    file_path: str
+    reason: str
+
+
+@dataclass
+class DownloadSummary:
+    """Structured result of a download run, used for the final report."""
+
+    new_files: list[DownloadedFile] = field(default_factory=list)
+    skipped_files: list[SkippedFile] = field(default_factory=list)
+    failed_files: list[FailedFile] = field(default_factory=list)
+    removed_temp_files: list[str] = field(default_factory=list)
+
+    @property
+    def new_count(self) -> int:
+        return len(self.new_files)
+
+    @property
+    def skipped_count(self) -> int:
+        return len(self.skipped_files)
+
+    @property
+    def failed_count(self) -> int:
+        return len(self.failed_files)
+
+    @property
+    def new_size_bytes(self) -> int:
+        return sum(file.size for file in self.new_files)
+
+    @property
+    def skipped_size_bytes(self) -> int:
+        return sum(file.size for file in self.skipped_files)
+
+    @property
+    def total_size_bytes(self) -> int:
+        # Files already on disk are still part of what this run accounts for,
+        # and mirror what the output directory now contains.
+        return self.new_size_bytes + self.skipped_size_bytes
+
+    @property
+    def new_size_mb(self) -> float:
+        return self.new_size_bytes / (1024 * 1024)
+
+    @property
+    def skipped_size_mb(self) -> float:
+        return self.skipped_size_bytes / (1024 * 1024)
+
+    @property
+    def total_size_mb(self) -> float:
+        return self.total_size_bytes / (1024 * 1024)
+
+
+@dataclass(frozen=True)
+class DownloadOutcome:
+    """Result of attempting a single file: new, skipped, or failed."""
+
+    status: str
+    file_path: str
+    size: int = 0
+    reason: str = ""
+
+
 def sanitize_filename(filename: str, fallback: str = "unnamed_file") -> str:
     """
     Remove or replace characters that are invalid across major operating systems
@@ -111,12 +198,25 @@ def create_telegram_client():
 
 
 def cleanup_incomplete_files(output_dir):
-    """Remove any leftover .tmp files from interrupted downloads."""
-    for file in os.listdir(output_dir):
-        if file.endswith(".tmp"):
-            temp_file_path = os.path.join(output_dir, file)
-            logger.warning(f"Removing incomplete file: {temp_file_path}")
+    """Remove any leftover .tmp files from interrupted downloads.
+
+    Returns the paths that were removed so the final summary can mention them.
+    """
+    removed = []
+    for file in sorted(os.listdir(output_dir)):
+        if not file.endswith(".tmp"):
+            continue
+        temp_file_path = os.path.join(output_dir, file)
+        if not os.path.isfile(temp_file_path):
+            continue
+        logger.warning("Removing incomplete file: %s", temp_file_path)
+        try:
             os.remove(temp_file_path)
+        except OSError as error:
+            logger.error("Could not remove %s: %s", temp_file_path, error)
+            continue
+        removed.append(temp_file_path)
+    return removed
 
 
 def create_directory_if_needed(directory):
@@ -125,38 +225,268 @@ def create_directory_if_needed(directory):
         os.makedirs(directory)
 
 
-def check_and_download_file(telegram_client, message, file_path):
-    """Downloads the file with a temporary name and renames it after completion."""
+def _message_id(message, fallback=None):
+    """Return the Telegram message ID, or a stable fallback for fake clients."""
+    message_id = getattr(message, "id", None)
+    return fallback if message_id is None else message_id
+
+
+def _format_error(error: Exception) -> str:
+    message = str(error).strip()
+    return f"{type(error).__name__}: {message}" if message else type(error).__name__
+
+
+def _remove_file_if_present(path):
     try:
-        # Skip downloading if the file already exists
-        if os.path.exists(file_path):
-            logger.info(f"File already exists: {file_path}, skipping download.")
-            return file_path, os.path.getsize(file_path)
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as error:
+        logger.warning("Could not remove temporary file %s: %s", path, error)
 
-        temp_file_path = file_path + ".tmp"
 
-        # Download the file as a .tmp file first
+def download_file(telegram_client, message, file_path) -> DownloadOutcome:
+    """Download one message's media to ``file_path`` using a .tmp file.
+
+    The returned outcome distinguishes a genuinely new download from a file
+    that already existed. Failures never leave a .tmp file behind and always
+    carry a human-readable reason.
+    """
+    if os.path.exists(file_path):
+        return DownloadOutcome("skipped", file_path, os.path.getsize(file_path))
+
+    temp_file_path = file_path + ".tmp"
+    try:
         downloaded_file = telegram_client.download_media(message, file=temp_file_path)
-
-        # Validate file size before renaming to ensure download was successful
-        if (
-            downloaded_file
-            and os.path.exists(temp_file_path)
-            and os.path.getsize(temp_file_path) > 0
-        ):
-            os.rename(temp_file_path, file_path)
-            logger.info(f"Downloaded: {file_path}")
-            return file_path, os.path.getsize(file_path)
-        else:
-            logger.warning(
-                f"Downloaded file is incomplete or missing: {temp_file_path}"
-            )
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-    # Catch everything so one failed file doesn't stop the whole run.
     except Exception as error:  # noqa: BLE001
-        logger.error(f"Failed to download file: {error}")
-    return None, 0
+        _remove_file_if_present(temp_file_path)
+        reason = f"download failed: {_format_error(error)}"
+        return DownloadOutcome("failed", file_path, reason=reason)
+
+    completed_path = temp_file_path
+    if not os.path.exists(completed_path):
+        # The caller asked for the .tmp path, so anything written elsewhere is
+        # not ours to move around (and might be an unrelated user file).
+        reason = (
+            "download completed but produced no file "
+            f"(download_media returned {downloaded_file!r})"
+        )
+        return DownloadOutcome("failed", file_path, reason=reason)
+
+    size = os.path.getsize(completed_path)
+    if size <= 0:
+        _remove_file_if_present(completed_path)
+        reason = "download produced an empty file (0 bytes)"
+        return DownloadOutcome("failed", file_path, reason=reason)
+
+    # Re-check: never overwrite a file that appeared while we were downloading.
+    if os.path.exists(file_path):
+        _remove_file_if_present(completed_path)
+        return DownloadOutcome("skipped", file_path, os.path.getsize(file_path))
+
+    try:
+        os.rename(completed_path, file_path)
+    except OSError as error:
+        _remove_file_if_present(completed_path)
+        reason = f"could not move temporary file into place: {_format_error(error)}"
+        return DownloadOutcome("failed", file_path, reason=reason)
+
+    logger.info("Downloaded: %s", file_path)
+    return DownloadOutcome("new", file_path, os.path.getsize(file_path))
+
+
+def check_and_download_file(telegram_client, message, file_path):
+    """Download a single file, returning ``(file_path, size)``.
+
+    Kept for callers that used the original helper directly; the download
+    loop uses :func:`download_file` so it can tell new files from skipped
+    ones. Returns ``(None, 0)`` when the download fails.
+    """
+    outcome = download_file(telegram_client, message, file_path)
+    if outcome.status == "failed":
+        return None, 0
+    return outcome.file_path, outcome.size
+
+
+def _file_type_matches(file_extension, file_type):
+    """Apply the original --format filtering rules to a detected extension."""
+    if not file_type:
+        return True
+    normalized_type = file_type.lower()
+    extension = file_extension.lstrip(".")
+    return (
+        normalized_type in FILE_CATEGORIES
+        and extension in FILE_CATEGORIES.get(normalized_type, [])
+    ) or extension == normalized_type
+
+
+def _collect_file_candidates(messages, file_type):
+    """Extract downloadable message/media pairs and their cleaned base names.
+
+    Returns a list of ``(message, message_id, base_filename)``. Filtering and
+    name sanitization behave exactly as before; collision handling happens
+    afterwards.
+    """
+    candidates = []
+    for index, message in enumerate(messages):
+        if not getattr(message, "media", None):
+            continue
+
+        message_id = _message_id(message, fallback=index + 1)
+
+        if isinstance(message.media, MessageMediaPhoto):
+            if file_type and file_type.lower() != "images":
+                continue
+            base_name = sanitize_filename(f"{message_id}.jpg", fallback=str(message_id))
+            candidates.append((message, message_id, base_name))
+            continue
+
+        file = getattr(message, "file", None)
+        if not file:
+            continue
+
+        mime_type = getattr(file, "mime_type", None)
+        file_extension = guess_extension(mime_type) if mime_type else None
+        if file_extension is None:
+            file_extension = ""
+
+        raw_name = getattr(file, "name", None) or str(message_id)
+        base_name = sanitize_filename(raw_name, fallback=str(message_id))
+        if file_extension and not base_name.endswith(file_extension):
+            base_name += file_extension
+
+        if not _file_type_matches(file_extension, file_type):
+            continue
+
+        candidates.append((message, message_id, base_name))
+    return candidates
+
+
+def _append_disambiguator(filename, marker, attempt):
+    """Append a stable marker before the extension.
+
+    The first attempt yields ``stem (marker).ext``; later attempts yield
+    ``stem (marker-2).ext`` etc., so a suffix never looks like a filename
+    another message genuinely has.
+    """
+    stem, extension = os.path.splitext(filename)
+    suffix = f"({marker})" if attempt == 1 else f"({marker}-{attempt})"
+    return f"{stem} {suffix}{extension}"
+
+
+def assign_unique_file_names(candidates):
+    """Attach a stable, collision-free filename to each candidate.
+
+    When two messages in the same batch clean to the same filename, every
+    member of that group gets its message ID appended (for example
+    ``report (101).pdf`` and ``report (102).pdf``). The result depends only on
+    the batch's base names and message IDs, so rerunning the same batch yields
+    the same names, and a sibling can never be mistaken for an existing file.
+
+    A generated name may still collide with another message's literal filename
+    (a document genuinely called ``report (101).pdf``). In that case the
+    literally-named file keeps its name and the generated one is bumped, which
+    is stable because message IDs are unique within a channel.
+
+    Returns a list of ``(message, message_id, final_filename)``.
+    """
+    base_names = [base_name for _, _, base_name in candidates]
+
+    normalized_groups = {}
+    for index, base_name in enumerate(base_names):
+        normalized_groups.setdefault(base_name.casefold(), []).append(index)
+
+    # Any name shared inside the batch is disambiguated for every member,
+    # rather than letting the first one keep an ambiguous base name.
+    attempts = [
+        1 if len(normalized_groups[base_name.casefold()]) > 1 else 0
+        for base_name in base_names
+    ]
+
+    # Message IDs identify files stably. If a client ever reports the same ID
+    # twice, fall back to the position so the suffix loop still converges.
+    seen_markers = {}
+    for _, message_id, _ in candidates:
+        seen_markers[str(message_id)] = seen_markers.get(str(message_id), 0) + 1
+    markers = []
+    for position, (_, message_id, _) in enumerate(candidates, start=1):
+        marker = str(message_id)
+        if seen_markers[marker] > 1:
+            marker = f"{marker}-{position}"
+        markers.append(marker)
+
+    names = [
+        _append_disambiguator(base_name, markers[index], attempts[index])
+        if attempts[index]
+        else base_name
+        for index, base_name in enumerate(base_names)
+    ]
+
+    # Resolve remaining collisions deterministically. Names that were already
+    # disambiguated give way first, so a literal filename is preserved when
+    # possible. The round bound is only a guard against pathological input.
+    for _ in range(len(base_names) + 1):
+        collisions = {}
+        for index, name in enumerate(names):
+            collisions.setdefault(name.casefold(), []).append(index)
+        duplicate_groups = [
+            indices for indices in collisions.values() if len(indices) > 1
+        ]
+        if not duplicate_groups:
+            break
+        for indices in duplicate_groups:
+            bumped = [index for index in indices if attempts[index] > 0] or indices
+            for index in bumped:
+                attempts[index] += 1
+                names[index] = _append_disambiguator(
+                    base_names[index], markers[index], attempts[index]
+                )
+
+    return [
+        (message, message_id, names[index])
+        for index, (message, message_id, _) in enumerate(candidates)
+    ]
+
+
+def _client_session(telegram_client):
+    """Allow simple fake clients that are not context managers."""
+    if hasattr(telegram_client, "__enter__") and hasattr(telegram_client, "__exit__"):
+        return telegram_client
+    return nullcontext(telegram_client)
+
+
+def _log_summary(summary):
+    """Log a final report that reconciles every inspected message."""
+    if summary.removed_temp_files:
+        logger.warning(
+            "Removed %d leftover .tmp file(s) from a previous run.",
+            len(summary.removed_temp_files),
+        )
+
+    for skipped in summary.skipped_files:
+        logger.info(
+            "Skipped (already exists): message %s -> %s",
+            skipped.message_id,
+            skipped.file_path,
+        )
+
+    for failed in summary.failed_files:
+        logger.error(
+            "Failed: message %s -> %s: %s",
+            failed.message_id,
+            failed.file_path,
+            failed.reason,
+        )
+
+    logger.info(
+        "Summary: new downloads: %d (%.2f MB), skipped (already existed): %d "
+        "(%.2f MB), failed: %d, total size: %.2f MB",
+        summary.new_count,
+        summary.new_size_mb,
+        summary.skipped_count,
+        summary.skipped_size_mb,
+        summary.failed_count,
+        summary.total_size_mb,
+    )
 
 
 def list_dialogs(telegram_client):
@@ -208,65 +538,51 @@ def download_files_from_entity(
     save_directory=".",
     message_limit=100,
 ):
-    create_directory_if_needed(save_directory)
-    cleanup_incomplete_files(save_directory)
+    """Download media from an entity, returning a structured summary.
 
-    total_file_size = 0
-    total_files_downloaded = 0
+    ``message_limit`` still limits how many messages are inspected, not how
+    many files are downloaded.
+    """
+    create_directory_if_needed(save_directory)
+    summary = DownloadSummary(
+        removed_temp_files=cleanup_incomplete_files(save_directory)
+    )
+
     message_limit = None if message_limit == 0 else message_limit
 
     # Resolve the entity (convert to int if numeric, keep as string otherwise)
     entity = resolve_entity(entity_identifier)
 
-    with telegram_client:
-        logger.info(f"Fetching messages from: {entity_identifier}")
+    with _client_session(telegram_client):
+        logger.info("Fetching messages from: %s", entity_identifier)
         messages = telegram_client.iter_messages(entity, limit=message_limit)
 
-        for message in messages:
-            if message.media:
-                if isinstance(message.media, MessageMediaPhoto):
-                    if not file_type or file_type.lower() == "images":
-                        file_name = f"{message.id}.jpg"
-                        file_path = os.path.join(save_directory, file_name)
-                        downloaded_file, file_size = check_and_download_file(
-                            telegram_client, message, file_path
-                        )
-                        if downloaded_file:
-                            total_file_size += file_size
-                            total_files_downloaded += 1
+        # Names are resolved for the whole batch before downloading, so that two
+        # messages sharing a filename never race each other or masquerade as
+        # "existing". Only media-bearing messages are retained, not the raw
+        # message stream, so --limit 0 stays memory-reasonable.
+        candidates = _collect_file_candidates(messages, file_type)
+        targets = assign_unique_file_names(candidates)
 
-                elif message.file:
-                    mime_type = message.file.mime_type
-                    file_extension = guess_extension(mime_type) if mime_type else None
-                    if file_extension is None:
-                        file_extension = ""
+        for message, message_id, file_name in targets:
+            file_path = os.path.join(save_directory, file_name)
+            outcome = download_file(telegram_client, message, file_path)
 
-                    raw_name = message.file.name or str(message.id)
-                    file_name = sanitize_filename(raw_name, fallback=str(message.id))
-                    if file_extension and not file_name.endswith(file_extension):
-                        file_name += file_extension
+            if outcome.status == "new":
+                summary.new_files.append(
+                    DownloadedFile(message_id, outcome.file_path, outcome.size)
+                )
+            elif outcome.status == "skipped":
+                summary.skipped_files.append(
+                    SkippedFile(message_id, outcome.file_path, outcome.size)
+                )
+            else:
+                summary.failed_files.append(
+                    FailedFile(message_id, outcome.file_path, outcome.reason)
+                )
 
-                    file_path = os.path.join(save_directory, file_name)
-
-                    if (
-                        not file_type
-                        or (
-                            file_type.lower() in FILE_CATEGORIES
-                            and file_extension.lstrip(".")
-                            in FILE_CATEGORIES.get(file_type.lower(), [])
-                        )
-                        or (file_extension.lstrip(".") == file_type.lower())
-                    ):
-                        downloaded_file, file_size = check_and_download_file(
-                            telegram_client, message, file_path
-                        )
-                        if downloaded_file:
-                            total_file_size += file_size
-                            total_files_downloaded += 1
-
-    logger.info(
-        f"\nSummary: Total files downloaded: {total_files_downloaded}, Total size: {total_file_size / (1024 * 1024):.2f} MB"
-    )
+    _log_summary(summary)
+    return summary
 
 
 if __name__ == "__main__":

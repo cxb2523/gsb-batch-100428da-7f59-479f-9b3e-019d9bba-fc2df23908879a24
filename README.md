@@ -17,6 +17,8 @@ A Python script to download files from Telegram entities (channels, groups, chat
   - [Usage](#usage)
     - [List All Accessible Dialogs](#list-all-accessible-dialogs)
     - [Download Files](#download-files)
+    - [Download Summary](#download-summary)
+    - [Duplicate Filenames](#duplicate-filenames)
   - [Security Notes](#security-notes)
   - [FAQ](#faq)
     - [What is a Telegram Entity?](#what-is-a-telegram-entity)
@@ -30,6 +32,7 @@ A Python script to download files from Telegram entities (channels, groups, chat
 - Download files from channels, groups, private chats, or your saved messages.
 - Filter downloads by file type (e.g., images, PDFs, videos).
 - Save files to a specific directory.
+- A final summary separates newly downloaded files, files skipped because they already exist, and failures (with the message ID and reason for each).
 - List all channels, groups, and chats you have access to.
 - Easy setup with environment variables for secure credential management.
 
@@ -143,9 +146,34 @@ python main.py @channel_name --output ./downloads --limit 0
 
 **Note:** The `--limit` parameter specifies how many messages to check, not how many files to download. For example, `--format pdf --limit 10` will check the 10 most recent messages and download any PDFs found among them.
 
+### Download Summary
+
+At the end of every run the script logs one summary line:
+
+```text
+Summary: new downloads: 3 (12.50 MB), skipped (already existed): 2 (4.00 MB), failed: 1, total size: 16.50 MB
+```
+
+- **new downloads** — files downloaded during this run and moved into place.
+- **skipped (already existed)** — files that were already in the output directory and were left untouched.
+- **failed** — messages whose media could not be downloaded. Each failure is logged with its message ID, target path, and a readable reason (for example an exception from Telegram, an empty file, or a client that returned no file). Failed downloads never leave a `.tmp` file behind.
+- **total size** — the size of new plus skipped files, i.e. what this run accounts for in the output directory.
+
+Leftover `.tmp` files from an interrupted earlier run are removed at startup, and the summary reports how many were cleaned up.
+
+### Duplicate Filenames
+
+If two messages in the inspected range sanitize to the same filename, every member of that collision gets its message ID appended before the extension:
+
+```text
+report.pdf  ->  report (101).pdf  and  report (102).pdf
+```
+
+Because the suffix depends only on the message IDs, rerunning the same channel produces the same names, so the second run reports those files as skipped instead of overwriting them. If a generated name happens to equal a file's literal name (a document actually called `report (101).pdf`), the literally-named file keeps its name and the generated one is bumped (`report (101-2).pdf`).
+
 ## Security Notes
 
-- Downloaded filenames are sanitized to replace OS-invalid characters and strip path traversal sequences so files always stay inside the `--output` directory (falling back to the Telegram message ID if the cleaned name is empty).
+- Downloaded filenames are sanitized to replace OS-invalid characters and strip path traversal sequences so files always stay inside the `--output` directory (falling back to the Telegram message ID if the cleaned name is empty). Filename-collision suffixes are added after sanitization and never relax these rules.
 - Avoid sharing the .env file.
 - Avoid sharing the `session_name.session` file, as it contains encrypted data that could potentially be misused to access your account.
 
