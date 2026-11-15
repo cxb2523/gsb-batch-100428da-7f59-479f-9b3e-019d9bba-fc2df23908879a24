@@ -1,0 +1,12 @@
+__pycache__
+test*
+setup*.py
+wrs-temp/
+*.pdf
+dist/
+build/
+*egg-info/
+temp*.py
+*.bat
+test
+.vscode
