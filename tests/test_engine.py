@@ -3,12 +3,17 @@ import support  # noqa: F401
 import asyncio
 import time
 import unittest
+from unittest import mock
+from urllib.parse import urlparse
+
+import httpx
 
 from therightbibtex import bibtex
 from therightbibtex import engine
 from therightbibtex import query
 import replay
 from therightbibtex.sources.base import Record
+from therightbibtex.sources.http import Http
 
 
 def rec(source, title, authors=("Ashish Vaswani", "Noam Shazeer"), year=2017, **kw):
@@ -292,6 +297,40 @@ class Replay(unittest.TestCase):
         w, _ = self.check("vaswani-kw", "Attention is All you Need", "NeurIPS 2017", {"year": "2017"})
         self.assertEqual([v["label"] for v in w["versions"] if not v["suspicious"]], ["NeurIPS 2017", "arXiv 1706.03762v7"])
 
+    def test_timeout_is_reported_and_does_not_fail_the_search(self):
+        """Une source qui ne répond pas à temps est signalée comme telle ; les autres
+        sources terminent la fusion normalement."""
+        class SlowArxiv(replay.ReplayHttp):
+            async def request(self, source, url, **kw):
+                if source == "arxiv":
+                    await asyncio.sleep(5)
+                return await super().request(source, url, **kw)
+
+        fx = replay.load("attention")
+        http = SlowArxiv(fx["responses"])
+        http.cache.conn.execute("DELETE FROM http_cache")
+        s = engine.Search(http, query.parse_input(fx["query"]))
+
+        async def go():
+            works, done = [], {}
+            async for ev in s.stream():
+                if ev["type"] == "results":
+                    works = ev["works"]
+                elif ev["type"] == "done":
+                    done = ev
+            await http.close()
+            return works, done
+
+        with mock.patch.dict(engine.TIMEOUTS, {"arxiv": 0.3}), \
+                mock.patch("therightbibtex.sources.http.MIN_INTERVAL", {}):
+            works, done = asyncio.run(go())
+        self.assertTrue(works)
+        self.assertEqual(works[0]["title"], "Attention is All you Need")
+        rep = by_source(done)
+        self.assertEqual(rep["arxiv"]["state"], "timeout")
+        self.assertFalse(rep["arxiv"]["skipped"])   # un délai dépassé n'est pas une source écartée
+        self.assertEqual(rep["dblp"]["state"], "ok")
+
     def test_slow_source_does_not_block(self):
         """Recherche par DOI : DBLP qui traîne ne retarde plus les premiers résultats."""
         class SlowDblp(replay.ReplayHttp):
@@ -303,6 +342,153 @@ class Replay(unittest.TestCase):
         works, first = asyncio.run(run_fixture("resnet-doi", SlowDblp))
         self.assertLess(first, 1.0)
         self.assertEqual(works[0]["title"], "Deep Residual Learning for Image Recognition")
+
+
+class FixtureHttp(Http):
+    """Vrai client HTTP (cache, cadence, disjoncteurs) dont le réseau rejoue un jeu
+    d'essai. `fail_hosts` fait répondre 429 aux URL de ces hôtes : c'est ce que fait
+    une source qui limite le débit."""
+
+    def __init__(self, responses: dict, fail_hosts=()):
+        super().__init__()
+        self.cache.conn.execute("DELETE FROM http_cache")   # chaque essai part d'un cache vide
+        self.responses, self.fail_hosts = responses, tuple(fail_hosts)
+        self.sent: list[str] = []
+        self.client.request = self._transport
+
+    async def _transport(self, method, url, *, params=None, headers=None, data=None, timeout=None):
+        self.sent.append(url)
+        req = httpx.Request(method, url)
+        if "*" in self.fail_hosts or any(h in urlparse(url).netloc for h in self.fail_hosts):
+            return httpx.Response(429, request=req)
+        hit = self.responses.get(replay.replay_key(method, url, params, headers, data))
+        if hit is None:
+            return httpx.Response(404, request=req)
+        if "error" in hit:
+            kind, message, status = hit["error"]
+            if kind == "timeout":
+                raise httpx.ConnectTimeout(message, request=req)
+            return httpx.Response(status or 403, request=req)
+        return httpx.Response(hit["status"], text=hit["text"], headers=hit.get("headers") or {}, request=req)
+
+    def count(self, host: str) -> int:
+        return sum(1 for u in self.sent if host in urlparse(u).netloc)
+
+
+def run_search(name: str, fail_hosts=(), http: FixtureHttp | None = None):
+    """Déroule une recherche rejouée : (œuvres, événement final, client)."""
+    fx = replay.load(name)
+    http = http or FixtureHttp(fx["responses"], fail_hosts)
+
+    async def go():
+        s = engine.Search(http, query.parse_input(fx["query"]))
+        works, done = [], {}
+        async for ev in s.stream():
+            if ev["type"] == "results":
+                works = ev["works"]
+            elif ev["type"] == "done":
+                done = ev
+        await http.close()
+        return works, done
+
+    # Cadence des sources ramenée à zéro : on ne teste pas les temps d'attente.
+    with mock.patch("therightbibtex.sources.http.MIN_INTERVAL", {}):
+        works, done = asyncio.run(go())
+    return works, done, http
+
+
+def by_source(done: dict) -> dict:
+    return {st["source"]: st for st in done["sources"]}
+
+
+class PartialFailures(unittest.TestCase):
+    """Un refus d'une source (429) ne fait pas échouer la recherche : les autres
+    répondent, la notice est fusionnée, et le sort de chaque source est publié."""
+
+    def test_one_source_rate_limited_others_answer(self):
+        works, done, http = run_search("attention", fail_hosts=("api.crossref.org",))
+        # La recherche aboutit : Crossref manque, mais DBLP, arXiv, OpenReview et les
+        # actes suffisent à la version NeurIPS 2017.
+        self.assertTrue(works)
+        w = works[0]
+        self.assertEqual(w["title"], "Attention is All you Need")
+        self.assertEqual(w["confidence"], "high")
+        v = main_version(w)
+        self.assertEqual((v["label"], v["status"]), ("NeurIPS 2017", "published"))
+        self.assertEqual(bibtex.parse_one(v["bibtex"]).fields["year"], "2017")
+        # Le sort de chaque source est publié : Crossref limitée et écartée, les
+        # autres normales.
+        rep = by_source(done)
+        self.assertEqual(rep["crossref"]["state"], "ratelimited")
+        self.assertTrue(rep["crossref"]["skipped"])
+        self.assertIn("rate limited", rep["crossref"]["message"])
+        for src in ("dblp", "arxiv", "openreview", "proceedings"):
+            self.assertEqual(rep[src]["state"], "ok", src)
+            self.assertFalse(rep[src]["skipped"], src)
+        self.assertEqual(done["skipped"], ["crossref"])
+        # Elle n'a été interrogée qu'une fois : la limite l'écarte pour le reste de la
+        # recherche (compléments compris) au lieu d'insister.
+        self.assertEqual(http.count("api.crossref.org"), 1)
+        self.assertTrue(http.breaker("crossref").is_open())
+
+    def test_open_breaker_is_skipped_on_the_next_search(self):
+        """Disjoncteur ouvert : la recherche suivante n'envoie plus rien à cette
+        source, le dit, et les autres sources font le travail."""
+        fx = replay.load("attention")
+        http = FixtureHttp(fx["responses"], fail_hosts=("api.crossref.org",))
+
+        async def two_searches():
+            reports, works = [], []
+            for _ in range(2):
+                s = engine.Search(http, query.parse_input(fx["query"]))
+                found, done = [], {}
+                async for ev in s.stream():
+                    if ev["type"] == "results":
+                        found = ev["works"]
+                    elif ev["type"] == "done":
+                        done = ev
+                reports.append(by_source(done))
+                works.append(found)
+            await http.close()
+            return works, reports
+
+        with mock.patch("therightbibtex.sources.http.MIN_INTERVAL", {}):
+            works, reports = asyncio.run(two_searches())
+        self.assertEqual(reports[0]["crossref"]["state"], "ratelimited")
+        # Deuxième recherche : Crossref est déjà coupée, aucun appel n'est tenté.
+        self.assertEqual(reports[1]["crossref"]["state"], "breaker")
+        self.assertTrue(reports[1]["crossref"]["breaker_open"])
+        self.assertTrue(reports[1]["crossref"]["skipped"])
+        self.assertEqual(http.count("api.crossref.org"), 1)
+        for found in works:
+            self.assertTrue(found)
+            self.assertEqual(found[0]["title"], "Attention is All you Need")
+            self.assertEqual(found[0]["confidence"], "high")
+
+    def test_no_paper_and_silent_sources_is_not_not_found(self):
+        """Toutes les sources muettes : le rapport distingue « rien trouvé » de
+        « sources absentes » (le papier n'est pas déclaré inexistant)."""
+        fx = replay.load("attention")
+        http = FixtureHttp(fx["responses"], fail_hosts=("*",))
+
+        async def go():
+            s = engine.Search(http, query.parse_input(fx["query"]))
+            works, done = [], {}
+            async for ev in s.stream():
+                if ev["type"] == "results":
+                    works = ev["works"]
+                elif ev["type"] == "done":
+                    done = ev
+            await http.close()
+            return works, done
+
+        with mock.patch("therightbibtex.sources.http.MIN_INTERVAL", {}):
+            works, done = asyncio.run(go())
+        self.assertEqual(works, [])
+        self.assertGreaterEqual(len(done["skipped"]), 5)
+        self.assertEqual(done["answered"], 0)
+        self.assertTrue(all(st["state"] in ("ratelimited", "breaker") for st in done["sources"]
+                            if st["source"] in done["skipped"]))
 
 
 if __name__ == "__main__":

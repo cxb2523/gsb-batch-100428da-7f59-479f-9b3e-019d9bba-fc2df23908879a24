@@ -3,6 +3,7 @@ import support  # noqa: F401
 import asyncio
 import http.server
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -39,8 +40,79 @@ class Client(unittest.TestCase):
             with self.assertRaises(SourceError) as cm:
                 await h.request("lent", "https://example.org/slow", refresh=True)
             self.assertEqual(cm.exception.kind, "unavailable")
+            self.assertTrue(cm.exception.open_breaker)      # pas interrogée : disjoncteur ouvert
             await h.close()
         asyncio.run(go())
+
+    def test_rate_limit_opens_breaker_for_its_cooldown(self):
+        """Un 429 met la source en sommeil (même disjoncteur, sans attendre son seuil) :
+        l'appel suivant n'est pas envoyé du tout, et la source revient après le délai."""
+        async def go():
+            h = Http()
+            calls = []
+
+            async def fake(method, url, **kw):
+                calls.append(url)
+                return httpx.Response(429, request=httpx.Request(method, url))
+
+            h.client.request = fake
+            with self.assertRaises(SourceError) as cm:
+                await h.request("src", "https://example.org/a", refresh=True)
+            self.assertEqual((cm.exception.kind, cm.exception.status), ("ratelimited", 429))
+            self.assertFalse(cm.exception.open_breaker)
+            br = h.breaker("src")
+            self.assertTrue(br.is_open())
+            # Refroidissement = RATE_LIMIT_COOLDOWN ; aucune nouvelle tentative d'ici là.
+            self.assertGreater(br.remaining(), http_mod.RATE_LIMIT_COOLDOWN - 2)
+            with self.assertRaises(SourceError) as cm:
+                await h.request("src", "https://example.org/b", refresh=True)
+            self.assertTrue(cm.exception.open_breaker)
+            self.assertEqual(calls, ["https://example.org/a"])     # une seule requête partie
+            # Le délai passé, la source est réinterrogée.
+            with mock.patch.object(br, "open_until", time.time() - 1):
+                async def ok(method, url, **kw):
+                    return _ok(method, url)
+                h.client.request = ok
+                r = await h.request("src", "https://example.org/c", refresh=True)
+            self.assertEqual(r.status, 200)
+            await h.close()
+        asyncio.run(go())
+
+    def test_cached_answer_neither_limited_nor_breaker(self):
+        """Une réponse en cache est servie même quand la source est en sommeil, et
+        elle n'incrémente ni les échecs du disjoncteur ni la limite de débit."""
+        async def go():
+            h = Http()
+            h.cache.conn.execute("DELETE FROM http_cache")
+            url = "https://example.org/cached"
+            calls = []
+
+            async def fake(method, url, **kw):
+                calls.append(url)
+                return httpx.Response(200, text="ok", request=httpx.Request(method, url))
+
+            h.client.request = fake
+            await h.request("src", url, ttl=3600)          # première réponse : mise en cache
+            br = h.breaker("src")
+            br.failures = br.threshold - 1                 # un échec de plus couperait la source
+            br.open_until = time.time() + 600              # disjoncteur déjà ouvert
+            r = await h.request("src", url)                # servie par le cache, sans réseau
+            self.assertTrue(r.cached)
+            self.assertEqual(r.text, "ok")
+            self.assertEqual(calls, [url])                 # aucune requête n'est partie
+            self.assertEqual(br.failures, br.threshold - 1)  # le cache n'a rien aggravé
+            self.assertTrue(br.is_open())                  # et n'a pas refermé le disjoncteur
+            # Une autre URL, elle, n'a pas de cache : la source reste coupée.
+            with self.assertRaises(SourceError) as cm:
+                await h.request("src", "https://example.org/other")
+            self.assertTrue(cm.exception.open_breaker)
+            self.assertEqual(calls, [url])
+            await h.close()
+        asyncio.run(go())
+
+
+def _ok(method, url):
+    return httpx.Response(200, text="ok", request=httpx.Request(method, url))
 
 
 class Ssrf(unittest.TestCase):

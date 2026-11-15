@@ -52,6 +52,9 @@ CONNECT_TIMEOUT = 5.0
 # Un appel abandonné par le moteur (budget épuisé) après ce délai compte comme un
 # échec : une source qui répond toujours trop tard finit coupée par son disjoncteur.
 SLOW_CANCEL = 8.0
+# Refus 429 : le disjoncteur de la source s'ouvre (sans attendre son seuil) pour ce
+# délai de refroidissement, comme avant, et la source n'est pas réessayée d'ici là.
+RATE_LIMIT_COOLDOWN = 60.0
 # Clé d'API passée dans l'URL (SerpAPI) : masquée avant d'écrire l'URL dans le cache.
 _SECRET_PARAM_RE = re.compile(r"(?<=[?&])(api_key|apikey)=[^&]*")
 
@@ -62,13 +65,18 @@ def redact(url: str) -> str:
 
 class SourceError(Exception):
     """kind : timeout | http | blocked | ratelimited | parse | unavailable ;
-    status : code HTTP de la réponse, s'il y en a une."""
+    status : code HTTP de la réponse, s'il y en a une.
+    open_breaker : la source n'a pas été interrogée du tout (disjoncteur ouvert).
+    ratelimited : la source a répondu 429 à cet appel ; elle est désormais en
+    sommeil pour son délai de refroidissement."""
 
-    def __init__(self, kind: str, message: str = "", status: int | None = None):
+    def __init__(self, kind: str, message: str = "", status: int | None = None,
+                 open_breaker: bool = False):
         super().__init__(message or kind)
         self.kind = kind
         self.message = message or kind
         self.status = status
+        self.open_breaker = open_breaker
 
 
 @dataclass
@@ -132,6 +140,10 @@ class _Breaker:
             self.open_until, self.failures = 0.0, 0
         return False
 
+    def remaining(self) -> float:
+        """Secondes avant la fin du sommeil (0 si le disjoncteur est fermé)."""
+        return max(0.0, self.open_until - time.time()) if self.open_until else 0.0
+
     def fail(self, reason: str, hard: bool = False, cooldown: float | None = None):
         self.failures += 1
         self.reason = reason
@@ -191,15 +203,20 @@ class Http:
         if not refresh:
             hit = self.cache.get(key)
             if hit is not None:
+                # Une réponse en cache est servie sans toucher au réseau : elle ne
+                # compte ni pour la limite de débit, ni pour le disjoncteur.
                 if hit.status not in ok_status:
                     raise SourceError("http", f"HTTP {hit.status} (cache)", status=hit.status)
                 return hit
         br = self.breaker(pace_key or source)
         if br.is_open():
-            raise SourceError("unavailable", br.reason or "source temporarily disabled")
+            raise SourceError("unavailable", br.reason or "source temporarily disabled", open_breaker=True)
         sem = self._sems.setdefault(source, asyncio.Semaphore(MAX_PARALLEL.get(source, 2)))
         async with sem:
             await self._pace(pace_key or source)
+            # Un autre appel a pu ouvrir le disjoncteur pendant l'attente dans la file.
+            if br.is_open():
+                raise SourceError("unavailable", br.reason or "source temporarily disabled", open_breaker=True)
             t = timeout or 12.0
             started = time.monotonic()
             try:
@@ -220,8 +237,13 @@ class Http:
                 raise
         resp = Resp(r.status_code, r.text, redact(str(r.url)), {k.lower(): v for k, v in r.headers.items()})
         if r.status_code == 429:
-            br.fail("rate limited (429)", cooldown=60)
-            raise SourceError("ratelimited", "rate limited", status=429)
+            # Même disjoncteur que pour les autres échecs, mais ouvert tout de suite
+            # (sans attendre son seuil) et pour le délai de refroidissement propre aux
+            # limites de débit : la source n'est pas réessayée d'ici là.
+            br.fail("rate limited (429)", hard=True, cooldown=RATE_LIMIT_COOLDOWN)
+            retry = br.remaining()
+            raise SourceError("ratelimited", "rate limited" + (f", retry in {int(retry)}s" if retry else ""),
+                              status=429)
         if r.status_code in ok_status:
             br.ok()
             if r.status_code in cache_status:

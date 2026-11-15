@@ -130,8 +130,31 @@ async def _search(http: Http, q, settings: dict, refresh: bool, on_event=None) -
     return works
 
 
+def _collect_report(report: dict, on_event=None):
+    """Fabrique un `on_event` qui note le sort des sources (l'événement « done »)
+    et relaie au besoin l'événement à l'appelant."""
+    def handler(ev, s):
+        if ev["type"] == "done":
+            report.update(ev)
+        if on_event:
+            on_event(ev, s)
+    return handler
+
+
 def recommended(work: dict) -> dict:
     return next(v for v in work["versions"] if v["id"] == work["recommended"])
+
+
+def _skipped_note(report: dict | None) -> str:
+    """« 2 sources unavailable (Semantic Scholar: rate limited) » ou « »."""
+    if not report:
+        return ""
+    skipped = [x for x in report.get("sources") or [] if x.get("skipped")]
+    if not skipped:
+        return ""
+    why = {"ratelimited": "rate limited", "breaker": "temporarily disabled", "skipped": "not queried"}
+    detail = ", ".join(f"{x.get('label') or x['source']}: {why.get(x['state'], x['state'])}" for x in skipped)
+    return f"{len(skipped)} source{'s' if len(skipped) > 1 else ''} unavailable ({detail})"
 
 
 def _progress_line(s) -> str:
@@ -150,22 +173,34 @@ def cmd_search(args, out: Out) -> int:
         return cmd_batch(args, out)
     settings = _settings(args.setting)
     q = _query_from(text)
+    report: dict = {}
 
     async def go():
         http = Http()
         try:
             return await _search(http, q, settings, args.refresh,
-                                 lambda ev, s: out.progress(_progress_line(s)) if ev["type"] == "source" else None)
+                                 on_event=_collect_report(report, lambda ev, s: out.progress(
+                                     _progress_line(s)) if ev["type"] == "source" else None))
         finally:
             await http.close()
 
     works = asyncio.run(go())
     out.clear()
+    note = _skipped_note(report)
     if args.json:
-        print(json.dumps(works, ensure_ascii=False, indent=2, default=str))
+        payload = {"works": works, "sources": report.get("sources") or [],
+                   "answered": report.get("answered") or 0,
+                   "skipped": [x["source"] for x in (report.get("sources") or []) if x.get("skipped")],
+                   "elapsed": report.get("elapsed") or 0}
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
         return 0 if works else EXIT_NOT_FOUND
     if not works:
-        out.warn("no paper found: try the exact title, a DOI or the arXiv ID")
+        if note:
+            # Aucune notice n'est revenue, mais des sources n'ont pas pu répondre :
+            # ce n'est pas la même chose qu'un papier introuvable.
+            out.warn(f"no paper found, but {note}: the result may be incomplete")
+        else:
+            out.warn("no paper found: try the exact title, a DOI or the arXiv ID")
         return EXIT_NOT_FOUND
     w = works[0]
     v = recommended(w)
@@ -180,6 +215,8 @@ def cmd_search(args, out: Out) -> int:
     others = [x["label"] for x in w["versions"] if x["id"] != v["id"] and not x.get("suspicious")]
     out.info(f"{v['label']} ({v['status']}), {CONFIDENCE_WORD.get(w['confidence'], w['confidence'] or 'unrated')}"
              + (f"; other versions: {', '.join(others)} (--all shows them)" if others and not args.all else ""))
+    if note:
+        out.warn(f"{note}: some fields may rest on fewer sources than usual")
     if w.get("retracted"):
         out.warn("a version of this paper was retracted or withdrawn: check before citing it")
     if w["confidence"] != "high" and len(works) > 1:
@@ -217,7 +254,9 @@ def cmd_batch(args, out: Out) -> int:
             nonlocal done, missing
             while queue:
                 i, item = queue.pop(0)
-                works = await _search(http, query_mod.parse_input(item), settings, args.refresh)
+                report: dict = {}
+                works = await _search(http, query_mod.parse_input(item), settings, args.refresh,
+                                      on_event=_collect_report(report))
                 done += 1
                 if works and works[0]["confidence"] in ("high", "medium"):
                     v = recommended(works[0])
@@ -231,8 +270,13 @@ def cmd_batch(args, out: Out) -> int:
                     out.info(f"[{done}/{len(items)}] {v['label']}{note}: {works[0]['title'][:60]}")
                 else:
                     missing += 1
-                    results[i] = (item if is_bib else f"% not found: {item}")
-                    out.info(f"[{done}/{len(items)}] not found, kept as is: {item.splitlines()[0][:60]}")
+                    why = _skipped_note(report)
+                    # Une source muette n'est pas une preuve que le papier n'existe pas :
+                    # le lot le dit, plutôt que de conclure « not found ».
+                    results[i] = item if is_bib else f"% {'not confirmed' if why else 'not found'}: {item}"
+                    out.info(f"[{done}/{len(items)}] " + (f"not confirmed, {why}: kept as is: "
+                                                          if why else "not found, kept as is: ")
+                             + item.splitlines()[0][:60])
 
         try:
             await asyncio.gather(worker(), worker())
@@ -292,10 +336,12 @@ def parse_answer(text: str, n: int, default: str) -> tuple[str, int]:
     return "again", 0
 
 
-def _searches_in_background(items: list[str], settings: dict, refresh: bool) -> list[concurrent.futures.Future]:
+def _searches_in_background(items: list[str], settings: dict, refresh: bool,
+                            reports: dict[int, dict] | None = None) -> list[concurrent.futures.Future]:
     """Lance les recherches (deux à la fois) dans un fil à part et rend un résultat à
     attendre par entrée : les recherches avancent pendant que l'utilisateur répond, et
-    Ctrl+C ou q n'ont rien à attendre (le fil s'arrête avec le programme)."""
+    Ctrl+C ou q n'ont rien à attendre (le fil s'arrête avec le programme).
+    `reports`, s'il est fourni, reçoit le sort des sources de chaque entrée."""
     futures = [concurrent.futures.Future() for _ in items]
 
     async def go():
@@ -305,11 +351,15 @@ def _searches_in_background(items: list[str], settings: dict, refresh: bool) -> 
         async def worker():
             while queue:
                 i, item = queue.pop(0)
+                report: dict = {}
                 try:
-                    works = await _search(http, query_mod.parse_input(item), settings, refresh)
+                    works = await _search(http, query_mod.parse_input(item), settings, refresh,
+                                          on_event=_collect_report(report))
                 except Exception as e:  # une recherche en échec ne bloque pas les questions
                     logging.getLogger(__name__).info("Recherche en échec : %s", e)
                     works = []
+                if reports is not None:
+                    reports[i] = report
                 futures[i].set_result(works)
 
         try:
@@ -355,7 +405,8 @@ def cmd_pick(args, out: Out) -> int:
         raise SystemExit(f"{args.file}: no BibTeX entry and no reference to look up")
     settings = _settings(args.setting)
     keep_keys = is_bib and not args.new_keys
-    futures = _searches_in_background(items, settings, args.refresh)
+    reports: dict[int, dict] = {}
+    futures = _searches_in_background(items, settings, args.refresh, reports)
     results: list[str | None] = [None] * len(items)
     found = kept = 0
     mode = "ask"          # ask | all (a : la recommandée pour le reste) | stop (q : le reste tel quel)
@@ -376,7 +427,9 @@ def cmd_pick(args, out: Out) -> int:
         old = bibtex.parse_one(item) if is_bib else None
         action, num = "keep", 0
         if not opts:
-            out.info(f"{head} not found, kept as is: {item.splitlines()[0][:60]}")
+            why = _skipped_note(reports.get(i))
+            out.info(f"{head} " + (f"not confirmed, {why}: kept as is: " if why else "not found, kept as is: ")
+                     + item.splitlines()[0][:60])
         elif mode == "all" or (len(opts) == 1 and works[0]["confidence"] == "high"):
             action, num = ("pick", 1) if confident else ("keep", 0)
             out.info(f"{head} {opts[0]['label'] if confident else 'uncertain match, kept as is'}: "

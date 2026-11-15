@@ -1,6 +1,7 @@
 import support  # noqa: F401
 
 import io
+import json
 import sys
 import tempfile
 import unittest
@@ -52,6 +53,76 @@ class Choices(unittest.TestCase):
         labels = [c["label"] for c in cli.choices([CHRONOS, CHRONOS_BOOK])]
         self.assertEqual(labels[1], "other paper: Chronos (Springer 2020)")
         self.assertEqual(cli.choices([]), [])
+
+
+class SkippedSources(unittest.TestCase):
+    """Une source limitée ou coupée ne fait pas passer le papier pour inexistant."""
+
+    REPORT = {"sources": [
+        {"source": "crossref", "label": "Crossref", "state": "ratelimited", "skipped": True,
+         "message": "rate limited, retry in 600s"},
+        {"source": "s2", "label": "Semantic Scholar", "state": "breaker", "skipped": True,
+         "message": "rate limited (429)"},
+        {"source": "arxiv", "label": "arXiv", "state": "ok", "count": 3, "skipped": False},
+        {"source": "zbmath", "label": "zbMATH", "state": "empty", "count": 0, "skipped": False},
+        {"source": "scholar", "label": "Google Scholar", "state": "skipped", "count": 0, "skipped": False},
+    ], "answered": 2, "skipped": ["crossref", "s2"], "elapsed": 1200}
+
+    def test_note_names_sources_and_reasons(self):
+        note = cli._skipped_note(self.REPORT)
+        self.assertIn("2 sources unavailable", note)
+        self.assertIn("Crossref: rate limited", note)
+        self.assertIn("Semantic Scholar: temporarily disabled", note)
+        self.assertNotIn("arXiv", note)
+        self.assertNotIn("Google Scholar", note)       # jamais interrogée : pas un incident
+        self.assertEqual(cli._skipped_note({"sources": []}), "")
+        self.assertEqual(cli._skipped_note(None), "")
+
+    def run_search(self, works, report=None, extra=None):
+        opts = dict(query=["x"], refresh=False, setting=[], all=False, json=False, output=None,
+                    quiet=False, verbose=False)
+        opts.update(extra or {})
+        args = SimpleNamespace(**opts)
+        err = io.StringIO()
+        stdout = io.StringIO()
+
+        async def fake_search(http, q, settings, refresh, on_event=None):
+            if on_event and report is not None:
+                on_event({"type": "done", **report}, None)
+            return works
+
+        with mock.patch.object(cli, "_search", fake_search), mock.patch.object(sys, "stderr", err), \
+                mock.patch.object(sys, "stdout", stdout), \
+                mock.patch.object(cli, "Http", lambda: SimpleNamespace(close=mock.AsyncMock())):
+            try:
+                code = cli.cmd_search(args, cli.Out())
+            except SystemExit as e:
+                code = e.code
+        return code, err.getvalue(), stdout.getvalue()
+
+    def test_not_found_is_qualified_when_a_source_is_missing(self):
+        code, err, _ = self.run_search([], self.REPORT)
+        self.assertEqual(code, cli.EXIT_NOT_FOUND)
+        self.assertIn("no paper found, but 2 sources unavailable", err)
+        self.assertIn("may be incomplete", err)
+        # Sans source muette, le message reste « not found ».
+        code, err, _ = self.run_search([], {"sources": self.REPORT["sources"][2:]})
+        self.assertIn("no paper found: try the exact title", err)
+
+    def test_warns_when_fields_rest_on_fewer_sources(self):
+        code, err, _ = self.run_search([RESNET], self.REPORT)
+        self.assertEqual(code, 0)
+        self.assertIn("2 sources unavailable", err)
+        self.assertIn("fewer sources than usual", err)
+
+    def test_json_carries_the_source_report(self):
+        code, _, out = self.run_search([RESNET], self.REPORT, {"json": True})
+        payload = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(payload["works"][0]["title"], RESNET["title"])
+        self.assertEqual(sorted(payload["skipped"]), ["crossref", "s2"])
+        self.assertEqual(payload["answered"], 2)
+        self.assertEqual({x["source"]: x["state"] for x in payload["sources"]}["crossref"], "ratelimited")
 
     def test_answers(self):
         self.assertEqual(cli.parse_answer("\n", 3, "pick"), ("pick", 1))

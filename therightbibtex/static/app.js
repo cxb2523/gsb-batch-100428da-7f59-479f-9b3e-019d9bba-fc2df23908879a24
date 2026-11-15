@@ -314,9 +314,29 @@ function applyEvent(s, ev) {
         && (STATUS_RANK[after.v.status] || 0) > (STATUS_RANK[before.v.status] || 0)) {
       noteUpgrade(s, after);
     }
-  } else if (ev.type === "done") { s.done = true; s.doneAt = Date.now(); s.elapsed = ev.elapsed; }
-  else if (ev.type === "notice") (s.notices ||= []).push(ev.message);
+  } else if (ev.type === "done") {
+    s.done = true; s.doneAt = Date.now(); s.elapsed = ev.elapsed;
+    // Le rapport final fait foi : il inclut les sources que les événements « source »
+    // n'ont pas détaillées (limitée, disjoncteur ouvert, jamais interrogée).
+    if (ev.sources) mergeSourceReport(s, ev.sources);
+    s.skipped = ev.skipped || [];
+  } else if (ev.type === "notice") (s.notices ||= []).push(ev.message);
   else if (ev.type === "error") s.error = ev.message;
+}
+
+// Le rapport final est un instantané complet : chaque source y prend son état définitif.
+function mergeSourceReport(s, list) {
+  for (const st of list || []) s.sources[st.source] = st;
+}
+
+const SKIP_WORD = { ratelimited: "rate limited", breaker: "temporarily disabled", skipped: "not queried" };
+
+// « 2 sources unavailable (Semantic Scholar: rate limited, arXiv: temporarily disabled) ».
+function skippedNote(s) {
+  const bad = Object.values(s.sources || {}).filter((st) => st.skipped);
+  if (!bad.length) return "";
+  const detail = bad.map((st) => `${LABELS[st.source] || st.source}: ${SKIP_WORD[st.state] || st.state}`).join(", ");
+  return `${bad.length} source${bad.length > 1 ? "s" : ""} unavailable (${detail})`;
 }
 
 // La prépublication affichée d'abord vient d'être remplacée par la version publiée :
@@ -378,10 +398,18 @@ function renderSearch() {
   if (!s.done) nodes.push(h("div", { class: "progress-line", role: "progressbar", "aria-label": "Searching" }));
   if (s.error && !s.works.length) nodes.push(h("p", { class: "alert", text: s.error }));
   if (s.done && !s.works.length && !s.error) {
-    nodes.push(h("p", { class: "verdict low", text: "No paper found. Try the exact title, a DOI or the arXiv id, or drop the PDF." }));
+    const why = skippedNote(s);
+    // Une source qui n'a pas pu répondre n'est pas une preuve que le papier n'existe pas.
+    nodes.push(h("p", { class: "verdict low", text: why
+      ? `No paper found, but ${why}. The result may be incomplete: search again in a few minutes.`
+      : "No paper found. Try the exact title, a DOI or the arXiv id, or drop the PDF." }));
   }
   const work = s.works.find((w) => w.id === s.current);
   if (work) nodes.push(renderWork(work, s));
+  if (s.done && work) {
+    const why = skippedNote(s);
+    if (why) nodes.push(h("p", { class: "hint", text: `${why}: some fields may rest on fewer sources than usual.` }));
+  }
   const others = s.works.filter((w) => w.id !== s.current);
   if (others.length) {
     nodes.push(h("section", { class: "others" },
@@ -406,8 +434,10 @@ function renderSources(el, s) {
   const names = Object.keys(s.sources).filter((n) => s.sources[n].state !== "skipped")
     .sort((a, b) => (SOURCE_ORDER.indexOf(a) + 99) % 99 - (SOURCE_ORDER.indexOf(b) + 99) % 99);
   if (!names.length) { el.replaceChildren(); return; }
-  const found = names.filter((n) => s.sources[n].state === "ok").length;
-  const summary = s.done ? `Found by ${found} of ${names.length} sources`
+  const found = names.filter((n) => s.sources[n].state === "ok" || s.sources[n].count > 0).length;
+  const short = names.filter((n) => s.sources[n].skipped).length;
+  const summary = s.done
+    ? `Found by ${found} of ${names.length} sources` + (short ? ` · ${short} unavailable` : "")
     : `Searching ${names.length} sources…`;
   const nodes = [h("button", { class: "summary", "aria-expanded": s.showStatus ? "true" : "false",
     text: `${summary} ${s.showStatus ? "▴" : "▾"}`, onclick: () => { s.showStatus = !s.showStatus; renderSearch(); } })];
@@ -417,9 +447,13 @@ function renderSources(el, s) {
       const tip = {
         ok: `${plural(st.count, "record", "records")} in ${st.ms} ms`, empty: "no results", running: "running…", pending: "waiting",
         blocked: st.message || "blocked", error: st.message || "error", timeout: st.message || "timed out",
+        ratelimited: st.message || "rate limited (429): skipped, the search went on without it",
+        breaker: st.message || "temporarily disabled: skipped without being asked",
       }[st.state] || st.state;
       return h("span", { class: `src-chip st-${st.state}`, title: `${LABELS[n] || n}: ${tip}` },
-        h("span", { class: "dot" }), LABELS[n] || n, st.state === "ok" ? h("span", { class: "n", text: st.count }) : null);
+        h("span", { class: "dot" }), LABELS[n] || n,
+        st.count ? h("span", { class: "n", text: st.count }) : null,
+        st.skipped ? h("span", { class: "n", text: "skipped" }) : null);
     })));
   }
   el.replaceChildren(...nodes);
@@ -695,7 +729,11 @@ async function runBatch(b) {
           (ev) => { applyEvent(it.search, ev); renderBatchSoon(b); }, b.ctrl.signal);
         it.search.done = true;
         it.status = it.search.works.length ? "done" : "fail";
-        if (!it.search.works.length) it.error = it.search.error || "no results";
+        if (!it.search.works.length) {
+          // Une source muette n'est pas une preuve d'absence : le dire, sans conclure.
+          const why = skippedNote(it.search);
+          it.error = why ? `nothing confirmed: ${why}` : (it.search.error || "no results");
+        }
       } catch (err) {
         if (err.name === "AbortError") return;
         if (err.status === 429) {

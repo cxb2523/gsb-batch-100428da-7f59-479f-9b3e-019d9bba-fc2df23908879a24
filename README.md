@@ -63,10 +63,12 @@ therightbibtex refs.bib -o refs-checked.bib     # check a whole .bib, citation k
 therightbibtex batch titles.txt                 # one reference per line (or - for stdin)
 therightbibtex pick refs.bib -o refs-checked.bib  # same, but asks which one to keep when there are several
 therightbibtex "attention is all you need" -s key_style=dblp -s venue_style=short
-therightbibtex "..." --json                     # every version and the source of each field
+therightbibtex "..." --json                     # every version, the source of each field, and each source's outcome
 ```
 
-`--refresh` skips the local cache, `-q` prints only BibTeX, `-v` logs what each source does.
+`--refresh` skips the local cache, `-q` prints only BibTeX, `-v` logs what each source does. `--json` also
+includes the outcome of every source (`state`, `message`, `skipped`), so a script can tell which sources were
+missing from a search.
 
 `pick` only asks when an entry has several possibilities (published version and preprint, other similar papers),
 while the next searches keep running: Enter keeps the recommended one, a number picks another, `k` keeps your
@@ -100,6 +102,11 @@ keeping the citation keys your paper already uses. Light and dark themes, and it
 
 - **Published version first.** Preprint, submission and published versions are kept apart, and the one to cite is
   recommended. In the web interface, the entry stays greyed with a highlighted `?` while sources are still answering.
+- **One source down does not fail the search.** A source that rate-limits (HTTP 429) or whose breaker is open is
+  skipped for that search: the others answer, the versions are merged, and the result says which sources were
+  missed and why (`rate limited`, `temporarily disabled`). A source that never answered is not mistaken for proof
+  that the paper does not exist. Cached answers are still served and never count towards the rate limit or the
+  breaker.
 - **Provenance everywhere.** Each field shows where it comes from. Disagreements between sources, retractions and
   suspicious copies (re-uploads, foreign DOIs) are flagged instead of silently merged.
 - **BibTeX your way.** Citation key style (`vaswani2017attention`, `Vaswani2017`, DBLP keys), full or short venue

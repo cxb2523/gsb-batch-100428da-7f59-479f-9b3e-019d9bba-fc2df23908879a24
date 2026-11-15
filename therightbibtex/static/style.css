@@ -243,6 +243,9 @@ a:hover { text-decoration-color: currentColor; }
 .src-chip.st-running .dot { background: var(--ink-2); animation: pulse 1s ease-in-out infinite; }
 .src-chip.st-error .dot, .src-chip.st-timeout .dot { background: var(--warn); }
 .src-chip.st-blocked .dot { background: var(--danger); }
+.src-chip.st-ratelimited .dot, .src-chip.st-breaker .dot { background: var(--warn); }
+.src-chip.st-ratelimited, .src-chip.st-breaker { color: var(--muted); }
+.src-chip.st-ratelimited .n, .src-chip.st-breaker .n { font-style: italic; }
 .src-chip .n { font-variant-numeric: tabular-nums; color: var(--muted); }
 @keyframes pulse { 50% { opacity: .25; } }
 @media (prefers-reduced-motion: reduce) { .src-chip.st-running .dot { animation: none; } }

@@ -832,36 +832,85 @@ class Search:
     def _emit(self, ev: dict):
         self.events.put_nowait(ev)
 
+    # Un échec de source, du moins grave au plus grave pour l'utilisateur : on
+    # affiche celui qui explique le mieux pourquoi la source n'a pas répondu.
+    _ERROR_PRIORITY = {"ratelimited": 0, "breaker": 1, "blocked": 2, "timeout": 3, "error": 4}
+
     def _set_status(self, source: str, state: str, count: int = 0, msg: str = "", ms: int = 0):
-        """state : pending | running | ok | error | blocked | timeout. Une source peut
-        être appelée plusieurs fois (recherche puis compléments) : l'état affiché
-        est dérivé de l'ensemble de ses appels."""
+        """state : pending | running | ok | empty | error | blocked | timeout | ratelimited | breaker.
+        Une source peut être appelée plusieurs fois (recherche puis compléments) : l'état
+        affiché est dérivé de l'ensemble de ses appels. ratelimited : elle a répondu 429
+        et son disjoncteur est ouvert ; breaker : il l'était déjà (autre recherche), elle
+        n'a pas été interrogée. Dans les deux cas la recherche continue sans elle, et
+        l'état le dit même si des réponses en cache ont pu être servies entre-temps."""
         st = self.status.setdefault(source, {"source": source, "label": LABELS.get(source, source),
                                              "state": "pending", "count": 0, "message": "", "ms": 0,
-                                             "_active": 0, "_ok": False, "_err": ""})
+                                             "_active": 0, "_ok": False, "_errs": {},
+                                             "_limited": False, "_breaker": False})
         if state == "running":
             st["_active"] += 1
         elif state == "ok":
             st["_active"] = max(0, st["_active"] - 1)
             st["_ok"] = True
             st["count"] += count
-        elif state in ("error", "blocked", "timeout"):
+        elif state in ("error", "blocked", "timeout", "ratelimited", "breaker"):
             st["_active"] = max(0, st["_active"] - 1)
-            st["_err"] = state
-            st["message"] = msg
+            st["_errs"][state] = msg or state
+            st["_limited"] = st["_limited"] or state == "ratelimited"
+            st["_breaker"] = st["_breaker"] or state == "breaker"
         if ms:
             st["ms"] = max(st["ms"], ms)
-        if st["_active"]:
+        err = min(st["_errs"], key=self._ERROR_PRIORITY.get) if st["_errs"] else ""
+        if err:
+            st["message"] = st["_errs"][err]
+        if st["_limited"]:
+            # Un refus (429) l'emporte sur tout le reste : même si des réponses en cache
+            # ont été servies, la source n'a pas pu être interrogée normalement.
+            st["state"] = "ratelimited"
+        elif st["_breaker"]:
+            st["state"] = "breaker"
+        elif st["_active"]:
             st["state"] = "running"
         elif st["count"]:
             st["state"] = "ok"
         elif st["_ok"]:
             st["state"] = "empty"
-        elif st["_err"]:
-            st["state"] = st["_err"]
+        elif err:
+            st["state"] = err
         else:
             st["state"] = "pending"
-        self._emit({"type": "source", **{k: v for k, v in st.items() if not k.startswith("_")}})
+        self._emit({"type": "source", **self._public_status(st)})
+
+    @staticmethod
+    def _public_status(st: dict) -> dict:
+        out = {k: v for k, v in st.items() if not k.startswith("_")}
+        out["limited"] = st.get("_limited", False)       # a été limitée en cours de recherche
+        out["breaker_open"] = st.get("_breaker", False)  # disjoncteur ouvert (pas interrogée)
+        # Écartée faute de pouvoir répondre : la recherche a continué sans elle et
+        # une notice peut manquer. (L'état « skipped » = source jamais interrogée,
+        # par exemple Google Scholar sans clé : ce n'est pas un incident.)
+        out["skipped"] = out["state"] in ("ratelimited", "breaker")
+        return out
+
+    def source_report(self) -> list[dict]:
+        """Le sort de chaque source pour cette recherche : ok | empty | ratelimited |
+        breaker | blocked | timeout | error | skipped."""
+        return [self._public_status(st) for st in self.status.values()]
+
+    def answered_sources(self) -> int:
+        return sum(1 for st in self.status.values() if st["state"] in ("ok", "empty"))
+
+    def skipped_sources(self) -> list[dict]:
+        """Sources qui n'ont pas pu répondre (limite de débit, disjoncteur ouvert) :
+        la recherche a continué sans elles."""
+        return [self._public_status(st) for st in self.status.values()
+                if self._public_status(st)["skipped"]]
+
+    def _finalize_sources(self):
+        for st in self.status.values():
+            if st["state"] in ("pending", "running"):
+                st["state"] = "skipped" if st["state"] == "pending" else "timeout"
+                self._emit({"type": "source", **self._public_status(st)})
 
     async def _call(self, source: str, coro, key: str | None = None) -> list[Record]:
         if key:
@@ -874,8 +923,17 @@ class Search:
         try:
             res = await asyncio.wait_for(coro, TIMEOUTS.get(source, DEFAULT_TIMEOUT))
         except SourceError as e:
-            self._set_status(source, "blocked" if e.kind in ("blocked", "unavailable", "ratelimited") else "error",
-                             msg=e.message, ms=int((time.monotonic() - t) * 1000))
+            if e.kind == "ratelimited":
+                state = "ratelimited"
+            elif e.open_breaker:
+                state = "breaker"
+            elif e.kind in ("blocked", "unavailable"):
+                state = "blocked"
+            elif e.kind == "timeout":
+                state = "timeout"
+            else:
+                state = "error"
+            self._set_status(source, state, msg=e.message, ms=int((time.monotonic() - t) * 1000))
             return []
         except asyncio.TimeoutError:
             self._set_status(source, "timeout", msg="timed out", ms=int((time.monotonic() - t) * 1000))
@@ -1292,7 +1350,8 @@ class Search:
             logger.exception("Calcul des résultats impossible")
             return
         self._emit({"type": "results", "final": final, "works": works,
-                    "elapsed": int((time.monotonic() - self.t0) * 1000)})
+                    "elapsed": int((time.monotonic() - self.t0) * 1000),
+                    "sources": self.source_report()})
 
     async def _phase_url(self):
         """URL quelconque : métadonnées de la page, ou PDF téléchargé puis analysé."""
@@ -1358,11 +1417,11 @@ class Search:
         finally:
             for f in self._background:
                 f.cancel()
-            for st in self.status.values():
-                if st["state"] in ("pending", "running"):
-                    st["state"] = "skipped" if st["state"] == "pending" else "timeout"
-                    self._emit({"type": "source", **st})
-            self._emit({"type": "done", "elapsed": int((time.monotonic() - self.t0) * 1000)})
+            self._finalize_sources()
+            self._emit({"type": "done", "elapsed": int((time.monotonic() - self.t0) * 1000),
+                        "sources": self.source_report(),
+                        "answered": self.answered_sources(),
+                        "skipped": [st["source"] for st in self.skipped_sources()]})
             self.events.put_nowait(None)
 
     async def stream(self):
