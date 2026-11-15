@@ -68,10 +68,35 @@ if(_h){
 /* Insert body */
 document.body.innerHTML=_b;
 
-/* FIX4: re-execute scripts sequentially, preserving order */
+/* FIX4: re-execute scripts sequentially, preserving order.
+   A failing external script (onerror) or a throwing inline script is
+   recorded and the chain continues with the next script. */
 var ysTN3K=0;
+var REPORT_EVENT='__rebuildScriptReport__';
+var REPORT_NODE_ID='__rebuild_script_report__';
+var _report={total:e78kT1.length,succeeded:0,failed:0,failures:[],results:[]};
+function _publishReport(){
+  window.__rebuildScriptReport__=_report;
+  var _r=document.getElementById(REPORT_NODE_ID);
+  if(!_r){
+    _r=document.createElement('script');
+    _r.type='application/json';
+    _r.id=REPORT_NODE_ID;
+    document.body.appendChild(_r);
+  }
+  _r.textContent=JSON.stringify(_report);
+  try{document.dispatchEvent(new CustomEvent(REPORT_EVENT,{detail:_report}));}catch(_e){}
+}
+function _settle(ok,rec){
+  rec.status=ok?'success':'failed';
+  _report.results.push(rec);
+  if(ok){_report.succeeded++;}
+  else{_report.failed++;_report.failures.push(rec);}
+  _publishReport();
+}
 function _next(){
   if(ysTN3K>=e78kT1.length) return;
+  var _idx=ysTN3K;
   var EZ2zlj=e78kT1[ysTN3K++];
   var GrlCw3=document.createElement('script');
   var dzLZce=EZ2zlj[2]||{};
@@ -79,16 +104,61 @@ function _next(){
     try{ GrlCw3.setAttribute(FLyrME,dzLZce[FLyrME]); }catch(_e){}
   }
   if(EZ2zlj[0]){
+    /* external script: wait for load/error before touching the next one,
+       so original ordering semantics are preserved. */
+    var _extRec={index:_idx,type:'external',src:EZ2zlj[1],status:'pending',message:''};
     GrlCw3.src=EZ2zlj[1];
     GrlCw3.async=false;
-    GrlCw3.onload=GrlCw3.onerror=function(){ _next(); };
+    GrlCw3.onload=function(){
+      _settle(true,_extRec);
+      _next();
+    };
+    GrlCw3.onerror=function(){
+      _extRec.message='Failed to load external script: '+EZ2zlj[1];
+      _settle(false,_extRec);
+      _next();
+    };
     document.body.appendChild(GrlCw3);
   }else{
-    GrlCw3.textContent=EZ2zlj[1];
-    document.body.appendChild(GrlCw3);
-    _next();
+    /* inline script: a throw from an inline classic script is reported
+       asynchronously via a window 'error' event (it does not propagate out
+       of appendChild), so capture it with a scoped listener for this single
+       script and keep the chain moving either way. */
+    var _inRec={index:_idx,type:'inline',src:'',status:'pending',message:''};
+    var _done=false;
+    function _inlineSettled(ok,msg){
+      if(_done)return;
+      _done=true;
+      window.removeEventListener('error',_onInlineError,true);
+      if(!ok)_inRec.message=msg||'Inline script threw an error';
+      _settle(ok,_inRec);
+      _next();
+    }
+    function _onInlineError(ev){
+      /* Resource load errors also reach window as 'error' events, but their
+         target is the failing element; runtime errors from this inline script
+         target window itself. */
+      if(ev.target!==window)return;
+      var _detail=ev.error||ev.message||ev;
+      /* Mark handled so the browser no longer reports it as "Uncaught".
+         preventDefault does not stop propagation: page-registered error
+         listeners still receive the event. */
+      try{ev.preventDefault();}catch(_e){}
+      _inlineSettled(false,(_detail&&(_detail.stack||_detail.message))||String(_detail));
+    }
+    window.addEventListener('error',_onInlineError,true);
+    try{
+      GrlCw3.textContent=EZ2zlj[1];
+      document.body.appendChild(GrlCw3);
+    }catch(_err){
+      _inlineSettled(false,(_err&&(_err.stack||_err.message))||String(_err));
+      return;
+    }
+    /* No error event until the next task => the inline script completed. */
+    setTimeout(function(){_inlineSettled(true);},0);
   }
 }
+_publishReport();
 _next();
 }
 

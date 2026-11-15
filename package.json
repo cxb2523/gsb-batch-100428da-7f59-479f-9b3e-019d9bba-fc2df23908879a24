@@ -1,0 +1,10 @@
+{
+  "name": "obfuscated-landing-rebuild",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Fault-tolerant rebuild chain for the obfuscated landing page, with local headless-browser tests.",
+  "scripts": {
+    "gen-pages": "node tests/lib/gen-pages.js",
+    "test": "node tests/lib/run-tests.js"
+  }
+}
