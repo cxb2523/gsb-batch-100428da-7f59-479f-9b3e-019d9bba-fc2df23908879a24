@@ -71,7 +71,7 @@ Every record is normalized to this shape before writing:
 }
 ```
 
-The MySQL table is `ranking`. Records with the same source and title within three days are updated instead of inserted again.
+The MySQL table is `ranking`. Duplicate detection uses the normalized title only, so a topic collected from several platforms is stored once. A recurring title updates its `hot_rank`, `source`, and `batch_timestamp` while `created_at` keeps the first-seen time. The `title` column carries a `uniq_title` unique key so concurrent crawler processes cannot insert the same topic twice; a duplicate-key error on insert falls back to an update.
 
 ![Database result](docs/database-result.svg)
 
