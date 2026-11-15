@@ -1,0 +1,54 @@
+name: Daily GitHub Agent
+permissions:
+  contents: read
+on:
+  schedule:
+    # 每天北京时间早上 9:00 运行 (UTC 1:00)
+    - cron: "0 1 * * *"
+  workflow_dispatch: # 允许你手动点击按钮触发测试
+
+jobs:
+  run-agent:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Agent
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+          SEND_MESSAGE: ${{ secrets.SEND_MESSAGE }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          NOTIFIER_WEBHOOK: ${{ secrets.NOTIFIER_WEBHOOK }}
+          GITHUB_TOKEN: ${{ secrets.TOKEN_GITHUB }}
+          TRENDING_LANGUAGE: ${{ secrets.LAN }}
+          TRENDING_SINCE: ${{ secrets.SINCE }}
+          ANALYSIS_NUM: 4
+          README_MAX_LENGTH: 10000
+          SAVE_README: "false"
+          PROMPT_TEMPLATE_PATH: Prompt.txt
+          LOG_DIR: logs
+          DATABASE_URL: sqlite:///backend/database/agent.db
+          FINAL_REPORT_PATH: final_report.txt
+        run: python main.py
+
+      - name: Upload database artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: github-agent-data-${{ github.run_id }}
+          path: |
+            backend/database/agent.db
+            final_report.txt
+          if-no-files-found: error
+          retention-days: 30
