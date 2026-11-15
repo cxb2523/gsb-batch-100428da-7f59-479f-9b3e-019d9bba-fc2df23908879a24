@@ -124,7 +124,7 @@ class FetchCoursesWorker(AsyncWorker):
 class FetchWorker(AsyncWorker):
     """Fetches current Moodle state and emits changed courses for preview."""
 
-    fetch_finished = Signal(list, object)  # emits (changed_courses, database)
+    fetch_finished = Signal(list, object, object)  # emits (changed_courses, database, failed_modules)
 
     def __init__(self, config: ConfigHelper, opts: MoodleDlOpts) -> None:
         super().__init__()
@@ -138,7 +138,7 @@ class FetchWorker(AsyncWorker):
         logging.info('Checking for changes...')
         changed_courses = await moodle.fetch_state(database)
 
-        self.fetch_finished.emit(changed_courses, database)
+        self.fetch_finished.emit(changed_courses, database, moodle.failed_modules)
 
 
 class DownloadWorker(AsyncWorker):

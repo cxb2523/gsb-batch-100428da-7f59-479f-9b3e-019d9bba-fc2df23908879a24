@@ -5,7 +5,7 @@ from typing import Dict, List
 from moodle_dl.config import ConfigHelper
 from moodle_dl.moodle.mods import MoodleMod
 from moodle_dl.moodle.moodle_constants import moodle_html_footer, moodle_html_header
-from moodle_dl.moodle.request_helper import RequestRejectedError
+from moodle_dl.moodle.request_helper import InvalidTokenRequestError, RequestRejectedError
 from moodle_dl.types import Course, File
 from moodle_dl.utils import PathTools as PT
 
@@ -81,6 +81,8 @@ class LessonMod(MoodleMod):
         try:
             user_attempt = await self.client.async_post('mod_lesson_get_user_attempt', data)
             user_attempt['lesson_name'] = lesson.get('name', '')
+        except InvalidTokenRequestError:
+            raise
         except RequestRejectedError:
             logging.debug("No access rights for lesson %d", lesson_id)
             return
@@ -92,6 +94,8 @@ class LessonMod(MoodleMod):
         data = {'lessonid': attempt_page.get('page', {}).get('lessonid', 0), 'pageid': page_id, 'returncontents': 1}
         try:
             page_result = await self.client.async_post('mod_lesson_get_page_data', data)
+        except InvalidTokenRequestError:
+            raise
         except RequestRejectedError:
             logging.debug("No access rights for lesson attempt page %d", page_id)
             return []

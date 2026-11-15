@@ -4,7 +4,7 @@ from typing import Dict, List
 from moodle_dl.config import ConfigHelper
 from moodle_dl.moodle.mods import MoodleMod
 from moodle_dl.moodle.moodle_constants import moodle_html_footer, moodle_html_header
-from moodle_dl.moodle.request_helper import RequestRejectedError
+from moodle_dl.moodle.request_helper import InvalidTokenRequestError, RequestRejectedError
 from moodle_dl.types import Course, File
 from moodle_dl.utils import PathTools as PT
 
@@ -105,6 +105,8 @@ class QuizMod(MoodleMod):
                 questions = (await self.client.async_post('mod_quiz_get_attempt_summary', data)).get('questions', [])
             else:
                 return result
+        except InvalidTokenRequestError:
+            raise
         except RequestRejectedError:
             logging.debug("No access rights for quiz attempt %d", attempt_id)
             return result

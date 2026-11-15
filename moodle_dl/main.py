@@ -98,6 +98,10 @@ def run_main(config: ConfigHelper, opts: MoodleDlOpts):
         database = StateRecorder(config, opts)
         changed_courses = asyncio.run(moodle.fetch_state(database))
 
+        if len(moodle.failed_modules) > 0:
+            logging.warning('%s', moodle.failed_modules.get_summary())
+            logging.warning('The failed modules are not marked as synced, so their content is retried on the next run.')
+
         if opts.log_responses:
             logging.info("All JSON-responses from Moodle have been written to the responses.log file.")
             return

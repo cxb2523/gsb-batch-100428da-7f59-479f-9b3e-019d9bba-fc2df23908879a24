@@ -173,7 +173,8 @@ class RequestHelper:
                         logging.debug("The %sth connection error occurred, retrying. %s", error_ctr, req_err)
                         await asyncio.sleep(1)
                         continue
-                    raise ConnectionError(f"Connection error: {req_err}") from None
+                    # Every retry was used up without a successful response.
+                    raise RequestRetriesExhaustedError(f"Connection error: {req_err}") from None
 
         return resp_json
 
@@ -348,8 +349,8 @@ class RequestHelper:
             error_code = resp_json.get('errorcode', '')
 
             if error_code == 'invalidtoken':
-                raise RequestRejectedError(
-                    'Your Moodle token has expired.'
+                raise InvalidTokenRequestError(
+                    TOKEN_EXPIRED_MESSAGE
                     + ' To create a new one run "moodle-dl -nt -u USERNAME -pw PASSWORD" or "moodle-dl -nt -sso"'
                 )
 
@@ -403,3 +404,37 @@ class RetryableRequestError(RequestRejectedError):
     """A Moodle error that is transient and should be retried."""
 
     pass
+
+
+class InvalidTokenRequestError(RequestRejectedError):
+    """The Moodle token is no longer valid.
+
+    This is a global error: every further request of the current run will fail
+    as well, so it must never be treated as a failure of a single module.
+    """
+
+    pass
+
+
+class RequestRetriesExhaustedError(ConnectionError):
+    """All retries of a request were used up without receiving a valid response.
+
+    This is a subclass of ConnectionError so that existing callers that treat
+    connection errors as fatal keep working.
+    """
+
+    pass
+
+
+TOKEN_EXPIRED_MESSAGE = 'Your Moodle token has expired.'
+
+
+def is_invalid_token_error(error: BaseException) -> bool:
+    """
+    Returns True if the given exception represents an expired/rejected Moodle token.
+    Both the dedicated InvalidTokenRequestError and a generic RequestRejectedError
+    carrying the token expiry message are recognized.
+    """
+    if isinstance(error, InvalidTokenRequestError):
+        return True
+    return TOKEN_EXPIRED_MESSAGE in str(error)

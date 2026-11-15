@@ -3,7 +3,7 @@ import os
 from typing import Dict
 
 from moodle_dl.config import ConfigHelper
-from moodle_dl.moodle.request_helper import RequestHelper, RequestRejectedError
+from moodle_dl.moodle.request_helper import InvalidTokenRequestError, RequestHelper, RequestRejectedError
 from moodle_dl.types import MoodleDlOpts
 from moodle_dl.utils import PathTools as PT
 
@@ -33,6 +33,8 @@ class CookieHandler:
         try:
             autologin_key_result = self.client.post('tool_mobile_get_autologin_key', extra_data)
             return autologin_key_result
+        except InvalidTokenRequestError:
+            raise
         except RequestRejectedError as e:
             logging.debug("Cookie lockout: %s", e)
             return None

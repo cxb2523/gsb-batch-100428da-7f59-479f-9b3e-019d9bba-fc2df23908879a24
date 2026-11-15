@@ -4,7 +4,7 @@ from sqlite3 import Error
 from typing import Dict, List
 
 from moodle_dl.config import ConfigHelper
-from moodle_dl.types import Course, File, MoodleDlOpts
+from moodle_dl.types import MOD_WIDE_FAILURE_COURSE_ID, Course, File, MoodleDlOpts
 from moodle_dl.utils import PathTools as PT
 
 
@@ -362,8 +362,18 @@ class StateRecorder:
         conn.close()
         return stored_courses
 
-    def get_modified_files(self, stored_courses: List[Course], current_courses: List[Course]) -> List[Course]:
+    def get_modified_files(
+        self,
+        stored_courses: List[Course],
+        current_courses: List[Course],
+        ignored_modules: set = None,
+    ) -> List[Course]:
         # returns courses with modified and deleted files
+        # @param ignored_modules: Set of (course id, module id) pairs of modules whose
+        #                         fetch failed. Their stored files must not be treated
+        #                         as deleted, because the current state is incomplete.
+        if ignored_modules is None:
+            ignored_modules = set()
         changed_courses = []
 
         for stored_course in stored_courses:
@@ -380,6 +390,8 @@ class StateRecorder:
                 # maybe it would be better
                 # to not notify about this changes?
                 for stored_file in stored_course.files:
+                    if self._module_is_ignored(stored_course.id, stored_file, ignored_modules):
+                        continue
                     stored_file.deleted = True
                     stored_file.notified = False
                 changed_courses.append(stored_course)
@@ -391,6 +403,12 @@ class StateRecorder:
             # also find modified files
             changed_course = Course(stored_course.id, stored_course.fullname)
             for stored_file in stored_course.files:
+                if self._module_is_ignored(stored_course.id, stored_file, ignored_modules):
+                    # The module of this file failed to fetch, so the current state is
+                    # incomplete. Keep the stored file completely untouched, so that it
+                    # is neither marked as deleted nor as moved or modified.
+                    continue
+
                 matching_file = None
 
                 for current_file in same_course_in_current.files:
@@ -421,13 +439,14 @@ class StateRecorder:
                         # file does still exist
                         break
 
-                if matching_file is None and not self.ignore_deleted(stored_file):
-                    # No matching file was found --> file was deleted
-                    stored_file.deleted = True
-                    stored_file.notified = False
-                    changed_course.files.append(stored_file)
+                if matching_file is None:
+                    if not self.ignore_deleted(stored_file):
+                        # No matching file was found --> file was deleted
+                        stored_file.deleted = True
+                        stored_file.notified = False
+                        changed_course.files.append(stored_file)
 
-                elif matching_file is not None:
+                if matching_file is not None:
                     matching_file.moved = True
                     matching_file.old_file = stored_file
                     changed_course.files.append(matching_file)
@@ -436,6 +455,21 @@ class StateRecorder:
                 changed_courses.append(changed_course)
 
         return changed_courses
+
+    @staticmethod
+    def _module_is_ignored(course_id: int, file: File, ignored_modules: set) -> bool:
+        """
+        Returns True if the module of the given stored file failed to fetch and its
+        stored state therefore must not be changed.
+        @param ignored_modules: Set of (course id, module id) pairs. The special
+                               course id MOD_WIDE_FAILURE_COURSE_ID marks a failure
+                               that affects every module of a whole mod type.
+        """
+        if not ignored_modules:
+            return False
+        if (course_id, file.module_id) in ignored_modules:
+            return True
+        return (MOD_WIDE_FAILURE_COURSE_ID, file.module_modname) in ignored_modules
 
     def get_new_files(
         self, changed_courses: List[Course], stored_courses: List[Course], current_courses: List[Course]
@@ -486,7 +520,7 @@ class StateRecorder:
                     matched_changed_course.files += changed_course.files
         return changed_courses
 
-    def changes_of_new_version(self, current_courses: List[Course]) -> List[Course]:
+    def changes_of_new_version(self, current_courses: List[Course], failed_modules=None) -> List[Course]:
         # all changes are stored inside changed_courses,
         # as a list of changed courses
         changed_courses = []
@@ -503,7 +537,14 @@ class StateRecorder:
         # first get all stored files (that are not yet deleted)
         stored_courses = self.get_stored_files()
 
-        changed_courses = self.get_modified_files(stored_courses, current_courses)
+        # Files of modules whose fetch failed must not be treated as deleted,
+        # otherwise a module that is still online would be marked as deleted just
+        # because its content could not be loaded this time.
+        ignored_modules = set()
+        if failed_modules is not None:
+            ignored_modules = failed_modules.get_ignored_module_identifiers()
+
+        changed_courses = self.get_modified_files(stored_courses, current_courses, ignored_modules)
         # ----------------------------------------------------------
 
         # check for new files

@@ -14,6 +14,7 @@ from moodle_dl.moodle.mods import (
     get_all_mods_classes,
     get_mod_plurals,
 )
+from moodle_dl.moodle.mods.common import FailedModules
 from moodle_dl.moodle.request_helper import RequestHelper
 from moodle_dl.moodle.result_builder import ResultBuilder
 from moodle_dl.types import Course, MoodleDlOpts, MoodleURL
@@ -24,6 +25,8 @@ class MoodleService:
     def __init__(self, config: ConfigHelper, opts: MoodleDlOpts):
         self.config = config
         self.opts = opts
+        # Filled by fetch_state with every module whose fetch ultimately failed.
+        self.failed_modules = FailedModules()
 
     def obtain_login_token(self, username: str, password: str, moodle_url: MoodleURL) -> str:
         "Send the login credentials to the Moodle-System and extracts the resulting Login-Token"
@@ -101,12 +104,20 @@ class MoodleService:
             core_handler.version = version
         return user_id, version
 
-    async def fetch_state(self, database: StateRecorder) -> List[Course]:
+    async def fetch_state(self, database: StateRecorder, failed_modules: FailedModules = None) -> List[Course]:
         """
         Fetch the current status of the configured Moodle account and compare it with the last known state
         It does not change the known state, nor does it download the files.
+        @param database: The StateRecorder used for the comparison with the last known state
+        @param failed_modules: Optional FailedModules instance, filled with every module whose
+                               fetch ultimately failed. The same instance is available as
+                               self.failed_modules afterwards.
         @return: List with detected changes between the new and old state
         """
+        if failed_modules is None:
+            failed_modules = FailedModules()
+        self.failed_modules = failed_modules
+
         logging.debug('Fetching current Moodle state...')
         token = self.config.get_token()
         privatetoken = self.config.get_privatetoken()
@@ -125,7 +136,9 @@ class MoodleService:
 
         core_contents = await core_handler.async_load_core_contents(courses)
         mods = get_all_mods(request_helper, version, user_id, database.get_last_timestamp_per_mod_module(), self.config)
-        fetched_mods_files = await fetch_mods_files(mods, courses, core_contents)
+        fetched_mods_files, collected_failures = await fetch_mods_files(mods, courses, core_contents)
+
+        failed_modules.extend(collected_failures.failures)
 
         logging.debug('Combine API results...')
         ResultBuilder(moodle_url, version, get_mod_plurals()).add_files_to_courses(
@@ -133,7 +146,7 @@ class MoodleService:
         )
 
         logging.debug('Checking for changes...')
-        changes = database.changes_of_new_version(courses)
+        changes = database.changes_of_new_version(courses, failed_modules)
         changes = self.add_options_to_courses(changes)
         changes = self.filter_courses(changes, self.config, cookie_handler, courses)
 

@@ -42,6 +42,7 @@ class DownloadPage(QWidget):
         self._download_service = None
         self._fetched_courses = None
         self._fetched_database = None
+        self._fetched_failed_modules = None
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(500)
         self._poll_timer.timeout.connect(self._poll_status)
@@ -171,13 +172,17 @@ class DownloadPage(QWidget):
         self._fetch_worker.error_occurred.connect(self._on_fetch_error)
         self._fetch_worker.start()
 
-    def _on_fetch_finished(self, courses, database) -> None:
+    def _on_fetch_finished(self, courses, database, failed_modules=None) -> None:
         """Scan complete — populate preview table."""
         self._fetched_courses = courses
         self._fetched_database = database
+        self._fetched_failed_modules = failed_modules
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.unsetCursor()
+
+        if failed_modules is not None and len(failed_modules) > 0:
+            logging.warning('%s', failed_modules.get_summary())
 
         # Load always-skip keys from config
         always_skip_keys = set(self.config.get_property_or('always_skip_files', []))
@@ -486,6 +491,7 @@ class DownloadPage(QWidget):
         self.progress_bar.setValue(0)
         self._fetched_courses = None
         self._fetched_database = None
+        self._fetched_failed_modules = None
 
         # Switch back to preview model
         self.table_view.setModel(self._preview_model)

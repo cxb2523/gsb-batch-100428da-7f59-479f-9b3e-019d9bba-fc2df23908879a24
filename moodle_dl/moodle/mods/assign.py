@@ -3,7 +3,7 @@ from typing import Dict, List
 
 from moodle_dl.config import ConfigHelper
 from moodle_dl.moodle.mods import MoodleMod
-from moodle_dl.moodle.request_helper import RequestRejectedError
+from moodle_dl.moodle.request_helper import InvalidTokenRequestError, RequestRejectedError
 from moodle_dl.types import Course, File
 from moodle_dl.utils import PathTools as PT
 
@@ -111,6 +111,8 @@ class AssignMod(MoodleMod):
             # TODO: Extract the API call to get enrolled users, if we need the information also in another mod
             try:
                 course_users = await self.client.async_post('core_enrol_get_enrolled_users', {'courseid': course_id})
+            except InvalidTokenRequestError:
+                raise
             except RequestRejectedError:
                 logging.debug("No access rights for enrolled users list of course %d", course_id)
                 return

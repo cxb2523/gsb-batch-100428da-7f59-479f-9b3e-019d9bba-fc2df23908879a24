@@ -5,6 +5,10 @@ from typing import Any, Dict, List
 
 from moodle_dl.utils import PathTools as PT
 
+# Marker for a failed module whose individual course module id is unknown, because the
+# listing request of the whole mod type failed. It matches every module of the mod type.
+MOD_WIDE_FAILURE_COURSE_ID = -1
+
 
 class File:
     def __init__(

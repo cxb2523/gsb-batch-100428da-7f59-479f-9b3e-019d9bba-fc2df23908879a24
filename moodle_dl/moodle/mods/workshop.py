@@ -3,7 +3,7 @@ from typing import Dict, List
 
 from moodle_dl.config import ConfigHelper
 from moodle_dl.moodle.mods import MoodleMod
-from moodle_dl.moodle.request_helper import RequestRejectedError
+from moodle_dl.moodle.request_helper import InvalidTokenRequestError, RequestRejectedError
 from moodle_dl.types import Course, File
 
 
@@ -111,6 +111,8 @@ class WorkshopMod(MoodleMod):
 
         try:
             submissions = (await self.client.async_post('mod_workshop_get_submissions', data)).get('submissions', [])
+        except InvalidTokenRequestError:
+            raise
         except RequestRejectedError:
             logging.debug("No access rights for workshop %d", workshop_id)
             return
@@ -119,6 +121,8 @@ class WorkshopMod(MoodleMod):
             assessments = (await self.client.async_post('mod_workshop_get_reviewer_assessments', data)).get(
                 'assessments', []
             )
+        except InvalidTokenRequestError:
+            raise
         except RequestRejectedError:
             assessments = []
         submissions += await self.run_async_collect_function_on_list(
@@ -130,6 +134,8 @@ class WorkshopMod(MoodleMod):
 
         try:
             grades = await self.client.async_post('mod_workshop_get_grades', data)
+        except InvalidTokenRequestError:
+            raise
         except RequestRejectedError:
             grades = {}
 
@@ -171,6 +177,8 @@ class WorkshopMod(MoodleMod):
             submission = (await self.client.async_post('mod_workshop_get_submission', data)).get('submission', {})
             submission['files'] = assessment_files
             return submission
+        except InvalidTokenRequestError:
+            raise
         except RequestRejectedError:
             logging.debug("No access rights for workshop submission %d", assessment_submission_id)
             return None
