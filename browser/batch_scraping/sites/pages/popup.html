@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Popup Window</title>
+</head>
+<body>
+  <h1 id="popup-title">Popup Window</h1>
+  <p id="popup-body">
+    Content that only exists inside the popup window. Element caches from the
+    opener window must not be reused here.
+  </p>
+
+  <form id="popup-form">
+    <input type="text" name="popup_token" id="popup-token"
+           placeholder="Popup token" />
+    <button type="button" id="popup-confirm" class="btn"
+            data-action="mutate-value">Confirm</button>
+  </form>
+
+  <ul class="popup-notes">
+    <li class="note">popup note one</li>
+    <li class="note">popup note two</li>
+  </ul>
+</body>
+</html>

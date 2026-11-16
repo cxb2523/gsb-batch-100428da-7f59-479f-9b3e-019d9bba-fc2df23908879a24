@@ -364,6 +364,31 @@ requests.post(f"{SERVER}/quit")
 requests.post(f"{SERVER}/shutdown")
 ```
 
+## Batch Scraping Layer
+
+For multi-step collection jobs, use the reusable batch layer in
+[`batch_scraping/`](batch_scraping/README.md) instead of issuing raw calls:
+
+```python
+from aib_batch import AIBClient, BatchRunner, format_report
+
+runner = BatchRunner(AIBClient("http://127.0.0.1:5000"))
+report = runner.run_batch([
+    {"op": "find", "selector": "button.open", "name": "find-open"},
+    {"op": "click", "index": 0, "name": "open"},
+    {"op": "get_text", "store": "body_text"},
+])
+print(format_report(report))
+```
+
+It settles every step independently (success / failed / skipped), retries a
+stale index with one re-find + one retry, skips steps whose dependencies
+failed instead of reporting false success, invalidates the element cache on
+window switch/close, and retains all collected text in the final report.
+The directory ships a stdlib-only mock AgentInBrowser server, self-made
+pages and a 16-case end-to-end test suite, so the logic can be verified
+without Chrome or any real site (`python -I tests/test_batch_runner.py`).
+
 ## Important Notes
 
 1. **Element indices are ephemeral** — Each `find`/`inputs`/`buttons` call resets internal cache, subsequent `click`/`send_keys`/`get_html` reference the most recent find result

@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Mutable List</title>
+</head>
+<body>
+  <h1 id="list-title">Mutable List</h1>
+  <p>Buttons on this page mutate the DOM, which invalidates cached indices.</p>
+
+  <ul id="item-list">
+    <li class="item">
+      <span class="label">Item one</span>
+      <button type="button" class="remove-btn" data-action="remove-item">Remove</button>
+    </li>
+    <li class="item">
+      <span class="label">Item two</span>
+      <button type="button" class="remove-btn" data-action="remove-item">Remove</button>
+    </li>
+    <li class="item">
+      <span class="label">Item three</span>
+      <button type="button" class="remove-btn" data-action="remove-item">Remove</button>
+    </li>
+  </ul>
+
+  <div class="controls">
+    <button type="button" id="add-btn" data-action="add-item">Add item</button>
+    <button type="button" id="refresh-btn" data-action="refresh-list">Refresh list</button>
+  </div>
+
+  <div class="card">
+    <p class="card-text">Card text that survives list mutations.</p>
+  </div>
+</body>
+</html>

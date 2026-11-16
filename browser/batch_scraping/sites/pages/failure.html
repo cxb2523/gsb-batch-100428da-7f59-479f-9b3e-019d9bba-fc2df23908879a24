@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Failure Scenarios</title>
+</head>
+<body>
+  <h1 id="failure-title">Controlled Failure Scenarios</h1>
+  <p>
+    This page deliberately lacks selectors used by failure tests, so a
+    <code>find</code> for <code>.does-not-exist</code> returns zero elements
+    and index steps against an empty cache fail deterministically.
+  </p>
+
+  <div class="only-this">
+    <span id="lone-span">lone element</span>
+  </div>
+
+  <button type="button" id="open-popup-btn" data-action="open-popup">
+    Open popup window
+  </button>
+</body>
+</html>

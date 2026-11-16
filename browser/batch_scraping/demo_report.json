@@ -1,0 +1,511 @@
+{
+  "scenario_a": {
+    "total": 12,
+    "summary": {
+      "success": 10,
+      "failed": 1,
+      "skipped": 1
+    },
+    "failure_reasons": [
+      {
+        "reason": "element-not-found",
+        "count": 1,
+        "seqs": [
+          9
+        ],
+        "sample_error": "index failed: stale element reference: DOM changed after the elements were cached; re-run find to refresh the index list; re-find returned 0 elements for find .ghost"
+      }
+    ],
+    "results": {
+      "detail_text": "Detail Page Detail Page Reached after a successful button click. The runner must keep text collected here even if a later step fails. Record Alpha Alpha body content worth scraping. Record Beta Beta body content worth scraping. Record Gamma Gamma body content worth scraping. Reload detail",
+      "first_record": "<article class=\"record\"><h2>Record Alpha</h2><p class=\"record-body\">Alpha body content worth scraping.</p></article>"
+    },
+    "steps": [
+      {
+        "seq": 0,
+        "name": "locate-inputs",
+        "op": "inputs",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "count": 2,
+          "inputs": [
+            {
+              "index": 0,
+              "type": "text",
+              "name": "username",
+              "id": "username",
+              "placeholder": "Username",
+              "value": ""
+            },
+            {
+              "index": 1,
+              "type": "password",
+              "name": "password",
+              "id": "password",
+              "placeholder": "Password",
+              "value": ""
+            }
+          ]
+        },
+        "captured": null,
+        "duration_ms": 0
+      },
+      {
+        "seq": 1,
+        "name": "type-user",
+        "op": "send_keys",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "success": true,
+          "value": "alice"
+        },
+        "captured": null,
+        "duration_ms": 0
+      },
+      {
+        "seq": 2,
+        "name": "type-pass",
+        "op": "send_keys",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "success": true,
+          "value": "secret"
+        },
+        "captured": null,
+        "duration_ms": 0
+      },
+      {
+        "seq": 3,
+        "name": "locate-button",
+        "op": "buttons",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "count": 1,
+          "buttons": [
+            {
+              "index": 0,
+              "text": "Login",
+              "class": "btn primary",
+              "id": "submit-btn"
+            }
+          ]
+        },
+        "captured": null,
+        "duration_ms": 15
+      },
+      {
+        "seq": 4,
+        "name": "login",
+        "op": "click",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "current_url": "/pages/detail.html",
+          "title": "Detail Page",
+          "window_count": 1
+        },
+        "captured": null,
+        "duration_ms": 0
+      },
+      {
+        "seq": 5,
+        "name": "read-detail",
+        "op": "get_text",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "text": "Detail Page Detail Page Reached after a successful button click. The runner must keep text collected here even if a later step fails. Record Alpha Alpha body content worth scraping. Record Beta Beta body content worth scraping. Record Gamma Gamma body content worth scraping. Reload detail"
+        },
+        "captured": "Detail Page Detail Page Reached after a successful button click. The runner must keep text collected here even if a later step fails. Record Alpha Alpha body content worth scraping. Record Beta Beta body content worth scraping. Record Gamma Gamma body content worth scraping. Reload detail",
+        "duration_ms": 0
+      },
+      {
+        "seq": 6,
+        "name": "find-records",
+        "op": "find",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "count": 3,
+          "elements": [
+            {
+              "index": 0,
+              "tag": "article",
+              "text": "Record Alpha Alpha body content worth scraping.",
+              "class": "record",
+              "id": ""
+            },
+            {
+              "index": 1,
+              "tag": "article",
+              "text": "Record Beta Beta body content worth scraping.",
+              "class": "record",
+              "id": ""
+            },
+            {
+              "index": 2,
+              "tag": "article",
+              "text": "Record Gamma Gamma body content worth scraping.",
+              "class": "record",
+              "id": ""
+            }
+          ]
+        },
+        "captured": null,
+        "duration_ms": 16
+      },
+      {
+        "seq": 7,
+        "name": "record-html",
+        "op": "get_html",
+        "status": "success",
+        "attempts": 2,
+        "retried": true,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "html": "<article class=\"record\"><h2>Record Alpha</h2><p class=\"record-body\">Alpha body content worth scraping.</p></article>"
+        },
+        "captured": "<article class=\"record\"><h2>Record Alpha</h2><p class=\"record-body\">Alpha body content worth scraping.</p></article>",
+        "duration_ms": 47
+      },
+      {
+        "seq": 8,
+        "name": "find-ghost",
+        "op": "find",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "count": 0,
+          "elements": []
+        },
+        "captured": null,
+        "duration_ms": 0
+      },
+      {
+        "seq": 9,
+        "name": "click-ghost",
+        "op": "click",
+        "status": "failed",
+        "attempts": 1,
+        "retried": true,
+        "reason": "element-not-found",
+        "error": "index failed: stale element reference: DOM changed after the elements were cached; re-run find to refresh the index list; re-find returned 0 elements for find .ghost",
+        "skipped_due_to": [],
+        "data": null,
+        "captured": null,
+        "duration_ms": 0
+      },
+      {
+        "seq": 10,
+        "name": "after-ghost",
+        "op": "get_text",
+        "status": "skipped",
+        "attempts": 0,
+        "retried": false,
+        "reason": "dependency not successful: seqs [3]",
+        "error": null,
+        "skipped_due_to": [
+          9
+        ],
+        "data": null,
+        "captured": null,
+        "duration_ms": 0
+      },
+      {
+        "seq": 11,
+        "name": "detail-info",
+        "op": "page_info",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "url": "/pages/detail.html",
+          "title": "Detail Page",
+          "source_length": 792
+        },
+        "captured": null,
+        "duration_ms": 0
+      }
+    ]
+  },
+  "scenario_b": {
+    "total": 11,
+    "summary": {
+      "success": 10,
+      "failed": 1,
+      "skipped": 0
+    },
+    "failure_reasons": [
+      {
+        "reason": "element-not-found",
+        "count": 1,
+        "seqs": [
+          6
+        ],
+        "sample_error": "index failed: stale element reference: DOM changed after the elements were cached; re-run find to refresh the index list; re-find returned 0 elements for find .missing"
+      }
+    ],
+    "results": {
+      "popup_note": "<li class=\"note\">popup note one</li>",
+      "main_span": "<span id=\"lone-span\">lone element</span>",
+      "main_text": "Failure Scenarios Controlled Failure Scenarios This page deliberately lacks selectors used by failure tests, so a for returns zero elements and index steps against an empty cache fail deterministically. find .does-not-exist lone element Open popup window"
+    },
+    "steps": [
+      {
+        "seq": 0,
+        "name": "find-popup-open",
+        "op": "buttons",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "count": 1,
+          "buttons": [
+            {
+              "index": 0,
+              "text": "Open popup window",
+              "class": "",
+              "id": "open-popup-btn"
+            }
+          ]
+        },
+        "captured": null,
+        "duration_ms": 0
+      },
+      {
+        "seq": 1,
+        "name": "open-popup",
+        "op": "click",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "current_url": "/pages/failure.html",
+          "title": "Failure Scenarios",
+          "window_count": 2
+        },
+        "captured": null,
+        "duration_ms": 0
+      },
+      {
+        "seq": 2,
+        "name": "switch-to-popup",
+        "op": "switch_window",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "current_url": "/pages/popup.html",
+          "title": "Popup Window",
+          "window_count": 2
+        },
+        "captured": null,
+        "duration_ms": 14
+      },
+      {
+        "seq": 3,
+        "name": "find-notes",
+        "op": "find",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "count": 2,
+          "elements": [
+            {
+              "index": 0,
+              "tag": "li",
+              "text": "popup note one",
+              "class": "note",
+              "id": ""
+            },
+            {
+              "index": 1,
+              "tag": "li",
+              "text": "popup note two",
+              "class": "note",
+              "id": ""
+            }
+          ]
+        },
+        "captured": null,
+        "duration_ms": 0
+      },
+      {
+        "seq": 4,
+        "name": "popup-note",
+        "op": "get_html",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "html": "<li class=\"note\">popup note one</li>"
+        },
+        "captured": "<li class=\"note\">popup note one</li>",
+        "duration_ms": 0
+      },
+      {
+        "seq": 5,
+        "name": "find-missing-in-popup",
+        "op": "find",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "count": 0,
+          "elements": []
+        },
+        "captured": null,
+        "duration_ms": 0
+      },
+      {
+        "seq": 6,
+        "name": "fail-in-popup",
+        "op": "click",
+        "status": "failed",
+        "attempts": 1,
+        "retried": true,
+        "reason": "element-not-found",
+        "error": "index failed: stale element reference: DOM changed after the elements were cached; re-run find to refresh the index list; re-find returned 0 elements for find .missing",
+        "skipped_due_to": [],
+        "data": null,
+        "captured": null,
+        "duration_ms": 32
+      },
+      {
+        "seq": 7,
+        "name": "close-popup",
+        "op": "close_window",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "current_url": "/pages/failure.html",
+          "title": "Failure Scenarios",
+          "window_count": 1
+        },
+        "captured": null,
+        "duration_ms": 15
+      },
+      {
+        "seq": 8,
+        "name": "refind-main",
+        "op": "find",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "count": 1,
+          "elements": [
+            {
+              "index": 0,
+              "tag": "span",
+              "text": "lone element",
+              "class": "",
+              "id": "lone-span"
+            }
+          ]
+        },
+        "captured": null,
+        "duration_ms": 0
+      },
+      {
+        "seq": 9,
+        "name": "main-span",
+        "op": "get_html",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "html": "<span id=\"lone-span\">lone element</span>"
+        },
+        "captured": "<span id=\"lone-span\">lone element</span>",
+        "duration_ms": 0
+      },
+      {
+        "seq": 10,
+        "name": "read-main",
+        "op": "get_text",
+        "status": "success",
+        "attempts": 1,
+        "retried": false,
+        "reason": null,
+        "error": null,
+        "skipped_due_to": [],
+        "data": {
+          "text": "Failure Scenarios Controlled Failure Scenarios This page deliberately lacks selectors used by failure tests, so a for returns zero elements and index steps against an empty cache fail deterministically. find .does-not-exist lone element Open popup window"
+        },
+        "captured": "Failure Scenarios Controlled Failure Scenarios This page deliberately lacks selectors used by failure tests, so a for returns zero elements and index steps against an empty cache fail deterministically. find .does-not-exist lone element Open popup window",
+        "duration_ms": 0
+      }
+    ]
+  }
+}
