@@ -1,0 +1,32 @@
+# Python files
+*.pyc
+__pycache__/
+
+# Environment variables
+.env
+
+# Virtual environment
+.venv/
+venv/
+
+.json
+
+# GCP service account keys
+service-account-key.json
+
+# Others
+.idea/
+.DS_Store
+dataform.json
+delete_files_by_match_id.ps1
+soccer_tracker_de_project.egg-info
+match_ids.json
+.vscode/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+deployment_scripts.txt
+vertex_example.py
+parse_md.py
+output.md
+cors-config.json

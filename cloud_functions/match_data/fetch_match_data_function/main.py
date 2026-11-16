@@ -1,0 +1,99 @@
+import json
+import os
+import logging
+from datetime import datetime, timedelta
+from google.cloud import pubsub_v1
+from .utils.match_data_helper import fetch_matches_for_competitions, save_to_gcs
+from cloud_functions.discord_utils.discord_notifications import (
+    send_discord_notification,
+)
+from cloud_functions.data_contracts.match_contract import MatchContract
+from cloud_functions.data_contracts.validation import (
+    validate_records,
+    format_validation_summary,
+)
+
+
+def fetch_football_data(event, context):
+    """
+    Cloud Function to fetch football match data from top 5 leagues and save to bucket,
+    with Discord notifications for success or failure and Pub/Sub trigger for next function.
+    """
+    try:
+        date_to = datetime.now().strftime("%Y-%m-%d")
+        date_from = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
+
+        logging.info(f"Fetching matches from {date_from} to {date_to}")
+        matches = fetch_matches_for_competitions(date_from, date_to)
+
+        new_matches = 0
+        error_count = 0
+        processed_matches = []
+
+        if not matches:
+            message = (
+                f"No new matches found on date {date_to}. Skipping conversion step."
+            )
+            logging.info(message)
+            send_discord_notification(
+                "📝 Fetch Match Data: No New Matches", message, 16776960
+            )
+            return "No new matches to process.", 200
+
+        valid_matches, validation_errors = validate_records(matches, MatchContract)
+
+        if validation_errors:
+            summary = format_validation_summary(
+                len(matches), len(valid_matches), validation_errors
+            )
+            logging.warning(f"Match data validation issues:\n{summary}")
+            send_discord_notification(
+                "⚠️ Fetch Match Data: Validation Issues", summary, 16776960
+            )
+
+        for match in valid_matches:
+            try:
+                match_id = match["id"]
+                if "season" in match and "winner" in match["season"]:
+                    match["season"]["winner"] = None
+                save_to_gcs(match, match_id)
+                processed_matches.append(match)
+                new_matches += 1
+            except Exception as e:
+                error_count += 1
+                logging.error(f"Error processing match ID {match_id}: {e}")
+
+        success_message = f"Fetched {new_matches} new matches. Errors: {error_count}. Triggering conversion step."
+        logging.info(success_message)
+        send_discord_notification(
+            "✅ Fetch Match Data: Success", success_message, 65280
+        )
+
+        if new_matches > 0:
+            publisher = pubsub_v1.PublisherClient()
+            topic_path = publisher.topic_path(
+                os.environ["GCP_PROJECT_ID"], "convert_to_parquet_topic"
+            )
+
+            publish_data = {"action": "convert_matches"}
+
+            future = publisher.publish(
+                topic_path,
+                data=json.dumps(publish_data).encode("utf-8"),
+                timestamp=datetime.now().isoformat(),
+            )
+
+            publish_result = future.result()
+            logging.info(
+                f"Published trigger message to convert_to_parquet_topic with ID: {publish_result}"
+            )
+
+        return "Process completed.", 200
+
+    except Exception as e:
+        error_message = f"An error occurred: {str(e)}"
+        send_discord_notification(
+            "❌ Fetch Match Data: Failure", error_message, 16711680
+        )
+        logging.exception(error_message)
+        return error_message, 500

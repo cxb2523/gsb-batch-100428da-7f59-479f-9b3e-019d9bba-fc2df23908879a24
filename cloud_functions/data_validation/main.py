@@ -1,0 +1,324 @@
+import base64
+import json
+import os
+import logging
+import requests
+from io import BytesIO
+from pathlib import Path
+from google.cloud import dataplex_v1
+from google.cloud import bigquery
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from .utils.match_validator import MatchValidator
+
+
+def load_query(name: str) -> str:
+    """Load SQL query from file."""
+    sql_path = Path(__file__).parent / "sql" / f"{name}.sql"
+    return sql_path.read_text()
+
+
+def get_table_record_counts() -> dict:
+    """Fetches daily record counts from BigQuery tables."""
+    client = bigquery.Client()
+
+    query = load_query("daily_record_counts")  # nosec B608
+
+    results = client.query(query).result()
+
+    dates = []
+    matches_counts = []
+    weather_counts = []
+    reddit_counts = []
+
+    for row in results:
+        dates.append(row.date)
+        matches_counts.append(row.matches_count or 0)
+        weather_counts.append(row.weather_count or 0)
+        reddit_counts.append(row.reddit_count or 0)
+
+    return {
+        "dates": dates,
+        "matches": matches_counts,
+        "weather": weather_counts,
+        "reddit": reddit_counts,
+    }
+
+
+def get_table_total_counts() -> dict:
+    """Fetches total record counts from BigQuery tables up to each date in the last 20 days."""
+    client = bigquery.Client()
+
+    query = load_query("total_record_counts")  # nosec B608
+
+    results = client.query(query).result()
+
+    dates = []
+    matches_counts = []
+    weather_counts = []
+    reddit_counts = []
+
+    for row in results:
+        dates.append(row.date)
+        matches_counts.append(row.matches_count or 0)
+        weather_counts.append(row.weather_count or 0)
+        reddit_counts.append(row.reddit_count or 0)
+
+    return {
+        "dates": dates,
+        "matches": matches_counts,
+        "weather": weather_counts,
+        "reddit": reddit_counts,
+    }
+
+
+def get_scan_results(table_suffix: str) -> dict:
+    """Fetches the latest scan results from BigQuery quality tables."""
+    client = bigquery.Client()
+    project_id = os.environ.get("GCP_PROJECT_ID")
+
+    record_limits = {"reddit": 4, "matches": 4, "standings": 5, "weather": 9}
+
+    query = load_query("scan_results").format(
+        project_id=project_id,
+        table_suffix=table_suffix,
+        limit=record_limits.get(table_suffix, 4),
+    )  # nosec B608
+
+    try:
+        results = client.query(query).result()
+        row = next(iter(results))
+        return {
+            "pass_rate": row.avg_pass_rate if row.avg_pass_rate is not None else 0.0
+        }
+    except Exception as e:
+        logging.error(f"Error getting scan results for {table_suffix}: {str(e)}")
+        return {"pass_rate": 0.0}
+
+
+def create_records_plot(record_counts: dict) -> bytes:
+    """Creates a line plot of record counts over time."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    ax.plot(
+        record_counts["dates"],
+        record_counts["matches"],
+        marker="o",
+        label="Matches/Weather",
+        linewidth=2,
+        markersize=4,
+    )
+
+    ax.plot(
+        record_counts["dates"],
+        record_counts["reddit"],
+        marker="o",
+        label="Reddit",
+        linewidth=2,
+        markersize=4,
+    )
+
+    ax.set_title("Daily Record Counts - Last 30 Days", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Number of Records")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    plt.xticks(rotation=45, ha="right")
+
+    plt.tight_layout()
+
+    buf = BytesIO()
+    plt.savefig(buf, format="png", dpi=100)
+    buf.seek(0)
+    img_bytes = buf.getvalue()
+    plt.close(fig)
+
+    return img_bytes
+
+
+def create_total_records_plot(record_counts: dict) -> bytes:
+    """Creates a line plot of total record counts over time."""
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    ax.plot(
+        record_counts["dates"],
+        record_counts["matches"],
+        marker="o",
+        label="Matches/Weather",
+        linewidth=2,
+        markersize=4,
+    )
+
+    ax.plot(
+        record_counts["dates"],
+        record_counts["reddit"],
+        marker="o",
+        label="Reddit",
+        linewidth=2,
+        markersize=4,
+    )
+
+    ax.set_title(
+        "Total Records Over Time - Last 30 Days", fontsize=14, fontweight="bold"
+    )
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Total Number of Records")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    plt.xticks(rotation=45, ha="right")
+
+    plt.tight_layout()
+
+    buf = BytesIO()
+    plt.savefig(buf, format="png", dpi=100)
+    buf.seek(0)
+    img_bytes = buf.getvalue()
+    plt.close(fig)
+
+    return img_bytes
+
+
+def send_discord_notification(
+    title: str,
+    message: str,
+    color: int,
+    daily_plot: bytes | None = None,
+    total_plot: bytes | None = None,
+):
+    """Sends a notification to Discord with the specified title, message, color and optional plots."""
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+    if not webhook_url:
+        logging.warning("Discord webhook URL not set.")
+        return
+
+    files = {}
+    if daily_plot:
+        files["daily_counts.png"] = ("daily_plot.png", daily_plot, "image/png")
+    if total_plot:
+        files["total_counts.png"] = ("total_plot.png", total_plot, "image/png")
+
+    payload = {"embeds": [{"title": title, "description": message, "color": color}]}
+
+    if files:
+        response = requests.post(
+            webhook_url,
+            data={"payload_json": json.dumps(payload)},
+            files=files,
+            timeout=90,
+        )
+    else:
+        response = requests.post(
+            webhook_url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=90,
+        )
+
+    if response.status_code != 204:
+        logging.error(
+            f"Failed to send Discord notification: {response.status_code}, {response.text}"
+        )
+
+
+def trigger_dataplex_scans(event, context):
+    """Triggers Dataplex data quality scans for all tables and validates match data"""
+    try:
+        pubsub_message = base64.b64decode(event["data"]).decode("utf-8")
+        message_data = json.loads(pubsub_message)
+
+        if "action" not in message_data or message_data["action"] != "trigger_scans":
+            error_message = "Invalid message format"
+            logging.error(error_message)
+            send_discord_notification(
+                "❌ Dataplex Scans: Invalid Trigger", error_message, 16711680
+            )
+            return error_message, 500
+
+        match_validator = MatchValidator()
+        discrepancies = match_validator.validate_matches()
+
+        client = dataplex_v1.DataScanServiceClient()
+        project_id = os.environ.get("GCP_PROJECT_ID")
+        location = os.environ.get("LOCATION", "europe-central2")
+
+        scan_ids = [
+            "matches-processed-scan",
+            "weather-processed-scan",
+            "reddit-processed-scan",
+            "standings-processed-scan",
+        ]
+
+        triggered_scans = []
+
+        for scan_id in scan_ids:
+            scan_name = (
+                f"projects/{project_id}/locations/{location}/dataScans/{scan_id}"
+            )
+            request = dataplex_v1.RunDataScanRequest(name=scan_name)
+            operation = client.run_data_scan(request=request)
+            triggered_scans.append(operation)
+
+        import time
+
+        time.sleep(60)
+
+        tables = ["matches", "weather", "reddit", "standings"]
+        scan_results = {}
+        for table in tables:
+            scan_results[table] = get_scan_results(table)
+
+        record_counts = get_table_record_counts()
+        total_counts = get_table_total_counts()
+
+        daily_plot = create_records_plot(record_counts)
+        total_plot = create_total_records_plot(total_counts)
+
+        scan_summary = "\n\n**Recent Scan Results:**"
+        for table, results in scan_results.items():
+            scan_summary += f"\n\n**{table}**:\n"
+            scan_summary += f"Pass Rate: {results['pass_rate']:.2f}%"
+
+        match_validation_summary = "\n\n**Match Data Validation:**"
+        if discrepancies:
+            match_validation_summary += f"\n\nFound {len(discrepancies)} score discrepancies in the last 24 hours:"
+            for discrepancy in discrepancies:
+                match_validation_summary += (
+                    f"\n- {discrepancy['home_team']} vs {discrepancy['away_team']} "
+                    f"(Match ID: {discrepancy['match_id']}): "
+                    f"BQ shows {discrepancy['bq_score']}, API shows {discrepancy['api_score']}"
+                )
+        else:
+            match_validation_summary += (
+                "\n\nNo score discrepancies found for matches in the last 24 hours."
+            )
+
+        status_message = (
+            f"Successfully triggered {len(triggered_scans)} Dataplex quality scans\n"
+            f"Record count trends for the last 30 days shown in the graphs above."
+            f"{scan_summary}"
+            f"{match_validation_summary}"
+        )
+
+        logging.info(status_message)
+        send_discord_notification(
+            "✅ Data Validation: Complete",
+            status_message,
+            65280,
+            daily_plot,
+            total_plot,
+        )
+
+        return status_message, 200
+
+    except Exception as e:
+        error_message = f"Error during data validation: {str(e)}"
+        send_discord_notification("❌ Data Validation: Failed", error_message, 16711680)
+        logging.exception(error_message)
+        return error_message, 500
