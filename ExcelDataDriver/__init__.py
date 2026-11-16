@@ -95,6 +95,7 @@ class ExcelDataDriver:
         self.ws_test_datas = {}
         self.total_datas = []
         self.rerun_failed = True
+        self.sheet_parse_results = {}
         self.validate_data_only = validate_data_only
 
         self.screenshot_running_id = 0
@@ -421,12 +422,23 @@ class ExcelDataDriver:
         | Open Excel           |  C:\\Python27\\XLSXRobotTest\\XLSXRobotTest.xlsx   |
 
         """
-        if data_type is not None:
-            CustomExcelParser = self.load_module(data_type)
-            custom_parser = CustomExcelParser.CustomExcelParser(main_column_key)
-            self.excelTestDataService.load_test_data(filename, custom_parser)
-        else:
-            self.excelTestDataService.load_test_data(filename, DefaultParserStrategy(main_column_key))
+        try:
+            if data_type is not None:
+                CustomExcelParser = self.load_module(data_type)
+                custom_parser = CustomExcelParser.CustomExcelParser(main_column_key)
+                self.excelTestDataService.load_test_data(filename, custom_parser)
+            else:
+                self.excelTestDataService.load_test_data(filename, DefaultParserStrategy(main_column_key))
+        finally:
+            # Per worksheet settlement stays reachable even when the whole workbook is invalid.
+            self.sheet_parse_results = self.excelTestDataService.get_sheet_parse_results()
+
+    @property
+    def sheet_results(self):
+        """
+        Settlement information of every worksheet in the loaded workbook.
+        """
+        return self.sheet_parse_results
 
     @keyword
     def get_all_test_data(self, rerun_only_failed=False, offset_row=0, maximum_row=None):
@@ -444,6 +456,98 @@ class ExcelDataDriver:
             | Get all test datas   |  ${True}           | ${10}               | ${10}             |
         """
         return self.excelTestDataService.get_all_test_data(rerun_only_failed, offset_row, maximum_row)
+
+    ####################################################
+    #
+    # Per worksheet settlement
+    #
+    ####################################################
+    @keyword
+    def get_sheet_parse_results(self):
+        """
+        Return the parse settlement of every worksheet in the loaded workbook.
+
+        Each entry contains:
+            | sheet_name        | Worksheet title                                             |
+            | success_count     | Number of test data rows loaded from the worksheet          |
+            | error_message     | Failure reason when the worksheet was skipped               |
+            | is_skipped        | True when the worksheet was skipped                         |
+            | truncated         | True when parsing stopped before the end of the worksheet   |
+            | truncated_row_no  | Excel row number where the worksheet data ended             |
+
+        Returns a dictionary of worksheet title -> settlement information.
+        """
+        return self.excelTestDataService.get_sheet_parse_results()
+
+    @keyword
+    def get_sheet_parse_result(self, sheet_name):
+        """
+        Return the parse settlement of one worksheet, or None when not found.
+
+        Arguments:
+            | sheet_name | Worksheet title |
+        """
+        return self.excelTestDataService.get_sheet_parse_result(sheet_name)
+
+    @keyword
+    def get_skipped_sheet_names(self):
+        """
+        Return the titles of the worksheets that were skipped because they were invalid.
+        """
+        return self.excelTestDataService.get_skipped_sheet_names()
+
+    @keyword
+    def get_sheet_test_data_count(self, sheet_name):
+        """
+        Return the number of test data rows loaded from one worksheet.
+
+        Skipped worksheets return 0 and unknown worksheet titles return None.
+
+        Arguments:
+            | sheet_name | Worksheet title |
+        """
+        return self.excelTestDataService.get_sheet_test_data_count(sheet_name)
+
+    @keyword
+    def get_sheet_results(self):
+        """
+        Short alias of :keyword:`Get Sheet Parse Results`.
+        """
+        return self.excelTestDataService.get_sheet_parse_results()
+
+    @keyword
+    def get_sheet_error_message(self, sheet_name):
+        """
+        Return the failure reason of one worksheet, or None when the sheet is unknown.
+
+        Arguments:
+            | sheet_name | Worksheet title |
+        """
+        return self.excelTestDataService.get_sheet_error_message(sheet_name)
+
+    @keyword
+    def is_sheet_skipped(self, sheet_name):
+        """
+        Return True when the worksheet was skipped because it was invalid.
+
+        Unknown worksheet titles return None.
+
+        Arguments:
+            | sheet_name | Worksheet title |
+        """
+        return self.excelTestDataService.is_sheet_skipped(sheet_name)
+
+    @keyword
+    def is_sheet_truncated(self, sheet_name):
+        """
+        Return True when parsing stopped before the end of the worksheet data.
+
+        Unknown worksheet titles return None.
+
+        Arguments:
+            | sheet_name | Worksheet title |
+        """
+        return self.excelTestDataService.is_sheet_truncated(sheet_name)
 
     ####################################################
     #

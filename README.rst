@@ -98,6 +98,36 @@ Enhancement and release
 
     python -m robot.libdoc -f html ExcelDataDriver docs/ExcelDataDriver.html
 
+Multi worksheet settlement
+--------------------------
+
+Every worksheet of a workbook is parsed and settled separately. A worksheet that
+misses any of the mandatory columns is skipped with its own failure reason, while
+the remaining worksheets still produce test data rows. The workbook only fails
+when every worksheet failed.
+
+A row with an empty main column key still ends the data of that worksheet. The
+settlement information then reports the row where parsing stopped, so an operator
+can see that data after that row was not loaded. ``truncated`` is True when data
+rows exist after the stop, and ``truncated_row_no`` / ``next_data_row_no`` point at
+the stop row and the first row left behind it.
+
+The settlement of the loaded workbook can be queried with the following keywords:
+
+.. code:: robotframework
+
+    ${results} =       Get Sheet Parse Results
+    ${result} =        Get Sheet Parse Result    Sheet1
+    ${rows} =          Get Sheet Test Data Count    Sheet1
+    ${reason} =        Get Sheet Error Message      Sheet1
+    ${was skipped} =   Is Sheet Skipped             Sheet1
+    ${was truncated} = Is Sheet Truncated           Sheet1
+    ${skipped} =       Get Skipped Sheet Names
+
+Each settlement entry contains ``sheet_name``, ``success_count``, ``error_message``,
+``is_skipped``, ``is_pass``, ``truncated``, ``truncated_row_no``,
+``next_data_row_no`` and ``truncation_reason``.
+
 - Extended (In-progress)
 
 

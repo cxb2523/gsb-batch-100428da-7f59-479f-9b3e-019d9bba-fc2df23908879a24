@@ -94,7 +94,22 @@ class ABCParserStrategy:
         return ws_column_indexs
 
     def parse_test_data_properties(self, ws, ws_column_indexs):
+        test_datas, truncation = self.parse_test_data_properties_with_settlement(ws, ws_column_indexs)
+        return test_datas
+
+    def parse_test_data_properties_with_settlement(self, ws, ws_column_indexs):
+        """
+        Parse test data rows of one worksheet and report where parsing stopped.
+
+        An empty main column key keeps the original meaning: the worksheet data ends
+        at that row, so rows after it are not loaded. The returned truncation
+        information reports that stop position, which lets an operator see that the
+        worksheet was cut even though the loaded row order is unchanged.
+
+        :return: (list of ExcelTestDataRow, truncation dict or None)
+        """
         test_datas = []
+        truncation = None
         for index, row in enumerate(ws.rows):
             if index < self.start_row:
                 continue
@@ -103,9 +118,49 @@ class ABCParserStrategy:
             if test_data is not None:
                 test_datas.append(test_data)
             else:
+                truncation = self._get_truncation_info(ws, ws_column_indexs, index)
                 break
         print(str(datetime.now())+': Total test datas: ' + str(len(test_datas)))
-        return test_datas
+        return test_datas, truncation
+
+    def find_main_column_data_after(self, ws, ws_column_indexs, row_index):
+        """
+        Return the row number of the first data row after ``row_index`` whose main
+        column key is not empty, or None when nothing was left behind.
+        """
+        main_column_index = ws_column_indexs.get(self.main_column_key)
+        if main_column_index is None:
+            return None
+        for index, row in enumerate(ws.rows):
+            if index <= row_index:
+                continue
+            if main_column_index > len(row):
+                continue
+            value = row[main_column_index - 1].value
+            if value is not None and value != '':
+                return index + 1
+        return None
+
+    def _get_truncation_info(self, ws, ws_column_indexs, row_index):
+        """
+        Describe the row where parsing stopped on an empty main column key.
+
+        The stop position is always reported. ``truncated`` is only True when data
+        rows are left behind the stop, which is the case an operator cannot see from
+        the loaded test data.
+
+        :return: dict with the stop position, or None when no main column is known.
+        """
+        if ws_column_indexs.get(self.main_column_key) is None:
+            return None
+        next_data_row_no = self.find_main_column_data_after(ws, ws_column_indexs, row_index)
+        return {
+            'row_index': row_index,
+            'row_no': row_index + 1,
+            'truncated': next_data_row_no is not None,
+            'next_data_row_no': next_data_row_no,
+            'reason': 'Empty main column "' + str(self.main_column_key) + '" stops parsing this worksheet.',
+        }
 
     def _cleanup_fieldname(self, field_name):
         field_name = str(field_name).lower().strip().replace(" ", "_")
