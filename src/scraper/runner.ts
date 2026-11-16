@@ -1,9 +1,8 @@
 import getLikedPosts from "./getLikes"
 import { createPage, createBrowser, page, login } from "./puppeteer"
-import postLikes, { PostPostsPkg } from "./postLikes"
-import { createNewDir, downloadImage } from "../utils"
-import path from "path"
-import constants from "../constants"
+import postLikes from "./postLikes"
+import { downloadImage } from "../utils"
+import { downloadAndPost } from "./downloadAndPost"
 import {
   saveStoreIfNew,
   checkIfNeedsPosting,
@@ -73,8 +72,7 @@ export async function run() {
     )
 
     const imagesDir = app.getPath("temp")
-    let postsToPost: PostPostsPkg[] = []
-    let counter = 0
+    const postsToDownload: GetPostsPkg[] = []
     for (const post of filteredPosts) {
       if (
         userDefaults.get("postPreference") === "onlyLikes" &&
@@ -97,38 +95,22 @@ export async function run() {
         )
         continue
       }
-      const reactionText = post.reaction === "like" ? "liked" : "reacted to"
-      const postTypeText = post.type === "photo" ? "photo" : "image in post"
-      sendToConsoleOutput(
-        `Downloading ${reactionText} ${postTypeText} at ${post.postUrl}`,
-        "loading"
-      )
-      const imageUrl = await getImageUrl(post.postUrl)
-      const file = path.join(imagesDir, postsToPost.length.toString() + ".png")
-      if (imageUrl) {
-        await downloadImage(imageUrl, file)
-        postsToPost.push({
-          postUrl: post.postUrl,
-          reaction: post.reaction,
-          file
-        })
-        sendToConsoleOutput("Downloaded image successfully", "info")
-        // if (process.env.NODE_ENV === "development" && counter > 2) break //TESTING ONLY - REMOVE IN PRODUCTION
-        counter++
-      } else {
-        updateIsInvalidImageURL(true, post.postUrl)
-        sendToConsoleOutput(
-          "Couldn't find the image URL (the post might not be an image, so it's safe to ignore this)",
-          "sadtimes"
-        )
-      }
+
+      postsToDownload.push(post)
     }
-    if (postsToPost.length > 0) {
-      sendToConsoleOutput("Preparing to post images", "loading")
-      await postLikes(postsToPost)
-    } else {
-      sendToConsoleOutput("Nothing to post", "info")
-    }
+
+    //each post is settled on its own: a failure is recorded and the rest of the
+    //round carries on, so one broken post can't stop the others from posting.
+    await downloadAndPost(postsToDownload, {
+      imagesDir,
+      getImageUrl,
+      downloadImage,
+      postImages: postLikes,
+      onInvalidImageUrl: postUrl => updateIsInvalidImageURL(true, postUrl),
+      output: sendToConsoleOutput,
+      shouldAbort: () => wasLastRunStoppedForcefully
+    })
+
     sendToConsoleOutput("Cleaning up", "loading")
     await cleanup()
     sendToConsoleOutput("Finished the run at " + new Date(), "startstop")
@@ -149,33 +131,31 @@ export function setWasLastRunStoppedForcefully(value: boolean) {
 }
 
 async function getImageUrl(postUrl: string): Promise<string | null> {
-  let imageUrl: string
+  //navigation errors are real failures, so let them propagate to the caller
   await Promise.all([page.goto(postUrl), page.waitForNavigation()])
-  try {
-    const attempt1Selector =
-      ".permalinkPost img.scaledImageFitWidth.img, .permalinkPost img.scaledImageFitHeight.img" //this doesn't work for group posts.
-    // we could use .userContentWrapper  img.scaledImageFitWidth.img which works for everything, although there could be multiple on a page so we are relying that the first one returned is the correct one, which it should be anyway. or we query a second time if the first one didn't work. yeah i prefer that.
-    const attempt2Selector =
-      ".userContentWrapper img.scaledImageFitWidth.img, .permalinkPost img.scaledImageFitHeight.img" //so far i've only seen this selector needed for posts liked from groups. if the group post is not an image, it won't match anything which is good
 
-    const linkSelector =
-      '.permalinkPost div[data-tooltip-content="Show more information about this link"]' //we don't wanna post this since it's a link to an article or something
-    const link = await page.$(linkSelector)
-    if (link) {
-      return null
-    }
-    let image = await page.$(attempt1Selector)
-    if (!image) {
-      image = await page.$(attempt2Selector)
-    }
-    imageUrl = await (await image!.getProperty("src")).jsonValue()
-    console.log("image url: ", imageUrl, "from this post: ", postUrl)
-  } catch (error) {
-    console.log(
-      "error finding image, prolly coz it's a video or no permalinkPost",
-      error.message
-    )
+  const attempt1Selector =
+    ".permalinkPost img.scaledImageFitWidth.img, .permalinkPost img.scaledImageFitHeight.img" //this doesn't work for group posts.
+  // we could use .userContentWrapper  img.scaledImageFitWidth.img which works for everything, although there could be multiple on a page so we are relying that the first one returned is the correct one, which it should be anyway. or we query a second time if the first one didn't work. yeah i prefer that.
+  const attempt2Selector =
+    ".userContentWrapper img.scaledImageFitWidth.img, .permalinkPost img.scaledImageFitHeight.img" //so far i've only seen this selector needed for posts liked from groups. if the group post is not an image, it won't match anything which is good
+
+  const linkSelector =
+    '.permalinkPost div[data-tooltip-content="Show more information about this link"]' //we don't wanna post this since it's a link to an article or something
+  const link = await page.$(linkSelector)
+  if (link) {
+    return null
   }
-
-  return imageUrl!
+  let image = await page.$(attempt1Selector)
+  if (!image) {
+    image = await page.$(attempt2Selector)
+  }
+  if (!image) {
+    //a post with no image (e.g. a video) is not a failure, there's just nothing to post
+    console.log("no image found on this post: ", postUrl)
+    return null
+  }
+  const imageUrl: string = await (await image.getProperty("src")).jsonValue()
+  console.log("image url: ", imageUrl, "from this post: ", postUrl)
+  return imageUrl
 }
