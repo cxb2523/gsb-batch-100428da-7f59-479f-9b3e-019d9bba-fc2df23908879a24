@@ -28,6 +28,8 @@
 - 📥 **Concurrent Downloads** - Download multiple chapters simultaneously
 - 📄 **Multiple Formats** - Save as Images, PDF, or CBZ
 - 🔄 **Smart Retry** - Automatic retry for failed image downloads
+- ♻️ **Resumable Downloads** - Re-running a chapter reuses pages already on disk
+- 📊 **Honest Settlement** - Chapters report complete, partial, or failed
 - ⚙️ **Configurable** - Customize download settings to your preference
 - 🚀 **Headless Mode** - Run without visible browser window
 - 💻 **CLI Support** - Full-featured command line interface
@@ -60,6 +62,15 @@ python main.py
 ```bash
 python main.py download --url "https://kagane.moe/series/..."
 ```
+
+### Tests
+```bash
+pip install pytest
+pytest tests/
+```
+The tests are fully offline: they build sample chapter directories locally and
+replace the HTTP session with a fake, so resume, partial-failure settlement and
+failed-page ordering can be verified without network access.
 
 ## ⚙️ Configuration
 

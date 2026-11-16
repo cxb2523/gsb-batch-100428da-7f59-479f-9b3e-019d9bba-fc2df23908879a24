@@ -76,7 +76,7 @@ class AppController(QObject):
     
     downloadStarted = pyqtSignal()
     downloadProgress = pyqtSignal(float, int, str)  # current, total, message
-    downloadChapterComplete = pyqtSignal(str, bool)  # chapter_number, success
+    downloadChapterComplete = pyqtSignal(str, str)  # chapter_number, status ("complete"|"partial"|"failed")
     downloadFinished = pyqtSignal(int, int)  # success, total
     downloadError = pyqtSignal(str)
     

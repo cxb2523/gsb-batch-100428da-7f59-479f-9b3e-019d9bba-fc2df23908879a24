@@ -276,19 +276,25 @@ def download_manga_flow():
 def download_chapters_api(series: Series, books: list[Book], config: Config):
     """Download chapters directly through the API (no browser required)"""
     from src.scraper import APIChapterDownloader
+    from src.scraper.api_downloader import (
+        CHAPTER_COMPLETE,
+        CHAPTER_FAILED,
+        CHAPTER_PARTIAL,
+        classify_chapter_status,
+    )
     from src.converter import create_pdf, create_cbz
-    
+
     download_dir = Path(config.download_directory)
     download_dir.mkdir(parents=True, exist_ok=True)
-    
+
     downloader = APIChapterDownloader(
         download_dir=download_dir,
         max_concurrent_images=config.max_concurrent_images,
         max_retries=config.max_retries
     )
-    
+
     results = []
-    
+
     try:
         with Progress(
             SpinnerColumn(),
@@ -301,69 +307,98 @@ def download_chapters_api(series: Series, books: list[Book], config: Config):
                 f"[cyan]Downloading {len(books)} chapter(s)...",
                 total=len(books)
             )
-            
+
             for idx, book in enumerate(books):
                 progress.update(overall_task, description=f"[cyan]Loading Chapter {book.chapter_no}...")
-                
+
                 # Create chapter directory
                 safe_title = downloader.sanitize_filename(series.title, max_length=50)
                 safe_chapter = downloader.sanitize_filename(f"Chapter_{book.chapter_no}_{book.title}", max_length=80)
                 chapter_dir = download_dir / safe_title / safe_chapter
                 chapter_dir.mkdir(parents=True, exist_ok=True)
-                
+
                 try:
                     image_urls = downloader.get_page_urls(book.book_id)
                     if image_urls:
-                        progress.update(overall_task, description=f"[cyan]Ch.{book.chapter_no}: Downloading {len(image_urls)} images...")
-                        
+                        total_pages = len(image_urls)
+                        progress.update(overall_task, description=f"[cyan]Ch.{book.chapter_no}: Downloading {total_pages} images...")
+
                         def on_image_progress(done: int, total: int, chapter_no: str = book.chapter_no):
                             progress.update(
                                 overall_task,
                                 completed=idx + done / max(total, 1),
                                 description=f"[cyan]Ch.{chapter_no}: {done}/{total} images..."
                             )
-                        
-                        pages_downloaded = downloader.download_from_urls(image_urls, chapter_dir, on_image_progress)
-                        success = pages_downloaded > 0
+
+                        failed_pages: list[int] = []
+
+                        def on_failed_pages(pages: list[int], sink: list[int] = failed_pages):
+                            sink.extend(pages)
+
+                        pages_downloaded = downloader.download_from_urls(
+                            image_urls,
+                            chapter_dir,
+                            on_image_progress,
+                            failed_pages_callback=on_failed_pages,
+                        )
+                        status = classify_chapter_status(pages_downloaded, total_pages)
                     else:
+                        total_pages = 0
                         pages_downloaded = 0
-                        success = False
-                    results.append((book, success, chapter_dir, pages_downloaded))
+                        failed_pages = []
+                        status = CHAPTER_FAILED
+                    results.append((book, status, chapter_dir, pages_downloaded, total_pages, failed_pages))
+
+                    if status == CHAPTER_PARTIAL:
+                        failed_count = total_pages - pages_downloaded
+                        console.print(
+                            f"[yellow][!] Ch.{book.chapter_no}: {pages_downloaded}/{total_pages} images, "
+                            f"{failed_count} failed (pages: {', '.join(str(p) for p in failed_pages)})[/]"
+                        )
+                    elif status == CHAPTER_FAILED:
+                        console.print(f"[red][X] Ch.{book.chapter_no}: no images downloaded[/]")
                 except Exception as e:
                     if config.enable_logs:
                         console.print(f"[red]Error downloading Ch.{book.chapter_no}: {e}[/]")
-                    results.append((book, False, chapter_dir, 0))
-                
+                    results.append((book, CHAPTER_FAILED, chapter_dir, 0, 0, []))
+
                 progress.update(overall_task, completed=idx + 1)
-        
+
         # Convert files if needed
         if config.download_format in ("pdf", "cbz"):
             with console.status(f"[cyan]Converting to {config.download_format.upper()}...[/]", spinner="dots"):
-                for book, success, chapter_dir, _ in results:
-                    if success and chapter_dir and chapter_dir.exists():
+                for book, status, chapter_dir, pages_downloaded, _total, _failed in results:
+                    # Convert whenever the chapter has at least one saved image
+                    if status in (CHAPTER_COMPLETE, CHAPTER_PARTIAL) and pages_downloaded > 0 and chapter_dir and chapter_dir.exists():
+                        # Keep a partial chapter's images even when keep_images is off:
+                        # deleting them would throw away the resume state for the retry
+                        delete_images = (not config.keep_images) and status == CHAPTER_COMPLETE
                         try:
                             if config.download_format == "pdf":
-                                create_pdf(chapter_dir, delete_images=not config.keep_images)
+                                create_pdf(chapter_dir, delete_images=delete_images)
                             elif config.download_format == "cbz":
-                                create_cbz(chapter_dir, series=series, book=book, delete_images=not config.keep_images)
+                                create_cbz(chapter_dir, series=series, book=book, delete_images=delete_images)
                         except Exception as e:
                             if config.enable_logs:
                                 console.print(f"[red]Error converting Ch.{book.chapter_no}: {e}[/]")
     finally:
         downloader.close()
-    
+
     # Display results
     console.print()
-    success_count = sum(1 for _, success, _, _ in results if success)
-    
-    if success_count == len(books):
+    complete_count = sum(1 for _, status, _, _, _, _ in results if status == CHAPTER_COMPLETE)
+    partial_count = sum(1 for _, status, _, _, _, _ in results if status == CHAPTER_PARTIAL)
+    failed_count = sum(1 for _, status, _, _, _, _ in results if status == CHAPTER_FAILED)
+
+    if complete_count == len(books):
         console.print(Panel(
-            f"[bold green][OK] Successfully downloaded {success_count}/{len(books)} chapters![/]",
+            f"[bold green][OK] Successfully downloaded {complete_count}/{len(books)} chapters![/]",
             border_style="green"
         ))
-    elif success_count > 0:
+    elif complete_count or partial_count:
         console.print(Panel(
-            f"[bold yellow][!] Downloaded {success_count}/{len(books)} chapters (some failed)[/]",
+            f"[bold yellow][!] {complete_count} complete, {partial_count} partial, "
+            f"{failed_count} failed (of {len(books)} chapters)[/]",
             border_style="yellow"
         ))
     else:

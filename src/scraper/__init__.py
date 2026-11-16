@@ -21,7 +21,16 @@ from .api_models import (
     parse_series, parse_books, get_image_url, IMAGE_BASE_URL
 )
 from .api_scraper import KaganeScraper, fetch_series
-from .api_downloader import APIChapterDownloader, get_image_urls_from_browser, get_reader_url
+from .api_downloader import (
+    APIChapterDownloader,
+    CHAPTER_COMPLETE,
+    CHAPTER_FAILED,
+    CHAPTER_PARTIAL,
+    classify_chapter_status,
+    normalize_page_numbers,
+    get_image_urls_from_browser,
+    get_reader_url,
+)
 
 # # Legacy modules (deprecated - kept for backward compatibility)
 # from .models import MangaInfo, Chapter
@@ -50,6 +59,11 @@ __all__ = [
     "KaganeScraper",
     "fetch_series",
     "APIChapterDownloader",
+    "CHAPTER_COMPLETE",
+    "CHAPTER_FAILED",
+    "CHAPTER_PARTIAL",
+    "classify_chapter_status",
+    "normalize_page_numbers",
     "get_image_urls_from_browser",
     "get_reader_url",
     # Legacy (deprecated)

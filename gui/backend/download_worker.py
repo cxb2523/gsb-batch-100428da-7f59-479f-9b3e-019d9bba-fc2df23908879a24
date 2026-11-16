@@ -12,16 +12,23 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from config import get_config
 from src.scraper import Series, Book
-from src.scraper.api_downloader import APIChapterDownloader
+from src.scraper.api_downloader import (
+    APIChapterDownloader,
+    CHAPTER_COMPLETE,
+    CHAPTER_FAILED,
+    CHAPTER_PARTIAL,
+    classify_chapter_status,
+)
 from src.converter import create_pdf, create_cbz
 
 
 class DownloadWorker(QThread):
     """Background worker for downloading chapters using API (sequential)"""
-    
+
     # Signals
     progress = pyqtSignal(float, int, str)  # current, total, message
-    chapterComplete = pyqtSignal(str, bool)  # chapter_number, success
+    # chapter_number, status ("complete" | "partial" | "failed")
+    chapterComplete = pyqtSignal(str, str)
     finished = pyqtSignal(int, int)  # success_count, total_count
     error = pyqtSignal(str)
     
@@ -67,53 +74,91 @@ class DownloadWorker(QThread):
                 try:
                     image_urls = downloader.get_page_urls(book.book_id)
                     if not image_urls:
-                        results.append((book, False, chapter_dir, 0))
-                        self.chapterComplete.emit(book.chapter_no, False)
+                        results.append((book, CHAPTER_FAILED, chapter_dir, 0, 0, []))
+                        self.chapterComplete.emit(book.chapter_no, CHAPTER_FAILED)
                         self.progress.emit(idx + 1, len(self.chapters), f"Chapter {book.chapter_no} failed")
                         continue
-                    
-                    self.progress.emit(idx, len(self.chapters), f"Ch.{book.chapter_no}: Downloading {len(image_urls)} images...")
-                    
+
+                    total_pages = len(image_urls)
+                    self.progress.emit(idx, len(self.chapters), f"Ch.{book.chapter_no}: Downloading {total_pages} images...")
+
                     def on_image_progress(done: int, total: int, chapter_no: str = book.chapter_no):
                         self.progress.emit(
                             idx + done / max(total, 1),
                             len(self.chapters),
                             f"Ch.{chapter_no}: {done}/{total} images..."
                         )
-                    
-                    # Download images
-                    pages_downloaded = downloader.download_from_urls(image_urls, chapter_dir, on_image_progress)
-                    
-                    success = pages_downloaded > 0
-                    results.append((book, success, chapter_dir, pages_downloaded))
-                    self.chapterComplete.emit(book.chapter_no, success)
-                    self.progress.emit(idx + 1, len(self.chapters), f"Chapter {book.chapter_no} complete")
-                    
+
+                    # Download images (resumes pages already saved on disk)
+                    failed_pages: list[int] = []
+
+                    def on_failed_pages(pages: list[int], sink: list[int] = failed_pages):
+                        sink.extend(pages)
+
+                    pages_downloaded = downloader.download_from_urls(
+                        image_urls,
+                        chapter_dir,
+                        on_image_progress,
+                        failed_pages_callback=on_failed_pages,
+                    )
+
+                    status = classify_chapter_status(pages_downloaded, total_pages)
+                    failed_count = total_pages - pages_downloaded
+
+                    results.append((book, status, chapter_dir, pages_downloaded, total_pages, failed_pages))
+                    self.chapterComplete.emit(book.chapter_no, status)
+
+                    if status == CHAPTER_COMPLETE:
+                        self.progress.emit(
+                            idx + 1,
+                            len(self.chapters),
+                            f"Chapter {book.chapter_no} complete: "
+                            f"{pages_downloaded}/{total_pages} images, {failed_count} failed"
+                        )
+                    elif status == CHAPTER_PARTIAL:
+                        self.progress.emit(
+                            idx + 1,
+                            len(self.chapters),
+                            f"Chapter {book.chapter_no} partially downloaded: "
+                            f"{pages_downloaded}/{total_pages} images, {failed_count} failed"
+                        )
+                    else:
+                        self.progress.emit(
+                            idx + 1,
+                            len(self.chapters),
+                            f"Chapter {book.chapter_no} failed: "
+                            f"{pages_downloaded}/{total_pages} images, {failed_count} failed"
+                        )
+
                 except Exception:
-                    results.append((book, False, chapter_dir, 0))
-                    self.chapterComplete.emit(book.chapter_no, False)
+                    results.append((book, CHAPTER_FAILED, chapter_dir, 0, 0, []))
+                    self.chapterComplete.emit(book.chapter_no, CHAPTER_FAILED)
                     self.progress.emit(idx + 1, len(self.chapters), f"Chapter {book.chapter_no} failed")
-            
+
             # Convert files if needed
             if config.download_format in ("pdf", "cbz") and not self._stop_requested:
                 self.progress.emit(len(self.chapters), len(self.chapters), f"Converting to {config.download_format.upper()}...")
-                for book, success, chapter_dir, _ in results:
+                for book, status, chapter_dir, pages_downloaded, _total, _failed in results:
                     if self._stop_requested:
                         break
-                    if success and chapter_dir and chapter_dir.exists():
+                    # Convert whenever the chapter has at least one saved image
+                    if status in (CHAPTER_COMPLETE, CHAPTER_PARTIAL) and pages_downloaded > 0 and chapter_dir and chapter_dir.exists():
+                        # Keep a partial chapter's images even when keep_images is off:
+                        # deleting them would throw away the resume state for the retry
+                        delete_images = (not config.keep_images) and status == CHAPTER_COMPLETE
                         try:
                             if config.download_format == "pdf":
-                                create_pdf(chapter_dir, delete_images=not config.keep_images)
+                                create_pdf(chapter_dir, delete_images=delete_images)
                             elif config.download_format == "cbz":
-                                create_cbz(chapter_dir, series=self.series, book=book, delete_images=not config.keep_images)
+                                create_cbz(chapter_dir, series=self.series, book=book, delete_images=delete_images)
                         except Exception:
                             pass  # Conversion error, continue
-            
-            # Count successes
-            for _, success, _, _ in results:
-                if success:
+
+            # Count chapters that produced at least one image (complete or partial)
+            for _, status, _, _, _, _ in results:
+                if status in (CHAPTER_COMPLETE, CHAPTER_PARTIAL):
                     success_count += 1
-            
+
             self.finished.emit(success_count, len(self.chapters))
             
         except Exception as e:

@@ -21,6 +21,9 @@ ApplicationWindow {
     property string downloadProgressMsg: ""
     property real downloadCurrent: 0
     property int downloadTotal: 0
+    property int downloadCompleteChapters: 0
+    property int downloadPartialChapters: 0
+    property int downloadFailedChapters: 0
     
     // Manga data
     property string mangaTitle: ""
@@ -81,6 +84,9 @@ ApplicationWindow {
             downloadProgressMsg = "Starting download..."
             downloadCurrent = 0
             downloadTotal = 0
+            downloadCompleteChapters = 0
+            downloadPartialChapters = 0
+            downloadFailedChapters = 0
         }
         
         function onDownloadProgress(current, total, msg) {
@@ -91,14 +97,37 @@ ApplicationWindow {
             downloadTotal = total
         }
         
+        function onDownloadChapterComplete(chapterNumber, status) {
+            // status: "complete" | "partial" | "failed"
+            if (status === "partial") {
+                downloadPartialChapters++
+                statusText.text = "Ch." + chapterNumber + ": partially downloaded"
+            } else if (status === "failed") {
+                downloadFailedChapters++
+                statusText.text = "Ch." + chapterNumber + ": failed"
+            } else {
+                downloadCompleteChapters++
+                statusText.text = "Ch." + chapterNumber + ": complete"
+            }
+        }
+
         function onDownloadFinished(success, total) {
             isDownloading = false
-            statusText.text = "Downloaded " + success + "/" + total + " chapters"
+            if (downloadPartialChapters > 0 || downloadFailedChapters > 0) {
+                statusText.text = "Downloaded " + success + "/" + total + " chapters ("
+                    + downloadCompleteChapters + " complete, "
+                    + downloadPartialChapters + " partial, "
+                    + downloadFailedChapters + " failed)"
+            } else {
+                statusText.text = "Downloaded " + success + "/" + total + " chapters"
+            }
             // Add to history model
             downloadHistoryModel.insert(0, {
                 title: mangaTitle,
                 success: success,
                 total: total,
+                partial: downloadPartialChapters,
+                failed: downloadFailedChapters,
                 time: new Date().toLocaleString(),
                 cover: mangaCover
             })
@@ -871,7 +900,14 @@ ApplicationWindow {
                                         font.pixelSize: 12
                                         color: model.success === model.total ? "#4ade80" : "#fbbf24"
                                     }
-                                    
+
+                                    Text {
+                                        visible: model.partial > 0 || model.failed > 0
+                                        text: (model.partial || 0) + " partial, " + (model.failed || 0) + " failed"
+                                        font.pixelSize: 11
+                                        color: "#c084fc"
+                                    }
+
                                     Text {
                                         text: model.time || ""
                                         font.pixelSize: 11
