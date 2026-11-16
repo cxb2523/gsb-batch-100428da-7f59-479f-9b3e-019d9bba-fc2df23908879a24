@@ -51,12 +51,10 @@ def fetch_reddit_threads(date: str) -> Dict[str, Any]:
     """
     Fetch Match Thread and Post Match Thread posts from r/soccer for a specific date.
     Filters posts based on their created_utc timestamp matching the given date.
+
+    GCS existence checks and skip handling are owned by the calling orchestrator;
+    this function only fetches and validates threads.
     """
-
-    if check_file_exists_in_gcs(date):
-        logging.info(f"Skipping date {date} as file already exists in GCS")
-        return {"date": date, "threads": [], "thread_count": 0}
-
     subreddit = reddit.subreddit("soccer")
 
     start_timestamp = int(datetime.strptime(date, "%Y-%m-%d").timestamp())
