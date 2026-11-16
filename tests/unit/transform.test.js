@@ -128,3 +128,30 @@ test("buildProductJson passes through description and reviews", () => {
   assert.equal(result.description, desc);
   assert.deepStrictEqual(result.reviews, revs);
 });
+
+test("buildProductJson omits descriptionStatus by default to preserve output shape", () => {
+  const result = buildProductJson({
+    data: {},
+    descriptionData: "<p>Description</p>",
+    reviews: [],
+  });
+
+  assert.equal("descriptionStatus" in result, false);
+});
+
+test("buildProductJson includes descriptionStatus only when explicitly provided", () => {
+  const descriptionStatus = {
+    status: "failed",
+    reason: "Description page fetch failed for https://desc.example: timeout",
+  };
+
+  const result = buildProductJson({
+    data: {},
+    descriptionData: null,
+    reviews: [],
+    descriptionStatus,
+  });
+
+  assert.equal(result.description, null);
+  assert.deepStrictEqual(result.descriptionStatus, descriptionStatus);
+});

@@ -37,6 +37,40 @@ console.log(data.title, data.salePrice);
 | `filterReviewsBy` | 'all' \| 1-5 | 'all' | Filter reviews by star rating |
 | `puppeteerOptions` | object | {} | Puppeteer launch options |
 | `timeout` | number | 60000 | Page navigation timeout (ms) |
+| `descriptionFailureStrategy` | `'fail'` \| `'continue'` | `'fail'` | What to do when the description page fails. `'fail'` aborts the whole scrape (historical behavior); `'continue'` degrades to `description: null` and reports a `descriptionStatus` field instead |
+
+### Description failure handling
+
+The description is loaded from a separate page **after** the main product data
+(title, price, SKUs, reviews, shipping) has already been captured. By default
+(`descriptionFailureStrategy: 'fail'`), a timeout or error on that page fails
+the entire scrape, exactly as in previous versions.
+
+Opt into graceful degradation with `descriptionFailureStrategy: 'continue'`.
+The main product data is then returned even if the description page fails, and
+the response gains a `descriptionStatus` field:
+
+```js
+import scrape from 'aliexpress-product-scraper';
+
+const product = await scrape('1005007429636284', {
+  descriptionFailureStrategy: 'continue',
+});
+
+console.log(product.description);       // HTML string, or null when unavailable
+console.log(product.descriptionStatus); // { status, reason }
+```
+
+| `descriptionStatus.status` | Meaning | `description` |
+|---|---|---|
+| `'success'` | Description HTML was fetched | HTML string |
+| `'failed'` | Description page navigation/parsing failed; `reason` contains the readable error (e.g. timeout message) | `null` |
+| `'skipped'` | The product had no description link; `reason` explains the skip | `null` |
+
+Failures of the main product page itself are **never** degraded — the scrape
+still rejects regardless of this option. The `descriptionStatus` field is only
+present when `'continue'` is selected, so the default response shape is
+unchanged.
 
 ---
 

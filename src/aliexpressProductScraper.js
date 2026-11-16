@@ -1,10 +1,13 @@
 import puppeteer from "puppeteer-extra";
 import StealthPlugin from "puppeteer-extra-plugin-stealth";
-import * as cheerio from "cheerio";
 
 import { get as GetReviews } from "./reviews.js";
 import { parseJsonp, extractDataFromApiResponse } from "./parsers.js";
 import { buildProductJson } from "./transform.js";
+import {
+  DESCRIPTION_FAILURE_STRATEGY,
+  fetchDescription,
+} from "./description.js";
 
 // Use stealth plugin to avoid bot detection
 puppeteer.use(StealthPlugin());
@@ -12,10 +15,27 @@ puppeteer.use(StealthPlugin());
 
 const AliexpressProductScraper = async (
   id,
-  { reviewsCount = 20, filterReviewsBy = "all", puppeteerOptions = {}, timeout = 60000 } = {}
+  {
+    reviewsCount = 20,
+    filterReviewsBy = "all",
+    puppeteerOptions = {},
+    timeout = 60000,
+    descriptionFailureStrategy = DESCRIPTION_FAILURE_STRATEGY.FAIL,
+  } = {}
 ) => {
   if (!id) {
     throw new Error("Please provide a valid product id");
+  }
+
+  if (
+    !Object.values(DESCRIPTION_FAILURE_STRATEGY).includes(
+      descriptionFailureStrategy
+    )
+  ) {
+    throw new Error(
+      `Invalid descriptionFailureStrategy: "${descriptionFailureStrategy}". ` +
+        `Expected one of: ${Object.values(DESCRIPTION_FAILURE_STRATEGY).join(", ")}`
+    );
   }
 
   let browser;
@@ -97,14 +117,12 @@ const AliexpressProductScraper = async (
 
     /** Scrape the description page for the product using the description url */
     const descriptionUrl = data?.productDescComponent?.descriptionUrl;
-    let descriptionDataPromise = null;
-    if (descriptionUrl) {
-      descriptionDataPromise = page.goto(descriptionUrl).then(async () => {
-        const descriptionPageHtml = await page.content();
-        const $ = cheerio.load(descriptionPageHtml);
-        return $("body").html();
-      });
-    }
+    const descriptionPromise = fetchDescription({
+      page,
+      descriptionUrl,
+      strategy: descriptionFailureStrategy,
+      productId: id,
+    });
 
     const reviewsPromise = GetReviews({
       productId: id,
@@ -113,14 +131,24 @@ const AliexpressProductScraper = async (
       filterReviewsBy,
     });
 
-    const [descriptionData, reviews] = await Promise.all([
-      descriptionDataPromise,
+    const [{ descriptionData, descriptionStatus }, reviews] = await Promise.all([
+      descriptionPromise,
       reviewsPromise,
     ]);
 
     await browser.close();
 
-    return buildProductJson({ data, descriptionData, reviews });
+    // The status field is only reported when description failure degradation
+    // is explicitly opted into; default strategy keeps the historical output.
+    const includeDescriptionStatus =
+      descriptionFailureStrategy === DESCRIPTION_FAILURE_STRATEGY.CONTINUE;
+
+    return buildProductJson({
+      data,
+      descriptionData,
+      reviews,
+      ...(includeDescriptionStatus ? { descriptionStatus } : {}),
+    });
   } catch (error) {
     console.error(error);
     if (browser) {

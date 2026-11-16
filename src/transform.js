@@ -1,12 +1,17 @@
 import { get as GetVariants } from "./variants.js";
 import { get as GetShippingDetails } from "./shipping.js";
 
-const buildProductJson = ({ data, descriptionData = null, reviews = [] }) => {
+const buildProductJson = ({
+  data,
+  descriptionData = null,
+  reviews = [],
+  descriptionStatus = undefined,
+}) => {
   const shipping = GetShippingDetails(
     data?.webGeneralFreightCalculateComponent?.originalLayoutResultList || []
   );
 
-  return {
+  const productJson = {
     title: data.productInfoComponent?.subject,
     categoryId: data.productInfoComponent?.categoryId,
     productId: data.productInfoComponent?.id,
@@ -54,6 +59,14 @@ const buildProductJson = ({ data, descriptionData = null, reviews = [] }) => {
     },
     shipping,
   };
+
+  // Only include the status field when a degraded description strategy was used,
+  // so the default output shape (and the output contract) stays unchanged.
+  if (descriptionStatus !== undefined) {
+    productJson.descriptionStatus = descriptionStatus;
+  }
+
+  return productJson;
 };
 
 export { buildProductJson };
