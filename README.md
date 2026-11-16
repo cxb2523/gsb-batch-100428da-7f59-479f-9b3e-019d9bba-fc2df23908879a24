@@ -213,7 +213,7 @@ python -m http.server 8000
 ```bash
 python src/collect.py                    # 全量：281 城门店 + 79 城场次抽样
 python src/collect.py --deep             # 深采：每个城市首店都取日期与场次
-python src/collect.py --resume           # 中断后续采，跳过已完成的城市
+python src/collect.py --resume           # 中断后续采，只跳过上次真正成功的城市
 python src/build_atlas.py                # 打包成 web/ 使用的 data/atlas.json
 ```
 
@@ -461,12 +461,22 @@ python tests/test_contest_compliance.py # 24 项：参赛要求逐项合规校�
 
 ## 十、采集的健壮性
 
-长任务中断是真实会发生的事（实测遇到过代理 502）。采集脚本为此做了三件事：
+长任务中断是真实会发生的事（实测遇到过代理 502）。采集脚本为此做了四件事：
 
-1. **增量落盘**：每 25 个城市写一次 `stores.json`，中途失败不丢已采数据；
-2. **断点续采**：`--resume` 复用上次已完成的城市，不从头再来；
-3. **网络错误与业务错误分离**：连接层故障（`URLError`）上抛重试，
+1. **逐城落盘**：每个城市处理完立即原子写入 `stores.json`（先写临时文件再
+   `os.replace`），并在 `cityStatus` 中记录该城市 `success` / `failed` 状态、
+   门店数与失败原因；任意时刻中断都不丢已完成城市，不再有「最后不足 25 城
+   整段丢失」的窗口；
+2. **断点续采**：`--resume` 只跳过上次真正 `success` 的城市；上次失败、采到
+   一半被打断或没有状态记录的城市都会重新采集，不会被 `byCity` 的键误判为已完成；
+3. **单城失败不中止**：单个城市采集报错只记录 `failed` 并继续后面的城市，
+   结束时打印成功、失败、跳过各多少城市；`totalStores` 只统计成功城市的门店；
+4. **网络错误与业务错误分离**：连接层故障（`URLError`）上抛重试，
    服务端错误码（401/429）按语义处理，两者不会混为一谈。
+
+`stores.json` 仍保留 `byCity`、`totalStores`、`representativeSpuId` 等既有字段，
+新增的 `cityStatus` 不影响 `build_atlas.py` 打包；离线验证见
+`tests/test_resume_collect.py`（本地伪造 MCP 客户端，不发真实请求、不依赖 Token）。
 
 ---
 
