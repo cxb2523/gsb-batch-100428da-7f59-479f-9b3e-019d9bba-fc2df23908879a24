@@ -1,6 +1,7 @@
 """This module contains the logic to find trains from the CLI."""
 
 import argparse
+import sys
 from typing import Any, Dict, List, Tuple
 
 from rich.box import HEAVY
@@ -55,7 +56,7 @@ def remove_duplicates(trains: List[TrainRideRecord]) -> List[TrainRideRecord]:
     return list(best.values())
 
 
-def main(origin: str, destination: str, departure_date: str, direct_only: bool = False):
+def main(origin: str, destination: str, departure_date: str, direct_only: bool = False) -> int:
     """Searches for available train rides between the specified origin and destination stations
     on the given departure date, and displays the results in a formatted table.
 
@@ -64,6 +65,10 @@ def main(origin: str, destination: str, departure_date: str, direct_only: bool =
     haven't opened yet are listed as "Not on sale", while sold out trains are hidden. If no
     trains are found, a message is displayed. If direct_only is set, trains with transfers are
     discarded. Duplicated trains (same type, times and transfers) are shown only once.
+
+    :return: Process exit code: 0 on success or empty results, 1 when the scraping chain
+        fails, 2 when the input validation fails
+    :rtype: int
     """
 
     print("\n")  # Padding line
@@ -79,11 +84,33 @@ def main(origin: str, destination: str, departure_date: str, direct_only: bool =
     for validations in ctx.values():
         if not validations:
             console.print(f"[i][red]{validations.error_message}[/i]")
-            return
+            return 2
 
     scraper = Scraper(ctx["origin"].station, ctx["destination"].station, ctx["departure_date"].date)
 
-    trains = scraper.get_trainrides()
+    result = scraper.get_trainrides()
+
+    if result.session_failed or result.train_list_failed:
+        stage = result.stage.value if result.stage is not None else "unknown"
+        console.print(
+            f"[bold red]Search failed at the '{stage}' stage.[/] "
+            "Renfe's website may be temporarily unavailable, please try again later."
+        )
+        console.print(f"[red]Cause: {result.error!r}[/]")
+        if result.rides:
+            console.print(
+                f"[yellow]{len(result.rides)} train(s) were parsed before the failure:[/]"
+            )
+        return 1
+
+    if result.empty:
+        console.print(
+            "[i][yellow]Renfe returned no trains for this route and date. "
+            "There are no train services scheduled for that day, try another date or route.[/i]"
+        )
+        return 0
+
+    trains = result.rides
 
     if direct_only:
         trains = [train for train in trains if train.is_direct]
@@ -92,7 +119,7 @@ def main(origin: str, destination: str, departure_date: str, direct_only: bool =
 
     if not trains:
         console.print("[i][red]No trains found for the given filter[/i]")
-        return
+        return 0
 
     # Trains not on sale yet are shown too, so users can check when Renfe opens their sales
     shown_trains = [train for train in trains if train.available or train.not_on_sale_yet]
@@ -103,7 +130,7 @@ def main(origin: str, destination: str, departure_date: str, direct_only: bool =
         else:
             message = f"All {len(trains)} trains for the given filter are sold out"
         console.print(f"[i][red]{message}[/i]")
-        return
+        return 0
 
     table = Table(
         header_style="bold blue",
@@ -133,6 +160,7 @@ def main(origin: str, destination: str, departure_date: str, direct_only: bool =
         )
 
     console.print(table)
+    return 0
 
 
 if __name__ == "__main__":
@@ -152,4 +180,4 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    main(args.origin, args.destination, args.departure_date, args.direct)
+    sys.exit(main(args.origin, args.destination, args.departure_date, args.direct))

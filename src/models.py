@@ -1,11 +1,84 @@
 """This module contains the models used in the application"""
 
+from __future__ import annotations
+
 from datetime import datetime, time
+from enum import Enum
 from typing import List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from errors import InvalidTrainRideFilter
+
+
+class ScrapeStage(str, Enum):
+    """Stages of the Renfe scraping chain, in execution order.
+
+    The first three stages establish the DWR session; the last one fetches and parses the
+    train list.
+    """
+
+    SEARCH = "search"
+    DWR_TOKEN = "dwr_token"
+    UPDATE_SESSION = "update_session"
+    TRAIN_LIST = "train_list"
+
+
+class ScrapeStatus(str, Enum):
+    """Possible outcomes of a train ride search."""
+
+    SUCCESS = "success"
+    EMPTY = "empty"
+    SESSION_FAILED = "session_failed"
+    TRAIN_LIST_FAILED = "train_list_failed"
+
+
+class TrainRideResult(BaseModel):
+    """Outcome of Scraper.get_trainrides().
+
+    It always carries a status so callers can distinguish a successful search, a Renfe
+    response with no trains, and a failure at a specific stage. On failure, ``stage`` tells
+    where the chain broke, ``error`` keeps the original exception so the cause is never
+    swallowed, and ``rides`` holds whatever was already parsed (relevant when the train list
+    stage fails halfway through parsing).
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    status: ScrapeStatus = Field(description="How the scraping chain ended")
+    rides: List[TrainRideRecord] = Field(
+        default_factory=list,
+        description="Train rides parsed so far; complete on success/empty, partial on failure",
+    )
+    stage: Optional[ScrapeStage] = Field(
+        default=None,
+        description="Stage where the failure happened, None for non-failure outcomes",
+    )
+    error: Optional[BaseException] = Field(
+        default=None,
+        description="Original exception that caused the failure, kept for traceability",
+    )
+
+    @property
+    def success(self) -> bool:
+        """Whether the full chain completed and at least one train was parsed"""
+        return self.status == ScrapeStatus.SUCCESS
+
+    @property
+    def empty(self) -> bool:
+        """Whether Renfe answered successfully but returned no trains for the day"""
+        return self.status == ScrapeStatus.EMPTY
+
+    @property
+    def session_failed(self) -> bool:
+        """Whether the chain broke while entering the page or getting/updating the DWR session"""
+        return self.status == ScrapeStatus.SESSION_FAILED
+
+    @property
+    def train_list_failed(self) -> bool:
+        """Whether the chain broke while fetching or parsing the train list"""
+        return self.status == ScrapeStatus.TRAIN_LIST_FAILED
+
 
 class StationRecord(BaseModel):
     """Represents a Station, using Renfe's data definition. It can be seen at the file

@@ -10,8 +10,19 @@ import urllib.parse
 import json5
 import requests
 
-from errors import InvalidDWRToken, InvalidTrainRideFilter
-from models import StationRecord, TrainRideRecord
+from errors import (
+    InvalidDWRToken,
+    InvalidTrainListResponse,
+    InvalidTrainRideFilter,
+    TrainRideParsingError,
+)
+from models import (
+    ScrapeStage,
+    ScrapeStatus,
+    StationRecord,
+    TrainRideRecord,
+    TrainRideResult,
+)
 
 SEARCH_URL = "https://venta.renfe.com/vol/buscarTren.do?Idioma=es&Pais=ES"
 
@@ -62,51 +73,108 @@ class Scraper:
         if return_date is not None and return_date < departure_date:
             raise InvalidTrainRideFilter
 
-    def get_trainrides(self) -> List[TrainRideRecord]:
-        """Perform all the functions calls needed to obtain the trains list
+    def get_trainrides(self) -> TrainRideResult:
+        """Perform all the function calls needed to obtain the trains list.
 
-        :return: List of train rides objects
-        :rtype: List[TrainRideRecord]
+        The chain never raises for scraping failures: every outcome is wrapped in a
+        TrainRideResult describing how it ended. The original exception (if any) is kept on
+        the result so the cause stays traceable, and rides parsed before a failure in the
+        train list stage are preserved.
+
+        :return: Result object with the outcome, the parsed rides (possibly partial) and,
+            on failure, the failing stage and the original exception
+        :rtype: TrainRideResult
         """
-        self._do_search()
-        self._do_get_dwr_token()
-        self._do_update_session_objects()
-        trains = self._do_get_train_list()
-        return self._parse_train_list(trains)
+        try:
+            self._do_search()
+        except Exception as error:
+            return TrainRideResult(
+                status=ScrapeStatus.SESSION_FAILED, stage=ScrapeStage.SEARCH, error=error
+            )
+
+        try:
+            self._do_get_dwr_token()
+        except Exception as error:
+            return TrainRideResult(
+                status=ScrapeStatus.SESSION_FAILED, stage=ScrapeStage.DWR_TOKEN, error=error
+            )
+
+        try:
+            self._do_update_session_objects()
+        except Exception as error:
+            return TrainRideResult(
+                status=ScrapeStatus.SESSION_FAILED, stage=ScrapeStage.UPDATE_SESSION, error=error
+            )
+
+        try:
+            trains = self._do_get_train_list()
+        except Exception as error:
+            return TrainRideResult(
+                status=ScrapeStatus.TRAIN_LIST_FAILED,
+                stage=ScrapeStage.TRAIN_LIST,
+                error=error,
+            )
+
+        if not trains.get("listadoTrenes"):
+            return TrainRideResult(status=ScrapeStatus.EMPTY, stage=ScrapeStage.TRAIN_LIST)
+
+        try:
+            rides = self._parse_train_list(trains)
+        except TrainRideParsingError as error:
+            return TrainRideResult(
+                status=ScrapeStatus.TRAIN_LIST_FAILED,
+                stage=ScrapeStage.TRAIN_LIST,
+                error=error,
+                rides=error.partial_rides,
+            )
+
+        return TrainRideResult(
+            status=ScrapeStatus.SUCCESS, stage=ScrapeStage.TRAIN_LIST, rides=rides
+        )
 
     def _parse_train_list(self, trains: Dict[str, Any]) -> List[TrainRideRecord]:
         """Creates the list of train objects from the JSON
 
         :param trains: trains dictionary
         :type trains: Dict[str, Any]
+        :raises TrainRideParsingError: If an entry of the list cannot be parsed; rides parsed
+            before the failing entry are attached to the exception
         :return: List of train rides objects
         :rtype: List[TrainRideRecord]
         """
         trains_records = []
-        for idx, train_way in enumerate(trains["listadoTrenes"]):
-            departure_direction = [self.origin.name, self.destination.name]
-            departure_time = self.departure_date if idx == 0 else self.return_date
-            assert departure_time is not None  # if idx eqs 1, it's because return_date is given
+        try:
+            for idx, train_way in enumerate(trains["listadoTrenes"]):
+                departure_direction = [self.origin.name, self.destination.name]
+                departure_time = self.departure_date if idx == 0 else self.return_date
+                assert departure_time is not None  # if idx eqs 1, it's because return_date is given
 
-            if idx == 1:
-                departure_direction.reverse()
+                if idx == 1:
+                    departure_direction.reverse()
 
-            origin, destination = departure_direction
-            for train in train_way["listviajeViewEnlaceBean"]:
-                price = train["tarifaMinima"] or "NaN"
-                train_record = TrainRideRecord(
-                    origin=origin,
-                    destination=destination,
-                    departure_time=self._change_datetime_hour(train["horaSalida"], departure_time),
-                    arrival_time=self._change_datetime_hour(train["horaLlegada"], departure_time),
-                    duration=train["duracionViajeTotalEnMinutos"],
-                    price=float(price.replace(",", ".")),
-                    available=self._is_train_available(train),
-                    not_on_sale_yet=self._is_train_not_on_sale_yet(train),
-                    train_type=train.get("tipoTrenUno", "N/A"),
-                    transfer_stations=self._get_transfer_stations(train),
-                )
-                trains_records.append(train_record)
+                origin, destination = departure_direction
+                for train in train_way["listviajeViewEnlaceBean"]:
+                    price = train["tarifaMinima"] or "NaN"
+                    train_record = TrainRideRecord(
+                        origin=origin,
+                        destination=destination,
+                        departure_time=self._change_datetime_hour(train["horaSalida"], departure_time),
+                        arrival_time=self._change_datetime_hour(train["horaLlegada"], departure_time),
+                        duration=train["duracionViajeTotalEnMinutos"],
+                        price=float(price.replace(",", ".")),
+                        available=self._is_train_available(train),
+                        not_on_sale_yet=self._is_train_not_on_sale_yet(train),
+                        train_type=train.get("tipoTrenUno", "N/A"),
+                        transfer_stations=self._get_transfer_stations(train),
+                    )
+                    trains_records.append(train_record)
+        except TrainRideParsingError:
+            raise
+        except Exception as error:
+            raise TrainRideParsingError(
+                f"Could not parse a train entry from Renfe's response: {error}",
+                partial_rides=trains_records,
+            ) from error
 
         return trains_records
 
@@ -184,7 +252,7 @@ class Scraper:
         }
 
         r = self.api.post(SEARCH_URL, data=data, allow_redirects=True)
-        assert r.ok
+        r.raise_for_status()
 
     def _do_get_dwr_token(self) -> None:
         """Encapsulate the API calls that must be done to obtain the DWR token"""
@@ -193,7 +261,7 @@ class Scraper:
 
         payload = self._create_generate_id_payload()
         r = self.api.post(SYSTEM_ID_URL, data=payload)
-        assert r.ok
+        r.raise_for_status()
 
         self.dwr_token = extract_dwr_token(r.text)
         self.api.cookies.set("DWRSESSIONID", self.dwr_token, path="/vol", domain="venta.renfe.com")
@@ -203,13 +271,13 @@ class Scraper:
         """Encapsulate the API calls that must be done to update the DWR session objects"""
         payload = self._create_update_session_objects_payload()
         r = self.api.post(UPDATE_SESSION_URL, data=payload)
-        assert r.ok
+        r.raise_for_status()
 
     def _do_get_train_list(self) -> Dict[str, Any]:
         """Encapsulate the API calls that must be done to get and parse the trains list"""
         payload = self._create_get_train_list_payload()
         r = self.api.post(TRAIN_LIST_URL, data=payload)
-        assert r.ok
+        r.raise_for_status()
         return extract_train_list(r.text)
 
     def _create_search_payload(self) -> Dict[str, str]:
@@ -384,12 +452,22 @@ def extract_train_list(response_text: str) -> Dict[str, Any]:
 
     :param response_text: The response from the trains API call
     :type response_text: str
+    :raises InvalidTrainListResponse: If the response body lacks the handleCallback fragment
+        or its payload cannot be decoded as JSON
     :return: Trains JSON
     :rtype: Dict[str, Any]
     """
     match = re.search(r"r\.handleCallback\([^,]+,\s*[^,]+,\s*(\{.*\})\);", response_text, re.DOTALL)
-    assert match is not None
-    return json5.loads(match.group(1))
+    if match is None:
+        raise InvalidTrainListResponse(
+            "The getTrainsList response does not contain a r.handleCallback payload"
+        )
+    try:
+        return json5.loads(match.group(1))
+    except ValueError as error:
+        raise InvalidTrainListResponse(
+            f"The getTrainsList payload could not be decoded: {error}"
+        ) from error
 
 
 def create_cookiedict(

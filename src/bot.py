@@ -13,7 +13,7 @@ from telebot.states.asyncio.middleware import StateMiddleware
 from telebot.types import Message
 
 from config import get_bot_token
-from errors import InvalidDWRToken, InvalidTrainRideFilter
+from errors import InvalidTrainRideFilter
 from messages import user_messages as msg, get_tickets_message
 from models import TrainRideFilter, StationRecord
 from scraper import Scraper
@@ -241,7 +241,24 @@ async def search_trains(message: Message, state: StateContext, ctx: Dict[str, An
 
     try:
         while not departure_done or not return_done:
-            trains = scraper.get_trainrides()
+            result = scraper.get_trainrides()
+
+            if result.session_failed:
+                await state.delete()
+                await bot.send_message(message.chat.id, msg["session_failed"])
+                return
+
+            if result.train_list_failed:
+                await state.delete()
+                await bot.send_message(message.chat.id, msg["train_list_failed"])
+                return
+
+            if result.empty:
+                await state.delete()
+                await bot.send_message(message.chat.id, msg["empty_list"])
+                return
+
+            trains = result.rides
             if not departure_done:
                 departure_trains = departure_filter.filter_rides(trains)
                 departure_done = len(departure_trains) > 0
@@ -265,10 +282,6 @@ async def search_trains(message: Message, state: StateContext, ctx: Dict[str, An
     except InvalidTrainRideFilter:
         await state.delete()
         await bot.send_message(message.chat.id, msg["invalid_filter"])
-
-    except InvalidDWRToken:
-        await state.delete()
-        await bot.send_message(message.chat.id, msg["invalid_dwr_token"])
 
     except Exception as e:
         await state.delete()

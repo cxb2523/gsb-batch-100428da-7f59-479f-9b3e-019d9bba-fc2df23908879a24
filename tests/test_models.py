@@ -1,8 +1,15 @@
 import pytest
 from datetime import datetime, time
 from unittest.mock import patch
-from errors import InvalidTrainRideFilter
-from models import TrainRideRecord, TrainRideFilter, StationRecord
+from errors import InvalidDWRToken, InvalidTrainRideFilter
+from models import (
+    ScrapeStage,
+    ScrapeStatus,
+    TrainRideRecord,
+    TrainRideFilter,
+    TrainRideResult,
+    StationRecord,
+)
 
 
 @pytest.fixture
@@ -123,3 +130,46 @@ def test_train_ride_with_transfer(sample_rides):
     ride = sample_rides[0].model_copy(update={"transfer_stations": ["ZARAGOZA"]})
     assert not ride.is_direct
     assert ride.transfers == 1
+
+
+def test_train_ride_result_success_properties(sample_rides):
+    result = TrainRideResult(
+        status=ScrapeStatus.SUCCESS, stage=ScrapeStage.TRAIN_LIST, rides=sample_rides
+    )
+    assert result.success
+    assert not result.empty
+    assert not result.session_failed
+    assert not result.train_list_failed
+
+
+def test_train_ride_result_empty_properties():
+    result = TrainRideResult(status=ScrapeStatus.EMPTY, stage=ScrapeStage.TRAIN_LIST)
+    assert result.empty
+    assert result.rides == []
+    assert result.stage == ScrapeStage.TRAIN_LIST
+    assert result.error is None
+
+
+def test_train_ride_result_session_failure_keeps_stage_and_error():
+    error = InvalidDWRToken()
+    result = TrainRideResult(
+        status=ScrapeStatus.SESSION_FAILED, stage=ScrapeStage.DWR_TOKEN, error=error
+    )
+    assert result.session_failed
+    assert result.stage == ScrapeStage.DWR_TOKEN
+    assert result.error is error
+    assert result.rides == []
+
+
+def test_train_ride_result_train_list_failure_keeps_partial_rides(sample_rides):
+    error = ValueError("payload cut off")
+    result = TrainRideResult(
+        status=ScrapeStatus.TRAIN_LIST_FAILED,
+        stage=ScrapeStage.TRAIN_LIST,
+        error=error,
+        rides=sample_rides[:1],
+    )
+    assert result.train_list_failed
+    assert len(result.rides) == 1
+    assert result.rides[0] == sample_rides[0]
+    assert result.error is error

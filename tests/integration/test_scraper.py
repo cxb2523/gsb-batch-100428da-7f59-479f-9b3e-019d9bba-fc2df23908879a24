@@ -12,6 +12,7 @@ return_date = today + timedelta(days=3)
 
 scraper = Scraper(origin, destination, departure_date, return_date)
 
-trains = scraper.get_trainrides()
+result = scraper.get_trainrides()
 
-assert len(trains) > 0, "There are no trains from Madrid to Barcelona (which is impossible)"
+assert result.success, f"Scraping did not succeed: status={result.status}, stage={result.stage}, error={result.error!r}"
+assert len(result.rides) > 0, "There are no trains from Madrid to Barcelona (which is impossible)"

@@ -4,8 +4,15 @@ from unittest.mock import patch
 import pytest
 
 from cli import main, remove_duplicates
-from models import StationRecord, TrainRideRecord
+from errors import InvalidTrainListResponse
+from models import ScrapeStage, ScrapeStatus, StationRecord, TrainRideRecord, TrainRideResult
 from validators import DateValidationResult, StationValidationResult
+
+
+def success_result(rides):
+    return TrainRideResult(
+        status=ScrapeStatus.SUCCESS, stage=ScrapeStage.TRAIN_LIST, rides=list(rides)
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -37,57 +44,62 @@ RIDES = [make_ride(7, []), make_ride(9, ["MADRID"])]
 
 @patch("cli.Scraper")
 def test_main_shows_all_trains(mock_scraper, capsys):
-    mock_scraper.return_value.get_trainrides.return_value = RIDES
-    main("Madrid", "Barcelona", "20/12/2026")
+    mock_scraper.return_value.get_trainrides.return_value = success_result(RIDES)
+    exit_code = main("Madrid", "Barcelona", "20/12/2026")
     out = capsys.readouterr().out
     assert "07:00" in out and "09:00" in out
+    assert exit_code == 0
 
 
 @patch("cli.Scraper")
 def test_main_direct_only(mock_scraper, capsys):
-    mock_scraper.return_value.get_trainrides.return_value = RIDES
-    main("Madrid", "Barcelona", "20/12/2026", direct_only=True)
+    mock_scraper.return_value.get_trainrides.return_value = success_result(RIDES)
+    exit_code = main("Madrid", "Barcelona", "20/12/2026", direct_only=True)
     out = capsys.readouterr().out
     assert "07:00" in out and "09:00" not in out
+    assert exit_code == 0
 
 
 @patch("cli.Scraper")
 def test_main_direct_only_without_direct_trains(mock_scraper, capsys):
-    mock_scraper.return_value.get_trainrides.return_value = RIDES[1:]
-    main("Madrid", "Barcelona", "20/12/2026", direct_only=True)
+    mock_scraper.return_value.get_trainrides.return_value = success_result(RIDES[1:])
+    exit_code = main("Madrid", "Barcelona", "20/12/2026", direct_only=True)
     assert "No trains found" in capsys.readouterr().out
+    assert exit_code == 0
 
 
 @patch("cli.Scraper")
 def test_main_all_sold_out(mock_scraper, capsys):
-    mock_scraper.return_value.get_trainrides.return_value = [
+    mock_scraper.return_value.get_trainrides.return_value = success_result([
         make_ride(7, [], available=False, price=float("nan")),
         make_ride(9, [], available=False, price=float("nan")),
-    ]
-    main("Madrid", "Barcelona", "20/12/2026")
+    ])
+    exit_code = main("Madrid", "Barcelona", "20/12/2026")
     out = capsys.readouterr().out
     assert "All 2 trains for the given filter are sold out" in out
     assert "Train type" not in out
+    assert exit_code == 0
 
 
 @patch("cli.Scraper")
 def test_main_direct_only_sold_out(mock_scraper, capsys):
-    mock_scraper.return_value.get_trainrides.return_value = [
+    mock_scraper.return_value.get_trainrides.return_value = success_result([
         make_ride(7, [], available=False, price=float("nan")),
         make_ride(9, ["MADRID"]),
-    ]
-    main("Madrid", "Barcelona", "20/12/2026", direct_only=True)
+    ])
+    exit_code = main("Madrid", "Barcelona", "20/12/2026", direct_only=True)
     assert "The only train for the given filter is sold out" in capsys.readouterr().out
+    assert exit_code == 0
 
 
 @patch("cli.format_transfers", return_value="")
 @patch("cli.Scraper")
 def test_main_highlights_cheap_trains_despite_sold_out(mock_scraper, _, capsys):
-    mock_scraper.return_value.get_trainrides.return_value = [
+    mock_scraper.return_value.get_trainrides.return_value = success_result([
         make_ride(7, [], price=30.0),
         make_ride(9, [], price=90.0),
         make_ride(11, [], available=False, price=float("nan")),
-    ]
+    ])
     with patch("cli.Table.add_row") as add_row:
         main("Madrid", "Barcelona", "20/12/2026")
     prices = [call.args[-1] for call in add_row.call_args_list]
@@ -98,10 +110,10 @@ def test_main_highlights_cheap_trains_despite_sold_out(mock_scraper, _, capsys):
 def test_main_shows_trains_not_on_sale_yet(mock_scraper, capsys):
     not_on_sale = make_ride(8, [], available=False, price=float("nan"))
     not_on_sale.not_on_sale_yet = True
-    mock_scraper.return_value.get_trainrides.return_value = [
+    mock_scraper.return_value.get_trainrides.return_value = success_result([
         not_on_sale,
         make_ride(10, [], available=False, price=float("nan")),  # sold out
-    ]
+    ])
     main("Madrid", "Barcelona", "20/12/2026")
     out = capsys.readouterr().out
     assert "08:00" in out and "Not on sale" in out
@@ -128,6 +140,75 @@ def test_remove_duplicates_keeps_different_trains():
 
 @patch("cli.Scraper")
 def test_main_shows_duplicated_trains_once(mock_scraper, capsys):
-    mock_scraper.return_value.get_trainrides.return_value = [make_ride(8, []), make_ride(8, [])]
+    mock_scraper.return_value.get_trainrides.return_value = success_result(
+        [make_ride(8, []), make_ride(8, [])]
+    )
     main("Madrid", "Barcelona", "20/12/2026")
     assert capsys.readouterr().out.count("08:00") == 1
+
+
+@patch("cli.Scraper")
+def test_main_empty_list_prints_explanation_instead_of_table(mock_scraper, capsys):
+    mock_scraper.return_value.get_trainrides.return_value = TrainRideResult(
+        status=ScrapeStatus.EMPTY, stage=ScrapeStage.TRAIN_LIST
+    )
+    exit_code = main("Madrid", "Barcelona", "20/12/2026")
+    out = capsys.readouterr().out
+    assert "no trains" in out.lower()
+    assert "Train type" not in out
+    assert exit_code == 0
+
+
+@patch("cli.Scraper")
+def test_main_session_failure_prints_stage_and_exits_nonzero(mock_scraper, capsys):
+    error = ConnectionError("boom")
+    mock_scraper.return_value.get_trainrides.return_value = TrainRideResult(
+        status=ScrapeStatus.SESSION_FAILED,
+        stage=ScrapeStage.DWR_TOKEN,
+        error=error,
+    )
+    exit_code = main("Madrid", "Barcelona", "20/12/2026")
+    out = capsys.readouterr().out
+    assert "dwr_token" in out
+    assert "Search failed" in out
+    assert "ConnectionError" in out
+    assert exit_code == 1
+
+
+@patch("cli.Scraper")
+def test_main_train_list_failure_prints_stage_and_exits_nonzero(mock_scraper, capsys):
+    error = InvalidTrainListResponse("missing handleCallback")
+    mock_scraper.return_value.get_trainrides.return_value = TrainRideResult(
+        status=ScrapeStatus.TRAIN_LIST_FAILED,
+        stage=ScrapeStage.TRAIN_LIST,
+        error=error,
+    )
+    exit_code = main("Madrid", "Barcelona", "20/12/2026")
+    out = capsys.readouterr().out
+    assert "train_list" in out
+    assert "InvalidTrainListResponse" in out
+    assert exit_code == 1
+
+
+@patch("cli.Scraper")
+def test_main_failure_reports_partial_rides(mock_scraper, capsys):
+    error = InvalidTrainListResponse("payload broke halfway")
+    mock_scraper.return_value.get_trainrides.return_value = TrainRideResult(
+        status=ScrapeStatus.TRAIN_LIST_FAILED,
+        stage=ScrapeStage.TRAIN_LIST,
+        error=error,
+        rides=[make_ride(7, [])],
+    )
+    exit_code = main("Madrid", "Barcelona", "20/12/2026")
+    out = capsys.readouterr().out
+    assert "1 train(s) were parsed before the failure" in out
+    assert exit_code == 1
+
+
+def test_main_validation_failure_exits_nonzero(capsys):
+    bad_station = StationValidationResult(False, None)
+    bad_station.error_message = "invalid station"
+    with patch("cli.validate_station", return_value=bad_station):
+        exit_code = main("Nowhere", "Barcelona", "20/12/2026")
+    assert "invalid station" in capsys.readouterr().out
+    assert exit_code == 2

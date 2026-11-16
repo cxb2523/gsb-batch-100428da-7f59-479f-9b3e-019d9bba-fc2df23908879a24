@@ -25,7 +25,18 @@ user_messages = {
     "wrong_date": "Perdona, no he entendido la fecha, por favor introdúcela de nuevo.",
     "wrong_number": "Número incorrecto, introdúcelo de nuevo.",
     "invalid_filter": "El filtro introducido no es válido o no se encontró ningún tren con estos parámetros, por favor, inténtalo de nuevo.",
-    "invalid_dwr_token": "Si esto ha ocurrido, Renfe ha actualizado por fin su web. Por favor, abre una issue en github para que pueda revisarlo.",
+    "session_failed": (
+        "No he podido establecer la sesión con la web de Renfe. Suele ser algo temporal, "
+        "inténtalo de nuevo en unos minutos."
+    ),
+    "empty_list": (
+        "No hay trenes disponibles para ese día en el trayecto indicado. "
+        "Prueba con otra fecha o estación."
+    ),
+    "train_list_failed": (
+        "He perdido la conexión con Renfe mientras obtenía la lista de trenes. "
+        "Por favor, inténtalo de nuevo en unos minutos."
+    ),
     "undefined_exception": "Oops, algo se ha roto y no sé el qué. Aquí va toda la traza: {}"
 }
 
